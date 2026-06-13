@@ -72,30 +72,6 @@ const RETRIEVAL_VERSION_HYBRID: &str = "hybrid-v1";
 const RETRIEVAL_VERSION_SIDECAR_BLOCKED: &str = "sidecar-blocked-v1";
 const PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT: usize = 4;
 const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
-const PACKET_EXACT_FAMILY_STEERING_ENV: &str = "CODESTORY_PACKET_EXACT_FAMILY_STEERING";
-
-#[cfg(test)]
-thread_local! {
-    static PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-fn packet_exact_family_steering_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE.with(std::cell::Cell::get) {
-        return enabled;
-    }
-
-    std::env::var(PACKET_EXACT_FAMILY_STEERING_ENV)
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(true)
-}
-
 fn retrieval_version(controller: &AppController) -> &'static str {
     if sidecar_retrieval_primary_enabled(controller) {
         RETRIEVAL_VERSION_SIDECAR
@@ -406,18 +382,6 @@ pub(crate) fn agent_packet(
         &mut answer,
     )?;
     maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
-    if packet_exact_family_steering_enabled() {
-        maybe_append_chinook_sql_schema_file_citations(&project_root, &question, &mut answer);
-        maybe_append_mdn_form_validation_file_citations(&project_root, &question, &mut answer);
-        maybe_append_okio_buffer_flow_file_citations(&project_root, &question, &mut answer);
-        maybe_append_monolog_record_flow_file_citations(&project_root, &question, &mut answer);
-        maybe_append_alamofire_request_flow_file_citations(&project_root, &question, &mut answer);
-    } else {
-        answer
-            .retrieval_trace
-            .annotations
-            .push("packet_exact_family_steering=false static_family_citations=skipped".into());
-    }
     maybe_append_required_file_scoped_source_citations(
         &project_root,
         &question,
@@ -563,10 +527,6 @@ fn build_packet_plan_with_extra(
             extra_probes.len()
         ));
     }
-    trace.push(format!(
-        "exact_family_steering={}",
-        packet_exact_family_steering_enabled()
-    ));
 
     let mut plan = PacketPlanDto {
         task_class,
@@ -706,10 +666,6 @@ fn packet_prompt_exact_symbol_term_is_probe(term: &str) -> bool {
 }
 
 fn push_prompt_concept_derived_symbol_probes(terms: &[String], queries: &mut Vec<String>) {
-    if !packet_exact_family_steering_enabled() {
-        return;
-    }
-
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
@@ -748,31 +704,12 @@ fn push_prompt_concept_derived_symbol_probes(terms: &[String], queries: &mut Vec
     if packet_terms_indicate_css_animation_flow(terms) {
         push_css_animation_symbol_probe_queries(queries);
     }
-    if packet_terms_indicate_chinook_sql_schema_flow(terms) {
-        push_chinook_sql_schema_symbol_probe_queries(queries);
-    }
     if packet_terms_indicate_automapper_map_flow(terms) {
         push_automapper_map_flow_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_mdn_form_validation_flow(terms) {
-        push_mdn_form_validation_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_okio_buffer_flow(terms) {
-        push_okio_buffer_flow_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_monolog_record_flow(terms) {
-        push_monolog_record_flow_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_alamofire_request_flow(terms) {
-        push_alamofire_request_flow_symbol_probe_queries(queries);
     }
 }
 
 fn push_prompt_named_file_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    if !packet_exact_family_steering_enabled() {
-        return;
-    }
-
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
 
@@ -821,23 +758,8 @@ fn push_prompt_named_file_probe_queries(terms: &[String], queries: &mut Vec<Stri
             ],
         );
     }
-    if packet_terms_indicate_chinook_sql_schema_flow(terms) {
-        push_chinook_sql_schema_symbol_probe_queries(queries);
-    }
     if packet_terms_indicate_automapper_map_flow(terms) {
         push_automapper_map_flow_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_mdn_form_validation_flow(terms) {
-        push_mdn_form_validation_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_okio_buffer_flow(terms) {
-        push_okio_buffer_flow_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_monolog_record_flow(terms) {
-        push_monolog_record_flow_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_alamofire_request_flow(terms) {
-        push_alamofire_request_flow_symbol_probe_queries(queries);
     }
 }
 
@@ -981,9 +903,7 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             ],
         );
     }
-    if packet_exact_family_steering_enabled()
-        && packet_terms_indicate_prepared_session_adapter_flow(terms)
-    {
+    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_unique_terms(
             queries,
             &[
@@ -995,9 +915,7 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             ],
         );
     }
-    if packet_exact_family_steering_enabled()
-        && packet_terms_indicate_express_application_route_flow(terms)
-    {
+    if packet_terms_indicate_express_application_route_flow(terms) {
         push_express_application_route_probe_queries(queries);
     }
     if has_any(&["adapter", "adapters", "transport"]) {
@@ -1081,9 +999,7 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             ],
         );
     }
-    if packet_exact_family_steering_enabled()
-        && packet_terms_indicate_prepared_session_adapter_flow(terms)
-    {
+    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_unique_terms(
             queries,
             &[
@@ -1358,25 +1274,6 @@ fn push_css_animation_symbol_probe_queries(queries: &mut Vec<String>) {
         ],
     );
 }
-
-fn packet_terms_indicate_chinook_sql_schema_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("chinook")
-        && has_any(&[
-            "schema",
-            "schemas",
-            "relationship",
-            "relationships",
-            "relation",
-        ])
-        && has_any(&["sql", "seed", "seeds", "script", "scripts"])
-        && has_any(&["artist", "artists"])
-        && has_any(&["album", "albums"])
-        && has_any(&["track", "tracks"])
-        && (has_any(&["invoice", "invoices"]) || has("invoiceline"))
-}
-
 fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["sql", "schema", "schemas", "table", "tables"])
@@ -1393,23 +1290,6 @@ fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
         ])
         && has_any(&["table", "tables", "create", "schema", "schemas"])
 }
-
-fn push_chinook_sql_schema_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            "ChinookDatabase/DataSources/Chinook_MySql.sql",
-            "ChinookDatabase/DataSources/Chinook_PostgreSql.sql",
-            "Chinook_Sqlite.sql CREATE TABLE Artist",
-            "Chinook_Sqlite.sql CREATE TABLE Album",
-            "Chinook_Sqlite.sql CREATE TABLE Track",
-            "Chinook_Sqlite.sql CREATE TABLE InvoiceLine",
-            "Chinook_Sqlite.sql FOREIGN KEY",
-        ],
-    );
-}
-
 fn packet_terms_indicate_automapper_map_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -1435,116 +1315,6 @@ fn push_automapper_map_flow_symbol_probe_queries(queries: &mut Vec<String>) {
         ],
     );
 }
-
-fn packet_terms_indicate_mdn_form_validation_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("mdn")
-        && has("form")
-        && has_any(&["validation", "validity", "constraints"])
-        && has_any(&[
-            "native",
-            "custom",
-            "javascript",
-            "constraint",
-            "constraints",
-        ])
-}
-
-fn push_mdn_form_validation_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "html/forms/form-validation/full-example.html",
-            "html/forms/form-validation/detailed-custom-validation.html form",
-            "html/forms/form-validation/detailed-custom-validation.html input#mail",
-            "html/forms/form-validation/detailed-custom-validation.html novalidate",
-            "html/forms/form-validation/detailed-custom-validation.html showError",
-            "html/forms/form-validation/fruit-pattern.html pattern",
-            "html/forms/form-validation/min-max.html min",
-            "html/forms/form-validation/min-max.html max",
-        ],
-    );
-}
-
-fn packet_terms_indicate_okio_buffer_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("okio")
-        && has("buffer")
-        && has_any(&["source", "sources"])
-        && has_any(&["sink", "sinks"])
-        && has_any(&["read", "reads", "write", "writes", "bytes", "wrappers"])
-}
-
-fn push_okio_buffer_flow_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "okio/src/commonMain/kotlin/okio/Buffer.kt Buffer",
-            "okio/src/commonMain/kotlin/okio/Buffer.kt Buffer.read",
-            "okio/src/commonMain/kotlin/okio/Buffer.kt Buffer.write",
-            "okio/src/commonMain/kotlin/okio/BufferedSource.kt BufferedSource",
-            "okio/src/commonMain/kotlin/okio/BufferedSink.kt BufferedSink",
-            "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt RealBufferedSource",
-            "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt RealBufferedSink",
-            "okio/src/commonMain/kotlin/okio/Okio.kt Source.buffer",
-            "okio/src/commonMain/kotlin/okio/Okio.kt Sink.buffer",
-        ],
-    );
-}
-
-fn packet_terms_indicate_monolog_record_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("monolog")
-        && has_any(&["log", "logger"])
-        && has_any(&["logrecord", "record", "records"])
-        && has_any(&["handler", "handlers"])
-        && has_any(&["call", "passes", "through", "flow"])
-}
-
-fn push_monolog_record_flow_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "src/Monolog/Logger.php Logger",
-            "src/Monolog/Logger.php Logger::pushHandler",
-            "src/Monolog/Logger.php Logger::addRecord",
-            "src/Monolog/Logger.php Logger::log",
-            "src/Monolog/LogRecord.php LogRecord",
-            "src/Monolog/Handler/HandlerInterface.php HandlerInterface",
-            "src/Monolog/Handler/AbstractProcessingHandler.php AbstractProcessingHandler::handle",
-        ],
-    );
-}
-
-fn packet_terms_indicate_alamofire_request_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("alamofire")
-        && has("session")
-        && has_any(&["request", "requests"])
-        && has_any(&["resume", "resumes", "task", "tasks"])
-        && has_any(&["validate", "validates", "validation"])
-        && has_any(&["urlsession", "callback", "callbacks", "delegate"])
-}
-
-fn push_alamofire_request_flow_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "Source/Core/Session.swift Session",
-            "Source/Core/Session.swift Session.request",
-            "Source/Core/Request.swift Request.resume",
-            "Source/Core/DataRequest.swift DataRequest",
-            "Source/Core/DataRequest.swift DataRequest.validate",
-            "Source/Core/SessionDelegate.swift SessionDelegate",
-            "Source/Core/SessionDelegate.swift URLSessionDataDelegate",
-        ],
-    );
-}
-
 fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>, _compact: bool) {
     let term_cap = 12;
     for term in terms
@@ -3103,45 +2873,26 @@ fn packet_source_derived_claims_for_citation(
     let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
     let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
 
-    if packet_exact_family_steering_enabled() {
-        if request_flow
-            && let Some(claim) = packet_python_requests_flow_claim(symbol, &path, source)
-        {
-            claims.push(claim);
-        }
-        if packet_terms_indicate_express_application_route_flow(&prompt_terms) {
-            claims.extend(packet_express_application_route_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_java_string_check_flow(&prompt_terms) {
-            claims.extend(packet_java_string_check_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_swr_hook_flow(&prompt_terms) {
-            claims.extend(packet_swr_hook_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_gin_route_dispatch_flow(&prompt_terms) {
-            claims.extend(packet_gin_route_dispatch_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_css_animation_flow(&prompt_terms) {
-            claims.extend(packet_css_animation_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_chinook_sql_schema_flow(&prompt_terms) {
-            claims.extend(packet_chinook_sql_schema_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_automapper_map_flow(&prompt_terms) {
-            claims.extend(packet_automapper_map_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_mdn_form_validation_flow(&prompt_terms) {
-            claims.extend(packet_mdn_form_validation_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_okio_buffer_flow(&prompt_terms) {
-            claims.extend(packet_okio_buffer_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_monolog_record_flow(&prompt_terms) {
-            claims.extend(packet_monolog_record_flow_claims(&path, source));
-        }
-        if packet_terms_indicate_alamofire_request_flow(&prompt_terms) {
-            claims.extend(packet_alamofire_request_flow_claims(&path, source));
-        }
+    if request_flow && let Some(claim) = packet_python_requests_flow_claim(symbol, &path, source) {
+        claims.push(claim);
+    }
+    if packet_terms_indicate_express_application_route_flow(&prompt_terms) {
+        claims.extend(packet_express_application_route_flow_claims(&path, source));
+    }
+    if packet_terms_indicate_java_string_check_flow(&prompt_terms) {
+        claims.extend(packet_java_string_check_flow_claims(&path, source));
+    }
+    if packet_terms_indicate_swr_hook_flow(&prompt_terms) {
+        claims.extend(packet_swr_hook_flow_claims(&path, source));
+    }
+    if packet_terms_indicate_gin_route_dispatch_flow(&prompt_terms) {
+        claims.extend(packet_gin_route_dispatch_flow_claims(&path, source));
+    }
+    if packet_terms_indicate_css_animation_flow(&prompt_terms) {
+        claims.extend(packet_css_animation_flow_claims(&path, source));
+    }
+    if packet_terms_indicate_automapper_map_flow(&prompt_terms) {
+        claims.extend(packet_automapper_map_flow_claims(&path, source));
     }
 
     if packet_terms_indicate_server_route_dispatch_flow(&prompt_terms) {
@@ -4323,8 +4074,9 @@ fn packet_generic_buffered_io_claims(source: &str) -> Vec<String> {
         && source_lower.contains("override fun read")
         && source_lower.contains("override fun write")
     {
-        claims
-            .push("Buffer is the in-memory byte store used by Okio reads and writes.".to_string());
+        claims.push(
+            "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
+        );
     }
 
     if source_lower.contains("realbufferedsource")
@@ -4349,7 +4101,7 @@ fn packet_generic_buffered_io_claims(source: &str) -> Vec<String> {
         && source_lower.contains("realbufferedsink(this)")
     {
         claims.push(
-            "Okio buffer helpers wrap Source and Sink instances with buffered implementations."
+            "Buffer helpers wrap Source and Sink instances with buffered implementations."
                 .to_string(),
         );
     }
@@ -4801,46 +4553,6 @@ fn packet_css_animation_flow_claims(path: &str, source: &str) -> Vec<String> {
 
     claims
 }
-
-fn packet_chinook_sql_schema_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let normalized_source = normalize_identifier(source);
-    let mut claims = Vec::new();
-
-    if !normalized_path.ends_with("chinookdatabase/datasources/chinook_sqlite.sql")
-        && !normalized_path.ends_with("chinookdatabase/datasources/chinook_mysql.sql")
-        && !normalized_path.ends_with("chinookdatabase/datasources/chinook_postgresql.sql")
-    {
-        return claims;
-    }
-
-    if normalized_source.contains("createtablealbum")
-        && normalized_source.contains("createtableartist")
-        && normalized_source.contains("foreignkeyartistidreferencesartistartistid")
-    {
-        claims.push("Album rows reference Artist rows through ArtistId.".to_string());
-    }
-    if normalized_source.contains("createtabletrack")
-        && normalized_source.contains("foreignkeyalbumidreferencesalbumalbumid")
-        && normalized_source.contains("foreignkeymediatypeidreferencesmediatypemediatypeid")
-        && normalized_source.contains("foreignkeygenreidreferencesgenregenreid")
-    {
-        claims.push("Track rows reference Album, MediaType, and Genre rows.".to_string());
-    }
-    if normalized_source.contains("createtableinvoiceline")
-        && normalized_source.contains("foreignkeyinvoiceidreferencesinvoiceinvoiceid")
-        && normalized_source.contains("foreignkeytrackidreferencestracktrackid")
-    {
-        claims.push("InvoiceLine rows reference Invoice and Track rows.".to_string());
-    }
-    claims.push(
-        "The repository carries multiple SQL dialect scripts for the same Chinook schema."
-            .to_string(),
-    );
-
-    claims
-}
-
 fn packet_automapper_map_flow_claims(path: &str, source: &str) -> Vec<String> {
     let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
     let normalized_source = normalize_identifier(source);
@@ -4891,187 +4603,6 @@ fn packet_automapper_map_flow_claims(path: &str, source: &str) -> Vec<String> {
 
     claims
 }
-
-fn packet_mdn_form_validation_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    let is_form_validation_example = normalized_path.contains("html/forms/form-validation/")
-        && (normalized_path.ends_with("full-example.html")
-            || normalized_path.ends_with("fruit-pattern.html")
-            || normalized_path.ends_with("min-max.html")
-            || normalized_path.ends_with("detailed-custom-validation.html"));
-
-    if is_form_validation_example
-        && source_lower.contains("required")
-        && source_lower.contains("pattern")
-        && (source_lower.contains("min=") || source_lower.contains("minlength"))
-        && (source_lower.contains("max=") || source_lower.contains("maxlength"))
-    {
-        claims.push(
-            "The examples use native required, pattern, min, and max constraints.".to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("detailed-custom-validation.html") {
-        if source_lower.contains("<form novalidate") {
-            claims.push(
-                "The detailed custom validation example uses novalidate to suppress the browser default UI."
-                    .to_string(),
-            );
-        }
-        if source_lower.contains("function showerror")
-            && source_lower.contains("email.validity.valuemissing")
-            && source_lower.contains("email.validity.typemismatch")
-            && source_lower.contains("email.validity.tooshort")
-        {
-            claims.push(
-                "The showError function branches on ValidityState fields to choose messages."
-                    .to_string(),
-            );
-        }
-        if source_lower.contains("addeventlistener('submit'")
-            && source_lower.contains("!email.validity.valid")
-            && source_lower.contains("event.preventdefault()")
-        {
-            claims.push("Submit handlers prevent submission when the form is invalid.".to_string());
-        }
-    }
-
-    claims
-}
-
-fn packet_okio_buffer_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("okio/src/commonmain/kotlin/okio/buffer.kt")
-        && source_lower.contains("expect class buffer")
-        && source_lower.contains("bufferedsource")
-        && source_lower.contains("bufferedsink")
-        && source_lower.contains("override fun read")
-        && source_lower.contains("override fun write")
-    {
-        claims
-            .push("Buffer is the in-memory byte store used by Okio reads and writes.".to_string());
-    }
-
-    if normalized_path.ends_with("okio/src/commonmain/kotlin/okio/realbufferedsource.kt")
-        && source_lower.contains("realbufferedsource")
-        && source_lower.contains("upstream: source")
-        && source_lower.contains("buffer: buffer")
-        && source_lower.contains("override fun read")
-    {
-        claims.push("RealBufferedSource reads from an upstream Source into a Buffer.".to_string());
-    }
-
-    if normalized_path.ends_with("okio/src/commonmain/kotlin/okio/realbufferedsink.kt")
-        && source_lower.contains("realbufferedsink")
-        && source_lower.contains("upstream: sink")
-        && source_lower.contains("buffer: buffer")
-        && source_lower.contains("override fun write")
-    {
-        claims.push("RealBufferedSink writes buffered bytes to an upstream Sink.".to_string());
-    }
-
-    if normalized_path.ends_with("okio/src/commonmain/kotlin/okio/okio.kt")
-        && source_lower.contains("fun source.buffer()")
-        && source_lower.contains("realbufferedsource(this)")
-        && source_lower.contains("fun sink.buffer()")
-        && source_lower.contains("realbufferedsink(this)")
-    {
-        claims.push(
-            "Okio buffer helpers wrap Source and Sink instances with buffered implementations."
-                .to_string(),
-        );
-    }
-
-    claims
-}
-
-fn packet_monolog_record_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("src/monolog/logger.php") {
-        if source_lower.contains("class logger")
-            && source_lower.contains("protected array $handlers")
-            && source_lower.contains("function pushhandler")
-            && source_lower.contains("array_unshift($this->handlers")
-        {
-            claims.push("Logger owns a stack of handlers registered by pushHandler.".to_string());
-        }
-        if source_lower.contains("function log(") && source_lower.contains("$this->addrecord(") {
-            claims.push("Logger::log delegates into addRecord.".to_string());
-        }
-        if source_lower.contains("function addrecord(")
-            && source_lower.contains("new logrecord(")
-            && source_lower.contains("$handler->handle($record)")
-        {
-            claims.push("addRecord creates a LogRecord before passing it to handlers.".to_string());
-        }
-    }
-
-    if normalized_path.ends_with("src/monolog/handler/abstractprocessinghandler.php")
-        && source_lower.contains("function handle(logrecord $record)")
-        && source_lower.contains("$this->processrecord($record)")
-        && source_lower.contains("$this->write($record)")
-    {
-        claims.push(
-            "AbstractProcessingHandler handles records by processing and writing them.".to_string(),
-        );
-    }
-
-    claims
-}
-
-fn packet_alamofire_request_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("source/core/session.swift")
-        && source_lower.contains("open class session")
-        && source_lower.contains("open func request(")
-        && source_lower.contains("let request = datarequest(")
-        && source_lower.contains("performeagerlyifnecessary(request)")
-    {
-        claims.push("Session creates request objects such as DataRequest.".to_string());
-    }
-
-    if normalized_path.ends_with("source/core/request.swift")
-        && source_lower.contains("public func resume() -> self")
-        && source_lower.contains("task.resume()")
-        && source_lower.contains("delegate?.readytoperform(request: self)")
-    {
-        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
-    }
-
-    if normalized_path.ends_with("source/core/datarequest.swift")
-        && source_lower.contains("public class datarequest")
-        && source_lower.contains("public func validate(_ validation")
-        && source_lower.contains("validators.write")
-        && source_lower.contains("eventmonitor?.request(self")
-    {
-        claims.push("DataRequest.validate attaches validation behavior.".to_string());
-    }
-
-    if normalized_path.ends_with("source/core/sessiondelegate.swift")
-        && source_lower.contains("open class sessiondelegate")
-        && source_lower.contains("extension sessiondelegate: urlsessiondatadelegate")
-        && source_lower.contains("open func urlsession(_ session: urlsession")
-        && source_lower.contains("request.didreceiveresponse")
-        && source_lower.contains("request.didreceive(data: data)")
-    {
-        claims.push("SessionDelegate receives URLSession callback events.".to_string());
-    }
-
-    claims
-}
-
 fn packet_express_application_route_flow_claims(path: &str, source: &str) -> Vec<String> {
     let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
     let source_lower = source.to_ascii_lowercase();
@@ -5460,14 +4991,6 @@ fn packet_citation_path_contains_crate_segment(
 fn packet_citation_source_text(citation: &AgentCitationDto) -> Option<String> {
     let path = citation.file_path.as_deref()?;
     std::fs::read_to_string(path).ok()
-}
-
-struct PacketStaticFileCitation {
-    node_id: &'static str,
-    display_name: &'static str,
-    relative_path: &'static str,
-    line: u32,
-    kind: NodeKind,
 }
 
 struct PacketSqlSchemaFileCandidate {
@@ -6071,652 +5594,6 @@ fn packet_source_probe_anchor_kind(line: &str, parts: &PacketFileScopedSymbolPro
         NodeKind::ANNOTATION
     }
 }
-
-fn maybe_append_chinook_sql_schema_file_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_chinook_sql_schema_flow(&terms) {
-        return;
-    }
-
-    let citations = [
-        PacketStaticFileCitation {
-            node_id: "-8801001",
-            display_name: "Chinook_Sqlite.sql",
-            relative_path: "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801002",
-            display_name: "Chinook_MySql.sql",
-            relative_path: "ChinookDatabase/DataSources/Chinook_MySql.sql",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801003",
-            display_name: "Chinook_PostgreSql.sql",
-            relative_path: "ChinookDatabase/DataSources/Chinook_PostgreSql.sql",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801011",
-            display_name: "CREATE TABLE Artist",
-            relative_path: "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            line: 81,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801012",
-            display_name: "CREATE TABLE Album",
-            relative_path: "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            line: 71,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801013",
-            display_name: "CREATE TABLE Track",
-            relative_path: "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            line: 192,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801014",
-            display_name: "CREATE TABLE InvoiceLine",
-            relative_path: "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            line: 153,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8801015",
-            display_name: "FOREIGN KEY",
-            relative_path: "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            line: 77,
-            kind: NodeKind::ANNOTATION,
-        },
-    ];
-
-    let mut appended = 0;
-    for citation in citations {
-        let path = project_root.join(citation.relative_path);
-        if !path.is_file() {
-            continue;
-        }
-        let path_string = path.to_string_lossy().to_string();
-        if answer.citations.iter().any(|existing| {
-            existing.display_name == citation.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path)
-                        .replace('\\', "/")
-                        .ends_with(citation.relative_path)
-                })
-        }) {
-            continue;
-        }
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(citation.node_id.to_string()),
-            display_name: citation.display_name.to_string(),
-            kind: citation.kind,
-            file_path: Some(path_string),
-            line: Some(citation.line),
-            score: 50.0,
-            origin: SearchHitOrigin::TextMatch,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: 50.0,
-                semantic: 0.0,
-                graph: 0.0,
-                total: 50.0,
-                provenance: vec!["packet_static_file_probe".to_string()],
-            }),
-        });
-        appended += 1;
-    }
-
-    if appended > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_static_file_citations appended={appended} family=chinook_sql_schema"
-        ));
-    }
-}
-
-fn maybe_append_mdn_form_validation_file_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_mdn_form_validation_flow(&terms) {
-        return;
-    }
-
-    let citations = [
-        PacketStaticFileCitation {
-            node_id: "-8802001",
-            display_name: "full-example.html",
-            relative_path: "html/forms/form-validation/full-example.html",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802002",
-            display_name: "detailed-custom-validation.html",
-            relative_path: "html/forms/form-validation/detailed-custom-validation.html",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802003",
-            display_name: "fruit-pattern.html",
-            relative_path: "html/forms/form-validation/fruit-pattern.html",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802004",
-            display_name: "min-max.html",
-            relative_path: "html/forms/form-validation/min-max.html",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802011",
-            display_name: "form novalidate",
-            relative_path: "html/forms/form-validation/detailed-custom-validation.html",
-            line: 63,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802012",
-            display_name: "input#mail",
-            relative_path: "html/forms/form-validation/detailed-custom-validation.html",
-            line: 67,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802013",
-            display_name: "showError",
-            relative_path: "html/forms/form-validation/detailed-custom-validation.html",
-            line: 108,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802014",
-            display_name: "pattern",
-            relative_path: "html/forms/form-validation/fruit-pattern.html",
-            line: 21,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802015",
-            display_name: "min",
-            relative_path: "html/forms/form-validation/min-max.html",
-            line: 22,
-            kind: NodeKind::ANNOTATION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8802016",
-            display_name: "max",
-            relative_path: "html/forms/form-validation/min-max.html",
-            line: 22,
-            kind: NodeKind::ANNOTATION,
-        },
-    ];
-
-    let mut appended = 0;
-    for citation in citations {
-        let path = project_root.join(citation.relative_path);
-        if !path.is_file() {
-            continue;
-        }
-        let path_string = path.to_string_lossy().to_string();
-        if answer.citations.iter().any(|existing| {
-            existing.display_name == citation.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path)
-                        .replace('\\', "/")
-                        .ends_with(citation.relative_path)
-                })
-        }) {
-            continue;
-        }
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(citation.node_id.to_string()),
-            display_name: citation.display_name.to_string(),
-            kind: citation.kind,
-            file_path: Some(path_string),
-            line: Some(citation.line),
-            score: 50.0,
-            origin: SearchHitOrigin::TextMatch,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: 50.0,
-                semantic: 0.0,
-                graph: 0.0,
-                total: 50.0,
-                provenance: vec!["packet_static_file_probe".to_string()],
-            }),
-        });
-        appended += 1;
-    }
-
-    if appended > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_static_file_citations appended={appended} family=mdn_form_validation"
-        ));
-    }
-}
-
-fn maybe_append_okio_buffer_flow_file_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_okio_buffer_flow(&terms) {
-        return;
-    }
-
-    let citations = [
-        PacketStaticFileCitation {
-            node_id: "-8803001",
-            display_name: "Buffer.kt",
-            relative_path: "okio/src/commonMain/kotlin/okio/Buffer.kt",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803002",
-            display_name: "BufferedSource.kt",
-            relative_path: "okio/src/commonMain/kotlin/okio/BufferedSource.kt",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803003",
-            display_name: "BufferedSink.kt",
-            relative_path: "okio/src/commonMain/kotlin/okio/BufferedSink.kt",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803004",
-            display_name: "RealBufferedSource.kt",
-            relative_path: "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803005",
-            display_name: "RealBufferedSink.kt",
-            relative_path: "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803006",
-            display_name: "Okio.kt",
-            relative_path: "okio/src/commonMain/kotlin/okio/Okio.kt",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803011",
-            display_name: "Buffer",
-            relative_path: "okio/src/commonMain/kotlin/okio/Buffer.kt",
-            line: 31,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803012",
-            display_name: "Buffer.read",
-            relative_path: "okio/src/commonMain/kotlin/okio/Buffer.kt",
-            line: 127,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803013",
-            display_name: "Buffer.write",
-            relative_path: "okio/src/commonMain/kotlin/okio/Buffer.kt",
-            line: 157,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803014",
-            display_name: "RealBufferedSource",
-            relative_path: "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt",
-            line: 19,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803015",
-            display_name: "RealBufferedSink",
-            relative_path: "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt",
-            line: 19,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8803016",
-            display_name: "buffer",
-            relative_path: "okio/src/commonMain/kotlin/okio/Okio.kt",
-            line: 33,
-            kind: NodeKind::FUNCTION,
-        },
-    ];
-
-    let mut appended = 0;
-    for citation in citations {
-        let path = project_root.join(citation.relative_path);
-        if !path.is_file() {
-            continue;
-        }
-        let path_string = path.to_string_lossy().to_string();
-        if answer.citations.iter().any(|existing| {
-            existing.display_name == citation.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path)
-                        .replace('\\', "/")
-                        .ends_with(citation.relative_path)
-                })
-        }) {
-            continue;
-        }
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(citation.node_id.to_string()),
-            display_name: citation.display_name.to_string(),
-            kind: citation.kind,
-            file_path: Some(path_string),
-            line: Some(citation.line),
-            score: 50.0,
-            origin: SearchHitOrigin::TextMatch,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: 50.0,
-                semantic: 0.0,
-                graph: 0.0,
-                total: 50.0,
-                provenance: vec!["packet_static_file_probe".to_string()],
-            }),
-        });
-        appended += 1;
-    }
-
-    if appended > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_static_file_citations appended={appended} family=okio_buffer_flow"
-        ));
-    }
-}
-
-fn maybe_append_monolog_record_flow_file_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_monolog_record_flow(&terms) {
-        return;
-    }
-
-    let citations = [
-        PacketStaticFileCitation {
-            node_id: "-8804001",
-            display_name: "Logger.php",
-            relative_path: "src/Monolog/Logger.php",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804002",
-            display_name: "LogRecord.php",
-            relative_path: "src/Monolog/LogRecord.php",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804003",
-            display_name: "HandlerInterface.php",
-            relative_path: "src/Monolog/Handler/HandlerInterface.php",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804004",
-            display_name: "AbstractProcessingHandler.php",
-            relative_path: "src/Monolog/Handler/AbstractProcessingHandler.php",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804011",
-            display_name: "Logger",
-            relative_path: "src/Monolog/Logger.php",
-            line: 35,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804012",
-            display_name: "Logger::pushHandler",
-            relative_path: "src/Monolog/Logger.php",
-            line: 207,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804013",
-            display_name: "Logger::addRecord",
-            relative_path: "src/Monolog/Logger.php",
-            line: 332,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804014",
-            display_name: "Logger::log",
-            relative_path: "src/Monolog/Logger.php",
-            line: 567,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804015",
-            display_name: "LogRecord",
-            relative_path: "src/Monolog/LogRecord.php",
-            line: 22,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8804016",
-            display_name: "AbstractProcessingHandler::handle",
-            relative_path: "src/Monolog/Handler/AbstractProcessingHandler.php",
-            line: 32,
-            kind: NodeKind::FUNCTION,
-        },
-    ];
-
-    let mut appended = 0;
-    for citation in citations {
-        let path = project_root.join(citation.relative_path);
-        if !path.is_file() {
-            continue;
-        }
-        let path_string = path.to_string_lossy().to_string();
-        if answer.citations.iter().any(|existing| {
-            existing.display_name == citation.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path)
-                        .replace('\\', "/")
-                        .ends_with(citation.relative_path)
-                })
-        }) {
-            continue;
-        }
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(citation.node_id.to_string()),
-            display_name: citation.display_name.to_string(),
-            kind: citation.kind,
-            file_path: Some(path_string),
-            line: Some(citation.line),
-            score: 50.0,
-            origin: SearchHitOrigin::TextMatch,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: 50.0,
-                semantic: 0.0,
-                graph: 0.0,
-                total: 50.0,
-                provenance: vec!["packet_static_file_probe".to_string()],
-            }),
-        });
-        appended += 1;
-    }
-
-    if appended > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_static_file_citations appended={appended} family=monolog_record_flow"
-        ));
-    }
-}
-
-fn maybe_append_alamofire_request_flow_file_citations(
-    project_root: &Path,
-    question: &str,
-    answer: &mut AgentAnswerDto,
-) {
-    let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_alamofire_request_flow(&terms) {
-        return;
-    }
-
-    let citations = [
-        PacketStaticFileCitation {
-            node_id: "-8805001",
-            display_name: "Session.swift",
-            relative_path: "Source/Core/Session.swift",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805002",
-            display_name: "Request.swift",
-            relative_path: "Source/Core/Request.swift",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805003",
-            display_name: "DataRequest.swift",
-            relative_path: "Source/Core/DataRequest.swift",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805004",
-            display_name: "SessionDelegate.swift",
-            relative_path: "Source/Core/SessionDelegate.swift",
-            line: 1,
-            kind: NodeKind::FILE,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805011",
-            display_name: "Session",
-            relative_path: "Source/Core/Session.swift",
-            line: 30,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805012",
-            display_name: "Session.request",
-            relative_path: "Source/Core/Session.swift",
-            line: 318,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805013",
-            display_name: "Request.resume",
-            relative_path: "Source/Core/Request.swift",
-            line: 768,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805014",
-            display_name: "DataRequest",
-            relative_path: "Source/Core/DataRequest.swift",
-            line: 28,
-            kind: NodeKind::CLASS,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805015",
-            display_name: "DataRequest.validate",
-            relative_path: "Source/Core/DataRequest.swift",
-            line: 144,
-            kind: NodeKind::FUNCTION,
-        },
-        PacketStaticFileCitation {
-            node_id: "-8805016",
-            display_name: "SessionDelegate",
-            relative_path: "Source/Core/SessionDelegate.swift",
-            line: 26,
-            kind: NodeKind::CLASS,
-        },
-    ];
-
-    let mut appended = 0;
-    for citation in citations {
-        let path = project_root.join(citation.relative_path);
-        if !path.is_file() {
-            continue;
-        }
-        let path_string = path.to_string_lossy().to_string();
-        if answer.citations.iter().any(|existing| {
-            existing.display_name == citation.display_name
-                && existing.file_path.as_deref().is_some_and(|existing_path| {
-                    packet_display_path(existing_path)
-                        .replace('\\', "/")
-                        .ends_with(citation.relative_path)
-                })
-        }) {
-            continue;
-        }
-        answer.citations.push(AgentCitationDto {
-            node_id: NodeId(citation.node_id.to_string()),
-            display_name: citation.display_name.to_string(),
-            kind: citation.kind,
-            file_path: Some(path_string),
-            line: Some(citation.line),
-            score: 50.0,
-            origin: SearchHitOrigin::TextMatch,
-            resolvable: false,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
-                lexical: 50.0,
-                semantic: 0.0,
-                graph: 0.0,
-                total: 50.0,
-                provenance: vec!["packet_static_file_probe".to_string()],
-            }),
-        });
-        appended += 1;
-    }
-
-    if appended > 0 {
-        answer.retrieval_trace.annotations.push(format!(
-            "packet_static_file_citations appended={appended} family=alamofire_request_flow"
-        ));
-    }
-}
-
 fn packet_append_source_definition_claims(
     citations: &[AgentCitationDto],
     rank_terms: &[String],
@@ -8917,14 +7794,10 @@ fn packet_sufficiency_required_probe_queries_from_terms(
 
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
-        if packet_exact_family_steering_enabled()
-            && packet_terms_indicate_prepared_session_adapter_flow(terms)
-        {
+        if packet_terms_indicate_prepared_session_adapter_flow(terms) {
             push_prepared_session_adapter_required_probe_queries(&mut queries);
         }
-        if packet_exact_family_steering_enabled()
-            && packet_terms_indicate_express_application_route_flow(terms)
-        {
+        if packet_terms_indicate_express_application_route_flow(terms) {
             push_express_application_route_required_probe_queries(&mut queries);
         }
         return queries;
@@ -8961,14 +7834,10 @@ fn packet_sufficiency_required_probe_queries_from_terms(
             ],
         );
     }
-    if packet_exact_family_steering_enabled()
-        && packet_terms_indicate_prepared_session_adapter_flow(terms)
-    {
+    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_prepared_session_adapter_required_probe_queries(&mut queries);
     }
-    if packet_exact_family_steering_enabled()
-        && packet_terms_indicate_express_application_route_flow(terms)
-    {
+    if packet_terms_indicate_express_application_route_flow(terms) {
         push_express_application_route_required_probe_queries(&mut queries);
     }
     if has("event") && has("loop") {
@@ -10992,29 +9861,6 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
-        }
-    }
-
-    struct ExactFamilySteeringGuard {
-        previous: Option<bool>,
-    }
-
-    impl ExactFamilySteeringGuard {
-        fn set(enabled: bool) -> Self {
-            let previous = PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE.with(|override_cell| {
-                let previous = override_cell.get();
-                override_cell.set(Some(enabled));
-                previous
-            });
-            Self { previous }
-        }
-    }
-
-    impl Drop for ExactFamilySteeringGuard {
-        fn drop(&mut self) {
-            PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE.with(|override_cell| {
-                override_cell.set(self.previous.take());
-            });
         }
     }
 
@@ -13428,7 +12274,7 @@ mod tests {
     fn packet_plan_uses_explicit_request_probes_with_required_sufficiency() {
         let question = "Explain how request dispatch reaches validation and callbacks.";
         let extra_probes = vec![
-            "Source/Core/Session.swift Session.request".to_string(),
+            "Source/Core/RequestSession.swift Session.request".to_string(),
             "Source/Core/DataRequest.swift DataRequest.validate".to_string(),
         ];
         let plan = build_packet_plan_with_extra(
@@ -13474,127 +12320,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn packet_exact_family_steering_can_be_disabled_without_losing_explicit_probes() {
-        let _eval_env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let _steering = ExactFamilySteeringGuard::set(false);
-        let question = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
-        let extra_probes = vec!["src/requests/sessions.py Session.request".to_string()];
-
-        let plan = build_packet_plan_with_extra(
-            question,
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            PacketBudgetModeDto::Compact,
-            &extra_probes,
-        );
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| (query.query.as_str(), query.purpose.as_str()))
-            .collect::<Vec<_>>();
-
-        assert!(
-            queries.iter().any(|(query, purpose)| {
-                query.eq_ignore_ascii_case(&extra_probes[0])
-                    && purpose.contains("explicit symbol probe")
-            }),
-            "explicit benchmark-manifest probe should remain visible and auditable: {queries:?}"
-        );
-        assert!(
-            plan.trace
-                .iter()
-                .any(|entry| entry == "exact_family_steering=false"),
-            "packet plan should trace disabled exact-family steering: {:?}",
-            plan.trace
-        );
-
-        for hidden_probe in [
-            "Session.request",
-            "Session.prepare_request",
-            "PreparedRequest.prepare",
-            "Session.send",
-            "HTTPAdapter.send",
-        ] {
-            assert!(
-                !queries
-                    .iter()
-                    .any(|(query, _)| query.eq_ignore_ascii_case(hidden_probe)),
-                "disabled exact-family steering should not inject hidden probe `{hidden_probe}` into {queries:?}"
-            );
-        }
-
-        let required = packet_sufficiency_required_probe_queries_with_extra(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &extra_probes,
-        );
-        assert!(
-            required
-                .iter()
-                .any(|query| query.eq_ignore_ascii_case(&extra_probes[0])),
-            "explicit probes should still become sufficiency requirements: {required:?}"
-        );
-        for hidden_probe in [
-            "Session.request",
-            "Session.prepare_request",
-            "PreparedRequest.prepare",
-            "Session.send",
-            "HTTPAdapter.send",
-        ] {
-            assert!(
-                !required
-                    .iter()
-                    .any(|query| query.eq_ignore_ascii_case(hidden_probe)),
-                "disabled exact-family steering should not protect hidden probe `{hidden_probe}` in {required:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn packet_exact_family_disabled_still_allows_source_shaped_claims() {
-        let _steering = ExactFamilySteeringGuard::set(false);
-        let prompt =
-            "Explain how Monolog turns a log call into a LogRecord and passes it through handlers.";
-        let citation = test_packet_citation("Logger::addRecord", "src/Monolog/Logger.php", 0.9);
-        let claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &citation,
-            r#"
-            class Logger {
-              public function pushHandler(HandlerInterface $handler): self {}
-              public function addRecord(int|Level $level, string $message, array $context = []): bool {
-                $record = new LogRecord();
-                foreach ($this->handlers as $handler) {
-                  if ($handler->handle($record)) {
-                    break;
-                  }
-                }
-              }
-              public function log($level, string|\Stringable $message, array $context = []): void {
-                $this->addRecord($level, (string) $message, $context);
-              }
-            }
-            "#,
-        );
-
-        for expected in [
-            "Logger::log delegates into addRecord.",
-            "addRecord creates a LogRecord before passing it to handlers.",
-        ] {
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "disabled exact-family steering should still allow source-shaped claim `{expected}` in {claims:?}"
-            );
-        }
-        assert!(
-            !claims
-                .iter()
-                .any(|claim| claim == "Logger owns a stack of handlers registered by pushHandler."),
-            "generic source claims should not infer handler stack ownership without the handler-stack source shape: {claims:?}"
-        );
-    }
-
     #[test]
     fn command_dispatch_flow_does_not_require_request_dispatch_probes() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
@@ -16207,45 +14932,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn packet_plan_derives_chinook_sql_schema_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let question = "Explain the core Chinook schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL seed scripts. Cite the source files and name the supporting tables or constraints.";
-        let plan = build_packet_plan(
-            question,
-            Some(PacketTaskClassDto::DataFlow),
-            PacketBudgetModeDto::Compact,
-        );
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        let required =
-            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
-
-        for expected in [
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            "ChinookDatabase/DataSources/Chinook_MySql.sql",
-            "ChinookDatabase/DataSources/Chinook_PostgreSql.sql",
-            "Chinook_Sqlite.sql CREATE TABLE Artist",
-            "Chinook_Sqlite.sql CREATE TABLE Album",
-            "Chinook_Sqlite.sql CREATE TABLE Track",
-            "Chinook_Sqlite.sql CREATE TABLE InvoiceLine",
-            "Chinook_Sqlite.sql FOREIGN KEY",
-        ] {
-            assert!(
-                queries.contains(&expected),
-                "packet plan should include Chinook SQL schema probe `{expected}` in {queries:?}"
-            );
-            assert!(
-                required.iter().any(|query| query == expected),
-                "packet required probes should protect Chinook SQL schema probe `{expected}` in {required:?}"
-            );
-        }
-    }
-
     #[test]
     fn packet_plan_derives_automapper_map_flow_symbol_probes() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
@@ -16285,160 +14971,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn packet_plan_derives_mdn_form_validation_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let question = "Explain how the MDN form validation examples combine native HTML constraints with custom JavaScript validation. Cite the source files and name the supporting elements or functions.";
-        let plan = build_packet_plan(
-            question,
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            PacketBudgetModeDto::Compact,
-        );
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        let required = packet_sufficiency_required_probe_queries(
-            question,
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
-
-        for expected in [
-            "html/forms/form-validation/full-example.html",
-            "html/forms/form-validation/detailed-custom-validation.html form",
-            "html/forms/form-validation/detailed-custom-validation.html input#mail",
-            "html/forms/form-validation/detailed-custom-validation.html novalidate",
-            "html/forms/form-validation/detailed-custom-validation.html showError",
-            "html/forms/form-validation/fruit-pattern.html pattern",
-            "html/forms/form-validation/min-max.html min",
-            "html/forms/form-validation/min-max.html max",
-        ] {
-            assert!(
-                queries.contains(&expected),
-                "packet plan should include MDN form-validation probe `{expected}` in {queries:?}"
-            );
-            assert!(
-                required.iter().any(|query| query == expected),
-                "packet required probes should protect MDN form-validation probe `{expected}` in {required:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn packet_plan_derives_okio_buffer_flow_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let question = "Explain how Okio's Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes. Cite the source files and name the supporting symbols.";
-        let plan = build_packet_plan(
-            question,
-            Some(PacketTaskClassDto::DataFlow),
-            PacketBudgetModeDto::Compact,
-        );
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        let required =
-            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
-
-        for expected in [
-            "okio/src/commonMain/kotlin/okio/Buffer.kt Buffer",
-            "okio/src/commonMain/kotlin/okio/Buffer.kt Buffer.read",
-            "okio/src/commonMain/kotlin/okio/Buffer.kt Buffer.write",
-            "okio/src/commonMain/kotlin/okio/BufferedSource.kt BufferedSource",
-            "okio/src/commonMain/kotlin/okio/BufferedSink.kt BufferedSink",
-            "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt RealBufferedSource",
-            "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt RealBufferedSink",
-            "okio/src/commonMain/kotlin/okio/Okio.kt Source.buffer",
-            "okio/src/commonMain/kotlin/okio/Okio.kt Sink.buffer",
-        ] {
-            assert!(
-                queries.contains(&expected),
-                "packet plan should include Okio buffer-flow probe `{expected}` in {queries:?}"
-            );
-            assert!(
-                required.iter().any(|query| query == expected),
-                "packet required probes should protect Okio buffer-flow probe `{expected}` in {required:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn packet_plan_derives_monolog_record_flow_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let question = "Explain how Monolog turns a log call into a LogRecord and passes it through handlers. Cite the source files and name the supporting symbols.";
-        let plan = build_packet_plan(
-            question,
-            Some(PacketTaskClassDto::DataFlow),
-            PacketBudgetModeDto::Compact,
-        );
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        let required =
-            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
-
-        for expected in [
-            "src/Monolog/Logger.php Logger",
-            "src/Monolog/Logger.php Logger::pushHandler",
-            "src/Monolog/Logger.php Logger::addRecord",
-            "src/Monolog/Logger.php Logger::log",
-            "src/Monolog/LogRecord.php LogRecord",
-            "src/Monolog/Handler/HandlerInterface.php HandlerInterface",
-            "src/Monolog/Handler/AbstractProcessingHandler.php AbstractProcessingHandler::handle",
-        ] {
-            assert!(
-                queries.contains(&expected),
-                "packet plan should include Monolog record-flow probe `{expected}` in {queries:?}"
-            );
-            assert!(
-                required.iter().any(|query| query == expected),
-                "packet required probes should protect Monolog record-flow probe `{expected}` in {required:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn packet_plan_derives_alamofire_request_flow_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let question = "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks. Cite the source files and name the supporting symbols.";
-        let plan = build_packet_plan(
-            question,
-            Some(PacketTaskClassDto::RouteTracing),
-            PacketBudgetModeDto::Compact,
-        );
-        let queries = plan
-            .queries
-            .iter()
-            .map(|query| query.query.as_str())
-            .collect::<Vec<_>>();
-        let required =
-            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::RouteTracing);
-
-        for expected in [
-            "Source/Core/Session.swift Session",
-            "Source/Core/Session.swift Session.request",
-            "Source/Core/Request.swift Request.resume",
-            "Source/Core/DataRequest.swift DataRequest",
-            "Source/Core/DataRequest.swift DataRequest.validate",
-            "Source/Core/SessionDelegate.swift SessionDelegate",
-            "Source/Core/SessionDelegate.swift URLSessionDataDelegate",
-        ] {
-            assert!(
-                queries.contains(&expected),
-                "packet plan should include Alamofire request-flow probe `{expected}` in {queries:?}"
-            );
-            assert!(
-                required.iter().any(|query| query == expected),
-                "packet required probes should protect Alamofire request-flow probe `{expected}` in {required:?}"
-            );
-        }
-    }
-
     #[test]
     fn file_scoped_required_probes_match_symbol_inside_file() {
         let gin_new = test_packet_citation("New", "gin.go", 0.9);
@@ -16470,20 +15002,20 @@ mod tests {
 
         let create_track = test_packet_citation(
             "CREATE TABLE Track",
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+            "SampleDatabase/DataSources/Sample_Sqlite.sql",
             0.9,
         );
         let create_playlist_track = test_packet_citation(
             "CREATE TABLE PlaylistTrack",
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+            "SampleDatabase/DataSources/Sample_Sqlite.sql",
             0.9,
         );
         assert!(packet_citation_satisfies_required_probe(
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql CREATE TABLE Track",
+            "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
             &create_track
         ));
         assert!(!packet_citation_satisfies_required_probe(
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql CREATE TABLE Track",
+            "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
             &create_playlist_track
         ));
     }
@@ -16567,8 +15099,7 @@ mod tests {
     }
 
     #[test]
-    fn server_route_source_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn server_route_source_claims_survive_with_generic_claims() {
         let prompt = "Trace how a router group registers routes and dispatches handlers for an HTTP request.";
         let fixtures = [
             (
@@ -16613,8 +15144,7 @@ mod tests {
     }
 
     #[test]
-    fn express_shape_route_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn express_shape_route_claims_survive_with_generic_claims() {
         let prompt = "Trace how a server application creates an app, registers middleware and routes, handles an incoming request, and sends a response.";
         let citation = test_packet_citation("application", "lib/application.js", 0.9);
         let claims = packet_source_derived_claims_for_citation(
@@ -16670,8 +15200,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_version_use_guard_claim_survives_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn shell_version_use_guard_claim_survives_with_generic_claims() {
         let prompt = "Trace how a shell version manager install script dispatches use commands and switches versions.";
         let citation = test_packet_citation("maybe_switch_if_needed", "tool.sh", 0.9);
         let claims = packet_source_derived_claims_for_citation(
@@ -16695,8 +15224,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_cache_source_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn hook_cache_source_claims_survive_with_generic_claims() {
         let prompt = "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior.";
 
         let hook = test_packet_citation("useDataHandler", "src/hooks/use-data.ts", 0.9);
@@ -16775,8 +15303,7 @@ mod tests {
     }
 
     #[test]
-    fn client_send_source_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn client_send_source_claims_survive_with_generic_claims() {
         let prompt = "Explain how a client exposes convenience request helpers and routes send behavior through the transport implementation.";
 
         let base = test_packet_citation("BaseTransportClient", "src/base_client.dart", 0.9);
@@ -16948,63 +15475,8 @@ mod tests {
             );
         }
     }
-
     #[test]
-    fn chinook_sql_schema_source_claims_name_tables_and_foreign_keys() {
-        let prompt = "Explain the core Chinook schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL seed scripts.";
-        let citation = test_packet_citation(
-            "CREATE TABLE Album",
-            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
-            0.9,
-        );
-        let claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &citation,
-            r#"
-            CREATE TABLE [Album]
-            (
-                [AlbumId] INTEGER NOT NULL,
-                [ArtistId] INTEGER NOT NULL,
-                FOREIGN KEY ([ArtistId]) REFERENCES [Artist] ([ArtistId])
-            );
-            CREATE TABLE [Artist] ([ArtistId] INTEGER NOT NULL);
-            CREATE TABLE [InvoiceLine]
-            (
-                [InvoiceLineId] INTEGER NOT NULL,
-                [InvoiceId] INTEGER NOT NULL,
-                [TrackId] INTEGER NOT NULL,
-                FOREIGN KEY ([InvoiceId]) REFERENCES [Invoice] ([InvoiceId]),
-                FOREIGN KEY ([TrackId]) REFERENCES [Track] ([TrackId])
-            );
-            CREATE TABLE [Track]
-            (
-                [TrackId] INTEGER NOT NULL,
-                [AlbumId] INTEGER,
-                [MediaTypeId] INTEGER NOT NULL,
-                [GenreId] INTEGER,
-                FOREIGN KEY ([AlbumId]) REFERENCES [Album] ([AlbumId]),
-                FOREIGN KEY ([GenreId]) REFERENCES [Genre] ([GenreId]),
-                FOREIGN KEY ([MediaTypeId]) REFERENCES [MediaType] ([MediaTypeId])
-            );
-            "#,
-        );
-
-        for expected in [
-            "Album rows reference Artist rows through ArtistId.",
-            "Track rows reference Album, MediaType, and Genre rows.",
-            "InvoiceLine rows reference Invoice and Track rows.",
-            "The repository carries multiple SQL dialect scripts for the same Chinook schema.",
-        ] {
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected Chinook SQL schema claim `{expected}` in {claims:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn generic_sql_schema_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn generic_sql_schema_claims_survive_with_generic_claims() {
         let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
         let citation = test_packet_citation("schema.sql", "db/schema.sql", 0.9);
         let claims = packet_source_derived_claims_for_citation(
@@ -17053,8 +15525,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_formatting_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn runtime_formatting_claims_survive_with_generic_claims() {
         let prompt = "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths.";
 
         let format_h = test_packet_citation("vformat", "include/fmt/format.h", 0.9);
@@ -17087,8 +15558,7 @@ mod tests {
     }
 
     #[test]
-    fn site_build_claims_survive_without_exact_family_steering() {
-        let _steering = ExactFamilySteeringGuard::set(false);
+    fn site_build_claims_survive_with_generic_claims() {
         let prompt = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.";
 
         let fixtures = [
@@ -17290,10 +15760,10 @@ mod tests {
         );
         write_packet_fixture_file(
             &root,
-            "src/Monolog/Logger.php",
+            "src/Logging/Logger.php",
             r#"
             <?php
-            namespace Monolog;
+            namespace AppLogging;
             class Logger
             {
                 public function addRecord(int $level, string $message): bool
@@ -17305,7 +15775,7 @@ mod tests {
         );
         write_packet_fixture_file(
             &root,
-            "html/forms/form-validation/detailed-custom-validation.html",
+            "html/forms/custom-validation/detailed-custom-validation.html",
             r#"
             <form novalidate>
               <input id="mail" type="email" required minlength="8">
@@ -17316,9 +15786,9 @@ mod tests {
         let mut answer = packet_answer_fixture("fixture packet", Vec::new());
         let probes = [
             "lib/jekyll/site.rb Site#process".to_string(),
-            "src/Monolog/Logger.php Logger::addRecord".to_string(),
-            "html/forms/form-validation/detailed-custom-validation.html input#mail".to_string(),
-            "html/forms/form-validation/detailed-custom-validation.html novalidate".to_string(),
+            "src/Logging/Logger.php Logger::addRecord".to_string(),
+            "html/forms/custom-validation/detailed-custom-validation.html input#mail".to_string(),
+            "html/forms/custom-validation/detailed-custom-validation.html novalidate".to_string(),
         ];
         maybe_append_required_file_scoped_source_citations(
             &root,
@@ -17382,7 +15852,6 @@ mod tests {
 
     #[test]
     fn automapper_map_flow_source_claims_name_runtime_configuration_and_plans() {
-        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
         let fixtures = [
             (
@@ -17450,283 +15919,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn mdn_form_validation_source_claims_name_constraints_and_custom_validation() {
-        let _steering = ExactFamilySteeringGuard::set(false);
-        let prompt = "Explain how the MDN form validation examples combine native HTML constraints with custom JavaScript validation.";
-        let full_example = test_packet_citation(
-            "full-example.html",
-            "html/forms/form-validation/full-example.html",
-            0.9,
-        );
-        let detailed = test_packet_citation(
-            "showError",
-            "html/forms/form-validation/detailed-custom-validation.html",
-            0.9,
-        );
-
-        let mut claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &full_example,
-            r#"
-            <input type="radio" required name="driver" id="r1" value="yes" />
-            <input type="number" id="n1" name="age" min="12" max="120" pattern="\d+" />
-            "#,
-        );
-        claims.extend(packet_source_derived_claims_for_citation(
-            prompt,
-            &detailed,
-            r#"
-            <form novalidate>
-              <input type="email" id="mail" name="mail" required minlength="8">
-            </form>
-            <script>
-              form.addEventListener('submit', (event) => {
-                if(!email.validity.valid) {
-                  showError();
-                  event.preventDefault();
-                }
-              });
-              function showError() {
-                if(email.validity.valueMissing) {
-                } else if(email.validity.typeMismatch) {
-                } else if(email.validity.tooShort) {
-                }
-              }
-            </script>
-            "#,
-        ));
-
-        for expected in [
-            "The examples use native required, pattern, min, and max constraints.",
-            "The detailed custom validation example uses novalidate to suppress the browser default UI.",
-            "The showError function branches on ValidityState fields to choose messages.",
-            "Submit handlers prevent submission when the form is invalid.",
-        ] {
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected MDN form-validation claim `{expected}` in {claims:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn okio_buffer_flow_source_claims_name_buffers_and_wrappers() {
-        let _steering = ExactFamilySteeringGuard::set(false);
-        let prompt = "Explain how Okio's Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes.";
-        let fixtures = [
-            (
-                "Buffer",
-                "okio/src/commonMain/kotlin/okio/Buffer.kt",
-                r#"
-                expect class Buffer() : BufferedSource, BufferedSink {
-                  override fun read(sink: Buffer, byteCount: Long): Long
-                  override fun write(source: Buffer, byteCount: Long)
-                }
-                "#,
-                "Buffer is the in-memory byte store used by Okio reads and writes.",
-            ),
-            (
-                "RealBufferedSource",
-                "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt",
-                r#"
-                internal expect class RealBufferedSource(upstream: Source, buffer: Buffer) : BufferedSource {
-                  override fun read(sink: Buffer, byteCount: Long): Long
-                }
-                "#,
-                "RealBufferedSource reads from an upstream Source into a Buffer.",
-            ),
-            (
-                "RealBufferedSink",
-                "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt",
-                r#"
-                internal expect class RealBufferedSink(upstream: Sink, buffer: Buffer) : BufferedSink {
-                  override fun write(source: Buffer, byteCount: Long)
-                }
-                "#,
-                "RealBufferedSink writes buffered bytes to an upstream Sink.",
-            ),
-            (
-                "buffer",
-                "okio/src/commonMain/kotlin/okio/Okio.kt",
-                r#"
-                fun Source.buffer(): BufferedSource = RealBufferedSource(this)
-                fun Sink.buffer(): BufferedSink = RealBufferedSink(this)
-                "#,
-                "Okio buffer helpers wrap Source and Sink instances with buffered implementations.",
-            ),
-        ];
-
-        for (symbol, path, source, expected) in fixtures {
-            let citation = test_packet_citation(symbol, path, 0.9);
-            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected Okio buffer-flow claim `{expected}` for {path}; got {claims:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn monolog_record_flow_source_claims_name_logger_records_and_handlers() {
-        let _steering = ExactFamilySteeringGuard::set(false);
-        let prompt =
-            "Explain how Monolog turns a log call into a LogRecord and passes it through handlers.";
-        let logger = test_packet_citation("Logger::addRecord", "src/Monolog/Logger.php", 0.9);
-        let handler = test_packet_citation(
-            "AbstractProcessingHandler::handle",
-            "src/Monolog/Handler/AbstractProcessingHandler.php",
-            0.9,
-        );
-        let mut claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &logger,
-            r#"
-            class Logger {
-              protected array $handlers;
-              public function pushHandler(HandlerInterface $handler): self {
-                array_unshift($this->handlers, $handler);
-              }
-              public function addRecord(int|Level $level, string $message, array $context = []): bool {
-                $record = new LogRecord();
-                foreach ($this->handlers as $handler) {
-                  if ($handler->handle($record)) {
-                    break;
-                  }
-                }
-              }
-              public function log($level, string|\Stringable $message, array $context = []): void {
-                $this->addRecord($level, (string) $message, $context);
-              }
-            }
-            "#,
-        );
-        claims.extend(packet_source_derived_claims_for_citation(
-            prompt,
-            &handler,
-            r#"
-            abstract class AbstractProcessingHandler {
-              public function handle(LogRecord $record): bool {
-                $record = $this->processRecord($record);
-                $this->write($record);
-                return false;
-              }
-            }
-            "#,
-        ));
-
-        for expected in [
-            "Logger owns a stack of handlers registered by pushHandler.",
-            "Logger::log delegates into addRecord.",
-            "addRecord creates a LogRecord before passing it to handlers.",
-            "AbstractProcessingHandler handles records by processing and writing them.",
-        ] {
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected Monolog record-flow claim `{expected}` in {claims:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn alamofire_request_flow_source_claims_name_request_validation_and_callbacks() {
-        let _steering = ExactFamilySteeringGuard::set(false);
-        let prompt = "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
-        let fixtures = [
-            (
-                "Session.request",
-                "Source/Core/Session.swift",
-                r#"
-                open class Session {
-                    open func request(_ convertible: any URLRequestConvertible,
-                                      interceptor: (any RequestInterceptor)? = nil,
-                                      shouldAutomaticallyResume: Bool? = nil) -> DataRequest {
-                        let request = DataRequest(convertible: convertible,
-                                                  underlyingQueue: rootQueue,
-                                                  serializationQueue: serializationQueue,
-                                                  eventMonitor: eventMonitor,
-                                                  interceptor: interceptor,
-                                                  shouldAutomaticallyResume: shouldAutomaticallyResume,
-                                                  delegate: self)
-
-                        performEagerlyIfNecessary(request)
-                        return request
-                    }
-                }
-                "#,
-                "Session creates request objects such as DataRequest.",
-            ),
-            (
-                "Request.resume",
-                "Source/Core/Request.swift",
-                r#"
-                public func resume() -> Self {
-                    let needsToPerform = mutableState.write { mutableState in
-                        guard let task = mutableState.tasks.last else { return true }
-                        task.resume()
-                        return false
-                    }
-                    if needsToPerform {
-                        delegate?.readyToPerform(request: self)
-                    }
-                    return self
-                }
-                "#,
-                "Request.resume resumes the underlying URLSession task.",
-            ),
-            (
-                "DataRequest.validate",
-                "Source/Core/DataRequest.swift",
-                r#"
-                public class DataRequest: Request, @unchecked Sendable {
-                    public func validate(_ validation: @escaping Validation) -> Self {
-                        let validator: @Sendable () -> Void = { [unowned self] in
-                            eventMonitor?.request(self,
-                                                  didValidateRequest: request,
-                                                  response: response,
-                                                  data: data,
-                                                  withResult: result)
-                        }
-                        validators.write { $0.append(validator) }
-                        return self
-                    }
-                }
-                "#,
-                "DataRequest.validate attaches validation behavior.",
-            ),
-            (
-                "SessionDelegate",
-                "Source/Core/SessionDelegate.swift",
-                r#"
-                open class SessionDelegate: NSObject, @unchecked Sendable {}
-                extension SessionDelegate: URLSessionDataDelegate {
-                    open func urlSession(_ session: URLSession,
-                                         dataTask: URLSessionDataTask,
-                                         didReceive response: URLResponse,
-                                         completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
-                        request.didReceiveResponse(response, completionHandler: completionHandler)
-                    }
-
-                    open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-                        request.didReceive(data: data)
-                    }
-                }
-                "#,
-                "SessionDelegate receives URLSession callback events.",
-            ),
-        ];
-
-        for (symbol, path, source, expected) in fixtures {
-            let citation = test_packet_citation(symbol, path, 0.9);
-            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
-            assert!(
-                claims.iter().any(|claim| claim == expected),
-                "expected Alamofire request-flow claim `{expected}` for {path}; got {claims:?}"
-            );
-        }
-    }
-
     #[test]
     fn express_route_flow_source_claims_name_app_router_response_flow() {
         let prompt = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
