@@ -332,7 +332,7 @@ Expected: all pass, and the lint fails if exact benchmark strings appear in prod
 - Modify: `crates/codestory-indexer/tests/import_resolution.rs`
 - Modify: `crates/codestory-indexer/tests/tictactoe_language_coverage.rs`
 
-- [ ] **Step 1: Split import extraction from resolution**
+- [x] **Step 1: Split import extraction from resolution**
 
 Rename the current single-file test to make its real contract explicit:
 
@@ -348,7 +348,7 @@ fn assert_import_edges_extracted(edges: &[codestory_contracts::graph::Edge]) {
 
 Keep the assertion that at least one `EdgeKind::IMPORT` exists.
 
-- [ ] **Step 2: Add a real cross-file resolution test**
+- [x] **Step 2: Add a real cross-file resolution test**
 
 Add fixtures with indexed targets in the same temporary workspace.
 
@@ -375,7 +375,7 @@ assert_import_resolved_to(&nodes, &edges, "src/main.ts", "src/foo.ts", "Foo");
 
 Repeat with at least one Rust module import where the target file is present. Do not use stdlib imports for resolution assertions.
 
-- [ ] **Step 3: Add an assertion helper for resolved targets**
+- [x] **Step 3: Add an assertion helper for resolved targets**
 
 Use this helper shape:
 
@@ -410,7 +410,7 @@ fn assert_import_resolved_to(
 
 Refactor as needed so the helper does not allocate a node map inside a loop.
 
-- [ ] **Step 4: Tighten method-kind expectations**
+- [x] **Step 4: Tighten method-kind expectations**
 
 In `tictactoe_language_coverage.rs`, update Kotlin/Swift/Dart class or protocol member expectations from `NodeKind::FUNCTION` to `NodeKind::METHOD` where the source member is owned by a class/interface/protocol.
 
@@ -420,7 +420,7 @@ Then change `has_node` so `NodeKind::FUNCTION` no longer accepts `NodeKind::METH
 node.kind == expected_kind
 ```
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run:
 
