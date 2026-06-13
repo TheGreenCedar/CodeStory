@@ -589,7 +589,7 @@ Expected: no missing-plan reference, no branch-local review plan in canonical do
 **Files:**
 - Modify: `docs/testing/codestory-e2e-stats-log.md` only if the ignored repo-scale e2e gate is run successfully at reviewed HEAD.
 
-- [ ] **Step 1: Run narrow serialized suite**
+- [x] **Step 1: Run narrow serialized suite**
 
 Run commands one at a time:
 
@@ -608,7 +608,7 @@ git diff --check origin/main...HEAD
 
 Expected: all pass.
 
-- [ ] **Step 2: Rebuild the CLI release binary**
+- [x] **Step 2: Rebuild the CLI release binary**
 
 Run:
 
@@ -618,7 +618,7 @@ cargo build --release -p codestory-cli
 
 Expected: release build passes.
 
-- [ ] **Step 3: Refresh active runtime surfaces**
+- [x] **Step 3: Refresh active runtime surfaces**
 
 Run:
 
@@ -632,7 +632,7 @@ target\release\codestory-cli.exe ready --project . --format json
 
 Expected: index and doctor succeed; if retrieval is stale, run full retrieval indexing before claiming packet/search readiness.
 
-- [ ] **Step 4: Run and log repo-scale e2e only if preparing to commit or merge**
+- [x] **Step 4: Run and log repo-scale e2e only if preparing to commit or merge**
 
 Run:
 
@@ -642,7 +642,12 @@ cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocap
 
 Expected: pass. Append the fresh row for current `HEAD` to `docs/testing/codestory-e2e-stats-log.md`.
 
-- [ ] **Step 5: Final diff review**
+Actual: broad ignored command first failed the real-repo drill precondition because
+`CODESTORY_REAL_REPO_DRILL_CASES` was unset; rerun with
+`CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1` passed 2/2 and emitted the logged
+full-sidecar stats.
+
+- [x] **Step 5: Final diff review**
 
 Run:
 
