@@ -1037,7 +1037,7 @@ mod tests {
             ("main.rb", Some("ruby")),
             ("main.php", Some("php")),
             ("Program.cs", Some("csharp")),
-            ("View.cshtml", Some("csharp")),
+            ("View.cshtml", None),
             ("Main.kt", Some("kotlin")),
             ("Main.swift", Some("swift")),
             ("main.dart", Some("dart")),
