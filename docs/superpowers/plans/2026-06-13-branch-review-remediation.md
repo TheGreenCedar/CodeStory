@@ -217,7 +217,7 @@ Expected: all pass.
 - Modify: `scripts/lint-retrieval-generalization.mjs`
 - Modify: `docs/testing/language-expansion-ab-report.md`
 
-- [ ] **Step 1: Add or reuse one eval-only predicate**
+- [x] **Step 1: Add or reuse one eval-only predicate**
 
 Expose a runtime predicate in `eval_probes.rs` with production default `false`.
 
@@ -233,7 +233,7 @@ pub(crate) fn exact_family_steering_enabled() -> bool {
 
 If an equivalent function already exists, reuse it and remove any separate default-on `CODESTORY_PACKET_EXACT_FAMILY_STEERING` path.
 
-- [ ] **Step 2: Gate prompt-derived benchmark probes**
+- [x] **Step 2: Gate prompt-derived benchmark probes**
 
 In `orchestrator.rs`, ensure the following call sites only run when the eval predicate is true:
 
@@ -251,7 +251,7 @@ if eval_probes::exact_family_steering_enabled() {
 }
 ```
 
-- [ ] **Step 3: Gate or delete canned benchmark-family source claims**
+- [x] **Step 3: Gate or delete canned benchmark-family source claims**
 
 The functions that emit claims for exact repos such as `StringUtils`, Gin, `source/animate.css`, and AutoMapper must not run in production. Either move them into eval-only test helpers or guard the call in `packet_append_source_derived_flow_claims`.
 
@@ -267,7 +267,7 @@ if eval_probes::exact_family_steering_enabled() {
 
 Keep generic source-derived claims that parse local source structure, but remove exact project-family claims from production.
 
-- [ ] **Step 4: Update tests**
+- [x] **Step 4: Update tests**
 
 Tests that expect exact probes for Commons Lang, SWR, Gin, animate.css, or AutoMapper must set `CODESTORY_EVAL_PROBES=1` for the duration of the test, or be rewritten as generic-shape tests that do not mention those families.
 
@@ -283,7 +283,7 @@ match previous {
 }
 ```
 
-- [ ] **Step 5: Strengthen the generalization lint**
+- [x] **Step 5: Strengthen the generalization lint**
 
 Add these banned production patterns to `scripts/lint-retrieval-generalization.mjs`:
 
@@ -303,7 +303,7 @@ Add these banned production patterns to `scripts/lint-retrieval-generalization.m
 
 Allow them only in tests, docs, task manifests, and eval-only helpers.
 
-- [ ] **Step 6: Update the A/B report wording**
+- [x] **Step 6: Update the A/B report wording**
 
 In `docs/testing/language-expansion-ab-report.md`, make the top verdict explicit:
 
@@ -311,7 +311,7 @@ In `docs/testing/language-expansion-ab-report.md`, make the top verdict explicit
 Production runtime defaults do not enable exact benchmark-family steering. Rows that used `CODESTORY_EVAL_PROBES=1` are eval-only diagnostics and are not promotion evidence.
 ```
 
-- [ ] **Step 7: Verify**
+- [x] **Step 7: Verify**
 
 Run:
 
