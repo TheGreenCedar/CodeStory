@@ -441,7 +441,7 @@ Expected: all pass and failures would catch missing import binding or method/fun
 - Modify: `crates/codestory-runtime/src/support.rs`
 - Test: `crates/codestory-runtime/src/lib.rs` or an existing runtime test module
 
-- [ ] **Step 1: Add bounded read helper**
+- [x] **Step 1: Add bounded read helper**
 
 In `support.rs`, add a helper that reads at most a fixed byte limit from a UTF-8-ish source file.
 
@@ -464,13 +464,13 @@ pub(crate) fn read_file_text_limited(path: &Path, max_bytes: u64) -> std::io::Re
 }
 ```
 
-- [ ] **Step 2: Use bounded reads in semantic file text cache**
+- [x] **Step 2: Use bounded reads in semantic file text cache**
 
 In `build_semantic_file_text_cache`, replace unbounded `read_to_string` calls with `read_file_text_limited(..., SEMANTIC_FILE_TEXT_MAX_BYTES)`.
 
 If the aggregate cache grows beyond `SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES`, stop caching additional file bodies and store `None` for later files.
 
-- [ ] **Step 3: Add tests**
+- [x] **Step 3: Add tests**
 
 Add tests for:
 
@@ -484,7 +484,7 @@ fn semantic_file_text_cache_respects_aggregate_byte_limit() { ... }
 
 Use tiny test-only limits if the helper accepts limits as arguments; otherwise test the helper directly with a file just over the limit using sparse metadata only if portable on Windows. Prefer direct helper tests with injectable limits.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run:
 
