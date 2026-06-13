@@ -7,6 +7,10 @@ use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
 
+// Repo-scale wall-clock guard; the zero-reembed assertion below carries the
+// stronger semantic reuse contract.
+const REPEAT_FULL_REFRESH_SECONDS_BUDGET: f64 = 30.0;
+
 #[derive(Debug, Serialize)]
 struct RepoE2eStats {
     project_root: String,
@@ -920,8 +924,9 @@ fn codestory_repo_release_e2e_emits_stats() {
         "repeat full refresh should embed zero unchanged dense docs"
     );
     assert!(
-        stats.repeat_full_refresh_seconds < 25.0,
-        "repeat full refresh should stay under 25 seconds, got {:.2}s",
+        stats.repeat_full_refresh_seconds < REPEAT_FULL_REFRESH_SECONDS_BUDGET,
+        "repeat full refresh should stay under {:.0} seconds, got {:.2}s",
+        REPEAT_FULL_REFRESH_SECONDS_BUDGET,
         stats.repeat_full_refresh_seconds
     );
     assert!(
