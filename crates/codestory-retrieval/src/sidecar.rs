@@ -6,6 +6,9 @@ use crate::generation::{
 use crate::health::{RetrievalStatusReport, probe_sidecar_health};
 use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
 use anyhow::{Context, Result};
+use codestory_contracts::language_support::{
+    LanguageSupportMode, language_support_profile_for_ext,
+};
 use codestory_store::Store;
 use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
@@ -244,41 +247,10 @@ fn strict_readiness_unavailable_reason(
 }
 
 fn graph_indexed_source_path(path: &Path) -> bool {
-    let extension = path
-        .extension()
+    path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-    matches!(
-        extension.as_deref(),
-        Some(
-            "rs" | "py"
-                | "pyi"
-                | "java"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "svelte"
-                | "vue"
-                | "astro"
-                | "ts"
-                | "tsx"
-                | "mts"
-                | "cts"
-                | "c"
-                | "cc"
-                | "cpp"
-                | "cxx"
-                | "h"
-                | "hh"
-                | "hpp"
-                | "hxx"
-                | "go"
-                | "rb"
-                | "php"
-                | "cs"
-        )
-    )
+        .and_then(language_support_profile_for_ext)
+        .is_some_and(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
 }
 
 fn manifest_contract_drift_should_win(reason: &str) -> bool {
@@ -575,6 +547,78 @@ mod tests {
                 .unwrap_or_default()
                 .contains("indexable_file_added_or_changed_after_sidecar_manifest"),
             "new indexable file should make strict status fail closed: {report:?}"
+        );
+    }
+
+    #[test]
+    fn strict_status_rejects_manifest_when_new_parser_backed_language_file_is_added() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let source_path = project.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let indexed_mtime = live_mtime_millis(&source_path);
+        let project_id = project_id_for_root(project.path());
+        let hash = "ba5eba11feedface";
+        {
+            let mut storage = Store::open(&storage_path).expect("open db");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path.clone(),
+                    language: "rust".into(),
+                    modification_time: indexed_mtime,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert indexed file");
+            storage
+                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                    project_id: project_id.clone(),
+                    zoekt_version: "zoekt-real-v1".into(),
+                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
+                    scip_revision: Some("graph-test".into()),
+                    built_at_epoch_ms: indexed_mtime,
+                    disk_bytes: None,
+                    degraded_modes_json: "[]".into(),
+                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
+                    embedding_dim: Some(768),
+                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
+                    sidecar_input_hash: Some(hash.into()),
+                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
+                    projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
+                })
+                .expect("manifest");
+        }
+
+        std::fs::write(
+            project.path().join("src").join("Routes.kt"),
+            "fun routeUsers() = Unit\n",
+        )
+        .expect("write kotlin source");
+
+        let report =
+            strict_sidecar_status(project.path(), Some(&storage_path)).expect("strict status");
+
+        assert_eq!(report.retrieval_mode, "unavailable");
+        assert!(
+            report
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("indexable_file_added_or_changed_after_sidecar_manifest"),
+            "new registry-backed parser file should make strict status fail closed: {report:?}"
         );
     }
 

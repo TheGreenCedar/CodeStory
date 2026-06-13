@@ -19,6 +19,9 @@ being claimed as parser-backed language support.
 - `fidelity-gated`: parser-backed graph support has overlapping regression
   evidence for symbols, imports, calls, member ownership, representable
   inheritance, and resolved-call behavior covered by the fixture suites.
+- `semantic-resolution-backed`: the language has explicit semantic resolver
+  dispatch and tests for the resolution behavior being claimed. This is a
+  narrower claim than parser-backed graph support.
 - `structural collector`: the language is indexed by dedicated structural
   collectors, not full tree-sitter graph rules.
 - `candidate parser compatibility record`: a parser crate/version was checked
@@ -38,13 +41,13 @@ support. The current language-expansion A/B report records a mixed full
 as blanket promotion proof for every parser-backed language.
 
 The parser-backed graph claim is not a promise that every language has identical
-dispatch semantics. Typed receiver-call support is claimed only for the
-fixture-backed cases named in the indexer regression suites. Current support
-covers simple local owner qualified calls where tests prove the behavior.
-Cross-package receiver lookup, polymorphic dispatch, inheritance-heavy target
-selection, framework-handler resolution, and declarative parameter extraction
-require separate fixtures and cannot be used as product claims until those
-fixtures pass.
+dispatch or semantic-resolution semantics. Typed receiver-call support is
+claimed only for the fixture-backed cases named in the indexer regression
+suites. Current support covers simple local owner qualified calls where tests
+prove the behavior. Cross-package receiver lookup, polymorphic dispatch,
+inheritance-heavy target selection, framework-handler resolution, and
+declarative parameter extraction require separate fixtures and cannot be used
+as product claims until those fixtures pass.
 
 ## Route Coverage Is Separate
 

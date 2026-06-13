@@ -946,6 +946,15 @@ fn language_filter_matches_path(requested: &str, path: &str) -> bool {
     }
 }
 
+fn indexed_file_matches_language_filter(
+    stored_language: &str,
+    path: &Path,
+    requested: &str,
+) -> bool {
+    stored_language.eq_ignore_ascii_case(requested)
+        || language_filter_matches_path(requested, &path.to_string_lossy())
+}
+
 fn language_family_alias(requested: &str) -> Option<&'static str> {
     match requested {
         "ts" => Some("typescript"),
@@ -8773,9 +8782,9 @@ impl AppController {
                         normalize_path_key(&runtime_relative_path(&root, &file.path))
                             .contains(needle)
                     })
-                    && language_filter
-                        .as_deref()
-                        .is_none_or(|language| file.language.eq_ignore_ascii_case(language))
+                    && language_filter.as_deref().is_none_or(|language| {
+                        indexed_file_matches_language_filter(&file.language, &file.path, language)
+                    })
             })
             .map(|file| IndexedFileDto {
                 path: runtime_relative_path(&root, &file.path),
@@ -10885,6 +10894,22 @@ mod tests {
         ));
         assert!(!language_filter_matches_path("tsx", "src/server.ts"));
         assert!(!language_filter_matches_path("jsx", "src/app.js"));
+
+        assert!(indexed_file_matches_language_filter(
+            "typescript",
+            Path::new("src/Widget.tsx"),
+            "tsx"
+        ));
+        assert!(indexed_file_matches_language_filter(
+            "bash",
+            Path::new("scripts/bootstrap.sh"),
+            "bash"
+        ));
+        assert!(!indexed_file_matches_language_filter(
+            "typescript",
+            Path::new("src/server.ts"),
+            "tsx"
+        ));
     }
 
     #[test]

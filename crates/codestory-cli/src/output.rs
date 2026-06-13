@@ -3460,9 +3460,9 @@ fn ansi_highlight_snippet(path: &str, snippet: &str) -> String {
 
 fn ansi_highlight_line(language: &str, line: &str) -> String {
     let comment_marker = match language {
-        "python" | "ruby" | "toml" | "yaml" => Some("#"),
+        "bash" | "python" | "ruby" | "toml" | "yaml" => Some("#"),
         "rust" | "typescript" | "tsx" | "javascript" | "jsx" | "go" | "java" | "kotlin"
-        | "csharp" | "cpp" | "php" | "swift" => Some("//"),
+        | "csharp" | "cpp" | "dart" | "php" | "swift" => Some("//"),
         _ => None,
     };
     let Some(marker) = comment_marker else {
@@ -4383,6 +4383,15 @@ mod tests {
         ] {
             assert_eq!(snippet_language(path), expected, "{path}");
         }
+    }
+
+    #[test]
+    fn ansi_highlight_snippet_marks_dart_and_bash_comments() {
+        let dart = ansi_highlight_snippet("lib/main.dart", "final ok = true; // comment");
+        assert!(dart.contains("\x1b[90m// comment\x1b[0m"), "{dart:?}");
+
+        let bash = ansi_highlight_snippet("scripts/bootstrap.sh", "echo ok # comment");
+        assert!(bash.contains("\x1b[90m# comment\x1b[0m"), "{bash:?}");
     }
 
     #[test]
