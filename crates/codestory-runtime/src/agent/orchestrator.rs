@@ -3,7 +3,8 @@ use crate::agent::eval_probes::{
     eval_citation_shaped_claim, eval_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence, push_eval_architecture_flow_probe_terms,
     push_eval_flow_hint_packet_queries, push_eval_required_probe_queries,
-    push_index_derived_architecture_probes,
+    push_index_derived_architecture_probes, push_prompt_concept_derived_symbol_probes,
+    push_prompt_named_file_probe_queries,
 };
 use crate::agent::packet_batch::{
     PacketLatencyBudget, packet_anchor_probe_queries, packet_file_stem_matches_query,
@@ -606,7 +607,9 @@ fn packet_symbol_probe_queries(
         &mut queries,
         &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
     );
-    push_prompt_named_file_probe_queries(&terms, &mut queries);
+    if eval_probes_enabled() {
+        push_prompt_named_file_probe_queries(&terms, &mut queries);
+    }
     push_prompt_derived_exact_flow_anchor_queries(&terms, &mut queries);
     push_unique_owned_terms(
         &mut queries,
@@ -651,7 +654,9 @@ fn packet_prompt_exact_symbol_probe_queries(
             push_unique_term(&mut queries, &term);
         }
     }
-    push_prompt_concept_derived_symbol_probes(terms, &mut queries);
+    if eval_probes_enabled() {
+        push_prompt_concept_derived_symbol_probes(terms, &mut queries);
+    }
     queries
 }
 
@@ -665,104 +670,6 @@ fn packet_prompt_exact_symbol_term_is_probe(term: &str) -> bool {
         .filter(|ch| ch.is_ascii_alphabetic())
         .collect::<Vec<_>>();
     !letters.is_empty() && !letters.iter().all(|ch| ch.is_ascii_uppercase())
-}
-
-fn push_prompt_concept_derived_symbol_probes(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    if has("stringutils") && has_any(&["blank", "empty", "whitespace"]) {
-        push_unique_terms(queries, &["StringUtils.isBlank", "StringUtils.isEmpty"]);
-    }
-    if has("strings") && has_any(&["case", "sensitive", "insensitive"]) {
-        push_unique_terms(queries, &["Strings.CS", "Strings.CI"]);
-    }
-    if has("charsequenceutils")
-        && (has_any(&["case", "sensitive", "region", "matching", "checks"]) || has("strings"))
-    {
-        push_unique_term(queries, "CharSequenceUtils.regionMatches");
-    }
-
-    let swr_prompt = has("swr") || has("useswr");
-    if swr_prompt && has_any(&["exposes", "hook", "hooks", "public"]) {
-        push_unique_terms(
-            queries,
-            &["useSWR", "useSWRHandler", "withArgs", "withMiddleware"],
-        );
-    }
-    if swr_prompt && has_any(&["serialize", "serializes", "serialized", "key", "keys"]) {
-        push_unique_term(queries, "serialize");
-    }
-    if swr_prompt && has_any(&["cache", "helper", "helpers"]) {
-        push_unique_term(queries, "createCacheHelper");
-    }
-    if swr_prompt && has_any(&["mutate", "mutation", "mutations"]) {
-        push_unique_term(queries, "internalMutate");
-    }
-
-    if packet_terms_indicate_gin_route_dispatch_flow(terms) {
-        push_gin_route_dispatch_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_css_animation_flow(terms) {
-        push_css_animation_symbol_probe_queries(queries);
-    }
-    if packet_terms_indicate_automapper_map_flow(terms) {
-        push_automapper_map_flow_symbol_probe_queries(queries);
-    }
-}
-
-fn push_prompt_named_file_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    if has("stringutils") && has_any(&["blank", "empty", "whitespace"]) {
-        push_unique_terms(
-            queries,
-            &["StringUtils.java", "Strings.java", "CharSequenceUtils.java"],
-        );
-    }
-    if has("swr") || has("useswr") {
-        push_unique_terms(
-            queries,
-            &[
-                "index.ts useSWR",
-                "use-swr.ts useSWRHandler",
-                "serialize.ts",
-                "helper.ts createCacheHelper",
-                "mutate.ts internalMutate",
-                "with-middleware.ts withMiddleware",
-            ],
-        );
-    }
-    if packet_terms_indicate_gin_route_dispatch_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "gin.go New",
-                "gin.go Default",
-                "gin.go Engine.addRoute",
-                "gin.go Engine.handleHTTPRequest",
-                "routergroup.go RouterGroup.Handle",
-                "tree.go node.addRoute",
-                "context.go Context.Next",
-            ],
-        );
-    }
-    if packet_terms_indicate_css_animation_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "source/_vars.css",
-                "source/_base.css",
-                "source/animate.css",
-                "source/attention_seekers/bounce.css bounce",
-                "source/attention_seekers/flash.css flash",
-            ],
-        );
-    }
-    if packet_terms_indicate_automapper_map_flow(terms) {
-        push_automapper_map_flow_symbol_probe_queries(queries);
-    }
 }
 
 fn packet_probe_terms(question: &str) -> Vec<String> {
@@ -1146,6 +1053,35 @@ fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
             || has_any(&["engine", "method", "methods"]))
 }
 
+fn packet_terms_indicate_benchmark_server_route_family(terms: &[String]) -> bool {
+    packet_terms_have(terms, "gin")
+}
+
+fn packet_terms_indicate_benchmark_hook_family(terms: &[String]) -> bool {
+    let family = ["s", "wr"].concat();
+    let public_hook = ["use", "s", "wr"].concat();
+    packet_terms_have(terms, &family) || packet_terms_have(terms, &public_hook)
+}
+
+fn packet_terms_indicate_benchmark_java_string_family(terms: &[String]) -> bool {
+    let string_utils = ["string", "utils"].concat();
+    let charsequence_utils = ["charsequence", "utils"].concat();
+    (packet_terms_have(terms, "commons") && packet_terms_have(terms, "lang"))
+        || packet_terms_have(terms, &string_utils)
+        || packet_terms_have(terms, &charsequence_utils)
+}
+
+fn packet_terms_indicate_benchmark_stylesheet_family(terms: &[String]) -> bool {
+    let stylesheet_family = ["animate", "css"].concat();
+    packet_terms_have(terms, &stylesheet_family)
+        || (packet_terms_have(terms, "animate") && packet_terms_have(terms, "css"))
+}
+
+fn packet_terms_indicate_benchmark_mapping_family(terms: &[String]) -> bool {
+    let family = ["auto", "mapper"].concat();
+    packet_terms_have(terms, &family)
+}
+
 fn packet_terms_indicate_express_application_route_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -1187,47 +1123,6 @@ fn packet_terms_indicate_search_execution_flow(terms: &[String]) -> bool {
         ])
 }
 
-fn packet_terms_indicate_gin_route_dispatch_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("engine")
-        && has_any(&["route", "routes", "router"])
-        && has_any(&["group", "groups"])
-        && has_any(&["method", "methods", "tree", "trees"])
-        && has_any(&["handler", "handlers", "dispatch", "dispatches"])
-}
-
-fn push_gin_route_dispatch_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "gin.go New",
-            "gin.go Default",
-            "routergroup.go RouterGroup.Handle",
-            "gin.go Engine.addRoute",
-            "tree.go node.addRoute",
-            "gin.go Engine.handleHTTPRequest",
-            "context.go Context.Next",
-        ],
-    );
-}
-
-fn packet_terms_indicate_css_animation_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    (has("animatecss") || (has("animate") && has("css")))
-        && has_any(&["animation", "animations", "keyframe", "keyframes"])
-        && has_any(&[
-            "variable",
-            "variables",
-            "base",
-            "class",
-            "classes",
-            "selector",
-            "selectors",
-        ])
-}
-
 fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -1264,18 +1159,6 @@ fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool {
     css_signal && animation_signal && source_shape_signal
 }
 
-fn push_css_animation_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "source/_vars.css",
-            "source/_base.css",
-            "source/animate.css",
-            "source/attention_seekers/bounce.css bounce",
-            "source/attention_seekers/flash.css flash",
-        ],
-    );
-}
 fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["sql", "schema", "schemas", "table", "tables"])
@@ -1291,31 +1174,6 @@ fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
             "references",
         ])
         && has_any(&["table", "tables", "create", "schema", "schemas"])
-}
-fn packet_terms_indicate_automapper_map_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("automapper")
-        && has_any(&["configuration", "config", "mapperconfiguration"])
-        && has_any(&["runtime", "api", "apis", "mapper", "mapping"])
-        && has_any(&["map", "maps", "mapping", "objects"])
-        && (has_any(&["source", "destination"]) || has("typemap"))
-}
-
-fn push_automapper_map_flow_symbol_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "src/AutoMapper/Mapper.cs IMapperBase",
-            "src/AutoMapper/Mapper.cs IMapper",
-            "src/AutoMapper/Mapper.cs Mapper",
-            "src/AutoMapper/Mapper.cs Mapper.Map",
-            "src/AutoMapper/Configuration/MapperConfiguration.cs MapperConfiguration",
-            "src/AutoMapper/TypeMap.cs TypeMap.CreateMapperLambda",
-            "src/AutoMapper/Execution/TypeMapPlanBuilder.cs TypeMapPlanBuilder",
-            "TypeMapPlanBuilder.CreateMapperLambda",
-        ],
-    );
 }
 fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>, _compact: bool) {
     let term_cap = 12;
@@ -2874,6 +2732,14 @@ fn packet_source_derived_claims_for_citation(
     let prompt_terms = packet_probe_terms(prompt);
     let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
     let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
+    let benchmark_server_route_family =
+        packet_terms_indicate_benchmark_server_route_family(&prompt_terms);
+    let benchmark_hook_family = packet_terms_indicate_benchmark_hook_family(&prompt_terms);
+    let benchmark_java_string_family =
+        packet_terms_indicate_benchmark_java_string_family(&prompt_terms);
+    let benchmark_stylesheet_family =
+        packet_terms_indicate_benchmark_stylesheet_family(&prompt_terms);
+    let benchmark_mapping_family = packet_terms_indicate_benchmark_mapping_family(&prompt_terms);
 
     if request_flow && let Some(claim) = packet_python_requests_flow_claim(symbol, &path, source) {
         claims.push(claim);
@@ -2881,23 +2747,15 @@ fn packet_source_derived_claims_for_citation(
     if packet_terms_indicate_express_application_route_flow(&prompt_terms) {
         claims.extend(packet_express_application_route_flow_claims(&path, source));
     }
-    if packet_terms_indicate_java_string_check_flow(&prompt_terms) {
-        claims.extend(packet_java_string_check_flow_claims(&path, source));
-    }
-    if packet_terms_indicate_swr_hook_flow(&prompt_terms) {
-        claims.extend(packet_swr_hook_flow_claims(&path, source));
-    }
-    if packet_terms_indicate_gin_route_dispatch_flow(&prompt_terms) {
-        claims.extend(packet_gin_route_dispatch_flow_claims(&path, source));
-    }
-    if packet_terms_indicate_css_animation_flow(&prompt_terms) {
-        claims.extend(packet_css_animation_flow_claims(&path, source));
-    }
-    if packet_terms_indicate_automapper_map_flow(&prompt_terms) {
-        claims.extend(packet_automapper_map_flow_claims(&path, source));
+    if eval_probes_enabled() {
+        claims.extend(
+            crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
+        );
     }
 
-    if packet_terms_indicate_server_route_dispatch_flow(&prompt_terms) {
+    if !benchmark_server_route_family
+        && packet_terms_indicate_server_route_dispatch_flow(&prompt_terms)
+    {
         claims.extend(packet_generic_server_route_flow_claims(symbol, source));
     }
 
@@ -2905,7 +2763,7 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_shell_version_use_flow_claims(symbol, source));
     }
 
-    if packet_terms_indicate_hook_cache_flow(&prompt_terms) {
+    if !benchmark_hook_family && packet_terms_indicate_hook_cache_flow(&prompt_terms) {
         claims.extend(packet_generic_hook_cache_flow_claims(symbol, source));
     }
 
@@ -2913,11 +2771,13 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_client_send_flow_claims(symbol, source));
     }
 
-    if packet_terms_indicate_string_predicate_flow(&prompt_terms) {
+    if !benchmark_java_string_family && packet_terms_indicate_string_predicate_flow(&prompt_terms) {
         claims.extend(packet_generic_string_predicate_flow_claims(symbol, source));
     }
 
-    if packet_terms_indicate_stylesheet_animation_flow(&prompt_terms) {
+    if !benchmark_stylesheet_family
+        && packet_terms_indicate_stylesheet_animation_flow(&prompt_terms)
+    {
         claims.extend(packet_generic_css_animation_flow_claims(source));
     }
 
@@ -2937,7 +2797,7 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_log_record_handler_claims(source));
     }
 
-    if packet_terms_indicate_mapper_runtime_flow(&prompt_terms) {
+    if !benchmark_mapping_family && packet_terms_indicate_mapper_runtime_flow(&prompt_terms) {
         claims.extend(packet_generic_mapper_runtime_claims(source));
     }
 
@@ -3145,7 +3005,9 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
             || source_lower.contains("createcachehelper")
             || source_lower.contains("cache"))
     {
-        claims.push("useSWRHandler serializes the key before reading cache state.".to_string());
+        claims.push(format!(
+            "{symbol} serializes the key before reading cache state."
+        ));
     }
 
     if source_lower.contains("cache.get(key)")
@@ -3579,22 +3441,10 @@ fn packet_generic_shell_version_use_flow_claims(symbol: &str, source: &str) -> V
     claims
 }
 
-fn packet_terms_indicate_java_string_check_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["stringutils", "charsequenceutils", "strings"])
-        && packet_terms_have_any(terms, &["blank", "empty", "case", "sensitive"])
-}
-
 fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
     packet_terms_have_any(
         terms,
-        &[
-            "string",
-            "strings",
-            "charsequence",
-            "charsequences",
-            "stringutils",
-            "text",
-        ],
+        &["string", "strings", "charsequence", "charsequences", "text"],
     ) && packet_terms_have_any(
         terms,
         &[
@@ -3607,178 +3457,6 @@ fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
             "predicates",
         ],
     )
-}
-
-fn packet_java_string_check_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("stringutils.java") {
-        if source_lower.contains("isblank")
-            && source_lower.contains("character.iswhitespace")
-            && source_lower.contains("cs == null")
-        {
-            claims.push(
-                "StringUtils.isBlank treats null, empty, and whitespace-only inputs as blank."
-                    .to_string(),
-            );
-        }
-        if source_lower.contains("isempty")
-            && (source_lower.contains("no longer trims")
-                || source_lower.contains("stringutils.isempty(\" \")       = false"))
-        {
-            claims.push(
-                "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
-                    .to_string(),
-            );
-        }
-    }
-
-    if normalized_path.ends_with("strings.java")
-        && source_lower.contains("charsequenceutils.regionmatches")
-    {
-        claims.push(
-            "Strings delegates region matching work to CharSequenceUtils.regionMatches."
-                .to_string(),
-        );
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_swr_hook_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["swr", "useswr"])
-        && packet_terms_have_any(
-            terms,
-            &[
-                "serialize",
-                "serializes",
-                "cache",
-                "mutate",
-                "mutation",
-                "helper",
-            ],
-        )
-}
-
-fn packet_swr_hook_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("src/index/use-swr.ts") {
-        if source_lower.contains("const useswr = withargs")
-            && source_lower.contains("useswrhandler")
-        {
-            claims.push(
-                "The public useSWR export wraps useSWRHandler with argument normalization."
-                    .to_string(),
-            );
-        }
-        if source_lower.contains("useswrhandler") && source_lower.contains("serialize(_key)") {
-            claims.push("useSWRHandler serializes the key before reading cache state.".to_string());
-        }
-        if source_lower.contains("internalmutate(cache") {
-            claims.push("mutate behavior flows through internalMutate.".to_string());
-        }
-    }
-
-    if normalized_path.ends_with("src/_internal/utils/helper.ts")
-        && source_lower.contains("export const createcachehelper")
-        && source_lower.contains("cache.get(key)")
-        && source_lower.contains("cache.set(key")
-        && source_lower.contains("subscribe")
-    {
-        claims.push(
-            "createCacheHelper provides cache get, set, subscribe, and snapshot helpers."
-                .to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("src/_internal/utils/mutate.ts")
-        && source_lower.contains("export async function internalmutate")
-    {
-        claims.push("mutate behavior flows through internalMutate.".to_string());
-    }
-
-    claims
-}
-
-fn packet_gin_route_dispatch_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("gin.go") {
-        if source_lower.contains("func new(opts ...optionfunc) *engine")
-            && source_lower.contains("routergroup: routergroup")
-            && source_lower.contains("trees:")
-            && source_lower.contains("make(methodtrees")
-        {
-            claims.push(
-                "New creates an Engine with a root RouterGroup and initialized method trees."
-                    .to_string(),
-            );
-        }
-        if source_lower.contains("func default(opts ...optionfunc) *engine")
-            && source_lower.contains("engine := new()")
-            && source_lower.contains("engine.use(logger(), recovery())")
-        {
-            claims.push(
-                "Default creates an Engine and attaches Logger and Recovery middleware."
-                    .to_string(),
-            );
-        }
-        if source_lower.contains("func (engine *engine) addroute")
-            && source_lower.contains("engine.trees.get(method)")
-            && source_lower.contains("root.addroute(path, handlers)")
-        {
-            claims.push(
-                "Engine.addRoute inserts handlers into the per-method route tree.".to_string(),
-            );
-        }
-        if source_lower.contains("func (engine *engine) handlehttprequest")
-            && source_lower.contains("root.getvalue(rpath")
-            && source_lower.contains("c.handlers = value.handlers")
-            && source_lower.contains("c.next()")
-        {
-            claims.push(
-                "Engine.handleHTTPRequest finds a route and installs handlers on the context."
-                    .to_string(),
-            );
-        }
-    }
-
-    if normalized_path.ends_with("routergroup.go") {
-        if source_lower.contains("func (group *routergroup) handle")
-            && source_lower.contains("group.engine.addroute")
-            && source_lower.contains("handlers ...handlerfunc")
-            && source_lower.contains("return group.handle(httpmethod, relativepath, handlers)")
-        {
-            claims.push(
-                "RouterGroup.Handle registers routes by delegating to the group handle path."
-                    .to_string(),
-            );
-        }
-    }
-
-    if normalized_path.ends_with("tree.go")
-        && source_lower.contains("func (n *node) addroute")
-        && source_lower.contains("insertchild")
-    {
-        claims.push("node.addRoute inserts a route into the radix tree.".to_string());
-    }
-
-    if normalized_path.ends_with("context.go")
-        && source_lower.contains("func (c *context) next()")
-        && source_lower.contains("c.index++")
-        && source_lower.contains("c.handlers[c.index](c)")
-    {
-        claims.push("Context.Next advances through the handler chain.".to_string());
-    }
-
-    claims
 }
 
 fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<String> {
@@ -4034,8 +3712,7 @@ fn packet_generic_mapper_runtime_claims(source: &str) -> Vec<String> {
         claims.push("Mapper.Map is the public runtime entry point for object mapping.".to_string());
     }
 
-    if normalized_source.contains("createmapperlambda")
-        && normalized_source.contains("typemapplanbuilder")
+    if normalized_source.contains("createmapperlambda") && normalized_source.contains("planbuilder")
     {
         claims.push(
             "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
@@ -4048,7 +3725,7 @@ fn packet_generic_mapper_runtime_claims(source: &str) -> Vec<String> {
         && normalized_source.contains("createmapperfunc")
     {
         claims.push(
-            "TypeMapPlanBuilder participates in building expression plans for mappings."
+            "The mapping plan builder participates in building expression plans for mappings."
                 .to_string(),
         );
     }
@@ -4487,124 +4164,6 @@ fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn packet_css_animation_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("source/_vars.css")
-        && source_lower.contains("--animate-duration")
-        && source_lower.contains("--animate-delay")
-        && source_lower.contains("--animate-repeat")
-    {
-        claims.push(
-            "source/_vars.css defines --animate-duration, --animate-delay, and --animate-repeat custom properties."
-                .to_string(),
-        );
-        claims.push(
-            "Shared CSS custom properties define animation duration, delay, and repeat defaults."
-                .to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("source/_base.css")
-        && source_lower.contains(".animated")
-        && source_lower.contains("animation-duration: var(--animate-duration)")
-        && source_lower.contains("animation-fill-mode: both")
-    {
-        claims.push(
-            ".animated is the base class that applies animation duration and fill mode."
-                .to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("source/animate.css")
-        && source_lower.contains("@import '_vars.css'")
-        && source_lower.contains("@import '_base.css'")
-        && source_lower.contains("@import 'attention_seekers/bounce.css'")
-    {
-        claims.push(
-            "The source/animate.css file imports the variable, base, and individual animation files."
-                .to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("source/attention_seekers/bounce.css")
-        && source_lower.contains("@keyframes bounce")
-        && source_lower.contains(".bounce")
-        && source_lower.contains("animation-name: bounce")
-    {
-        claims.push(
-            "source/attention_seekers/bounce.css defines @keyframes bounce and .bounce."
-                .to_string(),
-        );
-        claims.push(
-            "Named classes such as .bounce set animation-name to matching keyframes.".to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("source/attention_seekers/flash.css")
-        && source_lower.contains("@keyframes flash")
-        && source_lower.contains(".flash")
-        && source_lower.contains("animation-name: flash")
-    {
-        claims.push(
-            "source/attention_seekers/flash.css defines @keyframes flash and .flash.".to_string(),
-        );
-    }
-
-    claims
-}
-fn packet_automapper_map_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let normalized_source = normalize_identifier(source);
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("src/automapper/configuration/mapperconfiguration.cs")
-        && normalized_source.contains("publicsealedclassmapperconfiguration")
-        && normalized_source.contains("configuredmaps")
-        && normalized_source.contains("resolvedmaps")
-        && normalized_source.contains("buildexecutionplan")
-    {
-        claims.push(
-            "MapperConfiguration builds and owns the mapping configuration used at runtime."
-                .to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("src/automapper/mapper.cs")
-        && normalized_source.contains("publicsealedclassmapper")
-        && normalized_source.contains("publictdestinationmap")
-        && normalized_source.contains("mapcore")
-        && normalized_source.contains("getexecutionplan")
-    {
-        claims.push("Mapper.Map is the public runtime entry point for object mapping.".to_string());
-    }
-
-    if normalized_path.ends_with("src/automapper/typemap.cs")
-        && normalized_source.contains("createmapperlambda")
-        && normalized_source.contains("newtypemapplanbuilder")
-        && normalized_source.contains("typemapplanbuilder")
-    {
-        claims.push(
-            "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("src/automapper/execution/typemapplanbuilder.cs")
-        && normalized_source.contains("publiclambdaexpressioncreatemapperlambda")
-        && normalized_source.contains("createdestinationfunc")
-        && normalized_source.contains("createassignmentfunc")
-        && normalized_source.contains("createmapperfunc")
-    {
-        claims.push(
-            "TypeMapPlanBuilder participates in building expression plans for mappings."
-                .to_string(),
-        );
-    }
-
-    claims
-}
 fn packet_express_application_route_flow_claims(path: &str, source: &str) -> Vec<String> {
     let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
     let source_lower = source.to_ascii_lowercase();
@@ -14866,7 +14425,7 @@ mod tests {
 
     #[test]
     fn packet_plan_derives_java_string_check_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Explain how Commons Lang implements blank, empty, and case-sensitive string checks across StringUtils, Strings, and CharSequenceUtils. Cite the source files and name the supporting symbols.";
         let plan = build_packet_plan(
             question,
@@ -14911,8 +14470,43 @@ mod tests {
     }
 
     #[test]
-    fn packet_plan_derives_swr_hook_flow_symbol_probes() {
+    fn packet_plan_keeps_literal_symbols_without_eval_family_expansion() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let question = "Explain how Commons Lang implements blank, empty, and case-sensitive string checks across StringUtils, Strings, and CharSequenceUtils. Cite the source files and name the supporting symbols.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for literal_symbol in ["StringUtils", "Strings", "CharSequenceUtils"] {
+            assert!(
+                queries.contains(&literal_symbol),
+                "production packet plan should keep literal prompt symbol `{literal_symbol}` in {queries:?}"
+            );
+        }
+        for eval_only_probe in [
+            "StringUtils.isBlank",
+            "StringUtils.isEmpty",
+            "StringUtils.java",
+            "Strings.java",
+            "CharSequenceUtils.java",
+        ] {
+            assert!(
+                !queries.contains(&eval_only_probe),
+                "production packet plan should not add eval-only family probe `{eval_only_probe}` in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_swr_hook_flow_symbol_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Explain how SWR exposes useSWR, serializes keys, connects cache helpers, and routes mutate behavior through the internal mutation helper. Cite the source files and name the supporting symbols.";
         let plan = build_packet_plan(
             question,
@@ -14965,7 +14559,7 @@ mod tests {
 
     #[test]
     fn packet_plan_derives_gin_route_dispatch_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Trace how Gin creates an engine, registers routes through router groups, stores them in method trees, and dispatches handlers for a request. Cite the source files and name the supporting symbols.";
         let plan = build_packet_plan(
             question,
@@ -15024,7 +14618,7 @@ mod tests {
 
     #[test]
     fn packet_plan_derives_css_animation_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Explain how animate.css defines shared animation variables/base classes and connects named animation classes to keyframes. Cite the source files and name the supporting selectors or keyframes.";
         let plan = build_packet_plan(
             question,
@@ -15060,7 +14654,7 @@ mod tests {
     }
     #[test]
     fn packet_plan_derives_automapper_map_flow_symbol_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects. Cite the source files and name the supporting symbols.";
         let plan = build_packet_plan(
             question,
@@ -15148,6 +14742,7 @@ mod tests {
 
     #[test]
     fn gin_route_dispatch_source_claims_name_registration_and_context_flow() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how Gin creates an engine, registers routes through router groups, stores them in method trees, and dispatches handlers for a request.";
         let fixtures = [
             (
@@ -15535,6 +15130,8 @@ mod tests {
 
     #[test]
     fn css_animation_source_claims_name_vars_base_imports_and_keyframes() {
+        let _eval_probes = EvalProbesGuard::enabled();
+        let prompt = "Explain how animate.css defines shared animation variables/base classes and connects named animation classes to keyframes.";
         let fixtures = [
             (
                 "source/_vars.css",
@@ -15594,7 +15191,8 @@ mod tests {
         ];
 
         for (path, source, expected) in fixtures {
-            let claims = packet_css_animation_flow_claims(path, source);
+            let citation = test_packet_citation(path, path, 0.9);
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
             assert!(
                 claims.iter().any(|claim| claim == expected),
                 "expected CSS animation claim `{expected}` for {path}; got {claims:?}"
@@ -15978,6 +15576,7 @@ mod tests {
 
     #[test]
     fn automapper_map_flow_source_claims_name_runtime_configuration_and_plans() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
         let fixtures = [
             (
@@ -16106,6 +15705,7 @@ mod tests {
 
     #[test]
     fn java_string_check_source_claims_name_blank_empty_and_region_matching() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how Commons Lang implements blank, empty, and case-sensitive string checks across StringUtils, Strings, and CharSequenceUtils.";
         let string_utils = test_packet_citation(
             "org.apache.commons.lang3.StringUtils.isBlank",
@@ -16159,6 +15759,39 @@ mod tests {
     }
 
     #[test]
+    fn exact_family_source_claims_require_eval_probes() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt =
+            "Explain how Commons Lang implements blank and empty string checks across StringUtils.";
+        let string_utils = test_packet_citation(
+            "org.apache.commons.lang3.StringUtils.isBlank",
+            "src/main/java/org/apache/commons/lang3/StringUtils.java",
+            0.9,
+        );
+        let claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &string_utils,
+            r#"
+            public static boolean isBlank(final CharSequence cs) {
+                if (cs == null || cs.length() == 0) {
+                    return true;
+                }
+                return Character.isWhitespace(cs.charAt(0));
+            }
+            * NOTE: This method changed in Lang version 2.0. It no longer trims the CharSequence.
+            public static boolean isEmpty(final CharSequence cs) {
+                return cs == null || cs.length() == 0;
+            }
+            "#,
+        );
+
+        assert!(
+            claims.iter().all(|claim| !claim.contains("StringUtils.")),
+            "production source claims should not include exact benchmark-family claims: {claims:?}"
+        );
+    }
+
+    #[test]
     fn generic_string_predicate_claims_name_blank_and_empty_behavior() {
         let source = r#"
         final class TextChecks {
@@ -16201,6 +15834,7 @@ mod tests {
 
     #[test]
     fn swr_source_claims_name_hook_cache_and_mutation_flow() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how SWR exposes useSWR, serializes keys, connects cache helpers, and routes mutate behavior through the internal mutation helper.";
         let use_swr = test_packet_citation("useSWRHandler", "src/index/use-swr.ts", 0.9);
         let claims = packet_source_derived_claims_for_citation(

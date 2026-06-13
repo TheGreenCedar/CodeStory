@@ -137,6 +137,17 @@ const bannedPatterns = [
   "haystack\\.rs",
   "lib/axios\\.js",
   "lib/core/Axios\\.js",
+  "StringUtils",
+  "commons-lang",
+  "useSWR",
+  "swr",
+  "gin\\.go",
+  "RouterGroup\\.Handle",
+  "Engine\\.addRoute",
+  "Engine\\.handleHTTPRequest",
+  "AutoMapper",
+  "TypeMapPlanBuilder",
+  "source/animate\\.css",
 ];
 
 const bannedLiteralPatterns = [

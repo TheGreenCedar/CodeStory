@@ -4,6 +4,10 @@ Date: 2026-06-13
 
 ## Verdict
 
+Production runtime defaults do not enable exact benchmark-family steering. Rows
+that used `CODESTORY_EVAL_PROBES=1` are eval-only diagnostics and are not
+promotion evidence.
+
 The harness now measures the right shape of A/B comparison: a strictly
 no-CodeStory local baseline versus a CodeStory-first arm, with wall time, token
 usage, tool calls, command categories, web/search leakage, packet quality, and
@@ -25,11 +29,11 @@ diagnostic evidence, not broad language-support proof: many were achieved by
 adding exact task-family detectors, protected probes, and static citations for
 the benchmark's pinned repositories.
 
-A new anti-overfit packet gate confirms that concern. With hidden exact
-library-family steering disabled and only explicit manifest-derived probes plus
-generic source-shape claims enabled, the current controlled packet layer
-quality-passes `9/18` language rows. That is the current honest baseline for
-generalized packet behavior.
+A new anti-overfit packet gate confirms that concern. With production defaults
+excluding exact benchmark-family steering and only explicit manifest-derived
+probes plus generic source-shape claims enabled, the current controlled packet
+layer quality-passes `9/18` language rows. That is the current honest baseline
+for generalized packet behavior.
 
 The current post-reboot packet-gated A/B slice is a real controlled win for
 the rows that pass that gate: CodeStory passed `9/9` rows versus `6/9` for the
