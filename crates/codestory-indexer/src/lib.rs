@@ -138,25 +138,9 @@ pub struct LanguageConfig {
     ruleset: LanguageRuleset,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LanguageSupportMode {
-    ParserBackedGraph,
-    StructuralCollector,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LanguageEvidenceTier {
-    GraphFidelity,
-    StructuralOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LanguageSupportProfile {
-    pub language_name: &'static str,
-    pub support_mode: LanguageSupportMode,
-    pub evidence_tier: LanguageEvidenceTier,
-    pub claim_label: &'static str,
-}
+pub use codestory_contracts::language_support::{
+    LanguageEvidenceTier, LanguageSupportMode, LanguageSupportProfile,
+};
 
 struct CompiledLanguageRules {
     graph_file: GraphFile,
@@ -10924,82 +10908,19 @@ pub fn index_file(
     })
 }
 
-fn normalize_extension(ext: &str) -> String {
-    ext.trim().trim_start_matches('.').to_ascii_lowercase()
-}
-
 pub fn language_support_profile_for_ext(ext: &str) -> Option<LanguageSupportProfile> {
-    let ext = normalize_extension(ext);
-    match ext.as_str() {
-        "py" | "pyi" => Some(parser_graph_fidelity_profile("python")),
-        "java" => Some(parser_graph_fidelity_profile("java")),
-        "rs" => Some(parser_graph_fidelity_profile("rust")),
-        "js" | "jsx" | "mjs" | "cjs" => Some(parser_graph_fidelity_profile("javascript")),
-        "ts" | "tsx" | "mts" | "cts" => Some(parser_graph_fidelity_profile("typescript")),
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(parser_graph_fidelity_profile("cpp")),
-        "c" | "h" => Some(parser_graph_fidelity_profile("c")),
-        "go" => Some(parser_graph_fidelity_profile("go")),
-        "rb" => Some(parser_graph_fidelity_profile("ruby")),
-        "php" => Some(parser_graph_fidelity_profile("php")),
-        "cs" => Some(parser_graph_fidelity_profile("csharp")),
-        "html" | "htm" => Some(structural_profile("html")),
-        "css" => Some(structural_profile("css")),
-        "sql" => Some(structural_profile("sql")),
-        "kt" | "kts" => Some(parser_graph_fidelity_profile("kotlin")),
-        "swift" => Some(parser_graph_fidelity_profile("swift")),
-        "dart" => Some(parser_graph_fidelity_profile("dart")),
-        "sh" | "bash" => Some(parser_graph_fidelity_profile("bash")),
-        _ => None,
-    }
+    codestory_contracts::language_support::language_support_profile_for_ext(ext).copied()
 }
 
 pub fn language_support_profile_for_language_name(
     language_name: &str,
 ) -> Option<LanguageSupportProfile> {
-    let language_name = language_name.trim().to_ascii_lowercase();
-    match language_name.as_str() {
-        "python" => Some(parser_graph_fidelity_profile("python")),
-        "java" => Some(parser_graph_fidelity_profile("java")),
-        "rust" => Some(parser_graph_fidelity_profile("rust")),
-        "javascript" => Some(parser_graph_fidelity_profile("javascript")),
-        "typescript" => Some(parser_graph_fidelity_profile("typescript")),
-        "cpp" => Some(parser_graph_fidelity_profile("cpp")),
-        "c" => Some(parser_graph_fidelity_profile("c")),
-        "go" => Some(parser_graph_fidelity_profile("go")),
-        "ruby" => Some(parser_graph_fidelity_profile("ruby")),
-        "php" => Some(parser_graph_fidelity_profile("php")),
-        "csharp" => Some(parser_graph_fidelity_profile("csharp")),
-        "html" => Some(structural_profile("html")),
-        "css" => Some(structural_profile("css")),
-        "sql" => Some(structural_profile("sql")),
-        "kotlin" => Some(parser_graph_fidelity_profile("kotlin")),
-        "swift" => Some(parser_graph_fidelity_profile("swift")),
-        "dart" => Some(parser_graph_fidelity_profile("dart")),
-        "bash" => Some(parser_graph_fidelity_profile("bash")),
-        _ => None,
-    }
-}
-
-fn parser_graph_fidelity_profile(language_name: &'static str) -> LanguageSupportProfile {
-    LanguageSupportProfile {
-        language_name,
-        support_mode: LanguageSupportMode::ParserBackedGraph,
-        evidence_tier: LanguageEvidenceTier::GraphFidelity,
-        claim_label: "parser-backed graph, fidelity-gated",
-    }
-}
-
-fn structural_profile(language_name: &'static str) -> LanguageSupportProfile {
-    LanguageSupportProfile {
-        language_name,
-        support_mode: LanguageSupportMode::StructuralCollector,
-        evidence_tier: LanguageEvidenceTier::StructuralOnly,
-        claim_label: "structural collector only",
-    }
+    codestory_contracts::language_support::language_support_profile_for_language_name(language_name)
+        .copied()
 }
 
 pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
-    let ext = normalize_extension(ext);
+    let ext = codestory_contracts::language_support::normalize_extension(ext);
     match ext.as_str() {
         // Keep this extension map aligned with the top-level live rule registry.
         "py" | "pyi" => Some(make_language_config(
