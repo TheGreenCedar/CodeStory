@@ -913,6 +913,7 @@ mod tests {
             ("astro", Language::JavaScript),
             ("lua", Language::Lua),
             ("ps1", Language::PowerShell),
+            ("psm1", Language::PowerShell),
             ("scss", Language::Css),
             ("sass", Language::Css),
             ("less", Language::Css),

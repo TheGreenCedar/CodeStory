@@ -12972,6 +12972,14 @@ class Test {
             structural.evidence_tier,
             LanguageEvidenceTier::StructuralOnly
         );
+        assert!(
+            language_support_profile_for_ext("cshtml").is_none(),
+            ".cshtml stays compatibility-only until Razor support has a public profile"
+        );
+        assert!(
+            get_language_for_ext("cshtml").is_none(),
+            ".cshtml must not route into parser-backed indexing without a public profile"
+        );
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
             if profile.support_mode == LanguageSupportMode::ParserBackedGraph {
