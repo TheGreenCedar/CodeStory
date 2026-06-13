@@ -1,4 +1,4 @@
-﻿//! Trace adapters that merge packet batch retrieval results into agent answers.
+//! Trace adapters that merge packet batch retrieval results into agent answers.
 
 #![allow(clippy::items_after_test_module)]
 
@@ -224,6 +224,7 @@ mod golden_tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };

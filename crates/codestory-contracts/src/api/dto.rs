@@ -1570,6 +1570,17 @@ pub struct RetrievalShadowDto {
     pub candidate_resolution_counts: Vec<RetrievalCandidateResolutionCountDto>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketSidecarQueryDiagnosticDto {
+    pub query: String,
+    pub retrieval_mode: String,
+    pub candidate_count: u32,
+    pub resolved_hit_count: u32,
+    pub unresolved_candidate_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
@@ -1587,6 +1598,8 @@ pub struct AgentRetrievalTraceDto {
     #[serde(default)]
     pub annotations: Vec<String>,
     pub steps: Vec<AgentRetrievalStepDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packet_sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_shadow: Option<RetrievalShadowDto>,
 }
@@ -1924,6 +1937,7 @@ mod packet_tests {
             semantic_fallbacks: Vec::new(),
             annotations: Vec::new(),
             steps: Vec::new(),
+            packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: Some(RetrievalShadowDto {
                 retrieval_mode: "unavailable".to_string(),
                 degraded_reason: Some("sidecar_unavailable".to_string()),

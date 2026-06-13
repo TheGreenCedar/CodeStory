@@ -49,7 +49,9 @@ use codestory_contracts::api::{
     SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
-use codestory_contracts::api::{AgentRetrievalStepDto, EdgeId, SearchMatchQualityDto};
+use codestory_contracts::api::{
+    AgentRetrievalStepDto, EdgeId, PacketSidecarQueryDiagnosticDto, SearchMatchQualityDto,
+};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -7506,6 +7508,22 @@ fn build_packet_sufficiency_with_extra(
         min_claims,
         supported_claims.len(),
     );
+    let mut seen_unresolved_sidecar_queries = std::collections::HashSet::new();
+    let unresolved_sidecar_queries = answer
+        .retrieval_trace
+        .packet_sidecar_diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.candidate_count > 0
+                && diagnostic.resolved_hit_count == 0
+                && diagnostic.unresolved_candidate_count > 0
+        })
+        .filter_map(|diagnostic| {
+            seen_unresolved_sidecar_queries
+                .insert(diagnostic.query.clone())
+                .then(|| diagnostic.query.clone())
+        })
+        .collect::<Vec<_>>();
     let status = if answer.citations.is_empty() {
         PacketSufficiencyStatusDto::Insufficient
     } else if has_errors
@@ -7513,6 +7531,7 @@ fn build_packet_sufficiency_with_extra(
         || !has_minimum_claims
         || !has_minimum_claim_families
         || !missing_required_probe_queries.is_empty()
+        || !unresolved_sidecar_queries.is_empty()
         || has_sufficiency_blocking_budget_omission
         || packet_budget_exceeded_hard_output_cap(budget)
     {
@@ -7554,6 +7573,13 @@ fn build_packet_sufficiency_with_extra(
             "{:?} packet missed required planned flow probe(s): {}.",
             task_class,
             missing_required_probe_queries.join(", ")
+        ));
+    }
+    if !unresolved_sidecar_queries.is_empty() {
+        gaps.push(format!(
+            "{:?} packet had sidecar candidates that could not resolve to indexed symbols for: {}.",
+            task_class,
+            unresolved_sidecar_queries.join(", ")
         ));
     }
     if budget.truncated && status != PacketSufficiencyStatusDto::Sufficient {
@@ -9975,6 +10001,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         }
@@ -10636,6 +10663,92 @@ mod tests {
                 .iter()
                 .any(|command| command.contains("--query 'exec session'")),
             "missing required probes should become targeted follow-up searches: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn packet_sufficiency_treats_unresolved_sidecar_candidates_as_gap() {
+        let question = "Explain how packet retrieval flows through sidecar diagnostics.";
+        let (mut answer, initial_sufficiency) = build_sufficient_packet_fixture(
+            question,
+            PacketTaskClassDto::EditPlanning,
+            vec![
+                test_packet_citation("packet_planner", "src/packet.rs", 0.9),
+                test_packet_citation("sidecar_batch", "src/sidecar.rs", 0.8),
+                test_packet_citation("sufficiency_builder", "src/sufficiency.rs", 0.7),
+            ],
+        );
+        assert_eq!(
+            initial_sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient
+        );
+        answer
+            .retrieval_trace
+            .packet_sidecar_diagnostics
+            .push(PacketSidecarQueryDiagnosticDto {
+                query: "sidecar batch".to_string(),
+                retrieval_mode: "full".to_string(),
+                candidate_count: 1,
+                resolved_hit_count: 0,
+                unresolved_candidate_count: 1,
+                diagnostic: Some(
+                    "sidecar candidates did not all resolve to indexed symbols".to_string(),
+                ),
+            });
+        answer
+            .retrieval_trace
+            .packet_sidecar_diagnostics
+            .push(PacketSidecarQueryDiagnosticDto {
+                query: "sidecar batch".to_string(),
+                retrieval_mode: "full".to_string(),
+                candidate_count: 1,
+                resolved_hit_count: 0,
+                unresolved_candidate_count: 1,
+                diagnostic: Some(
+                    "sidecar candidates did not all resolve to indexed symbols".to_string(),
+                ),
+            });
+
+        let budget = PacketBudgetDto {
+            requested: PacketBudgetModeDto::Compact,
+            limits: packet_budget_limits(PacketBudgetModeDto::Compact),
+            used: PacketBudgetUsageDto {
+                anchors: 3,
+                files: 0,
+                snippets: 0,
+                trail_edges: 0,
+                output_bytes: 0,
+            },
+            truncated: false,
+            omitted_sections: Vec::new(),
+            next_deeper_command: None,
+        };
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::EditPlanning,
+            &answer,
+            &budget,
+        );
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("sidecar candidates")),
+            "expected sidecar candidate gap, got {:?}",
+            sufficiency.gaps
+        );
+        let sidecar_gap = sufficiency
+            .gaps
+            .iter()
+            .find(|gap| gap.contains("sidecar candidates"))
+            .expect("sidecar gap");
+        assert_eq!(
+            sidecar_gap.matches("sidecar batch").count(),
+            1,
+            "duplicate diagnostics should not duplicate query names in sufficiency gaps: {sidecar_gap}"
         );
     }
 
@@ -12766,6 +12879,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -12974,6 +13088,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13062,6 +13177,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13135,6 +13251,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13357,6 +13474,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13429,6 +13547,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13496,6 +13615,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13541,6 +13661,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13587,6 +13708,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13635,6 +13757,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13685,6 +13808,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -13720,6 +13844,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -14642,6 +14767,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };

@@ -128,6 +128,7 @@ impl TraceRecorder {
             semantic_fallbacks: Vec::new(),
             annotations: self.annotations,
             steps: self.steps,
+            packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: self.retrieval_shadow,
         }
     }

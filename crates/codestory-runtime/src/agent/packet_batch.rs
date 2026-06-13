@@ -138,12 +138,17 @@ pub(crate) fn run_packet_planned_subqueries(
             .collect::<Vec<_>>();
         let started_at = Instant::now();
         match controller.search_lexical_hybrid_batch(&batch) {
-            Ok(results) => {
+            Ok(outcome) => {
                 let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
                 answer.retrieval_trace.total_latency_ms = answer
                     .retrieval_trace
                     .total_latency_ms
                     .saturating_add(duration_ms);
+                answer
+                    .retrieval_trace
+                    .packet_sidecar_diagnostics
+                    .extend(outcome.sidecar_diagnostics);
+                let results = outcome.results;
                 merge_packet_lexical_subquery_batch(
                     answer,
                     &lexical_pending,
@@ -186,6 +191,10 @@ pub(crate) fn run_packet_planned_subqueries(
                                 .retrieval_trace
                                 .total_latency_ms
                                 .saturating_add(retry_duration_ms);
+                            answer
+                                .retrieval_trace
+                                .packet_sidecar_diagnostics
+                                .extend(outcome.sidecar_diagnostics);
                             record_semantic_fallbacks(answer, &outcome.fallbacks);
                             merge_packet_semantic_subquery_batch(
                                 answer,
@@ -242,6 +251,10 @@ pub(crate) fn run_packet_planned_subqueries(
                         .retrieval_trace
                         .total_latency_ms
                         .saturating_add(duration_ms);
+                    answer
+                        .retrieval_trace
+                        .packet_sidecar_diagnostics
+                        .extend(outcome.sidecar_diagnostics);
                     record_semantic_fallbacks(answer, &outcome.fallbacks);
                     merge_packet_semantic_subquery_batch(
                         answer,
@@ -371,7 +384,12 @@ pub(crate) fn run_packet_anchor_expansion(
         .total_latency_ms
         .saturating_add(duration_ms);
     match result {
-        Ok(results) => {
+        Ok(outcome) => {
+            answer
+                .retrieval_trace
+                .packet_sidecar_diagnostics
+                .extend(outcome.sidecar_diagnostics);
+            let results = outcome.results;
             let per_step_duration = duration_ms / results.len().max(1) as u32;
             for (query, hits) in results {
                 let mut added = 0usize;

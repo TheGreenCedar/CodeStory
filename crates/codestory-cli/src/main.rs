@@ -9915,6 +9915,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         }

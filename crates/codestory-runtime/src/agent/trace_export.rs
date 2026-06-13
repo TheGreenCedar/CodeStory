@@ -147,6 +147,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 steps,
+                packet_sidecar_diagnostics: Vec::new(),
                 annotations: Vec::new(),
                 retrieval_shadow: None,
             },

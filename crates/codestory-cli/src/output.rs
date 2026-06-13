@@ -4217,6 +4217,7 @@ mod tests {
                     output: Vec::new(),
                     message: Some("checked indexed symbols".to_string()),
                 }],
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };
@@ -4493,6 +4494,7 @@ mod tests {
                         message: Some("source reads skipped by budget".to_string()),
                     },
                 ],
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         };

@@ -6,12 +6,19 @@ use crate::agent::retrieval_primary::{
 };
 use crate::{AppController, HybridSearchScoredHit};
 use codestory_contracts::api::{
-    AgentHybridWeightsDto, ApiError, SearchHit, SemanticFallbackRecordDto,
+    AgentHybridWeightsDto, ApiError, PacketSidecarQueryDiagnosticDto, SearchHit,
+    SemanticFallbackRecordDto,
 };
 
 pub(crate) struct SemanticHybridBatchOutcome {
     pub results: Vec<(String, Vec<HybridSearchScoredHit>)>,
     pub fallbacks: Vec<SemanticFallbackRecordDto>,
+    pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+}
+
+pub(crate) struct LexicalBatchOutcome {
+    pub results: Vec<(String, Vec<SearchHit>)>,
+    pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
 impl AppController {
@@ -19,7 +26,7 @@ impl AppController {
         &self,
         queries: &[String],
         max_results: usize,
-    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
+    ) -> Result<LexicalBatchOutcome, ApiError> {
         let batched = queries
             .iter()
             .map(|query| (query.clone(), max_results))
@@ -30,13 +37,21 @@ impl AppController {
     pub(crate) fn search_lexical_hybrid_batch(
         &self,
         queries: &[(String, usize)],
-    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
+    ) -> Result<LexicalBatchOutcome, ApiError> {
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LexicalBatchOutcome {
+                results: Vec::new(),
+                sidecar_diagnostics: Vec::new(),
+            });
         }
         if packet_batch_should_use_sidecar(self) {
             match search_sidecar_packet_batch(self, queries, None) {
-                Ok(results) => return Ok(results),
+                Ok(outcome) => {
+                    return Ok(LexicalBatchOutcome {
+                        results: outcome.results,
+                        sidecar_diagnostics: outcome.diagnostics,
+                    });
+                }
                 Err(error) => {
                     tracing::warn!(
                         "sidecar retrieval packet lexical batch unavailable; fail-closed: {}",
@@ -68,6 +83,7 @@ impl AppController {
             return Ok(SemanticHybridBatchOutcome {
                 results: Vec::new(),
                 fallbacks: Vec::new(),
+                sidecar_diagnostics: Vec::new(),
             });
         }
         if packet_batch_should_use_sidecar(self) {
@@ -76,9 +92,10 @@ impl AppController {
                 .map(|(query, max_results, _)| (query.clone(), *max_results))
                 .collect::<Vec<_>>();
             match search_sidecar_packet_batch(self, &batch, None) {
-                Ok(results) => {
+                Ok(outcome) => {
                     return Ok(SemanticHybridBatchOutcome {
-                        results: results
+                        results: outcome
+                            .results
                             .into_iter()
                             .map(|(query, hits)| {
                                 (
@@ -96,6 +113,7 @@ impl AppController {
                             })
                             .collect(),
                         fallbacks: Vec::new(),
+                        sidecar_diagnostics: outcome.diagnostics,
                     });
                 }
                 Err(error) => {
