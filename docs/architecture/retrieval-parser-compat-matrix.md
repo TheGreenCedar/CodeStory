@@ -4,7 +4,10 @@ This page is a parser-version compatibility record, not the language support
 contract. For runtime support tiers and safe public claims, use
 [language-support.md](language-support.md).
 
-This records Step 2 parser compatibility decisions from `retrieval-language-support_038d3ae9.plan.md` against the workspace policy:
+This records parser compatibility decisions against the workspace parser-version
+policy. The matrix exists so new parser candidates are judged against the
+current shared `tree-sitter` and `tree-sitter-graph` pins before they are
+treated as durable language-support evidence:
 
 - `tree-sitter = "0.24"`
 - `tree-sitter-graph = "0.12"`

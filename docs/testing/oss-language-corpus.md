@@ -98,7 +98,7 @@ cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapt
 
 Result: 18/18 languages passed. The run compared 4,308 raw files and
 1,272,498 raw LOC against CodeStory indexing of the same file lists. CodeStory
-indexed 4,308 files and produced 385,735 nodes and 312,269 edges with 0 errors
+indexed 4,308 files and produced 385,735 nodes and 312,268 edges with 0 errors
 and 0 fatal errors. The latest per-language JSONL evidence is in
 `target/oss-language-corpus/reports/oss-language-corpus-latest.jsonl`.
 
@@ -108,11 +108,11 @@ The cheap integrity check used by the Autoresearch gate is:
 node scripts\codestory-language-holdout-integrity.mjs
 ```
 
-It verifies that all 18 language-expansion repos are materialized at their
-manifest commits and that the latest OSS corpus report has 18 passed rows with
-matching raw/indexed file counts and zero errors. It is a freshness and
-contamination guard for the holdout corpus; it does not rerun the expensive
-indexing job.
+It validates the recorded artifact shape and provenance: all 18
+language-expansion repos are materialized at their manifest commits, and the
+latest OSS corpus report has 18 passed rows with matching raw/indexed file
+counts and zero errors. It is not a fresh indexing run unless the corpus test is
+rerun with `CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1`.
 
 ## Manifest
 

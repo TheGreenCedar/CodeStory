@@ -141,25 +141,13 @@ packet fixes; then a task must pass the current packet gate and improve over
 the previous packet-probe `quality-debug.json` or A/B `reanalyzed-runs.jsonl`
 packet-prelude manifest score before nested agents are launched.
 
-For anti-overfit language work, run packet probes with
-`CODESTORY_PACKET_EXACT_FAMILY_STEERING=0` so hidden exact library-family probes
-and static family citations are disabled. The current clean serial packet gate
-is:
-
-```text
-target/agent-benchmark/segment8-no-family-steering-full-packets-java-css-generic-shapes-serial
-```
-
-It scores `9/18` packet-quality passes without sidecar failures. The matching
-current packet-gated A/B slice is:
-
-```text
-target/agent-benchmark/segment8-no-family-steering-current9-ab-java-css-generic-shapes
-```
-
-That slice is useful for cost/time/tool-call accounting (`9/9` CodeStory
-quality versus `6/9` baseline), but it is not promotion evidence for all
-supported languages because the other nine rows still fail the packet gate.
+For anti-overfit language work, run packet probes with production defaults and
+keep exact-family steering behind `CODESTORY_EVAL_PROBES=1` diagnostics only.
+The current clean serial packet gate scores `9/18` packet-quality passes without
+sidecar failures. The matching packet-gated A/B slice is useful for
+cost/time/tool-call accounting (`9/9` CodeStory quality versus `6/9` baseline),
+but it is not promotion evidence for all supported languages because the other
+nine rows still fail the packet gate.
 
 The lower-level packet runtime mode can also be run directly with row-level
 parallelism:

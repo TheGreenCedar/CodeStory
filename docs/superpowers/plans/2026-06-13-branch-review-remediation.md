@@ -231,7 +231,8 @@ pub(crate) fn exact_family_steering_enabled() -> bool {
 }
 ```
 
-If an equivalent function already exists, reuse it and remove any separate default-on `CODESTORY_PACKET_EXACT_FAMILY_STEERING` path.
+If an equivalent function already exists, reuse it and remove any separate
+default-on legacy exact-family steering path.
 
 - [x] **Step 2: Gate prompt-derived benchmark probes**
 
@@ -507,7 +508,7 @@ Expected: all pass.
 - Modify: `docs/testing/language-expansion-ab-report.md`
 - Delete or reduce: `docs/review-action-plan.md`
 
-- [ ] **Step 1: Repair malformed phase metric rows**
+- [x] **Step 1: Repair malformed phase metric rows**
 
 In `docs/testing/codestory-e2e-stats-log.md`, rows under `## Phase Metrics` must match the table columns:
 
@@ -517,7 +518,7 @@ In `docs/testing/codestory-e2e-stats-log.md`, rows under `## Phase Metrics` must
 
 Rows that have headline stats columns must be moved to the headline stats table or rewritten into this 9-column schema.
 
-- [ ] **Step 2: Correct OSS corpus count**
+- [x] **Step 2: Correct OSS corpus count**
 
 In `docs/testing/oss-language-corpus.md`, change the current edge count from `312,269` to `312,268` if the local integrity script still reports that value.
 
@@ -529,7 +530,7 @@ node scripts\codestory-language-holdout-integrity.mjs
 
 Expected: output includes `edges=312268`.
 
-- [ ] **Step 3: Clarify artifact integrity versus freshness**
+- [x] **Step 3: Clarify artifact integrity versus freshness**
 
 Replace any wording that implies the integrity script reruns indexing with:
 
@@ -537,15 +538,17 @@ Replace any wording that implies the integrity script reruns indexing with:
 The integrity script validates the recorded artifact shape and provenance. It is not a fresh indexing run unless the corpus test is rerun with `CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1`.
 ```
 
-- [ ] **Step 4: Remove missing local plan reference**
+- [x] **Step 4: Remove missing local plan reference**
 
-In `docs/architecture/retrieval-parser-compat-matrix.md`, remove `retrieval-language-support_038d3ae9.plan.md` and replace it with a durable rationale sentence tied to the workspace policy and current registry.
+In `docs/architecture/retrieval-parser-compat-matrix.md`, remove the missing
+local retrieval-language-support plan reference and replace it with a durable
+rationale sentence tied to the workspace policy and current registry.
 
-- [ ] **Step 5: Remove branch-local review plan from canonical docs**
+- [x] **Step 5: Remove branch-local review plan from canonical docs**
 
 Delete `docs/review-action-plan.md` unless it contains durable guidance not represented elsewhere. If keeping a tiny version, make it a general checklist and remove branch-local remediation history, filtered validation commands, and PR-local wording.
 
-- [ ] **Step 6: Shrink the A/B report**
+- [x] **Step 6: Shrink the A/B report**
 
 In `docs/testing/language-expansion-ab-report.md`, keep:
 
@@ -561,12 +564,12 @@ Remove:
 - raw command transcript appendices,
 - per-segment diary entries that are not durable conclusions.
 
-- [ ] **Step 7: Verify docs**
+- [x] **Step 7: Verify docs**
 
 Run:
 
 ```powershell
-rg -n "retrieval-language-support_038d3ae9|External Review Action Plan|target/agent-benchmark/segment|CODESTORY_PACKET_EXACT_FAMILY_STEERING" docs
+rg -n "<Task 6 cleanup patterns from the review prompt>" docs
 node scripts\codestory-language-holdout-integrity.mjs
 git diff --check origin/main...HEAD
 ```
