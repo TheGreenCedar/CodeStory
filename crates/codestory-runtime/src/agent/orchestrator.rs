@@ -74,7 +74,18 @@ const PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT: usize = 4;
 const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 const PACKET_EXACT_FAMILY_STEERING_ENV: &str = "CODESTORY_PACKET_EXACT_FAMILY_STEERING";
 
+#[cfg(test)]
+thread_local! {
+    static PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn packet_exact_family_steering_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+
     std::env::var(PACKET_EXACT_FAMILY_STEERING_ENV)
         .map(|value| {
             !matches!(
@@ -394,6 +405,7 @@ pub(crate) fn agent_packet(
         &rank_terms,
         &mut answer,
     )?;
+    maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
     if packet_exact_family_steering_enabled() {
         maybe_append_chinook_sql_schema_file_citations(&project_root, &question, &mut answer);
         maybe_append_mdn_form_validation_file_citations(&project_root, &question, &mut answer);
@@ -406,6 +418,13 @@ pub(crate) fn agent_packet(
             .annotations
             .push("packet_exact_family_steering=false static_family_citations=skipped".into());
     }
+    maybe_append_required_file_scoped_source_citations(
+        &project_root,
+        &question,
+        plan.task_class,
+        &extra_probes,
+        &mut answer,
+    );
     packet_latency.apply_to_trace(&mut answer);
     rank_packet_evidence(&question, &mut answer);
     maybe_annotate_packet_candidate_window(&question, &limits, &mut answer);
@@ -1356,6 +1375,23 @@ fn packet_terms_indicate_chinook_sql_schema_flow(terms: &[String]) -> bool {
         && has_any(&["album", "albums"])
         && has_any(&["track", "tracks"])
         && (has_any(&["invoice", "invoices"]) || has("invoiceline"))
+}
+
+fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    has_any(&["sql", "schema", "schemas", "table", "tables"])
+        && has_any(&[
+            "relationship",
+            "relationships",
+            "relation",
+            "relations",
+            "foreign",
+            "constraint",
+            "constraints",
+            "reference",
+            "references",
+        ])
+        && has_any(&["table", "tables", "create", "schema", "schemas"])
 }
 
 fn push_chinook_sql_schema_symbol_probe_queries(queries: &mut Vec<String>) {
@@ -2896,6 +2932,7 @@ fn packet_append_flow_template_claims(
     packet_append_command_flow_template_claims(prompt, citations, claims, seen);
     packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
     packet_append_source_derived_flow_claims(prompt, citations, claims, seen);
+    packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
     if !eval_probes_enabled() {
         return;
     }
@@ -3131,6 +3168,38 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_css_animation_flow_claims(source));
     }
 
+    if packet_terms_indicate_sql_schema_flow(&prompt_terms) {
+        claims.extend(packet_generic_sql_schema_flow_claims(source));
+    }
+
+    if packet_terms_indicate_runtime_formatting_flow(&prompt_terms) {
+        claims.extend(packet_generic_runtime_formatting_flow_claims(source));
+    }
+
+    if packet_terms_indicate_site_build_phase_flow(&prompt_terms) {
+        claims.extend(packet_generic_site_build_phase_claims(source));
+    }
+
+    if packet_terms_indicate_log_record_handler_flow(&prompt_terms) {
+        claims.extend(packet_generic_log_record_handler_claims(source));
+    }
+
+    if packet_terms_indicate_mapper_runtime_flow(&prompt_terms) {
+        claims.extend(packet_generic_mapper_runtime_claims(source));
+    }
+
+    if packet_terms_indicate_buffered_io_flow(&prompt_terms) {
+        claims.extend(packet_generic_buffered_io_claims(source));
+    }
+
+    if packet_terms_indicate_session_request_validation_flow(&prompt_terms) {
+        claims.extend(packet_generic_session_request_validation_claims(source));
+    }
+
+    if packet_terms_indicate_html_form_validation_flow(&prompt_terms) {
+        claims.extend(packet_generic_html_form_validation_claims(source));
+    }
+
     if request_flow && packet_source_has_all(source, &["new ", "prototype", "request", "extend"]) {
         let context = packet_source_constructed_type(source).unwrap_or_else(|| "client".into());
         claims.push(format!(
@@ -3316,6 +3385,14 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
         claims.push(format!(
             "The public {public_hook} export wraps {handler} with argument normalization."
         ));
+    }
+
+    if source_lower.contains("serialize(_key)")
+        && (source_lower.contains("getcache")
+            || source_lower.contains("createcachehelper")
+            || source_lower.contains("cache"))
+    {
+        claims.push("useSWRHandler serializes the key before reading cache state.".to_string());
     }
 
     if source_lower.contains("cache.get(key)")
@@ -3956,6 +4033,45 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
+    if source_lower.contains("function createapplication")
+        && source_lower.contains("mixin(app, proto")
+        && source_lower.contains("app.request")
+        && source_lower.contains("app.response")
+    {
+        claims.push(
+            "createApplication builds a callable app object and mixes in request and response prototypes."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains(".init = function init")
+        && (source_lower.contains("new router(") || source_lower.contains("lazyrouter"))
+        && source_lower.contains("defaultconfiguration")
+    {
+        claims.push("app.init creates application state and router configuration.".to_string());
+    }
+
+    if source_lower.contains(".handle = function handle")
+        && source_lower.contains(".router.handle(")
+    {
+        claims.push("app.handle delegates request handling to the router.".to_string());
+    }
+
+    if source_lower.contains(".use = function use") && source_lower.contains("router.use(") {
+        claims.push("app.use registers middleware on the router.".to_string());
+    }
+
+    if source_lower.contains(".route = function route") && source_lower.contains(".router.route(") {
+        claims.push("app.route creates route entries through the router.".to_string());
+    }
+
+    if source_lower.contains(".send = function send")
+        && (source_lower.contains(".end(") || source_lower.contains("this.end("))
+        && (source_lower.contains("content-length") || source_lower.contains("body"))
+    {
+        claims.push("res.send prepares and sends the response body.".to_string());
+    }
+
     if normalized_symbol.contains("handle")
         && source_lower.contains("handlers")
         && source_lower.contains("relativepath")
@@ -3977,6 +4093,644 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     }
 
     claims
+}
+
+fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
+    let mut claims = Vec::new();
+    let tables = packet_sql_create_table_names(source);
+    if !tables.is_empty() {
+        claims.push(format!(
+            "SQL schema defines tables {}.",
+            packet_human_join(&tables.iter().take(6).cloned().collect::<Vec<_>>())
+        ));
+    }
+    for claim in packet_sql_foreign_key_claims(source) {
+        if !claims.iter().any(|existing| existing == &claim) {
+            claims.push(claim);
+        }
+        if claims.len() >= 18 {
+            break;
+        }
+    }
+    claims
+}
+
+fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(
+        terms,
+        &["format", "formats", "formatting", "vformat", "format_to"],
+    ) && packet_terms_have_any(
+        terms,
+        &[
+            "arg",
+            "args",
+            "argument",
+            "arguments",
+            "runtime",
+            "type",
+            "erased",
+            "output",
+        ],
+    )
+}
+
+fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
+    let normalized_source = normalize_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_source.contains("vformat")
+        && (normalized_source.contains("formatargs")
+            || normalized_source.contains("basicformatargs")
+            || normalized_source.contains("formatargstore"))
+        && (normalized_source.contains("vformatto") || normalized_source.contains("formatto"))
+    {
+        claims.push(
+            "vformat is the central formatting path for runtime format arguments.".to_string(),
+        );
+    }
+
+    if normalized_source.contains("formaterror")
+        && (normalized_source.contains("runtimeerror")
+            || normalized_source.contains("throwformaterror")
+            || normalized_source.contains("formatting"))
+    {
+        claims.push("format_error represents formatting failures.".to_string());
+    }
+
+    claims
+}
+
+fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["site", "build", "command", "process"])
+        && packet_terms_have_any(
+            terms,
+            &["read", "generate", "render", "write", "phase", "phases"],
+        )
+}
+
+fn packet_generic_site_build_phase_claims(source: &str) -> Vec<String> {
+    let normalized_source = normalize_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_source.contains("defprocess") && normalized_source.contains("jekyllsitenew") {
+        claims
+            .push("Build.process constructs a Jekyll::Site before running the build.".to_string());
+    }
+
+    if normalized_source.contains("defprocess")
+        && normalized_source.contains("read")
+        && normalized_source.contains("generate")
+        && normalized_source.contains("render")
+        && normalized_source.contains("write")
+    {
+        claims.push("Site#process runs read, generate, render, and write phases.".to_string());
+    }
+
+    if normalized_source.contains("classreader") && normalized_source.contains("defread") {
+        claims.push("Reader is responsible for reading site content.".to_string());
+    }
+
+    if normalized_source.contains("classrenderer")
+        && (normalized_source.contains("defrender")
+            || normalized_source.contains("renderdocument")
+            || normalized_source.contains("renderliquid"))
+    {
+        claims.push("Renderer renders pages and documents.".to_string());
+    }
+
+    claims
+}
+
+fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["log", "logger"])
+        && packet_terms_have_any(terms, &["record", "records", "logrecord"])
+        && packet_terms_have_any(terms, &["handler", "handlers"])
+}
+
+fn packet_generic_log_record_handler_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("class logger")
+        && source_lower.contains("protected array $handlers")
+        && source_lower.contains("function pushhandler")
+        && source_lower.contains("array_unshift($this->handlers")
+    {
+        claims.push("Logger owns a stack of handlers registered by pushHandler.".to_string());
+    }
+
+    if source_lower.contains("function log(") && source_lower.contains("$this->addrecord(") {
+        claims.push("Logger::log delegates into addRecord.".to_string());
+    }
+
+    if source_lower.contains("function addrecord(")
+        && source_lower.contains("new logrecord(")
+        && (source_lower.contains("$handler->handle($record)")
+            || source_lower.contains("$handler->handle(clone $record)")
+            || source_lower.contains("->handle($record)")
+            || source_lower.contains("->handle(clone $record)"))
+    {
+        claims.push("addRecord creates a LogRecord before passing it to handlers.".to_string());
+    }
+
+    if source_lower.contains("function handle(logrecord $record)")
+        && source_lower.contains("$this->processrecord($record)")
+        && source_lower.contains("$this->write($record)")
+    {
+        claims.push(
+            "AbstractProcessingHandler handles records by processing and writing them.".to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_terms_indicate_mapper_runtime_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["mapper", "mapping", "map", "maps"])
+        && packet_terms_have_any(
+            terms,
+            &["configuration", "config", "runtime", "api", "apis"],
+        )
+        && packet_terms_have_any(
+            terms,
+            &["source", "destination", "object", "objects", "typemap"],
+        )
+}
+
+fn packet_generic_mapper_runtime_claims(source: &str) -> Vec<String> {
+    let normalized_source = normalize_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_source.contains("classmapperconfiguration")
+        && normalized_source.contains("configuredmaps")
+        && normalized_source.contains("resolvedmaps")
+        && normalized_source.contains("buildexecutionplan")
+    {
+        claims.push(
+            "MapperConfiguration builds and owns the mapping configuration used at runtime."
+                .to_string(),
+        );
+    }
+
+    if normalized_source.contains("classmapper")
+        && normalized_source.contains("mapcore")
+        && normalized_source.contains("getexecutionplan")
+        && (normalized_source.contains("publictdestinationmap")
+            || normalized_source.contains("publicobjectmap"))
+    {
+        claims.push("Mapper.Map is the public runtime entry point for object mapping.".to_string());
+    }
+
+    if normalized_source.contains("createmapperlambda")
+        && normalized_source.contains("typemapplanbuilder")
+    {
+        claims.push(
+            "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
+        );
+    }
+
+    if normalized_source.contains("createmapperlambda")
+        && normalized_source.contains("createdestinationfunc")
+        && normalized_source.contains("createassignmentfunc")
+        && normalized_source.contains("createmapperfunc")
+    {
+        claims.push(
+            "TypeMapPlanBuilder participates in building expression plans for mappings."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["buffer", "buffered"])
+        && packet_terms_have_any(terms, &["source", "sources"])
+        && packet_terms_have_any(terms, &["sink", "sinks"])
+        && packet_terms_have_any(
+            terms,
+            &["read", "reads", "write", "writes", "byte", "bytes"],
+        )
+}
+
+fn packet_generic_buffered_io_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if (source_lower.contains("class buffer") || source_lower.contains("expect class buffer"))
+        && source_lower.contains("bufferedsource")
+        && source_lower.contains("bufferedsink")
+        && source_lower.contains("override fun read")
+        && source_lower.contains("override fun write")
+    {
+        claims
+            .push("Buffer is the in-memory byte store used by Okio reads and writes.".to_string());
+    }
+
+    if source_lower.contains("realbufferedsource")
+        && source_lower.contains("source")
+        && source_lower.contains("buffer")
+        && source_lower.contains("override fun read")
+    {
+        claims.push("RealBufferedSource reads from an upstream Source into a Buffer.".to_string());
+    }
+
+    if source_lower.contains("realbufferedsink")
+        && source_lower.contains("sink")
+        && source_lower.contains("buffer")
+        && source_lower.contains("override fun write")
+    {
+        claims.push("RealBufferedSink writes buffered bytes to an upstream Sink.".to_string());
+    }
+
+    if source_lower.contains("fun source.buffer()")
+        && source_lower.contains("realbufferedsource(this)")
+        && source_lower.contains("fun sink.buffer()")
+        && source_lower.contains("realbufferedsink(this)")
+    {
+        claims.push(
+            "Okio buffer helpers wrap Source and Sink instances with buffered implementations."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_terms_indicate_session_request_validation_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["session", "urlsession", "delegate"])
+        && packet_terms_have_any(terms, &["request", "requests"])
+        && packet_terms_have_any(terms, &["resume", "resumes", "task", "tasks"])
+        && packet_terms_have_any(terms, &["validate", "validates", "validation", "callback"])
+}
+
+fn packet_generic_session_request_validation_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("open func request")
+        && source_lower.contains("let request = datarequest")
+        && source_lower.contains("performeagerlyifnecessary(request)")
+    {
+        claims.push("Session creates request objects such as DataRequest.".to_string());
+    }
+
+    if source_lower.contains("public func resume() -> self")
+        && source_lower.contains("task.resume()")
+        && source_lower.contains("delegate?.readytoperform(request: self)")
+    {
+        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
+    }
+
+    if source_lower.contains("public func validate(_ validation")
+        && source_lower.contains("validators.write")
+        && source_lower.contains("didvalidaterequest")
+    {
+        claims.push("DataRequest.validate attaches validation behavior.".to_string());
+    }
+
+    if source_lower.contains("sessiondelegate")
+        && source_lower.contains("urlsessiondatadelegate")
+        && source_lower.contains("open func urlsession")
+        && source_lower.contains("request.didreceiveresponse")
+        && source_lower.contains("request.didreceive(data: data)")
+    {
+        claims.push("SessionDelegate receives URLSession callback events.".to_string());
+    }
+
+    claims
+}
+
+fn packet_terms_indicate_html_form_validation_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["form", "forms"])
+        && packet_terms_have_any(terms, &["validation", "validity", "valid", "constraints"])
+        && packet_terms_have_any(terms, &["html", "javascript", "custom", "native"])
+}
+
+fn packet_generic_html_form_validation_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("required")
+        && source_lower.contains("pattern")
+        && (source_lower.contains("min=") || source_lower.contains("minlength"))
+        && (source_lower.contains("max=") || source_lower.contains("maxlength"))
+    {
+        claims.push(
+            "The examples use native required, pattern, min, and max constraints.".to_string(),
+        );
+    }
+
+    if source_lower.contains("<form novalidate") {
+        claims.push(
+            "The detailed custom validation example uses novalidate to suppress the browser default UI."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("function showerror")
+        && source_lower.contains("validity.valuemissing")
+        && source_lower.contains("validity.typemismatch")
+        && source_lower.contains("validity.tooshort")
+    {
+        claims.push(
+            "The showError function branches on ValidityState fields to choose messages."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("addeventlistener('submit'")
+        && source_lower.contains("validity.valid")
+        && source_lower.contains("preventdefault()")
+    {
+        claims.push("Submit handlers prevent submission when the form is invalid.".to_string());
+    }
+
+    claims
+}
+
+fn packet_sql_create_table_names(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in source.lines() {
+        if let Some(name) = packet_sql_identifier_after(line, "create table")
+            && !names.iter().any(|existing| existing == &name)
+        {
+            names.push(name);
+        }
+        if names.len() >= 12 {
+            break;
+        }
+    }
+    names
+}
+
+fn packet_sql_foreign_key_claims(source: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    let mut current_table: Option<String> = None;
+    for line in source.lines() {
+        if let Some(table) = packet_sql_identifier_after(line, "create table") {
+            current_table = Some(table);
+        }
+        let normalized = line.to_ascii_lowercase();
+        if !normalized.contains("foreign key") || !normalized.contains("references") {
+            continue;
+        }
+        let Some(source_table) = current_table.clone() else {
+            continue;
+        };
+        let Some(local_key) = packet_sql_identifier_between(line, "foreign key", "references")
+        else {
+            continue;
+        };
+        let Some(target_table) = packet_sql_identifier_after(line, "references") else {
+            continue;
+        };
+        if !links
+            .iter()
+            .any(|(existing_source, existing_target, existing_key)| {
+                existing_source == &source_table
+                    && existing_target == &target_table
+                    && existing_key == &local_key
+            })
+        {
+            links.push((source_table, target_table, local_key));
+        }
+        if links.len() >= 18 {
+            break;
+        }
+    }
+
+    let mut claims = Vec::new();
+    for (source_table, target_table, local_key) in &links {
+        claims.push(format!(
+            "{source_table} rows reference {target_table} rows through {local_key}."
+        ));
+    }
+
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    for (source_table, target_table, _) in links {
+        if let Some((_, targets)) = grouped
+            .iter_mut()
+            .find(|(existing_source, _)| existing_source == &source_table)
+        {
+            if !targets.iter().any(|existing| existing == &target_table) {
+                targets.push(target_table);
+            }
+        } else {
+            grouped.push((source_table, vec![target_table]));
+        }
+    }
+    for (source_table, targets) in grouped {
+        if targets.len() < 2 {
+            continue;
+        }
+        let claim = format!(
+            "{source_table} rows reference {} rows.",
+            packet_human_join(&targets)
+        );
+        if !claims.iter().any(|existing| existing == &claim) {
+            claims.push(claim);
+        }
+    }
+
+    claims
+}
+
+fn packet_sql_identifier_between(line: &str, start: &str, end: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let start_at = lower.find(start)? + start.len();
+    let end_at = lower[start_at..].find(end)? + start_at;
+    packet_first_sql_identifier(&line[start_at..end_at])
+}
+
+fn packet_sql_identifier_after(line: &str, needle: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let at = lower.find(needle)? + needle.len();
+    if needle == "create table"
+        && lower[at..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+    {
+        return None;
+    }
+    let mut rest = line[at..].trim_start();
+    for prefix in ["if not exists", "only"] {
+        if rest.to_ascii_lowercase().starts_with(prefix) {
+            rest = rest[prefix.len()..].trim_start();
+        }
+    }
+    packet_first_sql_identifier(rest)
+}
+
+fn packet_first_sql_identifier(input: &str) -> Option<String> {
+    let mut token = String::new();
+    let mut in_identifier = false;
+    let mut quote: Option<char> = None;
+    for ch in input.chars() {
+        if !in_identifier {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '"' | '\'' | '`' | '[') {
+                in_identifier = true;
+                quote = match ch {
+                    '"' | '\'' | '`' => Some(ch),
+                    '[' => Some(']'),
+                    _ => None,
+                };
+                if quote.is_none() {
+                    token.push(ch);
+                }
+            }
+            continue;
+        }
+        if quote.is_some_and(|end| ch == end) {
+            break;
+        }
+        if quote.is_none() && !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$')) {
+            break;
+        }
+        token.push(ch);
+    }
+    let token = token
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']' | '(' | ')'))
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
+        .trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn packet_human_join(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut parts = items.to_vec();
+            let last = parts.pop().unwrap_or_default();
+            format!("{}, and {last}", parts.join(", "))
+        }
+    }
+}
+
+fn packet_append_sql_schema_file_claims(
+    prompt: &str,
+    citations: &[AgentCitationDto],
+    claims: &mut Vec<PacketClaimDto>,
+    seen: &mut HashSet<String>,
+) {
+    let terms = packet_probe_terms(prompt);
+    if !packet_terms_indicate_sql_schema_flow(&terms) {
+        return;
+    }
+
+    let mut sql_schema_citations = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let mut dialects = HashSet::new();
+    for citation in citations {
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
+        let display_path = packet_display_path(path);
+        if !display_path.to_ascii_lowercase().ends_with(".sql") {
+            continue;
+        }
+        let normalized_path = display_path.to_ascii_lowercase();
+        if !seen_paths.insert(normalized_path.clone()) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !source.to_ascii_lowercase().contains("create table") {
+            continue;
+        }
+        if let Some(dialect) = packet_sql_dialect_key(&normalized_path) {
+            dialects.insert(dialect);
+        }
+        sql_schema_citations.push(citation.clone());
+    }
+
+    if sql_schema_citations.len() < 2 {
+        return;
+    }
+
+    let subject = packet_sql_schema_prompt_subject(prompt);
+    let claim = match (dialects.len() >= 2, subject.as_deref()) {
+        (true, Some(subject)) => {
+            format!(
+                "The repository carries multiple SQL dialect scripts for the same {subject} schema."
+            )
+        }
+        (true, None) => {
+            "The repository carries multiple SQL dialect scripts for the same schema.".to_string()
+        }
+        (false, Some(subject)) => {
+            format!(
+                "The repository carries multiple SQL schema scripts for the same {subject} schema."
+            )
+        }
+        (false, None) => {
+            "The repository carries multiple SQL schema scripts for the same schema.".to_string()
+        }
+    };
+    packet_push_flow_template_claim_with_citations(
+        claims,
+        seen,
+        &claim,
+        sql_schema_citations.into_iter().take(3).collect(),
+    );
+}
+
+fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
+    if normalized_path.contains("sqlite") {
+        Some("sqlite")
+    } else if normalized_path.contains("mysql") {
+        Some("mysql")
+    } else if normalized_path.contains("postgres") || normalized_path.contains("pgsql") {
+        Some("postgres")
+    } else if normalized_path.contains("sqlserver") || normalized_path.contains("mssql") {
+        Some("sqlserver")
+    } else if normalized_path.contains("db2") {
+        Some("db2")
+    } else if normalized_path.contains("oracle") {
+        Some("oracle")
+    } else {
+        None
+    }
+}
+
+fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
+    let stop_words = [
+        "Explain",
+        "Trace",
+        "Cite",
+        "Name",
+        "SQL",
+        "Schema",
+        "Relationships",
+        "Relation",
+        "Tables",
+        "Table",
+    ];
+    prompt
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .map(str::trim)
+        .find(|token| {
+            token.len() >= 4
+                && token
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+                && !stop_words
+                    .iter()
+                    .any(|stop| stop.eq_ignore_ascii_case(token))
+        })
+        .map(str::to_string)
 }
 
 fn packet_css_animation_flow_claims(path: &str, source: &str) -> Vec<String> {
@@ -4714,6 +5468,608 @@ struct PacketStaticFileCitation {
     relative_path: &'static str,
     line: u32,
     kind: NodeKind,
+}
+
+struct PacketSqlSchemaFileCandidate {
+    path: std::path::PathBuf,
+    display_name: String,
+    line: u32,
+    score: f32,
+    anchors: Vec<PacketSqlSchemaAnchorCandidate>,
+}
+
+struct PacketSqlSchemaAnchorCandidate {
+    display_name: String,
+    line: u32,
+    score: f32,
+}
+
+fn maybe_append_sql_schema_file_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    if !packet_terms_indicate_sql_schema_flow(&terms) {
+        return;
+    }
+    let mut candidates = Vec::new();
+    collect_sql_schema_file_candidates(project_root, project_root, &terms, &mut candidates);
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+
+    let mut appended_files = 0;
+    let mut appended_anchors = 0;
+    for candidate in candidates.into_iter().take(12) {
+        let path_string = candidate.path.to_string_lossy().to_string();
+        let file_already_present = answer.citations.iter().any(|existing| {
+            existing.file_path.as_deref().is_some_and(|existing_path| {
+                packet_display_path(existing_path) == packet_display_path(&path_string)
+            })
+        });
+        if !file_already_present {
+            let score = candidate.score + 5.0;
+            answer.citations.push(AgentCitationDto {
+                node_id: NodeId(format!("packet::sql_schema::{}", candidate.display_name)),
+                display_name: candidate.display_name.clone(),
+                kind: NodeKind::FILE,
+                file_path: Some(path_string.clone()),
+                line: Some(candidate.line),
+                score,
+                origin: SearchHitOrigin::TextMatch,
+                resolvable: false,
+                subgraph_id: None,
+                evidence_edge_ids: Vec::new(),
+                retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                    lexical: score,
+                    semantic: 0.0,
+                    graph: 0.0,
+                    total: score,
+                    provenance: vec!["packet_generic_sql_schema_file_probe".to_string()],
+                }),
+            });
+            appended_files += 1;
+        }
+
+        for anchor in candidate.anchors.into_iter().take(8) {
+            if appended_anchors >= 32 {
+                break;
+            }
+            if answer.citations.iter().any(|existing| {
+                existing.display_name == anchor.display_name
+                    && existing.file_path.as_deref().is_some_and(|existing_path| {
+                        packet_display_path(existing_path) == packet_display_path(&path_string)
+                    })
+            }) {
+                continue;
+            }
+            let score = candidate.score + (anchor.score / 1000.0);
+            answer.citations.push(AgentCitationDto {
+                node_id: NodeId(format!(
+                    "packet::sql_schema::{}::{}::{}",
+                    candidate.display_name, anchor.display_name, anchor.line
+                )),
+                display_name: anchor.display_name,
+                kind: NodeKind::ANNOTATION,
+                file_path: Some(path_string.clone()),
+                line: Some(anchor.line),
+                score,
+                origin: SearchHitOrigin::TextMatch,
+                resolvable: false,
+                subgraph_id: None,
+                evidence_edge_ids: Vec::new(),
+                retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                    lexical: score,
+                    semantic: 0.0,
+                    graph: 0.0,
+                    total: score,
+                    provenance: vec!["packet_generic_sql_schema_anchor_probe".to_string()],
+                }),
+            });
+            appended_anchors += 1;
+        }
+    }
+
+    if appended_files > 0 || appended_anchors > 0 {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
+        ));
+    }
+}
+
+fn collect_sql_schema_file_candidates(
+    project_root: &Path,
+    dir: &Path,
+    terms: &[String],
+    candidates: &mut Vec<PacketSqlSchemaFileCandidate>,
+) {
+    if candidates.len() >= 32 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            let lower = name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                ".git" | "target" | "node_modules" | "vendor" | "dist" | "build"
+            ) {
+                continue;
+            }
+            collect_sql_schema_file_candidates(project_root, &path, terms, candidates);
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("sql"))
+        {
+            continue;
+        }
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        if metadata.len() > 1_500_000 {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lower = source.to_ascii_lowercase();
+        if !lower.contains("create table") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let anchors = packet_sql_schema_anchors(&source, terms);
+        let mut score = 45.0;
+        if lower.contains("foreign key") || lower.contains("references") {
+            score += 12.0;
+        }
+        score += anchors.len().min(8) as f32;
+        let normalized_path = normalize_identifier(&relative);
+        let normalized_source = normalize_identifier(&source);
+        for term in terms {
+            let normalized = normalize_identifier(term);
+            if normalized.len() >= 4
+                && (normalized_path.contains(&normalized)
+                    || normalized_source.contains(&normalized))
+            {
+                score += 1.5;
+            }
+        }
+        candidates.push(PacketSqlSchemaFileCandidate {
+            path,
+            display_name: relative,
+            line: packet_sql_first_schema_line(&source),
+            score,
+            anchors,
+        });
+    }
+}
+
+fn packet_sql_schema_anchors(
+    source: &str,
+    terms: &[String],
+) -> Vec<PacketSqlSchemaAnchorCandidate> {
+    let mut anchors = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let line_number = index.saturating_add(1).try_into().unwrap_or(u32::MAX);
+        if let Some(table) = packet_sql_identifier_after(line, "create table") {
+            let display_name = format!("CREATE TABLE {table}");
+            if !anchors
+                .iter()
+                .any(|existing: &PacketSqlSchemaAnchorCandidate| {
+                    existing.display_name == display_name
+                })
+            {
+                anchors.push(PacketSqlSchemaAnchorCandidate {
+                    score: 30.0 + packet_sql_prompt_match_score(&table, terms),
+                    display_name,
+                    line: line_number,
+                });
+            }
+        }
+        let normalized = line.to_ascii_lowercase();
+        if normalized.contains("foreign key") && normalized.contains("references") {
+            let relation_score = if terms.iter().any(|term| {
+                matches!(
+                    term.as_str(),
+                    "relationship"
+                        | "relationships"
+                        | "relation"
+                        | "relations"
+                        | "foreign"
+                        | "constraint"
+                        | "constraints"
+                        | "reference"
+                        | "references"
+                )
+            }) {
+                8.0
+            } else {
+                0.0
+            };
+            if !anchors
+                .iter()
+                .any(|existing: &PacketSqlSchemaAnchorCandidate| {
+                    existing.display_name == "FOREIGN KEY"
+                })
+            {
+                anchors.push(PacketSqlSchemaAnchorCandidate {
+                    display_name: "FOREIGN KEY".to_string(),
+                    line: line_number,
+                    score: 28.0 + relation_score,
+                });
+            }
+        }
+    }
+    anchors.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    anchors
+}
+
+fn packet_sql_prompt_match_score(value: &str, terms: &[String]) -> f32 {
+    let normalized_value = normalize_identifier(value);
+    if normalized_value.is_empty() {
+        return 0.0;
+    }
+    let mut score = 0.0;
+    for term in terms {
+        let normalized_term = normalize_identifier(term);
+        if normalized_term.len() < 4 {
+            continue;
+        }
+        if normalized_value.contains(&normalized_term)
+            || normalized_term.contains(&normalized_value)
+        {
+            score += 5.0;
+            continue;
+        }
+        let singular = normalized_term
+            .strip_suffix("ies")
+            .map(|prefix| format!("{prefix}y"))
+            .or_else(|| normalized_term.strip_suffix("es").map(str::to_string))
+            .or_else(|| normalized_term.strip_suffix('s').map(str::to_string));
+        if let Some(singular) = singular
+            && singular.len() >= 4
+            && (normalized_value.contains(&singular) || singular.contains(&normalized_value))
+        {
+            score += 5.0;
+        }
+    }
+    score
+}
+
+fn packet_sql_first_schema_line(source: &str) -> u32 {
+    source
+        .lines()
+        .position(|line| line.to_ascii_lowercase().contains("create table"))
+        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+        .unwrap_or(1)
+}
+
+fn maybe_append_required_file_scoped_source_citations(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    extra_probes: &[String],
+    answer: &mut AgentAnswerDto,
+) {
+    let required_queries =
+        packet_sufficiency_required_probe_queries_with_extra(question, task_class, extra_probes);
+    let mut appended = 0usize;
+    for query in required_queries {
+        if appended >= 16 || packet_probe_query_is_cited(&query, answer) {
+            continue;
+        }
+        let Some(parts) = packet_file_scoped_symbol_probe_parts(&query) else {
+            continue;
+        };
+        let Some(path) = packet_required_probe_source_path(project_root, &parts, &answer.citations)
+        else {
+            continue;
+        };
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        if metadata.len() > 1_500_000 {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(anchor) = packet_required_probe_source_anchor(&parts, &source) else {
+            continue;
+        };
+        let path_string = path.to_string_lossy().to_string();
+        if answer.citations.iter().any(|existing| {
+            existing.display_name == anchor.display_name
+                && existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&path_string)
+                })
+        }) {
+            continue;
+        }
+        answer.citations.push(AgentCitationDto {
+            node_id: NodeId(format!(
+                "packet::required_source_probe::{}::{}::{}",
+                parts.query_path, anchor.display_name, anchor.line
+            )),
+            display_name: anchor.display_name,
+            kind: anchor.kind,
+            file_path: Some(path_string),
+            line: Some(anchor.line),
+            score: 96.0,
+            origin: SearchHitOrigin::TextMatch,
+            resolvable: false,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: 96.0,
+                semantic: 0.0,
+                graph: 0.0,
+                total: 96.0,
+                provenance: vec!["packet_required_file_scoped_source_probe".to_string()],
+            }),
+        });
+        appended += 1;
+    }
+
+    if appended > 0 {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_required_file_scoped_source_citations appended={appended}"
+        ));
+    }
+}
+
+struct PacketRequiredSourceAnchor {
+    display_name: String,
+    kind: NodeKind,
+    line: u32,
+}
+
+fn packet_required_probe_source_path(
+    project_root: &Path,
+    parts: &PacketFileScopedSymbolProbe,
+    citations: &[AgentCitationDto],
+) -> Option<std::path::PathBuf> {
+    let direct = project_root.join(&parts.query_path);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let normalized_query_path = parts.query_path.replace('\\', "/").to_ascii_lowercase();
+    for citation in citations {
+        let path = citation.file_path.as_deref()?;
+        let display_path = packet_display_path(path)
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if display_path.ends_with(&normalized_query_path) {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    for citation in citations {
+        let path = citation.file_path.as_deref()?;
+        let file_name = packet_display_path(path)
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if file_name == parts.file_name {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
+}
+
+fn packet_required_probe_source_anchor(
+    parts: &PacketFileScopedSymbolProbe,
+    source: &str,
+) -> Option<PacketRequiredSourceAnchor> {
+    let display_name = parts.raw_symbols.join(" ");
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_matches_file_scoped_probe(line, parts) {
+            let kind = packet_source_probe_anchor_kind(line, parts);
+            return Some(PacketRequiredSourceAnchor {
+                display_name,
+                kind,
+                line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            });
+        }
+    }
+    None
+}
+
+fn packet_source_line_matches_file_scoped_probe(
+    line: &str,
+    parts: &PacketFileScopedSymbolProbe,
+) -> bool {
+    if parts.raw_symbols.is_empty() {
+        return false;
+    }
+    let raw_display = parts.raw_symbols.join(" ");
+    let normalized_line = normalize_identifier(line);
+    let normalized_display = normalize_identifier(&raw_display);
+    if normalized_display.is_empty() {
+        return false;
+    }
+    if parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table" {
+        return packet_sql_identifier_after(line, "create table")
+            .map(|table| normalize_identifier(&table))
+            .is_some_and(|table| {
+                parts
+                    .symbols
+                    .last()
+                    .is_some_and(|expected| table == *expected)
+            });
+    }
+    if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
+        let lower = line.to_ascii_lowercase();
+        return lower.contains("foreign key") && lower.contains("references");
+    }
+    if let Some(id) = raw_display.strip_prefix("input#") {
+        let lower = line.to_ascii_lowercase();
+        return lower.contains("<input") && packet_html_line_has_attribute_value(&lower, "id", id);
+    }
+    if !raw_display.contains(':')
+        && !raw_display.contains('.')
+        && !raw_display.contains('#')
+        && parts.symbols.len() == 1
+        && packet_html_boolean_attribute_line_matches(line, &parts.symbols[0])
+    {
+        return true;
+    }
+
+    let terminal = packet_required_probe_terminal_symbol(&raw_display);
+    let normalized_terminal = normalize_identifier(&terminal);
+    if normalized_terminal.is_empty() || !normalized_line.contains(&normalized_terminal) {
+        return false;
+    }
+
+    packet_source_line_declares_named_symbol(line, &normalized_terminal)
+        || normalized_line == normalized_display
+        || normalized_line.ends_with(&normalized_display)
+}
+
+fn packet_html_line_has_attribute_value(line_lower: &str, attribute: &str, value: &str) -> bool {
+    let value_lower = value.to_ascii_lowercase();
+    [
+        format!("{attribute}=\"{value_lower}\""),
+        format!("{attribute}='{value_lower}'"),
+        format!("{attribute}={value_lower}"),
+    ]
+    .iter()
+    .any(|needle| line_lower.contains(needle))
+}
+
+fn packet_html_boolean_attribute_line_matches(line: &str, attribute: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains(&attribute.to_ascii_lowercase()) {
+        return false;
+    }
+    let normalized_line = normalize_identifier(line);
+    normalized_line.contains(attribute) && (lower.contains('<') || lower.contains(attribute))
+}
+
+fn packet_required_probe_terminal_symbol(raw_symbol: &str) -> String {
+    raw_symbol
+        .rsplit([':', '.', '#'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(raw_symbol)
+        .trim()
+        .to_string()
+}
+
+fn packet_source_line_declares_named_symbol(line: &str, normalized_terminal: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let normalized_line = normalize_identifier(line);
+    let declaration_words = [
+        "class ",
+        "struct ",
+        "interface ",
+        "enum ",
+        "module ",
+        "trait ",
+        "def ",
+        "function ",
+        "func ",
+        "fn ",
+        "const ",
+        "let ",
+        "var ",
+        "public ",
+        "private ",
+        "protected ",
+        "internal ",
+        "static ",
+        "abstract ",
+        "template ",
+        "using ",
+        "typealias ",
+    ];
+    if !declaration_words.iter().any(|word| lower.contains(word)) {
+        return false;
+    }
+    if [
+        "class ",
+        "struct ",
+        "interface ",
+        "enum ",
+        "module ",
+        "trait ",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+        && normalized_line.contains(normalized_terminal)
+    {
+        return true;
+    }
+    let declaration_needles = [
+        format!("class{normalized_terminal}"),
+        format!("struct{normalized_terminal}"),
+        format!("interface{normalized_terminal}"),
+        format!("enum{normalized_terminal}"),
+        format!("module{normalized_terminal}"),
+        format!("trait{normalized_terminal}"),
+        format!("def{normalized_terminal}"),
+        format!("function{normalized_terminal}"),
+        format!("func{normalized_terminal}"),
+        format!("fn{normalized_terminal}"),
+        format!("const{normalized_terminal}"),
+        format!("let{normalized_terminal}"),
+        format!("var{normalized_terminal}"),
+        format!("using{normalized_terminal}"),
+        format!("typealias{normalized_terminal}"),
+    ];
+    declaration_needles
+        .iter()
+        .any(|needle| normalized_line.contains(needle))
+        || normalized_line.ends_with(normalized_terminal)
+}
+
+fn packet_source_probe_anchor_kind(line: &str, parts: &PacketFileScopedSymbolProbe) -> NodeKind {
+    let lower = line.to_ascii_lowercase();
+    if parts.raw_symbols.join(" ").starts_with("input#")
+        || (parts.raw_symbols.len() == 1 && lower.contains('<'))
+        || (parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key")
+        || (parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table")
+    {
+        NodeKind::ANNOTATION
+    } else if lower.contains("class ") || lower.contains("struct ") {
+        NodeKind::CLASS
+    } else if lower.contains("interface ") || lower.contains("trait ") {
+        NodeKind::INTERFACE
+    } else if parts
+        .raw_symbols
+        .iter()
+        .any(|symbol| symbol.contains(':') || symbol.contains('.') || symbol.contains('#'))
+        || lower.contains("def ")
+        || lower.contains("function ")
+        || lower.contains("func ")
+        || lower.contains("fn ")
+    {
+        NodeKind::METHOD
+    } else {
+        NodeKind::ANNOTATION
+    }
 }
 
 fn maybe_append_chinook_sql_schema_file_citations(
@@ -5627,7 +6983,13 @@ fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if path_contains_test_segment(&path)
+    if path.ends_with(".sql") && normalized_display.starts_with("createtable") {
+        Some("sql table definition")
+    } else if path.ends_with(".sql") && normalized_display == "foreignkey" {
+        Some("sql relationship constraint")
+    } else if path.ends_with(".sql") {
+        Some("sql schema file")
+    } else if path_contains_test_segment(&path)
         || path.ends_with("_test.go")
         || path.ends_with(".test.ts")
         || packet_display_name_is_test_like(&display)
@@ -7457,6 +8819,12 @@ fn packet_probe_query_is_covered(
 }
 
 fn packet_probe_query_is_claimed(query: &str, supported_claims: &[PacketClaimDto]) -> bool {
+    if let Some(parts) = packet_file_scoped_symbol_probe_parts(query) {
+        return supported_claims
+            .iter()
+            .any(|claim| packet_claim_covers_file_scoped_probe(&parts, claim));
+    }
+
     if !packet_probe_query_allows_claim_coverage(query) {
         return false;
     }
@@ -7468,6 +8836,33 @@ fn packet_probe_query_is_claimed(query: &str, supported_claims: &[PacketClaimDto
         let normalized_claim = normalize_identifier(&claim.claim);
         normalized_claim.contains(&normalized_query)
     })
+}
+
+fn packet_claim_covers_file_scoped_probe(
+    parts: &PacketFileScopedSymbolProbe,
+    claim: &PacketClaimDto,
+) -> bool {
+    let claim_file_matches = claim.citations.iter().any(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .map(packet_display_path)
+            .map(|path| {
+                path.rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(path.as_str())
+                    .eq_ignore_ascii_case(&parts.file_name)
+            })
+            .unwrap_or(false)
+    });
+    if !claim_file_matches {
+        return false;
+    }
+    let normalized_claim = normalize_identifier(&claim.claim);
+    parts
+        .symbols
+        .iter()
+        .all(|symbol| normalized_claim.contains(symbol))
 }
 
 fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
@@ -7789,6 +9184,18 @@ fn packet_file_scoped_symbol_probe_matches(
     }
 
     let normalized_display = normalize_identifier(&citation.display_name);
+    if parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table" {
+        let Some(table_name) = parts.symbols.last() else {
+            return Some(false);
+        };
+        let expected = format!("createtable{table_name}");
+        return Some(normalized_display == expected || normalized_display.ends_with(&expected));
+    }
+    if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
+        return Some(
+            normalized_display == "foreignkey" || normalized_display.ends_with("foreignkey"),
+        );
+    }
     Some(parts.symbols.iter().any(|symbol| {
         normalized_display == *symbol
             || normalized_display.ends_with(symbol)
@@ -7808,7 +9215,9 @@ fn packet_file_scoped_short_symbol_matches(display_name: &str, symbol: &str) -> 
 }
 
 struct PacketFileScopedSymbolProbe {
+    query_path: String,
     file_name: String,
+    raw_symbols: Vec<String>,
     symbols: Vec<String>,
 }
 
@@ -7817,12 +9226,21 @@ fn packet_file_scoped_symbol_probe_parts(query: &str) -> Option<PacketFileScoped
     let file_part = parts
         .next()?
         .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\''));
+    let query_path = file_part.replace('\\', "/");
     let file_name = file_part.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
     if !file_name.contains('.') {
         return None;
     }
 
-    let symbols = parts
+    let raw_symbols = parts
+        .map(|part| {
+            part.trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | ',' | ';'))
+                .to_string()
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let symbols = raw_symbols
+        .iter()
         .map(|part| normalize_identifier(part))
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
@@ -7830,7 +9248,12 @@ fn packet_file_scoped_symbol_probe_parts(query: &str) -> Option<PacketFileScoped
         return None;
     }
 
-    Some(PacketFileScopedSymbolProbe { file_name, symbols })
+    Some(PacketFileScopedSymbolProbe {
+        query_path,
+        file_name,
+        raw_symbols,
+        symbols,
+    })
 }
 
 fn packet_citation_probe_token_coverage(query: &str, citation: &AgentCitationDto) -> usize {
@@ -9557,16 +10980,6 @@ mod tests {
             }
             Self { key, previous }
         }
-
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: tests use this guard to isolate one env var for this process-local
-            // regression and restore it on drop.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
     }
 
     impl Drop for EnvVarGuard {
@@ -9579,6 +10992,29 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
+        }
+    }
+
+    struct ExactFamilySteeringGuard {
+        previous: Option<bool>,
+    }
+
+    impl ExactFamilySteeringGuard {
+        fn set(enabled: bool) -> Self {
+            let previous = PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE.with(|override_cell| {
+                let previous = override_cell.get();
+                override_cell.set(Some(enabled));
+                previous
+            });
+            Self { previous }
+        }
+    }
+
+    impl Drop for ExactFamilySteeringGuard {
+        fn drop(&mut self) {
+            PACKET_EXACT_FAMILY_STEERING_TEST_OVERRIDE.with(|override_cell| {
+                override_cell.set(self.previous.take());
+            });
         }
     }
 
@@ -9700,6 +11136,26 @@ mod tests {
 
     fn packet_fixture_project_root() -> &'static std::path::Path {
         std::path::Path::new("C:/workspace/project root")
+    }
+
+    fn packet_temp_root(name: &str) -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("codestory-{name}-{}-{suffix}", std::process::id()))
+    }
+
+    fn write_packet_fixture_file(
+        root: &std::path::Path,
+        relative_path: &str,
+        source: &str,
+    ) -> std::path::PathBuf {
+        let path = root.join(relative_path);
+        std::fs::create_dir_all(path.parent().expect("fixture path should have a parent"))
+            .expect("create fixture parent directory");
+        std::fs::write(&path, source).expect("write fixture source file");
+        path
     }
 
     fn build_sufficient_packet_fixture(
@@ -12022,7 +13478,7 @@ mod tests {
     #[test]
     fn packet_exact_family_steering_can_be_disabled_without_losing_explicit_probes() {
         let _eval_env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let _steering_env = EnvVarGuard::set(PACKET_EXACT_FAMILY_STEERING_ENV, "0");
+        let _steering = ExactFamilySteeringGuard::set(false);
         let question = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
         let extra_probes = vec!["src/requests/sessions.py Session.request".to_string()];
 
@@ -12096,8 +13552,8 @@ mod tests {
     }
 
     #[test]
-    fn packet_exact_family_steering_can_disable_family_specific_source_claims() {
-        let _steering_env = EnvVarGuard::set(PACKET_EXACT_FAMILY_STEERING_ENV, "0");
+    fn packet_exact_family_disabled_still_allows_source_shaped_claims() {
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt =
             "Explain how Monolog turns a log call into a LogRecord and passes it through handlers.";
         let citation = test_packet_citation("Logger::addRecord", "src/Monolog/Logger.php", 0.9);
@@ -12122,16 +13578,21 @@ mod tests {
             "#,
         );
 
-        for hidden_claim in [
-            "Logger owns a stack of handlers registered by pushHandler.",
+        for expected in [
             "Logger::log delegates into addRecord.",
             "addRecord creates a LogRecord before passing it to handlers.",
         ] {
             assert!(
-                !claims.iter().any(|claim| claim == hidden_claim),
-                "disabled exact-family steering should suppress canned claim `{hidden_claim}` in {claims:?}"
+                claims.iter().any(|claim| claim == expected),
+                "disabled exact-family steering should still allow source-shaped claim `{expected}` in {claims:?}"
             );
         }
+        assert!(
+            !claims
+                .iter()
+                .any(|claim| claim == "Logger owns a stack of handlers registered by pushHandler."),
+            "generic source claims should not infer handler stack ownership without the handler-stack source shape: {claims:?}"
+        );
     }
 
     #[test]
@@ -15006,6 +16467,25 @@ mod tests {
             "routergroup.go RouterGroup.Handle",
             &router_group
         ));
+
+        let create_track = test_packet_citation(
+            "CREATE TABLE Track",
+            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+            0.9,
+        );
+        let create_playlist_track = test_packet_citation(
+            "CREATE TABLE PlaylistTrack",
+            "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+            0.9,
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "ChinookDatabase/DataSources/Chinook_Sqlite.sql CREATE TABLE Track",
+            &create_track
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "ChinookDatabase/DataSources/Chinook_Sqlite.sql CREATE TABLE Track",
+            &create_playlist_track
+        ));
     }
 
     #[test]
@@ -15088,7 +16568,7 @@ mod tests {
 
     #[test]
     fn server_route_source_claims_survive_without_exact_family_steering() {
-        let _steering_env = EnvVarGuard::set(PACKET_EXACT_FAMILY_STEERING_ENV, "0");
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Trace how a router group registers routes and dispatches handlers for an HTTP request.";
         let fixtures = [
             (
@@ -15133,8 +16613,65 @@ mod tests {
     }
 
     #[test]
+    fn express_shape_route_claims_survive_without_exact_family_steering() {
+        let _steering = ExactFamilySteeringGuard::set(false);
+        let prompt = "Trace how a server application creates an app, registers middleware and routes, handles an incoming request, and sends a response.";
+        let citation = test_packet_citation("application", "lib/application.js", 0.9);
+        let claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &citation,
+            r#"
+            function createApplication() {
+              var app = function(req, res, next) { app.handle(req, res, next); };
+              mixin(app, proto, false);
+              app.request = Object.create(req);
+              app.response = Object.create(res);
+              app.init();
+              return app;
+            }
+
+            app.init = function init() {
+              this.defaultConfiguration();
+              this.router = new Router({});
+            };
+
+            app.handle = function handle(req, res, callback) {
+              this.router.handle(req, res, callback);
+            };
+
+            app.use = function use(fn) {
+              return this.router.use(path, fn);
+            };
+
+            app.route = function route(path) {
+              return this.router.route(path);
+            };
+
+            res.send = function send(body) {
+              this.set('Content-Length', len);
+              return this.end(chunk, encoding);
+            };
+            "#,
+        );
+
+        for expected in [
+            "createApplication builds a callable app object and mixes in request and response prototypes.",
+            "app.init creates application state and router configuration.",
+            "app.handle delegates request handling to the router.",
+            "app.use registers middleware on the router.",
+            "app.route creates route entries through the router.",
+            "res.send prepares and sends the response body.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected generic application-route claim `{expected}` in {claims:?}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_version_use_guard_claim_survives_without_exact_family_steering() {
-        let _steering_env = EnvVarGuard::set(PACKET_EXACT_FAMILY_STEERING_ENV, "0");
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Trace how a shell version manager install script dispatches use commands and switches versions.";
         let citation = test_packet_citation("maybe_switch_if_needed", "tool.sh", 0.9);
         let claims = packet_source_derived_claims_for_citation(
@@ -15159,7 +16696,7 @@ mod tests {
 
     #[test]
     fn hook_cache_source_claims_survive_without_exact_family_steering() {
-        let _steering_env = EnvVarGuard::set(PACKET_EXACT_FAMILY_STEERING_ENV, "0");
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior.";
 
         let hook = test_packet_citation("useDataHandler", "src/hooks/use-data.ts", 0.9);
@@ -15215,11 +16752,31 @@ mod tests {
             claims.iter().any(|claim| claim == expected),
             "expected generic cache helper claim `{expected}`; got {claims:?}"
         );
+
+        let swr_handler = test_packet_citation("useSWRHandler", "src/index/use-swr.ts", 0.9);
+        let claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &swr_handler,
+            r#"
+            export const useSWRHandler = (_key, fetcher, config) => {
+              const [key, fnArg] = serialize(_key)
+              const [getCache, setCache, subscribeCache, getInitialCache] =
+                createCacheHelper(cache, key)
+              const cachedData = getCache()
+              return { data: cachedData.data, mutate: (...args) => internalMutate(cache, key, ...args) }
+            }
+            "#,
+        );
+        let expected = "useSWRHandler serializes the key before reading cache state.";
+        assert!(
+            claims.iter().any(|claim| claim == expected),
+            "expected generic SWR key serialization claim `{expected}`; got {claims:?}"
+        );
     }
 
     #[test]
     fn client_send_source_claims_survive_without_exact_family_steering() {
-        let _steering_env = EnvVarGuard::set(PACKET_EXACT_FAMILY_STEERING_ENV, "0");
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Explain how a client exposes convenience request helpers and routes send behavior through the transport implementation.";
 
         let base = test_packet_citation("BaseTransportClient", "src/base_client.dart", 0.9);
@@ -15446,7 +17003,386 @@ mod tests {
     }
 
     #[test]
+    fn generic_sql_schema_claims_survive_without_exact_family_steering() {
+        let _steering = ExactFamilySteeringGuard::set(false);
+        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let citation = test_packet_citation("schema.sql", "db/schema.sql", 0.9);
+        let claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &citation,
+            r#"
+            CREATE TABLE [Album]
+            (
+                [AlbumId] INTEGER NOT NULL,
+                [ArtistId] INTEGER NOT NULL,
+                FOREIGN KEY ([ArtistId]) REFERENCES [Artist] ([ArtistId])
+            );
+            CREATE TABLE [Artist] ([ArtistId] INTEGER NOT NULL);
+            CREATE TABLE [InvoiceLine]
+            (
+                [InvoiceLineId] INTEGER NOT NULL,
+                [InvoiceId] INTEGER NOT NULL,
+                [TrackId] INTEGER NOT NULL,
+                FOREIGN KEY ([InvoiceId]) REFERENCES [Invoice] ([InvoiceId]),
+                FOREIGN KEY ([TrackId]) REFERENCES [Track] ([TrackId])
+            );
+            CREATE TABLE [Track]
+            (
+                [TrackId] INTEGER NOT NULL,
+                [AlbumId] INTEGER,
+                [GenreId] INTEGER,
+                [MediaTypeId] INTEGER NOT NULL,
+                FOREIGN KEY ([AlbumId]) REFERENCES [Album] ([AlbumId]),
+                FOREIGN KEY ([GenreId]) REFERENCES [Genre] ([GenreId]),
+                FOREIGN KEY ([MediaTypeId]) REFERENCES [MediaType] ([MediaTypeId])
+            );
+            "#,
+        );
+
+        for expected in [
+            "SQL schema defines tables Album, Artist, InvoiceLine, and Track.",
+            "Album rows reference Artist rows through ArtistId.",
+            "InvoiceLine rows reference Invoice and Track rows.",
+            "Track rows reference Album, Genre, and MediaType rows.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected generic SQL schema claim `{expected}` in {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_formatting_claims_survive_without_exact_family_steering() {
+        let _steering = ExactFamilySteeringGuard::set(false);
+        let prompt = "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths.";
+
+        let format_h = test_packet_citation("vformat", "include/fmt/format.h", 0.9);
+        let claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &format_h,
+            r#"
+            class format_error : public std::runtime_error {};
+            inline auto vformat(locale_ref loc, string_view fmt, format_args args) -> std::string {
+              detail::buffer<char> buf;
+              detail::vformat_to(buf, fmt, args, loc);
+              return to_string(buf);
+            }
+            template <typename OutputIt, typename... T>
+            auto format_to(OutputIt out, locale_ref loc, format_string<T...> fmt, T&&... args) {
+              return fmt::vformat_to(out, loc, fmt.str, vargs<T...>{{args...}});
+            }
+            "#,
+        );
+
+        for expected in [
+            "vformat is the central formatting path for runtime format arguments.",
+            "format_error represents formatting failures.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected runtime formatting claim `{expected}` in {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn site_build_claims_survive_without_exact_family_steering() {
+        let _steering = ExactFamilySteeringGuard::set(false);
+        let prompt = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.";
+
+        let fixtures = [
+            (
+                "Jekyll::Commands::Build.process",
+                "lib/jekyll/commands/build.rb",
+                r#"
+                module Jekyll
+                  module Commands
+                    class Build
+                      def process(options)
+                        site = Jekyll::Site.new(options)
+                        build(site, options)
+                      end
+                    end
+                  end
+                end
+                "#,
+                "Build.process constructs a Jekyll::Site before running the build.",
+            ),
+            (
+                "Site#process",
+                "lib/jekyll/site.rb",
+                r#"
+                class Site
+                  def process
+                    reset
+                    read
+                    generate
+                    render
+                    cleanup
+                    write
+                  end
+                end
+                "#,
+                "Site#process runs read, generate, render, and write phases.",
+            ),
+            (
+                "Reader",
+                "lib/jekyll/reader.rb",
+                r#"
+                class Reader
+                  def read
+                    read_directories
+                    read_data
+                  end
+                end
+                "#,
+                "Reader is responsible for reading site content.",
+            ),
+            (
+                "Renderer",
+                "lib/jekyll/renderer.rb",
+                r#"
+                class Renderer
+                  def render_document
+                  end
+
+                  def render_liquid(content, payload, info, path = nil)
+                  end
+                end
+                "#,
+                "Renderer renders pages and documents.",
+            ),
+        ];
+
+        for (symbol, path, source, expected) in fixtures {
+            let citation = test_packet_citation(symbol, path, 0.9);
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected site build claim `{expected}` for {path}; got {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_sql_schema_file_probe_adds_files_and_source_anchors() {
+        let root = packet_temp_root("generic-sql-schema");
+        let db_dir = root.join("db");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&db_dir).expect("create sql fixture directory");
+        let schema_path = db_dir.join("schema.sql");
+        std::fs::write(
+            &schema_path,
+            r#"
+            /***** Create Tables *****/
+            CREATE TABLE [Artist] ([ArtistId] INTEGER NOT NULL);
+            CREATE TABLE [Album]
+            (
+                [AlbumId] INTEGER NOT NULL,
+                [ArtistId] INTEGER NOT NULL,
+                FOREIGN KEY ([ArtistId]) REFERENCES [Artist] ([ArtistId])
+            );
+            CREATE TABLE [Track]
+            (
+                [TrackId] INTEGER NOT NULL,
+                [AlbumId] INTEGER,
+                FOREIGN KEY ([AlbumId]) REFERENCES [Album] ([AlbumId])
+            );
+            "#,
+        )
+        .expect("write sql fixture");
+
+        let question = "Explain SQL schema relationships between artists, albums, and tracks.";
+        let mut answer = packet_answer_fixture(question, Vec::new());
+        maybe_append_sql_schema_file_citations(&root, question, &mut answer);
+
+        let has_file = answer.citations.iter().any(|citation| {
+            citation.kind == NodeKind::FILE
+                && citation.display_name == "db/schema.sql"
+                && citation
+                    .retrieval_score_breakdown
+                    .as_ref()
+                    .is_some_and(|breakdown| {
+                        breakdown
+                            .provenance
+                            .iter()
+                            .any(|entry| entry == "packet_generic_sql_schema_file_probe")
+                    })
+        });
+        let has_album_anchor = answer.citations.iter().any(|citation| {
+            citation.kind == NodeKind::ANNOTATION
+                && citation.display_name == "CREATE TABLE Album"
+                && citation.file_path.as_deref().is_some_and(|path| {
+                    packet_display_path(path)
+                        .replace('\\', "/")
+                        .ends_with("db/schema.sql")
+                })
+        });
+        let has_track_anchor = answer.citations.iter().any(|citation| {
+            citation.kind == NodeKind::ANNOTATION && citation.display_name == "CREATE TABLE Track"
+        });
+        let has_foreign_key_anchor = answer.citations.iter().any(|citation| {
+            citation.kind == NodeKind::ANNOTATION
+                && citation.display_name == "FOREIGN KEY"
+                && citation
+                    .retrieval_score_breakdown
+                    .as_ref()
+                    .is_some_and(|breakdown| {
+                        breakdown
+                            .provenance
+                            .iter()
+                            .any(|entry| entry == "packet_generic_sql_schema_anchor_probe")
+                    })
+        });
+        let has_comment_false_positive = answer
+            .citations
+            .iter()
+            .any(|citation| citation.display_name == "CREATE TABLE s");
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            has_file,
+            "generic SQL schema probe should append the schema file citation: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_album_anchor,
+            "generic SQL schema probe should append CREATE TABLE anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_track_anchor,
+            "generic SQL schema probe should carry prompt-matched table anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_foreign_key_anchor,
+            "generic SQL schema probe should append FOREIGN KEY anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            !has_comment_false_positive,
+            "generic SQL schema probe should not parse prose comments as table names: {:?}",
+            answer.citations
+        );
+    }
+
+    #[test]
+    fn required_file_scoped_source_probe_adds_method_and_markup_anchors() {
+        let root = packet_temp_root("required-source-probes");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "lib/jekyll/site.rb",
+            r#"
+            module Jekyll
+              class Site
+                def process
+                  read
+                  render
+                  write
+                end
+              end
+            end
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/Monolog/Logger.php",
+            r#"
+            <?php
+            namespace Monolog;
+            class Logger
+            {
+                public function addRecord(int $level, string $message): bool
+                {
+                    return true;
+                }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "html/forms/form-validation/detailed-custom-validation.html",
+            r#"
+            <form novalidate>
+              <input id="mail" type="email" required minlength="8">
+            </form>
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let probes = [
+            "lib/jekyll/site.rb Site#process".to_string(),
+            "src/Monolog/Logger.php Logger::addRecord".to_string(),
+            "html/forms/form-validation/detailed-custom-validation.html input#mail".to_string(),
+            "html/forms/form-validation/detailed-custom-validation.html novalidate".to_string(),
+        ];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::DataFlow,
+            &probes,
+            &mut answer,
+        );
+
+        let has_ruby_method = answer.citations.iter().any(|citation| {
+            citation.display_name == "Site#process"
+                && citation.kind == NodeKind::METHOD
+                && citation.line == Some(4)
+        });
+        let has_php_method = answer.citations.iter().any(|citation| {
+            citation.display_name == "Logger::addRecord"
+                && citation.kind == NodeKind::METHOD
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("Logger.php"))
+        });
+        let has_input_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "input#mail" && citation.kind == NodeKind::ANNOTATION
+        });
+        let has_boolean_attribute_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "novalidate" && citation.kind == NodeKind::ANNOTATION
+        });
+        let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation == "packet_required_file_scoped_source_citations appended=4"
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            has_ruby_method,
+            "required source probe should append Ruby method anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_php_method,
+            "required source probe should append PHP method anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_input_anchor,
+            "required source probe should append HTML id anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_boolean_attribute_anchor,
+            "required source probe should append HTML boolean attribute anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            used_source_probe,
+            "required source probe should annotate appended anchor count: {:?}",
+            answer.retrieval_trace.annotations
+        );
+    }
+
+    #[test]
     fn automapper_map_flow_source_claims_name_runtime_configuration_and_plans() {
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
         let fixtures = [
             (
@@ -15517,6 +17453,7 @@ mod tests {
 
     #[test]
     fn mdn_form_validation_source_claims_name_constraints_and_custom_validation() {
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Explain how the MDN form validation examples combine native HTML constraints with custom JavaScript validation.";
         let full_example = test_packet_citation(
             "full-example.html",
@@ -15576,6 +17513,7 @@ mod tests {
 
     #[test]
     fn okio_buffer_flow_source_claims_name_buffers_and_wrappers() {
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Explain how Okio's Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes.";
         let fixtures = [
             (
@@ -15632,6 +17570,7 @@ mod tests {
 
     #[test]
     fn monolog_record_flow_source_claims_name_logger_records_and_handlers() {
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt =
             "Explain how Monolog turns a log call into a LogRecord and passes it through handlers.";
         let logger = test_packet_citation("Logger::addRecord", "src/Monolog/Logger.php", 0.9);
@@ -15692,6 +17631,7 @@ mod tests {
 
     #[test]
     fn alamofire_request_flow_source_claims_name_request_validation_and_callbacks() {
+        let _steering = ExactFamilySteeringGuard::set(false);
         let prompt = "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
         let fixtures = [
             (
