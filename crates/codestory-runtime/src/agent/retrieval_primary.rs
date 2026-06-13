@@ -476,6 +476,20 @@ fn search_sidecar_packet_batch_inner(
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
+    search_sidecar_packet_batch_inner_with_query(
+        controller,
+        queries,
+        latency_budget_ms,
+        run_sidecar_query,
+    )
+}
+
+fn search_sidecar_packet_batch_inner_with_query(
+    controller: &AppController,
+    queries: &[(String, usize)],
+    latency_budget_ms: Option<u32>,
+    mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
+) -> Result<SidecarPacketBatchOutcome, ApiError> {
     let per_query_budget = sidecar_budget_ms(latency_budget_ms)
         .checked_div(queries.len().max(1) as u64)
         .unwrap_or(100)
@@ -483,8 +497,8 @@ fn search_sidecar_packet_batch_inner(
     let mut results = Vec::with_capacity(queries.len());
     let mut diagnostics = Vec::with_capacity(queries.len());
     for (query, max_results) in queries {
-        let query_result = run_sidecar_query(controller, query, Some(per_query_budget as u32))
-            .map_err(|error| {
+        let query_result =
+            run_query(controller, query, Some(per_query_budget as u32)).map_err(|error| {
                 sidecar_retrieval_unavailable_error(
                     controller,
                     format!("sidecar retrieval batch query failed: {error}"),
@@ -493,11 +507,15 @@ fn search_sidecar_packet_batch_inner(
         let max_results = (*max_results).clamp(1, 50);
         let resolution =
             resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results)
-                .unwrap_or(SidecarCandidateResolutionOutcome {
-                    resolved_hits: Vec::new(),
-                    attempted_candidate_count: 0,
-                    unresolved_candidate_count: 0,
-                });
+                .map_err(|error| {
+                    sidecar_retrieval_unavailable_error(
+                        controller,
+                        format!(
+                            "sidecar retrieval rejected packet batch query `{query}`: candidate resolution failed: {}",
+                            error.message
+                        ),
+                    )
+                })?;
         diagnostics.push(packet_sidecar_query_diagnostic(&query_result, &resolution));
         let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
@@ -520,13 +538,16 @@ fn search_sidecar_packet_batch_inner(
 
 fn sidecar_packet_batch_rejection_reason(
     query_result: &QueryResult,
-    _resolved_hits: &[SearchHit],
+    resolved_hits: &[SearchHit],
 ) -> Option<String> {
     if !sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode) {
         return Some(format!(
             "sidecar retrieval mode `{}` is not eligible for packet batch results",
             query_result.trace.retrieval_mode
         ));
+    }
+    if !query_result.hits.is_empty() && resolved_hits.is_empty() {
+        return Some("sidecar candidates did not resolve to indexed symbols".to_string());
     }
     None
 }
@@ -1930,7 +1951,7 @@ mod tests {
 
     #[test]
     fn packet_batch_rejects_unavailable_sidecar_mode() {
-        use codestory_retrieval::classify_query;
+        use codestory_retrieval::{CandidateSource, classify_query};
 
         let unavailable = QueryResult {
             query: "handler".into(),
@@ -1949,6 +1970,84 @@ mod tests {
         assert_eq!(
             sidecar_packet_batch_rejection_reason(&unavailable, &[]).as_deref(),
             Some("sidecar retrieval mode `no_semantic` is not eligible for packet batch results")
+        );
+
+        let unresolved = QueryResult {
+            query: "handler".into(),
+            features: classify_query("handler"),
+            hits: vec![CandidateHit::with_source(
+                "semantic:handler",
+                Some("handler".into()),
+                0.5,
+                CandidateSource::Qdrant,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        assert_eq!(
+            sidecar_packet_batch_rejection_reason(&unresolved, &[]).as_deref(),
+            Some("sidecar candidates did not resolve to indexed symbols")
+        );
+    }
+
+    #[test]
+    fn packet_batch_rejects_candidate_resolution_errors() {
+        use codestory_retrieval::CandidateSource;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+            .expect("open project");
+        std::fs::remove_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("remove storage parent");
+
+        let queries = vec![("handler".to_string(), 5)];
+        let result = search_sidecar_packet_batch_inner_with_query(
+            &controller,
+            &queries,
+            Some(500),
+            |_, _, _| {
+                Ok(QueryResult {
+                    query: "handler".into(),
+                    features: classify_query("handler"),
+                    hits: vec![CandidateHit::with_source(
+                        "src/lib.rs",
+                        Some("handler".into()),
+                        0.5,
+                        CandidateSource::Scip,
+                    )],
+                    trace: QueryTrace {
+                        retrieval_mode: "full".into(),
+                        degraded_reason: None,
+                        total_budget_ms: 500,
+                        elapsed_ms: 1,
+                        cancel_reason: None,
+                        cache_hit: false,
+                        stages: Vec::new(),
+                    },
+                })
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("packet batch must reject candidate resolution errors"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "retrieval_unavailable");
+        assert!(
+            error.message.contains("sidecar retrieval rejected")
+                || error.message.contains("candidate resolution failed"),
+            "error should preserve candidate resolution failure: {}",
+            error.message
         );
     }
 
