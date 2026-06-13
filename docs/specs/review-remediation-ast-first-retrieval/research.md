@@ -8,9 +8,9 @@ The reviewed branch improved parser-backed language coverage, but it also left b
 
 | ID | Source | Claim Supported | Confidence |
 | --- | --- | --- | --- |
-| E1 | `C:/Users/alber/Downloads/review_gemini_3_1.md` | Reviewer found hardcoded Chinook, MDN, Okio, Monolog, and Alamofire benchmark-family branches in `orchestrator.rs` and recommended deleting production static citation steering. | High |
-| E2 | `C:/Users/alber/Downloads/review_codex.md` | Reviewer found production exact-family steering enabled by default, incomplete semantic language labels, split support registries, packet sidecar unresolved-candidate opacity, filtered `files` count ambiguity, and hardcoded holdout assumptions. | High |
-| E3 | `C:/Users/alber/Downloads/review_gemini_3_5.md` | Reviewer found monolithic modules, string-based parameter parsing, cross-file receiver-call resolution risk, and proposed dynamic parser loading as a longer architecture direction. | Medium |
+| E1 | `review_gemini_3_1.md` from reviewer-provided evidence packet | Reviewer found hardcoded Chinook, MDN, Okio, Monolog, and Alamofire benchmark-family branches in `orchestrator.rs` and recommended deleting production static citation steering. | High |
+| E2 | `review_codex.md` from reviewer-provided evidence packet | Reviewer found production exact-family steering enabled by default, incomplete semantic language labels, split support registries, packet sidecar unresolved-candidate opacity, filtered `files` count ambiguity, and hardcoded holdout assumptions. | High |
+| E3 | `review_gemini_3_5.md` from reviewer-provided evidence packet | Reviewer found monolithic modules, string-based parameter parsing, cross-file receiver-call resolution risk, and proposed dynamic parser loading as a longer architecture direction. | Medium |
 | E4 | `crates/codestory-runtime/src/agent/orchestrator.rs:75` | `CODESTORY_PACKET_EXACT_FAMILY_STEERING` is defined in production runtime code. | High |
 | E5 | `crates/codestory-runtime/src/agent/orchestrator.rs:83` | `packet_exact_family_steering_enabled()` defaults to `true` when the env var is unset. | High |
 | E6 | `crates/codestory-runtime/src/agent/orchestrator.rs:409` | The product packet path appends Chinook, MDN, Okio, Monolog, and Alamofire static family citations when steering is enabled. | High |

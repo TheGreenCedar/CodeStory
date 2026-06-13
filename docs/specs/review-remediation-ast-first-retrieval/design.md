@@ -24,7 +24,7 @@ The remediation design keeps the first fix boring on purpose: delete or isolate 
 
 ```text
 Inputs:
-- External review files from C:/Users/alber/Downloads/
+- Reviewer-provided external review files
 - Local code references from crates/, docs/, and scripts/
 
 Outputs:
