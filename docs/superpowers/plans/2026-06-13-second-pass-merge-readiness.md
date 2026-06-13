@@ -175,7 +175,8 @@ Run:
 
 ```powershell
 cargo test -p codestory-runtime --test retrieval_generalization_guard linter_catches_split_benchmark_family_literals_in_production -- --nocapture
-cargo test -p codestory-runtime exact_family_source_claims_require_eval_probes packet_supported_claims_generic_source_claims_are_domain_neutral_without_eval_probes -- --nocapture
+cargo test -p codestory-runtime exact_family_source_claims_require_eval_probes -- --nocapture
+cargo test -p codestory-runtime packet_supported_claims_generic_source_claims_are_domain_neutral_without_eval_probes -- --nocapture
 node scripts\lint-retrieval-generalization.mjs
 rg -n "packet_terms_indicate_benchmark|benchmark_.*_family|\\[\"s\", \"wr\"\\]|\\[\"auto\", \"mapper\"\\]|\\[\"string\", \"utils\"\\]" crates\codestory-runtime\src\agent\orchestrator.rs scripts\lint-retrieval-generalization.mjs
 git diff --check

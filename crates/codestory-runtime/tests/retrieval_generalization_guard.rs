@@ -241,12 +241,18 @@ fn linter_catches_split_benchmark_family_literals_in_production() {
         r#"
 pub fn leaked_split_family_markers() -> Vec<String> {
     vec![
-        ["s", "wr"].concat(),
         ["use", "s", "wr"].concat(),
         ["string", "utils"].concat(),
         ["charsequence", "utils"].concat(),
-        ["auto", "mapper"].concat(),
         ["source/animate", ".css"].concat(),
+        [
+            "s",
+            "wr",
+        ].concat(),
+        [
+            "auto",
+            "mapper",
+        ].concat(),
     ]
 }
 "#,

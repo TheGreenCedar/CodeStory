@@ -621,39 +621,79 @@ function scanProductionCompactPatterns(filePath, marker) {
   const production = productionSource(filePath);
   const markerLower = marker.toLowerCase();
   const hits = [];
-  const lines = production.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    const literals = rustStringLiteralsOnLine(lines[index]);
-    if (literals.length < 2) {
-      continue;
-    }
-    const compactLiterals = literals
-      .map((literal) => compactProductionSource(literal))
-      .filter(Boolean);
-    let matched = false;
-    for (let start = 0; start < compactLiterals.length; start += 1) {
-      let compact = "";
-      for (let end = start; end < compactLiterals.length; end += 1) {
-        compact += compactLiterals[end];
-        if (compact === markerLower) {
-          matched = true;
-          break;
-        }
-        if (compact.length >= markerLower.length) {
-          break;
-        }
+  const literals = rustStringLiteralSpans(production);
+  for (let start = 0; start < literals.length; start += 1) {
+    let compact = "";
+    for (let end = start; end < literals.length; end += 1) {
+      if (
+        end > start
+        && !literalJoinGapAllowsCompactScan(
+          production.slice(literals[end - 1].endOffset, literals[end].startOffset),
+        )
+      ) {
+        break;
       }
-      if (matched) {
+      compact += compactProductionSource(literals[end].literal);
+      if (compact === markerLower) {
+        hits.push(
+          compactPatternHit(filePath, literals[start].line, literals[end].line, marker),
+        );
+        break;
+      }
+      if (compact.length >= markerLower.length) {
         break;
       }
     }
-    if (matched) {
-      hits.push(
-        `${filePath}:${index + 1}: compact production source contains split benchmark marker ${marker}`,
-      );
-    }
   }
   return hits;
+}
+
+function rustStringLiteralSpans(text) {
+  const literals = [];
+  const lineStarts = [0];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\n") {
+      lineStarts.push(index + 1);
+    }
+  }
+
+  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
+  let match;
+  while ((match = stringLiteral.exec(text)) != null) {
+    literals.push({
+      literal: match[0],
+      startOffset: match.index,
+      endOffset: match.index + match[0].length,
+      line: lineNumberAtOffset(lineStarts, match.index),
+    });
+  }
+  return literals;
+}
+
+function lineNumberAtOffset(lineStarts, offset) {
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (lineStarts[mid] <= offset) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return high + 1;
+}
+
+function literalJoinGapAllowsCompactScan(gap) {
+  return /^[\s,]*$/.test(gap);
+}
+
+function compactPatternHit(filePath, startLine, endLine, marker) {
+  const lineDisplay = startLine === endLine ? startLine : `${startLine}-${endLine}`;
+  return (
+    `${filePath}:${lineDisplay}: `
+    + `compact production source contains split benchmark marker ${marker}`
+  );
 }
 
 function rustStringLiteralsOnLine(line) {
