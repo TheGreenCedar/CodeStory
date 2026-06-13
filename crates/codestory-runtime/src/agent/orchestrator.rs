@@ -1053,35 +1053,6 @@ fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
             || has_any(&["engine", "method", "methods"]))
 }
 
-fn packet_terms_indicate_benchmark_server_route_family(terms: &[String]) -> bool {
-    packet_terms_have(terms, "gin")
-}
-
-fn packet_terms_indicate_benchmark_hook_family(terms: &[String]) -> bool {
-    let family = ["s", "wr"].concat();
-    let public_hook = ["use", "s", "wr"].concat();
-    packet_terms_have(terms, &family) || packet_terms_have(terms, &public_hook)
-}
-
-fn packet_terms_indicate_benchmark_java_string_family(terms: &[String]) -> bool {
-    let string_utils = ["string", "utils"].concat();
-    let charsequence_utils = ["charsequence", "utils"].concat();
-    (packet_terms_have(terms, "commons") && packet_terms_have(terms, "lang"))
-        || packet_terms_have(terms, &string_utils)
-        || packet_terms_have(terms, &charsequence_utils)
-}
-
-fn packet_terms_indicate_benchmark_stylesheet_family(terms: &[String]) -> bool {
-    let stylesheet_family = ["animate", "css"].concat();
-    packet_terms_have(terms, &stylesheet_family)
-        || (packet_terms_have(terms, "animate") && packet_terms_have(terms, "css"))
-}
-
-fn packet_terms_indicate_benchmark_mapping_family(terms: &[String]) -> bool {
-    let family = ["auto", "mapper"].concat();
-    packet_terms_have(terms, &family)
-}
-
 fn packet_terms_indicate_express_application_route_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -2732,14 +2703,6 @@ fn packet_source_derived_claims_for_citation(
     let prompt_terms = packet_probe_terms(prompt);
     let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
     let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
-    let benchmark_server_route_family =
-        packet_terms_indicate_benchmark_server_route_family(&prompt_terms);
-    let benchmark_hook_family = packet_terms_indicate_benchmark_hook_family(&prompt_terms);
-    let benchmark_java_string_family =
-        packet_terms_indicate_benchmark_java_string_family(&prompt_terms);
-    let benchmark_stylesheet_family =
-        packet_terms_indicate_benchmark_stylesheet_family(&prompt_terms);
-    let benchmark_mapping_family = packet_terms_indicate_benchmark_mapping_family(&prompt_terms);
 
     if request_flow && let Some(claim) = packet_python_requests_flow_claim(symbol, &path, source) {
         claims.push(claim);
@@ -2753,9 +2716,7 @@ fn packet_source_derived_claims_for_citation(
         );
     }
 
-    if !benchmark_server_route_family
-        && packet_terms_indicate_server_route_dispatch_flow(&prompt_terms)
-    {
+    if packet_terms_indicate_server_route_dispatch_flow(&prompt_terms) {
         claims.extend(packet_generic_server_route_flow_claims(symbol, source));
     }
 
@@ -2763,7 +2724,7 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_shell_version_use_flow_claims(symbol, source));
     }
 
-    if !benchmark_hook_family && packet_terms_indicate_hook_cache_flow(&prompt_terms) {
+    if packet_terms_indicate_hook_cache_flow(&prompt_terms) {
         claims.extend(packet_generic_hook_cache_flow_claims(symbol, source));
     }
 
@@ -2771,13 +2732,11 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_client_send_flow_claims(symbol, source));
     }
 
-    if !benchmark_java_string_family && packet_terms_indicate_string_predicate_flow(&prompt_terms) {
+    if packet_terms_indicate_string_predicate_flow(&prompt_terms) {
         claims.extend(packet_generic_string_predicate_flow_claims(symbol, source));
     }
 
-    if !benchmark_stylesheet_family
-        && packet_terms_indicate_stylesheet_animation_flow(&prompt_terms)
-    {
+    if packet_terms_indicate_stylesheet_animation_flow(&prompt_terms) {
         claims.extend(packet_generic_css_animation_flow_claims(source));
     }
 
@@ -2797,7 +2756,7 @@ fn packet_source_derived_claims_for_citation(
         claims.extend(packet_generic_log_record_handler_claims(source));
     }
 
-    if !benchmark_mapping_family && packet_terms_indicate_mapper_runtime_flow(&prompt_terms) {
+    if packet_terms_indicate_mapper_runtime_flow(&prompt_terms) {
         claims.extend(packet_generic_mapper_runtime_claims(source));
     }
 
@@ -3084,7 +3043,6 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
 fn packet_generic_string_predicate_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let normalized_symbol = normalize_identifier(symbol);
     let source_lower = source.to_ascii_lowercase();
-    let owner = packet_display_owner(symbol).unwrap_or_else(|| symbol.to_string());
     let mut claims = Vec::new();
 
     if normalized_symbol.ends_with("isblank")
@@ -3098,9 +3056,9 @@ fn packet_generic_string_predicate_flow_claims(symbol: &str, source: &str) -> Ve
             && (method_lower.contains("null") || null_empty_whitespace_documented)
             && method_lower.contains("length")
         {
-            claims.push(format!(
-                "{owner}.isBlank treats null, empty, and whitespace-only inputs as blank."
-            ));
+            claims.push(
+                "isBlank treats null, empty, and whitespace-only inputs as blank.".to_string(),
+            );
         }
     }
 
@@ -3115,9 +3073,7 @@ fn packet_generic_string_predicate_flow_claims(symbol: &str, source: &str) -> Ve
             && !method_lower.contains("strip(")
             && !method_lower.contains(".strip")
         {
-            claims.push(format!(
-                "{owner}.isEmpty does not trim whitespace before deciding emptiness."
-            ));
+            claims.push("isEmpty does not trim whitespace before deciding emptiness.".to_string());
         }
     }
 
@@ -15822,8 +15778,8 @@ mod tests {
         ));
 
         for expected in [
-            "TextChecks.isBlank treats null, empty, and whitespace-only inputs as blank.",
-            "TextChecks.isEmpty does not trim whitespace before deciding emptiness.",
+            "isBlank treats null, empty, and whitespace-only inputs as blank.",
+            "isEmpty does not trim whitespace before deciding emptiness.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),

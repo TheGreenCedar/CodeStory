@@ -27,7 +27,7 @@
 - Modify: `scripts/lint-retrieval-generalization.mjs`
 - Test: `crates/codestory-runtime/tests/retrieval_generalization_guard.rs`
 
-- [ ] **Step 1: Add the failing lint regression**
+- [x] **Step 1: Add the failing lint regression**
 
 Add this test near `linter_catches_current_holdout_literals_in_production` in `crates/codestory-runtime/tests/retrieval_generalization_guard.rs`:
 
@@ -62,7 +62,7 @@ pub fn leaked_split_family_markers() -> Vec<String> {
 }
 ```
 
-- [ ] **Step 2: Run the failing lint regression**
+- [x] **Step 2: Run the failing lint regression**
 
 Run:
 
@@ -72,7 +72,7 @@ cargo test -p codestory-runtime --test retrieval_generalization_guard linter_cat
 
 Expected before implementation: FAIL, because the current lint scans literal lines and string literals but does not reconstruct split benchmark-family strings.
 
-- [ ] **Step 3: Harden the lint script**
+- [x] **Step 3: Harden the lint script**
 
 In `scripts/lint-retrieval-generalization.mjs`, add compact patterns after `bannedLiteralPatterns`:
 
@@ -123,7 +123,7 @@ for (const pattern of bannedCompactPatterns) {
 
 Do not add `gin` as a compact marker because it is too short and causes false positives in ordinary words.
 
-- [ ] **Step 4: Remove production benchmark-family branching**
+- [x] **Step 4: Remove production benchmark-family branching**
 
 In `crates/codestory-runtime/src/agent/orchestrator.rs`, delete these helpers entirely:
 
@@ -169,7 +169,7 @@ if eval_probes_enabled() {
 }
 ```
 
-- [ ] **Step 5: Verify task**
+- [x] **Step 5: Verify task**
 
 Run:
 
@@ -183,7 +183,7 @@ git diff --check
 
 Expected: all tests/lints pass; `rg` has no matches in `orchestrator.rs` and only intentional lint-script pattern definitions if any.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Run:
 

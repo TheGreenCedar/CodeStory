@@ -154,6 +154,15 @@ const bannedLiteralPatterns = [
   "payload_collection",
 ];
 
+const bannedCompactPatterns = [
+  "swr",
+  "useswr",
+  "stringutils",
+  "charsequenceutils",
+  "automapper",
+  "sourceanimatecss",
+];
+
 const allowedPatternLines = [
   {
     pattern: "payload_collection",
@@ -601,6 +610,52 @@ function scanProductionStringLiterals(filePath, pattern) {
   return hits;
 }
 
+function compactProductionSource(text) {
+  return text
+    .replace(/["'`]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "")
+    .toLowerCase();
+}
+
+function scanProductionCompactPatterns(filePath, marker) {
+  const production = productionSource(filePath);
+  const markerLower = marker.toLowerCase();
+  const hits = [];
+  const lines = production.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const literals = rustStringLiteralsOnLine(lines[index]);
+    if (literals.length < 2) {
+      continue;
+    }
+    const compactLiterals = literals
+      .map((literal) => compactProductionSource(literal))
+      .filter(Boolean);
+    let matched = false;
+    for (let start = 0; start < compactLiterals.length; start += 1) {
+      let compact = "";
+      for (let end = start; end < compactLiterals.length; end += 1) {
+        compact += compactLiterals[end];
+        if (compact === markerLower) {
+          matched = true;
+          break;
+        }
+        if (compact.length >= markerLower.length) {
+          break;
+        }
+      }
+      if (matched) {
+        break;
+      }
+    }
+    if (matched) {
+      hits.push(
+        `${filePath}:${index + 1}: compact production source contains split benchmark marker ${marker}`,
+      );
+    }
+  }
+  return hits;
+}
+
 function rustStringLiteralsOnLine(line) {
   const literals = [];
   const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
@@ -662,6 +717,15 @@ for (const filePath of [...scanFiles].sort()) {
       if (hits.length > 0) {
         console.error(
           `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
+        );
+        failed = true;
+      }
+    }
+    for (const pattern of bannedCompactPatterns) {
+      const hits = scanProductionCompactPatterns(filePath, pattern);
+      if (hits.length > 0) {
+        console.error(
+          `Banned compact benchmark marker /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
         );
         failed = true;
       }

@@ -236,6 +236,41 @@ pub fn leaked_holdout_probe() -> &'static [&'static str] {
 }
 
 #[test]
+fn linter_catches_split_benchmark_family_literals_in_production() {
+    let output = run_lint_with_fixture(
+        r#"
+pub fn leaked_split_family_markers() -> Vec<String> {
+    vec![
+        ["s", "wr"].concat(),
+        ["use", "s", "wr"].concat(),
+        ["string", "utils"].concat(),
+        ["charsequence", "utils"].concat(),
+        ["auto", "mapper"].concat(),
+        ["source/animate", ".css"].concat(),
+    ]
+}
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "split benchmark-family literals should fail lint; stderr={stderr}"
+    );
+    for expected in [
+        "swr",
+        "useswr",
+        "stringutils",
+        "automapper",
+        "sourceanimatecss",
+    ] {
+        assert!(
+            stderr.to_ascii_lowercase().contains(expected),
+            "lint failure should report compact benchmark marker {expected}; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
 fn linter_masks_preceding_attrs_for_cfg_test_items() {
     let output = run_lint_with_fixture(
         r#"
