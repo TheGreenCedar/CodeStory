@@ -32,12 +32,13 @@ registry so support claims cannot drift quietly across crates.
 | Structural collector | HTML, CSS, SQL | dedicated structural collectors | structural collector tests | structural entity extraction, not semantic code navigation |
 
 The parser-backed graph claim is not a promise that every language has identical
-dispatch semantics. The current fixture floor covers local owner-qualified calls
-for simple typed parameters in Go, PHP, C#, Kotlin, Swift, and Dart, plus Ruby
-constructor-assigned locals and Bash shell command calls. Broader dynamic
-dispatch, polymorphism, cross-package resolution, and framework route
-extraction each need their own tests before a specific product claim can rely
-on them.
+dispatch semantics. Typed receiver-call support is claimed only for the
+fixture-backed cases named in the indexer regression suites. Current support
+covers simple local owner qualified calls where tests prove the behavior.
+Cross-package receiver lookup, polymorphic dispatch, inheritance-heavy target
+selection, framework-handler resolution, and declarative parameter extraction
+require separate fixtures and cannot be used as product claims until those
+fixtures pass.
 
 ## Route Coverage Is Separate
 
@@ -101,3 +102,9 @@ Before adding a new parser-backed language or broader framework claim:
       --out-dir target/agent-benchmark/language-expansion-holdout \
       --timeout-ms 600000
     ```
+
+11. Before widening typed receiver-call claims, add same-file and cross-file
+    fixtures for the target language. If implementation still uses signature
+    string slicing, document that as a transitional boundary; prefer a
+    tree-sitter-query or global-resolution-backed implementation for new
+    claims.
