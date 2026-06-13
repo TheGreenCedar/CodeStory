@@ -29,7 +29,10 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
-use codestory_contracts::language_support::language_support_profile_for_language_name;
+use codestory_contracts::language_support::{
+    LanguageSupportProfile, language_support_profile_for_ext,
+    language_support_profile_for_language_name,
+};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
@@ -908,41 +911,62 @@ fn search_hit_name_matches(display_name: &str, requested: &str) -> bool {
 }
 
 fn language_filter_matches_path(requested: &str, path: &str) -> bool {
-    let requested_lower = requested.trim().to_ascii_lowercase();
-    let requested_normalized = normalize_filter_token(&requested_lower);
+    let requested_lower = requested
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if requested_lower.is_empty() {
+        return false;
+    }
     let extension = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if extension.is_empty() {
+        return false;
+    }
 
+    if let Some(language_name) = language_family_alias(&requested_lower) {
+        return language_profile_matches_extension_name(language_name, &extension);
+    }
+
+    if let Some(profile) = language_support_profile_for_language_name(&requested_lower) {
+        return language_profile_matches_extension(profile, &extension);
+    }
+
+    if language_support_profile_for_ext(&requested_lower).is_some() {
+        return requested_lower == extension;
+    }
+
+    let requested_normalized = normalize_filter_token(&requested_lower);
     match requested_normalized.as_str() {
-        "rs" | "rust" => extension == "rs",
-        "ts" | "typescript" => matches!(extension.as_str(), "ts" | "tsx"),
-        "tsx" => extension == "tsx",
-        "js" | "javascript" => matches!(extension.as_str(), "js" | "jsx" | "mjs" | "cjs"),
-        "jsx" => extension == "jsx",
-        "py" | "python" => extension == "py",
-        "java" => extension == "java",
-        "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "cplusplus" if requested_lower != "c" => {
-            matches!(extension.as_str(), "cpp" | "cxx" | "cc" | "hpp" | "hxx")
-        }
-        _ if requested_lower == "c++" => {
-            matches!(extension.as_str(), "cpp" | "cxx" | "cc" | "hpp" | "hxx")
-        }
-        _ if requested_lower == "c#" => extension == "cs",
-        "c" => matches!(extension.as_str(), "c" | "h"),
-        "cs" | "csharp" => extension == "cs",
-        "go" => extension == "go",
-        "svelte" => extension == "svelte",
-        "json" => extension == "json",
-        "md" | "markdown" => matches!(extension.as_str(), "md" | "mdx"),
-        "rb" | "ruby" => extension == "rb",
-        "php" => extension == "php",
-        "kt" | "kotlin" => matches!(extension.as_str(), "kt" | "kts"),
-        "swift" => extension == "swift",
+        "markdown" => matches!(extension.as_str(), "md" | "mdx"),
         _ => requested_normalized == normalize_filter_token(&extension),
     }
+}
+
+fn language_family_alias(requested: &str) -> Option<&'static str> {
+    match requested {
+        "ts" => Some("typescript"),
+        "js" => Some("javascript"),
+        "kt" => Some("kotlin"),
+        "c++" | "cplusplus" => Some("cpp"),
+        "c#" | "cs" => Some("csharp"),
+        _ => None,
+    }
+}
+
+fn language_profile_matches_extension(profile: &LanguageSupportProfile, extension: &str) -> bool {
+    profile
+        .extensions
+        .iter()
+        .any(|candidate| *candidate == extension)
+}
+
+fn language_profile_matches_extension_name(language_name: &str, extension: &str) -> bool {
+    language_support_profile_for_language_name(language_name)
+        .is_some_and(|profile| language_profile_matches_extension(profile, extension))
 }
 
 fn normalize_filter_token(value: &str) -> String {
@@ -10829,6 +10853,38 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].display_name, "listUsers");
         assert_eq!(hits[0].file_path.as_deref(), Some("src/routes.ts"));
+    }
+
+    #[test]
+    fn language_filter_uses_shared_registry_extensions() {
+        for (requested, path) in [
+            ("bash", "scripts/bootstrap.sh"),
+            ("bash", "scripts/bootstrap.bash"),
+            ("sh", "scripts/bootstrap.sh"),
+            ("python", "pkg/types.pyi"),
+            ("ts", "src/server.mts"),
+            ("typescript", "src/server.cts"),
+            ("dart", "lib/main.dart"),
+            ("html", "templates/index.htm"),
+            ("css", "assets/site.css"),
+            ("sql", "db/schema.sql"),
+            ("c++", "include/runtime.hh"),
+            ("c#", "src/App.cs"),
+            ("markdown", "docs/guide.mdx"),
+        ] {
+            assert!(
+                language_filter_matches_path(requested, path),
+                "expected language:{requested} to match {path}"
+            );
+        }
+
+        assert!(!language_filter_matches_path("bash", "src/main.py"));
+        assert!(!language_filter_matches_path(
+            "sh",
+            "scripts/bootstrap.bash"
+        ));
+        assert!(!language_filter_matches_path("tsx", "src/server.ts"));
+        assert!(!language_filter_matches_path("jsx", "src/app.js"));
     }
 
     #[test]

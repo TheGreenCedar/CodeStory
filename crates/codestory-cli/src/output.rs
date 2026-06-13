@@ -10,6 +10,7 @@ use codestory_contracts::api::{
     SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto, SymbolContextDto,
     TrailContextDto, TrailStoryDto,
 };
+use codestory_contracts::language_support::language_name_for_path;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -3625,36 +3626,23 @@ fn is_language_keyword(language: &str, word: &str) -> bool {
 }
 
 fn snippet_language(path: &str) -> &'static str {
-    match Path::new(path)
+    let extension = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "rs" => "rust",
-        "ts" => "typescript",
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
         "tsx" => "tsx",
-        "js" => "javascript",
         "jsx" => "jsx",
-        "py" => "python",
-        "go" => "go",
-        "java" => "java",
-        "kt" => "kotlin",
-        "cs" => "csharp",
-        "cpp" | "cc" | "cxx" => "cpp",
-        "h" | "hpp" => "cpp",
-        "rb" => "ruby",
-        "php" => "php",
-        "swift" => "swift",
         "svelte" => "svelte",
         "vue" => "vue",
         "astro" => "astro",
         "json" => "json",
         "toml" => "toml",
-        "md" => "markdown",
+        "md" | "mdx" => "markdown",
         "yml" | "yaml" => "yaml",
-        _ => "",
+        _ => language_name_for_path(Some(path)).unwrap_or(""),
     }
 }
 
@@ -4374,6 +4362,27 @@ mod tests {
             commands[1],
             "codestory-cli snippet --project 'C:/repo with spaces' --id node-default --context 40"
         );
+    }
+
+    #[test]
+    fn snippet_language_uses_shared_registry_extensions() {
+        for (path, expected) in [
+            ("lib/main.dart", "dart"),
+            ("scripts/bootstrap.sh", "bash"),
+            ("scripts/bootstrap.bash", "bash"),
+            ("pkg/types.pyi", "python"),
+            ("src/server.mts", "typescript"),
+            ("src/server.cts", "typescript"),
+            ("build.gradle.kts", "kotlin"),
+            ("templates/index.html", "html"),
+            ("assets/site.css", "css"),
+            ("db/schema.sql", "sql"),
+            ("src/Widget.tsx", "tsx"),
+            ("src/Widget.jsx", "jsx"),
+            ("docs/guide.mdx", "markdown"),
+        ] {
+            assert_eq!(snippet_language(path), expected, "{path}");
+        }
     }
 
     #[test]
