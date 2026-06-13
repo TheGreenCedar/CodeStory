@@ -709,7 +709,6 @@ fn packet_terms_have_specific_flow_anchor(terms: &[String]) -> bool {
         || ((has("indexing") || has("indexer")) && (has("storage") || has("persistent")))
         || ((has("json") || has("jsonl")) && (has("exec") || has("thread") || has("turn")))
         || packet_terms_indicate_request_dispatch_flow(terms)
-        || packet_terms_indicate_express_application_route_flow(terms)
         || (has("event") && has("loop"))
         || (has_any(&["command", "commands"]) && has_any(&["dispatch", "dispatches"]))
         || (has("search") && (has("flags") || has("matcher") || has("haystack")))
@@ -811,21 +810,6 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
                 "transport adapter",
             ],
         );
-    }
-    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "Session.request",
-                "Session.prepare_request",
-                "PreparedRequest.prepare",
-                "Session.send",
-                "HTTPAdapter.send",
-            ],
-        );
-    }
-    if packet_terms_indicate_express_application_route_flow(terms) {
-        push_express_application_route_probe_queries(queries);
     }
     if has_any(&["adapter", "adapters", "transport"]) {
         push_unique_terms(queries, &["transport adapter", "adapter selection"]);
@@ -1053,26 +1037,10 @@ fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
             || has_any(&["engine", "method", "methods"]))
 }
 
-fn packet_terms_indicate_express_application_route_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    has("express")
-        && has_any(&["application", "app"])
-        && has_any(&[
-            "middleware",
-            "middleware/routes",
-            "route",
-            "routes",
-            "router",
-        ])
-        && has_any(&["request", "response", "handler", "handles"])
-}
-
 fn packet_terms_indicate_prepared_session_adapter_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    (has("prepared") || has("prepare") || has("preparedrequest"))
+    (has("prepared") || has("prepare"))
         && has_any(&["request", "requests"])
         && has("session")
         && has_any(&["adapter", "adapters", "send", "sends", "transport"])
@@ -2704,12 +2672,6 @@ fn packet_source_derived_claims_for_citation(
     let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
     let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
 
-    if request_flow && let Some(claim) = packet_python_requests_flow_claim(symbol, &path, source) {
-        claims.push(claim);
-    }
-    if packet_terms_indicate_express_application_route_flow(&prompt_terms) {
-        claims.extend(packet_express_application_route_flow_claims(&path, source));
-    }
     if eval_probes_enabled() {
         claims.extend(
             crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
@@ -2746,30 +2708,6 @@ fn packet_source_derived_claims_for_citation(
 
     if packet_terms_indicate_runtime_formatting_flow(&prompt_terms) {
         claims.extend(packet_generic_runtime_formatting_flow_claims(source));
-    }
-
-    if packet_terms_indicate_site_build_phase_flow(&prompt_terms) {
-        claims.extend(packet_generic_site_build_phase_claims(source));
-    }
-
-    if packet_terms_indicate_log_record_handler_flow(&prompt_terms) {
-        claims.extend(packet_generic_log_record_handler_claims(source));
-    }
-
-    if packet_terms_indicate_mapper_runtime_flow(&prompt_terms) {
-        claims.extend(packet_generic_mapper_runtime_claims(source));
-    }
-
-    if packet_terms_indicate_buffered_io_flow(&prompt_terms) {
-        claims.extend(packet_generic_buffered_io_claims(source));
-    }
-
-    if packet_terms_indicate_session_request_validation_flow(&prompt_terms) {
-        claims.extend(packet_generic_session_request_validation_claims(source));
-    }
-
-    if packet_terms_indicate_html_form_validation_flow(&prompt_terms) {
-        claims.extend(packet_generic_html_form_validation_claims(source));
     }
 
     if request_flow && packet_source_has_all(source, &["new ", "prototype", "request", "extend"]) {
@@ -3420,45 +3358,6 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
-    if source_lower.contains("function createapplication")
-        && source_lower.contains("mixin(app, proto")
-        && source_lower.contains("app.request")
-        && source_lower.contains("app.response")
-    {
-        claims.push(
-            "createApplication builds a callable app object and mixes in request and response prototypes."
-                .to_string(),
-        );
-    }
-
-    if source_lower.contains(".init = function init")
-        && (source_lower.contains("new router(") || source_lower.contains("lazyrouter"))
-        && source_lower.contains("defaultconfiguration")
-    {
-        claims.push("app.init creates application state and router configuration.".to_string());
-    }
-
-    if source_lower.contains(".handle = function handle")
-        && source_lower.contains(".router.handle(")
-    {
-        claims.push("app.handle delegates request handling to the router.".to_string());
-    }
-
-    if source_lower.contains(".use = function use") && source_lower.contains("router.use(") {
-        claims.push("app.use registers middleware on the router.".to_string());
-    }
-
-    if source_lower.contains(".route = function route") && source_lower.contains(".router.route(") {
-        claims.push("app.route creates route entries through the router.".to_string());
-    }
-
-    if source_lower.contains(".send = function send")
-        && (source_lower.contains(".end(") || source_lower.contains("this.end("))
-        && (source_lower.contains("content-length") || source_lower.contains("body"))
-    {
-        claims.push("res.send prepares and sends the response body.".to_string());
-    }
-
     if normalized_symbol.contains("handle")
         && source_lower.contains("handlers")
         && source_lower.contains("relativepath")
@@ -3542,295 +3441,6 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
             || normalized_source.contains("formatting"))
     {
         claims.push("format_error represents formatting failures.".to_string());
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["site", "build", "command", "process"])
-        && packet_terms_have_any(
-            terms,
-            &["read", "generate", "render", "write", "phase", "phases"],
-        )
-}
-
-fn packet_generic_site_build_phase_claims(source: &str) -> Vec<String> {
-    let normalized_source = normalize_identifier(source);
-    let mut claims = Vec::new();
-
-    if normalized_source.contains("defprocess") && normalized_source.contains("jekyllsitenew") {
-        claims
-            .push("Build.process constructs a Jekyll::Site before running the build.".to_string());
-    }
-
-    if normalized_source.contains("defprocess")
-        && normalized_source.contains("read")
-        && normalized_source.contains("generate")
-        && normalized_source.contains("render")
-        && normalized_source.contains("write")
-    {
-        claims.push("Site#process runs read, generate, render, and write phases.".to_string());
-    }
-
-    if normalized_source.contains("classreader") && normalized_source.contains("defread") {
-        claims.push("Reader is responsible for reading site content.".to_string());
-    }
-
-    if normalized_source.contains("classrenderer")
-        && (normalized_source.contains("defrender")
-            || normalized_source.contains("renderdocument")
-            || normalized_source.contains("renderliquid"))
-    {
-        claims.push("Renderer renders pages and documents.".to_string());
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["log", "logger"])
-        && packet_terms_have_any(terms, &["record", "records", "logrecord"])
-        && packet_terms_have_any(terms, &["handler", "handlers"])
-}
-
-fn packet_generic_log_record_handler_claims(source: &str) -> Vec<String> {
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if source_lower.contains("class logger")
-        && source_lower.contains("protected array $handlers")
-        && source_lower.contains("function pushhandler")
-        && source_lower.contains("array_unshift($this->handlers")
-    {
-        claims.push("Logger owns a stack of handlers registered by pushHandler.".to_string());
-    }
-
-    if source_lower.contains("function log(") && source_lower.contains("$this->addrecord(") {
-        claims.push("Logger::log delegates into addRecord.".to_string());
-    }
-
-    if source_lower.contains("function addrecord(")
-        && source_lower.contains("new logrecord(")
-        && (source_lower.contains("$handler->handle($record)")
-            || source_lower.contains("$handler->handle(clone $record)")
-            || source_lower.contains("->handle($record)")
-            || source_lower.contains("->handle(clone $record)"))
-    {
-        claims.push("addRecord creates a LogRecord before passing it to handlers.".to_string());
-    }
-
-    if source_lower.contains("function handle(logrecord $record)")
-        && source_lower.contains("$this->processrecord($record)")
-        && source_lower.contains("$this->write($record)")
-    {
-        claims.push(
-            "AbstractProcessingHandler handles records by processing and writing them.".to_string(),
-        );
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_mapper_runtime_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["mapper", "mapping", "map", "maps"])
-        && packet_terms_have_any(
-            terms,
-            &["configuration", "config", "runtime", "api", "apis"],
-        )
-        && packet_terms_have_any(
-            terms,
-            &["source", "destination", "object", "objects", "typemap"],
-        )
-}
-
-fn packet_generic_mapper_runtime_claims(source: &str) -> Vec<String> {
-    let normalized_source = normalize_identifier(source);
-    let mut claims = Vec::new();
-
-    if normalized_source.contains("classmapperconfiguration")
-        && normalized_source.contains("configuredmaps")
-        && normalized_source.contains("resolvedmaps")
-        && normalized_source.contains("buildexecutionplan")
-    {
-        claims.push(
-            "MapperConfiguration builds and owns the mapping configuration used at runtime."
-                .to_string(),
-        );
-    }
-
-    if normalized_source.contains("classmapper")
-        && normalized_source.contains("mapcore")
-        && normalized_source.contains("getexecutionplan")
-        && (normalized_source.contains("publictdestinationmap")
-            || normalized_source.contains("publicobjectmap"))
-    {
-        claims.push("Mapper.Map is the public runtime entry point for object mapping.".to_string());
-    }
-
-    if normalized_source.contains("createmapperlambda") && normalized_source.contains("planbuilder")
-    {
-        claims.push(
-            "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
-        );
-    }
-
-    if normalized_source.contains("createmapperlambda")
-        && normalized_source.contains("createdestinationfunc")
-        && normalized_source.contains("createassignmentfunc")
-        && normalized_source.contains("createmapperfunc")
-    {
-        claims.push(
-            "The mapping plan builder participates in building expression plans for mappings."
-                .to_string(),
-        );
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["buffer", "buffered"])
-        && packet_terms_have_any(terms, &["source", "sources"])
-        && packet_terms_have_any(terms, &["sink", "sinks"])
-        && packet_terms_have_any(
-            terms,
-            &["read", "reads", "write", "writes", "byte", "bytes"],
-        )
-}
-
-fn packet_generic_buffered_io_claims(source: &str) -> Vec<String> {
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if (source_lower.contains("class buffer") || source_lower.contains("expect class buffer"))
-        && source_lower.contains("bufferedsource")
-        && source_lower.contains("bufferedsink")
-        && source_lower.contains("override fun read")
-        && source_lower.contains("override fun write")
-    {
-        claims.push(
-            "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
-        );
-    }
-
-    if source_lower.contains("realbufferedsource")
-        && source_lower.contains("source")
-        && source_lower.contains("buffer")
-        && source_lower.contains("override fun read")
-    {
-        claims.push("RealBufferedSource reads from an upstream Source into a Buffer.".to_string());
-    }
-
-    if source_lower.contains("realbufferedsink")
-        && source_lower.contains("sink")
-        && source_lower.contains("buffer")
-        && source_lower.contains("override fun write")
-    {
-        claims.push("RealBufferedSink writes buffered bytes to an upstream Sink.".to_string());
-    }
-
-    if source_lower.contains("fun source.buffer()")
-        && source_lower.contains("realbufferedsource(this)")
-        && source_lower.contains("fun sink.buffer()")
-        && source_lower.contains("realbufferedsink(this)")
-    {
-        claims.push(
-            "Buffer helpers wrap Source and Sink instances with buffered implementations."
-                .to_string(),
-        );
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_session_request_validation_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["session", "urlsession", "delegate"])
-        && packet_terms_have_any(terms, &["request", "requests"])
-        && packet_terms_have_any(terms, &["resume", "resumes", "task", "tasks"])
-        && packet_terms_have_any(terms, &["validate", "validates", "validation", "callback"])
-}
-
-fn packet_generic_session_request_validation_claims(source: &str) -> Vec<String> {
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if source_lower.contains("open func request")
-        && source_lower.contains("let request = datarequest")
-        && source_lower.contains("performeagerlyifnecessary(request)")
-    {
-        claims.push("Session creates request objects such as DataRequest.".to_string());
-    }
-
-    if source_lower.contains("public func resume() -> self")
-        && source_lower.contains("task.resume()")
-        && source_lower.contains("delegate?.readytoperform(request: self)")
-    {
-        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
-    }
-
-    if source_lower.contains("public func validate(_ validation")
-        && source_lower.contains("validators.write")
-        && source_lower.contains("didvalidaterequest")
-    {
-        claims.push("DataRequest.validate attaches validation behavior.".to_string());
-    }
-
-    if source_lower.contains("sessiondelegate")
-        && source_lower.contains("urlsessiondatadelegate")
-        && source_lower.contains("open func urlsession")
-        && source_lower.contains("request.didreceiveresponse")
-        && source_lower.contains("request.didreceive(data: data)")
-    {
-        claims.push("SessionDelegate receives URLSession callback events.".to_string());
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_html_form_validation_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["form", "forms"])
-        && packet_terms_have_any(terms, &["validation", "validity", "valid", "constraints"])
-        && packet_terms_have_any(terms, &["html", "javascript", "custom", "native"])
-}
-
-fn packet_generic_html_form_validation_claims(source: &str) -> Vec<String> {
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if source_lower.contains("required")
-        && source_lower.contains("pattern")
-        && (source_lower.contains("min=") || source_lower.contains("minlength"))
-        && (source_lower.contains("max=") || source_lower.contains("maxlength"))
-    {
-        claims.push(
-            "The examples use native required, pattern, min, and max constraints.".to_string(),
-        );
-    }
-
-    if source_lower.contains("<form novalidate") {
-        claims.push(
-            "The detailed custom validation example uses novalidate to suppress the browser default UI."
-                .to_string(),
-        );
-    }
-
-    if source_lower.contains("function showerror")
-        && source_lower.contains("validity.valuemissing")
-        && source_lower.contains("validity.typemismatch")
-        && source_lower.contains("validity.tooshort")
-    {
-        claims.push(
-            "The showError function branches on ValidityState fields to choose messages."
-                .to_string(),
-        );
-    }
-
-    if source_lower.contains("addeventlistener('submit'")
-        && source_lower.contains("validity.valid")
-        && source_lower.contains("preventdefault()")
-    {
-        claims.push("Submit handlers prevent submission when the form is invalid.".to_string());
     }
 
     claims
@@ -4118,129 +3728,6 @@ fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
                     .any(|stop| stop.eq_ignore_ascii_case(token))
         })
         .map(str::to_string)
-}
-
-fn packet_express_application_route_flow_claims(path: &str, source: &str) -> Vec<String> {
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_path.ends_with("lib/express.js")
-        && source_lower.contains("function createapplication()")
-        && source_lower.contains("app.handle(req, res, next)")
-        && source_lower.contains("mixin(app, proto, false)")
-        && source_lower.contains("app.request = object.create(req")
-        && source_lower.contains("app.response = object.create(res")
-        && source_lower.contains("app.init()")
-    {
-        claims.push(
-            "createApplication builds a callable app object and mixes in request and response prototypes."
-                .to_string(),
-        );
-    }
-
-    if normalized_path.ends_with("lib/application.js") {
-        if source_lower.contains("app.init = function init()")
-            && source_lower.contains("new router({")
-            && source_lower.contains("defaultconfiguration()")
-        {
-            claims.push(
-                "app.init creates application state and lazy router configuration.".to_string(),
-            );
-        }
-        if source_lower.contains("app.handle = function handle(req, res, callback)")
-            && source_lower.contains("this.router.handle(req, res, done)")
-        {
-            claims.push("app.handle delegates request handling to the router.".to_string());
-        }
-        if source_lower.contains("app.use = function use(fn)")
-            && source_lower.contains("return router.use(path, fn)")
-        {
-            claims.push("app.use registers middleware on the router.".to_string());
-        }
-        if source_lower.contains("app.route = function route(path)")
-            && source_lower.contains("return this.router.route(path)")
-        {
-            claims.push("app.route creates route entries through the router.".to_string());
-        }
-    }
-
-    if normalized_path.ends_with("lib/response.js")
-        && source_lower.contains("res.send = function send(body)")
-        && source_lower.contains("this.set('content-length'")
-        && source_lower.contains("this.end(chunk, encoding)")
-    {
-        claims.push("res.send prepares and sends the response body.".to_string());
-    }
-
-    claims
-}
-
-fn packet_python_requests_flow_claim(symbol: &str, path: &str, source: &str) -> Option<String> {
-    let normalized_symbol = normalize_identifier(symbol);
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let source_lower = source.to_ascii_lowercase();
-    let in_requests_source =
-        normalized_path.contains("/src/requests/") || normalized_path.starts_with("src/requests/");
-    if !in_requests_source {
-        return None;
-    }
-
-    if normalized_symbol == "request"
-        && normalized_path.ends_with("src/requests/api.py")
-        && source_lower.contains("with sessions.session() as session")
-        && source_lower.contains("session.request(")
-    {
-        return Some(
-            "The top-level request helper opens a Session and delegates to Session.request."
-                .to_string(),
-        );
-    }
-
-    if normalized_symbol == "sessionrequest"
-        && normalized_path.ends_with("src/requests/sessions.py")
-        && source_lower.contains("request(")
-        && source_lower.contains("self.prepare_request(")
-    {
-        return Some(
-            "Session.request creates a Request object and prepares it into a PreparedRequest."
-                .to_string(),
-        );
-    }
-
-    if normalized_symbol == "preparedrequestprepare"
-        && normalized_path.ends_with("src/requests/models.py")
-        && source_lower.contains("prepare_method(")
-        && source_lower.contains("prepare_url(")
-        && source_lower.contains("prepare_body(")
-    {
-        return Some(
-            "PreparedRequest.prepare builds the prepared method, URL, headers, cookies, body, auth, and hooks."
-                .to_string(),
-        );
-    }
-
-    if normalized_symbol == "sessionsend"
-        && normalized_path.ends_with("src/requests/sessions.py")
-        && source_lower.contains("get_adapter(")
-        && source_lower.contains("adapter.send(")
-    {
-        return Some(
-            "Session.send chooses an adapter and calls the adapter send method.".to_string(),
-        );
-    }
-
-    if normalized_symbol == "httpadaptersend"
-        && normalized_path.ends_with("src/requests/adapters.py")
-        && source_lower.contains("conn.urlopen(")
-        && source_lower.contains("build_response(")
-    {
-        return Some(
-            "HTTPAdapter.send is the transport boundary that returns the response.".to_string(),
-        );
-    }
-
-    None
 }
 
 fn packet_append_indexing_storage_flow_template_claims(
@@ -5718,10 +5205,6 @@ fn packet_source_derived_claim_for_role(
     let prompt_terms = packet_probe_terms(prompt);
     let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
     let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
-
-    if request_flow && let Some(claim) = packet_python_requests_flow_claim(symbol, &path, &source) {
-        return Some(claim);
-    }
 
     if request_flow
         && role == "client factory"
@@ -7335,12 +6818,6 @@ fn packet_sufficiency_required_probe_queries_from_terms(
 
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
-        if packet_terms_indicate_prepared_session_adapter_flow(terms) {
-            push_prepared_session_adapter_required_probe_queries(&mut queries);
-        }
-        if packet_terms_indicate_express_application_route_flow(terms) {
-            push_express_application_route_required_probe_queries(&mut queries);
-        }
         return queries;
     }
 
@@ -7376,10 +6853,16 @@ fn packet_sufficiency_required_probe_queries_from_terms(
         );
     }
     if packet_terms_indicate_prepared_session_adapter_flow(terms) {
-        push_prepared_session_adapter_required_probe_queries(&mut queries);
-    }
-    if packet_terms_indicate_express_application_route_flow(terms) {
-        push_express_application_route_required_probe_queries(&mut queries);
+        push_unique_terms(
+            &mut queries,
+            &[
+                "prepared request",
+                "session request",
+                "session send",
+                "adapter send",
+                "get adapter",
+            ],
+        );
     }
     if has("event") && has("loop") {
         push_unique_terms(
@@ -7409,50 +6892,6 @@ fn packet_sufficiency_required_probe_queries_from_terms(
     }
 
     queries
-}
-
-fn push_prepared_session_adapter_required_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "Session.request",
-            "Session.prepare_request",
-            "PreparedRequest.prepare",
-            "Session.send",
-            "HTTPAdapter.send",
-        ],
-    );
-}
-
-fn push_express_application_route_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "createApplication",
-            "app.init",
-            "app.handle",
-            "app.use",
-            "app.route",
-            "res.send",
-            "application.js app.use",
-            "application handle use route",
-            "response send body",
-        ],
-    );
-}
-
-fn push_express_application_route_required_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "createApplication",
-            "app.init",
-            "app.handle",
-            "app.use",
-            "app.route",
-            "res.send",
-        ],
-    );
 }
 
 fn push_indexing_flow_required_probe_queries(queries: &mut Vec<String>) {
@@ -12332,6 +11771,7 @@ mod tests {
 
     #[test]
     fn route_tracing_packet_plan_seeds_express_app_route_probes_when_prompt_names_express() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
         let plan = build_packet_plan(
             question,
@@ -14345,6 +13785,7 @@ mod tests {
 
     #[test]
     fn packet_plan_adds_prepared_session_adapter_exact_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let question = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
         let plan = build_packet_plan(
             question,
@@ -14375,6 +13816,88 @@ mod tests {
             assert!(
                 required.iter().any(|query| query == expected),
                 "packet required probes should protect exact Requests flow probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_keeps_requests_and_express_exact_probes_eval_only() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let requests_question = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
+        let requests_plan = build_packet_plan(
+            requests_question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let requests_queries = requests_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let requests_required = packet_sufficiency_required_probe_queries(
+            requests_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for generic_probe in [
+            "prepared request",
+            "session request",
+            "session send",
+            "adapter send",
+        ] {
+            assert!(
+                requests_queries.contains(&generic_probe)
+                    || requests_required.iter().any(|query| query == generic_probe),
+                "production plan should keep generic request/session probe `{generic_probe}`; queries={requests_queries:?} required={requests_required:?}"
+            );
+        }
+        for eval_only_probe in [
+            "Session.request",
+            "Session.prepare_request",
+            "PreparedRequest.prepare",
+            "Session.send",
+            "HTTPAdapter.send",
+        ] {
+            assert!(
+                !requests_queries.contains(&eval_only_probe)
+                    && !requests_required
+                        .iter()
+                        .any(|query| query == eval_only_probe),
+                "production plan should not add exact Requests probe `{eval_only_probe}`; queries={requests_queries:?} required={requests_required:?}"
+            );
+        }
+
+        let express_question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
+        let express_plan = build_packet_plan(
+            express_question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let express_queries = express_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let express_required = packet_sufficiency_required_probe_queries(
+            express_question,
+            PacketTaskClassDto::RouteTracing,
+        );
+
+        for eval_only_probe in [
+            "createApplication",
+            "app.init",
+            "app.handle",
+            "app.use",
+            "app.route",
+            "res.send",
+            "application.js app.use",
+        ] {
+            assert!(
+                !express_queries.contains(&eval_only_probe)
+                    && !express_required
+                        .iter()
+                        .any(|query| query == eval_only_probe),
+                "production plan should not add exact Express probe `{eval_only_probe}`; queries={express_queries:?} required={express_required:?}"
             );
         }
     }
@@ -15239,6 +14762,7 @@ mod tests {
 
     #[test]
     fn site_build_claims_survive_with_generic_claims() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.";
 
         let fixtures = [
@@ -15602,6 +15126,7 @@ mod tests {
     }
     #[test]
     fn express_route_flow_source_claims_name_app_router_response_flow() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
         let fixtures = [
             (
@@ -15717,34 +15242,79 @@ mod tests {
     #[test]
     fn exact_family_source_claims_require_eval_probes() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
-        let prompt =
-            "Explain how Commons Lang implements blank and empty string checks across StringUtils.";
-        let string_utils = test_packet_citation(
-            "org.apache.commons.lang3.StringUtils.isBlank",
-            "src/main/java/org/apache/commons/lang3/StringUtils.java",
-            0.9,
-        );
-        let claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &string_utils,
-            r#"
-            public static boolean isBlank(final CharSequence cs) {
-                if (cs == null || cs.length() == 0) {
-                    return true;
+        let cases = [
+            (
+                "Explain how Commons Lang implements blank and empty string checks across StringUtils.",
+                test_packet_citation(
+                    "org.apache.commons.lang3.StringUtils.isBlank",
+                    "src/main/java/org/apache/commons/lang3/StringUtils.java",
+                    0.9,
+                ),
+                r#"
+                public static boolean isBlank(final CharSequence cs) {
+                    if (cs == null || cs.length() == 0) {
+                        return true;
+                    }
+                    return Character.isWhitespace(cs.charAt(0));
                 }
-                return Character.isWhitespace(cs.charAt(0));
-            }
-            * NOTE: This method changed in Lang version 2.0. It no longer trims the CharSequence.
-            public static boolean isEmpty(final CharSequence cs) {
-                return cs == null || cs.length() == 0;
-            }
-            "#,
-        );
+                * NOTE: This method changed in Lang version 2.0. It no longer trims the CharSequence.
+                public static boolean isEmpty(final CharSequence cs) {
+                    return cs == null || cs.length() == 0;
+                }
+                "#,
+                &["StringUtils."][..],
+            ),
+            (
+                "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.",
+                test_packet_citation("Session.request", "src/requests/sessions.py", 0.9),
+                "def request(self, method, url, **kwargs):\n    req = Request(method=method, url=url)\n    prep = self.prepare_request(req)\n    return self.send(prep, **kwargs)\n",
+                &["PreparedRequest", "Session.request"][..],
+            ),
+            (
+                "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
+                test_packet_citation("app.use", "lib/application.js", 0.9),
+                "app.use = function use(fn) { return router.use(path, fn); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\n",
+                &["app.use", "app.handle"][..],
+            ),
+            (
+                "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.",
+                test_packet_citation("Site#process", "lib/jekyll/site.rb", 0.9),
+                "class Site\n  def process\n    read\n    generate\n    render\n    write\n  end\nend\n",
+                &["Jekyll::Site", "Site#process"][..],
+            ),
+            (
+                "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.",
+                test_packet_citation(
+                    "MapperConfiguration",
+                    "src/AutoMapper/Configuration/MapperConfiguration.cs",
+                    0.9,
+                ),
+                "public sealed class MapperConfiguration { Dictionary<TypePair, TypeMap> _configuredMaps; Dictionary<TypePair, TypeMap> _resolvedMaps; LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) => null; }\n",
+                &["MapperConfiguration", "Mapper.Map", "TypeMap"][..],
+            ),
+            (
+                "Explain how Okio's Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes.",
+                test_packet_citation("RealBufferedSource", "okio/RealBufferedSource.kt", 0.9),
+                "class RealBufferedSource(val source: Source) { val buffer = Buffer(); override fun read(sink: Buffer, byteCount: Long): Long = source.read(buffer, byteCount) }\n",
+                &["RealBufferedSource", "Buffer helpers"][..],
+            ),
+            (
+                "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.",
+                test_packet_citation("DataRequest.validate", "Source/Core/DataRequest.swift", 0.9),
+                "public func validate(_ validation: @escaping Validation) -> Self { validators.write { $0.append(validation) }; didValidateRequest() }\n",
+                &["DataRequest.validate", "SessionDelegate"][..],
+            ),
+        ];
 
-        assert!(
-            claims.iter().all(|claim| !claim.contains("StringUtils.")),
-            "production source claims should not include exact benchmark-family claims: {claims:?}"
-        );
+        for (prompt, citation, source, forbidden_fragments) in cases {
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
+            for forbidden in forbidden_fragments {
+                assert!(
+                    claims.iter().all(|claim| !claim.contains(forbidden)),
+                    "production source claims should not include exact benchmark-family fragment `{forbidden}`: {claims:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -15852,6 +15422,7 @@ mod tests {
 
     #[test]
     fn python_requests_source_claims_name_method_flow() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
         let cases = [
             (

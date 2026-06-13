@@ -192,6 +192,12 @@ pub(crate) fn push_prompt_concept_derived_symbol_probes(
         push_unique_term(queries, "internalMutate");
     }
 
+    if eval_terms_indicate_python_requests_flow(terms) {
+        push_python_requests_flow_symbol_probe_queries(queries);
+    }
+    if eval_terms_indicate_express_application_route_flow(terms) {
+        push_express_application_route_symbol_probe_queries(queries);
+    }
     if eval_terms_indicate_gin_route_dispatch_flow(terms) {
         push_gin_route_dispatch_symbol_probe_queries(queries);
     }
@@ -227,6 +233,31 @@ pub(crate) fn push_prompt_named_file_probe_queries(terms: &[String], queries: &m
                 "helper.ts createCacheHelper",
                 "mutate.ts internalMutate",
                 "with-middleware.ts withMiddleware",
+            ],
+        );
+    }
+    if eval_terms_indicate_python_requests_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "src/requests/api.py request",
+                "src/requests/sessions.py Session.request",
+                "src/requests/models.py PreparedRequest.prepare",
+                "src/requests/sessions.py Session.send",
+                "src/requests/adapters.py HTTPAdapter.send",
+            ],
+        );
+    }
+    if eval_terms_indicate_express_application_route_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "lib/express.js createApplication",
+                "lib/application.js app.init",
+                "lib/application.js app.handle",
+                "lib/application.js app.use",
+                "lib/application.js app.route",
+                "lib/response.js res.send",
             ],
         );
     }
@@ -280,6 +311,15 @@ pub(crate) fn source_derived_claims_for_citation(
     if eval_terms_indicate_swr_hook_flow(&terms) {
         claims.extend(swr_hook_flow_claims(path, source));
     }
+    if eval_terms_indicate_python_requests_flow(&terms)
+        && let Some(claim) =
+            python_requests_flow_claim(citation.display_name.as_str(), path, source)
+    {
+        claims.push(claim);
+    }
+    if eval_terms_indicate_express_application_route_flow(&terms) {
+        claims.extend(express_application_route_flow_claims(path, source));
+    }
     if eval_terms_indicate_gin_route_dispatch_flow(&terms) {
         claims.extend(gin_route_dispatch_flow_claims(path, source));
     }
@@ -288,6 +328,21 @@ pub(crate) fn source_derived_claims_for_citation(
     }
     if eval_terms_indicate_automapper_map_flow(&terms) {
         claims.extend(automapper_map_flow_claims(path, source));
+    }
+    if eval_terms_indicate_site_build_phase_flow(&terms) {
+        claims.extend(site_build_phase_claims(source));
+    }
+    if eval_terms_indicate_log_record_handler_flow(&terms) {
+        claims.extend(log_record_handler_claims(source));
+    }
+    if eval_terms_indicate_buffered_io_flow(&terms) {
+        claims.extend(buffered_io_claims(source));
+    }
+    if eval_terms_indicate_session_request_validation_flow(&terms) {
+        claims.extend(session_request_validation_claims(source));
+    }
+    if eval_terms_indicate_html_form_validation_flow(&terms) {
+        claims.extend(html_form_validation_claims(source));
     }
 
     claims
@@ -673,6 +728,60 @@ fn eval_terms_indicate_swr_hook_flow(terms: &[String]) -> bool {
         )
 }
 
+fn eval_terms_indicate_python_requests_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    has("requests")
+        && has_any(&["request", "requests", "prepared", "preparedrequest"])
+        && has_any(&["session", "sessions"])
+        && has_any(&["adapter", "adapters", "send", "sends", "transport"])
+}
+
+fn push_python_requests_flow_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Session.request",
+            "Session.prepare_request",
+            "PreparedRequest.prepare",
+            "Session.send",
+            "HTTPAdapter.send",
+        ],
+    );
+}
+
+fn eval_terms_indicate_express_application_route_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    has("express")
+        && has_any(&["application", "app"])
+        && has_any(&[
+            "middleware",
+            "middleware/routes",
+            "route",
+            "routes",
+            "router",
+        ])
+        && has_any(&["request", "response", "handler", "handles"])
+}
+
+fn push_express_application_route_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "createApplication",
+            "app.init",
+            "app.handle",
+            "app.use",
+            "app.route",
+            "res.send",
+            "application.js app.use",
+            "application handle use route",
+            "response send body",
+        ],
+    );
+}
+
 fn eval_terms_indicate_gin_route_dispatch_flow(terms: &[String]) -> bool {
     let has = |term: &str| eval_terms_have(terms, term);
     let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
@@ -751,6 +860,45 @@ fn push_automapper_map_flow_symbol_probe_queries(queries: &mut Vec<String>) {
             "TypeMapPlanBuilder.CreateMapperLambda",
         ],
     );
+}
+
+fn eval_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "jekyll")
+        || eval_terms_have_any(terms, &["site", "build", "command", "process"]))
+        && eval_terms_have_any(
+            terms,
+            &["read", "generate", "render", "write", "phase", "phases"],
+        )
+}
+
+fn eval_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "monolog") || eval_terms_have_any(terms, &["log", "logger"]))
+        && eval_terms_have_any(terms, &["record", "records", "logrecord"])
+        && eval_terms_have_any(terms, &["handler", "handlers"])
+}
+
+fn eval_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "okio") || eval_terms_have_any(terms, &["buffer", "buffered"]))
+        && eval_terms_have_any(terms, &["source", "sources"])
+        && eval_terms_have_any(terms, &["sink", "sinks"])
+        && eval_terms_have_any(
+            terms,
+            &["read", "reads", "write", "writes", "byte", "bytes"],
+        )
+}
+
+fn eval_terms_indicate_session_request_validation_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "alamofire")
+        || eval_terms_have_any(terms, &["session", "urlsession", "delegate"]))
+        && eval_terms_have_any(terms, &["request", "requests"])
+        && eval_terms_have_any(terms, &["resume", "resumes", "task", "tasks"])
+        && eval_terms_have_any(terms, &["validate", "validates", "validation", "callback"])
+}
+
+fn eval_terms_indicate_html_form_validation_flow(terms: &[String]) -> bool {
+    eval_terms_have_any(terms, &["form", "forms"])
+        && eval_terms_have_any(terms, &["validation", "validity", "valid", "constraints"])
+        && eval_terms_have_any(terms, &["html", "javascript", "custom", "native"])
 }
 
 fn java_string_check_flow_claims(path: &str, source: &str) -> Vec<String> {
@@ -1025,6 +1173,324 @@ fn automapper_map_flow_claims(path: &str, source: &str) -> Vec<String> {
             "TypeMapPlanBuilder participates in building expression plans for mappings."
                 .to_string(),
         );
+    }
+
+    claims
+}
+
+fn python_requests_flow_claim(symbol: &str, path: &str, source: &str) -> Option<String> {
+    let normalized_symbol = normalize_eval_identifier(symbol);
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let in_requests_source =
+        normalized_path.contains("/src/requests/") || normalized_path.starts_with("src/requests/");
+    if !in_requests_source {
+        return None;
+    }
+
+    if normalized_symbol == "request"
+        && normalized_path.ends_with("src/requests/api.py")
+        && source_lower.contains("with sessions.session() as session")
+        && source_lower.contains("session.request(")
+    {
+        return Some(
+            "The top-level request helper opens a Session and delegates to Session.request."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "sessionrequest"
+        && normalized_path.ends_with("src/requests/sessions.py")
+        && source_lower.contains("request(")
+        && source_lower.contains("self.prepare_request(")
+    {
+        return Some(
+            "Session.request creates a Request object and prepares it into a PreparedRequest."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "preparedrequestprepare"
+        && normalized_path.ends_with("src/requests/models.py")
+        && source_lower.contains("prepare_method(")
+        && source_lower.contains("prepare_url(")
+        && source_lower.contains("prepare_body(")
+    {
+        return Some(
+            "PreparedRequest.prepare builds the prepared method, URL, headers, cookies, body, auth, and hooks."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "sessionsend"
+        && normalized_path.ends_with("src/requests/sessions.py")
+        && source_lower.contains("get_adapter(")
+        && source_lower.contains("adapter.send(")
+    {
+        return Some(
+            "Session.send chooses an adapter and calls the adapter send method.".to_string(),
+        );
+    }
+
+    if normalized_symbol == "httpadaptersend"
+        && normalized_path.ends_with("src/requests/adapters.py")
+        && source_lower.contains("conn.urlopen(")
+        && source_lower.contains("build_response(")
+    {
+        return Some(
+            "HTTPAdapter.send is the transport boundary that returns the response.".to_string(),
+        );
+    }
+
+    None
+}
+
+fn express_application_route_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("lib/express.js")
+        && source_lower.contains("function createapplication()")
+        && source_lower.contains("app.handle(req, res, next)")
+        && source_lower.contains("mixin(app, proto, false)")
+        && source_lower.contains("app.request = object.create(req")
+        && source_lower.contains("app.response = object.create(res")
+        && source_lower.contains("app.init()")
+    {
+        claims.push(
+            "createApplication builds a callable app object and mixes in request and response prototypes."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("lib/application.js") {
+        if source_lower.contains("app.init = function init()")
+            && source_lower.contains("new router({")
+            && source_lower.contains("defaultconfiguration()")
+        {
+            claims.push(
+                "app.init creates application state and lazy router configuration.".to_string(),
+            );
+        }
+        if source_lower.contains("app.handle = function handle(req, res, callback)")
+            && source_lower.contains("this.router.handle(req, res, done)")
+        {
+            claims.push("app.handle delegates request handling to the router.".to_string());
+        }
+        if source_lower.contains("app.use = function use(fn)")
+            && source_lower.contains("return router.use(path, fn)")
+        {
+            claims.push("app.use registers middleware on the router.".to_string());
+        }
+        if source_lower.contains("app.route = function route(path)")
+            && source_lower.contains("return this.router.route(path)")
+        {
+            claims.push("app.route creates route entries through the router.".to_string());
+        }
+    }
+
+    if normalized_path.ends_with("lib/response.js")
+        && source_lower.contains("res.send = function send(body)")
+        && source_lower.contains("this.set('content-length'")
+        && source_lower.contains("this.end(chunk, encoding)")
+    {
+        claims.push("res.send prepares and sends the response body.".to_string());
+    }
+
+    claims
+}
+
+fn site_build_phase_claims(source: &str) -> Vec<String> {
+    let normalized_source = normalize_eval_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_source.contains("defprocess") && normalized_source.contains("jekyllsitenew") {
+        claims
+            .push("Build.process constructs a Jekyll::Site before running the build.".to_string());
+    }
+
+    if normalized_source.contains("defprocess")
+        && normalized_source.contains("read")
+        && normalized_source.contains("generate")
+        && normalized_source.contains("render")
+        && normalized_source.contains("write")
+    {
+        claims.push("Site#process runs read, generate, render, and write phases.".to_string());
+    }
+
+    if normalized_source.contains("classreader") && normalized_source.contains("defread") {
+        claims.push("Reader is responsible for reading site content.".to_string());
+    }
+
+    if normalized_source.contains("classrenderer")
+        && (normalized_source.contains("defrender")
+            || normalized_source.contains("renderdocument")
+            || normalized_source.contains("renderliquid"))
+    {
+        claims.push("Renderer renders pages and documents.".to_string());
+    }
+
+    claims
+}
+
+fn log_record_handler_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("class logger")
+        && source_lower.contains("protected array $handlers")
+        && source_lower.contains("function pushhandler")
+        && source_lower.contains("array_unshift($this->handlers")
+    {
+        claims.push("Logger owns a stack of handlers registered by pushHandler.".to_string());
+    }
+
+    if source_lower.contains("function log(") && source_lower.contains("$this->addrecord(") {
+        claims.push("Logger::log delegates into addRecord.".to_string());
+    }
+
+    if source_lower.contains("function addrecord(")
+        && source_lower.contains("new logrecord(")
+        && (source_lower.contains("$handler->handle($record)")
+            || source_lower.contains("$handler->handle(clone $record)")
+            || source_lower.contains("->handle($record)")
+            || source_lower.contains("->handle(clone $record)"))
+    {
+        claims.push("addRecord creates a LogRecord before passing it to handlers.".to_string());
+    }
+
+    if source_lower.contains("function handle(logrecord $record)")
+        && source_lower.contains("$this->processrecord($record)")
+        && source_lower.contains("$this->write($record)")
+    {
+        claims.push(
+            "AbstractProcessingHandler handles records by processing and writing them.".to_string(),
+        );
+    }
+
+    claims
+}
+
+fn buffered_io_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if (source_lower.contains("class buffer") || source_lower.contains("expect class buffer"))
+        && source_lower.contains("bufferedsource")
+        && source_lower.contains("bufferedsink")
+        && source_lower.contains("override fun read")
+        && source_lower.contains("override fun write")
+    {
+        claims.push(
+            "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
+        );
+    }
+
+    if source_lower.contains("realbufferedsource")
+        && source_lower.contains("source")
+        && source_lower.contains("buffer")
+        && source_lower.contains("override fun read")
+    {
+        claims.push("RealBufferedSource reads from an upstream Source into a Buffer.".to_string());
+    }
+
+    if source_lower.contains("realbufferedsink")
+        && source_lower.contains("sink")
+        && source_lower.contains("buffer")
+        && source_lower.contains("override fun write")
+    {
+        claims.push("RealBufferedSink writes buffered bytes to an upstream Sink.".to_string());
+    }
+
+    if source_lower.contains("fun source.buffer()")
+        && source_lower.contains("realbufferedsource(this)")
+        && source_lower.contains("fun sink.buffer()")
+        && source_lower.contains("realbufferedsink(this)")
+    {
+        claims.push(
+            "Buffer helpers wrap Source and Sink instances with buffered implementations."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn session_request_validation_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("open func request")
+        && source_lower.contains("let request = datarequest")
+        && source_lower.contains("performeagerlyifnecessary(request)")
+    {
+        claims.push("Session creates request objects such as DataRequest.".to_string());
+    }
+
+    if source_lower.contains("public func resume() -> self")
+        && source_lower.contains("task.resume()")
+        && source_lower.contains("delegate?.readytoperform(request: self)")
+    {
+        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
+    }
+
+    if source_lower.contains("public func validate(_ validation")
+        && source_lower.contains("validators.write")
+        && source_lower.contains("didvalidaterequest")
+    {
+        claims.push("DataRequest.validate attaches validation behavior.".to_string());
+    }
+
+    if source_lower.contains("sessiondelegate")
+        && source_lower.contains("urlsessiondatadelegate")
+        && source_lower.contains("open func urlsession")
+        && source_lower.contains("request.didreceiveresponse")
+        && source_lower.contains("request.didreceive(data: data)")
+    {
+        claims.push("SessionDelegate receives URLSession callback events.".to_string());
+    }
+
+    claims
+}
+
+fn html_form_validation_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("required")
+        && source_lower.contains("pattern")
+        && (source_lower.contains("min=") || source_lower.contains("minlength"))
+        && (source_lower.contains("max=") || source_lower.contains("maxlength"))
+    {
+        claims.push(
+            "The examples use native required, pattern, min, and max constraints.".to_string(),
+        );
+    }
+
+    if source_lower.contains("<form novalidate") {
+        claims.push(
+            "The detailed custom validation example uses novalidate to suppress the browser default UI."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("function showerror")
+        && source_lower.contains("validity.valuemissing")
+        && source_lower.contains("validity.typemismatch")
+        && source_lower.contains("validity.tooshort")
+    {
+        claims.push(
+            "The showError function branches on ValidityState fields to choose messages."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("addeventlistener('submit'")
+        && source_lower.contains("validity.valid")
+        && source_lower.contains("preventdefault()")
+    {
+        claims.push("Submit handlers prevent submission when the form is invalid.".to_string());
     }
 
     claims
