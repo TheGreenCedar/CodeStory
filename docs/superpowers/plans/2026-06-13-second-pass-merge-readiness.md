@@ -280,7 +280,7 @@ git commit -m "clarify language evidence limits"
 **Files:**
 - Modify: `docs/testing/codestory-e2e-stats-log.md` only if the ignored repo-scale e2e gate is rerun successfully.
 
-- [ ] **Step 1: Run targeted serialized verification**
+- [x] **Step 1: Run targeted serialized verification**
 
 Run:
 
@@ -296,7 +296,9 @@ git diff --check origin/main...HEAD
 
 Expected: all pass.
 
-- [ ] **Step 2: Repair active sidecar readiness**
+Observed 2026-06-13: all commands passed. `retrieval_generalization_guard` ran 10 tests; language holdout integrity reported `tasks=18 languages=18 repos=18 raw_files=4308 indexed_files=4308 nodes=385735 edges=312268 errors=0 fatal_errors=0`.
+
+- [x] **Step 2: Repair active sidecar readiness**
 
 Run:
 
@@ -309,7 +311,9 @@ target\release\codestory-cli.exe doctor --project . --format json
 
 Expected: `ready` reports both `local_navigation` and `agent_packet_search` as `ready`; `doctor` reports `retrieval_mode: "full"` and semantic contract `ok`.
 
-- [ ] **Step 3: Run repo-scale e2e only if preparing another commit**
+Observed 2026-06-13: sidecars rebuilt to manifest generation `fe0b766440101c99-baeb1586bbcb68a5`; `ready` reported both `local_navigation` and `agent_packet_search` ready; `doctor` reported `retrieval_mode: "full"`, zero index errors, and semantic contract `ok`.
+
+- [x] **Step 3: Run repo-scale e2e only if preparing another commit**
 
 If any files changed after Task 2, run:
 
@@ -321,6 +325,8 @@ Remove-Item Env:CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES
 ```
 
 Expected: pass. If this emits a fresh stats row for the new HEAD, append it to `docs/testing/codestory-e2e-stats-log.md` before committing.
+
+Observed 2026-06-13: release build passed; ignored `codestory_repo_e2e_stats` passed with `proof_tier: "full_sidecar"`, no warnings, and `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`. Fresh row appended to `docs/testing/codestory-e2e-stats-log.md`.
 
 - [ ] **Step 4: Final branch review**
 
