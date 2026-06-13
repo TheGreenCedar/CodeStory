@@ -51,7 +51,7 @@ pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     parser_profile("go", &["go"]),
     parser_profile("ruby", &["rb"]),
     parser_profile("php", &["php"]),
-    parser_profile("csharp", &["cs", "cshtml"]),
+    parser_profile("csharp", &["cs"]),
     parser_profile("kotlin", &["kt", "kts"]),
     parser_profile("swift", &["swift"]),
     parser_profile("dart", &["dart"]),
@@ -143,9 +143,9 @@ mod tests {
                 .evidence_tier,
             LanguageEvidenceTier::StructuralOnly
         );
-        assert_eq!(
-            language_name_for_path(Some("src/app/Program.cshtml")),
-            Some("csharp")
+        assert!(
+            language_name_for_path(Some("src/app/Program.cshtml")).is_none(),
+            "Razor .cshtml files are workspace-compatible, but not a public parser-backed C# claim"
         );
     }
 

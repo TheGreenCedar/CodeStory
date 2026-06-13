@@ -7,9 +7,10 @@ are separate claims.
 The source of truth for extension ownership, stored-language names, support
 modes, evidence tiers, and claim labels is
 `crates/codestory-contracts/src/language_support.rs`. The indexer maps those
-shared support profiles to parser/rule construction in `get_language_for_ext`;
-workspace discovery and runtime semantic document labels consume the same
-registry so support claims cannot drift quietly across crates.
+shared support profiles to parser/rule construction in `get_language_for_ext`.
+The shared registry owns public support claims. Workspace discovery also carries
+compatibility-only filters for file types that can be scanned or grouped without
+being claimed as parser-backed language support.
 
 ## Claim Terms
 

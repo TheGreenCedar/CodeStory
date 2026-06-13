@@ -12973,14 +12973,18 @@ class Test {
             LanguageEvidenceTier::StructuralOnly
         );
 
-        for ext in ["kt", "kts", "swift", "dart", "sh", "bash"] {
-            let profile = language_support_profile_for_ext(ext).expect("new parser-backed profile");
-            assert_eq!(profile.support_mode, LanguageSupportMode::ParserBackedGraph);
-            assert_eq!(profile.evidence_tier, LanguageEvidenceTier::GraphFidelity);
-            assert!(
-                get_language_for_ext(ext).is_some(),
-                "parser-backed language {ext} must route into live indexing"
-            );
+        for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
+            if profile.support_mode == LanguageSupportMode::ParserBackedGraph {
+                for ext in profile.extensions {
+                    assert_eq!(profile.evidence_tier, LanguageEvidenceTier::GraphFidelity);
+                    assert!(
+                        get_language_for_ext(ext).is_some(),
+                        "parser-backed language {} extension {} must route into live indexing",
+                        profile.language_name,
+                        ext
+                    );
+                }
+            }
         }
     }
 

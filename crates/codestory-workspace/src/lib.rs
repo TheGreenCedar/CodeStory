@@ -888,12 +888,12 @@ mod tests {
 
     #[test]
     fn workspace_supported_source_extensions_have_registry_profiles() {
-        let claimed = [
+        let public_registry_claimed = [
             "rs", "py", "pyi", "java", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "c",
-            "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "go", "rb", "php", "cs", "cshtml", "kt",
-            "kts", "swift", "dart", "sql", "html", "htm", "css", "sh", "bash",
+            "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "go", "rb", "php", "cs", "kt", "kts",
+            "swift", "dart", "sql", "html", "htm", "css", "sh", "bash",
         ];
-        for extension in claimed {
+        for extension in public_registry_claimed {
             assert!(
                 codestory_contracts::language_support::language_support_profile_for_ext(extension)
                     .is_some(),
@@ -903,6 +903,30 @@ mod tests {
             assert!(
                 registry_language_for_path(Path::new(&file_name)).is_some(),
                 "workspace source extension should resolve registry language: {extension}"
+            );
+        }
+
+        let compatibility_only = [
+            ("cshtml", Language::CSharp),
+            ("svelte", Language::JavaScript),
+            ("vue", Language::JavaScript),
+            ("astro", Language::JavaScript),
+            ("lua", Language::Lua),
+            ("ps1", Language::PowerShell),
+            ("scss", Language::Css),
+            ("sass", Language::Css),
+            ("less", Language::Css),
+        ];
+        for (extension, language) in compatibility_only {
+            assert!(
+                codestory_contracts::language_support::language_support_profile_for_ext(extension)
+                    .is_none(),
+                "compatibility-only source extension should not have a public registry profile: {extension}"
+            );
+            let file_name = format!("main.{extension}");
+            assert!(
+                matches_source_group_language(Path::new(&file_name), &language),
+                "compatibility-only source extension should stay accepted by workspace discovery: {extension}"
             );
         }
     }
