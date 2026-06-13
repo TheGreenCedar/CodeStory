@@ -3476,6 +3476,8 @@ fn indexable_source_path(path: &Path) -> bool {
         .and_then(codestory_indexer::get_language_for_ext)
         .is_some();
     tree_sitter_supported
+        || codestory_indexer::template_pipeline::template_kind_for_path(path).is_some()
+        || codestory_indexer::structural::is_structural_candidate_path(path)
         || codestory_indexer::is_text_only_candidate_path(path)
         || looks_like_openapi_source_path(path)
 }
@@ -10699,6 +10701,33 @@ mod tests {
         assert!(
             !details.next_commands.is_empty(),
             "retrieval error should include repair commands: {error:?}"
+        );
+    }
+
+    #[test]
+    fn indexable_source_path_tracks_indexer_structural_and_template_surfaces() {
+        for relative_path in [
+            "src/lib.rs",
+            "src/main.go",
+            "src/App.vue",
+            "src/App.svelte",
+            "src/pages/index.astro",
+            "public/index.html",
+            "public/site.css",
+            "db/schema.sql",
+        ] {
+            assert!(
+                indexable_source_path(Path::new(relative_path)),
+                "runtime freshness should count indexer-indexable path: {relative_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexable_source_path_keeps_non_code_data_outside_freshness_gate() {
+        assert!(
+            !indexable_source_path(Path::new("target/run-output.log")),
+            "runtime freshness should not count unsupported output artifacts"
         );
     }
 

@@ -4,85 +4,135 @@ Date: 2026-06-13
 
 ## Verdict
 
-Production runtime defaults do not enable exact benchmark-family steering. Rows
-that used `CODESTORY_EVAL_PROBES=1` are eval-only diagnostics and are not
-promotion evidence.
+The language-expansion evidence is useful, but it is not broad promotion proof.
 
-The benchmark harness now measures the right A/B shape: a strict no-CodeStory
-local baseline against a CodeStory-first arm, with wall time, token usage, tool
-calls, command categories, source reads, web/search leakage, packet quality,
-post-packet source reads, and manifest quality scored from recorded artifacts.
+The strongest current result is a narrow packet-eligible A/B slice: CodeStory
+beats the strict no-CodeStory baseline on quality, tokens, commands, and wall
+time for nine selected rows. The broader 18-language packet runtime artifact now
+passes manifest quality for all 18 rows, but only 6 rows are packet-sufficient
+without follow-up commands and two rows still miss the packet retrieval latency
+SLA. The older full 18-language paired A/B run is explicitly not a promotion
+win because CodeStory quality improved only modestly while total tokens and wall
+time regressed.
 
-The honest result is still mixed. The latest full 18-language paired A/B
-artifact is not a promotion win: CodeStory passed more quality rows than the
-no-CodeStory baseline (`9/18` versus `7/18`) and used fewer tool
-calls/commands (`305` versus `519`), but it used more total tokens
-(`13,060,265` versus `8,191,771`), more runner wall time (`4,014,646 ms`
-versus `3,094,988 ms`), and more all-in wall time after cache preparation
-(`4,796,792 ms` versus `3,094,988 ms`). Packet manifest quality passed only
-`7/18` CodeStory rows in that older full paired run.
+Do not turn this report into a headline claim that every supported language is
+first-class. It proves that the harness and packet path can measure the right
+questions, and it identifies the next cleanup targets. It does not prove a
+generalized, production-safe, 18-language win.
 
-The current no-hidden-steering packet baseline is better but still partial.
-With production-default packet behavior plus explicit manifest-derived probes
-and generic source-shape claims, the packet gate quality-passes `9/18` language
-rows. That is the current generalized packet baseline. It is not broad
-18-language proof.
+## Evidence Ledger
 
-The current packet-eligible A/B slice is a real win inside that narrower gate:
-CodeStory passed `9/9` rows versus `6/9` for the strict no-CodeStory baseline,
-with no post-packet source reads and no web searches. It used `291,788` tokens
-versus `5,346,265`, `502,289 ms` all-in wall time versus `1,881,683 ms`, and
-`9` tool calls/commands versus `282`. This proves the packet-eligible slice is
-useful; it does not prove the remaining nine languages.
+| Slice | Raw evidence | Result | Use it for |
+| --- | --- | --- | --- |
+| Full 18-language paired A/B | `target/agent-benchmark/segment6-full-language-suite-r1-pathfix/reanalyzed-summary.json` and `.md` | CodeStory quality `9/18`; no-CodeStory quality `7/17` scored with one unsuccessful row. CodeStory used `13,060,265` tokens vs `8,191,771`, `4,014,646 ms` runner wall vs `3,094,988 ms`, and `4,796,792 ms` all-in wall vs `3,094,988 ms`. | Historical negative/diagnostic evidence. |
+| 18-language packet runtime | `target/agent-benchmark/segment9-generic-18lang-packet-final/packet-runtime-summary.json`, `packet-runtime-summary.md`, `packet-composition.md`, and `quality-debug.json` | Manifest quality passes `18/18`; packet sufficiency is only `6/18`. Java and Redis miss the `18,000 ms` packet retrieval SLA. | Current packet quality and sufficiency baseline. |
+| Packet-eligible paired A/B | `target/agent-benchmark/segment8-no-family-steering-current9-ab-java-css-generic-shapes/reanalyzed-summary.json` and `.md` | CodeStory quality `9/9` vs no-CodeStory `6/9`; CodeStory uses `291,788` tokens vs `5,346,265`, `502,289 ms` all-in wall vs `1,881,683 ms`, `9` commands vs `282`, and zero source reads vs `228`. | Narrow positive evidence for the rows that are packet-eligible today. |
+| Latest single-row follow-up | `target/agent-benchmark/segment9-current-ab-swr-generic-final/reanalyzed-summary.json` and `.md` | TypeScript/SWR single-row follow-up: CodeStory quality `1/1` vs baseline `0/1`, with lower tokens and commands. | Row-level regression/debug evidence only. |
 
-## Current Baseline
+All rows above are one-repeat local artifacts. They are useful for branch
+review, not public savings claims.
 
-| Evidence slice | Status | Key result |
-| --- | --- | --- |
-| Full 18-language paired A/B | Historical, not promotion evidence | CodeStory quality `9/18` vs baseline `7/18`, but worse token and wall-time cost |
-| Production-default packet gate | Current generalized packet baseline | `9/18` rows pass packet manifest quality; Java and Redis still miss packet latency SLA |
-| Packet-eligible paired A/B | Current narrow win | CodeStory `9/9` quality vs baseline `6/9`, much lower tokens and commands |
-| Eval-probe rows | Diagnostics only | Useful for debugging exact families, not promotion evidence |
+## Packet Runtime Baseline
 
-Current packet quality pass set:
+The latest 18-language packet runtime artifact passes manifest quality for every
+row, but most rows are still not self-contained enough to call first-class
+packet experiences.
+
+Packet-sufficient rows:
+
+- `javascript-express-routing-flow`
+- `c-redis-command-loop`
+- `go-gin-route-dispatch`
+- `bash-nvm-install-dispatch`
+- `html-mdn-form-validation`
+- `sql-chinook-schema-relations`
+
+Packet-partial rows:
 
 - `python-requests-session-flow`
 - `java-commons-lang-string-utils`
 - `rust-ripgrep-search-pipeline`
 - `typescript-swr-hook-flow`
-- `c-redis-command-loop`
-- `go-gin-route-dispatch`
-- `dart-http-client-flow`
-- `bash-nvm-install-dispatch`
-- `css-animate-base-and-keyframes`
-
-Current packet quality fail set:
-
-- `javascript-express-routing-flow`
 - `cpp-fmt-formatting-flow`
 - `ruby-jekyll-site-build`
 - `php-monolog-record-flow`
 - `csharp-automapper-map-flow`
 - `kotlin-okio-buffer-flow`
 - `swift-alamofire-request-flow`
-- `html-mdn-form-validation`
-- `sql-chinook-schema-relations`
+- `dart-http-client-flow`
+- `css-animate-base-and-keyframes`
 
-Important caveats:
+Latency misses:
 
-- Some passing packet rows are still generically `partial` even though manifest
-  quality passes.
-- Java broadened the pass set but made the 9-row aggregate A/B gap worse than
-  the prior 8-row slice.
-- Redis, Rust, Bash, and Dart have remaining citation or expected-claim recall
-  caveats inside otherwise passing rows.
-- The packet probe retry path recovered transient sidecar failures in earlier
-  higher-concurrency runs; keep that reliability path covered before raising
-  packet-probe concurrency.
+- `java-commons-lang-string-utils`: `32,279 ms` packet retrieval.
+- `c-redis-command-loop`: `25,215 ms` packet retrieval.
+
+The sufficient set is not the same as the packet-eligible A/B set. The A/B slice
+was selected because those rows were useful to compare after packet and manifest
+work; it is not the full supported-language surface.
+
+## Steering Boundary
+
+`CODESTORY_EVAL_PROBES` remains test-only in non-test builds, and eval rows are
+diagnostics rather than promotion evidence. That is good, but it is not the end
+of the steering audit.
+
+Framework and domain semantics are product semantics. React, Next, Remix, LINQ,
+ASP.NET, Rails, Django, Gin, Payload CMS, and similar framework-aware routing or
+concept extraction should not be removed merely because it is language- or
+framework-specific. First-class support requires that kind of domain knowledge.
+
+The audit boundary is whether production crates contain benchmark-specific
+knowledge: task ids, known benchmark repo names, `target/agent-benchmark` repo
+paths, fixture anchors, expected-answer shapes, or one-off route names that only
+exist to satisfy the current holdout. Those belong in benchmark manifests,
+scorer inputs, explicit request probes, or `eval_probes.rs` behind test-only
+gates.
+
+The current branch largely respects that boundary. The framework route
+collectors in `crates/codestory-indexer/src/lib.rs` are legitimate product
+semantics and should stay. The request/session/adapter and search-worker/
+haystack packet expansions in `crates/codestory-runtime/src/agent/orchestrator.rs`
+are broad flow heuristics, so they are **keep or move/rename** candidates, not
+delete candidates. If they continue to grow, move them into named domain or
+framework profiles instead of hiding them in generic packet planning.
+
+The target boundary is:
+
+- Benchmark-specific probes live in manifests, scorer inputs, request-scoped
+  `--extra-probe`/packet inputs, or
+  `eval_probes.rs` behind test-only gates.
+- Production packet planning can keep product-level framework/domain semantics,
+  but it should not name benchmark tasks, repos, fixture paths, or expected
+  answer forms.
+- Reports say exactly which boundary a run used.
+
+## What This Proves
+
+- The benchmark harness can compare strict no-CodeStory and CodeStory-first
+  arms with wall time, token usage, command counts, direct source reads, web
+  leakage, packet quality, and post-packet behavior.
+- CodeStory is clearly useful on the current 9-row packet-eligible slice.
+- Packet runtime can now retrieve and cite expected source evidence across all
+  18 supported-language tasks in one-repeat local evidence.
+- The remaining problem is no longer just parser coverage; it is packet
+  sufficiency, latency, production steering boundaries, and freshness/indexable
+  file parity.
+
+## What This Does Not Prove
+
+- It does not prove a broad 18-language A/B win.
+- It does not prove every runtime-supported language has equal semantic
+  resolution, graph depth, or packet sufficiency.
+- It does not prove production packet planning has a clean long-term profile
+  architecture for every framework/domain semantic it already knows.
+- It does not prove structural/template language freshness parity. That is a
+  separate runtime/indexer contract risk to verify with focused tests.
+- It does not justify public savings claims or default promotion language.
 
 ## Durable Surfaces
 
-Scripts and manifests that should remain maintained:
+Keep these maintained as durable evidence surfaces:
 
 - `scripts/codestory-agent-ab-benchmark.mjs`
 - `scripts/codestory-agent-ab-score.mjs`
@@ -91,20 +141,12 @@ Scripts and manifests that should remain maintained:
 - `benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json`
 - `docs/testing/oss-language-corpus.md`
 
-Artifact policy:
+Raw artifacts should stay under `target/agent-benchmark/`. This report should
+name the specific raw directories it summarizes, not paste local run catalogs.
 
-- Keep durable conclusions in this report.
-- Keep raw benchmark artifacts under `target/agent-benchmark/` for local
-  forensics, but do not paste long local run catalogs into this document.
-- Keep `summary.json`, `reanalyzed-summary.json`, packet quality summaries, and
-  transcript-derived metrics as the authoritative raw evidence for a run.
-- Treat exact family steering, static family citations, and eval probes as
-  diagnostics unless a report explicitly marks them as excluded from promotion
-  evidence.
+## Reproduction
 
-## Reproduction Commands
-
-Validate the recorded holdout/corpus shape without rerunning indexing:
+Validate the holdout manifest and corpus shape:
 
 ```powershell
 node scripts\codestory-language-holdout-integrity.mjs
@@ -146,7 +188,7 @@ node scripts\codestory-agent-ab-benchmark.mjs `
   --materialize-repos
 ```
 
-Run a packet-gated A/B selection from a prepared run:
+Run a packet-gated A/B selection:
 
 ```powershell
 node scripts\codestory-agent-ab-score.mjs `
@@ -162,7 +204,7 @@ node scripts\codestory-agent-ab-score.mjs `
   --timeout-ms 600000
 ```
 
-Run eval-only exact-family diagnostics when debugging a row-specific probe:
+Run eval-only exact benchmark diagnostics when debugging a row-specific probe:
 
 ```powershell
 # Only Rust tests and explicit benchmark/eval harnesses can enable this switch;
@@ -176,19 +218,18 @@ Do not use eval-only rows as promotion evidence.
 
 ## Promotion Blockers
 
-- Raise production-default packet manifest quality beyond the current `9/18`
-  pass rate without restoring hidden exact-family steering.
-- Fix the remaining packet quality failures for JavaScript, C++, Ruby, PHP, C#,
-  Kotlin, Swift, HTML, and SQL.
-- Fix packet latency; the latest clean serial gate still misses the `18,000 ms`
-  retrieval target on Java and Redis.
-- Replace row-specific detectors with generic structural claim layers selected
-  from code evidence, not repository names.
+- Quarantine any task-id, repo-name, fixture-path, expected-answer, or one-off
+  benchmark route knowledge found in production crates. Keep real
+  framework/domain semantics, and move hidden legitimate semantics into named
+  profiles when the generic packet planner becomes too crowded.
+- Align runtime freshness, sidecar strictness, and indexer indexability for
+  parser-backed, structural, template, text-only, and OpenAPI files.
+- Raise packet sufficiency beyond the current `6/18` while keeping manifest
+  quality at `18/18`.
+- Fix packet retrieval latency misses for Java and Redis.
 - Keep no-CodeStory baselines strict: they must inspect the local repository,
   avoid CodeStory tools, avoid web/search leakage, and match the current task
   manifest snapshot.
-- Run a fresh full 18-language paired A/B suite only after packet quality is
-  materially better, then repeat at least 3 times before claiming promotion.
-- Promote only after packet-first and no-CodeStory-baseline gates pass with
-  clean pinned checkout provenance, local-only CodeStory cache provenance, no
-  hidden eval steering, and no web/remote context blockers.
+- Run a fresh full 18-language paired A/B suite only after packet sufficiency and
+  steering boundaries improve, then repeat at least three times before claiming
+  promotion.

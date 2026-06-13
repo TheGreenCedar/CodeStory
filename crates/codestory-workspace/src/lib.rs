@@ -605,43 +605,59 @@ fn normalize_exclude_match_key(path: &Path) -> String {
 }
 
 fn matches_source_group_language(path: &Path, language: &Language) -> bool {
-    let extension = path
+    let Some(extension) = path
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
+        .map(codestory_contracts::language_support::normalize_extension)
+    else {
+        return false;
+    };
+
+    registry_extension_matches_source_group(&extension, language)
+        || compatibility_extension_matches_source_group(&extension, language)
+}
+
+fn registry_extension_matches_source_group(extension: &str, language: &Language) -> bool {
+    codestory_contracts::language_support::language_support_profile_for_ext(extension).is_some_and(
+        |profile| source_group_accepts_registry_language(language, profile.language_name),
+    )
+}
+
+fn source_group_accepts_registry_language(language: &Language, registry_language: &str) -> bool {
     matches!(
-        (language, extension.as_deref()),
-        (&Language::Rust, Some("rs"))
-            | (&Language::Python, Some("py" | "pyi"))
-            | (&Language::Java, Some("java"))
-            | (
-                &Language::JavaScript,
-                Some("js" | "jsx" | "mjs" | "cjs" | "svelte" | "vue" | "astro")
-            )
-            | (
-                &Language::TypeScript,
-                Some("ts" | "tsx" | "mts" | "cts" | "svelte" | "vue" | "astro")
-            )
-            | (
-                &Language::Cxx,
-                Some("c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx")
-            )
-            | (&Language::Go, Some("go"))
-            | (&Language::Ruby, Some("rb"))
-            | (&Language::Php, Some("php"))
-            | (&Language::CSharp, Some("cs" | "cshtml"))
-            | (&Language::Kotlin, Some("kt" | "kts"))
-            | (&Language::Swift, Some("swift"))
-            | (&Language::Dart, Some("dart"))
-            | (&Language::Lua, Some("lua"))
-            | (&Language::Sql, Some("sql"))
-            | (&Language::Html, Some("html" | "htm"))
-            | (&Language::Css, Some("css" | "scss" | "sass" | "less"))
-            | (&Language::Bash, Some("sh" | "bash"))
-            | (&Language::PowerShell, Some("ps1" | "psm1"))
-            | (&Language::Svelte, Some("svelte"))
-            | (&Language::Vue, Some("vue"))
-            | (&Language::Astro, Some("astro"))
+        (language, registry_language),
+        (&Language::Rust, "rust")
+            | (&Language::Python, "python")
+            | (&Language::Java, "java")
+            | (&Language::JavaScript, "javascript")
+            | (&Language::TypeScript, "typescript")
+            | (&Language::Cxx, "cpp" | "c")
+            | (&Language::Go, "go")
+            | (&Language::Ruby, "ruby")
+            | (&Language::Php, "php")
+            | (&Language::CSharp, "csharp")
+            | (&Language::Kotlin, "kotlin")
+            | (&Language::Swift, "swift")
+            | (&Language::Dart, "dart")
+            | (&Language::Sql, "sql")
+            | (&Language::Html, "html")
+            | (&Language::Css, "css")
+            | (&Language::Bash, "bash")
+    )
+}
+
+fn compatibility_extension_matches_source_group(extension: &str, language: &Language) -> bool {
+    matches!(
+        (language, extension),
+        (&Language::JavaScript, "svelte" | "vue" | "astro")
+            | (&Language::TypeScript, "svelte" | "vue" | "astro")
+            | (&Language::CSharp, "cshtml")
+            | (&Language::Lua, "lua")
+            | (&Language::Css, "scss" | "sass" | "less")
+            | (&Language::PowerShell, "ps1" | "psm1")
+            | (&Language::Svelte, "svelte")
+            | (&Language::Vue, "vue")
+            | (&Language::Astro, "astro")
     )
 }
 
@@ -888,29 +904,57 @@ mod tests {
 
     #[test]
     fn workspace_supported_source_extensions_have_registry_profiles() {
-        let public_registry_claimed = [
-            "rs", "py", "pyi", "java", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "c",
-            "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "go", "rb", "php", "cs", "kt", "kts",
-            "swift", "dart", "sql", "html", "htm", "css", "sh", "bash",
+        let source_group_languages = [
+            Language::Rust,
+            Language::Python,
+            Language::Java,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Cxx,
+            Language::Go,
+            Language::Ruby,
+            Language::Php,
+            Language::CSharp,
+            Language::Kotlin,
+            Language::Swift,
+            Language::Dart,
+            Language::Sql,
+            Language::Html,
+            Language::Css,
+            Language::Bash,
         ];
-        for extension in public_registry_claimed {
-            assert!(
-                codestory_contracts::language_support::language_support_profile_for_ext(extension)
-                    .is_some(),
-                "workspace source extension should have registry profile: {extension}"
-            );
-            let file_name = format!("main.{extension}");
-            assert!(
-                registry_language_for_path(Path::new(&file_name)).is_some(),
-                "workspace source extension should resolve registry language: {extension}"
-            );
+
+        for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
+            for extension in profile.extensions.iter().copied() {
+                let file_name = format!("main.{extension}");
+                assert_eq!(
+                    registry_language_for_path(Path::new(&file_name)),
+                    Some(profile.language_name),
+                    "workspace source extension should resolve registry language: {extension}"
+                );
+                assert!(
+                    source_group_languages
+                        .iter()
+                        .any(|language| matches_source_group_language(
+                            Path::new(&file_name),
+                            language
+                        )),
+                    "workspace discovery should accept public registry extension: {extension}"
+                );
+            }
         }
 
         let compatibility_only = [
             ("cshtml", Language::CSharp),
             ("svelte", Language::JavaScript),
+            ("svelte", Language::TypeScript),
+            ("svelte", Language::Svelte),
             ("vue", Language::JavaScript),
+            ("vue", Language::TypeScript),
+            ("vue", Language::Vue),
             ("astro", Language::JavaScript),
+            ("astro", Language::TypeScript),
+            ("astro", Language::Astro),
             ("lua", Language::Lua),
             ("ps1", Language::PowerShell),
             ("psm1", Language::PowerShell),

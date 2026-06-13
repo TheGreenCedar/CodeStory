@@ -366,17 +366,22 @@ impl FileRole {
             .to_string_lossy()
             .replace('\\', "/")
             .to_ascii_lowercase();
-        for marker in [
-            "/target/agent-benchmark/repos/",
-            "/target/oss-language-corpus/repos/",
-        ] {
-            if let Some(index) = normalized.find(marker) {
+        let mut best_repo_relative: Option<(usize, String)> = None;
+        for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+            if let Some(index) = normalized.rfind(marker) {
                 let remainder = &normalized[index + marker.len()..];
                 if let Some((_, repo_relative)) = remainder.split_once('/') {
-                    normalized = repo_relative.to_string();
+                    if best_repo_relative
+                        .as_ref()
+                        .is_none_or(|(best_index, _)| index > *best_index)
+                    {
+                        best_repo_relative = Some((index, repo_relative.to_string()));
+                    }
                 }
-                break;
             }
+        }
+        if let Some((_, repo_relative)) = best_repo_relative {
+            normalized = repo_relative;
         }
         let marked = format!("/{normalized}");
         let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());

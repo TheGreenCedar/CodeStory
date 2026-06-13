@@ -4,7 +4,8 @@ This page is the durable summary of the branch review/remediation trail. Tempora
 
 ## Current Merge Bar
 
-- Production packet/search code must not depend on benchmark holdout literals or exact-family source steering.
+- Production packet/search code must not depend on benchmark holdout literals,
+  benchmark repo names, fixture paths, or expected-answer shapes.
 - Eval probes must stay disabled outside test builds.
 - Agent packet/search readiness must report full sidecar retrieval, not semantic-only fallback.
 - Language support claims must distinguish parser-backed graph coverage, structural collectors, and agent-facing packet quality.
@@ -21,4 +22,5 @@ This page is the durable summary of the branch review/remediation trail. Tempora
 
 - Split `crates/codestory-runtime/src/agent/orchestrator.rs` into packet planning, source-claim synthesis, sufficiency, and tests.
 - Add semantic-resolution buckets and cross-file evidence for newer parser-backed languages before claiming every language is first-class in agent packet quality.
-- Replace remaining product/framework-shaped routing heuristics with generic structural layers where practical.
+- Move legitimate framework/domain heuristics out of generic packet planning
+  into named profiles when they become broad enough to need ownership.

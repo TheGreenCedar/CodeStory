@@ -1,16 +1,16 @@
 use super::*;
 
 #[test]
-fn file_role_classification_ignores_materialized_benchmark_repo_cache_prefix() {
+fn file_role_classification_ignores_materialized_repo_cache_prefix() {
     assert_eq!(
         FileRole::classify_path(Path::new(
-            "C:/repo/target/oss-language-corpus/repos/nvm-sh-nvm/install.sh"
+            "C:/repo/target/repo-cache/repos/nvm-sh-nvm/install.sh"
         )),
         FileRole::Source
     );
     assert_eq!(
         FileRole::classify_path(Path::new(
-            "C:/repo/target/agent-benchmark/repos/psf-requests/tests/test_sessions.py"
+            "C:/repo/target/repo-cache/repos/psf-requests/tests/test_sessions.py"
         )),
         FileRole::Test
     );

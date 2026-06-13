@@ -373,14 +373,9 @@ pub(crate) fn packet_display_path(path: &str) -> String {
 }
 
 fn path_after_named_repo_root(normalized: &str) -> Option<String> {
-    for marker in [
-        "/target/agent-benchmark/repos/",
-        "target/agent-benchmark/repos/",
-        "/source/repos/",
-        "/repos/",
-        "source/repos/",
-    ] {
-        let Some(index) = normalized.find(marker) else {
+    let mut best_match: Option<(usize, String)> = None;
+    for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+        let Some(index) = normalized.rfind(marker) else {
             continue;
         };
         let suffix = &normalized[index + marker.len()..];
@@ -389,8 +384,14 @@ fn path_after_named_repo_root(normalized: &str) -> Option<String> {
         };
         let path = &suffix[repo_name_end + 1..];
         if !path.is_empty() {
-            return Some(path.to_string());
+            let candidate = path.to_string();
+            if best_match
+                .as_ref()
+                .is_none_or(|(best_index, _)| index > *best_index)
+            {
+                best_match = Some((index, candidate));
+            }
         }
     }
-    None
+    best_match.map(|(_, path)| path)
 }

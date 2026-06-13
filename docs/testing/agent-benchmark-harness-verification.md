@@ -142,12 +142,16 @@ the previous packet-probe `quality-debug.json` or A/B `reanalyzed-runs.jsonl`
 packet-prelude manifest score before nested agents are launched.
 
 For anti-overfit language work, run packet probes with production defaults and
-keep exact-family steering behind `CODESTORY_EVAL_PROBES=1` diagnostics only.
-The current clean serial packet gate scores `9/18` packet-quality passes without
-sidecar failures. The matching packet-gated A/B slice is useful for
-cost/time/tool-call accounting (`9/9` CodeStory quality versus `6/9` baseline),
-but it is not promotion evidence for all supported languages because the other
-nine rows still fail the packet gate.
+keep exact benchmark probes behind manifests, explicit request probes, or
+`CODESTORY_EVAL_PROBES=1` diagnostics only. Do not treat general
+framework/domain semantics as overfit when they apply to real projects.
+The current clean serial packet runtime scores `18/18` manifest-quality passes
+without sidecar failures, but only `6/18` rows are packet-sufficient without
+follow-up commands and Java/Redis still miss the retrieval latency SLA. The
+matching packet-gated A/B slice is useful for cost/time/tool-call accounting
+(`9/9` CodeStory quality versus `6/9` baseline), but it is not promotion
+evidence for all supported languages because the slice is selected from rows
+that are useful to compare today.
 
 The lower-level packet runtime mode can also be run directly with row-level
 parallelism:

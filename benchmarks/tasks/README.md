@@ -132,16 +132,19 @@ Baseline reuse is valid only when the task manifest and scorer boundary are
 unchanged.
 
 For anti-overfit language checks, run promotion-oriented packet gates with
-production defaults. Exact task-family probes belong in benchmark manifests,
+production defaults. Exact benchmark probes belong in benchmark manifests,
 explicit `--extra-probe` inputs, or eval-only diagnostics; they are benchmark
-fixture behavior, not production steering.
+fixture behavior, not production steering. Framework/domain semantics belong in
+product code when they generalize to real projects.
 
 Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize the
 durable result in [language-expansion-ab-report.md](../../docs/testing/language-expansion-ab-report.md)
-instead of preserving local run directory catalogs here. The current generalized
-packet gate quality-passes `9/18` rows, and the packet-eligible A/B slice is a
-quality and efficiency win for those rows only. Treat that as packet-eligible
-slice evidence, not broad promotion proof for all supported languages.
+instead of preserving local run directory catalogs here. The current packet
+runtime artifact passes manifest quality for `18/18` rows but is
+packet-sufficient for only `6/18`; the packet-eligible A/B slice is a quality
+and efficiency win for its selected `9/9` CodeStory rows only. Treat that as
+packet-eligible slice evidence, not broad promotion proof for all supported
+languages.
 
 ## Local Real-Repo Corpus
 

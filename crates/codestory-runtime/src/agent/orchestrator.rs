@@ -10055,12 +10055,12 @@ mod tests {
         );
         assert_eq!(
             packet_display_path(
-                r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\ripgrep\crates\core\main.rs"
+                r"\\?\C:\Users\alber\source\repos\codestory\target\repo-cache\repos\ripgrep\crates\core\main.rs"
             ),
             "crates/core/main.rs"
         );
         assert_eq!(
-            packet_display_path("target/agent-benchmark/repos/axios/lib/core/Axios.js"),
+            packet_display_path("target/repo-cache/repos/axios/lib/core/Axios.js"),
             "lib/core/Axios.js"
         );
     }

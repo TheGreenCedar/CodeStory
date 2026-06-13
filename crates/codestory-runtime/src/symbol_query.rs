@@ -359,21 +359,26 @@ fn normalize_retrieval_path(path: &str) -> String {
 }
 
 fn strip_materialized_repo_cache_prefix(path: &str) -> &str {
-    for marker in [
-        "target/agent-benchmark/repos/",
-        "target/oss-language-corpus/repos/",
-    ] {
-        let Some(index) = path.find(marker) else {
+    let mut best_match: Option<(usize, &str)> = None;
+    for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+        let Some(index) = path.rfind(marker) else {
             continue;
         };
         let after_marker = &path[index + marker.len()..];
         if let Some((_, repo_relative)) = after_marker.split_once('/')
             && !repo_relative.is_empty()
         {
-            return repo_relative;
+            if best_match
+                .as_ref()
+                .is_none_or(|(best_index, _)| index > *best_index)
+            {
+                best_match = Some((index, repo_relative));
+            }
         }
     }
-    path
+    best_match
+        .map(|(_, repo_relative)| repo_relative)
+        .unwrap_or(path)
 }
 
 fn path_contains_any(path: &str, markers: &[&str]) -> bool {
@@ -1950,7 +1955,7 @@ mod tests {
         );
         assert_eq!(
             retrieval_file_role_from_path(
-                r"\\?\C:\repo\codestory\target\agent-benchmark\repos\expressjs-express\lib\response.js"
+                r"\\?\C:\repo\codestory\target\repo-cache\repos\expressjs-express\lib\response.js"
             ),
             RetrievalFileRole::Source
         );
