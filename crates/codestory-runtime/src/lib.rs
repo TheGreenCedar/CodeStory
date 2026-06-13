@@ -8728,8 +8728,10 @@ impl AppController {
             })
             .collect::<Vec<_>>();
         let limit = req.limit.unwrap_or(500).clamp(1, 5000) as usize;
+        let filtered_file_count = visible.len().min(u32::MAX as usize) as u32;
         let truncated = visible.len() > limit;
         visible.truncate(limit);
+        let visible_file_count = visible.len().min(u32::MAX as usize) as u32;
 
         let mut coverage_notes = Vec::new();
         if incomplete_file_count > 0 || error_file_count > 0 {
@@ -8763,6 +8765,8 @@ impl AppController {
             summary: IndexedFilesSummaryDto {
                 file_count,
                 indexed_file_count,
+                filtered_file_count,
+                visible_file_count,
                 incomplete_file_count,
                 error_file_count,
                 truncated,

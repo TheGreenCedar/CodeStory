@@ -7670,11 +7670,14 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
     let status = if output.usable { "usable" } else { "empty" };
     let _ = writeln!(
         markdown,
-        "- index: {status}; files: {}; indexed: {}; incomplete: {}; error files: {}",
+        "- index: {status}; whole index files: {}; indexed: {}; incomplete: {}; error files: {}; filtered files: {}; visible rows: {}; truncated: {}",
         output.summary.file_count,
         output.summary.indexed_file_count,
         output.summary.incomplete_file_count,
-        output.summary.error_file_count
+        output.summary.error_file_count,
+        output.summary.filtered_file_count,
+        output.summary.visible_file_count,
+        output.summary.truncated
     );
     if !output.summary.language_counts.is_empty() {
         let languages = output

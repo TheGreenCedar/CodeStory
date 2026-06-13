@@ -1624,6 +1624,32 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
         ],
     );
     assert!(
+        files["summary"]["file_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "files JSON should keep whole-index file_count: {files:#}"
+    );
+    assert_eq!(
+        files["summary"]["indexed_file_count"].as_u64(),
+        files["summary"]["file_count"].as_u64(),
+        "files JSON should keep indexed_file_count whole-index for the fully indexed fixture: {files:#}"
+    );
+    assert!(
+        files["summary"]["filtered_file_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "files JSON should include filtered_file_count: {files:#}"
+    );
+    assert!(
+        files["summary"]["file_count"].as_u64() > files["summary"]["filtered_file_count"].as_u64(),
+        "role-filtered files JSON should keep whole-index file_count distinct from filtered_file_count: {files:#}"
+    );
+    assert_eq!(
+        files["summary"]["visible_file_count"].as_u64(),
+        files["files"].as_array().map(|items| items.len() as u64),
+        "visible_file_count should match returned rows: {files:#}"
+    );
+    assert!(
         files["summary"]["language_counts"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["language"] == "rust"
@@ -1660,6 +1686,39 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
         "files --role test should list inferred test files: {files:#}"
     );
 
+    let limited_files = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "files",
+            "--language",
+            "rust",
+            "--limit",
+            "1",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        limited_files["summary"]["filtered_file_count"].as_u64()
+            > limited_files["summary"]["visible_file_count"].as_u64(),
+        "limited files JSON should report filtered rows before truncation and visible rows after truncation: {limited_files:#}"
+    );
+    assert_eq!(
+        limited_files["summary"]["visible_file_count"].as_u64(),
+        limited_files["files"]
+            .as_array()
+            .map(|items| items.len() as u64),
+        "limited visible_file_count should match returned rows: {limited_files:#}"
+    );
+    assert_eq!(
+        limited_files["summary"]["truncated"].as_bool(),
+        Some(true),
+        "limited files JSON should mark truncation: {limited_files:#}"
+    );
+
     let files_markdown = run_cli(
         workspace,
         cache_dir,
@@ -1683,6 +1742,9 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     let files_markdown = String::from_utf8_lossy(&files_markdown.stdout);
     assert!(
         files_markdown.contains("# indexed files")
+            && files_markdown.contains("whole index files:")
+            && files_markdown.contains("filtered files:")
+            && files_markdown.contains("visible rows:")
             && files_markdown.contains("languages:")
             && files_markdown.contains("rust=")
             && files_markdown.contains("[parser_backed_graph; graph_fidelity]")

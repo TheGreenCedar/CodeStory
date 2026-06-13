@@ -571,6 +571,10 @@ pub struct IndexedFileLanguageCountDto {
 pub struct IndexedFilesSummaryDto {
     pub file_count: u32,
     pub indexed_file_count: u32,
+    #[serde(default)]
+    pub filtered_file_count: u32,
+    #[serde(default)]
+    pub visible_file_count: u32,
     pub incomplete_file_count: u32,
     pub error_file_count: u32,
     pub truncated: bool,
