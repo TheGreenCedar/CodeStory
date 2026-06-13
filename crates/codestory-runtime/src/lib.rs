@@ -29,11 +29,9 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
+use codestory_contracts::language_support::language_support_profile_for_language_name;
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
-use codestory_indexer::{
-    LanguageEvidenceTier, LanguageSupportMode, language_support_profile_for_language_name,
-};
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
@@ -698,8 +696,8 @@ struct LanguageSupportSummary {
 fn language_support_summary_for_language(language: &str) -> LanguageSupportSummary {
     language_support_profile_for_language_name(language)
         .map(|profile| LanguageSupportSummary {
-            support_mode: language_support_mode_label(profile.support_mode).to_string(),
-            evidence_tier: language_evidence_tier_label(profile.evidence_tier).to_string(),
+            support_mode: profile.support_mode.as_str().to_string(),
+            evidence_tier: profile.evidence_tier.as_str().to_string(),
             claim_label: profile.claim_label.to_string(),
         })
         .unwrap_or_else(|| LanguageSupportSummary {
@@ -707,20 +705,6 @@ fn language_support_summary_for_language(language: &str) -> LanguageSupportSumma
             evidence_tier: "unknown".to_string(),
             claim_label: "no support claim recorded".to_string(),
         })
-}
-
-fn language_support_mode_label(mode: LanguageSupportMode) -> &'static str {
-    match mode {
-        LanguageSupportMode::ParserBackedGraph => "parser_backed_graph",
-        LanguageSupportMode::StructuralCollector => "structural_collector",
-    }
-}
-
-fn language_evidence_tier_label(tier: LanguageEvidenceTier) -> &'static str {
-    match tier {
-        LanguageEvidenceTier::GraphFidelity => "graph_fidelity",
-        LanguageEvidenceTier::StructuralOnly => "structural_only",
-    }
 }
 
 const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;

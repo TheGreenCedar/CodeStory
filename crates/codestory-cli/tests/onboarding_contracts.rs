@@ -298,12 +298,21 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
         "candidate parser compatibility record",
         "Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash",
         "Kotlin, Swift, Dart, Bash",
-        "language_support_profile_for_ext",
-        "language_support_profile_for_language_name",
     ] {
         assert!(
             language_support.contains(required),
             "language support doc should preserve support-claim term `{required}`"
+        );
+    }
+    for required in [
+        "crates/codestory-contracts/src/language_support.rs",
+        "language_support_profile_for_ext",
+        "language_support_profile_for_language_name",
+        "get_language_for_ext",
+    ] {
+        assert!(
+            language_support.contains(required),
+            "language support docs should mention `{required}`"
         );
     }
     assert!(

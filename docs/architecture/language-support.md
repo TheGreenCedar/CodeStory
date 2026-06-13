@@ -4,14 +4,12 @@ CodeStory uses the word "support" only with a qualifier. Parser routing,
 regression evidence, framework route coverage, and agent packet/search quality
 are separate claims.
 
-The source of truth for extension and stored-language runtime claims is
-`language_support_profile_for_ext` and
-`language_support_profile_for_language_name` in
-`crates/codestory-indexer/src/lib.rs`. The live parser-backed graph map is
-`get_language_for_ext`; structural collectors use their own runtime paths, and
-candidate parser compatibility records do not imply runtime support. The
-`files` command exposes these claim labels in `summary.language_counts` so
-operators can see the runtime path attached to the current indexed inventory.
+The source of truth for extension ownership, stored-language names, support
+modes, evidence tiers, and claim labels is
+`crates/codestory-contracts/src/language_support.rs`. The indexer maps those
+shared support profiles to parser/rule construction in `get_language_for_ext`;
+workspace discovery and runtime semantic document labels consume the same
+registry so support claims cannot drift quietly across crates.
 
 ## Claim Terms
 
@@ -60,9 +58,10 @@ Before adding a new parser-backed language or broader framework claim:
    any resolution behavior being claimed.
 4. Add targeted resolution tests before claiming local receiver-aware,
    polymorphic, cross-package, framework-handler, or owner-qualified call trails.
-5. Update `language_support_profile_for_ext`,
-   `language_support_profile_for_language_name`, and this page in the same
-   change.
+5. Update `crates/codestory-contracts/src/language_support.rs`, including
+   `language_support_profile_for_ext` and
+   `language_support_profile_for_language_name`, parser construction such as
+   `get_language_for_ext`, and this page in the same change.
 6. Add or update the
    [OSS language corpus](../testing/oss-language-corpus.md) entry so the new
    runtime-supported language has a pinned medium-sized open source project and

@@ -645,6 +645,12 @@ fn matches_source_group_language(path: &Path, language: &Language) -> bool {
     )
 }
 
+#[cfg(test)]
+fn registry_language_for_path(path: &Path) -> Option<&'static str> {
+    path.to_str()
+        .and_then(|path| codestory_contracts::language_support::language_name_for_path(Some(path)))
+}
+
 fn push_discovered_file(
     files: &mut Vec<PathBuf>,
     seen: &mut HashSet<String>,
@@ -878,6 +884,27 @@ mod tests {
         assert!(files.contains(&root.join("App.svelte")));
         assert!(files.contains(&root.join("src").join("main.py")));
         Ok(())
+    }
+
+    #[test]
+    fn workspace_supported_source_extensions_have_registry_profiles() {
+        let claimed = [
+            "rs", "py", "pyi", "java", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "c",
+            "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "go", "rb", "php", "cs", "cshtml", "kt",
+            "kts", "swift", "dart", "sql", "html", "htm", "css", "sh", "bash",
+        ];
+        for extension in claimed {
+            assert!(
+                codestory_contracts::language_support::language_support_profile_for_ext(extension)
+                    .is_some(),
+                "workspace source extension should have registry profile: {extension}"
+            );
+            let file_name = format!("main.{extension}");
+            assert!(
+                registry_language_for_path(Path::new(&file_name)).is_some(),
+                "workspace source extension should resolve registry language: {extension}"
+            );
+        }
     }
 
     #[test]
