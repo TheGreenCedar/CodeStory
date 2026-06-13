@@ -569,7 +569,13 @@ Remove:
 Run:
 
 ```powershell
-rg -n "<Task 6 cleanup patterns from the review prompt>" docs
+$task6CleanupPattern = @(
+  ("CODESTORY_PACKET_" + "EXACT_FAMILY_STEERING"),
+  ("target/agent-benchmark/" + "segment"),
+  ("retrieval-language-support_" + "038d3ae9"),
+  ("External Review " + "Action Plan")
+) -join "|"
+rg -n $task6CleanupPattern docs benchmarks/tasks/README.md
 node scripts\codestory-language-holdout-integrity.mjs
 git diff --check origin/main...HEAD
 ```

@@ -131,25 +131,17 @@ unavailability, the score wrapper reruns just those task ids serially in a
 Baseline reuse is valid only when the task manifest and scorer boundary are
 unchanged.
 
-For anti-overfit language checks, set
-`CODESTORY_PACKET_EXACT_FAMILY_STEERING=0` before running the packet gate. The
-current clean serial full gate is:
+For anti-overfit language checks, run promotion-oriented packet gates with
+production defaults. Exact task-family probes belong in benchmark manifests,
+explicit `--extra-probe` inputs, or eval-only diagnostics; they are benchmark
+fixture behavior, not production steering.
 
-```text
-target/agent-benchmark/segment8-no-family-steering-full-packets-java-css-generic-shapes-serial
-```
-
-It quality-passes `9/18` rows. The corresponding current packet-gated A/B slice
-is:
-
-```text
-target/agent-benchmark/segment8-no-family-steering-current9-ab-java-css-generic-shapes
-```
-
-That slice compares `9/9` CodeStory quality against `6/9` baseline quality and
-records time, tokens, commands, tool calls, post-packet source reads, and web
-leakage. Treat it as packet-eligible-slice evidence, not broad promotion proof
-for all supported languages.
+Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize the
+durable result in [language-expansion-ab-report.md](../../docs/testing/language-expansion-ab-report.md)
+instead of preserving local run directory catalogs here. The current generalized
+packet gate quality-passes `9/18` rows, and the packet-eligible A/B slice is a
+quality and efficiency win for those rows only. Treat that as packet-eligible
+slice evidence, not broad promotion proof for all supported languages.
 
 ## Local Real-Repo Corpus
 
