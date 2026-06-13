@@ -41,9 +41,11 @@ Make production packet/search behavior honest by removing remaining holdout-fami
   - `cargo check --workspace`
   - `node scripts\codestory-language-holdout-integrity.mjs`
 
-- [ ] **Task 5: Final proof at current tree**
+- [x] **Task 5: Final proof at current tree**
   - Rebuild release CLI.
   - Repair/rebuild retrieval sidecars for the final tree.
   - Rerun `ready` and `doctor`; both must report full/fresh retrieval.
   - Rerun ignored `codestory_repo_e2e_stats` and append the fresh stats row.
   - Run a final independent review on the resulting tree.
+
+  Observed 2026-06-13 before the verification-log commit: release build passed; retrieval sidecars rebuilt to manifest generation `fe0b766440101c99-89b7bb44df6fe9ce`; `ready` reported both `local_navigation` and `agent_packet_search` ready; `doctor` reported `retrieval_mode: "full"`, semantic contract `ok`, and zero index errors; ignored `codestory_repo_e2e_stats` passed with `proof_tier: "full_sidecar"`, no warnings, and `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`.
