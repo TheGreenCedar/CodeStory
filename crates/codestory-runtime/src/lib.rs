@@ -85,10 +85,11 @@ pub use services::{
     TrailService,
 };
 pub(crate) use support::{
-    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, aggregate_symbol_matches, clamp_i64_to_u32,
-    clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms,
-    file_text_match_line, hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
-    preferred_occurrence, query_has_symbol_or_literal_signal, read_searchable_file_contents,
+    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
+    SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches, clamp_i64_to_u32, clamp_u64_to_u32,
+    clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
+    hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name, preferred_occurrence,
+    query_has_symbol_or_literal_signal, read_file_text_limited, read_searchable_file_contents,
     should_expand_symbol_query,
 };
 #[cfg(test)]
@@ -4476,6 +4477,20 @@ fn build_semantic_file_text_cache(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
 ) -> HashMap<String, Option<String>> {
+    build_semantic_file_text_cache_with_limits(
+        graph_context,
+        semantic_nodes,
+        SEMANTIC_FILE_TEXT_MAX_BYTES,
+        SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
+    )
+}
+
+fn build_semantic_file_text_cache_with_limits(
+    graph_context: &SemanticDocGraphContext,
+    semantic_nodes: &[&GraphNode],
+    max_file_bytes: u64,
+    max_cache_bytes: usize,
+) -> HashMap<String, Option<String>> {
     let mut file_paths = semantic_nodes
         .iter()
         .filter_map(|node| {
@@ -4491,13 +4506,34 @@ fn build_semantic_file_text_cache(
         .collect::<Vec<_>>();
     file_paths.sort_by(|left, right| left.0.cmp(&right.0));
 
-    file_paths
-        .into_par_iter()
-        .map(|(display_path, read_path)| {
-            let contents = read_searchable_file_contents(&read_path);
-            (display_path, contents)
-        })
-        .collect()
+    let mut cached_bytes = 0usize;
+    let mut cache_exhausted = false;
+    let mut cache = HashMap::with_capacity(file_paths.len());
+    for (display_path, read_path) in file_paths {
+        if cache_exhausted {
+            cache.insert(display_path, None);
+            continue;
+        }
+
+        let contents = read_file_text_limited(Path::new(&read_path), max_file_bytes)
+            .ok()
+            .flatten();
+        let Some(contents) = contents else {
+            cache.insert(display_path, None);
+            continue;
+        };
+
+        let body_bytes = contents.len();
+        if cached_bytes.saturating_add(body_bytes) > max_cache_bytes {
+            cache_exhausted = true;
+            cache.insert(display_path, None);
+            continue;
+        }
+
+        cached_bytes = cached_bytes.saturating_add(body_bytes);
+        cache.insert(display_path, Some(contents));
+    }
+    cache
 }
 
 fn edge_digest_for_edges(edges: &[GraphEdge], limit: usize) -> Vec<String> {
@@ -10573,7 +10609,7 @@ mod tests {
     };
     use crossbeam_channel::unbounded;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use tempfile::tempdir;
 
@@ -10797,6 +10833,11 @@ mod tests {
 
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
+
         assert_eq!(llm_doc_embed_batch_size(), 128);
     }
 
@@ -11387,6 +11428,79 @@ mod tests {
                 .doc_text
                 .contains("component_report: dir:.")
         );
+    }
+
+    fn semantic_file_text_cache_node(
+        id: i64,
+        display_path: &str,
+        read_path: &Path,
+        context: &mut SemanticDocGraphContext,
+    ) -> Node {
+        let node = Node {
+            id: CoreNodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("symbol_{id}"),
+            file_node_id: Some(CoreNodeId(id + 100)),
+            start_line: Some(1),
+            ..Default::default()
+        };
+        context.file_paths.insert(node.id, display_path.to_string());
+        context
+            .file_read_paths
+            .insert(node.id, read_path.to_string_lossy().to_string());
+        node
+    }
+
+    #[test]
+    fn semantic_file_text_cache_skips_files_above_byte_limit() {
+        let temp = tempdir().expect("create temp dir");
+        let small_path = temp.path().join("small.rs");
+        let large_path = temp.path().join("large.rs");
+        fs::write(&small_path, "small").expect("write small file");
+        fs::write(&large_path, "too-large").expect("write large file");
+        let mut context = SemanticDocGraphContext::default();
+        let nodes = vec![
+            semantic_file_text_cache_node(1, "small.rs", &small_path, &mut context),
+            semantic_file_text_cache_node(2, "large.rs", &large_path, &mut context),
+        ];
+        let semantic_nodes = nodes.iter().collect::<Vec<_>>();
+
+        let cache = build_semantic_file_text_cache_with_limits(&context, &semantic_nodes, 5, 100);
+
+        assert_eq!(
+            cache
+                .get("small.rs")
+                .and_then(|contents| contents.as_deref()),
+            Some("small")
+        );
+        assert_eq!(cache.get("large.rs"), Some(&None));
+    }
+
+    #[test]
+    fn semantic_file_text_cache_respects_aggregate_byte_limit() {
+        let temp = tempdir().expect("create temp dir");
+        let a_path = temp.path().join("a.rs");
+        let b_path = temp.path().join("b.rs");
+        let c_path = temp.path().join("c.rs");
+        fs::write(&a_path, "aaaa").expect("write a file");
+        fs::write(&b_path, "bbbb").expect("write b file");
+        fs::write(&c_path, "cc").expect("write c file");
+        let mut context = SemanticDocGraphContext::default();
+        let nodes = vec![
+            semantic_file_text_cache_node(1, "a.rs", &a_path, &mut context),
+            semantic_file_text_cache_node(2, "b.rs", &b_path, &mut context),
+            semantic_file_text_cache_node(3, "c.rs", &c_path, &mut context),
+        ];
+        let semantic_nodes = nodes.iter().collect::<Vec<_>>();
+
+        let cache = build_semantic_file_text_cache_with_limits(&context, &semantic_nodes, 100, 7);
+
+        assert_eq!(
+            cache.get("a.rs").and_then(|contents| contents.as_deref()),
+            Some("aaaa")
+        );
+        assert_eq!(cache.get("b.rs"), Some(&None));
+        assert_eq!(cache.get("c.rs"), Some(&None));
     }
 
     fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
