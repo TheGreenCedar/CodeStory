@@ -328,7 +328,7 @@ Expected: pass. If this emits a fresh stats row for the new HEAD, append it to `
 
 Observed 2026-06-13: release build passed; ignored `codestory_repo_e2e_stats` passed with `proof_tier: "full_sidecar"`, no warnings, and `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`. Fresh row appended to `docs/testing/codestory-e2e-stats-log.md`.
 
-- [ ] **Step 4: Final branch review**
+- [x] **Step 4: Final branch review**
 
 Run:
 
@@ -339,3 +339,5 @@ git diff --check origin/main...HEAD
 ```
 
 Expected: branch clean; only intentional changes over `origin/main`; no whitespace errors.
+
+Observed 2026-06-13: committed tree was clean and ahead of origin branch; `git diff --stat origin/main...HEAD` showed the intended AST-first retrieval, language support, docs, tests, and second-pass cleanup changes; `git diff --check origin/main...HEAD` passed.
