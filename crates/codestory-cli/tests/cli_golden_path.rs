@@ -1745,6 +1745,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             && files_markdown.contains("whole index files:")
             && files_markdown.contains("filtered files:")
             && files_markdown.contains("visible rows:")
+            && files_markdown.contains("truncated:")
             && files_markdown.contains("languages:")
             && files_markdown.contains("rust=")
             && files_markdown.contains("[parser_backed_graph; graph_fidelity]")
