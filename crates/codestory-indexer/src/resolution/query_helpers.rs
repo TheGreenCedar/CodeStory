@@ -19,7 +19,7 @@ pub(super) fn import_alias_mismatch(source_name: &str, target_name: &str) -> boo
         .map(str::trim)
         .unwrap_or(target);
 
-    source != target_tail && (target.contains("::") || target.contains('.'))
+    source != target && source != target_tail && (target.contains("::") || target.contains('.'))
 }
 
 pub(super) fn sorted_scope_file_ids(

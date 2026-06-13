@@ -5968,6 +5968,11 @@ fn queue_qualified_child_names(
         // Keep members of type-like owners owner-qualified in both name fields so
         // downstream resolution can distinguish declared members from placeholder/reference nodes.
         if parent.is_type_like {
+            if promotes_type_member_functions_to_methods(traversal.language_name)
+                && child_node.kind == NodeKind::FUNCTION
+            {
+                child_node.kind = NodeKind::METHOD;
+            }
             child_node.serialized_name = format!(
                 "{}{}{}",
                 parent.serialized_name, delimiter, child_node.serialized_name
@@ -5976,6 +5981,10 @@ fn queue_qualified_child_names(
         child_node.qualified_name = Some(new_name.clone());
         queue.push((*child_id, new_name));
     }
+}
+
+fn promotes_type_member_functions_to_methods(language_name: &str) -> bool {
+    matches!(language_name, "kotlin" | "swift" | "dart")
 }
 
 fn qualified_name_delimiter(language_name: &str) -> &'static str {

@@ -90,12 +90,12 @@ pub(super) fn unresolved_edges(
     }
 
     let mut query = String::from(
-        "SELECT e.id, caller.file_node_id, caller.qualified_name, caller.serialized_name, target.serialized_name, e.target_node_id,
+        "SELECT e.id, COALESCE(caller.file_node_id, e.file_node_id), caller.qualified_name, caller.serialized_name, target.serialized_name, e.target_node_id,
                 file_node.serialized_name, e.callsite_identity
          FROM edge e
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
-         LEFT JOIN node file_node ON file_node.id = caller.file_node_id
+         LEFT JOIN node file_node ON file_node.id = COALESCE(caller.file_node_id, e.file_node_id)
          WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL
            AND (target.canonical_id IS NULL OR (
              target.canonical_id NOT LIKE 'tauri:command:%'
