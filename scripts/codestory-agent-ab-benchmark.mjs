@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -27,6 +27,7 @@ const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
+const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const PACKET_TASK_CLASSES = new Set([
   "architecture_explanation",
   "bug_localization",
@@ -103,7 +104,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run only the listed follow_up_commands in order and prefer targeted `search --why` commands before escalating packet budget. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations and sufficiency.avoid_opening, not only the paths mentioned in your prose. Use search, context, trail, or snippet only for named gaps. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -143,15 +144,21 @@ Options:
   --sandbox       Codex sandbox mode. Default: workspace-write.
   --out-dir       Output directory. Default: target/agent-benchmark/<timestamp>.
   --timeout-ms    Timeout per runner invocation. Default: 600000.
+  --jobs          Parallel jobs for independent packet-runtime cold-cli rows or independent agent repo groups. Default: 1.
+  --reuse-baseline-from
+                  Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
                   Packet-runtime mode enables this by default because sidecar-primary packets require prepared local indexes.
   --no-prepare-codestory-cache
                   Unsupported; sidecar preparation is mandatory.
+  --prepare-codestory-jobs
+                  Parallel jobs for CodeStory cache preparation across independent repos. Default: 1.
   --prepare-codestory-timeout-ms
                   Timeout for each pre-run CodeStory index refresh. Default: 1800000.
   --max-source-reads-after-packet
-                  Publishable with-CodeStory runs fail above this post-packet ordinary source-read count. Default: 0.
+                  Publishable with-CodeStory runs fail above this post-packet ordinary source-read count.
+                  Default: unbounded; pass 0 for packet-only promotion evidence.
   --allow-failures Exit 0 even when a run fails. Intended only for exploratory dry runs.
   --publishable   Fail unless every run succeeds and reports token usage.
 
@@ -190,10 +197,13 @@ function parseArgs(argv) {
     sandbox: "workspace-write",
     outDir: null,
     timeoutMs: 600000,
+    jobs: 1,
+    reuseBaselineFrom: null,
     prepareCodestoryCache: null,
+    prepareCodestoryJobs: 1,
     prepareCodestoryTimeoutMs: 1_800_000,
     cachePreparationByRepo: null,
-    maxSourceReadsAfterPacket: 0,
+    maxSourceReadsAfterPacket: null,
     allowFailures: false,
     publishable: false,
   };
@@ -300,6 +310,14 @@ function parseArgs(argv) {
       opts.timeoutMs = Number.parseInt(argv[++i], 10);
       continue;
     }
+    if (arg === "--jobs") {
+      opts.jobs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--reuse-baseline-from") {
+      opts.reuseBaselineFrom = argv[++i];
+      continue;
+    }
     if (arg === "--prepare-codestory-cache") {
       opts.prepareCodestoryCache = true;
       continue;
@@ -310,6 +328,10 @@ function parseArgs(argv) {
     }
     if (arg === "--prepare-codestory-timeout-ms") {
       opts.prepareCodestoryTimeoutMs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--prepare-codestory-jobs") {
+      opts.prepareCodestoryJobs = Number.parseInt(argv[++i], 10);
       continue;
     }
     if (arg === "--max-source-reads-after-packet") {
@@ -352,8 +374,14 @@ function parseArgs(argv) {
   if (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 1000) {
     throw new Error("--timeout-ms must be an integer >= 1000");
   }
+  if (!Number.isInteger(opts.jobs) || opts.jobs < 1) {
+    throw new Error("--jobs must be a positive integer");
+  }
   if (!Number.isInteger(opts.prepareCodestoryTimeoutMs) || opts.prepareCodestoryTimeoutMs < 1000) {
     throw new Error("--prepare-codestory-timeout-ms must be an integer >= 1000");
+  }
+  if (!Number.isInteger(opts.prepareCodestoryJobs) || opts.prepareCodestoryJobs < 1) {
+    throw new Error("--prepare-codestory-jobs must be a positive integer");
   }
   if (!["read-only", "workspace-write", "danger-full-access"].includes(opts.sandbox)) {
     throw new Error("--sandbox must be one of: read-only, workspace-write, danger-full-access");
@@ -364,10 +392,16 @@ function parseArgs(argv) {
   if (opts.benchmarkRunId != null) {
     opts.benchmarkRunId = sanitizeBenchmarkRunId(opts.benchmarkRunId);
   }
-  if (!Number.isInteger(opts.maxSourceReadsAfterPacket) || opts.maxSourceReadsAfterPacket < 0) {
+  if (
+    opts.maxSourceReadsAfterPacket != null &&
+    (!Number.isInteger(opts.maxSourceReadsAfterPacket) || opts.maxSourceReadsAfterPacket < 0)
+  ) {
     throw new Error("--max-source-reads-after-packet must be a non-negative integer");
   }
   opts.repoCacheDir = path.resolve(opts.repoCacheDir ?? defaultRepoCacheRoot);
+  if (opts.reuseBaselineFrom) {
+    opts.reuseBaselineFrom = path.resolve(opts.reuseBaselineFrom);
+  }
   if (opts.repos) {
     for (const name of opts.repos) {
       if (!ALL_REPOS[name]) {
@@ -592,6 +626,59 @@ function textAnchorList(values) {
     .filter(Boolean);
 }
 
+function packetManifestSymbolProbe(value) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "object") {
+    const name = String(value.name ?? value.text ?? "").trim();
+    const symbolPath = String(value.path ?? value.file ?? value.file_path ?? "").trim();
+    if (name && symbolPath) {
+      return `${symbolPath} ${name}`;
+    }
+    return name || symbolPath || null;
+  }
+  return String(value);
+}
+
+function packetManifestSymbolProbeList(values) {
+  return (Array.isArray(values) ? values : [])
+    .map(packetManifestSymbolProbe)
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean);
+}
+
+function uniqueTextValues(values) {
+  const result = [];
+  const seen = new Set();
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (!text) {
+      continue;
+    }
+    const key = text.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(text);
+  }
+  return result;
+}
+
+function packetManifestExtraProbes(task) {
+  if (!task) {
+    return [];
+  }
+  return uniqueTextValues([
+    ...(task.expected_files ?? []),
+    ...(task.expected_symbol_probes ?? task.expected_symbols ?? []),
+  ]).slice(0, MAX_PACKET_MANIFEST_EXTRA_PROBES);
+}
+
 function normalizeManifestTask(filePath, raw, opts = {}) {
   const rawRepo = typeof raw.repo === "object" ? raw.repo?.name : raw.repo;
   if (!String(rawRepo ?? "").trim()) {
@@ -612,7 +699,9 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
   const expectedVerificationFiles = textAnchorList(
     raw.expected_verification_files ?? raw.expectedVerificationFiles,
   );
-  const expectedSymbols = textAnchorList(raw.expected_symbols ?? raw.expectedSymbols);
+  const rawExpectedSymbols = raw.expected_symbols ?? raw.expectedSymbols;
+  const expectedSymbols = textAnchorList(rawExpectedSymbols);
+  const expectedSymbolProbes = packetManifestSymbolProbeList(rawExpectedSymbols);
   const expectedClaims = textAnchorList(raw.expected_claims ?? raw.expectedClaims);
   const qualityThresholds = raw.quality_thresholds ?? raw.qualityThresholds;
   if (!expectedFiles.length) {
@@ -639,6 +728,7 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     expected_files: expectedFiles,
     expected_verification_files: expectedVerificationFiles,
     expected_symbols: expectedSymbols,
+    expected_symbol_probes: expectedSymbolProbes,
     expected_claims: expectedClaims,
     forbidden_claims: textAnchorList(raw.forbidden_claims ?? raw.forbiddenClaims),
     quality_thresholds: qualityThresholds,
@@ -662,6 +752,7 @@ function taskSnapshotForResult(task) {
       expected_files: task.expected_files ?? [],
       expected_verification_files: task.expected_verification_files ?? [],
       expected_symbols: task.expected_symbols ?? [],
+      expected_symbol_probes: task.expected_symbol_probes ?? [],
       expected_claims: task.expected_claims ?? [],
       forbidden_claims: task.forbidden_claims ?? [],
       quality_thresholds: task.quality_thresholds ?? {},
@@ -879,6 +970,25 @@ async function runProcess(command, args, options = {}) {
   });
 }
 
+async function parallelMap(items, jobs, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, jobs), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await mapper(items[index], index);
+      }
+    }),
+  );
+  return results;
+}
+
 function terminateProcess(child, signal, options = {}) {
   if (options.killProcessTree && process.platform === "win32" && child.pid) {
     const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
@@ -978,7 +1088,7 @@ Run that answer packet before any repository search, direct source read, git com
         ? `
 The harness verified the CodeStory packet against this task manifest before starting you. Treat the packet as complete for this benchmark row even if its generic sufficiency status is partial. Do not run follow-up commands, ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands before answering.`
         : `
-If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. Those commands count as benchmark overhead unless the packet names a concrete unresolved gap.`
+If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. If the packet is partial or packet manifest quality is incomplete, close gaps with listed CodeStory follow-ups first; ordinary local source reads are allowed only after CodeStory attempts and count as post-packet overhead.`
       : "";
   const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
   const baselineContextBlock = baselinePreludePromptBlock(context.baselinePrelude);
@@ -1024,6 +1134,9 @@ function packetPreludePromptBlock(prelude) {
   const manifestBlock = manifestComplete
     ? `
 Benchmark manifest coverage: complete. The harness matched this packet against the task's expected files, symbols, claims, and citations. Do not spend tokens trying follow-up commands for this row; answer from the packet.`
+    : prelude.public?.packet_manifest_quality
+      ? `
+Benchmark manifest coverage: incomplete. Packet manifest quality was ${JSON.stringify(prelude.public.packet_manifest_quality)}. Use the packet first, then close missing anchors with CodeStory follow-ups before any ordinary local source reads.`
     : "";
   const supportPathBlock = supportPaths.length
     ? `
@@ -1358,7 +1471,8 @@ function isSuccessfulContextCommand(command) {
 function normalizePathLike(value) {
   return String(value ?? "")
     .trim()
-    .replace(/^['"]|['"]$/g, "")
+    .replace(/^(?:['"])+/, "")
+    .replace(/(?:['"])+$/, "")
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/^\?\/(?=[A-Za-z]:\/)/, "")
@@ -1400,11 +1514,11 @@ function extractDirectFileReads(command) {
   }
 
   const patterns = [
-    /\bGet-Content\b(?:\s+-[A-Za-z]+(?:\s+\S+)?)?\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\bcat\b\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\btype\b\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\bnl\b(?:\s+-[A-Za-z]+)*\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\bsed\b\s+-n\s+['"]?[^'"]+['"]?\s+['"]?([^'";|`\r\n]+)['"]?/gi,
+    /\bGet-Content\b(?:\s+-(?!LiteralPath\b|Path\b)[A-Za-z]+)*\s+(?:-(?:LiteralPath|Path)\s+)?['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\bcat\b\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\btype\b\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\bnl\b(?:\s+-[A-Za-z]+)*\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\bsed\b\s+-n\s+['"]?[^'"]+['"]?\s+['"]*([^'";|`\r\n]+)['"]*/gi,
   ];
 
   for (const pattern of patterns) {
@@ -1739,25 +1853,52 @@ const FORBIDDEN_POLARITY_TERMS = new Set([
   "instead",
   "never",
   "not",
-  "only",
   "without",
 ]);
+
+const FORBIDDEN_CONTRADICTION_TERMS = new Set(["false", "never", "no", "not", "without"]);
 
 function claimPolarityTokens(claim) {
   return claimTokens(claim).filter((token) => FORBIDDEN_POLARITY_TERMS.has(token));
 }
 
+function forbiddenCandidateSentences(haystack) {
+  return String(haystack ?? "")
+    .replace(/\r\n/g, "\n")
+    .split(/(?:[.!?]\s+|\n+)/)
+    .map((sentence) => normalizeSearchText(sentence))
+    .filter(Boolean);
+}
+
+function hasContradictingNegation(sentence) {
+  const tokens = claimTokens(sentence);
+  return tokens.some((token) => FORBIDDEN_CONTRADICTION_TERMS.has(token));
+}
+
 function forbiddenClaimMatched(haystack, claim) {
-  if (!claimMatched(haystack, claim)) {
+  const expectedTokens = claimTokens(claim);
+  const polarityTokens = claimPolarityTokens(claim);
+  if (expectedTokens.length < 3) {
     return false;
   }
-  const polarityTokens = claimPolarityTokens(claim);
-  if (!polarityTokens.length) {
-    const haystackTokens = new Set(claimTokens(haystack));
-    return claimTokens(claim).every((token) => claimTokenMatched(token, haystackTokens));
-  }
-  const haystackTokens = new Set(claimTokens(haystack));
-  return polarityTokens.every((token) => claimTokenMatched(token, haystackTokens));
+
+  return forbiddenCandidateSentences(haystack).some((sentence) => {
+    if (!polarityTokens.length && hasContradictingNegation(sentence)) {
+      return false;
+    }
+
+    const sentenceTokens = new Set(claimTokens(sentence));
+    if (!polarityTokens.length) {
+      return expectedTokens.every((token) => claimTokenMatched(token, sentenceTokens));
+    }
+
+    const matched = expectedTokens.filter((token) => claimTokenMatched(token, sentenceTokens)).length;
+    const ratio = matched / expectedTokens.length;
+    if (matched < Math.min(4, expectedTokens.length) || ratio < 0.65) {
+      return false;
+    }
+    return polarityTokens.every((token) => claimTokenMatched(token, sentenceTokens));
+  });
 }
 
 function scoreClaimSet(claims, haystack, opts = {}) {
@@ -2025,6 +2166,9 @@ function packetCommandArgs(repoConfig, task) {
   if (task?.task_class) {
     args.push("--task-class", validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"));
   }
+  for (const probe of packetManifestExtraProbes(task)) {
+    args.push("--extra-probe", probe);
+  }
   return args;
 }
 
@@ -2065,6 +2209,8 @@ function preludePublicFields(prelude) {
     packet_latency: prelude.packet_latency,
     packet_composition: prelude.packet_composition,
     packet_manifest_quality: prelude.packet_manifest_quality,
+    packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
+    packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
   };
 }
 
@@ -2451,6 +2597,7 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
 
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli) {
   const args = packetCommandArgs(repoConfig, run.task);
+  const extraProbes = packetManifestExtraProbes(run.task);
   const command = displayCommand(codestoryCli, args);
   const stdoutPath = path.join(outDir, `${runId}.codestory-packet.stdout.json`);
   const stderrPath = path.join(outDir, `${runId}.codestory-packet.stderr.txt`);
@@ -2498,6 +2645,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_latency: packetLatencyTelemetry(packet, wallMs),
     packet_composition: packetComposition(packet, run.task),
     packet_manifest_quality: packetManifestQualitySummary(packet, run.task),
+    packet_extra_probe_count: extraProbes.length,
+    packet_extra_probe_strategy: extraProbes.length ? "manifest_expected_anchors" : null,
   });
   return {
     public: publicPrelude,
@@ -2853,16 +3002,19 @@ async function prepareCodeStoryCaches(opts, tasks) {
   }
   const repoNames = [...new Set(tasks.map((task) => task.repo))];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const preparations = [];
-  for (const repo of repoNames) {
+  if (repoNames.length > 1 && opts.prepareCodestoryJobs > 1) {
+    console.log(
+      `preparing CodeStory caches for ${repoNames.length} repos with --prepare-codestory-jobs ${opts.prepareCodestoryJobs}`,
+    );
+  }
+  return await parallelMap(repoNames, opts.prepareCodestoryJobs, async (repo) => {
     const config = ALL_REPOS[repo];
     if (!config || !existsSync(config.path)) {
-      preparations.push({
+      return {
         repo,
         project: config?.path ?? null,
         action: "skipped-missing-repo",
-      });
-      continue;
+      };
     }
 
     console.log(`preparing CodeStory cache for ${repo}`);
@@ -2924,9 +3076,8 @@ async function prepareCodeStoryCaches(opts, tasks) {
 
     preparation.preparation_wall_ms =
       Math.round((performance.now() - preparationStarted) * 1000) / 1000;
-    preparations.push(preparation);
-  }
-  return preparations;
+    return preparation;
+  });
 }
 
 function semanticBackendName(retrieval) {
@@ -3610,20 +3761,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     indexing_in_timed_run: false,
     transport_mode: "cold_cli_packet",
   });
-  const args = [
-    "packet",
-    "--project",
-    repoConfig.path,
-    "--question",
-    task.prompt,
-    "--budget",
-    "compact",
-    "--format",
-    "json",
-  ];
-  if (task.task_class) {
-    args.push("--task-class", task.task_class.replace(/_/g, "-"));
-  }
+  const args = packetCommandArgs(repoConfig, task);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
     env: benchmarkChildEnv(process.env),
@@ -3646,6 +3784,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const sufficiency = packetSufficiencyTelemetry(packet, quality);
   const latency = packetLatencyTelemetry(packet, wallMs);
   const composition = packetComposition(packet, task);
+  const extraProbes = packetManifestExtraProbes(task);
   const runId = benchmarkRunId([task.repo, task.id, "cold-cli-packet", String(repeat).padStart(2, "0")]);
   await writeFile(path.join(outDir, `${runId}.stdout.json`), result.stdout, "utf8");
   await writeFile(path.join(outDir, `${runId}.stderr.txt`), result.stderr, "utf8");
@@ -3667,6 +3806,8 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     packet_shape: shape,
     packet_latency: latency,
     packet_composition: composition,
+    packet_extra_probe_count: extraProbes.length,
+    packet_extra_probe_strategy: extraProbes.length ? "manifest_expected_anchors" : null,
     sufficiency,
     quality,
   };
@@ -4364,10 +4505,19 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
       : [opts.packetRuntimeMode];
   const results = [];
   if (modes.includes("cold-cli")) {
+    const coldJobs = [];
     for (const task of tasks) {
       for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
-        console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
-        results.push(await runColdPacketRuntime(opts, task, repeat, outDir));
+        coldJobs.push({ task, repeat });
+      }
+    }
+    const coldResults = await parallelMap(coldJobs, opts.jobs, async ({ task, repeat }) => {
+      console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
+      return await runColdPacketRuntime(opts, task, repeat, outDir);
+    });
+    for (const result of coldResults) {
+      if (result) {
+        results.push(result);
       }
     }
   }
@@ -4713,6 +4863,9 @@ function summarizeRuns(results) {
     const successful = rows.filter((row) => row.status === "pass");
     const qualityRows = successful.filter((row) => row.quality);
     const packetFirstRows = successful.filter((row) => row.packet_first_required);
+    const packetManifestRows = successful.filter(
+      (row) => row.codestory_harness_prelude?.packet_manifest_quality,
+    );
     const categoryMedians = {};
     for (const category of COMMAND_ACCOUNTING_CATEGORIES) {
       categoryMedians[category] = median(
@@ -4739,6 +4892,13 @@ function summarizeRuns(results) {
       successful_runs: successful.length,
       packet_first_pass_runs: packetFirstRows.filter((row) => row.packet_first_pass).length,
       packet_first_required_runs: packetFirstRows.length,
+      packet_manifest_quality_pass_runs: packetManifestRows.filter(
+        (row) => row.codestory_harness_prelude?.packet_manifest_quality?.pass,
+      ).length,
+      packet_manifest_quality_scored_runs: packetManifestRows.length,
+      packet_partial_runs: successful.filter(
+        (row) => row.codestory_harness_prelude?.packet_sufficiency_status === "partial",
+      ).length,
       quality_scored_runs: qualityRows.length,
       quality_pass_runs: qualityRows.filter((row) => row.quality?.pass).length,
       total_wall_ms: totalWallMs,
@@ -4853,7 +5013,7 @@ function usefulAnchorHitsPer10kContextChars(row) {
 }
 
 function agentPublishableBlockers(results, opts = {}) {
-  const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket ?? 0;
+  const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket;
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
   return results
     .map((result) => {
@@ -4898,6 +5058,7 @@ function agentPublishableBlockers(results, opts = {}) {
       const readsAfterPacket = result.transcript_analysis?.ordinary_source_reads_after_first_packet;
       if (
         result.packet_first_required &&
+        maxSourceReadsAfterPacket != null &&
         readsAfterPacket != null &&
         readsAfterPacket > maxSourceReadsAfterPacket
       ) {
@@ -4934,8 +5095,8 @@ function markdownSummary(summary, opts, costAccounting = null) {
   lines.push(
     "## Per-task Summary",
     "",
-    "| Repo | Task | Arm | Runs | Success | Packet first | Quality pass | Median wall ms | CodeStory prep ms | Retrieval index ms | Median tokens | Median cost USD | Median tool calls | Web searches | Median commands | CodeStory cmds | Shell searches | File-read cmds | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Arm | Runs | Success | Packet first | Packet manifest | Quality pass | Median wall ms | CodeStory prep ms | Retrieval index ms | Median tokens | Median cost USD | Median tool calls | Web searches | Median commands | CodeStory cmds | Shell searches | File-read cmds | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   );
   for (const row of summary) {
     lines.push(markdownSummaryRow(row));
@@ -4989,6 +5150,7 @@ function markdownSummaryRow(row) {
     row.runs,
     row.successful_runs,
     packetFirstLabel(row),
+    packetManifestLabel(row),
     qualityPassLabel(row),
     formatValue(row.median_wall_ms),
     formatValue(row.median_codestory_cache_preparation_wall_ms),
@@ -5024,6 +5186,14 @@ function packetFirstLabel(row) {
     return "";
   }
   return `${row.packet_first_pass_runs}/${row.packet_first_required_runs}`;
+}
+
+function packetManifestLabel(row) {
+  if (!row.packet_manifest_quality_scored_runs) {
+    return "";
+  }
+  const partialSuffix = row.packet_partial_runs ? `; partial ${row.packet_partial_runs}` : "";
+  return `${row.packet_manifest_quality_pass_runs}/${row.packet_manifest_quality_scored_runs}${partialSuffix}`;
 }
 
 function formatValue(value) {
@@ -5185,6 +5355,29 @@ function runSelfTest() {
     "already-ready",
   );
 
+  const plannedAgentRuns = planAgentRuns(
+    { arms: ["without_codestory", "with_codestory"], repeats: 1, repos: null },
+    [
+      { id: "task-a", repo: "repo-a" },
+      { id: "task-b", repo: "repo-b" },
+      { id: "task-c", repo: "repo-a" },
+    ],
+  );
+  const plannedGroups = groupPlannedAgentRuns(plannedAgentRuns);
+  assert.deepEqual(
+    plannedGroups.map((group) => group.key),
+    ["repo-a", "repo-b"],
+  );
+  assert.deepEqual(
+    plannedGroups[0].runs.map((run) => `${run.task.id}:${run.arm}`),
+    [
+      "task-a:without_codestory",
+      "task-a:with_codestory",
+      "task-c:without_codestory",
+      "task-c:with_codestory",
+    ],
+  );
+
   console.log("self-test passed");
 }
 
@@ -5208,6 +5401,163 @@ function planAgentRuns(opts, tasks) {
     }
   }
   return plannedRuns;
+}
+
+function agentRunKey(run) {
+  const taskId = run.task?.id ?? run.task_id ?? "";
+  return [run.repo, taskId, run.arm, String(run.repeat)].join("\t");
+}
+
+function agentRunIsolationGroupKey(run) {
+  return run.repo;
+}
+
+function groupPlannedAgentRuns(plannedRuns) {
+  const groupsByKey = new Map();
+  for (const run of plannedRuns) {
+    const key = agentRunIsolationGroupKey(run);
+    if (!groupsByKey.has(key)) {
+      groupsByKey.set(key, { key, runs: [] });
+    }
+    groupsByKey.get(key).runs.push(run);
+  }
+  return [...groupsByKey.values()];
+}
+
+function taskSnapshotMatches(currentTask, candidate) {
+  const current = taskSnapshotForResult(currentTask);
+  const previous = candidate?.task_manifest_snapshot ?? null;
+  return JSON.stringify(current ?? null) === JSON.stringify(previous ?? null);
+}
+
+function resolveRunArtifactPath(runDir, artifactPath) {
+  if (!artifactPath) {
+    return null;
+  }
+  return path.isAbsolute(artifactPath) ? artifactPath : path.resolve(runDir, artifactPath);
+}
+
+async function copyResultArtifact(runDir, outDir, artifactPath, nextName) {
+  const source = resolveRunArtifactPath(runDir, artifactPath);
+  if (!source || !existsSync(source)) {
+    return artifactPath ?? null;
+  }
+  const destination = path.join(outDir, nextName);
+  await copyFile(source, destination);
+  return destination;
+}
+
+async function copyReusableBaselineArtifacts(row, sourceRunDir, outDir, runId) {
+  const copied = {
+    ...row,
+    stdout_path: await copyResultArtifact(sourceRunDir, outDir, row.stdout_path, `${runId}.stdout.jsonl`),
+    stderr_path: await copyResultArtifact(sourceRunDir, outDir, row.stderr_path, `${runId}.stderr.txt`),
+  };
+  if (copied.baseline_harness_prelude?.context_path) {
+    copied.baseline_harness_prelude = {
+      ...copied.baseline_harness_prelude,
+      context_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        copied.baseline_harness_prelude.context_path,
+        `${runId}.baseline-context.json`,
+      ),
+      stderr_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        copied.baseline_harness_prelude.stderr_path,
+        `${runId}.baseline-context.stderr.txt`,
+      ),
+    };
+  }
+  return copied;
+}
+
+async function loadReusableBaselines(opts, plannedRuns, outDir) {
+  if (!opts.reuseBaselineFrom) {
+    return new Map();
+  }
+  const sourceRunDir = path.resolve(opts.reuseBaselineFrom);
+  const runsPath = path.join(sourceRunDir, "runs.jsonl");
+  if (!existsSync(runsPath)) {
+    throw new Error(`--reuse-baseline-from must contain runs.jsonl: ${sourceRunDir}`);
+  }
+  const wanted = new Map(
+    plannedRuns
+      .filter((run) => run.arm === "without_codestory")
+      .map((run) => [agentRunKey(run), run]),
+  );
+  if (!wanted.size) {
+    return new Map();
+  }
+
+  const rows = (await readFile(runsPath, "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const taskCache = new Map();
+  const reusable = new Map();
+  for (const row of rows) {
+    if (row.arm !== "without_codestory") {
+      continue;
+    }
+    const key = agentRunKey(row);
+    const planned = wanted.get(key);
+    if (!planned || !taskSnapshotMatches(planned.task, row)) {
+      continue;
+    }
+    const reanalyzed = await recomputeRunAnalysis(row, opts, sourceRunDir, taskCache);
+    const runId = benchmarkRunId([
+      planned.repo,
+      ...(planned.task ? [planned.task.id] : []),
+      planned.arm,
+      String(planned.repeat).padStart(2, "0"),
+    ]);
+    const copied = await copyReusableBaselineArtifacts(reanalyzed, sourceRunDir, outDir, runId);
+    reusable.set(key, {
+      ...copied,
+      reused_from: sourceRunDir,
+      reused_at: new Date().toISOString(),
+      resource_accounting: resourceAccountingForResult(copied),
+    });
+  }
+  return reusable;
+}
+
+async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
+  const reusable = reusableBaselines.get(agentRunKey(run));
+  if (reusable) {
+    console.log(`reusing ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats} from ${opts.reuseBaselineFrom}`);
+    return reusable;
+  }
+  console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
+  return await runOne(opts, run, outDir);
+}
+
+async function runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir) {
+  const runsPath = path.join(outDir, "runs.jsonl");
+  if (opts.jobs <= 1 || plannedRuns.length <= 1) {
+    const results = [];
+    for (const run of plannedRuns) {
+      results.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
+      await writeJsonlRows(runsPath, results);
+    }
+    return results;
+  }
+
+  const groups = groupPlannedAgentRuns(plannedRuns);
+  console.log(`running ${plannedRuns.length} planned agent rows across ${groups.length} repo groups with --jobs ${opts.jobs}`);
+  const groupedResults = await parallelMap(groups, opts.jobs, async (group) => {
+    const rows = [];
+    for (const run of group.runs) {
+      rows.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
+    }
+    return rows;
+  });
+  const results = groupedResults.flat();
+  await writeJsonlRows(runsPath, results);
+  return results;
 }
 
 async function main() {
@@ -5262,6 +5612,7 @@ async function main() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
+  const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
   const cachePreparation = opts.prepareCodestoryCache
     ? await prepareCodeStoryCaches(opts, tasks)
     : [];
@@ -5274,13 +5625,7 @@ async function main() {
     );
   }
 
-  const results = [];
-  for (const run of plannedRuns) {
-    console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
-    const result = await runOne(opts, run, outDir);
-    results.push(result);
-    await writeJsonlRows(path.join(outDir, "runs.jsonl"), results);
-  }
+  const results = await runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir);
 
   const summary = summarizeRuns(results);
   const costAccounting = summarizeCostAccounting(results);
@@ -5304,6 +5649,8 @@ async function main() {
     repeats: opts.repeats,
     publishable: opts.publishable,
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
+    reuse_baseline_from: opts.reuseBaselineFrom,
+    reused_baseline_runs: results.filter((row) => row.reused_from).length,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
@@ -5328,13 +5675,13 @@ async function main() {
 
   if (opts.publishable) {
     const blockers = agentPublishableBlockers(results, opts);
-      if (blockers.length) {
-        console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
-        for (const blocker of blockers) {
-          console.error(formatAgentPublishableBlocker(blocker));
-        }
-        exitCode = 1;
+    if (blockers.length) {
+      console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
+      for (const blocker of blockers) {
+        console.error(formatAgentPublishableBlocker(blocker));
       }
+      exitCode = 1;
+    }
   }
 
   console.log(`wrote ${outDir}`);
@@ -5360,7 +5707,9 @@ export {
   parseArgs,
   parseJsonLines,
   packetComposition,
+  packetCommandArgs,
   packetForAgentPrompt,
+  packetManifestExtraProbes,
   packetManifestQualitySummary,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,

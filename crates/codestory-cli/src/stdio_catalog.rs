@@ -957,6 +957,10 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("task_class", "Optional task class.")
             .with_enum(PACKET_TASK_CLASSES)
             .nullable(),
+        SchemaProperty::string_array(
+            "extra_probes",
+            "Optional audited file, symbol, or file-scoped symbol probes to add to the packet plan.",
+        ),
         SchemaProperty::boolean(
             "include_evidence",
             "Include citation edge ids and score details.",

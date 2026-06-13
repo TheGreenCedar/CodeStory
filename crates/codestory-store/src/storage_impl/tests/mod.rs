@@ -1,4 +1,24 @@
 use super::*;
+
+#[test]
+fn file_role_classification_ignores_materialized_benchmark_repo_cache_prefix() {
+    assert_eq!(
+        FileRole::classify_path(Path::new(
+            "C:/repo/target/oss-language-corpus/repos/nvm-sh-nvm/install.sh"
+        )),
+        FileRole::Source
+    );
+    assert_eq!(
+        FileRole::classify_path(Path::new(
+            "C:/repo/target/agent-benchmark/repos/psf-requests/tests/test_sessions.py"
+        )),
+        FileRole::Test
+    );
+    assert_eq!(
+        FileRole::classify_path(Path::new("target/generated/client.ts")),
+        FileRole::Generated
+    );
+}
 use codestory_contracts::graph::{
     AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, SourceLocation, TrailConfig, TrailDirection,

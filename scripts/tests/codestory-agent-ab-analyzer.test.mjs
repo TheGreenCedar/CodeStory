@@ -16,7 +16,9 @@ import {
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
   packetComposition,
+  packetCommandArgs,
   packetForAgentPrompt,
+  packetManifestExtraProbes,
   packetManifestQualitySummary,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
@@ -33,6 +35,10 @@ import {
   qualityFailureReasons,
   taskSnapshotForResult,
 } from "../codestory-agent-ab-benchmark.mjs";
+import {
+  packetGateStderrPath,
+  retryablePacketGateTaskIds,
+} from "../codestory-agent-ab-score.mjs";
 
 const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
@@ -46,11 +52,14 @@ test("parses packet-runtime benchmark run id", () => {
     "local-real",
     "--benchmark-run-id",
     "segment 43/v2",
+    "--prepare-codestory-jobs",
+    "2",
   ]);
 
   assert.equal(opts.packetRuntime, true);
   assert.equal(opts.benchmarkRunId, "segment-43-v2");
   assert.equal(opts.prepareCodestoryCache, true);
+  assert.equal(opts.prepareCodestoryJobs, 2);
   assert.throws(
     () =>
       parseBenchmarkArgs([
@@ -60,6 +69,17 @@ test("parses packet-runtime benchmark run id", () => {
         "--no-prepare-codestory-cache",
       ]),
     /sidecar preparation is mandatory/,
+  );
+  assert.throws(
+    () =>
+      parseBenchmarkArgs([
+        "--packet-runtime",
+        "--task-suite",
+        "local-real",
+        "--prepare-codestory-jobs",
+        "0",
+      ]),
+    /--prepare-codestory-jobs must be a positive integer/,
   );
 });
 
@@ -238,6 +258,42 @@ test("categorizes commands without treating source paths as cli invocations", ()
   assert.equal(commandCategory("cargo test -p codestory-cli --test onboarding_contracts"), "build_test");
 });
 
+test("packet gate retries only transient sidecar packet failures", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-gate-retry-"));
+  try {
+    const retryable = {
+      repo: "dart-lang-http",
+      task_id: "dart-http-client-flow",
+      mode: "cold_cli_packet",
+      repeat: 1,
+      status: "fail",
+      quality_pass: null,
+      failure_reasons: ["missing_quality_score"],
+    };
+    const qualityFailure = {
+      repo: "fixture",
+      task_id: "quality-failure",
+      mode: "cold_cli_packet",
+      repeat: 1,
+      status: "fail",
+      quality_pass: false,
+      failure_reasons: ["expected_claim_recall_low"],
+    };
+    await writeFile(
+      packetGateStderrPath(dir, retryable),
+      "Error: retrieval_unavailable: project is not in full mode (mode=no_semantic, reason=qdrant_unreachable)\n",
+      "utf8",
+    );
+    await writeFile(packetGateStderrPath(dir, qualityFailure), "manifest quality failed\n", "utf8");
+
+    assert.deepEqual(retryablePacketGateTaskIds([retryable, qualityFailure], dir), [
+      "dart-http-client-flow",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("rejects manifest repo and workspace paths outside the cache", async () => {
   await withManifestFile(
     manifestFixture({
@@ -303,6 +359,37 @@ test("packet-first command renders manifest text for host shells", () => {
     () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }, "linux"),
     /task_class/,
   );
+});
+
+test("packet command carries bounded manifest-derived extra probes", () => {
+  const task = {
+    prompt: "Explain how Requests dispatch works.",
+    task_class: "architecture_explanation",
+    expected_files: ["src/requests/api.py", "src/requests/sessions.py"],
+    expected_symbols: ["request", "Session.request"],
+    expected_symbol_probes: [
+      "src/requests/api.py request",
+      "src/requests/sessions.py Session.request",
+      "src/requests/sessions.py Session.send",
+    ],
+  };
+
+  assert.deepEqual(packetManifestExtraProbes(task), [
+    "src/requests/api.py",
+    "src/requests/sessions.py",
+    "src/requests/api.py request",
+    "src/requests/sessions.py Session.request",
+    "src/requests/sessions.py Session.send",
+  ]);
+
+  const args = packetCommandArgs({ path: "C:\\repo" }, task);
+  const extraProbeIndexes = args
+    .map((arg, index) => (arg === "--extra-probe" ? index : -1))
+    .filter((index) => index >= 0);
+
+  assert.equal(extraProbeIndexes.length, 5);
+  assert.equal(args[extraProbeIndexes[0] + 1], "src/requests/api.py");
+  assert.equal(args[extraProbeIndexes[3] + 1], "src/requests/sessions.py Session.request");
 });
 
 test("benchmark artifact run ids strip path separators from dynamic parts", () => {
@@ -475,6 +562,23 @@ test("counts direct source reads for every supported language extension family",
   const analysis = analyzeTranscript(events);
   assert.equal(analysis.command_categories.direct_file_read, paths.length);
   assert.equal(analysis.direct_source_reads_total, paths.length);
+});
+
+test("counts PowerShell LiteralPath source reads after a CodeStory packet", () => {
+  const command = String.raw`"C:\\Program Files\\PowerShell\\pwsh.exe" -Command '$lines = Get-Content -LiteralPath '"'src/index/use-swr.ts'
+for ($i = 1; $i -le 2; $i++) { "{0}: {1}" -f $i, $lines[$i - 1] }'`;
+  const events = [
+    commandEvent("packet", "item.started", "& $env:CODESTORY_CLI packet --project . --question flow"),
+    commandEvent("packet", "item.completed", "& $env:CODESTORY_CLI packet --project . --question flow", "{}"),
+    commandEvent("read", "item.started", command),
+    commandEvent("read", "item.completed", command, "export default useSWR"),
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.direct_file_read, 1);
+  assert.equal(analysis.direct_source_reads_total, 1);
+  assert.equal(analysis.ordinary_source_reads_after_first_packet, 1);
+  assert.deepEqual(analysis.direct_file_reads_duplicated, {});
 });
 
 test("counts modern Codex JSONL tool categories including web search", () => {
@@ -1111,6 +1215,30 @@ test("forbidden claim scoring requires negative polarity terms", () => {
   assert.equal(quality.pass, true);
 });
 
+test("forbidden claim scoring does not flag contradicted positive claims", () => {
+  const task = runtimeQualityTask("forbidden-positive-contradicted-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = ["StringUtils.isEmpty treats whitespace-only strings as empty."];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "StringUtils.isEmpty does not trim whitespace before deciding emptiness.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
 test("forbidden claim scoring does not combine unrelated storage sentences", () => {
   const task = runtimeQualityTask("forbidden-storage-fixture", {
     min_expected_file_recall: 0,
@@ -1126,6 +1254,32 @@ test("forbidden claim scoring does not combine unrelated storage sentences", () 
     [
       agentMessageEvent(
         "StorageAccessProxy forwards storage calls to the active storage subject. PersistentStorage is the concrete persistent implementation behind the storage access contract.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
+test("forbidden claim scoring keeps polarity inside one candidate sentence", () => {
+  const task = runtimeQualityTask("forbidden-shell-polarity-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "nvm is a compiled binary and does not dispatch through shell functions.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "`nvm` is the shell function dispatcher. `nvm_use_if_needed` switches versions only when the requested version is not already active.",
       ),
     ],
     task,
@@ -1234,6 +1388,19 @@ test("publishable gate blocks avoidable source reads after packet", () => {
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /ordinary source reads after packet=1 > 0/);
+});
+
+test("publishable gate records but does not block post-packet reads by default", () => {
+  const blockers = agentPublishableBlockers([
+    publishableWithCodeStoryResult({
+      transcript_analysis: {
+        command_count: 3,
+        ordinary_source_reads_after_first_packet: 2,
+      },
+    }),
+  ]);
+
+  assert.deepEqual(blockers, []);
 });
 
 test("publishable gate requires packet before ordinary context exploration", () => {

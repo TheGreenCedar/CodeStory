@@ -1369,7 +1369,7 @@
         },
         {
           "name": "nvm_install_node",
-          "path": "nvm.sh",
+          "path": "install.sh",
           "kind": "function",
           "why": "Installs Node versions."
         },
@@ -1555,7 +1555,7 @@
           "why": "Shared animation delay variable."
         },
         {
-          "name": ".animate__animated",
+          "name": ".animated",
           "path": "source/_base.css",
           "kind": "selector",
           "why": "Base animation class."
@@ -1567,7 +1567,7 @@
           "why": "Bounce animation keyframes."
         },
         {
-          "name": ".animate__bounce",
+          "name": ".bounce",
           "path": "source/attention_seekers/bounce.css",
           "kind": "selector",
           "why": "Class that selects bounce keyframes."
@@ -1584,10 +1584,10 @@
           "text": "Shared CSS custom properties define animation duration, delay, and repeat defaults."
         },
         {
-          "text": ".animate__animated is the base class that applies animation duration and fill mode."
+          "text": ".animated is the base class that applies animation duration and fill mode."
         },
         {
-          "text": "Named classes such as .animate__bounce set animation-name to matching keyframes."
+          "text": "Named classes such as .bounce set animation-name to matching keyframes."
         },
         {
           "text": "The source/animate.css file imports the variable, base, and individual animation files."

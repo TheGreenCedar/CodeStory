@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -19,8 +19,16 @@ function parseArgs(argv) {
     outDir: null,
     reanalyzeDir: null,
     timeoutMs: 600000,
+    prepareCodestoryTimeoutMs: 1_800_000,
     prepareCodestoryCache: true,
     materializeRepos: true,
+    jobs: 1,
+    packetGate: false,
+    packetProbeJobs: 1,
+    packetProbeRepeats: 1,
+    packetGateImprovedFrom: null,
+    reuseBaselineFrom: null,
+    prepareCodestoryJobs: 1,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -60,6 +68,38 @@ function parseArgs(argv) {
       opts.timeoutMs = Number.parseInt(argv[++i], 10);
       continue;
     }
+    if (arg === "--prepare-codestory-timeout-ms") {
+      opts.prepareCodestoryTimeoutMs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--jobs") {
+      opts.jobs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--packet-gate") {
+      opts.packetGate = true;
+      continue;
+    }
+    if (arg === "--packet-probe-jobs") {
+      opts.packetProbeJobs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--packet-probe-repeats") {
+      opts.packetProbeRepeats = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--packet-gate-improved-from") {
+      opts.packetGateImprovedFrom = path.resolve(argv[++i]);
+      continue;
+    }
+    if (arg === "--reuse-baseline-from") {
+      opts.reuseBaselineFrom = path.resolve(argv[++i]);
+      continue;
+    }
+    if (arg === "--prepare-codestory-jobs") {
+      opts.prepareCodestoryJobs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
     if (arg === "--no-prepare-codestory-cache") {
       opts.prepareCodestoryCache = false;
       continue;
@@ -76,16 +116,38 @@ function parseArgs(argv) {
   if (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 1000) {
     throw new Error("--timeout-ms must be at least 1000");
   }
+  if (!Number.isInteger(opts.prepareCodestoryTimeoutMs) || opts.prepareCodestoryTimeoutMs < 1000) {
+    throw new Error("--prepare-codestory-timeout-ms must be at least 1000");
+  }
+  if (!Number.isInteger(opts.jobs) || opts.jobs < 1) {
+    throw new Error("--jobs must be a positive integer");
+  }
+  if (!Number.isInteger(opts.packetProbeJobs) || opts.packetProbeJobs < 1) {
+    throw new Error("--packet-probe-jobs must be a positive integer");
+  }
+  if (!Number.isInteger(opts.packetProbeRepeats) || opts.packetProbeRepeats < 1) {
+    throw new Error("--packet-probe-repeats must be a positive integer");
+  }
+  if (!Number.isInteger(opts.prepareCodestoryJobs) || opts.prepareCodestoryJobs < 1) {
+    throw new Error("--prepare-codestory-jobs must be a positive integer");
+  }
+  if (opts.packetGateImprovedFrom && !opts.packetGate) {
+    throw new Error("--packet-gate-improved-from requires --packet-gate");
+  }
   return opts;
 }
 
 function usage() {
   console.log(`Usage:
-  node scripts/codestory-agent-ab-score.mjs [--task-ids ids] [--repeats n] [--out-dir dir]
+  node scripts/codestory-agent-ab-score.mjs [--task-ids ids] [--repeats n] [--out-dir dir] [--prepare-codestory-timeout-ms ms]
+      [--jobs n] [--prepare-codestory-jobs n] [--packet-gate] [--packet-probe-jobs n]
+      [--packet-gate-improved-from dir] [--reuse-baseline-from dir]
   node scripts/codestory-agent-ab-score.mjs --reanalyze-dir target/agent-benchmark/<run>
 
 Runs the real CodeStory agent A/B harness, reanalyzes it with the current
 transcript analyzer, and emits METRIC lines for Codex Autoresearch.
+Packet-gate mode automatically retries transient sidecar-unavailable packet
+probe rows once, serially, before selecting nested A/B tasks.
 
 Default smoke task ids: ${defaultSmokeTaskIds}`);
 }
@@ -106,10 +168,18 @@ async function runProcess(command, args, options = {}) {
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      if (options.streamOutput) {
+        process.stdout.write(text);
+      }
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      if (options.streamOutput) {
+        process.stderr.write(text);
+      }
     });
     child.on("error", (error) => {
       resolve({ status: "error", exitCode: null, stdout, stderr, error });
@@ -125,6 +195,21 @@ async function runProcess(command, args, options = {}) {
       });
     });
   });
+}
+
+function artifactNamePart(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "");
+  if (!normalized || normalized === "." || normalized === "..") {
+    return "unknown";
+  }
+  return normalized;
+}
+
+function benchmarkArtifactStem(parts) {
+  return parts.map(artifactNamePart).join("-");
 }
 
 async function runBenchmark(opts, outDir) {
@@ -147,6 +232,12 @@ async function runBenchmark(opts, outDir) {
     outDir,
     "--timeout-ms",
     String(opts.timeoutMs),
+    "--prepare-codestory-timeout-ms",
+    String(opts.prepareCodestoryTimeoutMs),
+    "--jobs",
+    String(opts.jobs),
+    "--prepare-codestory-jobs",
+    String(opts.prepareCodestoryJobs),
   ];
   if (opts.materializeRepos) {
     args.push("--materialize-repos");
@@ -154,8 +245,11 @@ async function runBenchmark(opts, outDir) {
   if (opts.prepareCodestoryCache) {
     args.push("--prepare-codestory-cache");
   }
+  if (opts.reuseBaselineFrom) {
+    args.push("--reuse-baseline-from", opts.reuseBaselineFrom);
+  }
 
-  const result = await runProcess(process.execPath, args);
+  const result = await runProcess(process.execPath, args, { streamOutput: true });
   if (result.status !== "pass") {
     process.stderr.write(result.stderr || result.stdout);
     throw new Error(`A/B benchmark command failed with exit ${result.exitCode ?? result.status}`);
@@ -174,6 +268,153 @@ async function reanalyze(outDir) {
   }
 }
 
+async function runPacketProbeBenchmark(opts, gateDir, taskIds, jobs, prepareJobs) {
+  const args = [
+    benchmarkScript,
+    "--packet-runtime",
+    "--packet-runtime-mode",
+    "cold-cli",
+    "--task-suite",
+    opts.taskSuite,
+    "--task-ids",
+    taskIds,
+    "--repeats",
+    String(opts.packetProbeRepeats),
+    "--repo-cache-dir",
+    opts.repoCacheDir,
+    "--out-dir",
+    gateDir,
+    "--timeout-ms",
+    String(opts.timeoutMs),
+    "--prepare-codestory-timeout-ms",
+    String(opts.prepareCodestoryTimeoutMs),
+    "--jobs",
+    String(jobs),
+    "--prepare-codestory-jobs",
+    String(prepareJobs),
+    "--allow-failures",
+  ];
+  if (opts.materializeRepos) {
+    args.push("--materialize-repos");
+  }
+  if (opts.prepareCodestoryCache) {
+    args.push("--prepare-codestory-cache");
+  }
+
+  const result = await runProcess(process.execPath, args, { streamOutput: true });
+  if (result.status !== "pass") {
+    process.stderr.write(result.stderr || result.stdout);
+    throw new Error(`packet gate command failed with exit ${result.exitCode ?? result.status}`);
+  }
+}
+
+async function runPacketGate(opts, outDir) {
+  const gateDir = path.join(outDir, "packet-probes");
+  mkdirSync(gateDir, { recursive: true });
+  await runPacketProbeBenchmark(opts, gateDir, opts.taskIds, opts.packetProbeJobs, opts.prepareCodestoryJobs);
+
+  const qualityDebugPath = path.join(gateDir, "quality-debug.json");
+  const qualityDebug = readJsonFileIfPresent(qualityDebugPath);
+  const retryableTaskIds = retryablePacketGateTaskIds(qualityDebug?.rows ?? [], gateDir);
+  let selectedQualityDebugPath = qualityDebugPath;
+  let selectedRows = qualityDebug?.rows ?? [];
+  let retryDir = null;
+  let retryQualityDebugPath = null;
+  if (retryableTaskIds.length) {
+    retryDir = path.join(outDir, "packet-probes-retry");
+    mkdirSync(retryDir, { recursive: true });
+    console.log(`packet gate retrying transient sidecar failures: ${retryableTaskIds.join(",")}`);
+    await runPacketProbeBenchmark(opts, retryDir, retryableTaskIds.join(","), 1, 1);
+    retryQualityDebugPath = path.join(retryDir, "quality-debug.json");
+    const retryQualityDebug = readJsonFileIfPresent(retryQualityDebugPath);
+    selectedRows = mergePacketGateRows(selectedRows, retryQualityDebug?.rows ?? [], retryableTaskIds);
+    selectedQualityDebugPath = path.join(gateDir, "quality-debug-merged.json");
+    writeFileSync(
+      selectedQualityDebugPath,
+      `${JSON.stringify(
+        {
+          ...(qualityDebug ?? {}),
+          scope: "packet_runtime_quality_debug_with_retry",
+          retry: {
+            retry_dir: retryDir,
+            retry_quality_debug: retryQualityDebugPath,
+            retried_task_ids: retryableTaskIds,
+          },
+          rows: selectedRows,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+  }
+  const byTask = rowsByTask(selectedRows);
+  const baseline = opts.packetGateImprovedFrom
+    ? loadPacketGateBaselineRows(opts.packetGateImprovedFrom)
+    : null;
+  const baselineByTask = baseline ? rowsByTask(baseline.rows) : null;
+  const selected = [];
+  const improved = [];
+  const unchangedOrMissing = [];
+  for (const [taskId, rows] of byTask) {
+    if (!packetGateTaskPasses(rows)) {
+      continue;
+    }
+    if (baselineByTask) {
+      const improvement = packetGateImprovement(rows, baselineByTask.get(taskId) ?? []);
+      if (!improvement.improved) {
+        unchangedOrMissing.push({ taskId, reason: improvement.reason });
+        continue;
+      }
+      improved.push({ taskId, reason: improvement.reason });
+    }
+    if (rows.length) {
+      selected.push(taskId);
+    }
+  }
+  selected.sort();
+  improved.sort((a, b) => a.taskId.localeCompare(b.taskId));
+  unchangedOrMissing.sort((a, b) => a.taskId.localeCompare(b.taskId));
+
+  console.log(`METRIC packet_gate_scored_tasks=${byTask.size}`);
+  console.log(`METRIC packet_gate_selected_tasks=${selected.length}`);
+  console.log(`METRIC packet_gate_retry_tasks=${retryableTaskIds.length}`);
+  if (baselineByTask) {
+    console.log(`METRIC packet_gate_baseline_tasks=${baselineByTask.size}`);
+    console.log(`METRIC packet_gate_improved_tasks=${improved.length}`);
+  }
+  console.log(`ARTIFACT packet_gate_dir=${path.relative(repoRoot, gateDir)}`);
+  if (existsSync(qualityDebugPath)) {
+    console.log(`ARTIFACT packet_gate_quality_debug=${path.relative(repoRoot, qualityDebugPath)}`);
+  }
+  if (retryDir) {
+    console.log(`ARTIFACT packet_gate_retry_dir=${path.relative(repoRoot, retryDir)}`);
+  }
+  if (retryQualityDebugPath && existsSync(retryQualityDebugPath)) {
+    console.log(`ARTIFACT packet_gate_retry_quality_debug=${path.relative(repoRoot, retryQualityDebugPath)}`);
+  }
+  if (selectedQualityDebugPath !== qualityDebugPath && existsSync(selectedQualityDebugPath)) {
+    console.log(`ARTIFACT packet_gate_quality_debug_merged=${path.relative(repoRoot, selectedQualityDebugPath)}`);
+  }
+  if (baseline?.path) {
+    console.log(`ARTIFACT packet_gate_improvement_baseline=${path.relative(repoRoot, baseline.path)}`);
+  }
+  if (!selected.length) {
+    console.log("packet gate selected no tasks; skipping nested A/B run");
+    if (unchangedOrMissing.length) {
+      console.log(
+        `packet gate skipped unchanged tasks: ${unchangedOrMissing.map((row) => `${row.taskId}:${row.reason}`).join(",")}`,
+      );
+    }
+    return null;
+  }
+  if (improved.length) {
+    console.log(`packet gate improved tasks: ${improved.map((row) => `${row.taskId}:${row.reason}`).join(",")}`);
+  }
+  console.log(`packet gate selected tasks: ${selected.join(",")}`);
+  return selected;
+}
+
 function readJsonl(filePath) {
   return readFileSync(filePath, "utf8")
     .split(/\r?\n/)
@@ -187,6 +428,225 @@ function readJsonFileIfPresent(filePath) {
     return null;
   }
   return JSON.parse(readFileSync(filePath, "utf8"));
+}
+
+function resolvePacketGateBaselinePath(sourcePath) {
+  if (!sourcePath) {
+    return null;
+  }
+  const candidates = [];
+  if (sourcePath.toLowerCase().endsWith(".json") || sourcePath.toLowerCase().endsWith(".jsonl")) {
+    candidates.push(sourcePath);
+  }
+  candidates.push(
+    path.join(sourcePath, "quality-debug.json"),
+    path.join(sourcePath, "packet-probes", "quality-debug.json"),
+    path.join(sourcePath, "reanalyzed-runs.jsonl"),
+  );
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+function packetQualityDebugRowsFromAbRows(filePath) {
+  return readJsonl(filePath)
+    .filter((row) => row.arm === "with_codestory" && row.codestory_harness_prelude?.packet_manifest_quality)
+    .map((row) => {
+      const quality = row.codestory_harness_prelude.packet_manifest_quality;
+      return {
+        repo: row.repo,
+        task_id: row.task_id,
+        mode: "with_codestory_packet_prelude",
+        repeat: row.repeat ?? null,
+        status: row.codestory_harness_prelude.status ?? row.status ?? null,
+        quality_pass: quality.pass === true,
+        failure_reasons: quality.failure_reasons ?? [],
+        quality_metrics: {
+          expected_file_recall: quality.expected_file_recall,
+          expected_symbol_recall: quality.expected_symbol_recall,
+          expected_claim_recall: quality.expected_claim_recall,
+          citation_coverage: quality.citation_coverage,
+          expected_anchor_recall: quality.expected_anchor_recall,
+          forbidden_claims_found: quality.forbidden_claims_found,
+        },
+        missed_anchors: quality.missed_anchors ?? {},
+      };
+    });
+}
+
+function loadPacketGateBaselineRows(sourcePath) {
+  const resolved = resolvePacketGateBaselinePath(sourcePath);
+  if (!resolved) {
+    throw new Error(`--packet-gate-improved-from did not contain packet quality evidence: ${sourcePath}`);
+  }
+  if (resolved.endsWith(".jsonl")) {
+    return { path: resolved, rows: packetQualityDebugRowsFromAbRows(resolved) };
+  }
+  const payload = readJsonFileIfPresent(resolved);
+  return { path: resolved, rows: Array.isArray(payload?.rows) ? payload.rows : [] };
+}
+
+const transientSidecarFailurePatterns = [
+  /\bretrieval_unavailable\b/i,
+  /\bqdrant_unreachable\b/i,
+  /\bzoekt_unreachable\b/i,
+  /\bscip_unreachable\b/i,
+  /sidecar retrieval .* unavailable/i,
+  /sidecar retrieval .* failed/i,
+  /retrieval sidecar is mandatory/i,
+  /project is not in full mode/i,
+];
+
+function packetGateStderrPath(gateDir, row) {
+  const mode = String(row?.mode ?? "cold_cli_packet").replaceAll("_", "-");
+  const repeat = String(row?.repeat ?? 1).padStart(2, "0");
+  const stem = benchmarkArtifactStem([row?.repo, row?.task_id, mode, repeat]);
+  return path.join(gateDir, `${stem}.stderr.txt`);
+}
+
+function packetGateRowHasTransientSidecarFailure(row, gateDir) {
+  if (row?.status === "pass") {
+    return false;
+  }
+  const failureReasons = Array.isArray(row?.failure_reasons) ? row.failure_reasons : [];
+  if (row?.quality_pass !== null && !failureReasons.includes("missing_quality_score")) {
+    return false;
+  }
+  const stderrPath = packetGateStderrPath(gateDir, row);
+  if (!existsSync(stderrPath)) {
+    return false;
+  }
+  const stderr = readFileSync(stderrPath, "utf8");
+  return transientSidecarFailurePatterns.some((pattern) => pattern.test(stderr));
+}
+
+function retryablePacketGateTaskIds(rows, gateDir) {
+  const taskIds = new Set();
+  for (const row of rows ?? []) {
+    if (packetGateRowHasTransientSidecarFailure(row, gateDir) && row?.task_id) {
+      taskIds.add(row.task_id);
+    }
+  }
+  return [...taskIds].sort();
+}
+
+function mergePacketGateRows(initialRows, retryRows, retriedTaskIds) {
+  const retried = new Set(retriedTaskIds);
+  const merged = (initialRows ?? []).filter((row) => !retried.has(row?.task_id));
+  merged.push(...(retryRows ?? []).filter((row) => retried.has(row?.task_id)));
+  return merged;
+}
+
+function rowsByTask(rows) {
+  const byTask = new Map();
+  for (const row of rows ?? []) {
+    const taskId = row.task_id;
+    if (!taskId) {
+      continue;
+    }
+    if (!byTask.has(taskId)) {
+      byTask.set(taskId, []);
+    }
+    byTask.get(taskId).push(row);
+  }
+  return byTask;
+}
+
+function packetGateRowPasses(row) {
+  return row?.status === "pass" && row?.quality_pass === true;
+}
+
+function packetGateTaskPasses(rows) {
+  return rows.length > 0 && rows.every((row) => packetGateRowPasses(row));
+}
+
+const packetGateQualityMetricNames = [
+  "expected_file_recall",
+  "expected_symbol_recall",
+  "expected_claim_recall",
+  "citation_coverage",
+  "expected_anchor_recall",
+];
+
+function averageFinite(values) {
+  const nums = values.filter((value) => Number.isFinite(value));
+  if (!nums.length) {
+    return null;
+  }
+  return nums.reduce((sum, value) => sum + value, 0) / nums.length;
+}
+
+function packetGateMetricAverage(rows, name) {
+  return averageFinite(rows.map((row) => row.quality_metrics?.[name]));
+}
+
+function missedAnchorCount(row) {
+  const missed = row?.missed_anchors;
+  if (!missed || typeof missed !== "object") {
+    return null;
+  }
+  let count = 0;
+  let sawArray = false;
+  for (const value of Object.values(missed)) {
+    if (Array.isArray(value)) {
+      sawArray = true;
+      count += value.length;
+    }
+  }
+  return sawArray ? count : null;
+}
+
+function failureReasonCount(row) {
+  return Array.isArray(row?.failure_reasons) ? row.failure_reasons.length : 0;
+}
+
+function packetGateTaskProfile(rows) {
+  const metrics = Object.fromEntries(
+    packetGateQualityMetricNames.map((name) => [name, packetGateMetricAverage(rows, name)]),
+  );
+  return {
+    rows: rows.length,
+    passRate: rows.length ? rows.filter((row) => packetGateRowPasses(row)).length / rows.length : 0,
+    metrics,
+    missedAnchors: averageFinite(rows.map((row) => missedAnchorCount(row))),
+    failureReasons: averageFinite(rows.map((row) => failureReasonCount(row))) ?? 0,
+  };
+}
+
+function packetGateImprovement(currentRows, baselineRows) {
+  if (!baselineRows?.length) {
+    return { improved: false, reason: "missing_baseline_task" };
+  }
+  const current = packetGateTaskProfile(currentRows);
+  const baseline = packetGateTaskProfile(baselineRows);
+  const epsilon = 1e-9;
+  if (current.passRate > baseline.passRate + epsilon) {
+    return { improved: true, reason: "quality_pass_rate", current, baseline };
+  }
+  for (const name of packetGateQualityMetricNames) {
+    const currentMetric = current.metrics[name];
+    const baselineMetric = baseline.metrics[name];
+    if (
+      Number.isFinite(currentMetric) &&
+      Number.isFinite(baselineMetric) &&
+      currentMetric > baselineMetric + epsilon
+    ) {
+      return { improved: true, reason: name, current, baseline };
+    }
+  }
+  if (
+    Number.isFinite(current.missedAnchors) &&
+    Number.isFinite(baseline.missedAnchors) &&
+    current.missedAnchors < baseline.missedAnchors - epsilon
+  ) {
+    return { improved: true, reason: "missed_anchors", current, baseline };
+  }
+  if (
+    Number.isFinite(current.failureReasons) &&
+    Number.isFinite(baseline.failureReasons) &&
+    current.failureReasons < baseline.failureReasons - epsilon
+  ) {
+    return { improved: true, reason: "failure_reasons", current, baseline };
+  }
+  return { improved: false, reason: "not_improved", current, baseline };
 }
 
 function median(values) {
@@ -248,6 +708,15 @@ function summarizeArm(rows, arm) {
     qualityPass: successful.filter((row) => row.quality?.pass).length,
     packetFirstPass: successful.filter((row) => row.packet_first_required && row.packet_first_pass).length,
     packetFirstRequired: successful.filter((row) => row.packet_first_required).length,
+    packetManifestQualityPass: successful.filter(
+      (row) => row.codestory_harness_prelude?.packet_manifest_quality?.pass,
+    ).length,
+    packetManifestQualityScored: successful.filter(
+      (row) => row.codestory_harness_prelude?.packet_manifest_quality,
+    ).length,
+    packetPartial: successful.filter(
+      (row) => row.codestory_harness_prelude?.packet_sufficiency_status === "partial",
+    ).length,
     totalWallMs: sumFinite(successful.map((row) => row.wall_ms)),
     totalInputTokens: sumFinite(successful.map((row) => row.usage?.input_tokens)),
     totalOutputTokens: sumFinite(successful.map((row) => row.usage?.output_tokens)),
@@ -355,6 +824,13 @@ async function main() {
   mkdirSync(outDir, { recursive: true });
 
   if (!opts.reanalyzeDir) {
+    if (opts.packetGate) {
+      const selectedTaskIds = await runPacketGate(opts, outDir);
+      if (!selectedTaskIds) {
+        return;
+      }
+      opts.taskIds = selectedTaskIds.join(",");
+    }
     await runBenchmark(opts, outDir);
   }
   await reanalyze(outDir);
@@ -393,6 +869,9 @@ async function main() {
   printMetric("with_quality_passes", result.withCodeStory.qualityPass);
   printMetric("quality_pass_delta", result.withCodeStory.qualityPass - result.without.qualityPass);
   printMetric("with_packet_first_passes", result.withCodeStory.packetFirstPass);
+  printMetric("with_packet_manifest_quality_passes", result.withCodeStory.packetManifestQualityPass);
+  printMetric("with_packet_manifest_quality_scored", result.withCodeStory.packetManifestQualityScored);
+  printMetric("with_partial_packets", result.withCodeStory.packetPartial);
   printMetric("with_post_packet_source_reads", result.withCodeStory.medianPostPacketReads ?? 0);
   printMetric("external_web_searches", (result.without.medianWebSearches ?? 0) + (result.withCodeStory.medianWebSearches ?? 0));
   printMetric("with_tokens", result.withCodeStory.medianTokens);
@@ -443,7 +922,16 @@ async function main() {
   );
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(1);
+  });
+}
+
+export {
+  mergePacketGateRows,
+  packetGateStderrPath,
+  packetGateRowHasTransientSidecarFailure,
+  retryablePacketGateTaskIds,
+};

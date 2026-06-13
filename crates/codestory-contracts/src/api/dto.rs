@@ -1737,6 +1737,8 @@ pub struct AgentPacketRequestDto {
     pub budget: PacketBudgetModeDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_class: Option<PacketTaskClassDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_probes: Vec<String>,
     #[serde(default = "default_include_evidence")]
     pub include_evidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

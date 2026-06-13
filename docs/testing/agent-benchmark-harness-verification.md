@@ -31,6 +31,8 @@ The fixture verifies:
 - duplicate file reads by normalized path;
 - expected file, symbol, claim, and citation recall;
 - missed anchors as quality evidence, separate from operational run status;
+- forbidden-claim scoring that avoids contradicted positive-claim false
+  positives, including hyphenated terms such as `whitespace-only`;
 - publishable blockers when the `without_codestory` arm either calls CodeStory
   or never inspects the local repository.
 
@@ -80,6 +82,12 @@ that packet-level manifest quality passes, the nested CodeStory prompt treats
 the packet as complete for that benchmark row. That row-specific stop rule is
 not based on generic `sufficiency.status`; it is based on the same expected
 file, symbol, claim, and citation evidence used by the row quality gate.
+When packet-level manifest quality is incomplete, the CodeStory arm remains
+CodeStory-first but is not packet-only by default. The nested agent must use
+listed CodeStory follow-ups before ordinary source reads, and any source reads
+after the first packet are counted as post-packet overhead. Use
+`--max-source-reads-after-packet 0` only for stricter packet-only promotion
+evidence.
 Each run row also includes a normalized `resource_accounting` object with the
 same wall-clock, agent-runner wall-clock, baseline-prelude wall-clock,
 CodeStory-prelude wall-clock, token, tool-call, command-count, and source-read
@@ -97,12 +105,99 @@ medians.
 `scripts/codestory-agent-ab-score.mjs` reuses that ledger for Autoresearch and
 emits `METRIC` lines for the raw per-arm wall time, tokens, tool calls,
 commands, CodeStory commands, shell searches, file-read commands, web searches,
-post-packet reads, quality pass counts, packet-first pass counts, and ratios.
+post-packet reads, quality pass counts, packet-first pass counts,
+packet-manifest quality pass counts, partial packet counts, and ratios.
+The score wrapper streams the lower-level benchmark progress while still
+capturing stdout/stderr for failure reporting, and it forwards
+`--prepare-codestory-timeout-ms` to the benchmark so long CodeStory cache
+preparation is visible and explicitly bounded.
 The primary `agent_ab_gap` penalizes with-CodeStory quality failures,
 packet-first failures, post-packet source reads, and external web/search
 leakage. The no-CodeStory quality result is emitted separately as
 `without_quality_passes` and `quality_pass_delta` so baseline failure remains
 visible without being misattributed as a CodeStory-side regression.
+
+For faster iteration on runtime packet fixes, use packet probes before nested
+agents:
+
+```powershell
+node scripts\codestory-agent-ab-score.mjs `
+  --packet-gate --packet-probe-jobs 4 `
+  --prepare-codestory-jobs 2 `
+  --task-ids <comma-separated-task-ids> `
+  --out-dir target\agent-benchmark\<run-name>
+```
+
+The packet gate runs cold `codestory-cli packet` probes first, with independent
+rows parallelized by `--packet-probe-jobs`. Only tasks whose packet manifest
+quality passes are sent to the nested A/B harness. If no task passes the packet
+gate, the wrapper emits `packet_gate_*` metrics and skips nested agents.
+Rows that fail because the packet process temporarily cannot reach mandatory
+sidecars are retried once, serially, in `packet-probes-retry`; the wrapper
+emits `packet_gate_retry_tasks` plus retry artifact paths and uses the merged
+quality-debug rows for A/B selection. Content-quality failures are not retried.
+Use `--packet-gate-improved-from <previous-run-dir>` when iterating on runtime
+packet fixes; then a task must pass the current packet gate and improve over
+the previous packet-probe `quality-debug.json` or A/B `reanalyzed-runs.jsonl`
+packet-prelude manifest score before nested agents are launched.
+
+For anti-overfit language work, run packet probes with
+`CODESTORY_PACKET_EXACT_FAMILY_STEERING=0` so hidden exact library-family probes
+and static family citations are disabled. The current clean serial packet gate
+is:
+
+```text
+target/agent-benchmark/segment8-no-family-steering-full-packets-java-css-generic-shapes-serial
+```
+
+It scores `9/18` packet-quality passes without sidecar failures. The matching
+current packet-gated A/B slice is:
+
+```text
+target/agent-benchmark/segment8-no-family-steering-current9-ab-java-css-generic-shapes
+```
+
+That slice is useful for cost/time/tool-call accounting (`9/9` CodeStory
+quality versus `6/9` baseline), but it is not promotion evidence for all
+supported languages because the other nine rows still fail the packet gate.
+
+The lower-level packet runtime mode can also be run directly with row-level
+parallelism:
+
+```powershell
+node scripts\codestory-agent-ab-benchmark.mjs `
+  --packet-runtime --packet-runtime-mode cold-cli `
+  --task-ids <comma-separated-task-ids> `
+  --jobs 4 --prepare-codestory-jobs 2 `
+  --out-dir target\agent-benchmark\<run-name>
+```
+
+This mode runs only CodeStory packet probes and does not start nested agents.
+Keep `--prepare-codestory-jobs` lower than packet row concurrency; `2` to `4`
+is usually the practical cap before local indexing, embedding, or Qdrant work
+starts contending with itself.
+
+Nested A/B runs can use `--jobs N` too, but the harness parallelizes only
+independent repo groups. Arms, repeats, and multiple tasks for the same repo
+stay serial so both arms do not mutate the same checkout at the same time.
+
+When only CodeStory runtime packet behavior changed, reuse matching baselines:
+
+```powershell
+node scripts\codestory-agent-ab-score.mjs `
+  --packet-gate --packet-probe-jobs 4 `
+  --packet-gate-improved-from target\agent-benchmark\<previous-run> `
+  --task-ids <comma-separated-task-ids> `
+  --reuse-baseline-from target\agent-benchmark\<previous-run> `
+  --out-dir target\agent-benchmark\<run-name>
+```
+
+Baseline reuse is strict. The benchmark reuses only `without_codestory` rows
+whose repo, task id, repeat, and task manifest snapshot match the current run.
+It reanalyzes the old raw row with the current analyzer, copies stdout/stderr
+and baseline-context artifacts into the new output directory, and annotates the
+row with `reused_from`. Do not reuse baselines across manifest or scorer
+changes; rerun the no-CodeStory arm in those cases.
 
 Web search, browser tools, remote URLs, and upstream mirrors are not allowed in
 local pinned-repo A/B runs. Publishable gating reports external web/search tool

@@ -576,6 +576,7 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
             question: cmd.question,
             budget: cmd.budget.into(),
             task_class: cmd.task_class.map(Into::into),
+            extra_probes: cmd.extra_probes,
             include_evidence: !cmd.no_evidence,
             latency_budget_ms: cmd.latency_budget_ms,
         })

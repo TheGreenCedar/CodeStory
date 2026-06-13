@@ -76,9 +76,13 @@ runtime-supported languages. It is separate from the OSS language corpus:
 - The `without_codestory` arm mechanically runs a harness-owned local `rg` plus
   bounded source-read prelude. The `with_codestory` arm mechanically runs a
   harness-owned `codestory-cli packet` prelude. Both preludes count their wall
-  time and command/tool accounting. The `without_codestory` arm is invalid for
-  publishable evidence if it calls CodeStory or never inspects the local
-  repository.
+  time and command/tool accounting. The CodeStory arm is packet-first, not
+  packet-only by default: if the packet and CodeStory follow-ups are partial,
+  ordinary local source reads are allowed after CodeStory and counted as
+  post-packet overhead. Pass `--max-source-reads-after-packet 0` only when you
+  want stricter packet-only promotion evidence. The `without_codestory` arm is
+  invalid for publishable evidence if it calls CodeStory or never inspects the
+  local repository.
 
 The suite currently has one medium-sized open source project per supported
 language: Python, Java, Rust, JavaScript, TypeScript, C++, C, Go, Ruby, PHP,
@@ -105,6 +109,47 @@ node scripts/codestory-agent-ab-benchmark.mjs `
 Use `--task-ids <id>` for a cheaper targeted run. The Markdown summary table
 includes the human-readable A/B columns; `runs.jsonl` remains the source of
 truth for per-run metrics.
+
+For runtime packet fixes, prefer a packet-first gated loop before launching
+nested agents:
+
+```powershell
+node scripts/codestory-agent-ab-score.mjs `
+  --packet-gate --packet-probe-jobs 4 `
+  --packet-gate-improved-from target/agent-benchmark/<previous-run> `
+  --reuse-baseline-from target/agent-benchmark/<previous-run> `
+  --prepare-codestory-jobs 2 `
+  --task-ids <comma-separated-task-ids> `
+  --out-dir target/agent-benchmark/<run-name>
+```
+
+`--packet-probe-jobs` controls cheap packet probes, `--jobs` controls
+independent nested A/B repo groups, and `--prepare-codestory-jobs` caps cache
+prep across repos. If a packet probe fails from transient sidecar
+unavailability, the score wrapper reruns just those task ids serially in a
+`packet-probes-retry` artifact before deciding which rows enter the A/B phase.
+Baseline reuse is valid only when the task manifest and scorer boundary are
+unchanged.
+
+For anti-overfit language checks, set
+`CODESTORY_PACKET_EXACT_FAMILY_STEERING=0` before running the packet gate. The
+current clean serial full gate is:
+
+```text
+target/agent-benchmark/segment8-no-family-steering-full-packets-java-css-generic-shapes-serial
+```
+
+It quality-passes `9/18` rows. The corresponding current packet-gated A/B slice
+is:
+
+```text
+target/agent-benchmark/segment8-no-family-steering-current9-ab-java-css-generic-shapes
+```
+
+That slice compares `9/9` CodeStory quality against `6/9` baseline quality and
+records time, tokens, commands, tool calls, post-packet source reads, and web
+leakage. Treat it as packet-eligible-slice evidence, not broad promotion proof
+for all supported languages.
 
 ## Local Real-Repo Corpus
 

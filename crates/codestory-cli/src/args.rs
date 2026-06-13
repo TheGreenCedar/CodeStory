@@ -413,6 +413,12 @@ pub(crate) struct PacketCommand {
     #[arg(long, value_enum)]
     pub(crate) task_class: Option<CliPacketTaskClass>,
     #[arg(
+        long = "extra-probe",
+        value_name = "QUERY",
+        help = "Add an explicit file, symbol, or file-scoped symbol probe to the packet plan. Repeatable; intended for audited benchmark or operator-supplied anchors."
+    )]
+    pub(crate) extra_probes: Vec<String>,
+    #[arg(
         long,
         value_enum,
         default_value_t = RefreshMode::None,

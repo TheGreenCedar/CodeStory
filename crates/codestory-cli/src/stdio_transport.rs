@@ -473,6 +473,10 @@ fn handle_stdio_packet(
         Ok(latency_budget_ms) => latency_budget_ms,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
+    let extra_probes = match stdio_packet_extra_probes(request) {
+        Ok(extra_probes) => extra_probes,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
     let include_evidence = request
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
@@ -483,6 +487,7 @@ fn handle_stdio_packet(
         question,
         budget,
         task_class,
+        &extra_probes,
         include_evidence,
         latency_budget_ms,
     );
@@ -495,6 +500,7 @@ fn handle_stdio_packet(
             question: question.to_string(),
             budget,
             task_class,
+            extra_probes,
             include_evidence,
             latency_budget_ms,
         })
@@ -513,6 +519,7 @@ struct StdioPacketCacheKey {
     question: String,
     budget: &'static str,
     task_class: Option<&'static str>,
+    extra_probes: Vec<String>,
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
 }
@@ -584,6 +591,7 @@ fn stdio_packet_cache_key(
     question: &str,
     budget: PacketBudgetModeDto,
     task_class: Option<PacketTaskClassDto>,
+    extra_probes: &[String],
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
 ) -> StdioPacketCacheKey {
@@ -593,6 +601,7 @@ fn stdio_packet_cache_key(
         question: question.to_string(),
         budget: stdio_packet_budget_label(budget),
         task_class: task_class.map(stdio_packet_task_class_label),
+        extra_probes: extra_probes.to_vec(),
         include_evidence,
         latency_budget_ms,
     }
@@ -774,6 +783,39 @@ fn stdio_packet_latency_budget(request: &serde_json::Value) -> Result<Option<u32
         bail!("packet.latency_budget_ms must be between 1000 and 120000");
     }
     Ok(Some(value as u32))
+}
+
+fn stdio_packet_extra_probes(request: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(value) = request.pointer("/params/arguments/extra_probes") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!("packet.extra_probes must be an array of strings");
+    };
+    if values.len() > 16 {
+        bail!("packet.extra_probes accepts at most 16 probes");
+    }
+
+    let mut probes = Vec::new();
+    for value in values {
+        let Some(probe) = value.as_str() else {
+            bail!("packet.extra_probes must be an array of strings");
+        };
+        let probe = probe.trim();
+        if probe.is_empty() {
+            continue;
+        }
+        if probe.len() > 240 {
+            bail!("packet.extra_probes entries must be at most 240 characters");
+        }
+        if !probes
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(probe))
+        {
+            probes.push(probe.to_string());
+        }
+    }
+    Ok(probes)
 }
 
 fn handle_stdio_search(
@@ -1722,6 +1764,7 @@ mod tests {
             question,
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         )
@@ -1826,6 +1869,7 @@ mod tests {
             "Explain packet caching.",
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         );
@@ -1837,6 +1881,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 true,
                 Some(15_000),
             )
@@ -1849,6 +1894,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Tiny,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 true,
                 Some(15_000),
             )
@@ -1861,6 +1907,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::EditPlanning),
+                &[],
                 true,
                 Some(15_000),
             )
@@ -1873,6 +1920,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 false,
                 Some(15_000),
             )
@@ -1885,8 +1933,22 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 true,
                 Some(30_000),
+            )
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-a".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Compact,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                &["src/lib.rs run".to_string()],
+                true,
+                Some(15_000),
             )
         );
     }
@@ -1904,6 +1966,7 @@ mod tests {
             "Explain packet caching.",
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         );
@@ -1913,6 +1976,7 @@ mod tests {
             "Explain packet caching.",
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         );
@@ -1974,6 +2038,7 @@ mod tests {
             "Explain strict readiness.",
             PacketBudgetModeDto::Compact,
             None,
+            &[],
             true,
             None,
         );
@@ -2001,6 +2066,7 @@ mod tests {
             "Explain strict readiness.",
             PacketBudgetModeDto::Compact,
             None,
+            &[],
             true,
             None,
         );

@@ -362,10 +362,22 @@ impl FileRole {
     }
 
     pub fn classify_path(path: &Path) -> Self {
-        let normalized = path
+        let mut normalized = path
             .to_string_lossy()
             .replace('\\', "/")
             .to_ascii_lowercase();
+        for marker in [
+            "/target/agent-benchmark/repos/",
+            "/target/oss-language-corpus/repos/",
+        ] {
+            if let Some(index) = normalized.find(marker) {
+                let remainder = &normalized[index + marker.len()..];
+                if let Some((_, repo_relative)) = remainder.split_once('/') {
+                    normalized = repo_relative.to_string();
+                }
+                break;
+            }
+        }
         let marked = format!("/{normalized}");
         let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
 

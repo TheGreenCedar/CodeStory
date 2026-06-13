@@ -3819,7 +3819,7 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 4;
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 5;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
@@ -4310,12 +4310,110 @@ fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
     llm_indexable_kind_for_scope(kind, semantic_doc_scope_from_env())
 }
 
+fn normalize_semantic_store_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = path.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = path.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    path
+}
+
+fn semantic_path_is_absolute_like(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() > 2
+            && bytes[1] == b':'
+            && bytes[2] == b'/'
+            && bytes[0].is_ascii_alphabetic())
+}
+
+fn semantic_path_parent(path: &str) -> Option<&str> {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty())
+}
+
+fn common_semantic_path_prefix(left: &str, right: &str) -> String {
+    let left_parts = left.split('/').collect::<Vec<_>>();
+    let right_parts = right.split('/').collect::<Vec<_>>();
+    let mut common = Vec::new();
+    for (left, right) in left_parts.iter().zip(right_parts.iter()) {
+        if left != right {
+            break;
+        }
+        common.push(*left);
+    }
+    common.join("/")
+}
+
+fn common_absolute_semantic_parent(paths: &[(GraphNodeId, String)]) -> Option<String> {
+    let mut parents = paths
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .filter(|path| semantic_path_is_absolute_like(path))
+        .filter_map(semantic_path_parent);
+    let mut common = parents.next()?.to_string();
+    for parent in parents {
+        common = common_semantic_path_prefix(&common, parent);
+        if common.is_empty() {
+            return None;
+        }
+    }
+    Some(common).filter(|common| !common.is_empty())
+}
+
+fn strip_semantic_common_parent(path: &str, common_parent: &str) -> Option<String> {
+    let rest = path.strip_prefix(common_parent)?;
+    let rest = rest.strip_prefix('/')?;
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+fn semantic_file_table_path_maps(
+    files: Vec<FileInfo>,
+) -> (HashMap<GraphNodeId, String>, HashMap<GraphNodeId, String>) {
+    let rows = files
+        .into_iter()
+        .map(|file| {
+            (
+                codestory_contracts::graph::NodeId(file.id),
+                normalize_semantic_store_path(&file.path),
+            )
+        })
+        .collect::<Vec<_>>();
+    let common_parent = common_absolute_semantic_parent(&rows);
+    let mut display_paths = HashMap::new();
+    let mut read_paths = HashMap::new();
+    for (id, path) in rows {
+        let normalized = common_parent
+            .as_deref()
+            .and_then(|common_parent| strip_semantic_common_parent(&path, common_parent))
+            .unwrap_or_else(|| path.clone());
+        display_paths.insert(id, normalized);
+        read_paths.insert(id, path);
+    }
+    (display_paths, read_paths)
+}
+
+fn semantic_file_table_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
+    let (display_paths, _) = semantic_file_table_path_maps(files);
+    display_paths
+}
+
+fn semantic_file_table_read_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
+    let (_, read_paths) = semantic_file_table_path_maps(files);
+    read_paths
+}
+
 #[derive(Default)]
 struct SemanticDocGraphContext {
     child_labels: HashMap<GraphNodeId, Vec<String>>,
     referenced_labels: HashMap<GraphNodeId, Vec<String>>,
     edge_digests: HashMap<GraphNodeId, Vec<String>>,
     file_paths: HashMap<GraphNodeId, String>,
+    file_read_paths: HashMap<GraphNodeId, String>,
 }
 
 impl SemanticDocGraphContext {
@@ -4335,15 +4433,27 @@ impl SemanticDocGraphContext {
         let edges_by_node = storage.get_edges_for_node_ids(&node_ids).map_err(|e| {
             ApiError::internal(format!("Failed to load semantic doc graph context: {e}"))
         })?;
+        let files = storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+        let file_table_paths = semantic_file_table_path_map(files.clone());
+        let file_table_read_paths = semantic_file_table_read_path_map(files);
 
         let mut context = Self::default();
         for node in semantic_nodes {
             if let Some(file_id) = node.file_node_id
                 && let Some(file_node) = nodes_by_id.get(&file_id)
             {
-                context
-                    .file_paths
-                    .insert(node.id, file_node.serialized_name.clone());
+                let file_path = file_table_paths
+                    .get(&file_id)
+                    .cloned()
+                    .unwrap_or_else(|| file_node.serialized_name.clone());
+                context.file_paths.insert(node.id, file_path);
+                let read_path = file_table_read_paths
+                    .get(&file_id)
+                    .cloned()
+                    .unwrap_or_else(|| file_node.serialized_name.clone());
+                context.file_read_paths.insert(node.id, read_path);
             }
 
             let edges = edges_by_node
@@ -4369,6 +4479,13 @@ impl SemanticDocGraphContext {
     fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
         self.file_paths.get(&node.id).map(String::as_str)
     }
+
+    fn file_read_path_for_node(&self, node: &GraphNode) -> Option<&str> {
+        self.file_read_paths
+            .get(&node.id)
+            .or_else(|| self.file_paths.get(&node.id))
+            .map(String::as_str)
+    }
 }
 
 fn build_semantic_file_text_cache(
@@ -4377,17 +4494,24 @@ fn build_semantic_file_text_cache(
 ) -> HashMap<String, Option<String>> {
     let mut file_paths = semantic_nodes
         .iter()
-        .filter_map(|node| graph_context.file_path_for_node(node).map(str::to_string))
-        .collect::<HashSet<_>>()
+        .filter_map(|node| {
+            let display_path = graph_context.file_path_for_node(node)?.to_string();
+            let read_path = graph_context
+                .file_read_path_for_node(node)
+                .unwrap_or(display_path.as_str())
+                .to_string();
+            Some((display_path, read_path))
+        })
+        .collect::<HashMap<_, _>>()
         .into_iter()
         .collect::<Vec<_>>();
-    file_paths.sort();
+    file_paths.sort_by(|left, right| left.0.cmp(&right.0));
 
     file_paths
         .into_par_iter()
-        .map(|path| {
-            let contents = read_searchable_file_contents(&path);
-            (path, contents)
+        .map(|(display_path, read_path)| {
+            let contents = read_searchable_file_contents(&read_path);
+            (display_path, contents)
         })
         .collect()
 }
@@ -4958,7 +5082,7 @@ fn semantic_component_key_for_path(path: Option<&str>) -> Option<String> {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     if parts.is_empty() {
-        return None;
+        return Some("dir:.".into());
     }
     if let Some(index) = parts.iter().position(|part| *part == "crates")
         && let Some(crate_name) = parts.get(index.saturating_add(1))
@@ -11205,6 +11329,76 @@ mod tests {
         );
         assert!(report.symbol_doc.doc_text.contains("god_nodes:"));
         assert!(report.pending.is_none());
+    }
+
+    #[test]
+    fn component_reports_group_root_level_source_files() {
+        assert_eq!(
+            semantic_component_key_for_path(Some("nvm.sh")).as_deref(),
+            Some("dir:.")
+        );
+    }
+
+    #[test]
+    fn semantic_graph_context_uses_repo_relative_file_table_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        let verbatim_path = PathBuf::from(r"\\?\C:\work\nvm\nvm.sh");
+        storage
+            .insert_file(&FileInfo {
+                id: 11,
+                path: verbatim_path.clone(),
+                language: "bash".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 12,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert file");
+        let file_node = Node {
+            id: CoreNodeId(11),
+            kind: NodeKind::FILE,
+            serialized_name: verbatim_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let function_node = Node {
+            id: CoreNodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "nvm".to_string(),
+            file_node_id: Some(CoreNodeId(11)),
+            start_line: Some(1),
+            ..Default::default()
+        };
+        storage
+            .insert_nodes_batch(&[file_node.clone(), function_node.clone()])
+            .expect("insert nodes");
+        let nodes = vec![file_node, function_node.clone()];
+        let semantic_nodes = vec![&function_node];
+        let context =
+            SemanticDocGraphContext::build(&storage, &semantic_nodes, &nodes).expect("context");
+
+        assert_eq!(context.file_path_for_node(&function_node), Some("nvm.sh"));
+        assert_eq!(
+            context.file_read_path_for_node(&function_node),
+            Some("C:/work/nvm/nvm.sh")
+        );
+        let reports = build_component_report_docs(
+            &context,
+            &semantic_nodes,
+            &std::collections::HashMap::new(),
+            None,
+            123,
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].symbol_doc.file_path.as_deref(), Some("nvm.sh"));
+        assert!(
+            reports[0]
+                .symbol_doc
+                .doc_text
+                .contains("component_report: dir:.")
+        );
     }
 
     fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
