@@ -1,84 +1,75 @@
 # How CodeStory Works
 
-CodeStory is a local evidence layer for codebases. It does not replace judgment,
-tests, or source reading. It makes the first pass more structured.
+CodeStory indexes a workspace into a local graph, then serves read commands
+against that graph. It does not replace tests or judgment; it structures the
+first pass.
 
-An agent usually fails on a large repo by over-weighting the first few files it
-opens. CodeStory gives that agent an indexed map before it explains behavior or
-plans a change.
+Command loop: [README - What You Get](../../README.md#what-you-get).
+Readiness lanes: [usage.md](../usage.md#readiness-tracks).
 
-## The Loop
-
-```text
-doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
+```mermaid
+flowchart TD
+    Files["workspace files"] --> Plan["workspace discovery and refresh plan"]
+    Plan --> Parse["tree-sitter parsing and semantic resolution"]
+    Parse --> Graph["SQLite graph, occurrences, snippets, snapshots"]
+    Graph --> Local["local navigation commands"]
+    Graph --> SidecarBuild["retrieval index"]
+    SidecarBuild --> Sidecars["Zoekt, Qdrant, SCIP, llama.cpp"]
+    Sidecars --> Agent["agent packet/search commands"]
 ```
 
-- `doctor` checks whether the cache, index, retrieval mode, and local embedding
-  setup are usable.
-- `index` builds or refreshes local graph, search, snapshot, graph-native
-  symbol-doc, component-report, and selected dense-anchor state for one target
-  repository.
-- `ground` gives broad orientation and reports limited coverage or gaps.
-- `search` finds candidate files, symbols, routes, literals, modules, or behavior
-  terms.
-- `symbol`, `trail`, `snippet`, and `explore` inspect one selected target.
-- `context` bundles deeper evidence around that concrete target.
-- `packet` handles broad task questions and reports citations, gaps, and next
-  commands.
+## What gets stored
 
-The workflow is a repeatable evidence loop.
+Per-project SQLite under your user cache, keyed by workspace path:
 
-## What Gets Stored
+| Stored | Purpose |
+| --- | --- |
+| File inventory and refresh metadata | Incremental re-index |
+| Graph nodes and edges | Calls, imports, overrides, references |
+| Snippets and occurrences | Source-backed reads |
+| Search projections and symbol docs | Lookup without opening every file |
+| Snapshots | Cached read models rebuilt from the graph |
+| Dense anchors (when policy selects them) | Sidecar vector search only |
 
-CodeStory writes per-project state under the user cache, keyed by the target
-workspace path. The cache can include:
+Repo content stays local. Managed setup may fetch tool assets; indexed evidence
+does not leave the cache unless you copy it.
 
-- discovered files and refresh metadata
-- graph nodes for files, symbols, and related code elements
-- graph edges such as calls, imports, overrides, and references
-- source snippets and occurrence locations
-- search projection rows and local search indexes
-- grounding snapshots rebuilt from the graph
-- graph-native symbol docs, which are deterministic searchable summaries for
-  durable AST symbols
-- selected dense anchors, which are the only generated docs embedded as vectors
-  under the active semantic policy
+## The loop
 
-Repository data stays local. Managed setup may fetch tool or model assets, but
-the indexed project evidence lives in the local cache.
+```text
+doctor -> index -> ground/report/files -> exact target -> trail/snippet/context
+```
 
-## Key Terms
+Use `packet` and `search` after the sidecar lane reports
+`retrieval_mode: "full"`. Until then, keep local browsing on exact targets from
+`ground`, `report`, `files`, or existing node ids.
 
-- Grounding is source-backed context: the files, symbols, and summaries a command
-  returns so an answer can be tied back to repository evidence.
-- A symbol doc is deterministic generated text for a symbol, stored so lexical
-  and graph retrieval can find relevant code even when the query words are not
-  exact.
-- A dense anchor is a policy-selected symbol, component report, or unstructured
-  doc that receives a vector embedding. Code symbols do not need dense vectors
-  to be product-searchable.
-- A snapshot is a cached read model rebuilt from the local graph. If a snapshot
-  is stale, the tool should say so.
-- A trail is a focused graph walk around one symbol: callers, callees,
-  references, or neighborhood context.
-- A packet is a bounded evidence bundle for a broad task. It should include
-  citations, gaps, and follow-up commands.
+## Terms
 
-## What Good Looks Like
+| Term | Meaning |
+| --- | --- |
+| Grounding | Context tied back to indexed files and symbols |
+| Symbol doc | Generated searchable text for a symbol (lexical, not embedded by default) |
+| Dense anchor | Policy-selected symbol or report that gets a vector |
+| Snapshot | Derived read model; may be stale, and commands should say so |
+| Trail | Graph walk from one symbol: callers, callees, neighbors |
+| Packet | Bounded task evidence with citations, gaps, next commands |
+
+More: [glossary.md](../glossary.md).
+
+## What good output looks like
 
 A good CodeStory-backed answer does three things:
 
-1. It names the files, symbols, or snippets it used.
-2. It says when evidence is stale, partial, ambiguous, or missing.
-3. It gives the next concrete command when the current evidence is not enough.
+1. Names the files, symbols, snippets, or sidecar evidence it used.
+2. Says when evidence is stale, partial, ambiguous, or missing.
+3. Gives the next concrete command when the current evidence is not enough.
 
 The goal is not a more confident answer. The goal is confidence constrained by
 source evidence.
 
-## Where To Go Next
+## Related
 
-- Use [../usage.md](../usage.md) for command flows.
-- Use [../architecture/overview.md](../architecture/overview.md) for the system
-  boundary and crate model.
-- Use [../contributors/debugging.md](../contributors/debugging.md) when output
-  looks wrong.
+- [usage.md](../usage.md)
+- [architecture/overview.md](../architecture/overview.md)
+- [contributors/debugging.md](../contributors/debugging.md)

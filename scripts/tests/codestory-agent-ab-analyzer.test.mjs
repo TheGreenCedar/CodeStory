@@ -262,7 +262,7 @@ test("categorizes commands without treating source paths as cli invocations", ()
   );
   assert.equal(commandCategory("Get-Content crates/codestory-cli/src/main.rs"), "direct_file_read");
   assert.equal(commandCategory("Get-Content C:\\tools\\codestory-cli.exe"), "direct_file_read");
-  assert.equal(commandCategory("cargo test -p codestory-cli --test onboarding_contracts"), "build_test");
+  assert.equal(commandCategory("cargo test -p codestory-cli --test runtime_backed_flows"), "build_test");
 });
 
 test("packet gate retries only transient sidecar packet failures", async () => {
@@ -697,8 +697,8 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
     commandEvent("cmd_7", "item.completed", `$p='"'crates/codestory-runtime/src/lib.rs'; Get-Content $p`, "pub struct RuntimeContext;"),
     commandEvent("cmd_5", "item.started", "git status --short"),
     commandEvent("cmd_5", "item.completed", "git status --short", ""),
-    commandEvent("cmd_6", "item.started", "cargo test -p codestory-cli --test onboarding_contracts"),
-    commandEvent("cmd_6", "item.completed", "cargo test -p codestory-cli --test onboarding_contracts", "ok"),
+    commandEvent("cmd_6", "item.started", "cargo test -p codestory-cli --test runtime_backed_flows"),
+    commandEvent("cmd_6", "item.completed", "cargo test -p codestory-cli --test runtime_backed_flows", "ok"),
     {
       type: "item.completed",
       item: {
@@ -724,7 +724,7 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
     id: "fixture",
     task_class: "architecture_explanation",
     expected_files: ["crates/codestory-cli/src/main.rs"],
-    expected_verification_files: ["crates/codestory-cli/tests/onboarding_contracts.rs"],
+    expected_verification_files: ["crates/codestory-cli/tests/runtime_backed_flows.rs"],
     expected_symbols: ["RuntimeContext::ensure_open", "MissingSymbol"],
     expected_claims: ["Full indexing starts"],
     forbidden_claims: ["remote service is required"],
@@ -744,7 +744,7 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
   assert.deepEqual(quality.missed_anchors.symbols, ["MissingSymbol"]);
   assert.equal(quality.expected_verification_files.recall, 0);
   assert.deepEqual(quality.missed_anchors.verification_files, [
-    "crates/codestory-cli/tests/onboarding_contracts.rs",
+    "crates/codestory-cli/tests/runtime_backed_flows.rs",
   ]);
   assert.equal(quality.citation_coverage.recall, 1);
 });

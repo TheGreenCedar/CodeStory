@@ -1,7 +1,8 @@
 # Architecture Overview
 
-CodeStory has one job: turn a repository into local evidence that a coding agent
-can query before relying on a small set of manually opened files.
+CodeStory turns a repository into local evidence a coding agent can query: files
+and symbols in SQLite, optional sidecar indexes for packet/search, thin CLI on
+top of `codestory-runtime`.
 
 The runtime path is:
 

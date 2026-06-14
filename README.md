@@ -10,32 +10,42 @@ Local codebase grounding for coding agents.
 <a href="docs/testing/benchmark-ledger.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
-CodeStory builds a local evidence layer for a repository. It indexes files,
-symbols, relationships, snippets, search state, and freshness notes into a
-per-project SQLite cache, then exposes that evidence through a CLI and
-`serve --stdio`.
+**Situation.** You are in a repo with more files than anyone holds in memory.
+The agent needs to change behavior that spans packages - routing, indexing,
+auth, whatever - not rename a variable in the one file already open.
 
-Use it when a coding agent needs repository context before explaining behavior,
-planning a change, or choosing files to inspect. The workflow is explicit: check
-cache health, build or refresh the index, find candidate symbols, inspect
-relationships, pull snippets, and return an answer tied to source evidence.
+**Task.** Find the symbol that owns the behavior, see who calls it, read the
+source that actually runs, and know what to touch next. Without treating
+`grep -R` as architecture.
 
-Repository contents and inference stay local after the required tool or model
-assets are installed. Setup can fetch the CodeStory source artifact or managed
-embedding assets; the indexed project data stays in the user cache and commands
-stay explicit about which workspace they read.
+**Action.** CodeStory indexes the workspace into a local SQLite graph:
+files, symbols, calls, imports, snippets, search projections, and freshness
+notes. Use `doctor`, `index`, `ground`, and `report` for local navigation. Use
+`packet` and `search` after sidecars report `retrieval_mode: "full"`.
 
-## Public Promise
+**Result.** Work starts at a file and line you can open, not whichever match
+ranked first in ripgrep. Answers say what they used; gaps say when the index or
+sidecars are stale.
 
-CodeStory is a local evidence layer for repositories, not an automatic
-correctness guarantee. It gives operators and coding agents explicit commands
-for cache health, indexing, search, trails, snippets, and source-backed answers
-that name the files they used. The per-project SQLite cache is separate from
-the optional local retrieval sidecars used by packet/search workflows; a healthy
-local navigation readiness report does not by itself prove agent packet/search
-readiness and does not by itself prove sidecar readiness. Benchmark notes are
-environment- and repository-specific evidence, so public claims should cite the
-checked setup instead of promising universal speedups or savings.
+```mermaid
+flowchart LR
+    Repo["workspace files"] --> Index["index"]
+    Index --> Store["local SQLite graph"]
+    Store --> Local["local: ground, report, files, trail, snippet"]
+    Store --> RetrievalIndex["retrieval index"]
+    RetrievalIndex --> Sidecars["Zoekt + Qdrant + SCIP + llama.cpp"]
+    Sidecars --> AgentSearch["agent: packet, search"]
+```
+
+## What You Get
+
+| Need | Use |
+| --- | --- |
+| "Where do I start?" | `doctor`, `index`, `ground`, `report` |
+| "What does this symbol touch?" | `symbol`, `trail`, `snippet` |
+| "What changed and what might break?" | `affected` |
+| "Answer a broad repo question with citations." | `packet` with full sidecars |
+| "Find candidates by behavior term, path, symbol, or literal." | `search` with full sidecars |
 
 ## Try It On A Repo
 
@@ -51,158 +61,73 @@ TARGET_WORKSPACE="/path/to/repo"
 "$CODESTORY_CLI" index --project "$TARGET_WORKSPACE" --refresh full
 "$CODESTORY_CLI" ground --project "$TARGET_WORKSPACE" --why
 "$CODESTORY_CLI" report --project "$TARGET_WORKSPACE" --output-file codestory-report.md
-"$CODESTORY_CLI" report --project "$TARGET_WORKSPACE" --format json --output-file codestory-graph.json
 ```
 
 On Windows PowerShell, use `.\target\release\codestory-cli.exe`, environment
-assignments such as `$env:NAME = "value"`, and normal Windows paths such as
-`C:\path\to\repo`.
+assignments such as `$env:TARGET_WORKSPACE = "C:\path\to\repo"`, and normal
+Windows paths.
 
-That basic path establishes local navigation readiness: the local cache, graph,
-lexical index, and DB-backed navigation commands are usable for health, file,
-symbol, trail, snippet, context, orientation checks, and derived report/export
-artifacts.
-`report` reads the current SQLite store and writes generated artifacts; the
-Markdown report and full JSON graph export are not source-of-truth state. The managed
-embedding dry-run is a local semantic setup check; it does not prove agent
-packet/search readiness.
+That path proves local navigation readiness. It does not prove sidecar readiness
+for `packet` or `search`.
 
-Agent packet/search readiness requires `retrieval_mode=full` from local Zoekt,
-Qdrant, SCIP, and llama.cpp sidecars. See [docs/usage.md](docs/usage.md) for the
-full local-navigation versus sidecar-readiness split and
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for sidecar
-setup.
-
-After that first index, use narrower commands instead of asking the agent to
-start over:
+For agent-facing packet/search evidence, build and verify sidecars first:
 
 ```sh
+"$CODESTORY_CLI" retrieval bootstrap --project "$TARGET_WORKSPACE" --format json
+"$CODESTORY_CLI" retrieval index --project "$TARGET_WORKSPACE" --refresh full
+"$CODESTORY_CLI" retrieval status --project "$TARGET_WORKSPACE" --format json
+"$CODESTORY_CLI" packet --project "$TARGET_WORKSPACE" --question "what owns request routing?"
 "$CODESTORY_CLI" search --project "$TARGET_WORKSPACE" --query "request routing" --why
-"$CODESTORY_CLI" trail --project "$TARGET_WORKSPACE" --id <node-id> --story --hide-speculative
-"$CODESTORY_CLI" snippet --project "$TARGET_WORKSPACE" --id <node-id> --context 40
 ```
 
-A good CodeStory-backed answer should name the source files it used, say when
-evidence is stale or partial, and give the next concrete command when more proof
-is needed.
-
-For task-shaped flows, use [docs/usage.md](docs/usage.md).
-
-## Retrieval sidecars
-
-For Zoekt/Qdrant/SCIP packet retrieval, run `cargo retrieval-setup` once from
-this repository root, then follow
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for bootstrap
-flags, version pins, and troubleshooting.
+`retrieval status` must report `retrieval_mode: "full"` before trusting
+`packet` or `search`. See
+[docs/usage.md](docs/usage.md) for task-shaped flows and
+[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for sidecar
+setup and repair.
 
 ## Install As An Agent Skill
 
-Use this path when CodeStory should be installed once as a grounding skill and
-then pointed at whatever repository an agent is working on.
+Copy [`.agents/skills/codestory-grounding`](.agents/skills/codestory-grounding) to
+your skill directory. Run `scripts/setup.sh` or `scripts/setup.ps1`. See
+[`.agents/skills/codestory-grounding/SKILL.md`](.agents/skills/codestory-grounding/SKILL.md).
 
-```sh
-SkillHome="<agent-global-skill-directory>"
-mkdir -p "$SkillHome"
-cp -R ./.agents/skills/codestory-grounding "$SkillHome/codestory-grounding"
-bash "$SkillHome/codestory-grounding/scripts/setup.sh"
-```
+## Commands
 
-On Windows PowerShell:
-
-```powershell
-$SkillHome = "<agent-global-skill-directory>"
-New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
-Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
-& "$SkillHome\codestory-grounding\scripts\setup.ps1"
-```
-
-The setup script prints `CODESTORY_CLI=<path>`. Persist that path if your agent
-environment does not preserve variables between sessions.
-
-The skill package lives at
-[.agents/skills/codestory-grounding/SKILL.md](.agents/skills/codestory-grounding/SKILL.md).
-
-## Core Flow
-
-| Need | Command |
+| Task | Command |
 | --- | --- |
-| Local navigation readiness | `codestory-cli doctor --project <target-workspace>` |
-| Build or refresh an index | `codestory-cli index --project <target-workspace> --refresh full` |
-| Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
-| Repo report / graph export | `codestory-cli report --project <target-workspace> --format markdown` |
-| Broad task evidence (requires full sidecar retrieval) | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
-| Candidate discovery (requires full sidecar retrieval) | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
-| Exact symbol evidence | `codestory-cli symbol --project <target-workspace> --id <node-id>` |
-| Flow evidence | `codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative` |
-| Source excerpt | `codestory-cli snippet --project <target-workspace> --id <node-id>` |
-| Bundled navigation packet | `codestory-cli explore --project <target-workspace> --id <node-id> --no-tui` |
-| Deep context bundle | `codestory-cli context --project <target-workspace> --id <node-id>` |
-| Changed-file impact | `codestory-cli affected --project <target-workspace> --format markdown` |
-| Persistent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
+| Cache health | `doctor --project <repo>` |
+| Index | `index --project <repo> --refresh full` |
+| Orientation | `ground --project <repo> --why` |
+| Lookup with sidecars | `search --project <repo> --query "..." --why` |
+| Call graph | `trail --project <repo> --id <node-id> --story` |
+| Source | `snippet --project <repo> --id <node-id>` |
+| Target bundle | `context --project <repo> --id <node-id>` |
+| Task packet with sidecars | `packet --project <repo> --question "..."` |
+| Persistent reads | `serve --project <repo> --stdio` |
 
-Use `packet` for broad task questions once `ready --goal agent` reports full
-sidecar retrieval. For local cache-only inspection, start with `ground`,
-`report`, or `doctor`, then use `symbol`, `trail`, `snippet`, or `context` after
-you have a concrete target. Use `doctor` when output looks stale, incomplete, or
-inconsistent.
+## Language Support
 
-## What It Builds
-
-```mermaid
-flowchart LR
-    Repo["repository"] --> Workspace["workspace discovery"]
-    Workspace --> Indexer["symbol and edge extraction"]
-    Indexer --> Store["SQLite store"]
-    Store --> Runtime["retrieval and context assembly"]
-    Runtime --> CLI["CLI and stdio reads"]
-    CLI --> Agent["coding agent"]
-```
-
-CodeStory builds a local evidence layer so agents can request grounded context
-instead of relying on ad hoc file reads.
-
-## Language Support Claims
-
-CodeStory separates parser-backed graph indexing, regression-tested accuracy,
-structural extraction, framework route coverage, and agent packet/search
-readiness. The current contract is documented in
+CodeStory separates parser-backed graph coverage, structural collectors,
+regression-tested fidelity, and agent packet/search readiness. The current
+contract is documented in
 [docs/architecture/language-support.md](docs/architecture/language-support.md).
 
-In short: Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby,
-PHP, C#, Kotlin, Swift, Dart, and Bash are fidelity-gated parser-backed graph
-languages; HTML, CSS, and SQL use structural collectors.
-
-The opt-in OSS language corpus pairs each public language-support profile with a
-pinned medium-sized open source project and compares raw filesystem counts
-against CodeStory indexing of the same files:
-[docs/testing/oss-language-corpus.md](docs/testing/oss-language-corpus.md).
-The separate `language-expansion-holdout` benchmark suite runs strict
-`without_codestory` versus `with_codestory` agent tasks on those pinned
-projects and records elapsed time, token usage, estimated cost, tool calls,
-command counts, source reads, post-packet source reads, and quality gates.
-
-For the system model, start with
-[docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md),
-then [docs/architecture/overview.md](docs/architecture/overview.md).
+Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#,
+Kotlin, Swift, Dart, and Bash are fidelity-gated parser-backed graph languages.
+HTML, CSS, and SQL use structural collectors.
 
 ## Evidence
 
-The benchmark docs are deliberately cautious. They separate current checked-in
-benchmark history from the state of your local cache, which can drift and should
-be checked with `doctor`.
+Benchmark notes are environment- and repository-specific evidence. Do not turn
+one row into a universal savings claim.
 
-- Public evidence summary and caveats:
-  [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
-- Repo-scale timing history:
-  [docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md)
-- Warm stdio loop evidence:
-  [docs/testing/codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md)
-- Repeatable with/without harness:
-  [`scripts/codestory-agent-ab-benchmark.mjs`](scripts/codestory-agent-ab-benchmark.mjs)
+- Scorecard and caveats: [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
+- Repo-scale timing history: [docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md)
+- Warm stdio loop history: [docs/testing/codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md)
+- Repeatable with/without harness: [`scripts/codestory-agent-ab-benchmark.mjs`](scripts/codestory-agent-ab-benchmark.mjs)
 
-Do not promote a single benchmark row into a universal savings claim.
-
-## Hack On CodeStory
+## Contributing
 
 Start with the contributor docs, then run Cargo checks serially because this
 workspace shares build locks.
@@ -210,14 +135,17 @@ workspace shares build locks.
 - [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
 - [docs/contributors/debugging.md](docs/contributors/debugging.md)
 - [docs/contributors/testing-matrix.md](docs/contributors/testing-matrix.md)
+- [docs/architecture/overview.md](docs/architecture/overview.md)
 - [docs/architecture/runtime-execution-path.md](docs/architecture/runtime-execution-path.md)
-- [docs/architecture/language-support.md](docs/architecture/language-support.md)
-- [docs/architecture/subsystems/contracts.md](docs/architecture/subsystems/contracts.md)
-- [docs/architecture/subsystems/workspace.md](docs/architecture/subsystems/workspace.md)
-- [docs/architecture/subsystems/indexer.md](docs/architecture/subsystems/indexer.md)
-- [docs/architecture/subsystems/store.md](docs/architecture/subsystems/store.md)
-- [docs/architecture/subsystems/runtime.md](docs/architecture/subsystems/runtime.md)
-- [docs/architecture/subsystems/cli.md](docs/architecture/subsystems/cli.md)
+
+## Docs Map
+
+- Usage: [docs/usage.md](docs/usage.md)
+- Concepts: [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md)
+- Architecture: [docs/architecture/overview.md](docs/architecture/overview.md)
+- Languages: [docs/architecture/language-support.md](docs/architecture/language-support.md)
+- Benchmarks: [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
+- Contributing: [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
 
 ## License
 

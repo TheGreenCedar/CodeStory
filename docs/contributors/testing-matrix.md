@@ -14,7 +14,7 @@ flowchart TD
     change --> cli["CLI args or output boundary work"]
     change --> bench["Bench or perf-surface work"]
     change --> e2e["Repo-scale semantic or cold-start behavior"]
-    docs --> docs_checks["markdown/link checks + any touched doc contracts"]
+    docs --> docs_checks["readback + git diff --check"]
     always --> workspace["fmt, check, targeted tests, clippy"]
     indexer --> fidelity["fidelity_regression, tictactoe_language_coverage, integration"]
     store --> store_tests["cargo test -p codestory-store"]
@@ -40,11 +40,11 @@ These are the default checks for any contributor change.
 If you only changed `README.md` or `docs/**`, use the smallest credible lane:
 
 ```sh
-cargo fmt --check
-cargo test -p codestory-cli --test onboarding_contracts
+git diff --check
 ```
 
-Only escalate to broader cargo checks if the doc change depends on new code behavior or command output.
+Read the changed pages back before finishing. Only escalate to broader Cargo
+checks if the doc change depends on new code behavior or command output.
 
 ## Indexer And Graph Fidelity
 

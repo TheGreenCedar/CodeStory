@@ -1,9 +1,8 @@
 # CodeStory Benchmark Ledger
 
-This ledger keeps the decision-grade scorecard and detailed benchmark history
-that is too dense for the README. Treat every row as machine-, cache-, runner-,
-and date-specific. Promote only rows that pass the current harness gates
-documented below.
+Decision-grade scorecard and benchmark history - too dense for the README.
+Treat every row as machine-, cache-, runner-, and date-specific. Do not quote a
+row as a universal savings claim without checking harness tier and setup.
 
 Runs recorded before the 2026-05-24 harness tightening are historical unless
 they are reanalyzed or rerun with answer-level expected-file/symbol recall,
@@ -173,7 +172,7 @@ mismatches. Warm stdio task medians ranged from `2.69s` to `3.60s`, with an
 aggregate task median of `3.13s`; cold CLI task medians ranged from `4.22s` to
 `5.76s`, with an aggregate task median of `4.86s`.
 
-## Methodology
+## Harness Contract
 
 The agent A/B harness runs the same repository prompt in two arms:
 
