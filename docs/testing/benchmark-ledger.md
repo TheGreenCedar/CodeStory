@@ -1,176 +1,205 @@
 # CodeStory Benchmark Ledger
 
-Decision-grade scorecard and benchmark history - too dense for the README.
-Treat every row as machine-, cache-, runner-, and date-specific. Do not quote a
-row as a universal savings claim without checking harness tier and setup.
+This page is the current benchmark scorecard. It should answer one question
+quickly: does the latest evidence show CodeStory helping, hurting, or still
+needing proof?
 
-Runs recorded before the 2026-05-24 harness tightening are historical unless
-they are reanalyzed or rerun with answer-level expected-file/symbol recall,
-immutable manifest refs, and CodeStory cache provenance. The harness now keeps
-transcript-observed anchors separate from anchors actually present in the final
-answer, so tool output alone cannot make a row quality-pass.
+Short answer: there is fresh evidence from June 13-14, 2026. It is much better
+than the stale May quick-check row, but it is not broad enough yet for a general
+public savings claim.
 
-## Current Scorecard
+## Current Answer
 
-| Lane | Current status | Public claim status |
-| --- | --- | --- |
-| Agent A/B quick check | The 2026-05-23 CodeStory-only quick run passed both arms, but the CodeStory arm used more tokens, more wall time, and more tool starts. | No agent savings claim. |
-| Local-real Codex probe | On 2026-05-25, the narrowed `codex-exec-json-flow` live A/B repeated with a quality-passing CodeStory arm against a failing no-CodeStory arm. Latest corrected-wrapper repeat: `114,510` vs `2,209,856` tokens, `2` vs `39` observed tool calls, `117.37s` vs `262.39s`, and overhead ratio `0.183466`. | Strong exploratory evidence; no promotion claim from this task alone. |
-| Local-real Sourcetrail probe | On 2026-05-25, the `sourcetrail-indexing-to-storage` live A/B passed with CodeStory after source-group/indexing/storage packet fixes. CodeStory used `269,363` vs `5,697,852` tokens, `2` vs `105` observed tool calls, `138.92s` vs `532.68s`, `0` vs `87` source reads, and overhead ratio `0.10904`. | Strong second-repo exploratory evidence; still not promotion-grade because it is one repeat using a local existing cache. |
-| Local-real VS Code probe | On 2026-05-25, the `vscode-workbench-extension-host` packet holdout moved from partial coverage to a sufficient packet, then the live A/B passed with CodeStory after workbench/extension-host packet fixes. CodeStory used `1,070,153` vs `7,296,578` tokens, `2` vs `115` observed tool calls, `329.69s` vs `626.08s`, `0` vs `71` source reads, and overhead ratio `0.230215`. A follow-up release incremental refresh repaired the stale cache provenance, moving VS Code freshness from `74` new files to `0`. | Strong third-repo exploratory evidence; still not promotion-grade because it is one repeat and the no-CodeStory arm failed quality. |
-| Local-real drill-suite probe | On 2026-05-25, a four-repo `drill-suite` matrix exposed a real CodeStory cache-reuse blocker, stale Codex anchor selections, VS Code indexing-error blockage, and Sourcetrail source-truth-only bridges. After the CodeStory cache fix and Rust receiver/return-chain graph pass, this repo's one-case drill is still degraded but now resolves `11/11` anchors with `28/55` graph bridges, `27` partial bridges, and `0` unresolved bridges. | Diagnostic product evidence only; the remaining target is store/workspace execution-plan and snapshot/projection bridge coverage. |
-| Strict packet-first rows | Several with-CodeStory public-checkout rows passed quality, packet-first, and zero ordinary source reads after packet. | Behavior evidence only; paired savings still needs broader quality-passing baselines. |
-| Packet runtime | Public-core warm stdio and cold CLI packet rows passed repeated publishable quality gates. | Runtime evidence, not agent-token savings. |
-| Repo-scale cold index/read timing | The current timing source is the latest row in [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md). | Current only after a fresh row is logged for the relevant change. |
-| Warm stdio smoke | The current warm-loop timing source is [codestory-stdio-warm-loop-stats.md](codestory-stdio-warm-loop-stats.md). | Smoke evidence for the persistent read surface. |
+| Question | Answer |
+| --- | --- |
+| Is the May 23 "CodeStory used more tokens and time" row still the current answer? | No. It is historical context. |
+| Is there benchmark data from this week? | Yes: a June 13 SWR A/B row and a June 14 18-repo packet-runtime language sweep. |
+| Does the fresh data show CodeStory can be useful? | Yes. The SWR A/B row shows a large win, and the packet-runtime sweep shows broad language coverage. |
+| Can we claim general agent savings yet? | No. The strongest A/B row is one repeat, non-publishable, and reused one baseline run. |
 
-## What Is Solid
+## Current Evidence At A Glance
 
-- CodeStory can produce quality-passing packet-first answers on selected public
-  tasks while avoiding ordinary source reads after the answer packet.
-- Repeated packet-runtime rows show `packet` can fit inside an agent workflow
-  budget in both cold CLI and warm stdio modes.
-- The local-real harness now separates first-index setup cost from timed
-  cache-reuse agent work, blocks stale or semantic-empty caches from
-  publishable evidence, and records useful-context density for final-answer
-  context instead of raw packet volume alone.
-- The quality-passing local-real Codex live A/B has now repeated on the same
-  task with the corrected wrapper.
-- Sourcetrail now adds a second realistic repo where the CodeStory arm passed
-  quality and avoided source reads while the no-CodeStory arm failed quality
-  after broad exploration.
-- VS Code now adds a large TypeScript repo where the packet planner can find the
-  workbench startup, extension service, extension host manager, extension-host
-  activation, and command execution anchors without follow-up commands, and the
-  live CodeStory arm passed quality while using far fewer tools and source
-  reads than the no-CodeStory arm.
-- The VS Code cache freshness issue behind the first local-real row is now
-  understood and fixed: TypeScript/TSX factory-call superclass extraction no
-  longer crashes on `extends mock<T>()`, failed attempts are recorded as
-  incomplete files with attached errors, and `../vscode` now reports
-  `10,491/10,491` indexed files as fresh after incremental refresh.
-- CodeStory's own active cache can now recover from stale incremental
-  projection cleanup where cross-file callable state points at a deleted node;
-  release incremental refresh reports fresh inventory with `150/150` indexed
-  files, `0` errors, and `7,794` semantic docs.
-- The tightened CodeStory drill now exposes the CLI-to-runtime-to-indexer path
-  mostly as graph evidence: Rust receiver and return-chain resolution moved the
-  case from `3/55` graph bridges to `28/55`, while preserving explicit
-  source-truth-only status for the remaining unproven bridge pairs.
-- Repo-scale timing history is tracked in the stats log instead of copied into
-  prose that silently drifts.
+```mermaid
+xychart-beta
+  title "June 13 SWR A/B: CodeStory Ratio vs Baseline"
+  x-axis ["Tokens", "All-in wall", "Commands", "Source reads"]
+  y-axis "ratio, lower is better" 0 --> 1
+  bar [0.06, 0.212, 0.029, 0]
+```
 
-## What Is Not Claimed
-
-This page does not claim that CodeStory generally reduces agent cost, token
-count, wall time, or tool calls. General savings claims require repeated
-controlled with/without-agent measurements from the benchmark harness, not one
-exploratory row or representative estimates.
-
-The 2026-05-25 Codex, Sourcetrail, and VS Code local-real rows are explicitly
-non-promotional. They show a CodeStory advantage on three realistic tasks, but
-they are still single-run or same-task exploratory measurements using local
-cache state. The VS Code cache now has fresh provenance after the follow-up
-repair, but public savings language still needs repeated controlled rows, clean
-pinned checkout provenance, and at least one holdout that was not tuned during
-the implementation loop.
-
-The 2026-05-25 `drill-suite` rows are also non-promotional. They are designed to
-find grounding failures before an agent A/B run, and the current CodeStory case
-still falls back to source-truth-only evidence for `27/55` bridge pairs.
-
-## Proof Tier Ladder
-
-Use the highest tier actually reached when describing a row. Do not promote a
-lower tier into a broader claim just because the command exited successfully.
-
-| Proof tier | Required evidence | Can claim | Cannot claim |
+| Lane | Fresh result | What it means | Claim status |
 | --- | --- | --- | --- |
-| Stats-only local regression signal | `codestory_repo_e2e_stats` completed with skip allowances or without prepared full sidecars. | Local timing, indexing, and cache-shape regression signal for the current checkout. | Full sidecar readiness, agent packet/search readiness, real-repo release coverage, or performance promotion. |
-| Full sidecar readiness proof | Zoekt, Qdrant, SCIP, and llama.cpp are running; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` and product backend fields. | Agent-facing packet/search readiness for the verified workspace and cache state. | General quality, cross-repo coverage, or benchmark savings. |
-| Real-repo drill proof | Prepared real-repo drill manifests run without skip allowances and produce expected evidence packets, source-truth checks, and verdicts. | The release path was exercised beyond the CodeStory checkout on the named drill cases. | Generalized agent savings or promotion-grade performance. |
-| Promotion-grade benchmark proof | Controlled baseline and candidate benchmark rows use pinned refs, comparable cache state, sidecar status, answer-level quality gates, and no-regression thresholds. | Cautious performance or retrieval-quality promotion for the measured scope. | Universal savings, untested repos, or environments outside the recorded setup. |
+| SWR paired A/B | With CodeStory: `32,168` tokens, `42.67s` all-in wall, `1` command, `0` source reads, quality `1/1`. Without CodeStory: `535,632` tokens, `201.38s`, `35` commands, `30` source reads, quality `0/1`. | CodeStory was clearly useful on this task. | Strong single-task evidence, not a general savings claim. |
+| 18-repo packet-runtime sweep | `18/18` packet runs succeeded; `12/18` passed full quality; `17/18` had full expected-file recall; median cold packet wall was `11.14s`. | Packet retrieval works across many languages, but quality is still uneven. | Broad runtime and coverage evidence, not an agent A/B savings claim. |
+| May local-real Codex/Sourcetrail/VS Code rows | CodeStory won on selected realistic tasks, but rows were exploratory and single-repeat. | Useful supporting context. | Historical exploratory evidence. |
+| May 23 quick CodeStory repo run | CodeStory arm used more tokens, wall time, and tool starts. | A real negative baseline from before the stricter packet-first and sidecar work. | Historical; do not use as the current scorecard. |
 
-## Promotion Rules
+## Fresh Runs
 
-- Use the same project, cache state, semantic backend, command flags, runner,
-  model, and sample shape when comparing before/after results.
-- Do not promote a speed win if expected anchors, answer-level quality, protocol
-  cleanliness, or semantic-doc reuse regress.
-- Treat small-fixture warm-loop numbers as smoke evidence, not repo-scale
-  product proof.
-- Append current repo-scale timing rows to
-  [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md) when default
-  indexing, semantic persistence, embedding reuse, or cold-start behavior
-  changes.
+### SWR Paired A/B
 
-## Agent A/B History
+Evidence bundle:
+`target/agent-benchmark/segment9-current-ab-swr-generic-final/summary.json`
 
-The 2026-05-23 quick CodeStory repo run used:
+Generated: `2026-06-13T11:15:27.190Z`
+
+Scope:
+
+- Task suite: `language-expansion-holdout`
+- Task: `typescript-swr-hook-flow`
+- Runner: `codex`
+- Sidecar contract: `sidecar_primary_forced`
+- Embeddings: `llamacpp`
+- Retrieval mode for SWR cache: `full`
+- Cache status: fresh, `254` files, `0` indexing errors, `38` semantic docs
+
+| Arm | Quality | Packet first | Tokens | All-in wall | Commands | Source reads | File recall | Claim recall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| without CodeStory | `0/1` | n/a | `535,632` | `201.38s` | `35` | `30` | `66.7%` | `25%` |
+| with CodeStory | `1/1` | `1/1` | `32,168` | `42.67s` | `1` | `0` | `100%` | `100%` |
+
+Interpretation:
+
+- This is the clearest current evidence that CodeStory can change the shape of
+  agent work: fewer tokens, fewer commands, no source-read crawl, and better
+  answer quality on the measured task.
+- It is still one repeat. The run also reports `publishable: false`,
+  `allow_failures: true`, and `reused_baseline_runs: 1`, so keep it out of
+  broad marketing claims until rerun as a publishable repeated A/B.
+
+### 18-Repo Packet Runtime Sweep
+
+Evidence bundle:
+`target/agent-benchmark/language-expansion-packet-runtime-current-after-claim-fixes/packet-runtime-summary.json`
+
+Generated: `2026-06-14T01:10:57.739Z`
+
+Scope:
+
+- Mode: cold CLI packet
+- Repeats: `1`
+- Sidecar contract: `sidecar_primary_forced`
+- Embeddings: `llamacpp`
+- Compose profile: `real`
+
+| Metric | Result |
+| --- | ---: |
+| Packet runs succeeded | `18/18` |
+| Full quality pass | `12/18` |
+| Full expected-file recall | `17/18` |
+| Full expected-claim recall | `11/18` |
+| Sufficient packets | `9/18` |
+| Partial packets | `9/18` |
+| Sufficiency / quality gaps | `4` |
+| Packet SLA misses | `3` |
+| Cold packet wall time | min `5.04s`, median `11.14s`, max `33.10s` |
+| Retrieval time | min `4.45s`, median `10.29s`, max `30.93s` |
+
+Quality by task:
+
+| Repo | Task | Quality | Sufficiency | File recall | Claim recall |
+| --- | --- | ---: | --- | ---: | ---: |
+| psf-requests | python requests session flow | fail | sufficient | `100%` | `0%` |
+| apache-commons-lang | Java StringUtils | pass | partial | `100%` | `100%` |
+| ripgrep | Rust search pipeline | pass | partial | `100%` | `100%` |
+| express | JavaScript routing flow | pass | partial | `100%` | `100%` |
+| vercel-swr | TypeScript hook flow | pass | sufficient | `100%` | `100%` |
+| fmt | C++ formatting flow | pass | sufficient | `100%` | `100%` |
+| redis | C command loop | pass | partial | `75%` | `100%` |
+| gin | Go route dispatch | pass | sufficient | `100%` | `100%` |
+| jekyll | Ruby site build | fail | sufficient | `100%` | `50%` |
+| monolog | PHP record flow | fail | sufficient | `100%` | `0%` |
+| AutoMapper | C# map flow | fail | partial | `100%` | `0%` |
+| okio | Kotlin buffer flow | fail | partial | `100%` | `50%` |
+| Alamofire | Swift request flow | pass | partial | `100%` | `100%` |
+| dart-http | Dart client flow | pass | sufficient | `100%` | `100%` |
+| nvm | Bash install dispatch | pass | sufficient | `100%` | `100%` |
+| MDN forms | HTML validation | fail | sufficient | `100%` | `0%` |
+| animate.css | CSS base/keyframes | pass | partial | `100%` | `100%` |
+| Chinook | SQL schema relations | pass | partial | `100%` | `100%` |
+
+Interpretation:
+
+- The runtime path is real: every packet completed under the forced sidecar
+  contract with llama.cpp embeddings.
+- The language expansion work is not done. File recall is mostly solved, but
+  answer-claim quality still misses in Python, Ruby, PHP, C#, Kotlin, and HTML.
+- This is a packet-runtime result, not a paired agent-cost benchmark.
+
+## Older Rows
+
+The May 23 quick run remains in the ledger because it is an honest baseline:
 
 ```sh
 node ./scripts/codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 900000 --sandbox danger-full-access --publishable --out-dir target/agent-benchmark/codestory-quick-2026-05-23-r3
 ```
 
-It was a real baseline, not a savings claim. The without-CodeStory arm passed
-`3/3` with median `214.90s`, `1,605,030` total tokens, and `29` tool starts.
-The with-CodeStory arm passed `3/3` with median `306.24s`, `2,724,490` total
-tokens, and `43` tool starts. It showed no token, wall-time, or tool-count
-savings.
+It passed both arms, but the CodeStory arm was worse:
 
-The packet-first diagnostic series then tightened the harness around answer
-packets, `CODESTORY_CLI` injection, post-packet source-read budgets, final-answer
-quality scoring, and repository/cache provenance. The first strict
-with-CodeStory row for the CodeStory indexing-flow task was r20:
+| Arm | Pass | Median wall | Total tokens | Tool starts |
+| --- | ---: | ---: | ---: | ---: |
+| without CodeStory | `3/3` | `214.90s` | `1,605,030` | `29` |
+| with CodeStory | `3/3` | `306.24s` | `2,724,490` | `43` |
 
-| Arm | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Direct source reads | Reads after packet |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| With CodeStory r20 | `3/3` | `3/3` | `71.92s` | `167,102` | `2` | `0` | `0` |
+That row should not be deleted, but it should also not be treated as the latest
+state of the project. It predates the stricter packet-first harness work, full
+sidecar readiness checks, and the current language-expansion packet evidence.
 
-Strict with-CodeStory public-checkout rows followed:
+May 25 local-real rows for Codex, Sourcetrail, and VS Code showed CodeStory
+wins on realistic tasks, but they were still exploratory single-repeat rows
+using local cache state. Keep them as supporting evidence, not promotion-grade
+proof.
 
-| Repo | Task class | Quality | Answer packet first | Wall time | Total tokens | Tool starts | Direct source reads |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| vite | architecture_explanation | `3/3` | `3/3` | `66.78s` | `163,815` | `2` | `0` |
-| express | bug_localization | `3/3` | `3/3` | `67.39s` | `164,291` | `2` | `0` |
-| mux | architecture_explanation | `3/3` | `3/3` | `65.12s` | `163,935` | `2` | `0` |
-| express | symbol_ownership | `3/3` | `3/3` | `63.28s` | `165,715` | `2` | `0` |
-| mux | edit_planning | `3/3` | `3/3` | `59.08s` | `100,833` | `2` | `0` |
-| express | route_tracing | `3/3` | `3/3` | `62.80s` | `102,137` | `2` | `0` |
+## What Is Solid
 
-Historical paired diagnostics remain useful for context, but rows produced
-before the 2026-05-24 answer-level quality and cache-provenance gates should be
-rerun or reanalyzed before promotion:
+- CodeStory can produce a much better agent run on at least one current
+  holdout-language task: SWR hook-flow.
+- The current packet path runs through real sidecars, not stubbed or disabled
+  retrieval.
+- Packet runtime works across an 18-repo, multi-language sweep.
+- File-level recall is strong in the fresh packet sweep: `17/18` tasks reached
+  full expected-file recall.
 
-| Task | Without CodeStory | With CodeStory | Historical note |
-| --- | --- | --- | --- |
-| express response send bug localization | `3/3`, `136.57s`, `635,793` tokens, `18` tool starts | `3/3`, `67.39s`, `164,291` tokens, `2` tool starts | Pre-gate scorer showed fewer tokens, wall time, and tool starts. |
-| mux router matching flow | `3/3`, `123.37s`, `321,908` tokens, `16` tool starts | `3/3`, `65.12s`, `163,935` tokens, `2` tool starts | Pre-gate scorer showed fewer tokens, wall time, and tool starts. |
-| express response symbol ownership | `3/3`, `125.10s`, `397,110` tokens, `15` tool starts | `3/3`, `63.28s`, `165,715` tokens, `2` tool starts | Covers `symbol_ownership`. |
-| mux CORS middleware edit plan | `3/3`, `115.12s`, `364,175` tokens, `14` tool starts | `3/3`, `59.08s`, `100,833` tokens, `2` tool starts | Covers edit planning without broad file reads. |
-| express application routing flow | `3/3`, `127.46s`, `334,231` tokens, `15` tool starts | `3/3`, `62.80s`, `102,137` tokens, `2` tool starts | Covers route tracing. |
+## What Is Not Claimed
 
-The public-core subset with CodeStory quality-passed for CodeStory and Vite, but
-strict reanalysis showed the answer packet was not the first repository-context
-command. Keep those rows diagnostic until rerun with the stricter prompt and
-publishable gate.
+- No general "CodeStory saves tokens" claim yet.
+- No universal language-support claim yet.
+- No publishable paired benchmark claim from the June 13 SWR row.
+- No claim that a sufficient packet always means answer quality passes; the
+  June 14 sweep has `4` sufficiency/quality gaps.
 
-## Packet Runtime History
+## Next Runs Needed
 
-On 2026-05-23, the release CLI completed three-repeat packet runtime runs
-against the full public-core manifest suite in both warm stdio and cold CLI
-modes:
+Run these before promoting the current story beyond "promising current
+evidence":
+
+1. Repeat the SWR A/B row with `--publishable`, no reused baseline, and at least
+   `3` repeats.
+2. Rerun the 18-repo packet sweep after fixing the six claim-quality misses.
+3. Add at least two more paired A/B rows from the language-expansion holdout set.
+4. Keep the May 23 negative row visible until repeated current rows make the
+   trend obvious.
+
+## How To Rerun
+
+List available tasks:
 
 ```sh
-node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode warm-stdio --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/packet-runtime-public-core-warm-r8 --timeout-ms 120000 --publishable
-node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode cold-cli --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/packet-runtime-public-core-cold-r9 --timeout-ms 120000 --publishable
+node ./scripts/codestory-agent-ab-benchmark.mjs --list
+node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite language-expansion-holdout --list
 ```
 
-Across both modes, all `108` packet rows passed operationally and quality gates.
-Every row reported `sufficient` packet coverage with `0` sufficiency/quality
-mismatches. Warm stdio task medians ranged from `2.69s` to `3.60s`, with an
-aggregate task median of `3.13s`; cold CLI task medians ranged from `4.22s` to
-`5.76s`, with an aggregate task median of `4.86s`.
+Packet-runtime sweep:
+
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite language-expansion-holdout --repeats 1 --packet-runtime-mode cold-cli --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/language-expansion-packet-runtime-current --timeout-ms 120000
+```
+
+Publishable SWR A/B target:
+
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite language-expansion-holdout --task-ids typescript-swr-hook-flow --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/swr-publishable-r3
+```
 
 ## Harness Contract
 
@@ -182,37 +211,16 @@ The agent A/B harness runs the same repository prompt in two arms:
 
 The harness writes raw stdout/stderr per run, a JSONL run log, transcript
 analysis, a machine summary, and a Markdown summary under
-`target/agent-benchmark/<timestamp>`. Compare medians across successful repeats
-for the same runner, repository set, prompt set, cache policy, semantic backend,
-and model.
+`target/agent-benchmark/<run-dir>`.
 
-Use `--publishable` only when the selected runner reports token usage and every
-run succeeds. For agent A/B rows, `--publishable` also requires with-CodeStory
-runs to execute an answer packet with `--question` first and stay within the
-explicit post-packet ordinary source-read budget supplied through
-`--max-source-reads-after-packet <n>`. Use `0` for packet-only promotion
-evidence; use a larger number only when the row is intentionally CodeStory-first
-but not packet-only. Publishable rows must carry clean repository provenance
-pinned to a full 40-character Git commit SHA plus CodeStory cache provenance
-from `doctor --format json`. Tags are not accepted for publishable
-materialized-repo rows because they can be moved after the benchmark is
-published.
+Use `--publishable` only when:
 
-Packet runtime runs compare cold CLI `packet` invocations with warm
-`serve --stdio` packet calls. They are runtime rows, not agent-token rows, and
-still use manifest quality gates before promotion.
-
-## Commands
-
-```sh
-node ./scripts/codestory-agent-ab-benchmark.mjs --list
-node ./scripts/codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable --max-source-reads-after-packet 0
-node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --list
-node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids codestory-indexing-flow,vite-dev-server-architecture --arms with_codestory --repeats 3 --max-source-reads-after-packet 0 --allow-failures
-node ./scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
-node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --materialize-repos --list
-node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3
-```
+- both arms have token usage,
+- every required run succeeds,
+- repository provenance is pinned,
+- CodeStory cache provenance is recorded,
+- the with-CodeStory arm runs an answer packet first, and
+- post-packet source reads stay inside the explicit budget.
 
 Cold repo-scale timings are owned by
 [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md). Warm stdio loop
