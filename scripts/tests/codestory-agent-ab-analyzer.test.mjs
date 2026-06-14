@@ -1772,3 +1772,56 @@ test("buildQualityDebugPayload aggregates failure counts", () => {
   assert.equal(payload.summary.quality_fail_runs, 1);
   assert.ok(Object.keys(payload.summary.failure_reason_counts).length > 0);
 });
+
+test("buildQualityDebugPayload preserves packet sufficiency diagnostics", () => {
+  const payload = buildQualityDebugPayload([
+    {
+      repo: "requests",
+      task_id: "requests-session-flow",
+      mode: "cold_cli_packet",
+      status: "pass",
+      quality: {
+        pass: true,
+        thresholds: {},
+        expected_anchors: { recall: 1 },
+        expected_files: { recall: 1 },
+        expected_symbols: { recall: 1 },
+        expected_claims: { recall: 1 },
+        citation_coverage: { recall: 1 },
+        forbidden_claims: { found: 0 },
+      },
+      sufficiency: {
+        status: "partial",
+        gaps_count: 2,
+        gaps: [
+          "Packet was truncated by Compact budget: citations, trail_edges.",
+          "Packet omitted answer-critical evidence under Compact budget; use a deeper packet before treating this as complete.",
+        ],
+        open_next_count: 2,
+        open_next: ["codestory-cli packet --budget standard", "codestory-cli search --why"],
+        follow_up_commands_count: 2,
+        follow_up_commands: [
+          "codestory-cli packet --budget standard",
+          "codestory-cli search --why",
+        ],
+        covered_claims_count: 8,
+        avoid_opening_count: 4,
+        sufficient_quality_mismatch: false,
+      },
+    },
+  ]);
+
+  assert.equal(payload.rows[0].sufficiency_status, "partial");
+  assert.deepEqual(payload.rows[0].sufficiency.gaps, [
+    "Packet was truncated by Compact budget: citations, trail_edges.",
+    "Packet omitted answer-critical evidence under Compact budget; use a deeper packet before treating this as complete.",
+  ]);
+  assert.equal(payload.rows[0].sufficiency.follow_up_commands_count, 2);
+  assert.equal(payload.summary.packet_partial_runs, 1);
+  assert.equal(
+    payload.summary.partial_gap_counts[
+      "Packet was truncated by Compact budget: citations, trail_edges."
+    ],
+    1,
+  );
+});

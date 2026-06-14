@@ -71,6 +71,26 @@ The sufficient set is not the same as the packet-eligible A/B set. The A/B slice
 was selected because those rows were useful to compare after packet and manifest
 work; it is not the full supported-language surface.
 
+### Packet Partial Cause Queue
+
+The `segment9-generic-18lang-packet-final` artifact predates the follow-up
+runtime cleanup in this branch, so treat the table below as the baseline repair
+queue, not as a fresh post-fix result. It explains why the old `6/18`
+sufficiency number should not be flattened into a single score.
+
+| Cause bucket | Rows in old artifact | Product interpretation |
+| --- | --- | --- |
+| Compact budget clipped citations/trail edges after strong manifest recall | `python-requests-session-flow`, `ruby-jekyll-site-build`, `php-monolog-record-flow`, `swift-alamofire-request-flow` | Product false partial when the packet retained enough citations, claims, and graph edges to answer. The runtime now treats retained UML edges as useful even when additional trail edges were clipped; rerun the packet runtime before using the old `6/18` count as current. |
+| Claim-family detection saw generic citation roles instead of accepted claim semantics | `java-commons-lang-string-utils`, `typescript-swr-hook-flow`, `cpp-fmt-formatting-flow`, `kotlin-okio-buffer-flow`, `dart-http-client-flow`, `css-animate-base-and-keyframes` | Legitimate domain/framework semantics can be hidden inside covered claims. The runtime now counts semantic covered-claim families before falling back to citation roles; remaining rows in this bucket should become named domain collectors or stay partial if they still lack diverse evidence. |
+| Required planned probes missed | `rust-ripgrep-search-pipeline`, `csharp-automapper-map-flow` | Keep as product strictness until proven too generic. The next pass should decide whether probes such as `argument planning` and `APIs` are useful product concepts or over-broad planner noise. |
+| Retrieval latency SLA missed | `java-commons-lang-string-utils`, `c-redis-command-loop` | This is independent from answer quality. A row can retrieve the right evidence and still fail the packet latency target. |
+
+Fresh packet-runtime runs should regenerate `quality-debug.json` with row-level
+`sufficiency.gaps`, `open_next`, `follow_up_commands`, and
+`partial_gap_counts`. Those fields are the durable debugging surface for this
+queue; do not require reviewers to reopen every `*.stdout.json` file just to
+understand why a row is partial.
+
 ## Steering Boundary
 
 `CODESTORY_EVAL_PROBES` remains test-only in non-test builds, and eval rows are
@@ -186,6 +206,25 @@ node scripts\codestory-agent-ab-benchmark.mjs `
   --task-suite language-expansion-holdout `
   --repo-cache-dir target\oss-language-corpus\repos `
   --materialize-repos
+```
+
+Run a fresh packet-runtime diagnostic to regenerate `quality-debug.json` and
+the packet sufficiency repair queue:
+
+```powershell
+cargo build --release -p codestory-cli
+node scripts\codestory-agent-ab-benchmark.mjs `
+  --packet-runtime `
+  --packet-runtime-mode cold-cli `
+  --task-suite language-expansion-holdout `
+  --repeats 1 `
+  --repo-cache-dir target\oss-language-corpus\repos `
+  --materialize-repos `
+  --jobs 4 `
+  --prepare-codestory-jobs 2 `
+  --out-dir target\agent-benchmark\language-expansion-packet-runtime-current `
+  --codestory-cli target\release\codestory-cli.exe `
+  --timeout-ms 180000
 ```
 
 Run a packet-gated A/B selection:

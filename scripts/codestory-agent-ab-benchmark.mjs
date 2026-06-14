@@ -3660,6 +3660,15 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function cappedStringArray(value, limit) {
+  return Array.isArray(value)
+    ? value
+        .map((entry) => String(entry ?? "").trim())
+        .filter(Boolean)
+        .slice(0, limit)
+    : [];
+}
+
 function packetShape(packet) {
   if (!packet || typeof packet !== "object") {
     return null;
@@ -3683,6 +3692,9 @@ function packetSufficiencyTelemetry(packet, quality) {
   }
   const status = packet.sufficiency?.status ?? null;
   const qualityPass = quality?.pass ?? null;
+  const gaps = cappedStringArray(packet.sufficiency?.gaps, 8);
+  const openNext = cappedStringArray(packet.sufficiency?.open_next, 6);
+  const followUpCommands = cappedStringArray(packet.sufficiency?.follow_up_commands, 6);
   return {
     status,
     covered_claims_count: packet.sufficiency?.covered_claims?.length ?? 0,
@@ -3690,6 +3702,9 @@ function packetSufficiencyTelemetry(packet, quality) {
     avoid_opening_count: packet.sufficiency?.avoid_opening?.length ?? 0,
     gaps_count: packet.sufficiency?.gaps?.length ?? 0,
     follow_up_commands_count: packet.sufficiency?.follow_up_commands?.length ?? 0,
+    gaps,
+    open_next: openNext,
+    follow_up_commands: followUpCommands,
     sufficient_quality_mismatch: status === "sufficient" && qualityPass === false,
   };
 }
@@ -4295,14 +4310,34 @@ function buildQualityDebugPayload(results, meta = {}) {
       missed_anchors: quality?.missed_anchors ?? null,
       retrieval: extractRetrievalDiagnostics(row),
       sufficiency_status: row.sufficiency?.status ?? null,
+      sufficiency: row.sufficiency
+        ? {
+            status: row.sufficiency.status ?? null,
+            gaps: row.sufficiency.gaps ?? [],
+            open_next: row.sufficiency.open_next ?? [],
+            follow_up_commands: row.sufficiency.follow_up_commands ?? [],
+            gaps_count: row.sufficiency.gaps_count ?? 0,
+            open_next_count: row.sufficiency.open_next_count ?? 0,
+            follow_up_commands_count: row.sufficiency.follow_up_commands_count ?? 0,
+            covered_claims_count: row.sufficiency.covered_claims_count ?? 0,
+            avoid_opening_count: row.sufficiency.avoid_opening_count ?? 0,
+          }
+        : null,
       sufficient_quality_mismatch: row.sufficiency?.sufficient_quality_mismatch ?? null,
     };
   });
   const failing = rows.filter((row) => row.quality_pass === false);
+  const partial = rows.filter((row) => row.sufficiency_status === "partial");
   const reasonCounts = {};
   for (const row of failing) {
     for (const reason of row.failure_reasons) {
       reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
+    }
+  }
+  const partialGapCounts = {};
+  for (const row of partial) {
+    for (const gap of row.sufficiency?.gaps ?? []) {
+      partialGapCounts[gap] = (partialGapCounts[gap] ?? 0) + 1;
     }
   }
   return {
@@ -4315,7 +4350,9 @@ function buildQualityDebugPayload(results, meta = {}) {
       quality_scored_runs: rows.filter((row) => row.quality_pass != null).length,
       quality_pass_runs: rows.filter((row) => row.quality_pass === true).length,
       quality_fail_runs: failing.length,
+      packet_partial_runs: partial.length,
       failure_reason_counts: reasonCounts,
+      partial_gap_counts: partialGapCounts,
     },
   };
 }

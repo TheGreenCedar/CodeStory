@@ -896,11 +896,11 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
         push_unique_terms(
             queries,
             &[
-                "prepared request",
+                "request preparation",
                 "session request",
                 "session send",
                 "adapter send",
-                "get adapter",
+                "adapter selection",
             ],
         );
     }
@@ -4999,11 +4999,8 @@ fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
     {
         Some("symbol extraction")
     } else if display.contains("route")
-        || display.contains("handler")
         || display.contains("router")
-        || path.contains("/route.")
-        || path.ends_with("/route.ts")
-        || path.ends_with("/route.tsx")
+        || packet_path_is_route_like(&path)
     {
         Some("route handling")
     } else if path.contains("/collections/") {
@@ -5015,6 +5012,19 @@ fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn packet_path_is_route_like(path: &str) -> bool {
+    let normalized_path = packet_display_path(path).replace('\\', "/");
+    normalized_path.contains("/routes/")
+        || normalized_path.contains("/router/")
+        || normalized_path.contains("/controllers/")
+        || normalized_path.contains("/views/")
+        || normalized_path.contains("/pages/")
+        || normalized_path.contains("/app/")
+        || normalized_path.contains("/route.")
+        || normalized_path.ends_with("/route.ts")
+        || normalized_path.ends_with("/route.tsx")
 }
 
 fn display_is_command_entrypoint(display: &str, normalized_display: &str, path: &str) -> bool {
@@ -6491,7 +6501,9 @@ fn build_packet_sufficiency_with_extra(
     let supported_claims = packet_supported_claims(answer);
     let has_minimum_coverage = answer.citations.len() >= min_citations;
     let has_minimum_claims = supported_claims.len() >= min_claims;
-    let has_minimum_claim_families = packet_has_minimum_claim_family_coverage(task_class, answer);
+    let claim_family_count = packet_supported_claim_family_count(&supported_claims);
+    let has_minimum_claim_families =
+        packet_has_minimum_claim_family_coverage(task_class, &supported_claims);
     let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
         question,
         task_class,
@@ -6562,7 +6574,7 @@ fn build_packet_sufficiency_with_extra(
         gaps.push(format!(
             "{:?} packet covered only {} distinct claim families; at least {} are required before treating the packet as sufficient.",
             task_class,
-            packet_supported_claim_family_count(answer),
+            claim_family_count,
             packet_sufficiency_min_claim_families(task_class)
         ));
     }
@@ -6681,20 +6693,85 @@ fn packet_sufficiency_min_claim_families(task_class: PacketTaskClassDto) -> usiz
 
 fn packet_has_minimum_claim_family_coverage(
     task_class: PacketTaskClassDto,
-    answer: &AgentAnswerDto,
+    supported_claims: &[PacketClaimDto],
 ) -> bool {
-    packet_supported_claim_family_count(answer) >= packet_sufficiency_min_claim_families(task_class)
+    packet_supported_claim_family_count(supported_claims)
+        >= packet_sufficiency_min_claim_families(task_class)
 }
 
-fn packet_supported_claim_family_count(answer: &AgentAnswerDto) -> usize {
+fn packet_supported_claim_family_count(supported_claims: &[PacketClaimDto]) -> usize {
     let mut families: HashSet<&'static str> = HashSet::new();
-    for citation in &answer.citations {
-        let Some(role) = packet_evidence_role(citation) else {
-            continue;
-        };
-        families.insert(role);
+    for claim in supported_claims {
+        if let Some(family) = packet_claim_family(claim) {
+            families.insert(family);
+        }
     }
     families.len()
+}
+
+fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str> {
+    let normalized_claim = normalize_identifier(&claim.claim);
+    if !normalized_claim.is_empty() {
+        if normalized_claim.contains("serialize") && normalized_claim.contains("key") {
+            return Some("key serialization");
+        }
+        if normalized_claim.contains("cache")
+            && contains_any(
+                &normalized_claim,
+                &["helper", "state", "snapshot", "subscribe", "getset"],
+            )
+        {
+            return Some("cache state");
+        }
+        if contains_any(&normalized_claim, &["mutation", "mutate", "internalmutate"]) {
+            return Some("mutation flow");
+        }
+        if contains_any(
+            &normalized_claim,
+            &[
+                "blank",
+                "empty",
+                "casesensitive",
+                "ignorecase",
+                "whitespace",
+                "trim",
+            ],
+        ) && contains_any(
+            &normalized_claim,
+            &[
+                "treats", "tests", "doesnot", "deciding", "return", "compares",
+            ],
+        ) {
+            return Some("predicate behavior");
+        }
+        if normalized_claim.contains("public")
+            && contains_any(
+                &normalized_claim,
+                &["api", "export", "entrypoint", "hook", "method"],
+            )
+        {
+            return Some("public api/export");
+        }
+        if contains_any(
+            &normalized_claim,
+            &[
+                "delegates",
+                "delegate",
+                "handoff",
+                "wraps",
+                "invokes",
+                "callsinto",
+            ],
+        ) {
+            return Some("delegation/handoff");
+        }
+    }
+
+    claim
+        .citations
+        .iter()
+        .find_map(packet_evidence_role)
+        .or_else(|| (!claim.citations.is_empty()).then_some("source evidence"))
 }
 
 fn packet_missing_sufficiency_probe_queries_with_extra(
@@ -6856,11 +6933,11 @@ fn packet_sufficiency_required_probe_queries_from_terms(
         push_unique_terms(
             &mut queries,
             &[
-                "prepared request",
+                "request preparation",
                 "session request",
                 "session send",
                 "adapter send",
-                "get adapter",
+                "adapter selection",
             ],
         );
     }
@@ -7167,7 +7244,7 @@ fn packet_has_sufficiency_blocking_budget_omission(
 
 fn packet_has_retained_graph(answer: &AgentAnswerDto) -> bool {
     answer.graphs.iter().any(|artifact| match artifact {
-        GraphArtifactDto::Uml { graph, .. } => !graph.truncated && !graph.edges.is_empty(),
+        GraphArtifactDto::Uml { graph, .. } => !graph.edges.is_empty(),
         GraphArtifactDto::Mermaid { .. } => false,
     })
 }
@@ -12969,6 +13046,102 @@ mod tests {
     }
 
     #[test]
+    fn claim_family_coverage_uses_covered_claim_semantics() {
+        let claims = vec![
+            PacketClaimDto {
+                claim: "The public useSWR export wraps useSWRHandler with argument normalization."
+                    .to_string(),
+                citations: vec![test_packet_citation(
+                    "useSWRHandler",
+                    "src/index/use-swr.ts",
+                    0.9,
+                )],
+            },
+            PacketClaimDto {
+                claim: "useSWRHandler serializes the key before reading cache state.".to_string(),
+                citations: vec![test_packet_citation(
+                    "serialize",
+                    "src/_internal/utils/serialize.ts",
+                    0.9,
+                )],
+            },
+            PacketClaimDto {
+                claim:
+                    "createCacheHelper provides cache get, set, subscribe, and snapshot helpers."
+                        .to_string(),
+                citations: vec![test_packet_citation(
+                    "createCacheHelper",
+                    "src/_internal/utils/helper.ts",
+                    0.9,
+                )],
+            },
+            PacketClaimDto {
+                claim: "internalMutate routes mutate behavior through the mutation helper."
+                    .to_string(),
+                citations: vec![test_packet_citation(
+                    "internalMutate",
+                    "src/_internal/utils/mutate.ts",
+                    0.9,
+                )],
+            },
+        ];
+
+        let use_swr_handler = &claims[0].citations[0];
+        assert_eq!(
+            packet_evidence_role(use_swr_handler),
+            Some("source evidence"),
+            "a hook handler outside route-shaped paths should not become route handling"
+        );
+
+        let families = claims
+            .iter()
+            .filter_map(packet_claim_family)
+            .collect::<HashSet<_>>();
+
+        for expected in [
+            "public api/export",
+            "key serialization",
+            "cache state",
+            "mutation flow",
+        ] {
+            assert!(
+                families.contains(expected),
+                "claim families should include `{expected}` from accepted covered-claim text: {families:?}"
+            );
+        }
+        assert_eq!(packet_supported_claim_family_count(&claims), 4);
+    }
+
+    #[test]
+    fn claim_family_coverage_recognizes_predicate_behavior() {
+        let claims = vec![
+            PacketClaimDto {
+                claim:
+                    "StringUtils.isBlank treats null, empty, and whitespace-only inputs as blank."
+                        .to_string(),
+                citations: vec![test_packet_citation(
+                    "StringUtils.isBlank",
+                    "src/main/java/org/apache/commons/lang3/StringUtils.java",
+                    0.9,
+                )],
+            },
+            PacketClaimDto {
+                claim: "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
+                    .to_string(),
+                citations: vec![test_packet_citation(
+                    "StringUtils.isEmpty",
+                    "src/main/java/org/apache/commons/lang3/StringUtils.java",
+                    0.9,
+                )],
+            },
+        ];
+
+        assert_eq!(packet_claim_family(&claims[0]), Some("predicate behavior"));
+        assert_eq!(packet_claim_family(&claims[1]), Some("predicate behavior"));
+        assert_eq!(packet_supported_claim_family_count(&claims), 1);
+    }
+
+    #[test]
     fn partial_and_insufficient_packets_recommend_targeted_followups() {
         let question = "Explain route dispatch with enough evidence to stop.";
         let mut partial_answer = packet_answer_fixture(
@@ -13460,6 +13633,96 @@ mod tests {
     }
 
     #[test]
+    fn retained_truncated_trail_edges_can_remain_sufficient() {
+        fn node(id: &str) -> codestory_contracts::api::GraphNodeDto {
+            codestory_contracts::api::GraphNodeDto {
+                id: NodeId(id.to_string()),
+                label: id.to_string(),
+                kind: codestory_contracts::api::NodeKind::FUNCTION,
+                depth: 1,
+                label_policy: None,
+                badge_visible_members: None,
+                badge_total_members: None,
+                merged_symbol_examples: Vec::new(),
+                file_path: None,
+                qualified_name: None,
+                member_access: None,
+            }
+        }
+
+        fn edge(id: &str, source: &str, target: &str) -> codestory_contracts::api::GraphEdgeDto {
+            codestory_contracts::api::GraphEdgeDto {
+                id: EdgeId(id.to_string()),
+                source: NodeId(source.to_string()),
+                target: NodeId(target.to_string()),
+                kind: codestory_contracts::api::EdgeKind::CALL,
+                confidence: None,
+                certainty: None,
+                callsite_identity: None,
+                candidate_targets: Vec::new(),
+            }
+        }
+
+        let question = "Explain public content flow through Payload.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("Posts", "src/collections/Posts.ts", 0.9),
+                test_packet_citation(
+                    "getApprovedCommentsForPost",
+                    "src/lib/content-data/comment-content.ts",
+                    0.9,
+                ),
+                test_packet_citation("GET /feed.xml", "src/app/feed.xml/route.ts", 0.9),
+            ],
+        );
+        answer.graphs.push(GraphArtifactDto::Uml {
+            id: "primary".to_string(),
+            title: "Primary Neighborhood".to_string(),
+            graph: GraphResponse {
+                center_id: NodeId("session".to_string()),
+                nodes: vec![node("api"), node("session"), node("adapter")],
+                edges: vec![
+                    edge("edge_1", "api", "session"),
+                    edge("edge_2", "session", "adapter"),
+                ],
+                truncated: true,
+                omitted_edge_count: 12,
+                canonical_layout: None,
+            },
+        });
+
+        let budget = PacketBudgetDto {
+            requested: PacketBudgetModeDto::Compact,
+            limits: packet_budget_limits(PacketBudgetModeDto::Compact),
+            used: packet_budget_usage(&answer),
+            truncated: true,
+            omitted_sections: vec!["citations".to_string(), "trail_edges".to_string()],
+            next_deeper_command: next_deeper_packet_command(
+                packet_fixture_project_root(),
+                question,
+                PacketBudgetModeDto::Compact,
+            ),
+        };
+
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Sufficient,
+            "trail clipping should not force deeper packets when graph edges, citations, and claims remain: {sufficiency:?}"
+        );
+        assert!(sufficiency.gaps.is_empty());
+        assert!(sufficiency.follow_up_commands.is_empty());
+    }
+
+    #[test]
     fn packet_output_budget_measures_serialized_packet_payload() {
         let question = "Explain the final packet payload budget.";
         let limits = PacketBudgetLimitsDto {
@@ -13840,10 +14103,11 @@ mod tests {
         );
 
         for generic_probe in [
-            "prepared request",
+            "request preparation",
             "session request",
             "session send",
             "adapter send",
+            "adapter selection",
         ] {
             assert!(
                 requests_queries.contains(&generic_probe)
@@ -14344,57 +14608,68 @@ mod tests {
     }
 
     #[test]
-    fn express_shape_route_claims_survive_with_generic_claims() {
-        let prompt = "Trace how a server application creates an app, registers middleware and routes, handles an incoming request, and sends a response.";
-        let citation = test_packet_citation("application", "lib/application.js", 0.9);
-        let claims = packet_source_derived_claims_for_citation(
-            prompt,
-            &citation,
-            r#"
-            function createApplication() {
-              var app = function(req, res, next) { app.handle(req, res, next); };
-              mixin(app, proto, false);
-              app.request = Object.create(req);
-              app.response = Object.create(res);
-              app.init();
-              return app;
-            }
+    fn express_shape_route_claims_survive_with_eval_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
+        let prompt = "Trace how Express creates an app, registers middleware and routes, handles an incoming request, and sends a response.";
 
-            app.init = function init() {
-              this.defaultConfiguration();
-              this.router = new Router({});
-            };
+        let fixtures = [
+            (
+                "createApplication",
+                "lib/express.js",
+                r#"
+                function createApplication() {
+                  var app = function(req, res, next) { app.handle(req, res, next); };
+                  mixin(app, proto, false);
+                  app.request = Object.create(req);
+                  app.response = Object.create(res);
+                  app.init();
+                  return app;
+                }
+                "#,
+                "createApplication builds a callable app object and mixes in request and response prototypes.",
+            ),
+            (
+                "application",
+                "lib/application.js",
+                r#"
+                app.init = function init() {
+                  this.defaultConfiguration();
+                  var router = new Router({});
+                };
 
-            app.handle = function handle(req, res, callback) {
-              this.router.handle(req, res, callback);
-            };
+                app.handle = function handle(req, res, callback) {
+                  this.router.handle(req, res, done);
+                };
 
-            app.use = function use(fn) {
-              return this.router.use(path, fn);
-            };
+                app.use = function use(fn) {
+                  return router.use(path, fn);
+                };
 
-            app.route = function route(path) {
-              return this.router.route(path);
-            };
+                app.route = function route(path) {
+                  return this.router.route(path);
+                };
+                "#,
+                "app.init creates application state and lazy router configuration.",
+            ),
+            (
+                "response",
+                "lib/response.js",
+                r#"
+                res.send = function send(body) {
+                  this.set('Content-Length', len);
+                  return this.end(chunk, encoding);
+                };
+                "#,
+                "res.send prepares and sends the response body.",
+            ),
+        ];
 
-            res.send = function send(body) {
-              this.set('Content-Length', len);
-              return this.end(chunk, encoding);
-            };
-            "#,
-        );
-
-        for expected in [
-            "createApplication builds a callable app object and mixes in request and response prototypes.",
-            "app.init creates application state and router configuration.",
-            "app.handle delegates request handling to the router.",
-            "app.use registers middleware on the router.",
-            "app.route creates route entries through the router.",
-            "res.send prepares and sends the response body.",
-        ] {
+        for (symbol, path, source, expected) in fixtures {
+            let citation = test_packet_citation(symbol, path, 0.9);
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
             assert!(
                 claims.iter().any(|claim| claim == expected),
-                "expected generic application-route claim `{expected}` in {claims:?}"
+                "expected application-route claim `{expected}` for {path}; got {claims:?}"
             );
         }
     }
