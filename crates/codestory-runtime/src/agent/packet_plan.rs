@@ -11,7 +11,9 @@ use crate::agent::packet_required_probes::{
     packet_sufficiency_required_probe_queries_from_terms,
     push_indexing_flow_required_probe_queries, push_search_flow_probe_queries,
 };
-use crate::agent::packet_scoring::{packet_adjacent_query_stop_term, packet_query_stop_term};
+use crate::agent::packet_scoring::{
+    normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
+};
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_indexing_flow, packet_terms_indicate_prepared_session_adapter_flow,
@@ -112,6 +114,21 @@ pub(crate) fn build_packet_plan_with_extra(
         eval_probes_enabled()
     ));
     plan
+}
+
+pub(crate) fn packet_rank_terms(question: &str) -> Vec<String> {
+    let mut terms = prompt_search_terms(question);
+    for term in extract_packet_query_terms(question) {
+        push_unique_term(&mut terms, &term);
+    }
+    for query in packet_symbol_probe_queries(
+        question,
+        infer_packet_task_class(question),
+        PacketBudgetModeDto::Standard,
+    ) {
+        push_unique_term(&mut terms, &normalize_identifier(&query));
+    }
+    terms
 }
 
 pub(crate) fn packet_request_extra_probes(extra_probes: Vec<String>) -> Vec<String> {

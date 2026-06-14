@@ -8,10 +8,11 @@ use crate::agent::packet_batch::{
     packet_anchor_hit_is_relevant, packet_anchor_probe_limit_for_budget,
 };
 #[cfg(test)]
-use crate::agent::packet_budget::{apply_packet_budget, next_deeper_packet_command};
 use crate::agent::packet_budget::{
-    apply_packet_budget_with_extra, packet_budget_limits, packet_budget_usage,
-    truncate_answer_markdown_to_byte_cap,
+    apply_packet_budget, next_deeper_packet_command, packet_budget_usage,
+};
+use crate::agent::packet_budget::{
+    apply_packet_budget_with_extra, enforce_packet_output_budget, packet_budget_limits,
 };
 #[cfg(test)]
 use crate::agent::packet_capping::{
@@ -25,25 +26,23 @@ use crate::agent::packet_claim_profiles::{
 };
 #[cfg(test)]
 use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
-use crate::agent::packet_claims::{
-    append_flow_template_claims, append_ranked_citation_claims, packet_flow_claims_markdown,
-};
+use crate::agent::packet_claims::{packet_flow_claims_markdown, packet_supported_claims};
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
 #[cfg(test)]
-use crate::agent::packet_plan::{build_packet_plan, packet_concept_queries};
 use crate::agent::packet_plan::{
-    build_packet_plan_with_extra, extract_packet_query_terms, infer_packet_task_class,
-    packet_explicit_request_probe_queries, packet_plan_annotation, packet_request_extra_probes,
-    packet_symbol_probe_queries, push_unique_term,
+    build_packet_plan, packet_concept_queries, packet_symbol_probe_queries,
+};
+use crate::agent::packet_plan::{
+    build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
+    packet_request_extra_probes,
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
 use crate::agent::packet_required_probes::{
     PacketFileScopedSymbolProbe, packet_file_scoped_symbol_probe_parts,
-    packet_missing_sufficiency_probe_queries_with_extra, packet_probe_query_is_cited,
-    packet_sufficiency_required_probe_queries_with_extra,
+    packet_probe_query_is_cited, packet_sufficiency_required_probe_queries_with_extra,
 };
 #[cfg(test)]
 use crate::agent::packet_scoring::packet_citation_key;
@@ -51,17 +50,15 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
 };
 use crate::agent::packet_source_patterns::packet_sql_identifier_after;
+use crate::agent::packet_sufficiency::build_packet_sufficiency_with_extra;
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
     PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value,
 };
-use crate::agent::packet_sufficiency::{
-    PacketSufficiencyInput, build_packet_sufficiency as assemble_packet_sufficiency,
-};
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    packet_budget_exceeded_hard_output_cap, packet_claim_family,
-    packet_supported_claim_family_count,
+    build_packet_sufficiency, packet_budget_exceeded_hard_output_cap, packet_claim_family,
+    packet_supported_claim_family_count, packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_sql_schema_flow, prompt_search_terms,
@@ -87,16 +84,15 @@ use codestory_contracts::api::{
     AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepKindDto,
     ApiError, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
     IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketClaimDto, PacketPlanDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
+    NodeOccurrencesRequest, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto,
     PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchRepoTextMode,
     SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
-    AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetUsageDto,
-    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyStatusDto,
-    SearchMatchQualityDto,
+    AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetDto,
+    PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -472,7 +468,7 @@ pub(crate) fn agent_packet(
         &budget,
         &extra_probes,
     );
-    let retrieval_trace_summary = packet_retrieval_trace_summary(&answer);
+    let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
 
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
@@ -486,11 +482,9 @@ pub(crate) fn agent_packet(
     };
     enforce_packet_output_budget(&project_root, &mut packet);
 
-    if let Ok(trace_path) = std::env::var("CODESTORY_PACKET_STEP_TRACE_OUT")
-        && let Ok(payload) =
-            serde_json::to_string_pretty(&trace_export::packet_step_trace_json(&packet.answer))
-    {
-        let _ = std::fs::write(trace_path, payload);
+    if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
+        packet.answer.retrieval_trace.annotations.push(diagnostic);
+        enforce_packet_output_budget(&project_root, &mut packet);
     }
 
     Ok(packet)
@@ -691,21 +685,6 @@ fn packet_candidate_trace_row(
             .map(|line| line.to_string())
             .unwrap_or_else(|| "-".to_string())
     )
-}
-
-fn packet_rank_terms(question: &str) -> Vec<String> {
-    let mut terms = prompt_search_terms(question);
-    for term in extract_packet_query_terms(question) {
-        push_unique_term(&mut terms, &term);
-    }
-    for query in packet_symbol_probe_queries(
-        question,
-        infer_packet_task_class(question),
-        PacketBudgetModeDto::Standard,
-    ) {
-        push_unique_term(&mut terms, &normalize_identifier(&query));
-    }
-    terms
 }
 
 fn append_packet_evidence_sections(
@@ -1378,25 +1357,6 @@ fn packet_source_probe_anchor_kind(line: &str, parts: &PacketFileScopedSymbolPro
         NodeKind::ANNOTATION
     }
 }
-fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
-    let mut claims = Vec::new();
-    let mut seen_claims = HashSet::new();
-    let rank_terms = packet_rank_terms(&answer.prompt);
-    let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
-    let citations = answer.citations.clone();
-
-    append_flow_template_claims(&answer.prompt, &citations, &mut claims, &mut seen_claims);
-    append_ranked_citation_claims(
-        &answer.prompt,
-        &citations,
-        &rank_terms,
-        prefer_primary_sources,
-        &mut claims,
-        &mut seen_claims,
-    );
-    claims
-}
-
 #[cfg(test)]
 fn packet_claim_for_role(
     _key: &str,
@@ -1448,213 +1408,6 @@ fn packet_retrieval_profile(
     }
 
     AgentRetrievalProfileSelectionDto::Preset { preset }
-}
-
-fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto) {
-    let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
-    for _ in 0..8 {
-        let output_bytes = refresh_packet_output_bytes(packet);
-        if output_bytes <= packet.budget.limits.max_output_bytes as usize {
-            break;
-        }
-
-        packet.budget.truncated = true;
-        push_omitted_section(&mut packet.budget, "output_bytes");
-        push_omitted_section(&mut packet.budget, "packet_payload");
-
-        let over_by = output_bytes.saturating_sub(packet.budget.limits.max_output_bytes as usize);
-        let current_answer_bytes = serde_json::to_vec(&packet.answer)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
-        let next_answer_cap = current_answer_bytes
-            .saturating_sub(over_by.saturating_add(1024))
-            .max(1024);
-
-        if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
-            push_omitted_section(&mut packet.budget, "markdown_blocks");
-            packet.budget.used = packet_budget_usage(&packet.answer);
-            packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
-            packet.sufficiency = build_packet_sufficiency_with_extra(
-                project_root,
-                &packet.question,
-                packet
-                    .task_class
-                    .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
-                &packet.answer,
-                &packet.budget,
-                &extra_probes,
-            );
-            continue;
-        }
-        break;
-    }
-
-    let output_bytes = refresh_packet_output_bytes(packet);
-    if output_bytes > packet.budget.limits.max_output_bytes as usize {
-        packet.budget.truncated = true;
-        push_omitted_section(&mut packet.budget, "output_bytes");
-        push_omitted_section(&mut packet.budget, "packet_payload");
-        packet.sufficiency = build_packet_sufficiency_with_extra(
-            project_root,
-            &packet.question,
-            packet
-                .task_class
-                .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
-            &packet.answer,
-            &packet.budget,
-            &extra_probes,
-        );
-    } else {
-        remove_omitted_section(&mut packet.budget, "output_bytes");
-        remove_omitted_section(&mut packet.budget, "packet_payload");
-        let _ = refresh_packet_output_bytes(packet);
-        packet.sufficiency = build_packet_sufficiency_with_extra(
-            project_root,
-            &packet.question,
-            packet
-                .task_class
-                .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
-            &packet.answer,
-            &packet.budget,
-            &extra_probes,
-        );
-        let _ = refresh_packet_output_bytes(packet);
-    }
-}
-
-fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
-    for _ in 0..4 {
-        let output_bytes = serialized_packet_len(packet);
-        let output_bytes_u32 = output_bytes.try_into().unwrap_or(u32::MAX);
-        if packet.budget.used.output_bytes == output_bytes_u32 {
-            return output_bytes;
-        }
-        packet.budget.used.output_bytes = output_bytes_u32;
-    }
-    serialized_packet_len(packet)
-}
-
-fn serialized_packet_len(packet: &AgentPacketDto) -> usize {
-    serde_json::to_vec(packet)
-        .map(|bytes| bytes.len())
-        .unwrap_or_default()
-}
-
-fn push_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
-    if !budget
-        .omitted_sections
-        .iter()
-        .any(|existing| existing == section)
-    {
-        budget.omitted_sections.push(section.to_string());
-        budget.omitted_sections.sort();
-    }
-}
-
-fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
-    budget
-        .omitted_sections
-        .retain(|existing| existing != section);
-}
-
-#[cfg(test)]
-fn build_packet_sufficiency(
-    project_root: &Path,
-    question: &str,
-    task_class: PacketTaskClassDto,
-    answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
-) -> PacketSufficiencyDto {
-    build_packet_sufficiency_with_extra(project_root, question, task_class, answer, budget, &[])
-}
-
-fn build_packet_sufficiency_with_extra(
-    project_root: &Path,
-    question: &str,
-    task_class: PacketTaskClassDto,
-    answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
-    extra_probes: &[String],
-) -> PacketSufficiencyDto {
-    let supported_claims = packet_supported_claims(answer);
-    let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
-        question,
-        task_class,
-        answer,
-        &supported_claims,
-        extra_probes,
-    );
-    assemble_packet_sufficiency(PacketSufficiencyInput {
-        project_root,
-        question,
-        task_class,
-        answer,
-        budget,
-        supported_claims,
-        missing_required_probe_queries,
-        targeted_follow_up_queries: packet_targeted_follow_up_queries(question, task_class),
-    })
-}
-
-fn packet_targeted_follow_up_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    let probes = packet_symbol_probe_queries(question, task_class, PacketBudgetModeDto::Standard);
-    let selected: Vec<String> = probes
-        .iter()
-        .filter(|query| is_packet_structured_follow_up_query(query))
-        .take(6)
-        .cloned()
-        .collect();
-    selected
-}
-
-fn is_packet_structured_follow_up_query(query: &str) -> bool {
-    query.contains('_')
-        || query.contains("::")
-        || query.contains("Options")
-        || query.contains("Params")
-        || query.contains("Processor")
-        || query.contains("Subcommand")
-}
-
-fn packet_retrieval_trace_summary(answer: &AgentAnswerDto) -> PacketRetrievalTraceSummaryDto {
-    let mut source_read_steps = 0;
-    let mut search_steps = 0;
-    let mut trail_steps = 0;
-    for step in &answer.retrieval_trace.steps {
-        match step.kind {
-            AgentRetrievalStepKindDto::SourceRead => source_read_steps += 1,
-            AgentRetrievalStepKindDto::Search
-            | AgentRetrievalStepKindDto::SemanticQueryEmbedding
-            | AgentRetrievalStepKindDto::SemanticCandidateRetrieval
-            | AgentRetrievalStepKindDto::HybridRerank
-            | AgentRetrievalStepKindDto::QueryExpansion => search_steps += 1,
-            AgentRetrievalStepKindDto::Trail
-            | AgentRetrievalStepKindDto::Neighborhood
-            | AgentRetrievalStepKindDto::TrailFilterOptions => trail_steps += 1,
-            AgentRetrievalStepKindDto::NodeDetails
-            | AgentRetrievalStepKindDto::NodeOccurrences
-            | AgentRetrievalStepKindDto::EdgeOccurrences
-            | AgentRetrievalStepKindDto::RepoTextFallback
-            | AgentRetrievalStepKindDto::MermaidSynthesis
-            | AgentRetrievalStepKindDto::AnswerSynthesis => {}
-        }
-    }
-
-    let mut trace_summary = answer.retrieval_trace.clone();
-    // The full step trace already lives under answer.retrieval_trace. Keep the
-    // retrieval trace summary scalar-sized so compact packets do not serialize it twice.
-    trace_summary.annotations.clear();
-    trace_summary.steps.clear();
-
-    PacketRetrievalTraceSummaryDto {
-        retrieval_trace: trace_summary,
-        source_read_steps,
-        search_steps,
-        trail_steps,
-    }
 }
 
 fn cap_graph_artifacts(
@@ -7471,7 +7224,7 @@ mod tests {
         let full_trace_bytes = serde_json::to_vec(&answer.retrieval_trace)
             .expect("serialize canonical trace")
             .len();
-        let retrieval_trace_summary = packet_retrieval_trace_summary(&answer);
+        let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
         let retrieval_trace_summary_bytes =
             serde_json::to_vec(&retrieval_trace_summary.retrieval_trace)
                 .expect("serialize retrieval trace summary")
@@ -7845,7 +7598,7 @@ mod tests {
             &answer,
             &budget,
         );
-        let retrieval_trace_summary = packet_retrieval_trace_summary(&answer);
+        let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
         let mut packet = AgentPacketDto {
             packet_id: answer.answer_id.clone(),
             question: question.to_string(),

@@ -1,14 +1,16 @@
 use crate::agent::packet_capping::cap_packet_citations;
 use crate::agent::packet_command_profiles::packet_command_exact_probe_queries;
-use crate::agent::packet_plan::push_unique_term;
+use crate::agent::packet_plan::{packet_explicit_request_probe_queries, push_unique_term};
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries_with_extra;
 use crate::agent::packet_sufficiency::{
-    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value, quote_packet_project_arg,
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, build_packet_sufficiency_with_extra,
+    quote_packet_command_value, quote_packet_project_arg,
 };
+use crate::agent::trace_export::packet_retrieval_trace_summary;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentResponseBlockDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
-    GraphArtifactDto, GraphResponse, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketBudgetUsageDto, PacketTaskClassDto,
+    AgentAnswerDto, AgentPacketDto, AgentResponseBlockDto, AgentRetrievalStepKindDto,
+    AgentRetrievalStepStatusDto, GraphArtifactDto, GraphResponse, PacketBudgetDto,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto, PacketTaskClassDto,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -114,6 +116,102 @@ pub(crate) fn apply_packet_budget_with_extra(
         omitted_sections,
         next_deeper_command: next_deeper_packet_command(project_root, question, requested),
     }
+}
+
+pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto) {
+    let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
+    for _ in 0..8 {
+        let output_bytes = refresh_packet_output_bytes(packet);
+        if output_bytes <= packet.budget.limits.max_output_bytes as usize {
+            break;
+        }
+
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "output_bytes");
+        push_omitted_section(&mut packet.budget, "packet_payload");
+
+        let over_by = output_bytes.saturating_sub(packet.budget.limits.max_output_bytes as usize);
+        let current_answer_bytes = serde_json::to_vec(&packet.answer)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let next_answer_cap = current_answer_bytes
+            .saturating_sub(over_by.saturating_add(1024))
+            .max(1024);
+
+        if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
+            push_omitted_section(&mut packet.budget, "markdown_blocks");
+            packet.budget.used = packet_budget_usage(&packet.answer);
+            rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
+            continue;
+        }
+        break;
+    }
+
+    let output_bytes = refresh_packet_output_bytes(packet);
+    if output_bytes > packet.budget.limits.max_output_bytes as usize {
+        packet.budget.truncated = true;
+        push_omitted_section(&mut packet.budget, "output_bytes");
+        push_omitted_section(&mut packet.budget, "packet_payload");
+        rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
+    } else {
+        remove_omitted_section(&mut packet.budget, "output_bytes");
+        remove_omitted_section(&mut packet.budget, "packet_payload");
+        rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
+        let _ = refresh_packet_output_bytes(packet);
+    }
+}
+
+fn rebuild_packet_budget_dependents(
+    project_root: &Path,
+    packet: &mut AgentPacketDto,
+    extra_probes: &[String],
+) {
+    packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
+    packet.sufficiency = build_packet_sufficiency_with_extra(
+        project_root,
+        &packet.question,
+        packet
+            .task_class
+            .unwrap_or(PacketTaskClassDto::ArchitectureExplanation),
+        &packet.answer,
+        &packet.budget,
+        extra_probes,
+    );
+}
+
+fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
+    for _ in 0..4 {
+        let output_bytes = serialized_packet_len(packet);
+        let output_bytes_u32 = output_bytes.try_into().unwrap_or(u32::MAX);
+        if packet.budget.used.output_bytes == output_bytes_u32 {
+            return output_bytes;
+        }
+        packet.budget.used.output_bytes = output_bytes_u32;
+    }
+    serialized_packet_len(packet)
+}
+
+fn serialized_packet_len(packet: &AgentPacketDto) -> usize {
+    serde_json::to_vec(packet)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
+}
+
+fn push_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
+    if !budget
+        .omitted_sections
+        .iter()
+        .any(|existing| existing == section)
+    {
+        budget.omitted_sections.push(section.to_string());
+        budget.omitted_sections.sort();
+    }
+}
+
+fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
+    budget
+        .omitted_sections
+        .retain(|existing| existing != section);
 }
 
 fn cap_graph_edges(answer: &mut AgentAnswerDto, max_edges: u32) -> bool {

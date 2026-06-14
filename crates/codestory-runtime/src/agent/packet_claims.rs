@@ -13,12 +13,14 @@ use crate::agent::packet_command_profiles::packet_append_command_flow_template_c
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
+use crate::agent::packet_plan::packet_rank_terms;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
     packet_display_path, packet_query_stop_term,
 };
 use crate::agent::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
-use codestory_contracts::api::{AgentCitationDto, PacketClaimDto};
+use crate::query_mentions_non_primary_source;
+use codestory_contracts::api::{AgentAnswerDto, AgentCitationDto, PacketClaimDto};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -38,6 +40,25 @@ pub(crate) fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
         let _ = writeln!(markdown, "- {}{}", claim.claim, suffix);
     }
     markdown
+}
+
+pub(crate) fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
+    let mut claims = Vec::new();
+    let mut seen_claims = HashSet::new();
+    let rank_terms = packet_rank_terms(&answer.prompt);
+    let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
+    let citations = answer.citations.clone();
+
+    append_flow_template_claims(&answer.prompt, &citations, &mut claims, &mut seen_claims);
+    append_ranked_citation_claims(
+        &answer.prompt,
+        &citations,
+        &rank_terms,
+        prefer_primary_sources,
+        &mut claims,
+        &mut seen_claims,
+    );
+    claims
 }
 
 pub(crate) fn append_flow_template_claims(

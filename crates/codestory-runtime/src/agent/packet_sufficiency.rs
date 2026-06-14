@@ -1,9 +1,12 @@
+use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_evidence_roles::packet_evidence_role;
+use crate::agent::packet_plan::packet_symbol_probe_queries;
+use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto, GraphArtifactDto,
-    PacketBudgetDto, PacketClaimDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
-    PacketTaskClassDto,
+    PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketSufficiencyDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,7 +25,46 @@ pub(crate) struct PacketSufficiencyInput<'a> {
     pub(crate) targeted_follow_up_queries: Vec<String>,
 }
 
-pub(crate) fn build_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
+#[cfg(test)]
+pub(crate) fn build_packet_sufficiency(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+) -> PacketSufficiencyDto {
+    build_packet_sufficiency_with_extra(project_root, question, task_class, answer, budget, &[])
+}
+
+pub(crate) fn build_packet_sufficiency_with_extra(
+    project_root: &Path,
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &AgentAnswerDto,
+    budget: &PacketBudgetDto,
+    extra_probes: &[String],
+) -> PacketSufficiencyDto {
+    let supported_claims = packet_supported_claims(answer);
+    let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
+        question,
+        task_class,
+        answer,
+        &supported_claims,
+        extra_probes,
+    );
+    assemble_packet_sufficiency(PacketSufficiencyInput {
+        project_root,
+        question,
+        task_class,
+        answer,
+        budget,
+        supported_claims,
+        missing_required_probe_queries,
+        targeted_follow_up_queries: packet_targeted_follow_up_queries(question, task_class),
+    })
+}
+
+fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSufficiencyDto {
     let PacketSufficiencyInput {
         project_root,
         question,
@@ -122,6 +164,26 @@ pub(crate) fn build_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> Pac
         gaps,
         follow_up_commands,
     }
+}
+
+pub(crate) fn packet_targeted_follow_up_queries(
+    question: &str,
+    task_class: PacketTaskClassDto,
+) -> Vec<String> {
+    packet_symbol_probe_queries(question, task_class, PacketBudgetModeDto::Standard)
+        .into_iter()
+        .filter(|query| is_packet_structured_follow_up_query(query))
+        .take(6)
+        .collect()
+}
+
+fn is_packet_structured_follow_up_query(query: &str) -> bool {
+    query.contains('_')
+        || query.contains("::")
+        || query.contains("Options")
+        || query.contains("Params")
+        || query.contains("Processor")
+        || query.contains("Subcommand")
 }
 
 fn packet_sufficiency_status(
