@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
+
+static LINT_SCRIPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn production_source(contents: &str) -> &str {
     match contents.find("#[cfg(test)]") {
@@ -67,6 +70,10 @@ fn lint_script(repo_root: &Path) -> PathBuf {
 }
 
 fn run_lint_with_extra_root(repo_root: &Path, script: &Path, extra_root: &Path) -> Output {
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
     Command::new("node")
         .arg(script)
         .current_dir(repo_root)
@@ -101,6 +108,10 @@ fn retrieval_generalization_lint_script_exits_clean_when_dirs_absent() {
     let repo_root = workspace_root();
     let script = lint_script(&repo_root);
 
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
     let status = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
@@ -190,6 +201,87 @@ pub fn leaked_production_path() -> &'static str {
         stderr.contains("codex-rs/prod/src/lib.rs"),
         "lint failure should report the production literal after fake cfg text, stderr={stderr}"
     );
+}
+
+#[test]
+fn linter_catches_current_holdout_literals_in_production() {
+    let output = run_lint_with_fixture(
+        r#"
+pub fn leaked_holdout_probe() -> &'static [&'static str] {
+    &[
+        "axios",
+        "redis",
+        "ripgrep",
+        "dispatchRequest",
+        "readQueryFromClient",
+        "HiArgs",
+        "server.c",
+        "core/main.rs",
+        "haystack.rs",
+    ]
+}
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "fixture with current holdout literals should fail lint; stderr={stderr}"
+    );
+    for expected in ["dispatchRequest", "readQueryFromClient", "core/main.rs"] {
+        assert!(
+            stderr.contains(expected),
+            "lint failure should report current holdout literal {expected}, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_catches_split_benchmark_family_literals_in_production() {
+    let output = run_lint_with_fixture(
+        r##"
+pub fn leaked_split_family_markers() -> Vec<String> {
+    vec![
+        ["use", "s", "wr"].concat(),
+        ["string", "utils"].concat(),
+        ["charsequence", "utils"].concat(),
+        ["source/animate", ".css"].concat(),
+        [
+            "s",
+            "wr",
+        ].concat(),
+        [
+            "auto",
+            "mapper",
+        ].concat(),
+        [
+            r#"s"#,
+            r#"wr"#,
+        ].concat(),
+        [
+            r#"string"#,
+            r#"utils"#,
+        ].concat(),
+    ]
+}
+"##,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "split benchmark-family literals should fail lint; stderr={stderr}"
+    );
+    for expected in [
+        "swr",
+        "useswr",
+        "stringutils",
+        "automapper",
+        "sourceanimatecss",
+    ] {
+        assert!(
+            stderr.to_ascii_lowercase().contains(expected),
+            "lint failure should report compact benchmark marker {expected}; stderr={stderr}"
+        );
+    }
 }
 
 #[test]

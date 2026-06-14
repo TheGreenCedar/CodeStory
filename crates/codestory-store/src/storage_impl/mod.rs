@@ -26,7 +26,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 18;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
 const GROUNDING_SNAPSHOT_STATE_BUILDING: i64 = 1;
@@ -362,10 +362,27 @@ impl FileRole {
     }
 
     pub fn classify_path(path: &Path) -> Self {
-        let normalized = path
+        let mut normalized = path
             .to_string_lossy()
             .replace('\\', "/")
             .to_ascii_lowercase();
+        let mut best_repo_relative: Option<(usize, String)> = None;
+        for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+            if let Some(index) = normalized.rfind(marker) {
+                let remainder = &normalized[index + marker.len()..];
+                if let Some((_, repo_relative)) = remainder.split_once('/') {
+                    if best_repo_relative
+                        .as_ref()
+                        .is_none_or(|(best_index, _)| index > *best_index)
+                    {
+                        best_repo_relative = Some((index, repo_relative.to_string()));
+                    }
+                }
+            }
+        }
+        if let Some((_, repo_relative)) = best_repo_relative {
+            normalized = repo_relative;
+        }
         let marked = format!("/{normalized}");
         let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
 
@@ -705,6 +722,10 @@ pub struct LlmSymbolDoc {
     pub embedding_dim: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_reason: Option<String>,
     pub embedding: Vec<f32>,
     pub updated_at_epoch_ms: i64,
 }
@@ -719,6 +740,8 @@ pub struct LlmSymbolDocReuseMetadata {
     pub embedding_backend: Option<String>,
     pub embedding_dim: u32,
     pub doc_shape: Option<String>,
+    pub semantic_policy_version: Option<String>,
+    pub dense_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -732,12 +755,41 @@ pub struct LlmSymbolDocStats {
     pub embedding_dim: Option<u32>,
     pub doc_version: Option<u32>,
     pub doc_shape: Option<String>,
+    pub semantic_policy_version: Option<String>,
     pub mixed_embedding_profiles: bool,
     pub mixed_embedding_models: bool,
     pub mixed_embedding_backends: bool,
     pub mixed_dimensions: bool,
     pub mixed_doc_versions: bool,
     pub mixed_doc_shapes: bool,
+    pub mixed_semantic_policy_versions: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseReasonCounts {
+    pub public_api: u32,
+    pub entrypoint: u32,
+    pub documented_nontrivial: u32,
+    pub central_graph_node: u32,
+    pub component_report: u32,
+    pub unstructured_doc: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SymbolSearchDoc {
+    pub node_id: NodeId,
+    pub file_node_id: Option<NodeId>,
+    pub kind: NodeKind,
+    pub display_name: String,
+    pub qualified_name: Option<String>,
+    pub file_path: Option<String>,
+    pub start_line: Option<u32>,
+    pub doc_text: String,
+    pub doc_version: u32,
+    pub doc_hash: String,
+    pub policy_version: String,
+    pub source_provenance: String,
+    pub updated_at_epoch_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1492,6 +1544,7 @@ impl Storage {
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
+        tx.execute("DELETE FROM symbol_search_doc", [])?;
         tx.execute("DELETE FROM symbol_summary", [])?;
         tx.execute("DELETE FROM search_symbol_projection", [])?;
         tx.execute("DELETE FROM component_access", [])?;
@@ -1607,9 +1660,8 @@ impl Storage {
         cleanup_sqlite_sidecars(staged_path)
     }
 
-    fn init(&self, mode: StorageOpenMode) -> Result<(), StorageError> {
+    fn init(&self, _mode: StorageOpenMode) -> Result<(), StorageError> {
         self.create_tables()?;
-        self.create_indexes(mode)?;
         if self.schema_version()? == 0 {
             self.set_schema_version(SCHEMA_VERSION)?;
         }
@@ -1618,10 +1670,6 @@ impl Storage {
 
     fn create_tables(&self) -> Result<(), StorageError> {
         schema::create_tables(&self.conn)
-    }
-
-    fn create_indexes(&self, mode: StorageOpenMode) -> Result<(), StorageError> {
-        schema::create_indexes(&self.conn, mode)
     }
 
     fn schema_version(&self) -> Result<u32, StorageError> {
@@ -1904,6 +1952,87 @@ impl Storage {
 
         self.invalidate_grounding_snapshots()?;
         Ok(())
+    }
+
+    pub fn upsert_retrieval_artifact_nodes_batch(
+        &mut self,
+        nodes: &[Node],
+    ) -> Result<(), StorageError> {
+        let prepared_nodes = self.prepared_nodes_for_insert(nodes)?;
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO node (id, kind, serialized_name, qualified_name, canonical_id, file_node_id, start_line, start_col, end_line, end_col)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    serialized_name = excluded.serialized_name,
+                    qualified_name = excluded.qualified_name,
+                    canonical_id = excluded.canonical_id,
+                    file_node_id = excluded.file_node_id,
+                    start_line = excluded.start_line,
+                    start_col = excluded.start_col,
+                    end_line = excluded.end_line,
+                    end_col = excluded.end_col",
+            )?;
+            for node in &prepared_nodes {
+                Self::insert_node_with_stmt(&mut stmt, node)?;
+            }
+        }
+        tx.commit()?;
+
+        let mut cache = self.cache.nodes.write();
+        for node in &prepared_nodes {
+            cache.insert(node.id, node.clone());
+        }
+
+        Ok(())
+    }
+
+    pub fn copy_retrieval_artifact_nodes_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        drop(Storage::open(source_path)?);
+        let source = source_path.to_string_lossy().to_string();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO node (
+                id,
+                kind,
+                serialized_name,
+                qualified_name,
+                canonical_id,
+                file_node_id,
+                start_line,
+                start_col,
+                end_line,
+                end_col
+             )
+             SELECT
+                source_node.id,
+                source_node.kind,
+                source_node.serialized_name,
+                source_node.qualified_name,
+                source_node.canonical_id,
+                source_node.file_node_id,
+                source_node.start_line,
+                source_node.start_col,
+                source_node.end_line,
+                source_node.end_col
+             FROM source_snapshot.node source_node
+             WHERE source_node.serialized_name LIKE 'component_report:%'
+                OR source_node.canonical_id LIKE 'codestory:component_report:%'",
+            [],
+        );
+        let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
     }
 
     pub fn insert_edges_batch(&mut self, edges: &[Edge]) -> Result<(), StorageError> {
@@ -2219,6 +2348,10 @@ impl Storage {
         } else {
             self.prepared_nodes_for_insert_with_files(batch.nodes, batch.files)?
         };
+        let pending_node_labels = prepared_nodes
+            .iter()
+            .map(|node| (node.id, format!("{:?}:{}", node.kind, node.serialized_name)))
+            .collect::<HashMap<_, _>>();
         let nodes_prepare_ms = clamp_i64_to_u32(nodes_prepare_started.elapsed().as_millis() as i64);
 
         let tx = self.conn.transaction()?;
@@ -2281,7 +2414,12 @@ impl Storage {
                         .filter(|node| node.kind != NodeKind::FILE),
                 )
             {
-                Self::insert_node_with_stmt(&mut stmt, node)?;
+                Self::insert_node_with_stmt(&mut stmt, node).map_err(|err| {
+                    StorageError::Other(format!(
+                        "flush_projection_batch node insert failed for id={} kind={:?} name={} file_node_id={:?}: {err}",
+                        node.id.0, node.kind, node.serialized_name, node.file_node_id.map(|id| id.0)
+                    ))
+                })?;
             }
             breakdown.nodes_ms = nodes_prepare_ms.saturating_add(clamp_i64_to_u32(
                 nodes_insert_started.elapsed().as_millis() as i64,
@@ -2308,7 +2446,34 @@ impl Storage {
                     edge.callsite_identity.as_deref(),
                     row_mapping::certainty_db_value(edge.certainty),
                     serialize_candidate_targets(&edge.candidate_targets)?
-                ])?;
+                ])
+                .map_err(|err| {
+                    let source_label = pending_node_labels
+                        .get(&edge.source)
+                        .map(String::as_str)
+                        .unwrap_or("<not in pending batch>");
+                    let target_label = pending_node_labels
+                        .get(&edge.target)
+                        .map(String::as_str)
+                        .unwrap_or("<not in pending batch>");
+                    let file_label = edge
+                        .file_node_id
+                        .and_then(|id| pending_node_labels.get(&id).map(String::as_str))
+                        .unwrap_or("<not in pending batch>");
+                    StorageError::Other(format!(
+                        "flush_projection_batch edge insert failed for id={} kind={:?} source={} ({}) target={} ({}) file_node_id={:?} ({}) resolved_source={:?} resolved_target={:?}: {err}",
+                        edge.id.0,
+                        edge.kind,
+                        edge.source.0,
+                        source_label,
+                        edge.target.0,
+                        target_label,
+                        edge.file_node_id.map(|id| id.0),
+                        file_label,
+                        edge.resolved_source.map(|id| id.0),
+                        edge.resolved_target.map(|id| id.0)
+                    ))
+                })?;
             }
             breakdown.edges_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
         }
@@ -2328,7 +2493,19 @@ impl Storage {
                     occ.location.start_col,
                     occ.location.end_line,
                     occ.location.end_col,
-                ])?;
+                ])
+                .map_err(|err| {
+                    StorageError::Other(format!(
+                        "flush_projection_batch occurrence insert failed for element_id={} kind={:?} file_node_id={} range={}:{}-{}:{}: {err}",
+                        occ.element_id,
+                        occ.kind,
+                        occ.location.file_node_id.0,
+                        occ.location.start_line,
+                        occ.location.start_col,
+                        occ.location.end_line,
+                        occ.location.end_col
+                    ))
+                })?;
             }
             breakdown.occurrences_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
         }
@@ -2344,7 +2521,13 @@ impl Storage {
                 stmt.execute(params![
                     node_id.0,
                     row_mapping::access_kind_db_value(*access),
-                ])?;
+                ])
+                .map_err(|err| {
+                    StorageError::Other(format!(
+                        "flush_projection_batch component_access insert failed for node_id={} access={:?}: {err}",
+                        node_id.0, access
+                    ))
+                })?;
             }
             breakdown.component_access_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);
         }
@@ -2371,7 +2554,17 @@ impl Storage {
                     state.body_hash,
                     state.start_line,
                     state.end_line,
-                ])?;
+                ])
+                .map_err(|err| {
+                    StorageError::Other(format!(
+                        "flush_projection_batch callable_projection_state insert failed for file_id={} node_id={} symbol_key={} range={}-{}: {err}",
+                        state.file_id,
+                        state.node_id.0,
+                        state.symbol_key,
+                        state.start_line,
+                        state.end_line
+                    ))
+                })?;
             }
             breakdown.callable_projection_ms =
                 clamp_i64_to_u32(started.elapsed().as_millis() as i64);
@@ -2613,6 +2806,290 @@ impl Storage {
         Ok(clamp_i64_to_u32(count))
     }
 
+    pub fn upsert_symbol_search_docs_batch(
+        &mut self,
+        docs: &[SymbolSearchDoc],
+    ) -> Result<(), StorageError> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO symbol_search_doc (
+                    node_id,
+                    file_node_id,
+                    kind,
+                    display_name,
+                    qualified_name,
+                    file_path,
+                    start_line,
+                    doc_text,
+                    doc_version,
+                    doc_hash,
+                    policy_version,
+                    source_provenance,
+                    updated_at_epoch_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                 )
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    file_node_id = excluded.file_node_id,
+                    kind = excluded.kind,
+                    display_name = excluded.display_name,
+                    qualified_name = excluded.qualified_name,
+                    file_path = excluded.file_path,
+                    start_line = excluded.start_line,
+                    doc_text = excluded.doc_text,
+                    doc_version = excluded.doc_version,
+                    doc_hash = excluded.doc_hash,
+                    policy_version = excluded.policy_version,
+                    source_provenance = excluded.source_provenance,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+            for doc in docs {
+                stmt.execute(params![
+                    doc.node_id.0,
+                    doc.file_node_id.map(|id| id.0),
+                    doc.kind as i32,
+                    doc.display_name,
+                    doc.qualified_name,
+                    doc.file_path,
+                    doc.start_line,
+                    doc.doc_text,
+                    doc.doc_version as i64,
+                    doc.doc_hash,
+                    doc.policy_version,
+                    doc.source_provenance,
+                    doc.updated_at_epoch_ms,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_symbol_search_docs_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<SymbolSearchDoc>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                node_id,
+                file_node_id,
+                kind,
+                display_name,
+                qualified_name,
+                file_path,
+                start_line,
+                doc_text,
+                doc_version,
+                doc_hash,
+                policy_version,
+                source_provenance,
+                updated_at_epoch_ms
+             FROM symbol_search_doc
+             WHERE (?1 IS NULL OR node_id > ?1)
+             ORDER BY node_id ASC
+             LIMIT ?2",
+        )?;
+        let after_node_id = after_node_id.map(|id| id.0);
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut rows = stmt.query(params![after_node_id, limit])?;
+        let mut docs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: i32 = row.get(2)?;
+            let doc_version: i64 = row.get(8)?;
+            docs.push(SymbolSearchDoc {
+                node_id: NodeId(row.get(0)?),
+                file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                kind: NodeKind::try_from(kind)?,
+                display_name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                file_path: row.get(5)?,
+                start_line: row.get(6)?,
+                doc_text: row.get(7)?,
+                doc_version: doc_version.max(0).min(u32::MAX as i64) as u32,
+                doc_hash: row.get(9)?,
+                policy_version: row.get(10)?,
+                source_provenance: row.get(11)?,
+                updated_at_epoch_ms: row.get(12)?,
+            });
+        }
+        Ok(docs)
+    }
+
+    pub fn get_symbol_search_doc_count(&self) -> Result<u32, StorageError> {
+        let count = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbol_search_doc", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        Ok(clamp_i64_to_u32(count))
+    }
+
+    pub fn clear_symbol_search_docs(&mut self) -> Result<usize, StorageError> {
+        let removed = self.conn.execute("DELETE FROM symbol_search_doc", [])?;
+        Ok(removed)
+    }
+
+    pub fn copy_symbol_search_docs_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        drop(Storage::open(source_path)?);
+        let source = source_path.to_string_lossy().to_string();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO symbol_search_doc (
+                node_id,
+                file_node_id,
+                kind,
+                display_name,
+                qualified_name,
+                file_path,
+                start_line,
+                doc_text,
+                doc_version,
+                doc_hash,
+                policy_version,
+                source_provenance,
+                updated_at_epoch_ms
+             )
+             SELECT
+                source_doc.node_id,
+                source_doc.file_node_id,
+                source_doc.kind,
+                source_doc.display_name,
+                source_doc.qualified_name,
+                source_doc.file_path,
+                source_doc.start_line,
+                source_doc.doc_text,
+                source_doc.doc_version,
+                source_doc.doc_hash,
+                source_doc.policy_version,
+                source_doc.source_provenance,
+                source_doc.updated_at_epoch_ms
+             FROM source_snapshot.symbol_search_doc source_doc
+             WHERE EXISTS (
+                SELECT 1 FROM node WHERE node.id = source_doc.node_id
+             )
+             AND (
+                source_doc.file_node_id IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM node WHERE node.id = source_doc.file_node_id
+                )
+             )",
+            [],
+        );
+        let detach_result = self.conn.execute("DETACH DATABASE source_snapshot", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
+    }
+
+    pub fn prune_symbol_search_docs_to_node_ids(
+        &mut self,
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if keep_node_ids.is_empty() {
+            return self.clear_symbol_search_docs();
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS symbol_search_doc_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.symbol_search_doc_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.symbol_search_doc_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM symbol_search_doc
+             WHERE NOT EXISTS (
+                SELECT 1
+                FROM temp.symbol_search_doc_keep keep
+                WHERE keep.node_id = symbol_search_doc.node_id
+             )",
+            [],
+        )?;
+        tx.execute("DROP TABLE temp.symbol_search_doc_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn delete_symbol_search_docs_for_files_except_node_ids(
+        &mut self,
+        file_node_ids: &[NodeId],
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if file_node_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS symbol_search_doc_scope (
+                file_node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS symbol_search_doc_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.symbol_search_doc_scope", [])?;
+        tx.execute("DELETE FROM temp.symbol_search_doc_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.symbol_search_doc_scope (file_node_id) VALUES (?1)",
+            )?;
+            for file_node_id in file_node_ids {
+                stmt.execute(params![file_node_id.0])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.symbol_search_doc_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM symbol_search_doc
+             WHERE file_node_id IN (
+                SELECT file_node_id FROM temp.symbol_search_doc_scope
+             )
+             AND NOT EXISTS (
+                SELECT 1
+                FROM temp.symbol_search_doc_keep keep
+                WHERE keep.node_id = symbol_search_doc.node_id
+             )",
+            [],
+        )?;
+        tx.execute("DROP TABLE temp.symbol_search_doc_scope", [])?;
+        tx.execute("DROP TABLE temp.symbol_search_doc_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn max_indexed_file_modification_time(&self) -> Result<Option<i64>, StorageError> {
         self.conn
             .query_row(
@@ -2726,10 +3203,12 @@ impl Storage {
                     embedding_backend,
                     embedding_dim,
                     doc_shape,
+                    semantic_policy_version,
+                    dense_reason,
                     embedding_blob,
                     updated_at_epoch_ms
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
                  )
                  ON CONFLICT(node_id) DO UPDATE SET
                     file_node_id = excluded.file_node_id,
@@ -2746,6 +3225,8 @@ impl Storage {
                     embedding_backend = excluded.embedding_backend,
                     embedding_dim = excluded.embedding_dim,
                     doc_shape = excluded.doc_shape,
+                    semantic_policy_version = excluded.semantic_policy_version,
+                    dense_reason = excluded.dense_reason,
                     embedding_blob = excluded.embedding_blob,
                     updated_at_epoch_ms = excluded.updated_at_epoch_ms",
             )?;
@@ -2767,6 +3248,8 @@ impl Storage {
                     doc.embedding_backend,
                     doc.embedding_dim as i64,
                     doc.doc_shape,
+                    doc.semantic_policy_version,
+                    doc.dense_reason,
                     encode_embedding_blob(&doc.embedding),
                     doc.updated_at_epoch_ms,
                 ])?;
@@ -2801,6 +3284,8 @@ impl Storage {
                 embedding_backend,
                 embedding_dim,
                 doc_shape,
+                semantic_policy_version,
+                dense_reason,
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
@@ -2816,7 +3301,7 @@ impl Storage {
             let kind: i32 = row.get(2)?;
             let doc_version: i64 = row.get(8)?;
             let embedding_dim: i64 = row.get(13)?;
-            let embedding_blob: Vec<u8> = row.get(15)?;
+            let embedding_blob: Vec<u8> = row.get(17)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -2833,8 +3318,10 @@ impl Storage {
                 embedding_backend: row.get(12)?,
                 embedding_dim: embedding_dim.max(0) as u32,
                 doc_shape: row.get(14)?,
+                semantic_policy_version: row.get(15)?,
+                dense_reason: row.get(16)?,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(16)?,
+                updated_at_epoch_ms: row.get(18)?,
             });
         }
 
@@ -2862,6 +3349,9 @@ impl Storage {
             min_shape,
             max_shape,
             shape_count,
+            min_policy,
+            max_policy,
+            policy_count,
         ) = self.conn.query_row(
             "SELECT
                 COUNT(*),
@@ -2882,7 +3372,10 @@ impl Storage {
                 COUNT(doc_version),
                 MIN(doc_shape),
                 MAX(doc_shape),
-                COUNT(doc_shape)
+                COUNT(doc_shape),
+                MIN(semantic_policy_version),
+                MAX(semantic_policy_version),
+                COUNT(semantic_policy_version)
              FROM llm_symbol_doc",
             [],
             |row| {
@@ -2906,6 +3399,9 @@ impl Storage {
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, i64>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, Option<String>>(20)?,
+                    row.get::<_, i64>(21)?,
                 ))
             },
         )?;
@@ -2917,6 +3413,8 @@ impl Storage {
             uniform_optional_string_with_count(doc_count, backend_count, min_backend, max_backend);
         let (doc_shape, mixed_doc_shapes) =
             uniform_optional_string_with_count(doc_count, shape_count, min_shape, max_shape);
+        let (semantic_policy_version, mixed_semantic_policy_versions) =
+            uniform_optional_string_with_count(doc_count, policy_count, min_policy, max_policy);
         let (embedding_dim, mixed_dimensions) =
             uniform_optional_u32_with_count(doc_count, dim_count, min_dim, max_dim);
         let (doc_version, mixed_doc_versions) =
@@ -2930,12 +3428,14 @@ impl Storage {
             embedding_dim,
             doc_version,
             doc_shape,
+            semantic_policy_version,
             mixed_embedding_profiles,
             mixed_embedding_models,
             mixed_embedding_backends,
             mixed_dimensions,
             mixed_doc_versions,
             mixed_doc_shapes,
+            mixed_semantic_policy_versions,
         })
     }
 
@@ -3059,7 +3559,9 @@ impl Storage {
                 embedding_model,
                 embedding_backend,
                 embedding_dim,
-                doc_shape
+                doc_shape,
+                semantic_policy_version,
+                dense_reason
              FROM llm_symbol_doc
              ORDER BY node_id ASC",
         )?;
@@ -3077,6 +3579,8 @@ impl Storage {
                 embedding_backend: row.get(5)?,
                 embedding_dim: embedding_dim.max(0).min(u32::MAX as i64) as u32,
                 doc_shape: row.get(7)?,
+                semantic_policy_version: row.get(8)?,
+                dense_reason: row.get(9)?,
             });
         }
         Ok(docs)
@@ -3104,6 +3608,8 @@ impl Storage {
                 embedding_backend,
                 embedding_dim,
                 doc_shape,
+                semantic_policy_version,
+                dense_reason,
                 embedding_blob,
                 updated_at_epoch_ms
              FROM llm_symbol_doc
@@ -3119,7 +3625,7 @@ impl Storage {
             let kind: i32 = row.get(2)?;
             let doc_version: i64 = row.get(8)?;
             let embedding_dim: i64 = row.get(13)?;
-            let embedding_blob: Vec<u8> = row.get(15)?;
+            let embedding_blob: Vec<u8> = row.get(17)?;
             docs.push(LlmSymbolDoc {
                 node_id: NodeId(row.get(0)?),
                 file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
@@ -3136,8 +3642,10 @@ impl Storage {
                 embedding_backend: row.get(12)?,
                 embedding_dim: embedding_dim.max(0) as u32,
                 doc_shape: row.get(14)?,
+                semantic_policy_version: row.get(15)?,
+                dense_reason: row.get(16)?,
                 embedding: decode_embedding_blob(&embedding_blob)?,
-                updated_at_epoch_ms: row.get(16)?,
+                updated_at_epoch_ms: row.get(18)?,
             });
         }
         Ok(docs)
@@ -3152,6 +3660,7 @@ impl Storage {
         if !source_path.exists() {
             return Ok(0);
         }
+        drop(Storage::open(source_path)?);
         let source = source_path.to_string_lossy().to_string();
         self.conn
             .execute("ATTACH DATABASE ?1 AS source_snapshot", params![source])?;
@@ -3172,6 +3681,8 @@ impl Storage {
                 embedding_backend,
                 embedding_dim,
                 doc_shape,
+                semantic_policy_version,
+                dense_reason,
                 embedding_blob,
                 updated_at_epoch_ms
              )
@@ -3191,6 +3702,8 @@ impl Storage {
                 source_doc.embedding_backend,
                 source_doc.embedding_dim,
                 source_doc.doc_shape,
+                source_doc.semantic_policy_version,
+                source_doc.dense_reason,
                 source_doc.embedding_blob,
                 source_doc.updated_at_epoch_ms
              FROM source_snapshot.llm_symbol_doc source_doc
@@ -3311,6 +3824,17 @@ impl Storage {
     ) -> Result<usize, StorageError> {
         let removed = self.conn.execute(
             "DELETE FROM llm_symbol_doc WHERE file_node_id = ?1",
+            params![file_node_id.0],
+        )?;
+        Ok(removed)
+    }
+
+    pub fn delete_symbol_search_docs_for_file(
+        &mut self,
+        file_node_id: NodeId,
+    ) -> Result<usize, StorageError> {
+        let removed = self.conn.execute(
+            "DELETE FROM symbol_search_doc WHERE file_node_id = ?1",
             params![file_node_id.0],
         )?;
         Ok(removed)
@@ -4541,6 +5065,14 @@ impl Storage {
         tx.execute(
             &format!(
                 "DELETE FROM llm_symbol_doc
+                 WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 OR file_node_id = ?1"
+            ),
+            params![file_node_id],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM symbol_search_doc
                  WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR file_node_id = ?1"
             ),

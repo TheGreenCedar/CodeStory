@@ -110,6 +110,7 @@ struct StdioWarmLoopStats {
     warm_stdio_total_ms: f64,
     warm_stdio_per_loop_ms: f64,
     warm_vs_cold_per_loop_ratio: f64,
+    sidecar_status: ToolLatencyStats,
     warm_stdio: Vec<ToolLatencyStats>,
     state: StateStats,
     transcript: Vec<OperationSample>,
@@ -456,27 +457,45 @@ fn warm_tool_stats(samples: &[OperationSample]) -> Vec<ToolLatencyStats> {
     }
     grouped
         .into_iter()
-        .map(|(operation, samples)| {
-            let latencies = samples
-                .iter()
-                .map(|sample| sample.elapsed_ms)
-                .collect::<Vec<_>>();
-            let bytes = samples
-                .iter()
-                .map(|sample| sample.response_bytes)
-                .collect::<Vec<_>>();
-            ToolLatencyStats {
-                operation: operation.to_string(),
-                samples: samples.len(),
-                p50_ms: percentile(&latencies, 0.50),
-                p95_ms: percentile(&latencies, 0.95),
-                p99_ms: percentile(&latencies, 0.99),
-                max_ms: percentile(&latencies, 1.0),
-                response_bytes_p50: percentile_u64(&bytes, 0.50),
-                response_bytes_max: percentile_u64(&bytes, 1.0),
-            }
-        })
+        .map(|(operation, samples)| tool_latency_stats(operation, samples.into_iter()))
         .collect()
+}
+
+fn operation_stats(samples: &[OperationSample], operation: &str) -> ToolLatencyStats {
+    let filtered = samples
+        .iter()
+        .filter(|sample| sample.operation == operation)
+        .collect::<Vec<_>>();
+    tool_latency_stats(operation, filtered.into_iter())
+}
+
+fn tool_latency_stats<'a>(
+    operation: &str,
+    samples: impl Iterator<Item = &'a OperationSample>,
+) -> ToolLatencyStats {
+    let samples = samples.collect::<Vec<_>>();
+    assert!(
+        !samples.is_empty(),
+        "missing operation samples for {operation}"
+    );
+    let latencies = samples
+        .iter()
+        .map(|sample| sample.elapsed_ms)
+        .collect::<Vec<_>>();
+    let bytes = samples
+        .iter()
+        .map(|sample| sample.response_bytes)
+        .collect::<Vec<_>>();
+    ToolLatencyStats {
+        operation: operation.to_string(),
+        samples: samples.len(),
+        p50_ms: percentile(&latencies, 0.50),
+        p95_ms: percentile(&latencies, 0.95),
+        p99_ms: percentile(&latencies, 0.99),
+        max_ms: percentile(&latencies, 1.0),
+        response_bytes_p50: percentile_u64(&bytes, 0.50),
+        response_bytes_max: percentile_u64(&bytes, 1.0),
+    }
 }
 
 #[test]
@@ -747,6 +766,7 @@ fn warm_stdio_agent_loop_emits_stats_without_protocol_pollution() {
         warm_stdio_total_ms,
         warm_stdio_per_loop_ms,
         warm_vs_cold_per_loop_ratio,
+        sidecar_status: operation_stats(&transcript, "resources/read:status"),
         warm_stdio: warm_tool_stats(&transcript),
         state: StateStats {
             warm_search_dir_unchanged,

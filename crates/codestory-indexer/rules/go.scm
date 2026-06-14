@@ -24,6 +24,22 @@
 
 (type_declaration
   (type_spec
+    name: (type_identifier)
+    type: (interface_type
+      (method_elem
+        name: (field_identifier) @name) @def)))
+{
+  node @name.node
+  attr (@name.node) kind = "METHOD"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(type_declaration
+  (type_spec
     name: (type_identifier) @name)) @def
 {
   node @name.node

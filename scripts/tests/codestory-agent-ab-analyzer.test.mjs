@@ -16,18 +16,29 @@ import {
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
   packetComposition,
+  packetCommandArgs,
+  packetForAgentPrompt,
+  packetManifestExtraProbes,
+  packetManifestQualitySummary,
+  packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
+  packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
   resolveCodeStoryCli,
   scoreQuality,
+  summarizeCostAccounting,
   summarizePacketRuntimeRuns,
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
 } from "../codestory-agent-ab-benchmark.mjs";
+import {
+  packetGateStderrPath,
+  retryablePacketGateTaskIds,
+} from "../codestory-agent-ab-score.mjs";
 
 const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
@@ -41,11 +52,14 @@ test("parses packet-runtime benchmark run id", () => {
     "local-real",
     "--benchmark-run-id",
     "segment 43/v2",
+    "--prepare-codestory-jobs",
+    "2",
   ]);
 
   assert.equal(opts.packetRuntime, true);
   assert.equal(opts.benchmarkRunId, "segment-43-v2");
   assert.equal(opts.prepareCodestoryCache, true);
+  assert.equal(opts.prepareCodestoryJobs, 2);
   assert.throws(
     () =>
       parseBenchmarkArgs([
@@ -55,6 +69,17 @@ test("parses packet-runtime benchmark run id", () => {
         "--no-prepare-codestory-cache",
       ]),
     /sidecar preparation is mandatory/,
+  );
+  assert.throws(
+    () =>
+      parseBenchmarkArgs([
+        "--packet-runtime",
+        "--task-suite",
+        "local-real",
+        "--prepare-codestory-jobs",
+        "0",
+      ]),
+    /--prepare-codestory-jobs must be a positive integer/,
   );
 });
 
@@ -199,7 +224,15 @@ async function withManifestFile(manifest, callback) {
 
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
+  assert.equal(commandCategory('"${CODESTORY_CLI:-codestory-cli}" packet --project . --question flow'), "codestory_cli");
+  assert.equal(commandCategory('"$CODESTORY_CLI" index --project . --refresh full'), "codestory_cli");
   assert.equal(commandCategory('& "C:\\tools\\codestory-cli.exe" packet --project . --question flow'), "codestory_cli");
+  assert.equal(
+    commandCategory(
+      String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $(if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { 'codestory-cli' }) packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`,
+    ),
+    "codestory_cli",
+  );
   assert.equal(
     commandCategory(
       '"C:\\Program Files\\PowerShell\\pwsh.exe" -Command "& \\"C:\\tools\\codestory-cli.exe\\" packet --project . --question flow"',
@@ -223,6 +256,42 @@ test("categorizes commands without treating source paths as cli invocations", ()
   assert.equal(commandCategory("Get-Content crates/codestory-cli/src/main.rs"), "direct_file_read");
   assert.equal(commandCategory("Get-Content C:\\tools\\codestory-cli.exe"), "direct_file_read");
   assert.equal(commandCategory("cargo test -p codestory-cli --test onboarding_contracts"), "build_test");
+});
+
+test("packet gate retries only transient sidecar packet failures", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-gate-retry-"));
+  try {
+    const retryable = {
+      repo: "dart-lang-http",
+      task_id: "dart-http-client-flow",
+      mode: "cold_cli_packet",
+      repeat: 1,
+      status: "fail",
+      quality_pass: null,
+      failure_reasons: ["missing_quality_score"],
+    };
+    const qualityFailure = {
+      repo: "fixture",
+      task_id: "quality-failure",
+      mode: "cold_cli_packet",
+      repeat: 1,
+      status: "fail",
+      quality_pass: false,
+      failure_reasons: ["expected_claim_recall_low"],
+    };
+    await writeFile(
+      packetGateStderrPath(dir, retryable),
+      "Error: retrieval_unavailable: project is not in full mode (mode=no_semantic, reason=qdrant_unreachable)\n",
+      "utf8",
+    );
+    await writeFile(packetGateStderrPath(dir, qualityFailure), "manifest quality failed\n", "utf8");
+
+    assert.deepEqual(retryablePacketGateTaskIds([retryable, qualityFailure], dir), [
+      "dart-http-client-flow",
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("rejects manifest repo and workspace paths outside the cache", async () => {
@@ -260,21 +329,67 @@ test("rejects manifest repo and workspace paths outside the cache", async () => 
   );
 });
 
-test("packet-first command renders manifest text as PowerShell literals", () => {
-  const command = packetFirstCommandForPrompt(
+test("packet-first command renders manifest text for host shells", () => {
+  const windowsCommand = packetFirstCommandForPrompt(
     "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
     { task_class: "bug_localization" },
+    "win32",
   );
 
   assert.match(
-    command,
+    windowsCommand,
     /--question 'Inspect \$env:SECRET and \$\(Get-ChildItem\), then read John''s file\. Next line\.'/,
   );
-  assert.match(command, /--task-class 'bug-localization'/);
+  assert.match(windowsCommand, /--task-class 'bug-localization'/);
+
+  const unixCommand = packetFirstCommandForPrompt(
+    "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
+    { task_class: "bug_localization" },
+    "linux",
+  );
+
+  assert.ok(unixCommand.startsWith('"${CODESTORY_CLI:-codestory-cli}" packet '));
+  assert.ok(
+    unixCommand.includes(
+      "--question 'Inspect $env:SECRET and $(Get-ChildItem), then read John'\\''s file. Next line.'",
+    ),
+  );
+  assert.match(unixCommand, /--task-class 'bug-localization'/);
   assert.throws(
-    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }),
+    () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }, "linux"),
     /task_class/,
   );
+});
+
+test("packet command carries bounded manifest-derived extra probes", () => {
+  const task = {
+    prompt: "Explain how Requests dispatch works.",
+    task_class: "architecture_explanation",
+    expected_files: ["src/requests/api.py", "src/requests/sessions.py"],
+    expected_symbols: ["request", "Session.request"],
+    expected_symbol_probes: [
+      "src/requests/api.py request",
+      "src/requests/sessions.py Session.request",
+      "src/requests/sessions.py Session.send",
+    ],
+  };
+
+  assert.deepEqual(packetManifestExtraProbes(task), [
+    "src/requests/api.py",
+    "src/requests/sessions.py",
+    "src/requests/api.py request",
+    "src/requests/sessions.py Session.request",
+    "src/requests/sessions.py Session.send",
+  ]);
+
+  const args = packetCommandArgs({ path: "C:\\repo" }, task);
+  const extraProbeIndexes = args
+    .map((arg, index) => (arg === "--extra-probe" ? index : -1))
+    .filter((index) => index >= 0);
+
+  assert.equal(extraProbeIndexes.length, 5);
+  assert.equal(args[extraProbeIndexes[0] + 1], "src/requests/api.py");
+  assert.equal(args[extraProbeIndexes[3] + 1], "src/requests/sessions.py Session.request");
 });
 
 test("benchmark artifact run ids strip path separators from dynamic parts", () => {
@@ -418,6 +533,179 @@ test("analyzes transcript command friction and scores manifest anchors", () => {
   assert.equal(quality.citation_coverage.recall, 1);
 });
 
+test("counts direct source reads for every supported language extension family", () => {
+  const paths = [
+    "src/main.rs",
+    "src/app.py",
+    "src/App.java",
+    "src/index.js",
+    "src/index.tsx",
+    "include/fmt/base.hpp",
+    "src/server.c",
+    "router.go",
+    "lib/site.rb",
+    "src/Logger.php",
+    "src/Mapper.cs",
+    "src/Main.kt",
+    "Package.swift",
+    "lib/client.dart",
+    "nvm.sh",
+    "index.html",
+    "styles/site.css",
+    "schema/chinook.sql",
+  ];
+  const events = paths.flatMap((sourcePath, index) => [
+    commandEvent(`cmd_${index}`, "item.started", `Get-Content ${sourcePath}`),
+    commandEvent(`cmd_${index}`, "item.completed", `Get-Content ${sourcePath}`, "source"),
+  ]);
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.direct_file_read, paths.length);
+  assert.equal(analysis.direct_source_reads_total, paths.length);
+});
+
+test("counts PowerShell LiteralPath source reads after a CodeStory packet", () => {
+  const command = String.raw`"C:\\Program Files\\PowerShell\\pwsh.exe" -Command '$lines = Get-Content -LiteralPath '"'src/index/use-swr.ts'
+for ($i = 1; $i -le 2; $i++) { "{0}: {1}" -f $i, $lines[$i - 1] }'`;
+  const events = [
+    commandEvent("packet", "item.started", "& $env:CODESTORY_CLI packet --project . --question flow"),
+    commandEvent("packet", "item.completed", "& $env:CODESTORY_CLI packet --project . --question flow", "{}"),
+    commandEvent("read", "item.started", command),
+    commandEvent("read", "item.completed", command, "export default useSWR"),
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.direct_file_read, 1);
+  assert.equal(analysis.direct_source_reads_total, 1);
+  assert.equal(analysis.ordinary_source_reads_after_first_packet, 1);
+  assert.deepEqual(analysis.direct_file_reads_duplicated, {});
+});
+
+test("counts modern Codex JSONL tool categories including web search", () => {
+  const events = [
+    {
+      type: "item.started",
+      item: {
+        id: "item_web",
+        type: "web_search",
+        query: "github psf requests api.py",
+      },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "item_web",
+        type: "web_search",
+        query: "github psf requests api.py",
+      },
+    },
+    {
+      type: "item.started",
+      item: {
+        id: "item_mcp",
+        type: "mcp_tool_call",
+        server: "codex",
+        tool: "list_mcp_resources",
+      },
+    },
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_count, 0);
+  assert.equal(analysis.tool_categories.web_search, 1);
+  assert.equal(analysis.tool_categories.mcp_tool_call, 1);
+  assert.equal(analysis.external_context_tool_calls, 1);
+
+  const blockers = agentPublishableBlockers([
+    {
+      status: "pass",
+      arm: "without_codestory",
+      usage: { total_tokens: 1 },
+      transcript_analysis: analysis,
+    },
+  ]);
+  assert.match(blockers[0].reasons.join("\n"), /external web\/search tool calls=1 > 0/);
+});
+
+test("summarizes A/B cost accounting totals and ratios", () => {
+  const costAccounting = summarizeCostAccounting([
+    {
+      arm: "without_codestory",
+      status: "pass",
+      wall_ms: 200,
+      agent_runner_wall_ms: 190,
+      baseline_harness_prelude: {
+        wall_ms: 10,
+      },
+      usage: { input_tokens: 80, output_tokens: 20, total_tokens: 100 },
+      estimated_cost_usd: 0.02,
+      tool_calls_observed: 4,
+      transcript_analysis: {
+        command_count: 4,
+        tool_categories: { command_execution: 4 },
+        command_categories: { shell_search: 2, direct_file_read: 2 },
+        direct_source_reads_total: 2,
+        external_context_tool_calls: 0,
+      },
+    },
+    {
+      arm: "with_codestory",
+      status: "pass",
+      wall_ms: 50,
+      agent_runner_wall_ms: 40,
+      usage: { input_tokens: 30, output_tokens: 10, total_tokens: 40 },
+      estimated_cost_usd: 0.01,
+      tool_calls_observed: 1,
+      codex_tool_calls_observed: 0,
+      codestory_harness_prelude: {
+        wall_ms: 10,
+      },
+      codestory_cache_provenance: {
+        cache_preparation: { preparation_wall_ms: 10 },
+      },
+      transcript_analysis: {
+        command_count: 1,
+        tool_categories: { command_execution: 1 },
+        command_categories: { codestory_cli: 1 },
+        direct_source_reads_total: 0,
+        external_context_tool_calls: 0,
+      },
+    },
+    {
+      arm: "with_codestory",
+      status: "fail",
+      wall_ms: 5,
+      usage: null,
+      estimated_cost_usd: null,
+      tool_calls_observed: 1,
+      transcript_analysis: {
+        command_count: 1,
+        tool_categories: { command_execution: 1 },
+        command_categories: { codestory_cli: 1 },
+        direct_source_reads_total: 0,
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(costAccounting.arms.with_codestory.runs, 2);
+  assert.equal(costAccounting.arms.with_codestory.failed_runs, 1);
+  assert.equal(costAccounting.arms.with_codestory.missing_token_usage_runs, 1);
+  assert.equal(costAccounting.arms.without_codestory.time_spent_ms.agent_runner, 190);
+  assert.equal(costAccounting.arms.without_codestory.time_spent_ms.baseline_harness_prelude, 10);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.runner_wall, 55);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.agent_runner, 45);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.codestory_harness_prelude, 10);
+  assert.equal(costAccounting.arms.with_codestory.time_spent_ms.all_in, 65);
+  assert.equal(costAccounting.arms.with_codestory.tokens_spent.total_tokens, 40);
+  assert.equal(costAccounting.arms.with_codestory.tool_calls.codex_observed, 0);
+  assert.equal(costAccounting.arms.without_codestory.tool_calls.observed, 4);
+  assert.equal(costAccounting.arms.without_codestory.commands.categories.shell_search, 2);
+  assert.equal(costAccounting.with_vs_without.total_tokens.ratio, 0.4);
+  assert.equal(costAccounting.with_vs_without.all_in_wall_ms.ratio, 0.325);
+  assert.equal(costAccounting.with_vs_without.tool_calls.with_minus_without, -2);
+});
+
 test("parses JSONL transcript text before analysis", () => {
   const jsonl = [
     JSON.stringify(commandEvent("cmd_1", "item.started", "codestory-cli packet --project . --question flow")),
@@ -468,6 +756,33 @@ test("requires packet as the CodeStory subcommand for packet-first telemetry", (
   assert.equal(analysis.packet_was_first_context_command, false);
 });
 
+test("recognizes quoted PowerShell variable CodeStory packet commands", () => {
+  const command =
+    "\"C:\\\\Program Files\\\\PowerShell\\\\pwsh.exe\" -Command '$cli = if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { '\"'codestory-cli' }\n& \"'$cli packet --project . --question '\"'Explain flow' --task-class 'architecture-explanation' --budget compact --format json\"";
+  const events = [
+    commandEvent("cmd_1", "item.started", command),
+    commandEvent("cmd_1", "item.completed", command, "{\"packet_id\":\"ask-1\"}", 0),
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.codestory_cli, 1);
+  assert.equal(analysis.first_successful_packet_command.id, "cmd_1");
+  assert.equal(analysis.packet_was_first_context_command, true);
+});
+
+test("recognizes inline PowerShell env fallback CodeStory packet commands", () => {
+  const command = String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $(if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { 'codestory-cli' }) packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`;
+  const events = [
+    commandEvent("cmd_1", "item.started", command),
+    commandEvent("cmd_1", "item.completed", command, "{\"packet_id\":\"ask-1\"}", 0),
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.codestory_cli, 1);
+  assert.equal(analysis.first_successful_packet_command.id, "cmd_1");
+  assert.equal(analysis.packet_was_first_context_command, true);
+});
+
 test("packet-first telemetry treats git and help probes before packet as context", () => {
   const gitFirst = analyzeTranscript([
     commandEvent("cmd_git", "item.completed", "git status --short", " M file"),
@@ -483,6 +798,35 @@ test("packet-first telemetry treats git and help probes before packet as context
   assert.equal(helpFirst.first_successful_context_command.id, "cmd_help");
   assert.equal(helpFirst.first_successful_packet_command.id, "cmd_packet");
   assert.equal(helpFirst.packet_was_first_context_command, false);
+});
+
+test("harness packet prelude counts as the first context command", () => {
+  const events = [
+    {
+      type: "harness.command.started",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command: '"C:\\tools\\codestory-cli.exe" packet --project . --question flow --format json',
+      },
+    },
+    {
+      type: "harness.command.completed",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command: '"C:\\tools\\codestory-cli.exe" packet --project . --question flow --format json',
+        aggregated_output: '{"answer":{"citations":[{"file_path":"src/requests/sessions.py"}]}}',
+        exit_code: 0,
+      },
+    },
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_count, 1);
+  assert.equal(analysis.tool_categories.command_execution, 1);
+  assert.equal(analysis.first_successful_packet_command.id, "harness_codestory_packet");
+  assert.equal(analysis.packet_was_first_context_command, true);
 });
 
 test("codestory cli resolver prefers explicit path, release binary, then PATH fallback", () => {
@@ -646,6 +990,127 @@ test("packet composition separates citations, answer surfaces, and structured-on
   assert.equal(composition.verification_summary.structured_file_recall, 0);
 });
 
+test("packet prompt excerpt keeps answer support while dropping bulky packet fields", () => {
+  const longText = `${"flow ".repeat(1400)}tail`;
+  const promptPacket = packetForAgentPrompt({
+    answer: {
+      summary: "Requests flow",
+      sections: [{ title: "Verbose", blocks: [{ markdown: longText }] }],
+      citations: [
+        {
+          display_name: "Session.request",
+          kind: "function",
+          file_path:
+            "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/sessions.py",
+          line: 557,
+          snippet: "large snippet should not be embedded",
+        },
+      ],
+    },
+    sufficiency: {
+      status: "partial",
+      gaps: ["drop me"],
+      open_next: ["drop me too"],
+      avoid_opening: [
+        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/api.py",
+      ],
+      follow_up_commands: ["a", "b", "c", "d", "e"],
+      covered_claims: [
+        {
+          claim: "Session.request prepares requests.",
+          citations: [
+            {
+              display_name: "Session.request",
+              file_path:
+                "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/sessions.py",
+              line: 557,
+            },
+          ],
+        },
+      ],
+    },
+  });
+
+  assert.equal(promptPacket.answer.summary, "Requests flow");
+  assert.match(promptPacket.answer.text, /\[truncated \d+ chars\]$/);
+  assert.ok(promptPacket.answer.text.length < longText.length);
+  assert.deepEqual(promptPacket.answer.citations, [
+    {
+      display_name: "Session.request",
+      kind: "function",
+      file_path: "src/requests/sessions.py",
+      line: 557,
+    },
+  ]);
+  assert.deepEqual(promptPacket.sufficiency.avoid_opening, ["src/requests/api.py"]);
+  assert.deepEqual(promptPacket.sufficiency.follow_up_commands, ["a", "b", "c", "d"]);
+  assert.deepEqual(promptPacket.sufficiency.covered_claims, [
+    "Session.request prepares requests.",
+  ]);
+  assert.equal(Object.hasOwn(promptPacket.answer, "sections"), false);
+  assert.equal(Object.hasOwn(promptPacket.sufficiency, "gaps"), false);
+  assert.equal(Object.hasOwn(promptPacket.sufficiency, "open_next"), false);
+});
+
+test("packet manifest completion is gated by packet quality evidence", () => {
+  const task = manifestFixture({
+    expected_files: ["src/requests/sessions.py"],
+    expected_symbols: ["Session.request"],
+    expected_claims: ["Session.request prepares requests."],
+  });
+  const packet = {
+    answer: {
+      summary: "Session.request prepares requests in src/requests/sessions.py.",
+      sections: [],
+      citations: [
+        {
+          display_name: "Session.request",
+          file_path: "src/requests/sessions.py",
+          line: 557,
+        },
+      ],
+    },
+    sufficiency: {
+      covered_claims: [{ claim: "Session.request prepares requests." }],
+    },
+  };
+
+  const quality = packetManifestQualitySummary(packet, task);
+  assert.equal(quality.pass, true);
+  assert.equal(
+    packetPreludeManifestComplete({
+      packet_manifest_quality: quality,
+      packet_composition: packetComposition(packet, task),
+    }),
+    true,
+  );
+
+  const incompleteQuality = packetManifestQualitySummary(
+    {
+      answer: {
+        summary: "Session.request is present in src/requests/sessions.py.",
+        citations: [
+          {
+            display_name: "Session.request",
+            file_path: "src/requests/sessions.py",
+            line: 557,
+          },
+        ],
+      },
+      sufficiency: { covered_claims: [] },
+    },
+    task,
+  );
+  assert.equal(incompleteQuality.pass, false);
+  assert.equal(
+    packetPreludeManifestComplete({
+      packet_manifest_quality: incompleteQuality,
+      packet_composition: packetComposition(packet, task),
+    }),
+    false,
+  );
+});
+
 const LOCAL_REAL_COMPACT_BUDGET_TASKS = [
   {
     repo: "vscode",
@@ -750,6 +1215,30 @@ test("forbidden claim scoring requires negative polarity terms", () => {
   assert.equal(quality.pass, true);
 });
 
+test("forbidden claim scoring does not flag contradicted positive claims", () => {
+  const task = runtimeQualityTask("forbidden-positive-contradicted-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = ["StringUtils.isEmpty treats whitespace-only strings as empty."];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "StringUtils.isEmpty does not trim whitespace before deciding emptiness.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
 test("forbidden claim scoring does not combine unrelated storage sentences", () => {
   const task = runtimeQualityTask("forbidden-storage-fixture", {
     min_expected_file_recall: 0,
@@ -765,6 +1254,32 @@ test("forbidden claim scoring does not combine unrelated storage sentences", () 
     [
       agentMessageEvent(
         "StorageAccessProxy forwards storage calls to the active storage subject. PersistentStorage is the concrete persistent implementation behind the storage access contract.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
+test("forbidden claim scoring keeps polarity inside one candidate sentence", () => {
+  const task = runtimeQualityTask("forbidden-shell-polarity-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "nvm is a compiled binary and does not dispatch through shell functions.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "`nvm` is the shell function dispatcher. `nvm_use_if_needed` switches versions only when the requested version is not already active.",
       ),
     ],
     task,
@@ -810,11 +1325,14 @@ function publishableWithCodeStoryResult(overrides = {}) {
     arm: "with_codestory",
     repeat: 1,
     status: "pass",
+    wall_ms: 10,
     usage: { total_tokens: 100 },
+    tool_calls_observed: 1,
     packet_first_required: true,
     packet_first_pass: true,
     quality: { pass: true },
     transcript_analysis: {
+      command_count: 1,
       ordinary_source_reads_after_first_packet: 0,
     },
     repo_provenance: pinnedRepoProvenance(),
@@ -872,6 +1390,19 @@ test("publishable gate blocks avoidable source reads after packet", () => {
   assert.match(blockers[0].reasons.join("\n"), /ordinary source reads after packet=1 > 0/);
 });
 
+test("publishable gate records but does not block post-packet reads by default", () => {
+  const blockers = agentPublishableBlockers([
+    publishableWithCodeStoryResult({
+      transcript_analysis: {
+        command_count: 3,
+        ordinary_source_reads_after_first_packet: 2,
+      },
+    }),
+  ]);
+
+  assert.deepEqual(blockers, []);
+});
+
 test("publishable gate requires packet before ordinary context exploration", () => {
   const blockers = agentPublishableBlockers(
     [
@@ -895,6 +1426,88 @@ test("publishable gate requires packet before ordinary context exploration", () 
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /missing answer packet as first successful context command/);
+});
+
+test("publishable gate rejects CodeStory use in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 1,
+        command_categories: {
+          codestory_cli: 1,
+        },
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /without_codestory arm used CodeStory/);
+});
+
+test("publishable gate requires local repo inspection in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 0,
+        command_categories: {},
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /without_codestory arm did not inspect local repository/);
+});
+
+test("publishable gate accepts ordinary local inspection in the without arm", () => {
+  const blockers = agentPublishableBlockers([
+    {
+      repo: "codestory",
+      task_id: "codestory-indexing-flow",
+      arm: "without_codestory",
+      repeat: 1,
+      status: "pass",
+      wall_ms: 10,
+      usage: { total_tokens: 100 },
+      tool_calls_observed: 1,
+      packet_first_required: false,
+      packet_first_pass: true,
+      quality: { pass: true },
+      transcript_analysis: {
+        command_count: 2,
+        command_categories: {
+          shell_search: 1,
+          direct_file_read: 1,
+        },
+        external_context_tool_calls: 0,
+      },
+    },
+  ]);
+
+  assert.deepEqual(blockers, []);
 });
 
 test("publishable provenance requires pinned clean manifest checkout", () => {
@@ -977,6 +1590,29 @@ test("publishable gate accepts local-only CodeStory cache provenance", () => {
   assert.deepEqual(blockers, []);
 });
 
+test("publishable gate requires resource accounting fields", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      publishableWithCodeStoryResult({
+        wall_ms: null,
+        usage: { total_tokens: null },
+        tool_calls_observed: null,
+        transcript_analysis: {
+          ordinary_source_reads_after_first_packet: 0,
+        },
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  const reasons = blockers[0].reasons.join("\n");
+  assert.match(reasons, /missing wall time/);
+  assert.match(reasons, /missing total token usage/);
+  assert.match(reasons, /missing tool call count/);
+  assert.match(reasons, /missing command count/);
+});
+
 test("publishable gate requires CodeStory local-only provenance", () => {
   const blockers = agentPublishableBlockers(
     [
@@ -1046,6 +1682,21 @@ test("packet runtime publishable gate requires SLA pass and full retrieval shado
   assert.match(blockers[0].reasons.join("\n"), /packet retrieval SLA missed=true; expected false/);
   assert.match(blockers[1].reasons.join("\n"), /missing retrieval shadow telemetry/);
   assert.match(blockers[2].reasons.join("\n"), /packet retrieval shadow mode=degraded; expected full/);
+});
+
+test("holdout packet runtime requires quality gate unless failures are allowed", () => {
+  assert.equal(
+    packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }),
+    true,
+  );
+  assert.equal(
+    packetRuntimeQualityGateRequired({
+      taskSuite: "holdout-retrieval",
+      allowFailures: true,
+    }),
+    false,
+  );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
 });
 
 test("reanalysis uses the run-time task snapshot before current manifest contents", async () => {
@@ -1120,4 +1771,57 @@ test("buildQualityDebugPayload aggregates failure counts", () => {
   ]);
   assert.equal(payload.summary.quality_fail_runs, 1);
   assert.ok(Object.keys(payload.summary.failure_reason_counts).length > 0);
+});
+
+test("buildQualityDebugPayload preserves packet sufficiency diagnostics", () => {
+  const payload = buildQualityDebugPayload([
+    {
+      repo: "requests",
+      task_id: "requests-session-flow",
+      mode: "cold_cli_packet",
+      status: "pass",
+      quality: {
+        pass: true,
+        thresholds: {},
+        expected_anchors: { recall: 1 },
+        expected_files: { recall: 1 },
+        expected_symbols: { recall: 1 },
+        expected_claims: { recall: 1 },
+        citation_coverage: { recall: 1 },
+        forbidden_claims: { found: 0 },
+      },
+      sufficiency: {
+        status: "partial",
+        gaps_count: 2,
+        gaps: [
+          "Packet was truncated by Compact budget: citations, trail_edges.",
+          "Packet omitted answer-critical evidence under Compact budget; use a deeper packet before treating this as complete.",
+        ],
+        open_next_count: 2,
+        open_next: ["codestory-cli packet --budget standard", "codestory-cli search --why"],
+        follow_up_commands_count: 2,
+        follow_up_commands: [
+          "codestory-cli packet --budget standard",
+          "codestory-cli search --why",
+        ],
+        covered_claims_count: 8,
+        avoid_opening_count: 4,
+        sufficient_quality_mismatch: false,
+      },
+    },
+  ]);
+
+  assert.equal(payload.rows[0].sufficiency_status, "partial");
+  assert.deepEqual(payload.rows[0].sufficiency.gaps, [
+    "Packet was truncated by Compact budget: citations, trail_edges.",
+    "Packet omitted answer-critical evidence under Compact budget; use a deeper packet before treating this as complete.",
+  ]);
+  assert.equal(payload.rows[0].sufficiency.follow_up_commands_count, 2);
+  assert.equal(payload.summary.packet_partial_runs, 1);
+  assert.equal(
+    payload.summary.partial_gap_counts[
+      "Packet was truncated by Compact budget: citations, trail_edges."
+    ],
+    1,
+  );
 });

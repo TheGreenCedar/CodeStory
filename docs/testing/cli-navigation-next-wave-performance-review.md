@@ -48,7 +48,7 @@ clock milliseconds from `Measure-Command`; stdout was redirected to `Out-Null`.
 - Route/ranking changes must keep the search-quality eval at no lost expected
   anchors and no lower MRR unless the validation record explains the tradeoff.
 - `files` coverage output must remain deterministic and include
-  `fixture_status`, `unsupported_patterns`, `known_gaps`, and `promotable`.
+  `coverage_evidence`, `unsupported_patterns`, `known_gaps`, and `promotable`.
 - `explore` JSON must keep stable status, profile, resolution, navigation,
   relationship evidence, route context, source packet, trail, symbol, and
   snippet sections.

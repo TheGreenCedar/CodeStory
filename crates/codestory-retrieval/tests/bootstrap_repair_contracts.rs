@@ -46,6 +46,11 @@ fn mixed_flat_and_hashed_cache_protects_both_manifest_collections() {
             sidecar_input_hash: None,
             sidecar_generation: None,
             projection_count: None,
+            symbol_doc_count: None,
+            dense_projection_count: None,
+            semantic_policy_version: None,
+            graph_artifact_hash: None,
+            dense_reason_counts_json: None,
         })
         .expect("flat manifest");
 
@@ -67,6 +72,11 @@ fn mixed_flat_and_hashed_cache_protects_both_manifest_collections() {
             sidecar_input_hash: None,
             sidecar_generation: None,
             projection_count: None,
+            symbol_doc_count: None,
+            dense_projection_count: None,
+            semantic_policy_version: None,
+            graph_artifact_hash: None,
+            dense_reason_counts_json: None,
         })
         .expect("hashed manifest");
 

@@ -2,7 +2,7 @@ use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{
     AccessKind, EdgeKind, NodeId, NodeKind, OccurrenceKind, ResolutionCertainty,
 };
-use codestory_indexer::resolution::ResolutionPass;
+use codestory_indexer::resolution::{RESOLUTION_SUPPORT_SNAPSHOT_VERSION, ResolutionPass};
 use codestory_indexer::{IncrementalIndexingStats, WorkspaceIndexer};
 use codestory_store::Store as Storage;
 use std::fs;
@@ -258,7 +258,7 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
     assert_eq!(first_stats.artifact_cache_hits, 0);
     assert_eq!(first_stats.artifact_cache_misses, 1);
     assert!(!first_stats.resolution_support_snapshot_hit);
-    assert!(storage.has_ready_resolution_support_snapshot(1)?);
+    assert!(storage.has_ready_resolution_support_snapshot(RESOLUTION_SUPPORT_SNAPSHOT_VERSION)?);
 
     let second_stats = run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
     assert_eq!(second_stats.artifact_cache_hits, 1);
@@ -438,7 +438,7 @@ func (r *Router) Handle(path string) {}
     assert!(
         before_nodes
             .iter()
-            .any(|node| node.serialized_name == "StrictSlash"),
+            .any(|node| node.serialized_name == "Router.StrictSlash"),
         "expected initial Go parser-backed method projection"
     );
     let file_id = before_nodes
@@ -471,7 +471,7 @@ func (r *Router) Handle(path string) {}
     assert!(
         !after_nodes
             .iter()
-            .any(|node| node.serialized_name == "StrictSlash"),
+            .any(|node| node.serialized_name.ends_with(".StrictSlash")),
         "stale Go method should be removed after structural refresh"
     );
     let states_after = storage.get_callable_projection_states_for_file(file_id.0)?;

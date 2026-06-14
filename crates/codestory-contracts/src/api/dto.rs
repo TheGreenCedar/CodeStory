@@ -190,6 +190,10 @@ pub struct StoredSemanticDocsContractDto {
     pub mixed_doc_shapes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_shape: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_policy_version: Option<String>,
+    #[serde(default)]
+    pub mixed_semantic_policy_versions: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -227,6 +231,60 @@ pub struct IndexFreshnessDto {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<IndexFreshnessSampleDto>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessGoalDto {
+    LocalNavigation,
+    AgentPacketSearch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessStatusDto {
+    Ready,
+    RepairIndex,
+    CheckIndex,
+    RepairRetrieval,
+    CacheBusy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessIndexSnapshotDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<IndexFreshnessStatusDto>,
+    pub changed_file_count: u32,
+    pub new_file_count: u32,
+    pub removed_file_count: u32,
+    pub checked_file_count: u32,
+    pub indexed_file_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessSidecarSnapshotDto {
+    pub retrieval_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_input_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessVerdictDto {
+    pub goal: ReadinessGoalDto,
+    pub status: ReadinessStatusDto,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimum_next: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub full_repair: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<ReadinessIndexSnapshotDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<ReadinessSidecarSnapshotDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -504,12 +562,19 @@ pub struct IndexedFileDto {
 pub struct IndexedFileLanguageCountDto {
     pub language: String,
     pub file_count: u32,
+    pub support_mode: String,
+    pub evidence_tier: String,
+    pub claim_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct IndexedFilesSummaryDto {
     pub file_count: u32,
     pub indexed_file_count: u32,
+    #[serde(default)]
+    pub filtered_file_count: u32,
+    #[serde(default)]
+    pub visible_file_count: u32,
     pub incomplete_file_count: u32,
     pub error_file_count: u32,
     pub truncated: bool,
@@ -533,7 +598,8 @@ pub struct FrameworkRouteCoverageDto {
     pub framework: String,
     pub language: String,
     pub status: String,
-    pub fixture_status: String,
+    #[serde(alias = "fixture_status")]
+    pub coverage_evidence: String,
     pub confidence_floor: String,
     pub handler_link_support: String,
     #[serde(default)]
@@ -1305,6 +1371,8 @@ pub struct RetrievalScoreBreakdownDto {
     pub semantic: f32,
     pub graph: f32,
     pub total: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1507,6 +1575,17 @@ pub struct RetrievalShadowDto {
     pub candidate_resolution_counts: Vec<RetrievalCandidateResolutionCountDto>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct PacketSidecarQueryDiagnosticDto {
+    pub query: String,
+    pub retrieval_mode: String,
+    pub candidate_count: u32,
+    pub resolved_hit_count: u32,
+    pub unresolved_candidate_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
@@ -1524,6 +1603,8 @@ pub struct AgentRetrievalTraceDto {
     #[serde(default)]
     pub annotations: Vec<String>,
     pub steps: Vec<AgentRetrievalStepDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packet_sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_shadow: Option<RetrievalShadowDto>,
 }
@@ -1674,6 +1755,8 @@ pub struct AgentPacketRequestDto {
     pub budget: PacketBudgetModeDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_class: Option<PacketTaskClassDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_probes: Vec<String>,
     #[serde(default = "default_include_evidence")]
     pub include_evidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1714,6 +1797,7 @@ pub struct PacketBudgetDto {
 pub enum PacketSufficiencyStatusDto {
     Sufficient,
     Partial,
+    #[serde(rename = "blocked", alias = "insufficient")]
     Insufficient,
 }
 
@@ -1740,7 +1824,7 @@ pub struct PacketSufficiencyDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct PacketBenchmarkTraceDto {
+pub struct PacketRetrievalTraceSummaryDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
     pub source_read_steps: u32,
     pub search_steps: u32,
@@ -1757,7 +1841,8 @@ pub struct AgentPacketDto {
     pub answer: AgentAnswerDto,
     pub budget: PacketBudgetDto,
     pub sufficiency: PacketSufficiencyDto,
-    pub benchmark_trace: PacketBenchmarkTraceDto,
+    #[serde(alias = "benchmark_trace")]
+    pub retrieval_trace_summary: PacketRetrievalTraceSummaryDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1858,6 +1943,7 @@ mod packet_tests {
             semantic_fallbacks: Vec::new(),
             annotations: Vec::new(),
             steps: Vec::new(),
+            packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: Some(RetrievalShadowDto {
                 retrieval_mode: "unavailable".to_string(),
                 degraded_reason: Some("sidecar_unavailable".to_string()),
@@ -1888,8 +1974,49 @@ mod packet_tests {
     }
 
     #[test]
+    fn framework_route_coverage_uses_product_evidence_field_with_legacy_alias() {
+        let coverage = FrameworkRouteCoverageDto {
+            framework: "express".to_string(),
+            language: "javascript/typescript".to_string(),
+            status: "partial".to_string(),
+            coverage_evidence: "validated_by_indexer_regression".to_string(),
+            confidence_floor: "heuristic".to_string(),
+            handler_link_support: "probable_when_handler_name_resolves".to_string(),
+            unsupported_patterns: vec!["router composition is partial".to_string()],
+            known_gaps: vec!["mounted prefixes are not globally propagated".to_string()],
+            promotable: true,
+        };
+
+        let value = serde_json::to_value(&coverage).expect("serialize");
+        assert_eq!(
+            value["coverage_evidence"],
+            "validated_by_indexer_regression"
+        );
+        assert!(
+            value.get("fixture_status").is_none(),
+            "product JSON should use coverage_evidence, not fixture_status"
+        );
+
+        let legacy: FrameworkRouteCoverageDto = serde_json::from_str(
+            r#"{
+                "framework":"express",
+                "language":"javascript/typescript",
+                "status":"partial",
+                "fixture_status":"covered_by_indexer_unit_fixture",
+                "confidence_floor":"heuristic",
+                "handler_link_support":"probable_when_handler_name_resolves",
+                "unsupported_patterns":[],
+                "known_gaps":[],
+                "promotable":true
+            }"#,
+        )
+        .expect("deserialize legacy field spelling");
+        assert_eq!(legacy.coverage_evidence, "covered_by_indexer_unit_fixture");
+    }
+
+    #[test]
     fn packet_sufficiency_serializes_status_as_snake_case() {
-        let value = serde_json::to_value(PacketSufficiencyDto {
+        let partial = serde_json::to_value(PacketSufficiencyDto {
             status: PacketSufficiencyStatusDto::Partial,
             covered_claims: Vec::new(),
             open_next: vec!["codestory-cli search --query runtime".to_string()],
@@ -1899,7 +2026,22 @@ mod packet_tests {
         })
         .expect("serialize");
 
-        assert_eq!(value["status"], "partial");
+        assert_eq!(partial["status"], "partial");
+
+        let blocked = serde_json::to_value(PacketSufficiencyDto {
+            status: PacketSufficiencyStatusDto::Insufficient,
+            covered_claims: Vec::new(),
+            open_next: Vec::new(),
+            avoid_opening: Vec::new(),
+            gaps: vec!["Sidecar readiness is not full.".to_string()],
+            follow_up_commands: Vec::new(),
+        })
+        .expect("serialize");
+
+        assert_eq!(blocked["status"], "blocked");
+        let legacy: PacketSufficiencyStatusDto =
+            serde_json::from_str("\"insufficient\"").expect("deserialize legacy status");
+        assert_eq!(legacy, PacketSufficiencyStatusDto::Insufficient);
     }
 
     #[test]

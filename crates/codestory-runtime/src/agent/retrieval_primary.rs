@@ -5,8 +5,9 @@ use crate::agent::retrieval_rollback::{RollbackCheckInput, check_and_log_rollbac
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::{
-    ApiError, RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto,
-    RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStageTimingDto, SearchHit,
+    ApiError, PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
+    RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
+    RetrievalStageTimingDto, SearchHit,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
@@ -19,6 +20,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_000;
+const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
+const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
@@ -161,13 +164,41 @@ fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
     vec![
         format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval bootstrap --project {project} --format json"),
-        format!("codestory-cli retrieval index --project {project} --refresh full"),
+        format!("codestory-cli retrieval index --project {project} --refresh full --format json"),
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
 
 fn quote_cli_arg(value: &str) -> String {
+    let normalized = clean_cli_path(value);
+    if normalized
+        .chars()
+        .any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
+    {
+        quote_shell_single_quoted_arg(&normalized)
+    } else {
+        format!("\"{}\"", normalized.replace('"', "\\\""))
+    }
+}
+
+#[cfg(windows)]
+fn quote_shell_single_quoted_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_shell_single_quoted_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn clean_cli_path(value: &str) -> String {
+    let mut path = value.replace('\\', "/");
+    if let Some(stripped) = path.strip_prefix("//?/UNC/") {
+        path = format!("//{stripped}");
+    } else if path.starts_with("//?/") {
+        path = path[4..].to_string();
+    }
+    path
 }
 
 pub(crate) fn shadow_retrieval_enabled() -> bool {
@@ -272,6 +303,13 @@ pub(crate) fn sidecar_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
         .map(|ms| u64::from(ms).min(DEFAULT_SIDECAR_BUDGET_MS))
         .unwrap_or(DEFAULT_SIDECAR_BUDGET_MS)
         .max(100)
+}
+
+fn sidecar_packet_batch_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
+    latency_budget_ms
+        .map(u64::from)
+        .unwrap_or(DEFAULT_PACKET_BATCH_BUDGET_MS)
+        .clamp(100, MAX_PACKET_BATCH_BUDGET_MS)
 }
 
 pub(crate) fn run_sidecar_query(
@@ -409,34 +447,86 @@ pub(crate) fn search_sidecar_packet_batch(
     controller: &AppController,
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
-) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
+) -> Result<SidecarPacketBatchOutcome, ApiError> {
     with_sidecar_primary_retrieval(|| {
         search_sidecar_packet_batch_inner(controller, queries, latency_budget_ms)
     })
+}
+
+pub(crate) struct SidecarPacketBatchOutcome {
+    pub results: Vec<(String, Vec<SearchHit>)>,
+    pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+}
+
+struct SidecarCandidateResolutionOutcome {
+    resolved_hits: Vec<SearchHit>,
+    attempted_candidate_count: usize,
+    unresolved_candidate_count: usize,
+}
+
+fn packet_sidecar_query_diagnostic(
+    query_result: &QueryResult,
+    resolution: &SidecarCandidateResolutionOutcome,
+) -> PacketSidecarQueryDiagnosticDto {
+    PacketSidecarQueryDiagnosticDto {
+        query: query_result.query.clone(),
+        retrieval_mode: query_result.trace.retrieval_mode.clone(),
+        candidate_count: u32::try_from(resolution.attempted_candidate_count).unwrap_or(u32::MAX),
+        resolved_hit_count: u32::try_from(resolution.resolved_hits.len()).unwrap_or(u32::MAX),
+        unresolved_candidate_count: u32::try_from(resolution.unresolved_candidate_count)
+            .unwrap_or(u32::MAX),
+        diagnostic: (resolution.unresolved_candidate_count > 0)
+            .then(|| "sidecar candidates did not all resolve to indexed symbols".to_string()),
+    }
 }
 
 fn search_sidecar_packet_batch_inner(
     controller: &AppController,
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
-) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
-    let per_query_budget = sidecar_budget_ms(latency_budget_ms)
+) -> Result<SidecarPacketBatchOutcome, ApiError> {
+    search_sidecar_packet_batch_inner_with_query(
+        controller,
+        queries,
+        latency_budget_ms,
+        run_sidecar_query,
+    )
+}
+
+fn search_sidecar_packet_batch_inner_with_query(
+    controller: &AppController,
+    queries: &[(String, usize)],
+    latency_budget_ms: Option<u32>,
+    mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
+) -> Result<SidecarPacketBatchOutcome, ApiError> {
+    let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
         .checked_div(queries.len().max(1) as u64)
         .unwrap_or(100)
         .max(100);
     let mut results = Vec::with_capacity(queries.len());
+    let mut diagnostics = Vec::with_capacity(queries.len());
     for (query, max_results) in queries {
-        let query_result = run_sidecar_query(controller, query, Some(per_query_budget as u32))
-            .map_err(|error| {
+        let query_result =
+            run_query(controller, query, Some(per_query_budget as u32)).map_err(|error| {
                 sidecar_retrieval_unavailable_error(
                     controller,
                     format!("sidecar retrieval batch query failed: {error}"),
                 )
             })?;
         let max_results = (*max_results).clamp(1, 50);
-        let resolved_hits =
-            resolve_sidecar_candidates_to_search_hits(controller, &query_result.hits, max_results)
-                .unwrap_or_default();
+        let resolution =
+            resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results)
+                .map_err(|error| {
+                    sidecar_retrieval_unavailable_error(
+                        controller,
+                        format!(
+                            "sidecar retrieval rejected packet batch query `{query}`: candidate resolution failed: {}",
+                            error.message
+                        ),
+                    )
+                })?;
+        diagnostics.push(packet_sidecar_query_diagnostic(&query_result, &resolution));
+        let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
             let diagnostic =
                 sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
@@ -449,12 +539,15 @@ fn search_sidecar_packet_batch_inner(
         }
         results.push((query.clone(), resolved_hits));
     }
-    Ok(results)
+    Ok(SidecarPacketBatchOutcome {
+        results,
+        diagnostics,
+    })
 }
 
 fn sidecar_packet_batch_rejection_reason(
     query_result: &QueryResult,
-    resolved_hits: &[SearchHit],
+    _resolved_hits: &[SearchHit],
 ) -> Option<String> {
     if !sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode) {
         return Some(format!(
@@ -462,19 +555,7 @@ fn sidecar_packet_batch_rejection_reason(
             query_result.trace.retrieval_mode
         ));
     }
-    if sidecar_packet_batch_unresolved_full_mode(query_result, resolved_hits) {
-        return Some("sidecar retrieval candidates did not resolve to indexed symbols".into());
-    }
     None
-}
-
-fn sidecar_packet_batch_unresolved_full_mode(
-    query_result: &QueryResult,
-    resolved_hits: &[SearchHit],
-) -> bool {
-    sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode)
-        && !query_result.hits.is_empty()
-        && resolved_hits.is_empty()
 }
 
 pub(crate) fn packet_batch_should_use_sidecar(controller: &AppController) -> bool {
@@ -1051,6 +1132,16 @@ fn resolve_candidate_node_id(
     rel_path: &str,
     candidate: &CandidateHit,
 ) -> Option<CoreNodeId> {
+    if let Some(node_id) = candidate
+        .node_id
+        .as_deref()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .map(CoreNodeId)
+        && storage.get_node(node_id).ok().flatten().is_some()
+    {
+        return Some(node_id);
+    }
+
     if let Some(line) = candidate.start_line {
         let mut first_nodes = Vec::new();
         for lookup_path in candidate_lookup_paths(project_root, rel_path) {
@@ -1115,11 +1206,22 @@ pub(crate) fn resolve_sidecar_candidates_to_search_hits(
     candidates: &[CandidateHit],
     max_results: usize,
 ) -> Result<Vec<SearchHit>, ApiError> {
+    resolve_sidecar_candidates_with_stats(controller, candidates, max_results)
+        .map(|outcome| outcome.resolved_hits)
+}
+
+fn resolve_sidecar_candidates_with_stats(
+    controller: &AppController,
+    candidates: &[CandidateHit],
+    max_results: usize,
+) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
     controller.ensure_search_state()?;
     let storage = controller.open_storage()?;
     let project_root = controller.require_project_root()?;
     let node_names = controller.state.lock().node_names.clone();
     let mut hits = Vec::new();
+    let mut attempted_candidate_count = 0;
+    let mut unresolved_candidate_count = 0;
     let mut seen = HashMap::<String, ()>::new();
     let mut ordered: Vec<&CandidateHit> = candidates
         .iter()
@@ -1140,10 +1242,12 @@ pub(crate) fn resolve_sidecar_candidates_to_search_hits(
         if hits.len() >= max_results {
             break;
         }
+        attempted_candidate_count += 1;
         let rel_path = normalize_repo_relative_path(&project_root, &candidate.file_path);
         let Some(node_id) =
             resolve_candidate_node_id(&storage, &node_names, &project_root, &rel_path, candidate)
         else {
+            unresolved_candidate_count += 1;
             continue;
         };
         let dedupe_key = node_id.0.to_string();
@@ -1154,18 +1258,48 @@ pub(crate) fn resolve_sidecar_candidates_to_search_hits(
         let Some(mut hit) =
             AppController::build_search_hit(&storage, &node_names, node_id, candidate.score)
         else {
+            unresolved_candidate_count += 1;
             continue;
         };
-        hit.score_breakdown = Some(RetrievalScoreBreakdownDto {
-            lexical: candidate.score,
-            semantic: 0.0,
-            graph: 0.0,
-            total: candidate.score,
-        });
+        hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
         hits.push(hit);
     }
 
-    Ok(hits)
+    Ok(SidecarCandidateResolutionOutcome {
+        resolved_hits: hits,
+        attempted_candidate_count,
+        unresolved_candidate_count,
+    })
+}
+
+fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
+    let provenance = candidate_provenance_labels(candidate);
+    let (lexical, semantic, graph) = match candidate.source {
+        CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+        CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
+        CandidateSource::Scip => (0.0, 0.0, candidate.score),
+        CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
+    };
+    RetrievalScoreBreakdownDto {
+        lexical,
+        semantic,
+        graph,
+        total: candidate.score,
+        provenance,
+    }
+}
+
+fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
+    if !candidate.provenance.is_empty() {
+        return candidate.provenance.clone();
+    }
+    let label = match candidate.source {
+        CandidateSource::Zoekt => "lexical_source",
+        CandidateSource::Qdrant => "dense_anchor",
+        CandidateSource::Scip => "graph_neighbor",
+        CandidateSource::Legacy => "legacy",
+    };
+    vec![label.to_string()]
 }
 
 #[cfg(test)]
@@ -1174,12 +1308,9 @@ mod tests {
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
     };
-    use std::sync::{Mutex, MutexGuard};
 
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_test_lock() -> MutexGuard<'static, ()> {
-        ENV_TEST_LOCK.lock().expect("env test lock")
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::process_env_test_lock()
     }
 
     #[test]
@@ -1498,17 +1629,37 @@ mod tests {
     }
 
     #[test]
-    fn recovery_commands_quote_powershell_sensitive_project_paths() {
+    fn packet_batch_budget_uses_packet_latency_budget() {
+        assert_eq!(
+            sidecar_packet_batch_budget_ms(None),
+            DEFAULT_PACKET_BATCH_BUDGET_MS
+        );
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(18_000)), 18_000);
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(5_000)), 5_000);
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(5)), 100);
+        assert_eq!(
+            sidecar_packet_batch_budget_ms(Some(250_000)),
+            MAX_PACKET_BATCH_BUDGET_MS
+        );
+    }
+
+    #[test]
+    fn recovery_commands_quote_shell_sensitive_project_paths() {
         let commands = sidecar_retrieval_recovery_commands(r"C:\tmp\cost$cache`tick's repo");
+
+        #[cfg(windows)]
+        let expected_project = r"'C:/tmp/cost$cache`tick''s repo'";
+        #[cfg(not(windows))]
+        let expected_project = r"'C:/tmp/cost$cache`tick'\''s repo'";
 
         assert_eq!(
             commands[0],
-            r"codestory-cli index --project 'C:\tmp\cost$cache`tick''s repo' --refresh full"
+            format!("codestory-cli index --project {expected_project} --refresh full")
         );
         assert!(
             commands
                 .iter()
-                .all(|command| command.contains(r"--project 'C:\tmp\cost$cache`tick''s repo'")),
+                .all(|command| command.contains(&format!("--project {expected_project}"))),
             "all recovery commands should quote the project path literally: {commands:?}"
         );
     }
@@ -1551,6 +1702,11 @@ mod tests {
                 sidecar_input_hash: Some(hash.into()),
                 sidecar_generation: Some(generation),
                 projection_count: Some(0),
+                symbol_doc_count: Some(0),
+                dense_projection_count: Some(0),
+                semantic_policy_version: Some("graph_first_v1".into()),
+                graph_artifact_hash: Some("graph-test-hash".into()),
+                dense_reason_counts_json: Some("{}".into()),
             })
             .expect("manifest");
 
@@ -1646,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_batch_allows_empty_full_mode_queries_but_rejects_unresolved_candidates() {
+    fn packet_sidecar_query_diagnostic_distinguishes_empty_and_unresolved_candidates() {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let empty_full = QueryResult {
@@ -1663,11 +1819,176 @@ mod tests {
                 stages: Vec::new(),
             },
         };
-        assert_eq!(
-            sidecar_packet_batch_rejection_reason(&empty_full, &[]),
-            None
+        let empty_resolution = SidecarCandidateResolutionOutcome {
+            resolved_hits: Vec::new(),
+            attempted_candidate_count: 0,
+            unresolved_candidate_count: 0,
+        };
+        let empty_diagnostic = packet_sidecar_query_diagnostic(&empty_full, &empty_resolution);
+        assert_eq!(empty_diagnostic.candidate_count, 0);
+        assert_eq!(empty_diagnostic.resolved_hit_count, 0);
+        assert_eq!(empty_diagnostic.unresolved_candidate_count, 0);
+        assert!(empty_diagnostic.diagnostic.is_none());
+
+        let unresolved = QueryResult {
+            query: "handler".into(),
+            features: classify_query("handler"),
+            hits: vec![CandidateHit::with_source(
+                "semantic:handler",
+                Some("handler".into()),
+                0.5,
+                CandidateSource::Qdrant,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let unresolved_resolution = SidecarCandidateResolutionOutcome {
+            resolved_hits: Vec::new(),
+            attempted_candidate_count: 1,
+            unresolved_candidate_count: 1,
+        };
+        let unresolved_diagnostic =
+            packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution);
+        assert_eq!(unresolved_diagnostic.candidate_count, 1);
+        assert_eq!(unresolved_diagnostic.resolved_hit_count, 0);
+        assert_eq!(unresolved_diagnostic.unresolved_candidate_count, 1);
+        assert!(
+            unresolved_diagnostic
+                .diagnostic
+                .as_deref()
+                .is_some_and(|value| value.contains("did not all resolve"))
         );
-        assert!(!sidecar_packet_batch_unresolved_full_mode(&empty_full, &[]));
+    }
+
+    #[test]
+    fn packet_sidecar_query_diagnostic_ignores_candidates_skipped_by_result_cap() {
+        use codestory_retrieval::{CandidateSource, classify_query};
+        use codestory_store::{FileInfo, FileRole};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let source_path = temp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "fn alpha() {}\n").expect("write source");
+
+        {
+            let mut storage = Store::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: source_path.to_string_lossy().to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "alpha".to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+        let mut resolved_candidate = CandidateHit::with_source(
+            "src/lib.rs",
+            Some("alpha".to_string()),
+            1.0,
+            CandidateSource::Scip,
+        );
+        resolved_candidate.node_id = Some("2".to_string());
+        let query_result = QueryResult {
+            query: "alpha".into(),
+            features: classify_query("alpha"),
+            hits: vec![
+                resolved_candidate,
+                CandidateHit::with_source(
+                    "src/missing.rs",
+                    Some("missing".to_string()),
+                    0.5,
+                    CandidateSource::Scip,
+                ),
+            ],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+
+        let resolution = resolve_sidecar_candidates_with_stats(&controller, &query_result.hits, 1)
+            .expect("resolve sidecar candidates");
+        assert_eq!(resolution.attempted_candidate_count, 1);
+        assert_eq!(resolution.resolved_hits.len(), 1);
+        assert_eq!(resolution.unresolved_candidate_count, 0);
+
+        let diagnostic = packet_sidecar_query_diagnostic(&query_result, &resolution);
+        assert_eq!(diagnostic.candidate_count, 1);
+        assert_eq!(diagnostic.resolved_hit_count, 1);
+        assert_eq!(diagnostic.unresolved_candidate_count, 0);
+        assert!(
+            diagnostic.diagnostic.is_none(),
+            "capped-away candidates should not create unresolved diagnostics: {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn packet_batch_rejects_unavailable_sidecar_mode() {
+        use codestory_retrieval::{CandidateSource, classify_query};
+
+        let unavailable = QueryResult {
+            query: "handler".into(),
+            features: classify_query("handler"),
+            hits: Vec::new(),
+            trace: QueryTrace {
+                retrieval_mode: "no_semantic".into(),
+                degraded_reason: Some("semantic store unavailable".into()),
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        assert_eq!(
+            sidecar_packet_batch_rejection_reason(&unavailable, &[]).as_deref(),
+            Some("sidecar retrieval mode `no_semantic` is not eligible for packet batch results")
+        );
 
         let unresolved = QueryResult {
             query: "handler".into(),
@@ -1689,62 +2010,178 @@ mod tests {
             },
         };
         assert_eq!(
-            sidecar_packet_batch_rejection_reason(&unresolved, &[]),
-            Some("sidecar retrieval candidates did not resolve to indexed symbols".to_string())
+            sidecar_packet_batch_rejection_reason(&unresolved, &[]).as_deref(),
+            None,
+            "packet subqueries should report unresolved full-mode candidates as diagnostics instead of aborting the whole packet"
         );
-        assert!(sidecar_packet_batch_unresolved_full_mode(&unresolved, &[]));
-
-        let unresolved_scip_only = QueryResult {
-            query: "neutral sidecar candidate".into(),
-            features: classify_query("neutral sidecar candidate"),
-            hits: vec![CandidateHit::with_source(
-                "src/main.rs",
-                Some("src/main.rs".into()),
-                0.5,
-                CandidateSource::Scip,
-            )],
-            trace: QueryTrace {
-                retrieval_mode: "full".into(),
-                degraded_reason: None,
-                total_budget_ms: 100,
-                elapsed_ms: 120,
-                cancel_reason: None,
-                cache_hit: false,
-                stages: Vec::new(),
-            },
-        };
-        assert_eq!(
-            sidecar_packet_batch_rejection_reason(&unresolved_scip_only, &[]),
-            Some("sidecar retrieval candidates did not resolve to indexed symbols".to_string()),
-            "packet batch should fail closed when SCIP-only candidates do not resolve"
-        );
-        assert!(sidecar_packet_batch_unresolved_full_mode(
-            &unresolved_scip_only,
-            &[]
-        ));
     }
 
     #[test]
-    fn packet_batch_rejects_unavailable_sidecar_mode() {
+    fn packet_batch_reports_unresolved_full_mode_candidates_without_rejecting() {
+        use codestory_retrieval::CandidateSource;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let queries = vec![("helpers".to_string(), 5)];
+        let outcome = search_sidecar_packet_batch_inner_with_query(
+            &controller,
+            &queries,
+            Some(500),
+            |_, _, _| {
+                Ok(QueryResult {
+                    query: "helpers".into(),
+                    features: classify_query("helpers"),
+                    hits: vec![CandidateHit::with_source(
+                        "docs/helpers.md",
+                        Some("helpers".into()),
+                        0.5,
+                        CandidateSource::Scip,
+                    )],
+                    trace: QueryTrace {
+                        retrieval_mode: "full".into(),
+                        degraded_reason: None,
+                        total_budget_ms: 500,
+                        elapsed_ms: 1,
+                        cancel_reason: None,
+                        cache_hit: false,
+                        stages: Vec::new(),
+                    },
+                })
+            },
+        )
+        .expect("full-mode unresolved candidates should not reject packet batch");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].0, "helpers");
+        assert!(
+            outcome.results[0].1.is_empty(),
+            "unresolved packet query should contribute no resolved hits"
+        );
+        assert_eq!(outcome.diagnostics.len(), 1);
+        let diagnostic = &outcome.diagnostics[0];
+        assert_eq!(diagnostic.query, "helpers");
+        assert_eq!(diagnostic.retrieval_mode, "full");
+        assert_eq!(diagnostic.candidate_count, 1);
+        assert_eq!(diagnostic.resolved_hit_count, 0);
+        assert_eq!(diagnostic.unresolved_candidate_count, 1);
+        assert!(
+            diagnostic
+                .diagnostic
+                .as_deref()
+                .is_some_and(|value| value.contains("did not all resolve")),
+            "diagnostic should preserve unresolved sidecar detail: {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn packet_batch_divides_request_budget_across_queries() {
         use codestory_retrieval::classify_query;
 
-        let unavailable = QueryResult {
-            query: "handler".into(),
-            features: classify_query("handler"),
-            hits: Vec::new(),
-            trace: QueryTrace {
-                retrieval_mode: "no_semantic".into(),
-                degraded_reason: Some("semantic store unavailable".into()),
-                total_budget_ms: 500,
-                elapsed_ms: 1,
-                cancel_reason: None,
-                cache_hit: false,
-                stages: Vec::new(),
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let queries = vec![
+            ("entrypoint".to_string(), 5),
+            ("file discovery".to_string(), 5),
+            ("symbol extraction".to_string(), 5),
+            ("search projection".to_string(), 5),
+        ];
+        let mut observed_budgets = Vec::new();
+        let outcome = search_sidecar_packet_batch_inner_with_query(
+            &controller,
+            &queries,
+            Some(18_000),
+            |_, query, budget| {
+                observed_budgets.push(budget);
+                Ok(QueryResult {
+                    query: query.to_string(),
+                    features: classify_query(query),
+                    hits: Vec::new(),
+                    trace: QueryTrace {
+                        retrieval_mode: "full".into(),
+                        degraded_reason: None,
+                        total_budget_ms: u64::from(budget.unwrap_or_default()),
+                        elapsed_ms: 1,
+                        cancel_reason: None,
+                        cache_hit: false,
+                        stages: Vec::new(),
+                    },
+                })
             },
-        };
+        )
+        .expect("empty full-mode packet query results should not reject");
+
+        assert_eq!(outcome.results.len(), queries.len());
         assert_eq!(
-            sidecar_packet_batch_rejection_reason(&unavailable, &[]).as_deref(),
-            Some("sidecar retrieval mode `no_semantic` is not eligible for packet batch results")
+            observed_budgets,
+            vec![Some(4_500), Some(4_500), Some(4_500), Some(4_500)]
+        );
+    }
+
+    #[test]
+    fn packet_batch_rejects_candidate_resolution_errors() {
+        use codestory_retrieval::CandidateSource;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+            .expect("open project");
+        std::fs::remove_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("remove storage parent");
+
+        let queries = vec![("handler".to_string(), 5)];
+        let result = search_sidecar_packet_batch_inner_with_query(
+            &controller,
+            &queries,
+            Some(500),
+            |_, _, _| {
+                Ok(QueryResult {
+                    query: "handler".into(),
+                    features: classify_query("handler"),
+                    hits: vec![CandidateHit::with_source(
+                        "src/lib.rs",
+                        Some("handler".into()),
+                        0.5,
+                        CandidateSource::Scip,
+                    )],
+                    trace: QueryTrace {
+                        retrieval_mode: "full".into(),
+                        degraded_reason: None,
+                        total_budget_ms: 500,
+                        elapsed_ms: 1,
+                        cancel_reason: None,
+                        cache_hit: false,
+                        stages: Vec::new(),
+                    },
+                })
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("packet batch must reject candidate resolution errors"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "retrieval_unavailable");
+        assert!(
+            error.message.contains("sidecar retrieval rejected")
+                || error.message.contains("candidate resolution failed"),
+            "error should preserve candidate resolution failure: {}",
+            error.message
         );
     }
 

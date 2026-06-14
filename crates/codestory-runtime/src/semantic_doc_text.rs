@@ -4,22 +4,7 @@ use std::collections::HashSet;
 use crate::symbol_query::symbol_query_tokens;
 
 pub(crate) fn semantic_doc_language_from_path(path: Option<&str>) -> Option<&'static str> {
-    let ext = path?
-        .rsplit('.')
-        .next()?
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "c" => Some("c"),
-        "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => Some("cpp"),
-        "java" => Some("java"),
-        "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
-        "py" | "pyi" => Some("python"),
-        "rs" => Some("rust"),
-        "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
-        "svelte" => Some("svelte"),
-        _ => None,
-    }
+    codestory_contracts::language_support::language_name_for_path(path)
 }
 
 pub(crate) fn semantic_symbol_role_aliases(kind: NodeKind) -> &'static str {
@@ -69,6 +54,9 @@ pub(crate) fn semantic_symbol_aliases(
         if let Some(alias) = normalized_symbol_alias(candidate) {
             push_unique_alias(&mut aliases.name_aliases, &mut seen_names, alias);
         }
+        for expanded_alias in expanded_symbol_aliases(candidate) {
+            push_unique_alias(&mut aliases.name_aliases, &mut seen_names, expanded_alias);
+        }
         if let Some(terminal) = terminal_symbol_part(candidate)
             && let Some(alias) = normalized_symbol_alias(terminal)
         {
@@ -76,6 +64,9 @@ pub(crate) fn semantic_symbol_aliases(
                 aliases.terminal_alias = Some(alias.clone());
             }
             push_unique_alias(&mut aliases.name_aliases, &mut seen_names, alias);
+            for expanded_alias in expanded_symbol_aliases(terminal) {
+                push_unique_alias(&mut aliases.name_aliases, &mut seen_names, expanded_alias);
+            }
         }
 
         let owner_parts = owner_symbol_parts(candidate);
@@ -1035,25 +1026,25 @@ mod tests {
     #[test]
     fn language_from_path_covers_supported_extensions() {
         let cases = [
-            ("a.c", Some("c")),
-            ("a.cc", Some("cpp")),
-            ("a.cpp", Some("cpp")),
-            ("a.cxx", Some("cpp")),
-            ("a.h", Some("cpp")),
-            ("a.hpp", Some("cpp")),
-            ("A.JAVA", Some("java")),
-            ("a.js", Some("javascript")),
-            ("a.jsx", Some("javascript")),
-            ("a.mjs", Some("javascript")),
-            ("a.cjs", Some("javascript")),
-            ("a.py", Some("python")),
-            ("a.pyi", Some("python")),
-            ("a.rs", Some("rust")),
-            ("a.ts", Some("typescript")),
-            ("a.tsx", Some("typescript")),
-            ("a.mts", Some("typescript")),
-            ("a.cts", Some("typescript")),
-            ("App.svelte", Some("svelte")),
+            ("main.c", Some("c")),
+            ("main.cpp", Some("cpp")),
+            ("Main.java", Some("java")),
+            ("main.js", Some("javascript")),
+            ("main.py", Some("python")),
+            ("main.rs", Some("rust")),
+            ("main.ts", Some("typescript")),
+            ("main.go", Some("go")),
+            ("main.rb", Some("ruby")),
+            ("main.php", Some("php")),
+            ("Program.cs", Some("csharp")),
+            ("View.cshtml", None),
+            ("Main.kt", Some("kotlin")),
+            ("Main.swift", Some("swift")),
+            ("main.dart", Some("dart")),
+            ("script.sh", Some("bash")),
+            ("index.html", Some("html")),
+            ("style.css", Some("css")),
+            ("schema.sql", Some("sql")),
             ("README.md", None),
         ];
 
@@ -1097,6 +1088,22 @@ mod tests {
         assert!(
             aliases
                 .owner_aliases
+                .contains(&"source group c++ compile commands json".to_string())
+        );
+    }
+
+    #[test]
+    fn symbol_aliases_expand_cpp_cdb_terminal_acronyms() {
+        let aliases = semantic_symbol_aliases("SourceGroupCxxCdb", Some("SourceGroupCxxCdb"));
+
+        assert!(
+            aliases
+                .name_aliases
+                .contains(&"source group c++ compilation database".to_string())
+        );
+        assert!(
+            aliases
+                .name_aliases
                 .contains(&"source group c++ compile commands json".to_string())
         );
     }

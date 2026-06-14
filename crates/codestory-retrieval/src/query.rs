@@ -37,7 +37,11 @@ pub fn execute_retrieval_query_with_cache(
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
         if let Some(manifest) = manifest.as_ref() {
-            if let Err(error) = validate_strict_sidecar_readiness(request.project_root, &storage) {
+            if let Err(error) = validate_strict_sidecar_readiness(
+                request.project_root,
+                request.storage_path,
+                &storage,
+            ) {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
                 );
@@ -110,6 +114,11 @@ mod tests {
             sidecar_input_hash: Some(hash.into()),
             sidecar_generation: Some(sidecar_generation_id(project_id, hash)),
             projection_count: Some(projection_count),
+            symbol_doc_count: Some(projection_count),
+            dense_projection_count: Some(projection_count),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: Some("graph-test-hash".into()),
+            dense_reason_counts_json: Some(format!("{{\"public_api\":{projection_count}}}")),
         }
     }
 
@@ -204,6 +213,10 @@ mod tests {
                     embedding_backend: Some("onnx".to_string()),
                     embedding_dim: 768,
                     doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".to_string()),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    dense_reason: Some("public_api".into()),
                     embedding: vec![0.01; 768],
                     updated_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
                 }])
@@ -247,6 +260,11 @@ mod tests {
                     sidecar_input_hash: None,
                     sidecar_generation: None,
                     projection_count: None,
+                    symbol_doc_count: None,
+                    dense_projection_count: None,
+                    semantic_policy_version: None,
+                    graph_artifact_hash: None,
+                    dense_reason_counts_json: None,
                 })
                 .expect("manifest");
         }

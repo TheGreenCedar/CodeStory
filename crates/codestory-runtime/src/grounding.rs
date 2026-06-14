@@ -571,6 +571,7 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
             semantic: 0.0,
             graph: 0.55,
             total: 1.0,
+            provenance: Vec::new(),
         }),
     }
 }

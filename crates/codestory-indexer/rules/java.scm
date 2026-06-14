@@ -583,10 +583,12 @@
   attr (@module.node -> @module.node) kind = "IMPORT"
 }
 
-;; Lambda assignment
-(variable_declarator
-  name: (identifier) @name
-  value: (lambda_expression) @def)
+;; Lambda assignment for local variables. Field declarations are handled by the
+;; field rule above; matching them again here creates duplicate graph variables.
+(local_variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (lambda_expression) @def))
 {
   node @name.node
   attr (@name.node) kind = "FUNCTION"

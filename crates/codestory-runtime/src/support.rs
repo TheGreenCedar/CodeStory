@@ -5,8 +5,12 @@ use codestory_contracts::api::{AgentHybridWeightsDto, SearchHybridLimitsDto};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io::Read;
+use std::path::Path;
 
 pub(crate) const HYBRID_RETRIEVAL_ENABLED_ENV: &str = "CODESTORY_HYBRID_RETRIEVAL_ENABLED";
+pub(crate) const SEMANTIC_FILE_TEXT_MAX_BYTES: u64 = 1_000_000;
+pub(crate) const SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES: usize = 64 * 1_024 * 1_024;
 
 pub(crate) fn hybrid_retrieval_enabled() -> bool {
     env_flag_enabled(HYBRID_RETRIEVAL_ENABLED_ENV, true)
@@ -357,6 +361,25 @@ pub(crate) fn read_searchable_file_contents(path: &str) -> Option<String> {
     }
 
     None
+}
+
+pub(crate) fn read_file_text_limited(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<String>> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > max_bytes {
+        return Ok(None);
+    }
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = file.take(max_bytes.saturating_add(1));
+    let mut contents = String::new();
+    reader.read_to_string(&mut contents)?;
+    if contents.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    Ok(Some(contents))
 }
 
 pub(crate) fn aggregate_symbol_matches(

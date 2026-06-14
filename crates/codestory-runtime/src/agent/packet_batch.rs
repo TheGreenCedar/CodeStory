@@ -55,6 +55,10 @@ impl PacketLatencyBudget {
         self.elapsed_ms() >= self.target_ms
     }
 
+    pub(crate) fn remaining_ms(&self) -> u32 {
+        clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(100))
+    }
+
     pub(crate) fn budget_usage_percent(&self, consumed_trace_ms: u32) -> u128 {
         (consumed_trace_ms as u128)
             .saturating_mul(100)
@@ -137,13 +141,18 @@ pub(crate) fn run_packet_planned_subqueries(
             .map(|(_, query)| (query.query.clone(), per_query_limit))
             .collect::<Vec<_>>();
         let started_at = Instant::now();
-        match controller.search_lexical_hybrid_batch(&batch) {
-            Ok(results) => {
+        match controller.search_lexical_hybrid_batch(&batch, Some(packet_latency.remaining_ms())) {
+            Ok(outcome) => {
                 let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
                 answer.retrieval_trace.total_latency_ms = answer
                     .retrieval_trace
                     .total_latency_ms
                     .saturating_add(duration_ms);
+                answer
+                    .retrieval_trace
+                    .packet_sidecar_diagnostics
+                    .extend(outcome.sidecar_diagnostics);
+                let results = outcome.results;
                 merge_packet_lexical_subquery_batch(
                     answer,
                     &lexical_pending,
@@ -178,7 +187,10 @@ pub(crate) fn run_packet_planned_subqueries(
                         })
                         .collect::<Vec<_>>();
                     let retry_started = Instant::now();
-                    match controller.search_semantic_hybrid_batch(&retry_batch) {
+                    match controller.search_semantic_hybrid_batch(
+                        &retry_batch,
+                        Some(packet_latency.remaining_ms()),
+                    ) {
                         Ok(outcome) => {
                             let retry_duration_ms =
                                 clamp_u128_to_u32(retry_started.elapsed().as_millis());
@@ -186,6 +198,10 @@ pub(crate) fn run_packet_planned_subqueries(
                                 .retrieval_trace
                                 .total_latency_ms
                                 .saturating_add(retry_duration_ms);
+                            answer
+                                .retrieval_trace
+                                .packet_sidecar_diagnostics
+                                .extend(outcome.sidecar_diagnostics);
                             record_semantic_fallbacks(answer, &outcome.fallbacks);
                             merge_packet_semantic_subquery_batch(
                                 answer,
@@ -235,13 +251,19 @@ pub(crate) fn run_packet_planned_subqueries(
                 })
                 .collect::<Vec<_>>();
             let started_at = Instant::now();
-            match controller.search_semantic_hybrid_batch(&batch) {
+            match controller
+                .search_semantic_hybrid_batch(&batch, Some(packet_latency.remaining_ms()))
+            {
                 Ok(outcome) => {
                     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
                     answer.retrieval_trace.total_latency_ms = answer
                         .retrieval_trace
                         .total_latency_ms
                         .saturating_add(duration_ms);
+                    answer
+                        .retrieval_trace
+                        .packet_sidecar_diagnostics
+                        .extend(outcome.sidecar_diagnostics);
                     record_semantic_fallbacks(answer, &outcome.fallbacks);
                     merge_packet_semantic_subquery_batch(
                         answer,
@@ -364,14 +386,23 @@ pub(crate) fn run_packet_anchor_expansion(
     }
 
     let started_at = Instant::now();
-    let result = controller.search_symbolic_packet_anchor_batch(&queries, per_query_limit);
+    let result = controller.search_symbolic_packet_anchor_batch(
+        &queries,
+        per_query_limit,
+        Some(packet_latency.remaining_ms()),
+    );
     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
     answer.retrieval_trace.total_latency_ms = answer
         .retrieval_trace
         .total_latency_ms
         .saturating_add(duration_ms);
     match result {
-        Ok(results) => {
+        Ok(outcome) => {
+            answer
+                .retrieval_trace
+                .packet_sidecar_diagnostics
+                .extend(outcome.sidecar_diagnostics);
+            let results = outcome.results;
             let per_step_duration = duration_ms / results.len().max(1) as u32;
             for (query, hits) in results {
                 let mut added = 0usize;
@@ -492,6 +523,7 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         .filter(|query| {
             let query = query.1;
             query.purpose.contains("symbol probe")
+                || packet_task_seed_anchor_probe(&query.query)
                 || query.purpose.contains("concrete symbol")
                 || is_packet_code_like_term(&query.query)
         })
@@ -506,11 +538,20 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
 fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
     if query.purpose.contains("symbol probe") {
         0
-    } else if packet_anchor_probe_has_strong_code_shape(&query.query) {
+    } else if packet_task_seed_anchor_probe(&query.query) {
         1
-    } else {
+    } else if packet_anchor_probe_has_strong_code_shape(&query.query) {
         2
+    } else {
+        3
     }
+}
+
+fn packet_task_seed_anchor_probe(query: &str) -> bool {
+    matches!(
+        normalize_identifier(query).as_str(),
+        "main" | "run" | "entrypoint"
+    )
 }
 
 fn packet_anchor_probe_has_strong_code_shape(query: &str) -> bool {
@@ -556,7 +597,13 @@ pub(crate) fn packet_file_stem_matches_query(query: &str, path: Option<&str>) ->
     let Some(path) = path else {
         return false;
     };
-    let normalized_query = normalize_identifier(query);
+    let query_path = query.replace('\\', "/");
+    let query_file_name = query_path.rsplit('/').next().unwrap_or(query).trim();
+    let query_stem = query_file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(query_file_name);
+    let normalized_query = normalize_identifier(query_stem);
     if normalized_query.is_empty() {
         return false;
     }
@@ -705,6 +752,45 @@ mod tests {
                 "workspace/app/src/lib.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn packet_anchor_probe_queries_execute_entrypoint_seed_queries() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Explain the runtime flow".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "architecture entrypoint".to_string(),
+                    purpose: "task-class retrieval seed".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "main".to_string(),
+                    purpose: "task-class retrieval seed".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "run".to_string(),
+                    purpose: "task-class retrieval seed".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "entrypoint".to_string(),
+                    purpose: "task-class retrieval seed".to_string(),
+                },
+            ],
+            trace: Vec::new(),
+        };
+
+        let queries = packet_anchor_probe_queries(&plan);
+
+        assert!(queries.contains(&"main".to_string()));
+        assert!(queries.contains(&"run".to_string()));
+        assert!(queries.contains(&"entrypoint".to_string()));
+        assert!(!queries.contains(&"architecture entrypoint".to_string()));
     }
 }
 

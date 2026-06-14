@@ -1,7 +1,9 @@
 use codestory_contracts::graph::NodeKind;
 use codestory_store::{LlmSymbolDoc, RetrievalIndexManifest, Store};
+use std::collections::BTreeMap;
 
 pub const SIDECAR_SCHEMA_VERSION: i32 = 1;
+pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
 const STALENESS_DOC_BATCH_SIZE: usize = 1024;
@@ -30,6 +32,17 @@ pub fn manifest_has_current_sidecar_contract(
         && manifest.sidecar_generation.as_deref() == Some(expected_generation.as_str())
         && manifest.qdrant_collection == expected_collection
         && manifest.projection_count.is_some_and(|count| count >= 0)
+        && manifest.symbol_doc_count.is_some_and(|count| count >= 0)
+        && manifest
+            .dense_projection_count
+            .is_some_and(|count| count >= 0)
+        && manifest.dense_projection_count == manifest.projection_count
+        && manifest.semantic_policy_version.as_deref() == Some(SEMANTIC_POLICY_VERSION)
+        && manifest
+            .graph_artifact_hash
+            .as_deref()
+            .is_some_and(|hash| !hash.trim().is_empty())
+        && manifest.dense_reason_counts_json.is_some()
 }
 
 pub fn manifest_staleness_reason(
@@ -56,27 +69,58 @@ pub fn manifest_staleness_reason(
         ));
     }
 
-    if let Some(expected_count) = manifest.projection_count {
+    if manifest.semantic_policy_version.as_deref() != Some(SEMANTIC_POLICY_VERSION) {
+        return Some(format!(
+            "sidecar_semantic_policy_changed: manifest={} current={SEMANTIC_POLICY_VERSION}",
+            manifest
+                .semantic_policy_version
+                .as_deref()
+                .unwrap_or("<missing>")
+        ));
+    }
+
+    if let Some(expected_symbol_doc_count) = manifest.symbol_doc_count {
+        match storage.get_symbol_search_doc_count() {
+            Ok(actual) if i64::from(actual) == expected_symbol_doc_count => {}
+            Ok(actual) => {
+                return Some(format!(
+                    "sidecar_symbol_doc_count_changed: manifest={expected_symbol_doc_count} current={actual}"
+                ));
+            }
+            Err(error) => {
+                return Some(format!("sidecar_symbol_doc_count_unavailable: {error}"));
+            }
+        }
+    }
+
+    if let Some(expected_count) = manifest
+        .dense_projection_count
+        .or(manifest.projection_count)
+    {
         match collect_sidecar_semantic_doc_stats(storage) {
             Ok(stats) => {
-                if stats.doc_count == 0 {
+                if expected_count > 0 && stats.doc_count == 0 {
                     return Some(
                         "sidecar_semantic_doc_count_unavailable: no sidecar-eligible stored docs"
                             .into(),
                     );
                 }
-                if stats.mixed_embedding_profiles
-                    || stats.mixed_embedding_models
-                    || stats.mixed_embedding_backends
-                    || stats.mixed_dimensions
-                    || stats.mixed_doc_shapes
-                    || stats.embedding_profile.as_deref() != Some("bge-base-en-v1.5")
-                    || stats.embedding_dim
-                        != Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32)
-                    || !stats
-                        .embedding_model
-                        .as_deref()
-                        .is_some_and(|model| model.contains("bge-base-en-v1.5"))
+                if expected_count > 0
+                    && (stats.mixed_embedding_profiles
+                        || stats.mixed_embedding_models
+                        || stats.mixed_embedding_backends
+                        || stats.mixed_dimensions
+                        || stats.mixed_doc_shapes
+                        || stats.mixed_semantic_policy_versions
+                        || stats.semantic_policy_version.as_deref()
+                            != Some(SEMANTIC_POLICY_VERSION)
+                        || stats.embedding_profile.as_deref() != Some("bge-base-en-v1.5")
+                        || stats.embedding_dim
+                            != Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32)
+                        || !stats
+                            .embedding_model
+                            .as_deref()
+                            .is_some_and(|model| model.contains("bge-base-en-v1.5")))
                 {
                     return Some(SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED.into());
                 }
@@ -85,6 +129,15 @@ pub fn manifest_staleness_reason(
                         "sidecar_semantic_doc_count_changed: manifest={expected_count} current={}",
                         stats.doc_count
                     ));
+                }
+                if let Some(expected_reasons) = manifest.dense_reason_counts_json.as_deref() {
+                    let actual_reasons = serde_json::to_string(&stats.dense_reason_counts)
+                        .unwrap_or_else(|_| "{}".into());
+                    if actual_reasons != expected_reasons {
+                        return Some(format!(
+                            "sidecar_dense_reason_counts_changed: manifest={expected_reasons} current={actual_reasons}"
+                        ));
+                    }
                 }
             }
             Err(error) => {
@@ -123,7 +176,9 @@ pub fn manifest_sidecar_generation(manifest: &RetrievalIndexManifest) -> &str {
 }
 
 pub(crate) fn sidecar_semantic_doc_is_product_eligible(doc: &LlmSymbolDoc) -> bool {
-    sidecar_semantic_node_kind(doc.kind) && sidecar_stored_embedding_is_product_compatible(doc)
+    (sidecar_semantic_node_kind(doc.kind)
+        || doc.dense_reason.as_deref() == Some("component_report"))
+        && sidecar_stored_embedding_is_product_compatible(doc)
 }
 
 pub(crate) fn sidecar_semantic_node_kind(kind: NodeKind) -> bool {
@@ -175,11 +230,14 @@ struct SidecarSemanticDocStats {
     embedding_backend: Option<String>,
     embedding_dim: Option<u32>,
     doc_shape: Option<String>,
+    semantic_policy_version: Option<String>,
+    dense_reason_counts: BTreeMap<String, u32>,
     mixed_embedding_profiles: bool,
     mixed_embedding_models: bool,
     mixed_embedding_backends: bool,
     mixed_dimensions: bool,
     mixed_doc_shapes: bool,
+    mixed_semantic_policy_versions: bool,
 }
 
 fn collect_sidecar_semantic_doc_stats(storage: &Store) -> Result<SidecarSemanticDocStats, String> {
@@ -189,6 +247,7 @@ fn collect_sidecar_semantic_doc_stats(storage: &Store) -> Result<SidecarSemantic
     let mut first_backend: Option<Option<String>> = None;
     let mut first_dim: Option<Option<u32>> = None;
     let mut first_shape: Option<Option<String>> = None;
+    let mut first_policy: Option<Option<String>> = None;
     let mut after = None;
 
     loop {
@@ -234,6 +293,14 @@ fn collect_sidecar_semantic_doc_stats(storage: &Store) -> Result<SidecarSemantic
                 &mut stats.mixed_doc_shapes,
                 doc.doc_shape.as_deref(),
             );
+            observe_optional_string(
+                &mut first_policy,
+                &mut stats.semantic_policy_version,
+                &mut stats.mixed_semantic_policy_versions,
+                doc.semantic_policy_version.as_deref(),
+            );
+            let reason = doc.dense_reason.unwrap_or_else(|| "unknown".into());
+            *stats.dense_reason_counts.entry(reason).or_insert(0) += 1;
         }
     }
 
@@ -294,6 +361,11 @@ mod tests {
             sidecar_input_hash: Some(hash.into()),
             sidecar_generation: Some(sidecar_generation_id(project_id, hash)),
             projection_count: Some(7),
+            symbol_doc_count: Some(0),
+            dense_projection_count: Some(7),
+            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: Some("graph-test-hash".into()),
+            dense_reason_counts_json: Some("{\"public_api\":7}".into()),
         }
     }
 
@@ -370,6 +442,7 @@ mod tests {
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
         manifest.embedding_dim = Some(crate::embeddings::qdrant_vector_dim() as i32);
+        manifest.dense_reason_counts_json = Some("{\"public_api\":2}".into());
 
         let reason =
             manifest_staleness_reason(&storage, &manifest).expect("mixed shapes should stale");
@@ -414,6 +487,8 @@ mod tests {
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
         manifest.embedding_dim = Some(crate::embeddings::qdrant_vector_dim() as i32);
         manifest.projection_count = Some(1);
+        manifest.dense_projection_count = Some(1);
+        manifest.dense_reason_counts_json = Some("{\"public_api\":1}".into());
 
         let reason = manifest_staleness_reason(&storage, &manifest);
 
@@ -437,6 +512,8 @@ mod tests {
             embedding_backend: Some("onnx".into()),
             embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             doc_shape: Some(doc_shape.into()),
+            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.into()),
+            dense_reason: Some("public_api".into()),
             embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
             updated_at_epoch_ms: 123,
         }

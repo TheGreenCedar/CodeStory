@@ -1,0 +1,976 @@
+use crate::agent::packet_batch::packet_file_stem_matches_query;
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
+};
+use crate::agent::packet_required_probes::{
+    packet_citation_probe_match_rank, packet_citation_probe_token_coverage,
+    packet_citation_satisfies_required_probe, packet_required_probe_needs_exact_match,
+};
+use crate::agent::packet_scoring::{
+    normalize_identifier, packet_citation_key, packet_display_name_is_import_literal,
+    packet_display_name_is_test_like, packet_display_path, packet_low_signal_display_name,
+};
+use crate::{query_mentions_non_primary_source, retrieval_file_role_from_path};
+use codestory_contracts::api::{
+    AgentAnswerDto, AgentCitationDto, NodeKind, PacketBudgetLimitsDto, SearchHitOrigin,
+};
+use std::collections::{HashMap, HashSet};
+
+pub(crate) fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLimitsDto) -> bool {
+    cap_citations_with_protected(answer, limits, &HashSet::new())
+}
+
+pub(crate) fn cap_citations_with_protected(
+    answer: &mut AgentAnswerDto,
+    limits: &PacketBudgetLimitsDto,
+    protected_citation_keys: &HashSet<String>,
+) -> bool {
+    let original_len = answer.citations.len();
+    let mut files = HashSet::new();
+    let mut roles = HashSet::new();
+    let mut claim_keys: HashSet<String> = HashSet::new();
+    let mut secondary_claim_keys: HashSet<String> = HashSet::new();
+    let mut kept = Vec::new();
+    let mut deferred = Vec::new();
+
+    for citation in answer.citations.drain(..) {
+        let citation_key = packet_citation_key(&citation);
+        let file = citation.file_path.as_deref().map(packet_display_path);
+        let role = packet_evidence_role(&citation);
+        let claim_key = role.map(|role| packet_claim_key_for_citation(role, &citation));
+        let low_priority_role = packet_low_priority_cap_role(role);
+        let protected = protected_citation_keys.contains(&citation_key);
+        if protected
+            && kept.len() < limits.max_anchors as usize
+            && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
+        {
+            if let Some(path) = file {
+                files.insert(path);
+            }
+            if let Some(role) = role {
+                roles.insert(role);
+            }
+            if let Some(ref claim_key) = claim_key {
+                claim_keys.insert(claim_key.clone());
+            }
+            kept.push(citation);
+            continue;
+        }
+        if let Some(ref claim_key) = claim_key
+            && claim_keys.contains(claim_key)
+            && replace_weaker_duplicate_claim_citation(
+                &mut kept,
+                claim_key,
+                citation.clone(),
+                protected_citation_keys,
+            )
+        {
+            rebuild_packet_cap_tracking(&kept, &mut files, &mut roles, &mut claim_keys);
+            continue;
+        }
+        let file_is_new = file.as_ref().is_some_and(|path| !files.contains(path));
+        let role_is_new = role.is_some_and(|role| !roles.contains(&role));
+        let claim_key_is_new = claim_key
+            .as_ref()
+            .is_some_and(|key| !claim_keys.contains(key));
+        let secondary_claim_definition = claim_key.as_ref().is_some_and(|key| {
+            claim_keys.contains(key)
+                && !secondary_claim_keys.contains(key)
+                && packet_keep_secondary_claim_definition(key, &citation)
+        });
+        let claim_key_expands_primary_packet_coverage =
+            !low_priority_role && claim_key_is_new && (role_is_new || file_is_new);
+        let expands_primary_packet_coverage = !low_priority_role
+            && (claim_key_expands_primary_packet_coverage
+                || role_is_new
+                || kept.is_empty()
+                || (claim_key.is_none() && file_is_new)
+                || secondary_claim_definition);
+        if kept.len() >= limits.max_anchors as usize
+            && packet_primary_definition_file_citation(&citation)
+            && replace_weaker_same_role_or_low_priority_citation(
+                &mut kept,
+                citation.clone(),
+                protected_citation_keys,
+                limits,
+            )
+        {
+            rebuild_packet_cap_tracking(&kept, &mut files, &mut roles, &mut claim_keys);
+            continue;
+        }
+        if kept.len() >= limits.max_anchors as usize
+            && !low_priority_role
+            && role_is_new
+            && replace_overrepresented_role_citation(
+                &mut kept,
+                citation.clone(),
+                protected_citation_keys,
+                limits,
+            )
+        {
+            rebuild_packet_cap_tracking(&kept, &mut files, &mut roles, &mut claim_keys);
+            continue;
+        }
+        if kept.len() < limits.max_anchors as usize
+            && expands_primary_packet_coverage
+            && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
+        {
+            if let Some(path) = file {
+                files.insert(path);
+            }
+            if let Some(role) = role {
+                roles.insert(role);
+            }
+            if let Some(ref claim_key) = claim_key {
+                claim_keys.insert(claim_key.clone());
+                if secondary_claim_definition {
+                    secondary_claim_keys.insert(claim_key.clone());
+                }
+            }
+            kept.push(citation);
+        } else {
+            deferred.push(citation);
+        }
+    }
+
+    let mut primary_new_files = Vec::new();
+    let mut primary_duplicate_files = Vec::new();
+    let mut low_priority_new_files = Vec::new();
+    let mut low_priority_duplicate_files = Vec::new();
+    for citation in deferred {
+        let file = citation.file_path.as_deref().map(packet_display_path);
+        let low_priority = packet_low_priority_cap_role(packet_evidence_role(&citation));
+        if file.as_ref().is_some_and(|path| files.contains(path)) {
+            if low_priority {
+                low_priority_duplicate_files.push(citation);
+            } else {
+                primary_duplicate_files.push(citation);
+            }
+        } else if low_priority {
+            low_priority_new_files.push(citation);
+        } else {
+            primary_new_files.push(citation);
+        }
+    }
+    for citation in primary_new_files
+        .into_iter()
+        .chain(primary_duplicate_files)
+        .chain(low_priority_new_files)
+        .chain(low_priority_duplicate_files)
+    {
+        if kept.len() >= limits.max_anchors as usize {
+            continue;
+        }
+        let file = citation.file_path.as_deref().map(packet_display_path);
+        if !packet_file_fits_limit(file.as_deref(), &files, limits.max_files) {
+            continue;
+        }
+        if let Some(path) = file {
+            files.insert(path);
+        }
+        kept.push(citation);
+    }
+
+    let truncated = kept.len() < original_len;
+    answer.citations = kept;
+    truncated
+}
+
+pub(crate) fn packet_low_priority_cap_role(role: Option<PacketEvidenceRole>) -> bool {
+    role.is_some_and(PacketEvidenceRole::is_low_priority_cap_role)
+}
+
+fn replace_weaker_same_role_or_low_priority_citation(
+    kept: &mut [AgentCitationDto],
+    candidate: AgentCitationDto,
+    protected_citation_keys: &HashSet<String>,
+    limits: &PacketBudgetLimitsDto,
+) -> bool {
+    let candidate_role = packet_evidence_role(&candidate);
+    let candidate_file = candidate.file_path.as_deref().map(packet_display_path);
+    let mut replacement: Option<(usize, u8, f32)> = None;
+
+    for (index, existing) in kept.iter().enumerate() {
+        if protected_citation_keys.contains(&packet_citation_key(existing)) {
+            continue;
+        }
+        if !packet_file_fits_limit_after_replacement(
+            candidate_file.as_deref(),
+            kept,
+            index,
+            limits.max_files,
+        ) {
+            continue;
+        }
+
+        let existing_role = packet_evidence_role(existing);
+        let replacement_priority = if packet_low_priority_cap_role(existing_role) {
+            3
+        } else if candidate_role.is_some()
+            && candidate_role == existing_role
+            && !packet_primary_definition_file_citation(existing)
+        {
+            2
+        } else {
+            0
+        };
+        if replacement_priority == 0 {
+            continue;
+        }
+
+        let existing_rank = existing.score;
+        let should_replace = replacement
+            .map(|(_, best_priority, best_rank)| {
+                replacement_priority > best_priority
+                    || (replacement_priority == best_priority && existing_rank < best_rank)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            replacement = Some((index, replacement_priority, existing_rank));
+        }
+    }
+
+    let Some((index, _, _)) = replacement else {
+        return false;
+    };
+    kept[index] = candidate;
+    true
+}
+
+fn replace_overrepresented_role_citation(
+    kept: &mut [AgentCitationDto],
+    candidate: AgentCitationDto,
+    protected_citation_keys: &HashSet<String>,
+    limits: &PacketBudgetLimitsDto,
+) -> bool {
+    let Some(candidate_role) = packet_evidence_role(&candidate) else {
+        return false;
+    };
+    if kept
+        .iter()
+        .any(|citation| packet_evidence_role(citation) == Some(candidate_role))
+    {
+        return false;
+    }
+    let candidate_file = candidate.file_path.as_deref().map(packet_display_path);
+    let role_counts = kept.iter().filter_map(packet_evidence_role).fold(
+        HashMap::<PacketEvidenceRole, usize>::new(),
+        |mut counts, role| {
+            *counts.entry(role).or_insert(0) += 1;
+            counts
+        },
+    );
+
+    let mut replacement: Option<(usize, usize, f32)> = None;
+    for (index, existing) in kept.iter().enumerate() {
+        if protected_citation_keys.contains(&packet_citation_key(existing)) {
+            continue;
+        }
+        let Some(existing_role) = packet_evidence_role(existing) else {
+            continue;
+        };
+        let existing_role_count = role_counts.get(&existing_role).copied().unwrap_or_default();
+        if existing_role_count <= 1 {
+            continue;
+        }
+        if !packet_file_fits_limit_after_replacement(
+            candidate_file.as_deref(),
+            kept,
+            index,
+            limits.max_files,
+        ) {
+            continue;
+        }
+        let existing_rank = existing.score;
+        let should_replace = replacement
+            .map(|(_, best_count, best_rank)| {
+                existing_role_count > best_count
+                    || (existing_role_count == best_count && existing_rank < best_rank)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            replacement = Some((index, existing_role_count, existing_rank));
+        }
+    }
+
+    let Some((index, _, _)) = replacement else {
+        return false;
+    };
+    kept[index] = candidate;
+    true
+}
+
+fn packet_file_fits_limit_after_replacement(
+    path: Option<&str>,
+    kept: &[AgentCitationDto],
+    replacement_index: usize,
+    max_files: u32,
+) -> bool {
+    let files = kept
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != replacement_index)
+        .filter_map(|(_, citation)| citation.file_path.as_deref().map(packet_display_path))
+        .collect::<HashSet<_>>();
+    packet_file_fits_limit(path, &files, max_files)
+}
+
+fn replace_weaker_duplicate_claim_citation(
+    kept: &mut [AgentCitationDto],
+    claim_key: &str,
+    candidate: AgentCitationDto,
+    protected_citation_keys: &HashSet<String>,
+) -> bool {
+    let Some(index) = kept.iter().position(|citation| {
+        packet_evidence_role(citation)
+            .map(|role| packet_claim_key_for_citation(role, citation) == claim_key)
+            .unwrap_or(false)
+    }) else {
+        return false;
+    };
+    if protected_citation_keys.contains(&packet_citation_key(&kept[index])) {
+        return false;
+    }
+    if packet_prefer_duplicate_claim_citation(&candidate, &kept[index]) {
+        kept[index] = candidate;
+        return true;
+    }
+    false
+}
+
+fn packet_prefer_duplicate_claim_citation(
+    candidate: &AgentCitationDto,
+    existing: &AgentCitationDto,
+) -> bool {
+    if packet_prefer_flow_anchor_path_citation(candidate, existing) {
+        return true;
+    }
+    normalize_identifier(&candidate.display_name) == normalize_identifier(&existing.display_name)
+        && packet_exact_definition_file_citation(candidate)
+        && !packet_exact_definition_file_citation(existing)
+}
+
+pub(crate) fn packet_primary_definition_file_citation(citation: &AgentCitationDto) -> bool {
+    packet_exact_definition_file_citation(citation)
+        || packet_near_stem_type_definition_file(citation)
+}
+
+fn packet_near_stem_type_definition_file(citation: &AgentCitationDto) -> bool {
+    if citation.origin != SearchHitOrigin::IndexedSymbol
+        || !citation.resolvable
+        || !matches!(
+            citation.kind,
+            NodeKind::STRUCT
+                | NodeKind::CLASS
+                | NodeKind::INTERFACE
+                | NodeKind::UNION
+                | NodeKind::ENUM
+                | NodeKind::TYPEDEF
+        )
+    {
+        return false;
+    }
+    let normalized_display = normalize_identifier(&citation.display_name);
+    if normalized_display.is_empty()
+        || packet_low_signal_display_name(normalized_display.as_str())
+        || packet_exact_definition_file_citation(citation)
+    {
+        return false;
+    }
+    let stem = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .and_then(|path| {
+            let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
+            file_name
+                .rsplit_once('.')
+                .map(|(stem, _)| stem.to_string())
+                .or_else(|| Some(file_name.to_string()))
+        })
+        .map(|stem| normalize_identifier(&stem))
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return false;
+    }
+
+    let len_delta = normalized_display.len().abs_diff(stem.len());
+    if len_delta > 2 {
+        return false;
+    }
+    let shared_prefix = normalized_display
+        .chars()
+        .zip(stem.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    shared_prefix >= 8
+        && shared_prefix.saturating_mul(5)
+            >= normalized_display.len().min(stem.len()).saturating_mul(4)
+}
+
+pub(crate) fn packet_prefer_flow_anchor_path_citation(
+    candidate: &AgentCitationDto,
+    existing: &AgentCitationDto,
+) -> bool {
+    let candidate_path = candidate
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let existing_path = existing
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if candidate_path == existing_path {
+        return false;
+    }
+    let candidate_role = retrieval_file_role_from_path(&candidate_path);
+    let existing_role = retrieval_file_role_from_path(&existing_path);
+    candidate_role == crate::RetrievalFileRole::Source && existing_role.is_non_primary()
+}
+
+pub(crate) fn packet_exact_definition_file_citation(citation: &AgentCitationDto) -> bool {
+    citation.origin == SearchHitOrigin::IndexedSymbol
+        && citation.resolvable
+        && matches!(
+            citation.kind,
+            NodeKind::STRUCT
+                | NodeKind::CLASS
+                | NodeKind::INTERFACE
+                | NodeKind::UNION
+                | NodeKind::ENUM
+                | NodeKind::TYPEDEF
+        )
+        && !packet_low_signal_display_name(normalize_identifier(&citation.display_name).as_str())
+        && packet_file_stem_matches_query(&citation.display_name, citation.file_path.as_deref())
+}
+
+fn packet_keep_secondary_claim_definition(_claim_key: &str, citation: &AgentCitationDto) -> bool {
+    if !packet_primary_definition_file_citation(citation) {
+        return false;
+    }
+    packet_mandatory_secondary_path_citation(citation)
+}
+
+fn packet_mandatory_secondary_path_citation(citation: &AgentCitationDto) -> bool {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    path.contains("event_processor")
+        || path.contains("_events")
+        || path.contains("-events")
+        || path.contains("/cli/")
+        || path.ends_with("/main.rs")
+}
+
+fn rebuild_packet_cap_tracking(
+    kept: &[AgentCitationDto],
+    files: &mut HashSet<String>,
+    roles: &mut HashSet<PacketEvidenceRole>,
+    claim_keys: &mut HashSet<String>,
+) {
+    files.clear();
+    roles.clear();
+    claim_keys.clear();
+    for citation in kept {
+        if let Some(path) = citation.file_path.as_deref().map(packet_display_path) {
+            files.insert(path);
+        }
+        if let Some(role) = packet_evidence_role(citation) {
+            roles.insert(role);
+            claim_keys.insert(packet_claim_key_for_citation(role, citation));
+        }
+    }
+}
+
+fn packet_file_fits_limit(path: Option<&str>, files: &HashSet<String>, max_files: u32) -> bool {
+    path.is_none_or(|path| files.contains(path) || files.len() < max_files as usize)
+}
+
+const PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT: usize = 4;
+
+pub(crate) fn cap_packet_citations(
+    answer: &mut AgentAnswerDto,
+    limits: &PacketBudgetLimitsDto,
+    required_probe_queries: &[String],
+) -> bool {
+    let mut protected_citation_keys =
+        promote_required_probe_citations(answer, required_probe_queries);
+    let focus_neighborhood_keys =
+        promote_focus_neighborhood_citations(answer, &protected_citation_keys);
+    protected_citation_keys.extend(focus_neighborhood_keys);
+    if protected_citation_keys.is_empty() {
+        cap_citations(answer, limits)
+    } else {
+        cap_citations_with_protected(answer, limits, &protected_citation_keys)
+    }
+}
+
+pub(crate) fn promote_required_probe_citations(
+    answer: &mut AgentAnswerDto,
+    required_probe_queries: &[String],
+) -> HashSet<String> {
+    if required_probe_queries.is_empty() || answer.citations.is_empty() {
+        return HashSet::new();
+    }
+
+    let focus_roots = packet_command_focus_roots(&answer.citations);
+    let mut promoted_indices = Vec::new();
+    for query in required_probe_queries {
+        if promoted_indices
+            .iter()
+            .any(|index| packet_citation_satisfies_required_probe(query, &answer.citations[*index]))
+        {
+            continue;
+        }
+        let mut best_match = None;
+        for (index, citation) in answer.citations.iter().enumerate() {
+            if promoted_indices.contains(&index) {
+                continue;
+            }
+            let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
+                continue;
+            };
+            if packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
+                && !packet_citation_satisfies_required_probe(query, citation)
+            {
+                continue;
+            }
+            if best_match
+                .map(|(best_index, best_rank)| {
+                    packet_prefer_required_probe_match(
+                        query,
+                        citation,
+                        match_rank,
+                        &answer.citations[best_index],
+                        best_rank,
+                        &focus_roots,
+                    )
+                })
+                .unwrap_or(true)
+            {
+                best_match = Some((index, match_rank));
+            }
+        }
+        if let Some((index, _)) = best_match {
+            promoted_indices.push(index);
+        }
+    }
+    if promoted_indices.is_empty() {
+        return HashSet::new();
+    }
+
+    let protected_citation_keys = promoted_indices
+        .iter()
+        .map(|index| packet_citation_key(&answer.citations[*index]))
+        .collect::<HashSet<_>>();
+    let promoted_index_set = promoted_indices.iter().copied().collect::<HashSet<_>>();
+    let mut reordered = Vec::with_capacity(answer.citations.len());
+    for index in promoted_indices {
+        reordered.push(answer.citations[index].clone());
+    }
+    for (index, citation) in answer.citations.drain(..).enumerate() {
+        if !promoted_index_set.contains(&index) {
+            reordered.push(citation);
+        }
+    }
+    answer.citations = reordered;
+    answer.retrieval_trace.annotations.push(format!(
+        "packet_required_probe_citations promoted={} required={}",
+        promoted_index_set.len(),
+        required_probe_queries.join("|").replace('`', "'")
+    ));
+    protected_citation_keys
+}
+
+pub(crate) fn promote_focus_neighborhood_citations(
+    answer: &mut AgentAnswerDto,
+    protected_citation_keys: &HashSet<String>,
+) -> HashSet<String> {
+    if answer.citations.is_empty() {
+        return HashSet::new();
+    }
+    let focus_roots = packet_command_focus_roots(&answer.citations);
+    if focus_roots.is_empty() {
+        return HashSet::new();
+    }
+    let protected_file_paths = answer
+        .citations
+        .iter()
+        .filter(|citation| protected_citation_keys.contains(&packet_citation_key(citation)))
+        .filter_map(packet_citation_file_path_key)
+        .collect::<HashSet<_>>();
+
+    let mut ranked_candidates = answer
+        .citations
+        .iter()
+        .enumerate()
+        .filter(|(_, citation)| {
+            packet_focus_neighborhood_candidate(
+                citation,
+                &focus_roots,
+                protected_citation_keys,
+                &protected_file_paths,
+            )
+        })
+        .map(|(index, citation)| {
+            (
+                index,
+                packet_focus_neighborhood_rank(citation, &focus_roots),
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked_candidates.sort_by(|(left_index, left_rank), (right_index, right_rank)| {
+        right_rank
+            .cmp(left_rank)
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    let mut promoted_indices = Vec::new();
+    let mut promoted_file_paths = HashSet::new();
+    for (index, _) in ranked_candidates {
+        let Some(path) = packet_citation_file_path_key(&answer.citations[index]) else {
+            continue;
+        };
+        if !promoted_file_paths.insert(path) {
+            continue;
+        }
+        promoted_indices.push(index);
+        if promoted_indices.len() >= PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT {
+            break;
+        }
+    }
+    if promoted_indices.is_empty() {
+        return HashSet::new();
+    }
+
+    let promoted_index_set = promoted_indices.iter().copied().collect::<HashSet<_>>();
+    let promoted_keys = promoted_indices
+        .iter()
+        .map(|index| packet_citation_key(&answer.citations[*index]))
+        .collect::<HashSet<_>>();
+    let mut reordered = Vec::with_capacity(answer.citations.len());
+    for citation in &answer.citations {
+        if protected_citation_keys.contains(&packet_citation_key(citation)) {
+            reordered.push(citation.clone());
+        }
+    }
+    for index in promoted_indices {
+        reordered.push(answer.citations[index].clone());
+    }
+    for (index, citation) in answer.citations.drain(..).enumerate() {
+        let key = packet_citation_key(&citation);
+        if !protected_citation_keys.contains(&key) && !promoted_index_set.contains(&index) {
+            reordered.push(citation);
+        }
+    }
+    answer.citations = reordered;
+    answer.retrieval_trace.annotations.push(format!(
+        "packet_focus_neighborhood_citations promoted={} roots={}",
+        promoted_keys.len(),
+        focus_roots
+            .iter()
+            .map(|root| root.root.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+            .replace('`', "'")
+    ));
+    promoted_keys
+}
+
+fn packet_focus_neighborhood_candidate(
+    citation: &AgentCitationDto,
+    focus_roots: &[PacketCommandFocusRoot],
+    protected_citation_keys: &HashSet<String>,
+    protected_file_paths: &HashSet<String>,
+) -> bool {
+    if protected_citation_keys.contains(&packet_citation_key(citation))
+        || citation.origin != SearchHitOrigin::IndexedSymbol
+        || !citation.resolvable
+        || packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
+        || packet_display_name_is_test_like(&citation.display_name)
+    {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default();
+    if path.is_empty() || packet_citation_focus_root_score(citation, focus_roots) == 0 {
+        return false;
+    }
+    if protected_file_paths.contains(&path) {
+        return false;
+    }
+    !retrieval_file_role_from_path(&path.to_ascii_lowercase()).is_non_primary()
+}
+
+fn packet_citation_file_path_key(citation: &AgentCitationDto) -> Option<String> {
+    let path = citation.file_path.as_deref().map(packet_display_path)?;
+    if path.is_empty() { None } else { Some(path) }
+}
+
+fn packet_focus_neighborhood_rank(
+    citation: &AgentCitationDto,
+    focus_roots: &[PacketCommandFocusRoot],
+) -> (u8, u8, u8, u8, u8, u8, i32) {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default();
+    let source_file: u8 = if retrieval_file_role_from_path(&path.to_ascii_lowercase())
+        == crate::RetrievalFileRole::Source
+    {
+        1
+    } else {
+        0
+    };
+    let direct_root_file = packet_citation_direct_focus_root_file_score(citation, focus_roots);
+    let role_backed: u8 = if packet_evidence_role(citation).is_some() {
+        1
+    } else {
+        0
+    };
+    let implementation_file: u8 = if packet_path_is_implementation(&path) {
+        1
+    } else {
+        0
+    };
+    let definition_file: u8 = if packet_primary_definition_file_citation(citation) {
+        1
+    } else {
+        0
+    };
+    (
+        packet_citation_focus_root_score(citation, focus_roots),
+        direct_root_file,
+        packet_source_navigation_file_score(&path),
+        source_file,
+        role_backed,
+        implementation_file.saturating_add(definition_file),
+        (citation.score * 1000.0).round() as i32,
+    )
+}
+
+fn packet_citation_direct_focus_root_file_score(
+    citation: &AgentCitationDto,
+    focus_roots: &[PacketCommandFocusRoot],
+) -> u8 {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .replace('\\', "/");
+    let parent = path.rsplit_once('/').map(|(parent, _)| parent);
+    focus_roots
+        .iter()
+        .filter(|root| parent == Some(root.root.as_str()))
+        .map(|root| root.weight)
+        .max()
+        .unwrap_or_default()
+}
+
+fn packet_source_navigation_file_score(path: &str) -> u8 {
+    let normalized = packet_display_path(path).replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "cli" | "cmd" | "command" | "commands" => 4,
+        "lib" | "mod" | "index" => 3,
+        "events" | "event" => 2,
+        "main" | "app" | "server" | "router" | "routes" => 2,
+        "handler" | "handlers" | "entrypoint" | "entrypoints" => 1,
+        _ if stem.ends_with("_events")
+            || stem.ends_with("_event")
+            || stem.ends_with("-events")
+            || stem.ends_with("-event") =>
+        {
+            2
+        }
+        _ => 0,
+    }
+}
+
+fn packet_prefer_required_probe_match(
+    query: &str,
+    candidate: &AgentCitationDto,
+    candidate_rank: u8,
+    existing: &AgentCitationDto,
+    existing_rank: u8,
+    focus_roots: &[PacketCommandFocusRoot],
+) -> bool {
+    if !query_mentions_non_primary_source(query) {
+        let candidate_test_like = packet_display_name_is_test_like(&candidate.display_name);
+        let existing_test_like = packet_display_name_is_test_like(&existing.display_name);
+        if candidate_test_like != existing_test_like {
+            return !candidate_test_like;
+        }
+    }
+    if candidate_rank != existing_rank {
+        return candidate_rank > existing_rank;
+    }
+    if !packet_required_probe_needs_exact_match(query) {
+        let candidate_focus = packet_citation_focus_root_score(candidate, focus_roots);
+        let existing_focus = packet_citation_focus_root_score(existing, focus_roots);
+        if candidate_focus != existing_focus {
+            return candidate_focus > existing_focus;
+        }
+        let candidate_token_coverage = packet_citation_probe_token_coverage(query, candidate);
+        let existing_token_coverage = packet_citation_probe_token_coverage(query, existing);
+        if candidate_token_coverage != existing_token_coverage {
+            return candidate_token_coverage > existing_token_coverage;
+        }
+    }
+    if packet_prefer_flow_anchor_path_citation(candidate, existing) {
+        return true;
+    }
+    if packet_required_probe_prefers_implementation(query)
+        && packet_prefer_implementation_file(candidate, existing)
+    {
+        return true;
+    }
+    packet_exact_definition_file_citation(candidate)
+        && !packet_exact_definition_file_citation(existing)
+}
+
+fn packet_required_probe_prefers_implementation(query: &str) -> bool {
+    query.contains("::") || query.contains('.')
+}
+
+fn packet_prefer_implementation_file(
+    candidate: &AgentCitationDto,
+    existing: &AgentCitationDto,
+) -> bool {
+    let candidate_path = candidate
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default();
+    let existing_path = existing
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default();
+    packet_path_is_implementation(&candidate_path) && !packet_path_is_implementation(&existing_path)
+}
+
+fn packet_path_is_implementation(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some(
+            "c" | "cc"
+                | "cpp"
+                | "cxx"
+                | "go"
+                | "java"
+                | "js"
+                | "jsx"
+                | "kt"
+                | "php"
+                | "py"
+                | "rb"
+                | "rs"
+                | "ts"
+                | "tsx"
+        )
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PacketCommandFocusRoot {
+    root: String,
+    weight: u8,
+}
+
+fn packet_command_focus_roots(citations: &[AgentCitationDto]) -> Vec<PacketCommandFocusRoot> {
+    let mut roots = Vec::<PacketCommandFocusRoot>::new();
+    for citation in citations {
+        let display = citation.display_name.as_str();
+        let normalized_display = normalize_identifier(display);
+        let path = citation
+            .file_path
+            .as_deref()
+            .map(packet_display_path)
+            .unwrap_or_default();
+        let Some(root) = packet_source_root_from_path(&path) else {
+            continue;
+        };
+        let normalized_path = path.replace('\\', "/");
+        let weight =
+            if normalized_display.ends_with("runmain") || normalized_display.contains("runexec") {
+                3
+            } else if display.contains("::Cli")
+                || display.contains("::cli")
+                || normalized_path.ends_with("/src/cli.rs")
+                || (normalized_path.ends_with("/main.rs") && normalized_display == "main")
+            {
+                2
+            } else if display.contains("Subcommand::") {
+                1
+            } else {
+                continue;
+            };
+        packet_push_focus_root(&mut roots, root, weight);
+    }
+    roots.sort_by(|left, right| {
+        right
+            .weight
+            .cmp(&left.weight)
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    roots
+}
+
+fn packet_push_focus_root(roots: &mut Vec<PacketCommandFocusRoot>, root: String, weight: u8) {
+    if let Some(existing) = roots.iter_mut().find(|existing| existing.root == root) {
+        existing.weight = existing.weight.max(weight);
+    } else {
+        roots.push(PacketCommandFocusRoot { root, weight });
+    }
+}
+
+fn packet_source_root_from_path(path: &str) -> Option<String> {
+    let normalized = packet_display_path(path);
+    let normalized = normalized.trim_matches('/').replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(index) = normalized.find("/src/") {
+        let root = &normalized[..index + "/src".len()];
+        return (!root.is_empty()).then(|| root.to_string());
+    }
+    let (parent, _) = normalized.rsplit_once('/')?;
+    (!parent.is_empty()).then(|| parent.to_string())
+}
+
+fn packet_citation_focus_root_score(
+    citation: &AgentCitationDto,
+    focus_roots: &[PacketCommandFocusRoot],
+) -> u8 {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .replace('\\', "/");
+    focus_roots
+        .iter()
+        .filter(|root| path == root.root || path.starts_with(&format!("{}/", root.root)))
+        .map(|root| root.weight)
+        .max()
+        .unwrap_or_default()
+}

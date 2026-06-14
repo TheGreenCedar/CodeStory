@@ -11,9 +11,10 @@
 - contracts: shared graph, DTO, and event types that are safe to depend on across boundaries
 - repo-text hit: a direct file-content match surfaced alongside indexed-symbol search results
 - retrieval mode: retrieval status contract for sidecar evidence; `retrieval_mode=full` is required for agent packet/search readiness
-- semantic doc: generated per-symbol text plus an embedding stored in SQLite for hybrid retrieval
+- symbol doc: deterministic generated per-symbol text stored in SQLite for graph-native lexical retrieval; it is not embedded by default
+- dense anchor: a policy-selected symbol, component report, or unstructured doc that receives a vector embedding
 - local navigation readiness: the local cache, graph, lexical index, and DB-backed navigation commands are usable
 - agent packet/search readiness: sidecar packet/search evidence is trustworthy only when retrieval status reports `retrieval_mode=full`
 - target context: DB-first evidence for one concrete target; not a replacement for broad packet, search, or drill questions
-- semantic ready: local diagnostic state where hybrid retrieval is enabled, an embedding runtime is available, and persisted semantic docs exist; not agent packet/search readiness
+- semantic ready: local diagnostic state where dense-anchor retrieval is enabled, an embedding runtime is available when dense anchors exist, and persisted dense anchors match the active policy; not agent packet/search readiness
 - cache root: the directory that owns one project cache; by default this is under the user cache directory, but `--cache-dir` can override it

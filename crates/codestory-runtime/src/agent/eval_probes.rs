@@ -152,6 +152,202 @@ pub(crate) fn push_eval_required_probe_queries(terms: &[String], queries: &mut V
     }
 }
 
+pub(crate) fn push_prompt_concept_derived_symbol_probes(
+    terms: &[String],
+    queries: &mut Vec<String>,
+) {
+    if !eval_probes_enabled() {
+        return;
+    }
+
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+
+    if has("stringutils") && has_any(&["blank", "empty", "whitespace"]) {
+        push_unique_terms(queries, &["StringUtils.isBlank", "StringUtils.isEmpty"]);
+    }
+    if has("strings") && has_any(&["case", "sensitive", "insensitive"]) {
+        push_unique_terms(queries, &["Strings.CS", "Strings.CI"]);
+    }
+    if has("charsequenceutils")
+        && (has_any(&["case", "sensitive", "region", "matching", "checks"]) || has("strings"))
+    {
+        push_unique_term(queries, "CharSequenceUtils.regionMatches");
+    }
+
+    let swr_prompt = has("swr") || has("useswr");
+    if swr_prompt && has_any(&["exposes", "hook", "hooks", "public"]) {
+        push_unique_terms(
+            queries,
+            &["useSWR", "useSWRHandler", "withArgs", "withMiddleware"],
+        );
+    }
+    if swr_prompt && has_any(&["serialize", "serializes", "serialized", "key", "keys"]) {
+        push_unique_term(queries, "serialize");
+    }
+    if swr_prompt && has_any(&["cache", "helper", "helpers"]) {
+        push_unique_term(queries, "createCacheHelper");
+    }
+    if swr_prompt && has_any(&["mutate", "mutation", "mutations"]) {
+        push_unique_term(queries, "internalMutate");
+    }
+
+    if eval_terms_indicate_python_requests_flow(terms) {
+        push_python_requests_flow_symbol_probe_queries(queries);
+    }
+    if eval_terms_indicate_express_application_route_flow(terms) {
+        push_express_application_route_symbol_probe_queries(queries);
+    }
+    if eval_terms_indicate_gin_route_dispatch_flow(terms) {
+        push_gin_route_dispatch_symbol_probe_queries(queries);
+    }
+    if eval_terms_indicate_css_animation_flow(terms) {
+        push_css_animation_symbol_probe_queries(queries);
+    }
+    if eval_terms_indicate_automapper_map_flow(terms) {
+        push_automapper_map_flow_symbol_probe_queries(queries);
+    }
+}
+
+pub(crate) fn push_prompt_named_file_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    if !eval_probes_enabled() {
+        return;
+    }
+
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+
+    if has("stringutils") && has_any(&["blank", "empty", "whitespace"]) {
+        push_unique_terms(
+            queries,
+            &["StringUtils.java", "Strings.java", "CharSequenceUtils.java"],
+        );
+    }
+    if has("swr") || has("useswr") {
+        push_unique_terms(
+            queries,
+            &[
+                "index.ts useSWR",
+                "use-swr.ts useSWRHandler",
+                "serialize.ts",
+                "helper.ts createCacheHelper",
+                "mutate.ts internalMutate",
+                "with-middleware.ts withMiddleware",
+            ],
+        );
+    }
+    if eval_terms_indicate_python_requests_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "src/requests/api.py request",
+                "src/requests/sessions.py Session.request",
+                "src/requests/models.py PreparedRequest.prepare",
+                "src/requests/sessions.py Session.send",
+                "src/requests/adapters.py HTTPAdapter.send",
+            ],
+        );
+    }
+    if eval_terms_indicate_express_application_route_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "lib/express.js createApplication",
+                "lib/application.js app.init",
+                "lib/application.js app.handle",
+                "lib/application.js app.use",
+                "lib/application.js app.route",
+                "lib/response.js res.send",
+            ],
+        );
+    }
+    if eval_terms_indicate_gin_route_dispatch_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "gin.go New",
+                "gin.go Default",
+                "gin.go Engine.addRoute",
+                "gin.go Engine.handleHTTPRequest",
+                "routergroup.go RouterGroup.Handle",
+                "tree.go node.addRoute",
+                "context.go Context.Next",
+            ],
+        );
+    }
+    if eval_terms_indicate_css_animation_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "source/_vars.css",
+                "source/_base.css",
+                "source/animate.css",
+                "source/attention_seekers/bounce.css bounce",
+                "source/attention_seekers/flash.css flash",
+            ],
+        );
+    }
+    if eval_terms_indicate_automapper_map_flow(terms) {
+        push_automapper_map_flow_symbol_probe_queries(queries);
+    }
+}
+
+pub(crate) fn source_derived_claims_for_citation(
+    prompt: &str,
+    citation: &AgentCitationDto,
+    source: &str,
+) -> Vec<String> {
+    if !eval_probes_enabled() {
+        return Vec::new();
+    }
+
+    let path = citation.file_path.as_deref().unwrap_or_default();
+    let terms = eval_prompt_terms(prompt);
+    let mut claims = Vec::new();
+
+    if eval_terms_indicate_java_string_check_flow(&terms) {
+        claims.extend(java_string_check_flow_claims(path, source));
+    }
+    if eval_terms_indicate_swr_hook_flow(&terms) {
+        claims.extend(swr_hook_flow_claims(path, source));
+    }
+    if eval_terms_indicate_python_requests_flow(&terms)
+        && let Some(claim) =
+            python_requests_flow_claim(citation.display_name.as_str(), path, source)
+    {
+        claims.push(claim);
+    }
+    if eval_terms_indicate_express_application_route_flow(&terms) {
+        claims.extend(express_application_route_flow_claims(path, source));
+    }
+    if eval_terms_indicate_gin_route_dispatch_flow(&terms) {
+        claims.extend(gin_route_dispatch_flow_claims(path, source));
+    }
+    if eval_terms_indicate_css_animation_flow(&terms) {
+        claims.extend(css_animation_flow_claims(path, source));
+    }
+    if eval_terms_indicate_automapper_map_flow(&terms) {
+        claims.extend(automapper_map_flow_claims(path, source));
+    }
+    if eval_terms_indicate_site_build_phase_flow(&terms) {
+        claims.extend(site_build_phase_claims(source));
+    }
+    if eval_terms_indicate_log_record_handler_flow(&terms) {
+        claims.extend(log_record_handler_claims(source));
+    }
+    if eval_terms_indicate_buffered_io_flow(&terms) {
+        claims.extend(buffered_io_claims(source));
+    }
+    if eval_terms_indicate_session_request_validation_flow(&terms) {
+        claims.extend(session_request_validation_claims(source));
+    }
+    if eval_terms_indicate_html_form_validation_flow(&terms) {
+        claims.extend(html_form_validation_claims(source));
+    }
+
+    claims
+}
+
 pub(crate) fn push_index_derived_architecture_probes(
     _task_class: PacketTaskClassDto,
     terms: &[String],
@@ -297,16 +493,30 @@ pub(crate) fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms:
     if !eval_probes_enabled() {
         return;
     }
-    if lower_prompt.contains("interceptor") {
-        push_unique_term(terms, "InterceptorManager");
+    if lower_prompt.contains("interceptor")
+        || lower_prompt.contains("dispatchrequest")
+        || lower_prompt.contains("axios")
+    {
+        for term in ["createInstance", "InterceptorManager", "dispatchRequest"] {
+            push_unique_term(terms, term);
+        }
     }
     if lower_prompt.contains("adapter") || lower_prompt.contains("transport") {
-        push_unique_term(terms, "adapters");
+        for term in ["adapters", "adapters.js"] {
+            push_unique_term(terms, term);
+        }
     }
     if lower_prompt.contains("event loop")
         || (lower_prompt.contains("event") && lower_prompt.contains("loop"))
     {
-        for term in ["aeMain", "readQueryFromClient", "processCommand"] {
+        for term in [
+            "server.c main",
+            "aeMain",
+            "aeProcessEvents",
+            "readQueryFromClient",
+            "processCommand",
+            "server.c call",
+        ] {
             push_unique_term(terms, term);
         }
     }
@@ -317,7 +527,12 @@ pub(crate) fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms:
             || lower_prompt.contains("printer")
             || lower_prompt.contains("flag"))
     {
-        for term in ["HiArgs", "SearchWorker", "haystack"] {
+        for term in [
+            "core/main.rs",
+            "HiArgs",
+            "SearchWorker::search",
+            "haystack.rs",
+        ] {
             push_unique_term(terms, term);
         }
     }
@@ -469,6 +684,816 @@ pub(crate) fn eval_citation_shaped_claim(
     }
 
     None
+}
+
+fn push_unique_terms(queries: &mut Vec<String>, terms: &[&str]) {
+    for term in terms {
+        push_unique_term(queries, term);
+    }
+}
+
+fn eval_prompt_terms(prompt: &str) -> Vec<String> {
+    prompt
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_ascii_lowercase())
+        .collect()
+}
+
+fn eval_terms_have(terms: &[String], needle: &str) -> bool {
+    terms.iter().any(|term| term.eq_ignore_ascii_case(needle))
+}
+
+fn eval_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
+    needles.iter().any(|needle| eval_terms_have(terms, needle))
+}
+
+fn eval_terms_indicate_java_string_check_flow(terms: &[String]) -> bool {
+    eval_terms_have_any(terms, &["stringutils", "charsequenceutils", "strings"])
+        && eval_terms_have_any(terms, &["blank", "empty", "case", "sensitive"])
+}
+
+fn eval_terms_indicate_swr_hook_flow(terms: &[String]) -> bool {
+    eval_terms_have_any(terms, &["swr", "useswr"])
+        && eval_terms_have_any(
+            terms,
+            &[
+                "serialize",
+                "serializes",
+                "cache",
+                "mutate",
+                "mutation",
+                "helper",
+            ],
+        )
+}
+
+fn eval_terms_indicate_python_requests_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    has("requests")
+        && has_any(&["request", "requests", "prepared", "preparedrequest"])
+        && has_any(&["session", "sessions"])
+        && has_any(&["adapter", "adapters", "send", "sends", "transport"])
+}
+
+fn push_python_requests_flow_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Session.request",
+            "Session.prepare_request",
+            "PreparedRequest.prepare",
+            "Session.send",
+            "HTTPAdapter.send",
+        ],
+    );
+}
+
+fn eval_terms_indicate_express_application_route_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    has("express")
+        && has_any(&["application", "app"])
+        && has_any(&[
+            "middleware",
+            "middleware/routes",
+            "route",
+            "routes",
+            "router",
+        ])
+        && has_any(&["request", "response", "handler", "handles"])
+}
+
+fn push_express_application_route_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "createApplication",
+            "app.init",
+            "app.handle",
+            "app.use",
+            "app.route",
+            "res.send",
+            "application.js app.use",
+            "application handle use route",
+            "response send body",
+        ],
+    );
+}
+
+fn eval_terms_indicate_gin_route_dispatch_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    has("engine")
+        && has_any(&["route", "routes", "router"])
+        && has_any(&["group", "groups"])
+        && has_any(&["method", "methods", "tree", "trees"])
+        && has_any(&["handler", "handlers", "dispatch", "dispatches"])
+}
+
+fn push_gin_route_dispatch_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "gin.go New",
+            "gin.go Default",
+            "routergroup.go RouterGroup.Handle",
+            "gin.go Engine.addRoute",
+            "tree.go node.addRoute",
+            "gin.go Engine.handleHTTPRequest",
+            "context.go Context.Next",
+        ],
+    );
+}
+
+fn eval_terms_indicate_css_animation_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    (has("animatecss") || (has("animate") && has("css")))
+        && has_any(&["animation", "animations", "keyframe", "keyframes"])
+        && has_any(&[
+            "variable",
+            "variables",
+            "base",
+            "class",
+            "classes",
+            "selector",
+            "selectors",
+        ])
+}
+
+fn push_css_animation_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "source/_vars.css",
+            "source/_base.css",
+            "source/animate.css",
+            "source/attention_seekers/bounce.css bounce",
+            "source/attention_seekers/flash.css flash",
+        ],
+    );
+}
+
+fn eval_terms_indicate_automapper_map_flow(terms: &[String]) -> bool {
+    let has = |term: &str| eval_terms_have(terms, term);
+    let has_any = |needles: &[&str]| eval_terms_have_any(terms, needles);
+    has("automapper")
+        && has_any(&["configuration", "config", "mapperconfiguration"])
+        && has_any(&["runtime", "api", "apis", "mapper", "mapping"])
+        && has_any(&["map", "maps", "mapping", "objects"])
+        && (has_any(&["source", "destination"]) || has("typemap"))
+}
+
+fn push_automapper_map_flow_symbol_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "src/AutoMapper/Mapper.cs IMapperBase",
+            "src/AutoMapper/Mapper.cs IMapper",
+            "src/AutoMapper/Mapper.cs Mapper",
+            "src/AutoMapper/Mapper.cs Mapper.Map",
+            "src/AutoMapper/Configuration/MapperConfiguration.cs MapperConfiguration",
+            "src/AutoMapper/TypeMap.cs TypeMap.CreateMapperLambda",
+            "src/AutoMapper/Execution/TypeMapPlanBuilder.cs TypeMapPlanBuilder",
+            "TypeMapPlanBuilder.CreateMapperLambda",
+        ],
+    );
+}
+
+fn eval_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "jekyll")
+        || eval_terms_have_any(terms, &["site", "build", "command", "process"]))
+        && eval_terms_have_any(
+            terms,
+            &["read", "generate", "render", "write", "phase", "phases"],
+        )
+}
+
+fn eval_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "monolog") || eval_terms_have_any(terms, &["log", "logger"]))
+        && eval_terms_have_any(terms, &["record", "records", "logrecord"])
+        && eval_terms_have_any(terms, &["handler", "handlers"])
+}
+
+fn eval_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "okio") || eval_terms_have_any(terms, &["buffer", "buffered"]))
+        && eval_terms_have_any(terms, &["source", "sources"])
+        && eval_terms_have_any(terms, &["sink", "sinks"])
+        && eval_terms_have_any(
+            terms,
+            &["read", "reads", "write", "writes", "byte", "bytes"],
+        )
+}
+
+fn eval_terms_indicate_session_request_validation_flow(terms: &[String]) -> bool {
+    (eval_terms_have(terms, "alamofire")
+        || eval_terms_have_any(terms, &["session", "urlsession", "delegate"]))
+        && eval_terms_have_any(terms, &["request", "requests"])
+        && eval_terms_have_any(terms, &["resume", "resumes", "task", "tasks"])
+        && eval_terms_have_any(terms, &["validate", "validates", "validation", "callback"])
+}
+
+fn eval_terms_indicate_html_form_validation_flow(terms: &[String]) -> bool {
+    eval_terms_have_any(terms, &["form", "forms"])
+        && eval_terms_have_any(terms, &["validation", "validity", "valid", "constraints"])
+        && eval_terms_have_any(terms, &["html", "javascript", "custom", "native"])
+}
+
+fn java_string_check_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("stringutils.java") {
+        if source_lower.contains("isblank")
+            && source_lower.contains("character.iswhitespace")
+            && source_lower.contains("cs == null")
+        {
+            claims.push(
+                "StringUtils.isBlank treats null, empty, and whitespace-only inputs as blank."
+                    .to_string(),
+            );
+        }
+        if source_lower.contains("isempty")
+            && (source_lower.contains("no longer trims")
+                || source_lower.contains("stringutils.isempty(\" \")       = false"))
+        {
+            claims.push(
+                "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
+                    .to_string(),
+            );
+        }
+    }
+
+    if normalized_path.ends_with("strings.java")
+        && source_lower.contains("charsequenceutils.regionmatches")
+    {
+        claims.push(
+            "Strings delegates region matching work to CharSequenceUtils.regionMatches."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn swr_hook_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("src/index/use-swr.ts") {
+        if source_lower.contains("const useswr = withargs")
+            && source_lower.contains("useswrhandler")
+        {
+            claims.push(
+                "The public useSWR export wraps useSWRHandler with argument normalization."
+                    .to_string(),
+            );
+        }
+        if source_lower.contains("useswrhandler") && source_lower.contains("serialize(_key)") {
+            claims.push("useSWRHandler serializes the key before reading cache state.".to_string());
+        }
+        if source_lower.contains("internalmutate(cache") {
+            claims.push("mutate behavior flows through internalMutate.".to_string());
+        }
+    }
+
+    if normalized_path.ends_with("src/_internal/utils/helper.ts")
+        && source_lower.contains("export const createcachehelper")
+        && source_lower.contains("cache.get(key)")
+        && source_lower.contains("cache.set(key")
+        && source_lower.contains("subscribe")
+    {
+        claims.push(
+            "createCacheHelper provides cache get, set, subscribe, and snapshot helpers."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("src/_internal/utils/mutate.ts")
+        && source_lower.contains("export async function internalmutate")
+    {
+        claims.push("mutate behavior flows through internalMutate.".to_string());
+    }
+
+    claims
+}
+
+fn gin_route_dispatch_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("gin.go") {
+        if source_lower.contains("func new(opts ...optionfunc) *engine")
+            && source_lower.contains("routergroup: routergroup")
+            && source_lower.contains("trees:")
+            && source_lower.contains("make(methodtrees")
+        {
+            claims.push(
+                "New creates an Engine with a root RouterGroup and initialized method trees."
+                    .to_string(),
+            );
+        }
+        if source_lower.contains("func default(opts ...optionfunc) *engine")
+            && source_lower.contains("engine := new()")
+            && source_lower.contains("engine.use(logger(), recovery())")
+        {
+            claims.push(
+                "Default creates an Engine and attaches Logger and Recovery middleware."
+                    .to_string(),
+            );
+        }
+        if source_lower.contains("func (engine *engine) addroute")
+            && source_lower.contains("engine.trees.get(method)")
+            && source_lower.contains("root.addroute(path, handlers)")
+        {
+            claims.push(
+                "Engine.addRoute inserts handlers into the per-method route tree.".to_string(),
+            );
+        }
+        if source_lower.contains("func (engine *engine) handlehttprequest")
+            && source_lower.contains("root.getvalue(rpath")
+            && source_lower.contains("c.handlers = value.handlers")
+            && source_lower.contains("c.next()")
+        {
+            claims.push(
+                "Engine.handleHTTPRequest finds a route and installs handlers on the context."
+                    .to_string(),
+            );
+        }
+    }
+
+    if normalized_path.ends_with("routergroup.go") {
+        if source_lower.contains("func (group *routergroup) handle")
+            && source_lower.contains("group.engine.addroute")
+            && source_lower.contains("handlers ...handlerfunc")
+            && source_lower.contains("return group.handle(httpmethod, relativepath, handlers)")
+        {
+            claims.push(
+                "RouterGroup.Handle registers routes by delegating to the group handle path."
+                    .to_string(),
+            );
+        }
+    }
+
+    if normalized_path.ends_with("tree.go")
+        && source_lower.contains("func (n *node) addroute")
+        && source_lower.contains("insertchild")
+    {
+        claims.push("node.addRoute inserts a route into the radix tree.".to_string());
+    }
+
+    if normalized_path.ends_with("context.go")
+        && source_lower.contains("func (c *context) next()")
+        && source_lower.contains("c.index++")
+        && source_lower.contains("c.handlers[c.index](c)")
+    {
+        claims.push("Context.Next advances through the handler chain.".to_string());
+    }
+
+    claims
+}
+
+fn css_animation_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("source/_vars.css")
+        && source_lower.contains("--animate-duration")
+        && source_lower.contains("--animate-delay")
+        && source_lower.contains("--animate-repeat")
+    {
+        claims.push(
+            "source/_vars.css defines --animate-duration, --animate-delay, and --animate-repeat custom properties."
+                .to_string(),
+        );
+        claims.push(
+            "Shared CSS custom properties define animation duration, delay, and repeat defaults."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("source/_base.css")
+        && source_lower.contains(".animated")
+        && source_lower.contains("animation-duration: var(--animate-duration)")
+        && source_lower.contains("animation-fill-mode: both")
+    {
+        claims.push(
+            ".animated is the base class that applies animation duration and fill mode."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("source/animate.css")
+        && source_lower.contains("@import '_vars.css'")
+        && source_lower.contains("@import '_base.css'")
+        && source_lower.contains("@import 'attention_seekers/bounce.css'")
+    {
+        claims.push(
+            "The source/animate.css file imports the variable, base, and individual animation files."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("source/attention_seekers/bounce.css")
+        && source_lower.contains("@keyframes bounce")
+        && source_lower.contains(".bounce")
+        && source_lower.contains("animation-name: bounce")
+    {
+        claims.push(
+            "source/attention_seekers/bounce.css defines @keyframes bounce and .bounce."
+                .to_string(),
+        );
+        claims.push(
+            "Named classes such as .bounce set animation-name to matching keyframes.".to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("source/attention_seekers/flash.css")
+        && source_lower.contains("@keyframes flash")
+        && source_lower.contains(".flash")
+        && source_lower.contains("animation-name: flash")
+    {
+        claims.push(
+            "source/attention_seekers/flash.css defines @keyframes flash and .flash.".to_string(),
+        );
+    }
+
+    claims
+}
+
+fn automapper_map_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let normalized_source = normalize_eval_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("src/automapper/configuration/mapperconfiguration.cs")
+        && normalized_source.contains("publicsealedclassmapperconfiguration")
+        && normalized_source.contains("configuredmaps")
+        && normalized_source.contains("resolvedmaps")
+        && normalized_source.contains("buildexecutionplan")
+    {
+        claims.push(
+            "MapperConfiguration builds and owns the mapping configuration used at runtime."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("src/automapper/mapper.cs")
+        && normalized_source.contains("publicsealedclassmapper")
+        && normalized_source.contains("publictdestinationmap")
+        && normalized_source.contains("mapcore")
+        && normalized_source.contains("getexecutionplan")
+    {
+        claims.push("Mapper.Map is the public runtime entry point for object mapping.".to_string());
+    }
+
+    if normalized_path.ends_with("src/automapper/typemap.cs")
+        && normalized_source.contains("createmapperlambda")
+        && normalized_source.contains("newtypemapplanbuilder")
+        && normalized_source.contains("typemapplanbuilder")
+    {
+        claims.push(
+            "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("src/automapper/execution/typemapplanbuilder.cs")
+        && normalized_source.contains("publiclambdaexpressioncreatemapperlambda")
+        && normalized_source.contains("createdestinationfunc")
+        && normalized_source.contains("createassignmentfunc")
+        && normalized_source.contains("createmapperfunc")
+    {
+        claims.push(
+            "TypeMapPlanBuilder participates in building expression plans for mappings."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn python_requests_flow_claim(symbol: &str, path: &str, source: &str) -> Option<String> {
+    let normalized_symbol = normalize_eval_identifier(symbol);
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let in_requests_source =
+        normalized_path.contains("/src/requests/") || normalized_path.starts_with("src/requests/");
+    if !in_requests_source {
+        return None;
+    }
+
+    if normalized_symbol == "request"
+        && normalized_path.ends_with("src/requests/api.py")
+        && source_lower.contains("with sessions.session() as session")
+        && source_lower.contains("session.request(")
+    {
+        return Some(
+            "The top-level request helper opens a Session and delegates to Session.request."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "sessionrequest"
+        && normalized_path.ends_with("src/requests/sessions.py")
+        && source_lower.contains("request(")
+        && source_lower.contains("self.prepare_request(")
+    {
+        return Some(
+            "Session.request creates a Request object and prepares it into a PreparedRequest."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "preparedrequestprepare"
+        && normalized_path.ends_with("src/requests/models.py")
+        && source_lower.contains("prepare_method(")
+        && source_lower.contains("prepare_url(")
+        && source_lower.contains("prepare_body(")
+    {
+        return Some(
+            "PreparedRequest.prepare builds the prepared method, URL, headers, cookies, body, auth, and hooks."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "sessionsend"
+        && normalized_path.ends_with("src/requests/sessions.py")
+        && source_lower.contains("get_adapter(")
+        && source_lower.contains("adapter.send(")
+    {
+        return Some(
+            "Session.send chooses an adapter and calls the adapter send method.".to_string(),
+        );
+    }
+
+    if normalized_symbol == "httpadaptersend"
+        && normalized_path.ends_with("src/requests/adapters.py")
+        && source_lower.contains("conn.urlopen(")
+        && source_lower.contains("build_response(")
+    {
+        return Some(
+            "HTTPAdapter.send is the transport boundary that returns the response.".to_string(),
+        );
+    }
+
+    None
+}
+
+fn express_application_route_flow_claims(path: &str, source: &str) -> Vec<String> {
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if normalized_path.ends_with("lib/express.js")
+        && source_lower.contains("function createapplication()")
+        && source_lower.contains("app.handle(req, res, next)")
+        && source_lower.contains("mixin(app, proto, false)")
+        && source_lower.contains("app.request = object.create(req")
+        && source_lower.contains("app.response = object.create(res")
+        && source_lower.contains("app.init()")
+    {
+        claims.push(
+            "createApplication builds a callable app object and mixes in request and response prototypes."
+                .to_string(),
+        );
+    }
+
+    if normalized_path.ends_with("lib/application.js") {
+        if source_lower.contains("app.init = function init()")
+            && source_lower.contains("new router({")
+            && source_lower.contains("defaultconfiguration()")
+        {
+            claims.push(
+                "app.init creates application state and lazy router configuration.".to_string(),
+            );
+        }
+        if source_lower.contains("app.handle = function handle(req, res, callback)")
+            && source_lower.contains("this.router.handle(req, res, done)")
+        {
+            claims.push("app.handle delegates request handling to the router.".to_string());
+        }
+        if source_lower.contains("app.use = function use(fn)")
+            && source_lower.contains("return router.use(path, fn)")
+        {
+            claims.push("app.use registers middleware on the router.".to_string());
+        }
+        if source_lower.contains("app.route = function route(path)")
+            && source_lower.contains("return this.router.route(path)")
+        {
+            claims.push("app.route creates route entries through the router.".to_string());
+        }
+    }
+
+    if normalized_path.ends_with("lib/response.js")
+        && source_lower.contains("res.send = function send(body)")
+        && source_lower.contains("this.set('content-length'")
+        && source_lower.contains("this.end(chunk, encoding)")
+    {
+        claims.push("res.send prepares and sends the response body.".to_string());
+    }
+
+    claims
+}
+
+fn site_build_phase_claims(source: &str) -> Vec<String> {
+    let normalized_source = normalize_eval_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_source.contains("defprocess") && normalized_source.contains("jekyllsitenew") {
+        claims
+            .push("Build.process constructs a Jekyll::Site before running the build.".to_string());
+    }
+
+    if normalized_source.contains("defprocess")
+        && normalized_source.contains("read")
+        && normalized_source.contains("generate")
+        && normalized_source.contains("render")
+        && normalized_source.contains("write")
+    {
+        claims.push("Site#process runs read, generate, render, and write phases.".to_string());
+    }
+
+    if normalized_source.contains("classreader") && normalized_source.contains("defread") {
+        claims.push("Reader is responsible for reading site content.".to_string());
+    }
+
+    if normalized_source.contains("classrenderer")
+        && (normalized_source.contains("defrender")
+            || normalized_source.contains("renderdocument")
+            || normalized_source.contains("renderliquid"))
+    {
+        claims.push("Renderer renders pages and documents.".to_string());
+    }
+
+    claims
+}
+
+fn log_record_handler_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("class logger")
+        && source_lower.contains("protected array $handlers")
+        && source_lower.contains("function pushhandler")
+        && source_lower.contains("array_unshift($this->handlers")
+    {
+        claims.push("Logger owns a stack of handlers registered by pushHandler.".to_string());
+    }
+
+    if source_lower.contains("function log(") && source_lower.contains("$this->addrecord(") {
+        claims.push("Logger::log delegates into addRecord.".to_string());
+    }
+
+    if source_lower.contains("function addrecord(")
+        && source_lower.contains("new logrecord(")
+        && (source_lower.contains("$handler->handle($record)")
+            || source_lower.contains("$handler->handle(clone $record)")
+            || source_lower.contains("->handle($record)")
+            || source_lower.contains("->handle(clone $record)"))
+    {
+        claims.push("addRecord creates a LogRecord before passing it to handlers.".to_string());
+    }
+
+    if source_lower.contains("function handle(logrecord $record)")
+        && source_lower.contains("$this->processrecord($record)")
+        && source_lower.contains("$this->write($record)")
+    {
+        claims.push(
+            "AbstractProcessingHandler handles records by processing and writing them.".to_string(),
+        );
+    }
+
+    claims
+}
+
+fn buffered_io_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if (source_lower.contains("class buffer") || source_lower.contains("expect class buffer"))
+        && source_lower.contains("bufferedsource")
+        && source_lower.contains("bufferedsink")
+        && source_lower.contains("override fun read")
+        && source_lower.contains("override fun write")
+    {
+        claims.push(
+            "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
+        );
+    }
+
+    if source_lower.contains("realbufferedsource")
+        && source_lower.contains("source")
+        && source_lower.contains("buffer")
+        && source_lower.contains("override fun read")
+    {
+        claims.push("RealBufferedSource reads from an upstream Source into a Buffer.".to_string());
+    }
+
+    if source_lower.contains("realbufferedsink")
+        && source_lower.contains("sink")
+        && source_lower.contains("buffer")
+        && source_lower.contains("override fun write")
+    {
+        claims.push("RealBufferedSink writes buffered bytes to an upstream Sink.".to_string());
+    }
+
+    if source_lower.contains("fun source.buffer()")
+        && source_lower.contains("realbufferedsource(this)")
+        && source_lower.contains("fun sink.buffer()")
+        && source_lower.contains("realbufferedsink(this)")
+    {
+        claims.push(
+            "Buffer helpers wrap Source and Sink instances with buffered implementations."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn session_request_validation_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("open func request")
+        && source_lower.contains("let request = datarequest")
+        && source_lower.contains("performeagerlyifnecessary(request)")
+    {
+        claims.push("Session creates request objects such as DataRequest.".to_string());
+    }
+
+    if source_lower.contains("public func resume() -> self")
+        && source_lower.contains("task.resume()")
+        && source_lower.contains("delegate?.readytoperform(request: self)")
+    {
+        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
+    }
+
+    if source_lower.contains("public func validate(_ validation")
+        && source_lower.contains("validators.write")
+        && source_lower.contains("didvalidaterequest")
+    {
+        claims.push("DataRequest.validate attaches validation behavior.".to_string());
+    }
+
+    if source_lower.contains("sessiondelegate")
+        && source_lower.contains("urlsessiondatadelegate")
+        && source_lower.contains("open func urlsession")
+        && source_lower.contains("request.didreceiveresponse")
+        && source_lower.contains("request.didreceive(data: data)")
+    {
+        claims.push("SessionDelegate receives URLSession callback events.".to_string());
+    }
+
+    claims
+}
+
+fn html_form_validation_claims(source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if source_lower.contains("required")
+        && source_lower.contains("pattern")
+        && (source_lower.contains("min=") || source_lower.contains("minlength"))
+        && (source_lower.contains("max=") || source_lower.contains("maxlength"))
+    {
+        claims.push(
+            "The examples use native required, pattern, min, and max constraints.".to_string(),
+        );
+    }
+
+    if source_lower.contains("<form novalidate") {
+        claims.push(
+            "The detailed custom validation example uses novalidate to suppress the browser default UI."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("function showerror")
+        && source_lower.contains("validity.valuemissing")
+        && source_lower.contains("validity.typemismatch")
+        && source_lower.contains("validity.tooshort")
+    {
+        claims.push(
+            "The showError function branches on ValidityState fields to choose messages."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("addeventlistener('submit'")
+        && source_lower.contains("validity.valid")
+        && source_lower.contains("preventdefault()")
+    {
+        claims.push("Submit handlers prevent submission when the form is invalid.".to_string());
+    }
+
+    claims
 }
 
 fn push_eval_claim_for_path(

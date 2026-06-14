@@ -172,6 +172,32 @@
       ]
     },
     {
+      "all_terms": ["requests", "session"],
+      "any_terms": ["prepared", "preparedrequest", "adapter", "send"],
+      "queries": [
+        "Session.request",
+        "Session.prepare_request",
+        "PreparedRequest.prepare",
+        "Session.send",
+        "HTTPAdapter.send"
+      ]
+    },
+    {
+      "all_terms": ["express"],
+      "any_terms": ["application", "app", "route", "routes", "router", "middleware"],
+      "queries": [
+        "createApplication",
+        "app.init",
+        "app.handle",
+        "app.use",
+        "app.route",
+        "res.send",
+        "application.js app.use",
+        "application handle use route",
+        "response send body"
+      ]
+    },
+    {
       "all_terms": [],
       "any_terms": [
         "payload",
@@ -271,6 +297,29 @@
         "TaskFillIndexerCommandsQueue",
         "IndexerCommandCxx",
         "IndexerJava::doIndex"
+      ]
+    },
+    {
+      "all_terms": ["requests", "session"],
+      "any_terms": ["prepared", "preparedrequest", "adapter", "send"],
+      "queries": [
+        "Session.request",
+        "Session.prepare_request",
+        "PreparedRequest.prepare",
+        "Session.send",
+        "HTTPAdapter.send"
+      ]
+    },
+    {
+      "all_terms": ["express"],
+      "any_terms": ["application", "app", "route", "routes", "router", "middleware"],
+      "queries": [
+        "createApplication",
+        "app.init",
+        "app.handle",
+        "app.use",
+        "app.route",
+        "res.send"
       ]
     }
   ],

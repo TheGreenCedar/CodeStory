@@ -9,8 +9,8 @@ Promote only rows that pass the current harness gates documented in
 
 The 2026-05-23 quick CodeStory repo run used:
 
-```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 900000 --sandbox danger-full-access --publishable --out-dir target\agent-benchmark\codestory-quick-2026-05-23-r3
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 900000 --sandbox danger-full-access --publishable --out-dir target/agent-benchmark/codestory-quick-2026-05-23-r3
 ```
 
 It was a real baseline, not a savings claim. The without-CodeStory arm passed
@@ -62,9 +62,9 @@ On 2026-05-23, the release CLI completed three-repeat packet runtime runs
 against the full public-core manifest suite in both warm stdio and cold CLI
 modes:
 
-```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode warm-stdio --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\packet-runtime-public-core-warm-r8 --timeout-ms 120000 --publishable
-node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode cold-cli --codestory-cli .\target\release\codestory-cli.exe --out-dir target\agent-benchmark\packet-runtime-public-core-cold-r9 --timeout-ms 120000 --publishable
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode warm-stdio --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/packet-runtime-public-core-warm-r8 --timeout-ms 120000 --publishable
+node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3 --packet-runtime-mode cold-cli --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/packet-runtime-public-core-cold-r9 --timeout-ms 120000 --publishable
 ```
 
 Across both modes, all `108` packet rows passed operationally and quality gates.
@@ -100,14 +100,14 @@ still use manifest quality gates before promotion.
 
 ## Commands
 
-```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs --list
-node .\scripts\codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable
-node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --list
-node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids codestory-indexing-flow,vite-dev-server-architecture --arms with_codestory --repeats 3 --max-source-reads-after-packet 0 --allow-failures
-node .\scripts\codestory-agent-ab-benchmark.mjs --reanalyze-dir target\agent-benchmark\<run-dir>
-node .\scripts\codestory-agent-ab-benchmark.mjs --task-suite public-core --materialize-repos --list
-node .\scripts\codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs --list
+node ./scripts/codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable
+node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --list
+node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids codestory-indexing-flow,vite-dev-server-architecture --arms with_codestory --repeats 3 --max-source-reads-after-packet 0 --allow-failures
+node ./scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
+node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --materialize-repos --list
+node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite public-core --repeats 3
 ```
 
 Cold repo-scale timings are owned by

@@ -635,8 +635,7 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     assert!(
         joined.contains("codestory-cli index")
             && joined.contains("--refresh incremental")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
+            && joined.contains("codestory-cli doctor"),
         "stale doctor should recommend index repair then doctor recheck: {doctor:#}"
     );
     assert!(
@@ -706,8 +705,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
         joined.contains("codestory-cli retrieval status")
             && joined.contains("codestory-cli retrieval index")
             && joined.contains("--refresh full")
-            && joined.contains("codestory-cli doctor")
-            && joined.contains("--format markdown"),
+            && joined.contains("codestory-cli doctor"),
         "doctor should recommend retrieval repair before packet/search: {doctor:#}"
     );
     assert!(
@@ -1626,10 +1624,39 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
         ],
     );
     assert!(
+        files["summary"]["file_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "files JSON should keep whole-index file_count: {files:#}"
+    );
+    assert_eq!(
+        files["summary"]["indexed_file_count"].as_u64(),
+        files["summary"]["file_count"].as_u64(),
+        "files JSON should keep indexed_file_count whole-index for the fully indexed fixture: {files:#}"
+    );
+    assert!(
+        files["summary"]["filtered_file_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "files JSON should include filtered_file_count: {files:#}"
+    );
+    assert!(
+        files["summary"]["file_count"].as_u64() > files["summary"]["filtered_file_count"].as_u64(),
+        "role-filtered files JSON should keep whole-index file_count distinct from filtered_file_count: {files:#}"
+    );
+    assert_eq!(
+        files["summary"]["visible_file_count"].as_u64(),
+        files["files"].as_array().map(|items| items.len() as u64),
+        "visible_file_count should match returned rows: {files:#}"
+    );
+    assert!(
         files["summary"]["language_counts"]
             .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "files JSON should include language counts: {files:#}"
+            .is_some_and(|items| items.iter().any(|item| item["language"] == "rust"
+                && item["support_mode"] == "parser_backed_graph"
+                && item["evidence_tier"] == "graph_fidelity"
+                && item["claim_label"] == "parser-backed graph, fidelity-gated")),
+        "files JSON should include language counts with support tiers: {files:#}"
     );
     assert!(
         files["summary"]["framework_route_coverage"]
@@ -1637,7 +1664,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             .is_some_and(
                 |items| items.iter().any(|item| item["framework"] == "express"
                     && item["promotable"] == true
-                    && item["fixture_status"].is_string()
+                    && item["coverage_evidence"].is_string()
                     && item["unsupported_patterns"].is_array())
                     && items.iter().any(|item| item["framework"] == "nextjs"
                         && item["confidence_floor"] == "file_convention"
@@ -1657,6 +1684,39 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
                 .is_some_and(|path| path.contains("app_controller_test.rs"))
                 && file["role"] == "test"),
         "files --role test should list inferred test files: {files:#}"
+    );
+
+    let limited_files = run_cli_json(
+        workspace,
+        cache_dir,
+        &[
+            "files",
+            "--language",
+            "rust",
+            "--limit",
+            "1",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        limited_files["summary"]["filtered_file_count"].as_u64()
+            > limited_files["summary"]["visible_file_count"].as_u64(),
+        "limited files JSON should report filtered rows before truncation and visible rows after truncation: {limited_files:#}"
+    );
+    assert_eq!(
+        limited_files["summary"]["visible_file_count"].as_u64(),
+        limited_files["files"]
+            .as_array()
+            .map(|items| items.len() as u64),
+        "limited visible_file_count should match returned rows: {limited_files:#}"
+    );
+    assert_eq!(
+        limited_files["summary"]["truncated"].as_bool(),
+        Some(true),
+        "limited files JSON should mark truncation: {limited_files:#}"
     );
 
     let files_markdown = run_cli(
@@ -1682,10 +1742,18 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
     let files_markdown = String::from_utf8_lossy(&files_markdown.stdout);
     assert!(
         files_markdown.contains("# indexed files")
+            && files_markdown.contains("whole index files:")
+            && files_markdown.contains("filtered files:")
+            && files_markdown.contains("visible rows:")
+            && files_markdown.contains("truncated:")
             && files_markdown.contains("languages:")
+            && files_markdown.contains("rust=")
+            && files_markdown.contains("[parser_backed_graph; graph_fidelity]")
+            && files_markdown.contains("language_support_claims:")
+            && files_markdown.contains("parser-backed graph, fidelity-gated")
             && files_markdown.contains("coverage:")
             && files_markdown.contains("framework route coverage:"),
-        "files markdown should summarize inventory and coverage:\n{files_markdown}"
+        "files markdown should summarize inventory, support tiers, and coverage:\n{files_markdown}"
     );
 
     let affected = run_cli_json(

@@ -11,7 +11,9 @@ use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
-use crate::display::{clean_path_string, format_search_hit_target, relative_path};
+use crate::display::{
+    clean_path_string, format_search_hit_target, quote_command_path, relative_path,
+};
 use crate::query_resolution::{
     ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_resolvable_graph_target,
     resolution_rank_with_project_root, search_hit_matches_file_filter,
@@ -150,7 +152,7 @@ impl RuntimeContext {
                 self.project_root.clone(),
                 self.storage_path.clone(),
             )
-            .map_err(map_api_error)
+            .map_err(|error| map_api_error_for_project(error, &self.project_root))
     }
 }
 
@@ -450,8 +452,34 @@ pub(crate) fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Re
 }
 
 pub(crate) fn map_api_error(error: ApiError) -> anyhow::Error {
+    map_api_error_with_project(error, None)
+}
+
+pub(crate) fn map_api_error_for_project(error: ApiError, project: &Path) -> anyhow::Error {
+    map_api_error_with_project(error, Some(project))
+}
+
+fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow::Error {
+    if api_error_is_cache_busy(&error) {
+        return anyhow!(cache_busy_message(project));
+    }
     let mut message = format!("{}: {}", error.code, error.message);
-    if let Some(next_commands) = api_error_next_commands(&error) {
+    if let Some((minimum_next, full_repair)) = api_error_repair_groups(&error) {
+        if !minimum_next.is_empty() {
+            message.push_str("\n\nMinimum next:");
+            for command in minimum_next {
+                message.push_str("\n  ");
+                message.push_str(command);
+            }
+        }
+        if !full_repair.is_empty() && full_repair != minimum_next {
+            message.push_str("\n\nFull repair:");
+            for command in full_repair {
+                message.push_str("\n  ");
+                message.push_str(command);
+            }
+        }
+    } else if let Some(next_commands) = api_error_next_commands(&error) {
         message.push_str("\n\nNext commands:");
         for command in next_commands {
             message.push_str("\n  ");
@@ -461,9 +489,48 @@ pub(crate) fn map_api_error(error: ApiError) -> anyhow::Error {
     anyhow!(message)
 }
 
+pub(crate) fn map_cache_busy_anyhow(error: anyhow::Error, project: &Path) -> anyhow::Error {
+    if is_cache_busy_text(&error.to_string()) {
+        return anyhow!(cache_busy_message(Some(project)));
+    }
+    error
+}
+
+fn api_error_repair_groups(error: &ApiError) -> Option<(&[String], &[String])> {
+    let details = error.details.as_ref()?;
+    if details.minimum_next.is_empty() && details.full_repair.is_empty() {
+        return details.readiness.as_ref().map(|verdict| {
+            (
+                verdict.minimum_next.as_slice(),
+                verdict.full_repair.as_slice(),
+            )
+        });
+    }
+    Some((&details.minimum_next, &details.full_repair))
+}
+
 fn api_error_next_commands(error: &ApiError) -> Option<Vec<String>> {
     let commands = &error.details.as_ref()?.next_commands;
     (!commands.is_empty()).then_some(commands.clone())
+}
+
+fn api_error_is_cache_busy(error: &ApiError) -> bool {
+    let text = format!("{} {}", error.code, error.message).to_ascii_lowercase();
+    is_cache_busy_text(&text)
+}
+
+fn is_cache_busy_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("database is locked") || text.contains("sqlite_busy")
+}
+
+fn cache_busy_message(project: Option<&Path>) -> String {
+    let project = project
+        .map(quote_command_path)
+        .unwrap_or_else(|| "<repo>".to_string());
+    format!(
+        "cache_busy: CodeStory cache is busy or locked. Wait for the active indexing/search process to release the SQLite cache, then retry.\n\nMinimum next:\n  codestory-cli ready --project {project} --goal agent\n\nFull repair:\n  codestory-cli ready --project {project} --goal agent\n  codestory-cli doctor --project {project}"
+    )
 }
 
 pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {

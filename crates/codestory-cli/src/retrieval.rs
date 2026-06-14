@@ -98,7 +98,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
-    let outcome = finalize_retrieval_index(&runtime).or_else(|error| {
+    let outcome = finalize_retrieval_index_for_runtime(&runtime).or_else(|error| {
         if !retrieval_index_should_retry_full_refresh(cmd.refresh, &error) {
             return Err(error);
         }
@@ -106,7 +106,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
             .index
             .run_indexing_blocking(IndexMode::Full)
             .map_err(map_api_error)?;
-        finalize_retrieval_index(&runtime)
+        finalize_retrieval_index_for_runtime(&runtime)
             .context("retrieval index finalize after semantic-doc contract repair")
     })?;
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
@@ -138,7 +138,9 @@ fn run_retrieval_index_refresh(
         })
 }
 
-fn finalize_retrieval_index(runtime: &RuntimeContext) -> Result<FinalizeIndexOutcome> {
+pub(crate) fn finalize_retrieval_index_for_runtime(
+    runtime: &RuntimeContext,
+) -> Result<FinalizeIndexOutcome> {
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "retrieval index")?;
     codestory_retrieval::finalize_index(&runtime.project_root, &runtime.storage_path)

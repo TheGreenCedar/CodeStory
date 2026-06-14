@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
  * CI guard: ban repo-specific path literals in retrieval integration production code.
- * Scope is Rust production retrieval integration files. Benchmark/eval harness scripts
- * intentionally live outside this guard because their manifests name holdout
- * repos; keep that boundary explicit instead of treating them as product code.
+ * Scope is Rust production retrieval integration files. Benchmark/eval harness
+ * scripts and the env-gated eval probe module intentionally live outside this
+ * guard because their manifests name holdout repos; keep that boundary explicit
+ * instead of treating them as product code.
  * Scans Rust files after masking `#[cfg(test)]` items/modules so test fixtures
  * do not define the production contract.
  */
@@ -50,6 +51,10 @@ const scanDirs = [
 
 const productionOnlyFiles = requiredProductionOnlyFiles;
 
+const evalOnlyProductionFiles = new Set([
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
+]);
+
 const benchmarkIdentityScriptFiles = [
   path.join(repoRoot, "scripts", "codestory-agent-ab-benchmark.mjs"),
   path.join(repoRoot, "scripts", "codestory-manual-friction-check.mjs"),
@@ -93,6 +98,16 @@ const bannedPatterns = [
   "Subcommand::Exec",
   "ThreadStartParams",
   "TurnStartParams",
+  "chinook",
+  "mdn",
+  "okio",
+  "monolog",
+  "alamofire",
+  "ChinookDatabase",
+  "form-validation",
+  "commonMain/kotlin/okio",
+  "src/Monolog",
+  "Source/Core/Session\\.swift",
   "SocialEntries",
   "ElsewhereFeed",
   "src/lib_cxx",
@@ -100,10 +115,76 @@ const bannedPatterns = [
   "src/lib/data/storage",
   "getPayloadClient",
   "comment_submission_guard",
+  "axios",
+  "redis",
+  "ripgrep",
+  "createInstance",
+  "InterceptorManager",
+  "dispatchRequest",
+  "readQueryFromClient",
+  "processCommand",
+  "aeMain",
+  "aeProcessEvents",
+  "HiArgs",
+  "SearchWorker",
+  "search_parallel",
+  "adapters\\.js",
+  "server\\.c",
+  "ae\\.c",
+  "networking\\.c",
+  "core/main\\.rs",
+  "flags/hiargs\\.rs",
+  "haystack\\.rs",
+  "lib/axios\\.js",
+  "lib/core/Axios\\.js",
+  "StringUtils",
+  "commons-lang",
+  "PreparedRequest",
+  "HTTPAdapter",
+  "createApplication",
+  "app\\.use",
+  "lib/express\\.js",
+  "Jekyll",
+  "LogRecord",
+  "AbstractProcessingHandler",
+  "useSWR",
+  "swr",
+  "gin\\.go",
+  "RouterGroup\\.Handle",
+  "Engine\\.addRoute",
+  "Engine\\.handleHTTPRequest",
+  "AutoMapper",
+  "TypeMapPlanBuilder",
+  "RealBufferedSource",
+  "RealBufferedSink",
+  "DataRequest",
+  "SessionDelegate",
+  "novalidate",
+  "showError",
+  "source/animate\\.css",
 ];
 
 const bannedLiteralPatterns = [
   "payload_collection",
+];
+
+const bannedCompactPatterns = [
+  "swr",
+  "useswr",
+  "stringutils",
+  "charsequenceutils",
+  "preparedrequest",
+  "httpadapter",
+  "createapplication",
+  "appuse",
+  "jekyll",
+  "logrecord",
+  "automapper",
+  "realbufferedsource",
+  "realbufferedsink",
+  "datarequest",
+  "sessiondelegate",
+  "sourceanimatecss",
 ];
 
 const allowedPatternLines = [
@@ -553,6 +634,103 @@ function scanProductionStringLiterals(filePath, pattern) {
   return hits;
 }
 
+function compactProductionSource(text) {
+  return rustStringLiteralContent(text)
+    .replace(/["'`]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "")
+    .toLowerCase();
+}
+
+function rustStringLiteralContent(literal) {
+  const raw = literal.match(/^b?r(#+)?"([\s\S]*)"(#*)$/);
+  if (raw && (raw[1] ?? "") === raw[3]) {
+    return raw[2];
+  }
+  if (literal.length >= 2 && ["\"", "'", "`"].includes(literal[0])) {
+    return literal.slice(1, -1);
+  }
+  return literal;
+}
+
+function scanProductionCompactPatterns(filePath, marker) {
+  const production = productionSource(filePath);
+  const markerLower = marker.toLowerCase();
+  const hits = [];
+  const literals = rustStringLiteralSpans(production);
+  for (let start = 0; start < literals.length; start += 1) {
+    let compact = "";
+    for (let end = start; end < literals.length; end += 1) {
+      if (
+        end > start
+        && !literalJoinGapAllowsCompactScan(
+          production.slice(literals[end - 1].endOffset, literals[end].startOffset),
+        )
+      ) {
+        break;
+      }
+      compact += compactProductionSource(literals[end].literal);
+      if (compact === markerLower) {
+        hits.push(
+          compactPatternHit(filePath, literals[start].line, literals[end].line, marker),
+        );
+        break;
+      }
+      if (compact.length >= markerLower.length) {
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
+function rustStringLiteralSpans(text) {
+  const literals = [];
+  const lineStarts = [0];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "\n") {
+      lineStarts.push(index + 1);
+    }
+  }
+
+  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
+  let match;
+  while ((match = stringLiteral.exec(text)) != null) {
+    literals.push({
+      literal: match[0],
+      startOffset: match.index,
+      endOffset: match.index + match[0].length,
+      line: lineNumberAtOffset(lineStarts, match.index),
+    });
+  }
+  return literals;
+}
+
+function lineNumberAtOffset(lineStarts, offset) {
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (lineStarts[mid] <= offset) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return high + 1;
+}
+
+function literalJoinGapAllowsCompactScan(gap) {
+  return /^[\s,]*$/.test(gap);
+}
+
+function compactPatternHit(filePath, startLine, endLine, marker) {
+  const lineDisplay = startLine === endLine ? startLine : `${startLine}-${endLine}`;
+  return (
+    `${filePath}:${lineDisplay}: `
+    + `compact production source contains split benchmark marker ${marker}`
+  );
+}
+
 function rustStringLiteralsOnLine(line) {
   const literals = [];
   const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
@@ -567,6 +745,10 @@ function lineAllowedForPattern(pattern, line) {
   return allowedPatternLines.some(
     (allowed) => allowed.pattern === pattern && line.includes(allowed.includes),
   );
+}
+
+function isEvalOnlyProductionFile(filePath) {
+  return evalOnlyProductionFiles.has(path.resolve(filePath));
 }
 
 function scanRankerFilenameLiterals(filePath) {
@@ -595,22 +777,33 @@ if (scanFiles.size === 0) {
 }
 
 for (const filePath of [...scanFiles].sort()) {
-  for (const pattern of bannedPatterns) {
-    const hits = scanProductionFile(filePath, pattern);
-    if (hits.length > 0) {
-      console.error(
-        `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
-      );
-      failed = true;
+  if (!isEvalOnlyProductionFile(filePath)) {
+    for (const pattern of bannedPatterns) {
+      const hits = scanProductionFile(filePath, pattern);
+      if (hits.length > 0) {
+        console.error(
+          `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
+        );
+        failed = true;
+      }
     }
-  }
-  for (const pattern of bannedLiteralPatterns) {
-    const hits = scanProductionStringLiterals(filePath, pattern);
-    if (hits.length > 0) {
-      console.error(
-        `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
-      );
-      failed = true;
+    for (const pattern of bannedLiteralPatterns) {
+      const hits = scanProductionStringLiterals(filePath, pattern);
+      if (hits.length > 0) {
+        console.error(
+          `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
+        );
+        failed = true;
+      }
+    }
+    for (const pattern of bannedCompactPatterns) {
+      const hits = scanProductionCompactPatterns(filePath, pattern);
+      if (hits.length > 0) {
+        console.error(
+          `Banned compact benchmark marker /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
+        );
+        failed = true;
+      }
     }
   }
   if (filePath.endsWith(`${path.sep}ranker.rs`)) {

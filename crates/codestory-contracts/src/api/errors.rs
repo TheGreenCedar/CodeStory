@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use super::dto::ReadinessVerdictDto;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ApiError {
     pub code: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<ApiErrorDetails>,
+    pub details: Option<Box<ApiErrorDetails>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -17,15 +19,39 @@ pub struct ApiErrorDetails {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub next_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimum_next: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub full_repair: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ReadinessVerdictDto>,
 }
 
 impl ApiErrorDetails {
     pub fn retrieval_unavailable(project: impl Into<String>, next_commands: Vec<String>) -> Self {
+        let minimum_next = next_commands.iter().take(2).cloned().collect::<Vec<_>>();
         Self {
             failed_layer: Some("retrieval_sidecar".to_string()),
             project: Some(project.into()),
+            minimum_next,
+            full_repair: next_commands.clone(),
             next_commands,
+            readiness: None,
         }
+    }
+
+    pub fn with_readiness(mut self, readiness: ReadinessVerdictDto) -> Self {
+        if self.minimum_next.is_empty() {
+            self.minimum_next = readiness.minimum_next.clone();
+        }
+        if self.full_repair.is_empty() {
+            self.full_repair = readiness.full_repair.clone();
+        }
+        if self.next_commands.is_empty() {
+            self.next_commands = self.full_repair.clone();
+        }
+        self.readiness = Some(readiness);
+        self
     }
 }
 
@@ -46,7 +72,7 @@ impl ApiError {
         Self {
             code: code.into(),
             message: message.into(),
-            details: Some(details),
+            details: Some(Box::new(details)),
         }
     }
 
@@ -99,6 +125,14 @@ mod tests {
         assert_eq!(
             value["details"]["next_commands"][0],
             "codestory-cli index --project \"C:/repo/example\" --refresh full"
+        );
+        assert_eq!(
+            value["details"]["minimum_next"][0],
+            "codestory-cli index --project \"C:/repo/example\" --refresh full"
+        );
+        assert_eq!(
+            value["details"]["full_repair"][1],
+            "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
         );
     }
 }

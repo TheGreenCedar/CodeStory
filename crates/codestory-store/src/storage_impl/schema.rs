@@ -101,7 +101,26 @@ const TABLE_STATEMENTS: &[&str] = &[
         embedding_backend TEXT,
         embedding_dim INTEGER NOT NULL,
         doc_shape TEXT,
+        semantic_policy_version TEXT,
+        dense_reason TEXT,
         embedding_blob BLOB NOT NULL,
+        updated_at_epoch_ms INTEGER NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id),
+        FOREIGN KEY(file_node_id) REFERENCES node(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS symbol_search_doc (
+        node_id INTEGER PRIMARY KEY,
+        file_node_id INTEGER,
+        kind INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        qualified_name TEXT,
+        file_path TEXT,
+        start_line INTEGER,
+        doc_text TEXT NOT NULL,
+        doc_version INTEGER NOT NULL DEFAULT 0,
+        doc_hash TEXT NOT NULL DEFAULT '',
+        policy_version TEXT NOT NULL,
+        source_provenance TEXT NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL,
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
@@ -220,7 +239,12 @@ const TABLE_STATEMENTS: &[&str] = &[
         sidecar_schema_version INTEGER,
         sidecar_input_hash TEXT,
         sidecar_generation TEXT,
-        projection_count INTEGER
+        projection_count INTEGER,
+        symbol_doc_count INTEGER,
+        dense_projection_count INTEGER,
+        semantic_policy_version TEXT,
+        graph_artifact_hash TEXT,
+        dense_reason_counts_json TEXT
     )",
 ];
 
@@ -256,6 +280,12 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_file_node ON llm_symbol_doc(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_kind ON llm_symbol_doc(kind)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_policy_reason
+     ON llm_symbol_doc(semantic_policy_version, dense_reason)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_file_node ON symbol_search_doc(file_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_kind ON symbol_search_doc(kind)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_policy ON symbol_search_doc(policy_version)",
+    "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_hash ON symbol_search_doc(doc_version, doc_hash)",
     "CREATE INDEX IF NOT EXISTS idx_search_symbol_projection_display_name
      ON search_symbol_projection(display_name)",
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_node_id ON callable_projection_state(node_id)",
@@ -388,14 +418,19 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         migrate_v17_retrieval_manifest_sidecar_generation(&storage.conn)?;
         storage.set_schema_version(17)?;
     }
+    if stored_version < 18 {
+        migrate_v18_ast_first_symbol_docs(&storage.conn)?;
+        storage.set_schema_version(18)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
-    if storage.deferred_secondary_indexes {
-        create_load_indexes(&storage.conn)?;
+    let index_mode = if storage.deferred_secondary_indexes {
+        StorageOpenMode::Build
     } else {
-        create_secondary_indexes(&storage.conn)?;
-    }
+        StorageOpenMode::Live
+    };
+    create_indexes(&storage.conn, index_mode)?;
 
     if stored_version < SCHEMA_VERSION {
         storage.set_schema_version(SCHEMA_VERSION)?;
@@ -522,6 +557,49 @@ pub(super) fn migrate_v17_retrieval_manifest_sidecar_generation(
     try_add_column(conn, "retrieval_index_manifest", "sidecar_input_hash TEXT")?;
     try_add_column(conn, "retrieval_index_manifest", "sidecar_generation TEXT")?;
     try_add_column(conn, "retrieval_index_manifest", "projection_count INTEGER")?;
+    Ok(())
+}
+
+pub(super) fn migrate_v18_ast_first_symbol_docs(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS symbol_search_doc (
+            node_id INTEGER PRIMARY KEY,
+            file_node_id INTEGER,
+            kind INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            qualified_name TEXT,
+            file_path TEXT,
+            start_line INTEGER,
+            doc_text TEXT NOT NULL,
+            doc_version INTEGER NOT NULL DEFAULT 0,
+            doc_hash TEXT NOT NULL DEFAULT '',
+            policy_version TEXT NOT NULL,
+            source_provenance TEXT NOT NULL,
+            updated_at_epoch_ms INTEGER NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id),
+            FOREIGN KEY(file_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    try_add_column(conn, "llm_symbol_doc", "semantic_policy_version TEXT")?;
+    try_add_column(conn, "llm_symbol_doc", "dense_reason TEXT")?;
+    try_add_column(conn, "retrieval_index_manifest", "symbol_doc_count INTEGER")?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "dense_projection_count INTEGER",
+    )?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "semantic_policy_version TEXT",
+    )?;
+    try_add_column(conn, "retrieval_index_manifest", "graph_artifact_hash TEXT")?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "dense_reason_counts_json TEXT",
+    )?;
     Ok(())
 }
 

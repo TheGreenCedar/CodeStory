@@ -6,12 +6,19 @@ use crate::agent::retrieval_primary::{
 };
 use crate::{AppController, HybridSearchScoredHit};
 use codestory_contracts::api::{
-    AgentHybridWeightsDto, ApiError, SearchHit, SemanticFallbackRecordDto,
+    AgentHybridWeightsDto, ApiError, PacketSidecarQueryDiagnosticDto, SearchHit,
+    SemanticFallbackRecordDto,
 };
 
 pub(crate) struct SemanticHybridBatchOutcome {
     pub results: Vec<(String, Vec<HybridSearchScoredHit>)>,
     pub fallbacks: Vec<SemanticFallbackRecordDto>,
+    pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+}
+
+pub(crate) struct LexicalBatchOutcome {
+    pub results: Vec<(String, Vec<SearchHit>)>,
+    pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
 impl AppController {
@@ -19,24 +26,34 @@ impl AppController {
         &self,
         queries: &[String],
         max_results: usize,
-    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
+        latency_budget_ms: Option<u32>,
+    ) -> Result<LexicalBatchOutcome, ApiError> {
         let batched = queries
             .iter()
             .map(|query| (query.clone(), max_results))
             .collect::<Vec<_>>();
-        self.search_lexical_hybrid_batch(&batched)
+        self.search_lexical_hybrid_batch(&batched, latency_budget_ms)
     }
 
     pub(crate) fn search_lexical_hybrid_batch(
         &self,
         queries: &[(String, usize)],
-    ) -> Result<Vec<(String, Vec<SearchHit>)>, ApiError> {
+        latency_budget_ms: Option<u32>,
+    ) -> Result<LexicalBatchOutcome, ApiError> {
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LexicalBatchOutcome {
+                results: Vec::new(),
+                sidecar_diagnostics: Vec::new(),
+            });
         }
         if packet_batch_should_use_sidecar(self) {
-            match search_sidecar_packet_batch(self, queries, None) {
-                Ok(results) => return Ok(results),
+            match search_sidecar_packet_batch(self, queries, latency_budget_ms) {
+                Ok(outcome) => {
+                    return Ok(LexicalBatchOutcome {
+                        results: outcome.results,
+                        sidecar_diagnostics: outcome.diagnostics,
+                    });
+                }
                 Err(error) => {
                     tracing::warn!(
                         "sidecar retrieval packet lexical batch unavailable; fail-closed: {}",
@@ -63,11 +80,13 @@ impl AppController {
     pub(crate) fn search_semantic_hybrid_batch(
         &self,
         queries: &[(String, usize, Option<AgentHybridWeightsDto>)],
+        latency_budget_ms: Option<u32>,
     ) -> Result<SemanticHybridBatchOutcome, ApiError> {
         if queries.is_empty() {
             return Ok(SemanticHybridBatchOutcome {
                 results: Vec::new(),
                 fallbacks: Vec::new(),
+                sidecar_diagnostics: Vec::new(),
             });
         }
         if packet_batch_should_use_sidecar(self) {
@@ -75,10 +94,11 @@ impl AppController {
                 .iter()
                 .map(|(query, max_results, _)| (query.clone(), *max_results))
                 .collect::<Vec<_>>();
-            match search_sidecar_packet_batch(self, &batch, None) {
-                Ok(results) => {
+            match search_sidecar_packet_batch(self, &batch, latency_budget_ms) {
+                Ok(outcome) => {
                     return Ok(SemanticHybridBatchOutcome {
-                        results: results
+                        results: outcome
+                            .results
                             .into_iter()
                             .map(|(query, hits)| {
                                 (
@@ -96,6 +116,7 @@ impl AppController {
                             })
                             .collect(),
                         fallbacks: Vec::new(),
+                        sidecar_diagnostics: outcome.diagnostics,
                     });
                 }
                 Err(error) => {
@@ -144,8 +165,40 @@ impl AppController {
 mod tests {
     use super::*;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn cleared(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: test-only env cleanup under the shared process env lock.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the process-local env var captured by this guard.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     #[test]
     fn packet_subquery_warmup_fails_closed_without_sidecar_primary() {
+        let _lock = crate::process_env_test_lock();
+        let _retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL");
+        let _deprecated_retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL_V2");
         let controller = AppController::new();
 
         let error = controller

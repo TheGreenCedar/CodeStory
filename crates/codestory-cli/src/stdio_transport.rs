@@ -473,6 +473,10 @@ fn handle_stdio_packet(
         Ok(latency_budget_ms) => latency_budget_ms,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
+    let extra_probes = match stdio_packet_extra_probes(request) {
+        Ok(extra_probes) => extra_probes,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
     let include_evidence = request
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
@@ -483,6 +487,7 @@ fn handle_stdio_packet(
         question,
         budget,
         task_class,
+        &extra_probes,
         include_evidence,
         latency_budget_ms,
     );
@@ -495,6 +500,7 @@ fn handle_stdio_packet(
             question: question.to_string(),
             budget,
             task_class,
+            extra_probes,
             include_evidence,
             latency_budget_ms,
         })
@@ -513,6 +519,7 @@ struct StdioPacketCacheKey {
     question: String,
     budget: &'static str,
     task_class: Option<&'static str>,
+    extra_probes: Vec<String>,
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
 }
@@ -584,6 +591,7 @@ fn stdio_packet_cache_key(
     question: &str,
     budget: PacketBudgetModeDto,
     task_class: Option<PacketTaskClassDto>,
+    extra_probes: &[String],
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
 ) -> StdioPacketCacheKey {
@@ -593,6 +601,7 @@ fn stdio_packet_cache_key(
         question: question.to_string(),
         budget: stdio_packet_budget_label(budget),
         task_class: task_class.map(stdio_packet_task_class_label),
+        extra_probes: extra_probes.to_vec(),
         include_evidence,
         latency_budget_ms,
     }
@@ -774,6 +783,39 @@ fn stdio_packet_latency_budget(request: &serde_json::Value) -> Result<Option<u32
         bail!("packet.latency_budget_ms must be between 1000 and 120000");
     }
     Ok(Some(value as u32))
+}
+
+fn stdio_packet_extra_probes(request: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(value) = request.pointer("/params/arguments/extra_probes") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!("packet.extra_probes must be an array of strings");
+    };
+    if values.len() > 16 {
+        bail!("packet.extra_probes accepts at most 16 probes");
+    }
+
+    let mut probes = Vec::new();
+    for value in values {
+        let Some(probe) = value.as_str() else {
+            bail!("packet.extra_probes must be an array of strings");
+        };
+        let probe = probe.trim();
+        if probe.is_empty() {
+            continue;
+        }
+        if probe.len() > 240 {
+            bail!("packet.extra_probes entries must be at most 240 characters");
+        }
+        if !probes
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(probe))
+        {
+            probes.push(probe.to_string());
+        }
+    }
+    Ok(probes)
 }
 
 fn handle_stdio_search(
@@ -1424,25 +1466,51 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
     let summary = runtime.open_project_summary()?;
     let retrieval = summary.retrieval.as_ref();
-    let sidecar = match codestory_retrieval::strict_sidecar_status(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-    ) {
-        Ok(report) => serde_json::json!({
-            "retrieval_mode": report.retrieval_mode,
-            "degraded_reason": report.degraded_reason,
-            "manifest_generation": report.manifest.as_ref().and_then(|manifest| manifest.sidecar_generation.as_deref()),
-            "manifest_input_hash": report.manifest.as_ref().and_then(|manifest| manifest.sidecar_input_hash.as_deref()),
+    let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash) =
+        match codestory_retrieval::strict_sidecar_status(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+        ) {
+            Ok(report) => {
+                let manifest_generation = report
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.sidecar_generation.clone());
+                let manifest_input_hash = report
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.sidecar_input_hash.clone());
+                (
+                    report.retrieval_mode,
+                    report.degraded_reason,
+                    manifest_generation,
+                    manifest_input_hash,
+                )
+            }
+            Err(error) => (
+                "unavailable".to_string(),
+                Some(format!("sidecar_status_error: {error}")),
+                None,
+                None,
+            ),
+        };
+    let sidecar = serde_json::json!({
+        "retrieval_mode": sidecar_mode.clone(),
+        "degraded_reason": degraded_reason.clone(),
+        "manifest_generation": manifest_generation.clone(),
+        "manifest_input_hash": manifest_input_hash.clone(),
+    });
+    let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+        project: &summary.root,
+        stats: &summary.stats,
+        freshness: summary.freshness.as_ref(),
+        sidecar: Some(crate::readiness::ReadinessSidecarInput {
+            retrieval_mode: &sidecar_mode,
+            degraded_reason: degraded_reason.as_deref(),
+            manifest_generation: manifest_generation.as_deref(),
+            manifest_input_hash: manifest_input_hash.as_deref(),
         }),
-        Err(error) => serde_json::json!({
-            "retrieval_mode": "unavailable",
-            "degraded_reason": format!("sidecar_status_error: {error}"),
-        }),
-    };
-    let sidecar_mode = sidecar
-        .get("retrieval_mode")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unavailable");
+    });
     let recommended_next_calls = if sidecar_mode == "full" {
         serde_json::json!([
             {
@@ -1478,39 +1546,39 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             }
         ])
     } else {
-        serde_json::json!([
-            {
-                "method": "cli",
-                "command": "codestory-cli retrieval status --project <repo>"
-            },
-            {
-                "method": "cli",
-                "command": "codestory-cli retrieval index --project <repo> --refresh full"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://status"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://agent-guide"
-            },
-            {
-                "method": "tools/call",
-                "tool": "search",
-                "arguments": {
-                    "query": "<symbol-or-concept>",
-                    "limit": 10
-                }
-            }
-        ])
+        let commands = readiness
+            .iter()
+            .find(|verdict| crate::readiness::goal_label(verdict.goal) == "agent_packet_search")
+            .map(|verdict| verdict.full_repair.as_slice())
+            .unwrap_or_default();
+        serde_json::Value::Array(
+            commands
+                .iter()
+                .map(|command| {
+                    serde_json::json!({
+                        "method": "cli",
+                        "command": command
+                    })
+                })
+                .chain([
+                    serde_json::json!({
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }),
+                    serde_json::json!({
+                        "method": "resources/read",
+                        "uri": "codestory://agent-guide"
+                    }),
+                ])
+                .collect(),
+        )
     };
     Ok(serde_json::json!({
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
         "storage_exists": runtime.storage_path.exists(),
-        "retrieval_mode": sidecar["retrieval_mode"],
-        "degraded_reason": sidecar["degraded_reason"],
+        "retrieval_mode": sidecar_mode,
+        "degraded_reason": degraded_reason,
         "sidecar_retrieval": sidecar,
         "legacy_semantic_diagnostics": {
             "mode": retrieval.map(|state| state.mode),
@@ -1521,6 +1589,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
+        "readiness": readiness,
         "recommended_next_calls": recommended_next_calls
     }))
 }
@@ -1695,6 +1764,7 @@ mod tests {
             question,
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         )
@@ -1799,6 +1869,7 @@ mod tests {
             "Explain packet caching.",
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         );
@@ -1810,6 +1881,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 true,
                 Some(15_000),
             )
@@ -1822,6 +1894,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Tiny,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 true,
                 Some(15_000),
             )
@@ -1834,6 +1907,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::EditPlanning),
+                &[],
                 true,
                 Some(15_000),
             )
@@ -1846,6 +1920,7 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 false,
                 Some(15_000),
             )
@@ -1858,8 +1933,22 @@ mod tests {
                 "Explain packet caching.",
                 PacketBudgetModeDto::Compact,
                 Some(PacketTaskClassDto::ArchitectureExplanation),
+                &[],
                 true,
                 Some(30_000),
+            )
+        );
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(
+                "snapshot-a".to_string(),
+                "sidecar-full".to_string(),
+                "Explain packet caching.",
+                PacketBudgetModeDto::Compact,
+                Some(PacketTaskClassDto::ArchitectureExplanation),
+                &["src/lib.rs run".to_string()],
+                true,
+                Some(15_000),
             )
         );
     }
@@ -1877,6 +1966,7 @@ mod tests {
             "Explain packet caching.",
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         );
@@ -1886,6 +1976,7 @@ mod tests {
             "Explain packet caching.",
             PacketBudgetModeDto::Compact,
             Some(PacketTaskClassDto::ArchitectureExplanation),
+            &[],
             true,
             Some(15_000),
         );
@@ -1926,6 +2017,11 @@ mod tests {
             sidecar_input_hash: Some("hash-a".into()),
             sidecar_generation: Some("project-a-hash-a".into()),
             projection_count: Some(12),
+            symbol_doc_count: Some(120),
+            dense_projection_count: Some(12),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph-hash-a".into()),
+            dense_reason_counts_json: Some(r#"{"public_api":12}"#.into()),
         };
         let before_stale = stdio_mandatory_sidecar_fingerprint_from_status(
             codestory_retrieval::embedding_runtime_id(),
@@ -1942,6 +2038,7 @@ mod tests {
             "Explain strict readiness.",
             PacketBudgetModeDto::Compact,
             None,
+            &[],
             true,
             None,
         );
@@ -1969,6 +2066,7 @@ mod tests {
             "Explain strict readiness.",
             PacketBudgetModeDto::Compact,
             None,
+            &[],
             true,
             None,
         );

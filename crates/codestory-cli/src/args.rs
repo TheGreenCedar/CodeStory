@@ -2,11 +2,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary,
-    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
-    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
-    SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope, TrailContextDto,
-    TrailDirection, TrailMode,
+    NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
+    ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
+    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
+    SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
+    TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -49,6 +49,8 @@ pub(crate) enum Command {
     Packet(PacketCommand),
     #[command(about = "Check cache, index, and retrieval health.")]
     Doctor(DoctorCommand),
+    #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
+    Ready(ReadyCommand),
     #[command(about = "Install or check local setup assets.")]
     Setup(SetupCommand),
     #[command(about = "Find symbols and repo text evidence.")]
@@ -296,6 +298,8 @@ pub(crate) struct ReportCommand {
         help = "Write the generated report/export artifact to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ReportProfile::Full)]
+    pub(crate) profile: ReportProfile,
     #[arg(
         long,
         value_name = "N",
@@ -304,6 +308,13 @@ pub(crate) struct ReportCommand {
         help = "Maximum number of hotspots, entry points, bridges, and follow-up queries to include in report sections. JSON graph export still includes the full graph."
     )]
     pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ReportProfile {
+    #[default]
+    Full,
+    Handoff,
 }
 
 #[derive(Args, Debug)]
@@ -402,6 +413,12 @@ pub(crate) struct PacketCommand {
     #[arg(long, value_enum)]
     pub(crate) task_class: Option<CliPacketTaskClass>,
     #[arg(
+        long = "extra-probe",
+        value_name = "QUERY",
+        help = "Add an explicit file, symbol, or file-scoped symbol probe to the packet plan. Repeatable; intended for audited benchmark or operator-supplied anchors."
+    )]
+    pub(crate) extra_probes: Vec<String>,
+    #[arg(
         long,
         value_enum,
         default_value_t = RefreshMode::None,
@@ -447,6 +464,37 @@ pub(crate) struct DoctorCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ReadyCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum)]
+    pub(crate) goal: Option<ReadyGoal>,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ReadyGoal {
+    Local,
+    Agent,
+}
+
+impl ReadyGoal {
+    pub(crate) const fn as_dto(self) -> ReadinessGoalDto {
+        match self {
+            Self::Local => ReadinessGoalDto::LocalNavigation,
+            Self::Agent => ReadinessGoalDto::AgentPacketSearch,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -962,6 +1010,8 @@ pub(crate) struct ExploreCommand {
         help = "Print plain Markdown instead of opening the terminal explorer when stdout is interactive."
     )]
     pub(crate) no_tui: bool,
+    #[arg(long, help = "Alias for --no-tui; useful for agent-safe plain output.")]
+    pub(crate) plain: bool,
     #[arg(
         long,
         value_enum,
@@ -1196,7 +1246,14 @@ pub(crate) struct IndexOutput<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) summary_generation: Option<&'a SummaryGenerationDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) readiness: Vec<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) next_commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReadyOutput {
+    pub(crate) verdicts: Vec<ReadinessVerdictDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1988,6 +2045,8 @@ pub(crate) struct DoctorOutput {
     pub(crate) retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) freshness: Option<IndexFreshnessDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) readiness: Vec<ReadinessVerdictDto>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,

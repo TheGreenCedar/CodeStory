@@ -2,7 +2,7 @@
 
 use crate::config::ZOEKT_REAL_VERSION_PIN;
 use anyhow::{Context, Result};
-use codestory_store::FileRole;
+use codestory_store::{FileRole, Store, SymbolSearchDoc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,33 @@ const MAX_FILE_BYTES: usize = 256 * 1024;
 struct LexicalIndexEntry {
     path: String,
     content: String,
+    #[serde(default)]
+    source: LexicalDocumentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symbol_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalDocumentSource {
+    #[default]
+    LexicalSource,
+    SymbolDoc,
+    ComponentReport,
+}
+
+impl LexicalDocumentSource {
+    pub(crate) fn provenance_label(self) -> &'static str {
+        match self {
+            Self::LexicalSource => "lexical_source",
+            Self::SymbolDoc => "symbol_doc",
+            Self::ComponentReport => "component_report",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +63,7 @@ pub struct LexicalInputFingerprint {
 /// Populate `shards/<project_id>/` with a searchable lexical index; remove stub marker on success.
 pub fn build_zoekt_shard(
     project_root: &Path,
+    storage_path: Option<&Path>,
     zoekt_data_dir: &Path,
     project_id: &str,
     zoekt_http_reachable: bool,
@@ -44,7 +72,7 @@ pub fn build_zoekt_shard(
     std::fs::create_dir_all(&shard_dir)
         .with_context(|| format!("create zoekt shard dir {}", shard_dir.display()))?;
 
-    let entries = collect_lexical_entries(project_root)?;
+    let entries = collect_lexical_entries(project_root, storage_path)?;
     if entries.is_empty() {
         return Ok(false);
     }
@@ -108,8 +136,11 @@ pub fn shard_matches_lexical_input(
         && meta.lexical_hash.as_deref() == Some(expected_hash)
 }
 
-pub fn lexical_input_fingerprint(project_root: &Path) -> Result<LexicalInputFingerprint> {
-    let entries = collect_lexical_entries(project_root)?;
+pub fn lexical_input_fingerprint(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+) -> Result<LexicalInputFingerprint> {
+    let entries = collect_lexical_entries(project_root, storage_path)?;
     Ok(LexicalInputFingerprint {
         file_count: entries.len().min(u32::MAX as usize) as u32,
         hash: lexical_entries_hash(&entries),
@@ -125,6 +156,20 @@ fn lexical_entries_hash(entries: &[LexicalIndexEntry]) -> String {
         hasher.update(entry.path.as_bytes());
         hasher.update([0]);
         hasher.update(entry.content.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.source.provenance_label().as_bytes());
+        hasher.update([0]);
+        if let Some(node_id) = entry.node_id.as_deref() {
+            hasher.update(node_id.as_bytes());
+        }
+        hasher.update([0]);
+        if let Some(symbol_name) = entry.symbol_name.as_deref() {
+            hasher.update(symbol_name.as_bytes());
+        }
+        hasher.update([0]);
+        if let Some(start_line) = entry.start_line {
+            hasher.update(start_line.to_le_bytes());
+        }
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
@@ -174,9 +219,13 @@ pub fn search_lexical_index(
         if token_match.matched_weight >= required_weight
             && broad_query_path_gate(tokens.len(), &token_match)
         {
-            let score = score_lexical_match(&entry.path, &token_match);
+            let score = score_lexical_match(&entry.path, entry.source, &token_match);
             hits.push(LexicalHit {
                 path: entry.path,
+                source: entry.source,
+                node_id: entry.node_id,
+                symbol_name: entry.symbol_name,
+                start_line: entry.start_line,
                 score,
             });
         }
@@ -345,10 +394,18 @@ fn path_match_factor(path_lower: &str, token: &str) -> f32 {
 #[derive(Debug, Clone)]
 pub struct LexicalHit {
     pub path: String,
+    pub source: LexicalDocumentSource,
+    pub node_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub start_line: Option<u32>,
     pub score: f32,
 }
 
-fn score_lexical_match(path: &str, token_match: &LexicalTokenMatch) -> f32 {
+fn score_lexical_match(
+    path: &str,
+    source: LexicalDocumentSource,
+    token_match: &LexicalTokenMatch,
+) -> f32 {
     let coverage = if token_match.total_weight <= 0.0 {
         0.0
     } else {
@@ -362,7 +419,11 @@ fn score_lexical_match(path: &str, token_match: &LexicalTokenMatch) -> f32 {
     if path_lower.contains("/src/") || path_lower.starts_with("src/") {
         score += 0.04;
     }
-    score *= lexical_file_role_multiplier(FileRole::classify_path(Path::new(path)));
+    if source == LexicalDocumentSource::ComponentReport {
+        score += 0.08;
+    } else {
+        score *= lexical_file_role_multiplier(FileRole::classify_path(Path::new(path)));
+    }
     score.min(0.99)
 }
 
@@ -378,9 +439,13 @@ fn lexical_file_role_multiplier(file_role: FileRole) -> f32 {
     }
 }
 
-fn collect_lexical_entries(project_root: &Path) -> Result<Vec<LexicalIndexEntry>> {
+fn collect_lexical_entries(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+) -> Result<Vec<LexicalIndexEntry>> {
     let mut entries = Vec::new();
     collect_lexical_entries_inner(project_root, project_root, &mut entries)?;
+    collect_symbol_doc_entries(project_root, storage_path, &mut entries)?;
     Ok(entries)
 }
 
@@ -426,9 +491,80 @@ fn collect_lexical_entries_inner(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        entries.push(LexicalIndexEntry { path: rel, content });
+        entries.push(LexicalIndexEntry {
+            path: rel,
+            content,
+            source: LexicalDocumentSource::LexicalSource,
+            node_id: None,
+            symbol_name: None,
+            start_line: None,
+        });
     }
     Ok(())
+}
+
+fn collect_symbol_doc_entries(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    entries: &mut Vec<LexicalIndexEntry>,
+) -> Result<()> {
+    let Some(storage_path) = storage_path.filter(|path| path.is_file()) else {
+        return Ok(());
+    };
+    let storage = Store::open(storage_path).context("open storage for lexical symbol docs")?;
+    let mut after = None;
+    loop {
+        let batch = storage
+            .get_symbol_search_docs_batch_after(after, 4096)
+            .context("load symbol search docs for lexical shard")?;
+        if batch.is_empty() {
+            break;
+        }
+        after = batch.last().map(|doc| doc.node_id);
+        for doc in batch {
+            entries.push(symbol_doc_lexical_entry(project_root, &doc));
+        }
+    }
+    Ok(())
+}
+
+fn symbol_doc_lexical_entry(project_root: &Path, doc: &SymbolSearchDoc) -> LexicalIndexEntry {
+    let source = if doc.display_name.starts_with("component_report:") {
+        LexicalDocumentSource::ComponentReport
+    } else {
+        LexicalDocumentSource::SymbolDoc
+    };
+    let path = doc
+        .file_path
+        .as_deref()
+        .and_then(|path| normalize_lexical_file_path(project_root, path))
+        .unwrap_or_else(|| {
+            format!(
+                "codestory://{}",
+                doc.display_name
+                    .replace('\\', "/")
+                    .replace([' ', '\t', '\r', '\n'], "_")
+            )
+        });
+    LexicalIndexEntry {
+        path,
+        content: doc.doc_text.clone(),
+        source,
+        node_id: Some(doc.node_id.0.to_string()),
+        symbol_name: Some(doc.display_name.clone()),
+        start_line: doc.start_line,
+    }
+}
+
+fn normalize_lexical_file_path(project_root: &Path, path: &str) -> Option<String> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.strip_prefix(project_root)
+            .ok()
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+    } else {
+        Some(path.to_string_lossy().replace('\\', "/"))
+    }
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -464,7 +600,20 @@ pub fn shard_dir_for(zoekt_data_dir: &Path, project_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_store::{FileInfo, FileRole};
     use tempfile::TempDir;
+
+    fn entry(path: &str, content: &str) -> LexicalIndexEntry {
+        LexicalIndexEntry {
+            path: path.into(),
+            content: content.into(),
+            source: LexicalDocumentSource::LexicalSource,
+            node_id: None,
+            symbol_name: None,
+            start_line: None,
+        }
+    }
 
     #[test]
     fn lexical_index_finds_repo_relative_paths() {
@@ -475,7 +624,7 @@ mod tests {
         )
         .expect("write");
         let zoekt_root = TempDir::new().expect("zoekt");
-        build_zoekt_shard(project.path(), zoekt_root.path(), "abc123", false).expect("build");
+        build_zoekt_shard(project.path(), None, zoekt_root.path(), "abc123", false).expect("build");
         let shard = shard_dir_for(zoekt_root.path(), "abc123");
         assert!(shard_has_lexical_index(&shard));
         let hits = search_lexical_index(&shard, "extension", 8).expect("search");
@@ -483,12 +632,102 @@ mod tests {
     }
 
     #[test]
+    fn lexical_index_includes_symbol_search_docs_with_node_provenance() {
+        let project = TempDir::new().expect("project");
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let source_path = src.join("lib.rs");
+        std::fs::write(&source_path, "fn private_helper() {}\n").expect("write source");
+
+        let storage_path = project.path().join("codestory.db");
+        let mut storage = Store::open(&storage_path).expect("open store");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/lib.rs".into(),
+                    qualified_name: None,
+                    canonical_id: None,
+                    file_node_id: None,
+                    start_line: Some(1),
+                    start_col: Some(0),
+                    end_line: Some(1),
+                    end_col: Some(0),
+                },
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "private_helper".into(),
+                    qualified_name: Some("private_helper".into()),
+                    canonical_id: None,
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(1),
+                    start_col: Some(0),
+                    end_line: Some(1),
+                    end_col: Some(22),
+                },
+            ])
+            .expect("insert nodes");
+        storage
+            .upsert_symbol_search_docs_batch(&[SymbolSearchDoc {
+                node_id: NodeId(2),
+                file_node_id: Some(NodeId(1)),
+                kind: NodeKind::FUNCTION,
+                display_name: "private_helper".into(),
+                qualified_name: Some("private_helper".into()),
+                file_path: Some(source_path.to_string_lossy().to_string()),
+                start_line: Some(1),
+                doc_text: "symbol private_helper deterministic cache skip logic".into(),
+                doc_version: 4,
+                doc_hash: "doc-hash".into(),
+                policy_version: "graph_first_v1".into(),
+                source_provenance: "extracted".into(),
+                updated_at_epoch_ms: 1,
+            }])
+            .expect("upsert symbol doc");
+        drop(storage);
+
+        let zoekt_root = TempDir::new().expect("zoekt");
+        build_zoekt_shard(
+            project.path(),
+            Some(&storage_path),
+            zoekt_root.path(),
+            "symbols",
+            false,
+        )
+        .expect("build");
+        let shard = shard_dir_for(zoekt_root.path(), "symbols");
+        let hits = search_lexical_index(&shard, "cache skip logic", 4).expect("search");
+        let hit = hits
+            .iter()
+            .find(|hit| hit.symbol_name.as_deref() == Some("private_helper"))
+            .expect("symbol doc hit");
+        assert_eq!(hit.source, LexicalDocumentSource::SymbolDoc);
+        assert_eq!(hit.node_id.as_deref(), Some("2"));
+        assert_eq!(hit.start_line, Some(1));
+    }
+
+    #[test]
     fn shard_match_requires_current_lexical_hash_metadata() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("write");
         let zoekt_root = TempDir::new().expect("zoekt");
-        let fingerprint = lexical_input_fingerprint(project.path()).expect("fingerprint");
-        build_zoekt_shard(project.path(), zoekt_root.path(), "generation", false).expect("build");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        build_zoekt_shard(project.path(), None, zoekt_root.path(), "generation", false)
+            .expect("build");
 
         assert!(shard_matches_lexical_input(
             zoekt_root.path(),
@@ -508,14 +747,8 @@ mod tests {
     fn lexical_search_scores_all_matches_before_truncating() {
         let zoekt_root = TempDir::new().expect("zoekt");
         let shard = zoekt_root.path();
-        let weak = LexicalIndexEntry {
-            path: "src/a_weak.rs".into(),
-            content: "handler mentioned once".into(),
-        };
-        let strong = LexicalIndexEntry {
-            path: "src/z_strong_handler.rs".into(),
-            content: "handler handler handler".into(),
-        };
+        let weak = entry("src/a_weak.rs", "handler mentioned once");
+        let strong = entry("src/z_strong_handler.rs", "handler handler handler");
         let lines = [weak, strong]
             .into_iter()
             .map(|entry| serde_json::to_string(&entry).expect("serialize"))
@@ -542,7 +775,7 @@ mod tests {
         }
 
         let zoekt_root = TempDir::new().expect("zoekt");
-        build_zoekt_shard(project.path(), zoekt_root.path(), "large", false).expect("build");
+        build_zoekt_shard(project.path(), None, zoekt_root.path(), "large", false).expect("build");
         let shard = shard_dir_for(zoekt_root.path(), "large");
         let hits = search_lexical_index(&shard, "symbol_4099", 4).expect("search");
 
@@ -556,14 +789,8 @@ mod tests {
     fn lexical_search_tie_breaks_by_path() {
         let zoekt_root = TempDir::new().expect("zoekt");
         let shard = zoekt_root.path();
-        let later = LexicalIndexEntry {
-            path: "src/b.rs".into(),
-            content: "handler".into(),
-        };
-        let earlier = LexicalIndexEntry {
-            path: "src/a.rs".into(),
-            content: "handler".into(),
-        };
+        let later = entry("src/b.rs", "handler");
+        let earlier = entry("src/a.rs", "handler");
         let lines = [later, earlier]
             .into_iter()
             .map(|entry| serde_json::to_string(&entry).expect("serialize"))
@@ -582,26 +809,23 @@ mod tests {
     fn lexical_search_uses_partial_matching_for_broad_prompts() {
         let zoekt_root = TempDir::new().expect("zoekt");
         let shard = zoekt_root.path();
-        let source = LexicalIndexEntry {
-            path: "workspace/app/src/event_processor_with_jsonl_output.rs".into(),
-            content: "jsonl event output request runtime turn start".into(),
-        };
-        let test = LexicalIndexEntry {
-            path: "workspace/app/tests/event_processor_with_json_output.rs".into(),
-            content: "json event output test approval fixture".into(),
-        };
-        let unrelated = LexicalIndexEntry {
-            path: "workspace/core/src/session.rs".into(),
-            content: "session bookkeeping".into(),
-        };
-        let generic_agent_doc = LexicalIndexEntry {
-            path: ".agents/skills/review/SKILL.md".into(),
-            content: "request json cli runtime thread turn start event output".into(),
-        };
-        let generated_schema = LexicalIndexEntry {
-            path: "workspace/app-protocol/schema/typescript/v2/CommandRequestParams.ts".into(),
-            content: "app server command request turn start request".into(),
-        };
+        let source = entry(
+            "workspace/app/src/event_processor_with_jsonl_output.rs",
+            "jsonl event output request runtime turn start",
+        );
+        let test = entry(
+            "workspace/app/tests/event_processor_with_json_output.rs",
+            "json event output test approval fixture",
+        );
+        let unrelated = entry("workspace/core/src/session.rs", "session bookkeeping");
+        let generic_agent_doc = entry(
+            ".agents/skills/review/SKILL.md",
+            "request json cli runtime thread turn start event output",
+        );
+        let generated_schema = entry(
+            "workspace/app-protocol/schema/typescript/v2/CommandRequestParams.ts",
+            "app server command request turn start request",
+        );
         let lines = [test, unrelated, generic_agent_doc, generated_schema, source]
             .into_iter()
             .map(|entry| serde_json::to_string(&entry).expect("serialize"))

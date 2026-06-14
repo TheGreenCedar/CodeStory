@@ -4,7 +4,7 @@
 
 Run these from the repo root:
 
-```powershell
+```sh
 cargo fmt --check
 cargo check
 cargo test -p codestory-cli
@@ -19,14 +19,16 @@ If you touch runtime search, grounding, or repo-scale indexing behavior, check t
 
 After the basic cargo checks, verify the shipped CLI flow with the built binary instead of `cargo run`:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
-.\target\release\codestory-cli.exe setup embeddings --project . --dry-run
-.\target\release\codestory-cli.exe index --project . --refresh auto
-.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer --why
-.\target\release\codestory-cli.exe context --project . --query WorkspaceIndexer
-.\target\release\codestory-cli.exe doctor --project .
+./target/release/codestory-cli setup embeddings --project . --dry-run
+./target/release/codestory-cli index --project . --refresh auto
+./target/release/codestory-cli search --project . --query WorkspaceIndexer --why
+./target/release/codestory-cli context --project . --query WorkspaceIndexer
+./target/release/codestory-cli doctor --project .
 ```
+
+On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
 Read commands default to `--refresh none`. If a read command says the cache is empty, either run `index --refresh full` first or rerun the read command with an explicit refresh mode.
 
@@ -35,7 +37,8 @@ Read commands default to `--refresh none`. If a read command says the cache is e
 Use the managed full-sidecar path before debugging ranking quality:
 
 - managed real-model setup: `node scripts/setup-retrieval-env.mjs --fetch-embed-model`, then `codestory-cli retrieval bootstrap --project .`
-- default semantic scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol semantic doc set
+- default symbol-doc scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol diagnostic symbol-doc set
+- default dense policy: `graph_first_v1` embeds only selected dense anchors; private trivial code remains searchable through symbol docs, lexical source, and graph expansion
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and local llama.cpp sidecar settings
 

@@ -75,7 +75,18 @@ impl ZoektClient {
 
         let hits = search_lexical_index(&shard_dir, query, limit)?
             .into_iter()
-            .map(|hit| CandidateHit::with_source(hit.path, None, hit.score, CandidateSource::Zoekt))
+            .map(|hit| {
+                let mut candidate = CandidateHit::with_source(
+                    hit.path,
+                    hit.symbol_name,
+                    hit.score,
+                    CandidateSource::Zoekt,
+                );
+                candidate.node_id = hit.node_id;
+                candidate.start_line = hit.start_line;
+                candidate.add_provenance(hit.source.provenance_label());
+                candidate
+            })
             .collect::<Vec<_>>();
         Ok(hits)
     }
@@ -115,10 +126,22 @@ mod tests {
         .expect("write b");
 
         let zoekt_data = TempDir::new().expect("zoekt data");
-        build_zoekt_shard(project_a.path(), zoekt_data.path(), "project-a", false)
-            .expect("index a");
-        build_zoekt_shard(project_b.path(), zoekt_data.path(), "project-b", false)
-            .expect("index b");
+        build_zoekt_shard(
+            project_a.path(),
+            None,
+            zoekt_data.path(),
+            "project-a",
+            false,
+        )
+        .expect("index a");
+        build_zoekt_shard(
+            project_b.path(),
+            None,
+            zoekt_data.path(),
+            "project-b",
+            false,
+        )
+        .expect("index b");
 
         let mut layout = SidecarLayout::from_env();
         layout.zoekt_data_dir = zoekt_data.path().to_path_buf();

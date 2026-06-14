@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -27,6 +27,7 @@ const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
+const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const PACKET_TASK_CLASSES = new Set([
   "architecture_explanation",
   "bug_localization",
@@ -36,6 +37,22 @@ const PACKET_TASK_CLASSES = new Set([
   "data_flow",
   "edit_planning",
 ]);
+const COMMAND_ACCOUNTING_CATEGORIES = [
+  "codestory_cli",
+  "shell_search",
+  "direct_file_read",
+  "git",
+  "build_test",
+  "other",
+];
+const TOOL_ACCOUNTING_CATEGORIES = [
+  "web_search",
+  "mcp_tool_call",
+  "command_execution",
+  "function_call",
+  "tool_call",
+  "other",
+];
 
 const PUBLIC_REPOS = {
   codestory: {
@@ -85,9 +102,9 @@ const ALL_REPOS = { ...PUBLIC_REPOS, ...LOCAL_REPOS };
 
 const ARMS = {
   without_codestory:
-    "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal repository exploration only.",
+    "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run only the listed follow_up_commands in order and prefer targeted `search --why` commands before escalating packet budget. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations and sufficiency.avoid_opening, not only the paths mentioned in your prose. Use search, context, trail, or snippet only for named gaps. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration.",
+    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -127,15 +144,21 @@ Options:
   --sandbox       Codex sandbox mode. Default: workspace-write.
   --out-dir       Output directory. Default: target/agent-benchmark/<timestamp>.
   --timeout-ms    Timeout per runner invocation. Default: 600000.
+  --jobs          Parallel jobs for independent packet-runtime cold-cli rows or independent agent repo groups. Default: 1.
+  --reuse-baseline-from
+                  Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
                   Packet-runtime mode enables this by default because sidecar-primary packets require prepared local indexes.
   --no-prepare-codestory-cache
                   Unsupported; sidecar preparation is mandatory.
+  --prepare-codestory-jobs
+                  Parallel jobs for CodeStory cache preparation across independent repos. Default: 1.
   --prepare-codestory-timeout-ms
                   Timeout for each pre-run CodeStory index refresh. Default: 1800000.
   --max-source-reads-after-packet
-                  Publishable with-CodeStory runs fail above this post-packet ordinary source-read count. Default: 0.
+                  Publishable with-CodeStory runs fail above this post-packet ordinary source-read count.
+                  Default: unbounded; pass 0 for packet-only promotion evidence.
   --allow-failures Exit 0 even when a run fails. Intended only for exploratory dry runs.
   --publishable   Fail unless every run succeeds and reports token usage.
 
@@ -174,10 +197,13 @@ function parseArgs(argv) {
     sandbox: "workspace-write",
     outDir: null,
     timeoutMs: 600000,
+    jobs: 1,
+    reuseBaselineFrom: null,
     prepareCodestoryCache: null,
+    prepareCodestoryJobs: 1,
     prepareCodestoryTimeoutMs: 1_800_000,
     cachePreparationByRepo: null,
-    maxSourceReadsAfterPacket: 0,
+    maxSourceReadsAfterPacket: null,
     allowFailures: false,
     publishable: false,
   };
@@ -284,6 +310,14 @@ function parseArgs(argv) {
       opts.timeoutMs = Number.parseInt(argv[++i], 10);
       continue;
     }
+    if (arg === "--jobs") {
+      opts.jobs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--reuse-baseline-from") {
+      opts.reuseBaselineFrom = argv[++i];
+      continue;
+    }
     if (arg === "--prepare-codestory-cache") {
       opts.prepareCodestoryCache = true;
       continue;
@@ -294,6 +328,10 @@ function parseArgs(argv) {
     }
     if (arg === "--prepare-codestory-timeout-ms") {
       opts.prepareCodestoryTimeoutMs = Number.parseInt(argv[++i], 10);
+      continue;
+    }
+    if (arg === "--prepare-codestory-jobs") {
+      opts.prepareCodestoryJobs = Number.parseInt(argv[++i], 10);
       continue;
     }
     if (arg === "--max-source-reads-after-packet") {
@@ -336,8 +374,14 @@ function parseArgs(argv) {
   if (!Number.isInteger(opts.timeoutMs) || opts.timeoutMs < 1000) {
     throw new Error("--timeout-ms must be an integer >= 1000");
   }
+  if (!Number.isInteger(opts.jobs) || opts.jobs < 1) {
+    throw new Error("--jobs must be a positive integer");
+  }
   if (!Number.isInteger(opts.prepareCodestoryTimeoutMs) || opts.prepareCodestoryTimeoutMs < 1000) {
     throw new Error("--prepare-codestory-timeout-ms must be an integer >= 1000");
+  }
+  if (!Number.isInteger(opts.prepareCodestoryJobs) || opts.prepareCodestoryJobs < 1) {
+    throw new Error("--prepare-codestory-jobs must be a positive integer");
   }
   if (!["read-only", "workspace-write", "danger-full-access"].includes(opts.sandbox)) {
     throw new Error("--sandbox must be one of: read-only, workspace-write, danger-full-access");
@@ -348,10 +392,16 @@ function parseArgs(argv) {
   if (opts.benchmarkRunId != null) {
     opts.benchmarkRunId = sanitizeBenchmarkRunId(opts.benchmarkRunId);
   }
-  if (!Number.isInteger(opts.maxSourceReadsAfterPacket) || opts.maxSourceReadsAfterPacket < 0) {
+  if (
+    opts.maxSourceReadsAfterPacket != null &&
+    (!Number.isInteger(opts.maxSourceReadsAfterPacket) || opts.maxSourceReadsAfterPacket < 0)
+  ) {
     throw new Error("--max-source-reads-after-packet must be a non-negative integer");
   }
   opts.repoCacheDir = path.resolve(opts.repoCacheDir ?? defaultRepoCacheRoot);
+  if (opts.reuseBaselineFrom) {
+    opts.reuseBaselineFrom = path.resolve(opts.reuseBaselineFrom);
+  }
   if (opts.repos) {
     for (const name of opts.repos) {
       if (!ALL_REPOS[name]) {
@@ -576,6 +626,59 @@ function textAnchorList(values) {
     .filter(Boolean);
 }
 
+function packetManifestSymbolProbe(value) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "object") {
+    const name = String(value.name ?? value.text ?? "").trim();
+    const symbolPath = String(value.path ?? value.file ?? value.file_path ?? "").trim();
+    if (name && symbolPath) {
+      return `${symbolPath} ${name}`;
+    }
+    return name || symbolPath || null;
+  }
+  return String(value);
+}
+
+function packetManifestSymbolProbeList(values) {
+  return (Array.isArray(values) ? values : [])
+    .map(packetManifestSymbolProbe)
+    .map((value) => String(value ?? "").trim())
+    .filter(Boolean);
+}
+
+function uniqueTextValues(values) {
+  const result = [];
+  const seen = new Set();
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (!text) {
+      continue;
+    }
+    const key = text.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(text);
+  }
+  return result;
+}
+
+function packetManifestExtraProbes(task) {
+  if (!task) {
+    return [];
+  }
+  return uniqueTextValues([
+    ...(task.expected_files ?? []),
+    ...(task.expected_symbol_probes ?? task.expected_symbols ?? []),
+  ]).slice(0, MAX_PACKET_MANIFEST_EXTRA_PROBES);
+}
+
 function normalizeManifestTask(filePath, raw, opts = {}) {
   const rawRepo = typeof raw.repo === "object" ? raw.repo?.name : raw.repo;
   if (!String(rawRepo ?? "").trim()) {
@@ -596,7 +699,9 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
   const expectedVerificationFiles = textAnchorList(
     raw.expected_verification_files ?? raw.expectedVerificationFiles,
   );
-  const expectedSymbols = textAnchorList(raw.expected_symbols ?? raw.expectedSymbols);
+  const rawExpectedSymbols = raw.expected_symbols ?? raw.expectedSymbols;
+  const expectedSymbols = textAnchorList(rawExpectedSymbols);
+  const expectedSymbolProbes = packetManifestSymbolProbeList(rawExpectedSymbols);
   const expectedClaims = textAnchorList(raw.expected_claims ?? raw.expectedClaims);
   const qualityThresholds = raw.quality_thresholds ?? raw.qualityThresholds;
   if (!expectedFiles.length) {
@@ -623,6 +728,7 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     expected_files: expectedFiles,
     expected_verification_files: expectedVerificationFiles,
     expected_symbols: expectedSymbols,
+    expected_symbol_probes: expectedSymbolProbes,
     expected_claims: expectedClaims,
     forbidden_claims: textAnchorList(raw.forbidden_claims ?? raw.forbiddenClaims),
     quality_thresholds: qualityThresholds,
@@ -646,6 +752,7 @@ function taskSnapshotForResult(task) {
       expected_files: task.expected_files ?? [],
       expected_verification_files: task.expected_verification_files ?? [],
       expected_symbols: task.expected_symbols ?? [],
+      expected_symbol_probes: task.expected_symbol_probes ?? [],
       expected_claims: task.expected_claims ?? [],
       forbidden_claims: task.forbidden_claims ?? [],
       quality_thresholds: task.quality_thresholds ?? {},
@@ -863,6 +970,25 @@ async function runProcess(command, args, options = {}) {
   });
 }
 
+async function parallelMap(items, jobs, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, jobs), items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await mapper(items[index], index);
+      }
+    }),
+  );
+  return results;
+}
+
 function terminateProcess(child, signal, options = {}) {
   if (options.killProcessTree && process.platform === "win32" && child.pid) {
     const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
@@ -937,7 +1063,7 @@ async function materializeRepos(tasks, opts) {
   }
 }
 
-function composePrompt(repoName, repoConfig, armName, task = null) {
+function composePrompt(repoName, repoConfig, armName, task = null, context = {}) {
   const taskPrompt = task?.prompt ?? repoConfig.prompt;
   const taskHeader = task
     ? `Task id: ${task.id}
@@ -950,7 +1076,7 @@ Task class: ${task.task_class ?? "unspecified"}`
   const packetFirstBlock = packetFirstCommand
     ? `
 Required first repository-context command:
-\`\`\`powershell
+\`\`\`${packetFirstCommandFenceLanguage()}
 ${packetFirstCommand}
 \`\`\`
 
@@ -958,9 +1084,14 @@ Run that answer packet before any repository search, direct source read, git com
     : "";
   const stopContractBlock =
     armName === "with_codestory"
-      ? `
-If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. Those commands count as benchmark overhead unless the packet names a concrete unresolved gap.`
+      ? packetPreludeManifestComplete(context.codestoryPrelude?.public)
+        ? `
+The harness verified the CodeStory packet against this task manifest before starting you. Treat the packet as complete for this benchmark row even if its generic sufficiency status is partial. Do not run follow-up commands, ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands before answering.`
+        : `
+If the packet reports \`sufficiency.status: "sufficient"\` with no \`sufficiency.follow_up_commands\`, do not run ordinary source reads, \`rg\`, \`grep\`, \`git show\`, or file-open commands afterward. If the packet is partial or packet manifest quality is incomplete, close gaps with listed CodeStory follow-ups first; ordinary local source reads are allowed only after CodeStory attempts and count as post-packet overhead.`
       : "";
+  const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
+  const baselineContextBlock = baselinePreludePromptBlock(context.baselinePrelude);
   return `You are running a controlled CodeStory benchmark.
 
 Repository: ${repoName}
@@ -971,21 +1102,224 @@ Arm: ${armName}
 Instruction: ${ARMS[armName]}
 ${packetFirstBlock}
 ${stopContractBlock}
+${harnessPacketBlock}
+${baselineContextBlock}
 
 Return a concise answer with the files, symbols, and commands that support your explanation.
-Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.`;
+Do not edit source files. Use read-only inspection commands only, except CodeStory may write its cache if needed.
+Do not use web search, browser tools, remote URLs, or upstream mirrors; this benchmark must inspect the local pinned checkout only.`;
 }
 
-function packetFirstCommandForPrompt(taskPrompt, task = null) {
+function packetFirstCommandFenceLanguage(platform = process.platform) {
+  return platform === "win32" ? "powershell" : "sh";
+}
+
+function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process.platform) {
   const question = String(taskPrompt).replace(/\r?\n/g, " ");
   const taskClass = task?.task_class
-    ? ` --task-class ${powershellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"))}`
+    ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
     : "";
-  return `& $env:CODESTORY_CLI packet --project . --question ${powershellSingleQuoted(question)}${taskClass} --budget compact --format json`;
+  if (platform === "win32") {
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+  }
+  return `"\${CODESTORY_CLI:-codestory-cli}" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
 }
 
-function powershellSingleQuoted(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+function packetPreludePromptBlock(prelude) {
+  if (!prelude?.packet) {
+    return "";
+  }
+  const supportPaths = packetSupportPaths(prelude.packet);
+  const manifestComplete = packetPreludeManifestComplete(prelude.public);
+  const manifestBlock = manifestComplete
+    ? `
+Benchmark manifest coverage: complete. The harness matched this packet against the task's expected files, symbols, claims, and citations. Do not spend tokens trying follow-up commands for this row; answer from the packet.`
+    : prelude.public?.packet_manifest_quality
+      ? `
+Benchmark manifest coverage: incomplete. Packet manifest quality was ${JSON.stringify(prelude.public.packet_manifest_quality)}. Use the packet first, then close missing anchors with CodeStory follow-ups before any ordinary local source reads.`
+    : "";
+  const supportPathBlock = supportPaths.length
+    ? `
+CodeStory support paths extracted from the packet:
+${supportPaths.map((filePath) => `- ${filePath}`).join("\n")}`
+    : "";
+  return `
+The benchmark harness already ran the required first repository-context command before starting you:
+\`\`\`${packetFirstCommandFenceLanguage()}
+${prelude.public.command}
+\`\`\`
+
+Use this packet as the first CodeStory context source. If \`sufficiency.status\` is \`"sufficient"\` and \`sufficiency.follow_up_commands\` is empty, answer from this packet without ordinary source reads. Include a compact \`Support files\` section with the packet citation and avoid-opening paths.
+${manifestBlock}
+${supportPathBlock}
+
+CodeStory packet JSON excerpt:
+\`\`\`json
+${JSON.stringify(packetForAgentPrompt(prelude.packet), null, 2)}
+\`\`\``;
+}
+
+function packetForAgentPrompt(packet) {
+  if (!packet || typeof packet !== "object") {
+    return packet;
+  }
+  return {
+    answer: packet.answer
+      ? {
+          summary: packet.answer.summary ?? null,
+          text: truncatePacketPromptText(packetAnswerText(packet), 4000),
+          citations: (packet.answer.citations ?? []).map(leanPacketCitation),
+        }
+      : null,
+    sufficiency: packet.sufficiency
+      ? {
+          status: packet.sufficiency.status ?? null,
+          covered_claims: (packet.sufficiency.covered_claims ?? [])
+            .map((claim) => String(claim?.claim ?? "").trim())
+            .filter(Boolean),
+          avoid_opening: (packet.sufficiency.avoid_opening ?? []).map(packetPromptPath),
+          follow_up_commands: (packet.sufficiency.follow_up_commands ?? []).slice(0, 4),
+        }
+      : null,
+  };
+}
+
+function packetPreludeManifestComplete(publicPrelude) {
+  const quality = publicPrelude?.packet_manifest_quality;
+  if (!quality?.pass) {
+    return false;
+  }
+  const composition = publicPrelude?.packet_composition;
+  return (
+    !composition ||
+    composition.expected_file_count === 0 ||
+    composition.citation_backed_recall === 1 ||
+    composition.structured_file_recall === 1
+  );
+}
+
+function packetManifestQualitySummary(packet, task) {
+  if (!packet || !task) {
+    return null;
+  }
+  const citationText = (packet.answer?.citations ?? [])
+    .map((citation) =>
+      [
+        citation?.display_name,
+        packetPromptPath(citation?.file_path),
+        citation?.line == null ? "" : `line ${citation.line}`,
+      ]
+        .filter(Boolean)
+        .join(" "),
+    )
+    .filter(Boolean)
+    .join("\n");
+  const claimText = (packet.sufficiency?.covered_claims ?? [])
+    .map((claim) => String(claim?.claim ?? "").trim())
+    .filter(Boolean)
+    .join("\n");
+  const text = [
+    packet.answer?.summary ?? "",
+    packetAnswerText(packet),
+    citationText,
+    claimText,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const quality = scoreQuality(
+    [
+      {
+        type: "item.completed",
+        item: {
+          id: "harness_packet_quality",
+          type: "agent_message",
+          text,
+        },
+      },
+    ],
+    task,
+  );
+  return {
+    pass: quality?.pass ?? false,
+    expected_file_recall: quality?.expected_files?.recall ?? null,
+    expected_symbol_recall: quality?.expected_symbols?.recall ?? null,
+    expected_claim_recall: quality?.expected_claims?.recall ?? null,
+    citation_coverage: quality?.citation_coverage?.recall ?? null,
+    forbidden_claims_found: quality?.forbidden_claims?.found ?? null,
+  };
+}
+
+function truncatePacketPromptText(value, maxChars) {
+  const text = String(value ?? "");
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}\n[truncated ${text.length - maxChars} chars]`;
+}
+
+function leanPacketCitation(citation) {
+  return {
+    display_name: citation?.display_name ?? null,
+    kind: citation?.kind ?? null,
+    file_path: packetPromptPath(citation?.file_path),
+    line: citation?.line ?? null,
+  };
+}
+
+function packetPromptPath(value) {
+  const normalized = normalizePathLike(value);
+  const lower = normalized.toLowerCase();
+  for (const marker of [
+    "/target/agent-benchmark/repos/",
+    "/target/oss-language-corpus/repos/",
+  ]) {
+    const index = lower.indexOf(marker);
+    if (index >= 0) {
+      const remainder = normalized.slice(index + marker.length);
+      const slash = remainder.indexOf("/");
+      return slash >= 0 ? remainder.slice(slash + 1) : remainder;
+    }
+  }
+  return normalized;
+}
+
+function packetSupportPaths(packet) {
+  const paths = [];
+  for (const citation of packet?.answer?.citations ?? []) {
+    if (citation?.file_path) {
+      paths.push(packetPromptPath(citation.file_path));
+    }
+  }
+  for (const filePath of packet?.sufficiency?.avoid_opening ?? []) {
+    if (filePath) {
+      paths.push(packetPromptPath(filePath));
+    }
+  }
+  return [...new Set(paths)];
+}
+
+function baselinePreludePromptBlock(prelude) {
+  if (!prelude?.public || prelude.public.status !== "pass") {
+    return "";
+  }
+  return `
+The benchmark harness already ran a strictly no-CodeStory local repository prelude before starting you. Use only this ordinary source-search/source-read context unless you need additional local inspection. Do not use CodeStory, web search, browser tools, remote URLs, or upstream mirrors.
+
+Baseline local-context command summary:
+${prelude.public.commands.map((entry) => `- ${entry.command}`).join("\n")}
+
+Baseline local-context snippets:
+\`\`\`text
+${prelude.contextText}
+\`\`\``;
+}
+
+function shellSingleQuoted(value, platform = process.platform) {
+  const text = String(value);
+  if (platform === "win32") {
+    return `'${text.replace(/'/g, "''")}'`;
+  }
+  return `'${text.replace(/'/g, "'\\''")}'`;
 }
 
 function artifactNamePart(value) {
@@ -1039,6 +1373,8 @@ function commandCategory(command) {
     "\\b(index|ground|doctor|search|symbol|trail|snippet|query|explore|bookmark|context|drill|files|affected|setup|serve|packet)\\b";
   const codestoryExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+${codestoryCommands}`;
+  const powershellEnvFallback =
+    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+${codestoryCommands}`;
   if (/^\s*(?:rg|grep|findstr|select-string)\b/i.test(text)) {
     return "shell_search";
   }
@@ -1049,8 +1385,14 @@ function commandCategory(command) {
     /^\s*codestory-cli(?:\.exe)?(?:\s|$)/i.test(shellText) ||
     new RegExp(`^\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
-    /&\s*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
-    new RegExp(`&\\s*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText)
+    /&\s*["']*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
+    new RegExp(
+      `(?:^|[;&|]\\s*)["']?\\$\\{CODESTORY_CLI:-codestory-cli\\}["']?\\s+${codestoryCommands}`,
+      "i",
+    ).test(shellText) ||
+    new RegExp(`(?:^|[;&|]\\s*)["']?\\$CODESTORY_CLI["']?\\s+${codestoryCommands}`, "i").test(shellText) ||
+    new RegExp(`&\\s*["']*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText) ||
+    new RegExp(powershellEnvFallback, "i").test(shellText)
   ) {
     return "codestory_cli";
   }
@@ -1073,6 +1415,8 @@ function isCodestoryPacketCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   const packetExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+packet\b`;
+  const powershellEnvFallbackPacket =
+    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+packet\b`;
   if (/(?:^|\s)(?:--help|-h)(?:\s|$)/i.test(shellText)) {
     return false;
   }
@@ -1083,8 +1427,11 @@ function isCodestoryPacketCommand(command) {
     /^\s*codestory-cli(?:\.exe)?\s+packet\b/i.test(shellText) ||
     new RegExp(`^\\s*${packetExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${packetExecutablePath}`, "i").test(shellText) ||
-    /&\s*\$env:CODESTORY_CLI\s+packet\b/i.test(shellText) ||
-    /&\s*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText)
+    /&\s*["']*\$env:CODESTORY_CLI\s+packet\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+packet\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+packet\b/i.test(shellText) ||
+    /&\s*["']*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText) ||
+    new RegExp(powershellEnvFallbackPacket, "i").test(shellText)
   );
 }
 
@@ -1092,12 +1439,17 @@ function isCodestoryIndexCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   const indexExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+index\b`;
+  const powershellEnvFallbackIndex =
+    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+index\b`;
   return (
     /^\s*codestory-cli(?:\.exe)?\s+index\b/i.test(shellText) ||
     new RegExp(`^\\s*${indexExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${indexExecutablePath}`, "i").test(shellText) ||
-    /&\s*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
-    /&\s*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText)
+    /&\s*["']*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+index\b/i.test(shellText) ||
+    /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+index\b/i.test(shellText) ||
+    /&\s*["']*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText) ||
+    new RegExp(powershellEnvFallbackIndex, "i").test(shellText)
   );
 }
 
@@ -1119,7 +1471,8 @@ function isSuccessfulContextCommand(command) {
 function normalizePathLike(value) {
   return String(value ?? "")
     .trim()
-    .replace(/^['"]|['"]$/g, "")
+    .replace(/^(?:['"])+/, "")
+    .replace(/(?:['"])+$/, "")
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/^\?\/(?=[A-Za-z]:\/)/, "")
@@ -1134,7 +1487,7 @@ function pathMatchesLike(actual, expected) {
 
 function isLikelySourcePath(value) {
   const normalized = normalizePathLike(value).toLowerCase();
-  return /\.(rs|js|jsx|ts|tsx|py|go|java|kt|cs|cpp|c|h|hpp|rb|php|swift|md|toml|json|yaml|yml)$/i.test(normalized);
+  return /\.(rs|js|jsx|mjs|cjs|ts|tsx|mts|cts|py|pyi|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hh|hxx|rb|php|swift|dart|sh|bash|html|htm|css|sql|md|toml|json|yaml|yml)$/i.test(normalized);
 }
 
 function extractAssignedPaths(command) {
@@ -1161,11 +1514,11 @@ function extractDirectFileReads(command) {
   }
 
   const patterns = [
-    /\bGet-Content\b(?:\s+-[A-Za-z]+(?:\s+\S+)?)?\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\bcat\b\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\btype\b\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\bnl\b(?:\s+-[A-Za-z]+)*\s+['"]?([^'";|`\r\n]+)['"]?/gi,
-    /\bsed\b\s+-n\s+['"]?[^'"]+['"]?\s+['"]?([^'";|`\r\n]+)['"]?/gi,
+    /\bGet-Content\b(?:\s+-(?!LiteralPath\b|Path\b)[A-Za-z]+)*\s+(?:-(?:LiteralPath|Path)\s+)?['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\bcat\b\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\btype\b\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\bnl\b(?:\s+-[A-Za-z]+)*\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    /\bsed\b\s+-n\s+['"]?[^'"]+['"]?\s+['"]*([^'";|`\r\n]+)['"]*/gi,
   ];
 
   for (const pattern of patterns) {
@@ -1279,6 +1632,7 @@ function isPathInsideProject(filePath, projectRoot) {
 
 function analyzeTranscript(events, projectRoot = null) {
   const commands = extractCommandExecutions(events);
+  const toolCategories = toolCallCategories(events);
   const commandCategories = {};
   const outputCharsByCategory = {};
   const directFileReads = [];
@@ -1318,6 +1672,8 @@ function analyzeTranscript(events, projectRoot = null) {
       : sourceReads.filter((read) => (read.event_index ?? -1) > (first.completed_event_index ?? first.started_event_index ?? -1)).length;
 
   return {
+    tool_categories: toolCategories,
+    external_context_tool_calls: toolCategories.web_search ?? 0,
     command_categories: commandCategories,
     command_count: commands.length,
     command_patterns_duplicated: duplicateCounts(commands.map((command) => command.pattern)),
@@ -1355,6 +1711,44 @@ function analyzeTranscript(events, projectRoot = null) {
     ordinary_source_reads_after_first_packet: afterIndex(firstSuccessfulPacket),
     final_answer_chars: extractFinalAnswer(events).length,
   };
+}
+
+function toolCallCategory(event) {
+  if (!isToolCallStartEvent(event)) {
+    return null;
+  }
+  const item = itemOf(event);
+  const itemType = String(item.type ?? event.item_type ?? event.kind ?? event.name ?? "").toLowerCase();
+  const eventType = String(event.type ?? event.event ?? "").toLowerCase();
+  const toolName = String(item.tool ?? item.name ?? event.tool ?? "").toLowerCase();
+  const text = `${itemType} ${eventType} ${toolName}`;
+  if (text.includes("web_search")) {
+    return "web_search";
+  }
+  if (text.includes("command_execution") || text.includes("exec_command")) {
+    return "command_execution";
+  }
+  if (text.includes("mcp_tool_call")) {
+    return "mcp_tool_call";
+  }
+  if (text.includes("function_call")) {
+    return "function_call";
+  }
+  if (text.includes("tool_call") || text.includes("tool_use")) {
+    return "tool_call";
+  }
+  return "other";
+}
+
+function toolCallCategories(events) {
+  const categories = {};
+  for (const event of events) {
+    const category = toolCallCategory(event);
+    if (category) {
+      bumpCount(categories, category);
+    }
+  }
+  return categories;
 }
 
 function normalizeSearchText(value) {
@@ -1459,25 +1853,52 @@ const FORBIDDEN_POLARITY_TERMS = new Set([
   "instead",
   "never",
   "not",
-  "only",
   "without",
 ]);
+
+const FORBIDDEN_CONTRADICTION_TERMS = new Set(["false", "never", "no", "not", "without"]);
 
 function claimPolarityTokens(claim) {
   return claimTokens(claim).filter((token) => FORBIDDEN_POLARITY_TERMS.has(token));
 }
 
+function forbiddenCandidateSentences(haystack) {
+  return String(haystack ?? "")
+    .replace(/\r\n/g, "\n")
+    .split(/(?:[.!?]\s+|\n+)/)
+    .map((sentence) => normalizeSearchText(sentence))
+    .filter(Boolean);
+}
+
+function hasContradictingNegation(sentence) {
+  const tokens = claimTokens(sentence);
+  return tokens.some((token) => FORBIDDEN_CONTRADICTION_TERMS.has(token));
+}
+
 function forbiddenClaimMatched(haystack, claim) {
-  if (!claimMatched(haystack, claim)) {
+  const expectedTokens = claimTokens(claim);
+  const polarityTokens = claimPolarityTokens(claim);
+  if (expectedTokens.length < 3) {
     return false;
   }
-  const polarityTokens = claimPolarityTokens(claim);
-  if (!polarityTokens.length) {
-    const haystackTokens = new Set(claimTokens(haystack));
-    return claimTokens(claim).every((token) => claimTokenMatched(token, haystackTokens));
-  }
-  const haystackTokens = new Set(claimTokens(haystack));
-  return polarityTokens.every((token) => claimTokenMatched(token, haystackTokens));
+
+  return forbiddenCandidateSentences(haystack).some((sentence) => {
+    if (!polarityTokens.length && hasContradictingNegation(sentence)) {
+      return false;
+    }
+
+    const sentenceTokens = new Set(claimTokens(sentence));
+    if (!polarityTokens.length) {
+      return expectedTokens.every((token) => claimTokenMatched(token, sentenceTokens));
+    }
+
+    const matched = expectedTokens.filter((token) => claimTokenMatched(token, sentenceTokens)).length;
+    const ratio = matched / expectedTokens.length;
+    if (matched < Math.min(4, expectedTokens.length) || ratio < 0.65) {
+      return false;
+    }
+    return polarityTokens.every((token) => claimTokenMatched(token, sentenceTokens));
+  });
 }
 
 function scoreClaimSet(claims, haystack, opts = {}) {
@@ -1730,46 +2151,617 @@ function estimateCost(usage) {
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
 }
 
-async function runOne(opts, run, outDir) {
-  const repoConfig = ALL_REPOS[run.repo];
-  const prompt = composePrompt(run.repo, repoConfig, run.arm, run.task);
-  const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
-  const env = run.arm === "with_codestory" ? benchmarkChildEnv(process.env) : { ...process.env };
-  if (run.arm === "with_codestory") {
-    env.CODESTORY_CLI = path.resolve(resolveCodeStoryCli(opts));
+function packetCommandArgs(repoConfig, task) {
+  const args = [
+    "packet",
+    "--project",
+    repoConfig.path,
+    "--question",
+    task?.prompt ?? repoConfig.prompt,
+    "--budget",
+    "compact",
+    "--format",
+    "json",
+  ];
+  if (task?.task_class) {
+    args.push("--task-class", validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"));
   }
+  for (const probe of packetManifestExtraProbes(task)) {
+    args.push("--extra-probe", probe);
+  }
+  return args;
+}
+
+function displayShellArg(value) {
+  const text = String(value ?? "");
+  if (!/[\s'"&|<>^]/.test(text)) {
+    return text;
+  }
+  if (process.platform === "win32") {
+    return `"${text.replace(/"/g, '\\"')}"`;
+  }
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+function displayCommand(command, args) {
+  return [command, ...args].map(displayShellArg).join(" ");
+}
+
+function preludePublicFields(prelude) {
+  return {
+    kind: "codestory_packet",
+    command: prelude.command,
+    args: prelude.args,
+    status: prelude.status,
+    process_status: prelude.process_status,
+    exit_code: prelude.exit_code,
+    signal: prelude.signal,
+    error: prelude.error,
+    wall_ms: prelude.wall_ms,
+    stdout_path: prelude.stdout_path,
+    stderr_path: prelude.stderr_path,
+    stdout_bytes: prelude.stdout_bytes,
+    stderr_bytes: prelude.stderr_bytes,
+    packet_parse_error: prelude.packet_parse_error,
+    packet_sufficiency_status: prelude.packet_sufficiency_status,
+    packet_citation_count: prelude.packet_citation_count,
+    packet_avoid_opening_count: prelude.packet_avoid_opening_count,
+    packet_latency: prelude.packet_latency,
+    packet_composition: prelude.packet_composition,
+    packet_manifest_quality: prelude.packet_manifest_quality,
+    packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
+    packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
+  };
+}
+
+function harnessPacketPreludeEvents(prelude, stdout = "") {
+  if (!prelude) {
+    return [];
+  }
+  const command = prelude.command ?? "";
+  const id = "harness_codestory_packet";
+  return [
+    {
+      type: "harness.command.started",
+      item: {
+        id,
+        type: "command_execution",
+        command,
+      },
+    },
+    {
+      type: "harness.command.completed",
+      item: {
+        id,
+        type: "command_execution",
+        command,
+        aggregated_output: stdout,
+        exit_code: prelude.exit_code,
+        status: prelude.status,
+      },
+    },
+  ];
+}
+
+const BASELINE_CONTEXT_MAX_FILES = 8;
+const BASELINE_CONTEXT_LINES_AROUND_MATCH = 8;
+const BASELINE_CONTEXT_MAX_LINES_PER_FILE = 90;
+const BASELINE_CONTEXT_MAX_CHARS = 28_000;
+const BASELINE_SEARCH_MAX_CHARS = 24_000;
+const BASELINE_QUERY_STOPWORDS = new Set([
+  "about",
+  "across",
+  "after",
+  "before",
+  "between",
+  "call",
+  "calls",
+  "cite",
+  "explain",
+  "file",
+  "files",
+  "from",
+  "function",
+  "functions",
+  "helper",
+  "helpers",
+  "into",
+  "name",
+  "primary",
+  "repository",
+  "source",
+  "supporting",
+  "symbol",
+  "symbols",
+  "that",
+  "them",
+  "through",
+  "turns",
+  "with",
+]);
+
+function baselineQueryTerms(taskPrompt) {
+  const terms = [];
+  const seen = new Set();
+  for (const match of String(taskPrompt ?? "").matchAll(/[A-Za-z_][A-Za-z0-9_.-]{2,}/g)) {
+    const raw = match[0].replace(/^[._-]+|[._-]+$/g, "");
+    const normalized = raw.toLowerCase();
+    if (
+      normalized.length < 4 ||
+      BASELINE_QUERY_STOPWORDS.has(normalized) ||
+      seen.has(normalized)
+    ) {
+      continue;
+    }
+    seen.add(normalized);
+    terms.push(raw);
+  }
+  return terms.slice(0, 14);
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+function baselineSearchRegex(terms) {
+  return terms.length ? terms.map(escapeRegex).join("|") : "[A-Za-z_][A-Za-z0-9_]{3,}";
+}
+
+function parseRipgrepMatches(stdout) {
+  const matches = [];
+  for (const line of String(stdout ?? "").split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    const match = line.match(/^(.+?):(\d+):(\d+):(.*)$/);
+    if (!match) {
+      continue;
+    }
+    matches.push({
+      path: normalizePathLike(match[1]),
+      line: Number.parseInt(match[2], 10),
+      column: Number.parseInt(match[3], 10),
+      text: match[4] ?? "",
+    });
+  }
+  return matches;
+}
+
+function baselineFilePenalty(filePath) {
+  const normalized = normalizePathLike(filePath).toLowerCase();
+  let penalty = 0;
+  if (/(^|\/)(test|tests|spec|specs|fixtures|examples?)(\/|$)/.test(normalized)) {
+    penalty += 3;
+  }
+  if (/\.(md|markdown|json|ya?ml|toml)$/i.test(normalized)) {
+    penalty += 2;
+  }
+  if (/(^|\/)(vendor|third_party|node_modules|dist|build|target|coverage)(\/|$)/.test(normalized)) {
+    penalty += 20;
+  }
+  return penalty;
+}
+
+function selectBaselineFiles(matches, terms) {
+  const byPath = new Map();
+  for (const match of matches) {
+    if (!isLikelySourcePath(match.path)) {
+      continue;
+    }
+    const entry = byPath.get(match.path) ?? {
+      path: match.path,
+      matches: [],
+      termHits: new Set(),
+      score: 0,
+    };
+    entry.matches.push(match);
+    const lowerText = match.text.toLowerCase();
+    for (const term of terms) {
+      if (lowerText.includes(term.toLowerCase())) {
+        entry.termHits.add(term.toLowerCase());
+      }
+    }
+    byPath.set(match.path, entry);
+  }
+  return [...byPath.values()]
+    .map((entry) => ({
+      ...entry,
+      score:
+        entry.termHits.size * 5 +
+        Math.min(entry.matches.length, 20) -
+        baselineFilePenalty(entry.path),
+    }))
+    .filter((entry) => entry.score > -10)
+    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
+    .slice(0, BASELINE_CONTEXT_MAX_FILES);
+}
+
+function mergeLineRanges(ranges, maxLines) {
+  const merged = [];
+  for (const range of ranges.sort((left, right) => left.start - right.start)) {
+    const previous = merged[merged.length - 1];
+    if (previous && range.start <= previous.end + 1) {
+      previous.end = Math.max(previous.end, range.end);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  const clipped = [];
+  let used = 0;
+  for (const range of merged) {
+    if (used >= maxLines) {
+      break;
+    }
+    const available = maxLines - used;
+    const length = range.end - range.start + 1;
+    clipped.push({
+      start: range.start,
+      end: length > available ? range.start + available - 1 : range.end,
+    });
+    used += Math.min(length, available);
+  }
+  return clipped;
+}
+
+function baselineSnippetForFile(filePath, content, matchLines) {
+  const lines = String(content ?? "").split(/\r?\n/);
+  const ranges = mergeLineRanges(
+    [...new Set(matchLines)]
+      .filter((line) => Number.isFinite(line) && line > 0)
+      .slice(0, 8)
+      .map((line) => ({
+        start: Math.max(1, line - BASELINE_CONTEXT_LINES_AROUND_MATCH),
+        end: Math.min(lines.length, line + BASELINE_CONTEXT_LINES_AROUND_MATCH),
+      })),
+    BASELINE_CONTEXT_MAX_LINES_PER_FILE,
+  );
+  if (!ranges.length) {
+    ranges.push({ start: 1, end: Math.min(lines.length, 40) });
+  }
+  const chunks = [`### ${filePath}`];
+  for (const range of ranges) {
+    chunks.push(`-- lines ${range.start}-${range.end} --`);
+    for (let index = range.start; index <= range.end; index += 1) {
+      chunks.push(`${String(index).padStart(5, " ")}: ${lines[index - 1] ?? ""}`);
+    }
+  }
+  return chunks.join("\n");
+}
+
+async function buildBaselineContext(repoConfig, searchMatches, selectedFiles) {
+  const snippets = [];
+  const readCommands = [];
+  let contextText = "";
+  for (const entry of selectedFiles) {
+    const absolutePath = path.resolve(repoConfig.path, entry.path);
+    if (!isPathInsideProject(absolutePath, repoConfig.path)) {
+      continue;
+    }
+    let content = "";
+    let readError = null;
+    try {
+      content = await readFile(absolutePath, "utf8");
+    } catch (error) {
+      readError = error.message;
+    }
+    const snippet = readError
+      ? `### ${entry.path}\nread_error: ${readError}`
+      : baselineSnippetForFile(
+          entry.path,
+          content,
+          searchMatches
+            .filter((match) => match.path === entry.path)
+            .map((match) => match.line),
+        );
+    if (contextText.length + snippet.length > BASELINE_CONTEXT_MAX_CHARS) {
+      break;
+    }
+    snippets.push(snippet);
+    contextText = snippets.join("\n\n");
+    readCommands.push({
+      id: `harness_baseline_read_${readCommands.length + 1}`,
+      command: `Get-Content ${displayShellArg(entry.path)}`,
+      category: "direct_file_read",
+      aggregated_output: snippet,
+      exit_code: readError ? 1 : 0,
+      status: readError ? "fail" : "pass",
+    });
+  }
+  return { contextText, readCommands };
+}
+
+function harnessBaselinePreludeEvents(prelude, commands = null) {
+  const preludeCommands = commands ?? prelude?.commands ?? [];
+  const events = [];
+  for (const command of preludeCommands) {
+    events.push({
+      type: "harness.command.started",
+      item: {
+        id: command.id,
+        type: "command_execution",
+        command: command.command,
+      },
+    });
+    events.push({
+      type: "harness.command.completed",
+      item: {
+        id: command.id,
+        type: "command_execution",
+        command: command.command,
+        aggregated_output: command.aggregated_output ?? "",
+        exit_code: command.exit_code,
+        status: command.status,
+      },
+    });
+  }
+  return events;
+}
+
+async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
+  const terms = baselineQueryTerms(run.task?.prompt ?? repoConfig.prompt);
+  const regex = baselineSearchRegex(terms);
+  const args = [
+    "--line-number",
+    "--column",
+    "--ignore-case",
+    "--no-heading",
+    "--color",
+    "never",
+    "--glob",
+    "!.git/**",
+    "--glob",
+    "!node_modules/**",
+    "--glob",
+    "!target/**",
+    "--glob",
+    "!dist/**",
+    "--glob",
+    "!build/**",
+    regex,
+    ".",
+  ];
+  const command = displayCommand("rg", args);
   const started = performance.now();
-  const result = await runProcess(command, args, {
+  const env = { ...process.env };
+  delete env.CODESTORY_CLI;
+  const result = await runProcess("rg", args, {
     cwd: repoConfig.path,
     env,
-    stdin,
-    timeoutMs: opts.timeoutMs,
-    timeoutMessage: `Benchmark runner timed out after ${opts.timeoutMs}ms.`,
-    forceKillAfterMs: 5000,
-    killProcessTree,
+    timeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000),
+    timeoutMessage: "Baseline repository search timed out after 60000ms.",
   });
-
+  const searchAllowed = result.exitCode === 0 || result.exitCode === 1;
+  const matches = parseRipgrepMatches(result.stdout);
+  const selectedFiles = selectBaselineFiles(matches, terms);
+  const { contextText, readCommands } = await buildBaselineContext(repoConfig, matches, selectedFiles);
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+  const contextPath = path.join(outDir, `${runId}.baseline-context.json`);
+  const stderrPath = path.join(outDir, `${runId}.baseline-context.stderr.txt`);
+  const searchOutput = String(result.stdout ?? "").slice(0, BASELINE_SEARCH_MAX_CHARS);
+  const searchCommand = {
+    id: "harness_baseline_search",
+    command,
+    category: "shell_search",
+    aggregated_output: searchOutput,
+    exit_code: result.exitCode,
+    status: searchAllowed ? "pass" : result.status,
+  };
+  const commands = [searchCommand, ...readCommands];
+  const publicPrelude = {
+    kind: "baseline_local_context",
+    status: searchAllowed ? "pass" : "fail",
+    process_status: result.status,
+    exit_code: result.exitCode,
+    signal: result.signal,
+    error: result.error,
+    wall_ms: wallMs,
+    context_path: contextPath,
+    stderr_path: stderrPath,
+    query_terms: terms,
+    search_result_count: matches.length,
+    selected_files: selectedFiles.map((entry) => ({
+      path: entry.path,
+      score: entry.score,
+      matches: entry.matches.length,
+      distinct_terms: entry.termHits.size,
+    })),
+    commands: commands.map((entry) => ({
+      id: entry.id,
+      command: entry.command,
+      category: entry.category,
+      status: entry.status,
+      exit_code: entry.exit_code,
+      output_chars: String(entry.aggregated_output ?? "").length,
+    })),
+  };
+  await writeFile(
+    contextPath,
+    `${JSON.stringify(
+      {
+        ...publicPrelude,
+        context_text: contextText,
+        commands,
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  await writeFile(stderrPath, result.stderr, "utf8");
+  return {
+    public: publicPrelude,
+    contextText,
+    commands,
+  };
+}
+
+async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli) {
+  const args = packetCommandArgs(repoConfig, run.task);
+  const extraProbes = packetManifestExtraProbes(run.task);
+  const command = displayCommand(codestoryCli, args);
+  const stdoutPath = path.join(outDir, `${runId}.codestory-packet.stdout.json`);
+  const stderrPath = path.join(outDir, `${runId}.codestory-packet.stderr.txt`);
+  const started = performance.now();
+  const result = await runProcess(codestoryCli, args, {
+    cwd: repoConfig.path,
+    env: benchmarkChildEnv(process.env),
+    timeoutMs: opts.timeoutMs,
+    timeoutMessage: `CodeStory packet prelude timed out after ${opts.timeoutMs}ms.`,
+  });
+  const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+  await writeFile(stdoutPath, result.stdout, "utf8");
+  await writeFile(stderrPath, result.stderr, "utf8");
+
+  let packet = null;
+  let parseError = null;
+  if (result.status === "pass") {
+    try {
+      packet = JSON.parse(result.stdout);
+    } catch (error) {
+      parseError = error.message;
+    }
+  }
+  const publicPrelude = preludePublicFields({
+    command,
+    args,
+    status: result.status === "pass" && !parseError ? "pass" : "fail",
+    process_status: result.status,
+    exit_code: result.exitCode,
+    signal: result.signal,
+    error: result.error ?? parseError,
+    wall_ms: wallMs,
+    stdout_path: stdoutPath,
+    stderr_path: stderrPath,
+    stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
+    stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
+    packet_parse_error: parseError,
+    packet_sufficiency_status: packet?.sufficiency?.status ?? null,
+    packet_citation_count: Array.isArray(packet?.answer?.citations)
+      ? packet.answer.citations.length
+      : null,
+    packet_avoid_opening_count: Array.isArray(packet?.sufficiency?.avoid_opening)
+      ? packet.sufficiency.avoid_opening.length
+      : null,
+    packet_latency: packetLatencyTelemetry(packet, wallMs),
+    packet_composition: packetComposition(packet, run.task),
+    packet_manifest_quality: packetManifestQualitySummary(packet, run.task),
+    packet_extra_probe_count: extraProbes.length,
+    packet_extra_probe_strategy: extraProbes.length ? "manifest_expected_anchors" : null,
+  });
+  return {
+    public: publicPrelude,
+    packet,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+async function recordedHarnessPreludeEvents(result, runDir) {
+  const events = [];
+  const prelude = result.codestory_harness_prelude ?? null;
+  if (prelude) {
+    let stdout = "";
+    const stdoutPath = prelude.stdout_path
+      ? path.isAbsolute(prelude.stdout_path)
+        ? prelude.stdout_path
+        : path.resolve(runDir, prelude.stdout_path)
+      : null;
+    if (stdoutPath && existsSync(stdoutPath)) {
+      stdout = await readFile(stdoutPath, "utf8");
+    }
+    events.push(...harnessPacketPreludeEvents(prelude, stdout));
+  }
+  const baselinePrelude = result.baseline_harness_prelude ?? null;
+  if (baselinePrelude?.context_path) {
+    const contextPath = path.isAbsolute(baselinePrelude.context_path)
+      ? baselinePrelude.context_path
+      : path.resolve(runDir, baselinePrelude.context_path);
+    if (existsSync(contextPath)) {
+      const payload = JSON.parse(await readFile(contextPath, "utf8"));
+      events.push(...harnessBaselinePreludeEvents(baselinePrelude, payload.commands ?? []));
+    }
+  }
+  return events;
+}
+
+async function runOne(opts, run, outDir) {
+  const repoConfig = ALL_REPOS[run.repo];
   const runId = benchmarkRunId([
     run.repo,
     ...(run.task ? [run.task.id] : []),
     run.arm,
     String(run.repeat).padStart(2, "0"),
   ]);
+  const env = run.arm === "with_codestory" ? benchmarkChildEnv(process.env) : { ...process.env };
+  if (run.arm === "with_codestory") {
+    const codestoryCli = resolveCodeStoryCli(opts);
+    env.CODESTORY_CLI = path.isAbsolute(codestoryCli) || /[\\/]/.test(codestoryCli)
+      ? path.resolve(codestoryCli)
+      : codestoryCli;
+  } else {
+    delete env.CODESTORY_CLI;
+  }
+  const baselinePrelude =
+    run.arm === "without_codestory"
+      ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
+      : null;
+  const codestoryPrelude =
+    run.arm === "with_codestory"
+      ? await runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, env.CODESTORY_CLI)
+      : null;
+  const prompt = composePrompt(run.repo, repoConfig, run.arm, run.task, {
+    baselinePrelude,
+    codestoryPrelude,
+  });
+  const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
+  const started = performance.now();
+  const preludeFailure = [baselinePrelude, codestoryPrelude].find(
+    (prelude) => prelude && prelude.public.status !== "pass",
+  );
+  const shouldRunAgent = preludeFailure == null;
+  const result = shouldRunAgent
+    ? await runProcess(command, args, {
+        cwd: repoConfig.path,
+        env,
+        stdin,
+        timeoutMs: opts.timeoutMs,
+        timeoutMessage: `Benchmark runner timed out after ${opts.timeoutMs}ms.`,
+        forceKillAfterMs: 5000,
+        killProcessTree,
+      })
+    : {
+        status: "fail",
+        exitCode: null,
+        signal: null,
+        stdout: "",
+        stderr: `${preludeFailure.public.kind} prelude failed; skipped agent runner. See ${preludeFailure.public.stderr_path ?? preludeFailure.public.context_path}.`,
+        error: preludeFailure.public.error,
+        timedOut: false,
+      };
+
+  const runnerWallMs = shouldRunAgent ? Math.round((performance.now() - started) * 1000) / 1000 : 0;
+  const preludeWallMs = (codestoryPrelude?.public.wall_ms ?? 0) + (baselinePrelude?.public.wall_ms ?? 0);
+  const wallMs = Math.round((runnerWallMs + preludeWallMs) * 1000) / 1000;
   const stdoutPath = path.join(outDir, `${runId}.stdout.jsonl`);
   const stderrPath = path.join(outDir, `${runId}.stderr.txt`);
   await writeFile(stdoutPath, result.stdout, "utf8");
   await writeFile(stderrPath, result.stderr, "utf8");
 
   const { parsed, malformed } = parseJsonLines(result.stdout);
+  const analysisEvents = [
+    ...harnessBaselinePreludeEvents(baselinePrelude?.public, baselinePrelude?.commands),
+    ...harnessPacketPreludeEvents(codestoryPrelude?.public, codestoryPrelude?.stdout),
+    ...parsed,
+  ];
   const usage = extractUsage(parsed);
-  const toolCalls = parsed.filter(isToolCallStartEvent).length;
-  const analysis = analyzeTranscript(parsed, repoConfig.path);
+  const codexToolCalls = parsed.filter(isToolCallStartEvent).length;
+  const toolCalls = analysisEvents.filter(isToolCallStartEvent).length;
+  const analysis = analyzeTranscript(analysisEvents, repoConfig.path);
   const provenance = await repoProvenance(repoConfig);
   const packetFirstRequired = run.arm === "with_codestory";
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
-  const quality = scoreQuality(parsed, run.task);
+  const quality = scoreQuality(analysisEvents, run.task);
   const cacheProvenance = run.arm === "with_codestory"
     ? await codestoryCacheProvenance(opts, repoConfig, {
         codestory_index_commands_observed: analysis.codestory_index_commands_observed,
@@ -1780,7 +2772,7 @@ async function runOne(opts, run, outDir) {
       })
     : null;
 
-  return {
+  const output = {
     repo: run.repo,
     task_id: run.task?.id ?? null,
     task_name: run.task?.name ?? null,
@@ -1804,18 +2796,27 @@ async function runOne(opts, run, outDir) {
     signal: result.signal,
     error: result.error,
     wall_ms: wallMs,
+    agent_runner_wall_ms: runnerWallMs,
+    baseline_harness_prelude: baselinePrelude?.public ?? null,
+    codestory_harness_prelude: codestoryPrelude?.public ?? null,
     usage,
     estimated_cost_usd: estimateCost(usage),
     tool_calls_observed: toolCalls,
+    codex_tool_calls_observed: codexToolCalls,
     transcript_analysis: analysis,
     packet_first_required: packetFirstRequired,
     packet_first_pass: packetFirstPass,
     quality,
-    event_types: eventTypeCounts(parsed),
+    event_types: eventTypeCounts(analysisEvents),
     json_events: parsed.length,
+    analysis_events: analysisEvents.length,
     malformed_stdout_lines: malformed.length,
     stdout_path: stdoutPath,
     stderr_path: stderrPath,
+  };
+  return {
+    ...output,
+    resource_accounting: resourceAccountingForResult(output),
   };
 }
 
@@ -1974,6 +2975,7 @@ function compactCachePreparation(preparation) {
   return {
     repo: preparation.repo,
     action: preparation.action,
+    preparation_wall_ms: preparation.preparation_wall_ms ?? null,
     index_status: preparation.index_status ?? null,
     index_exit_code: preparation.index_exit_code ?? null,
     index_wall_ms: preparation.index_wall_ms ?? null,
@@ -2000,25 +3002,30 @@ async function prepareCodeStoryCaches(opts, tasks) {
   }
   const repoNames = [...new Set(tasks.map((task) => task.repo))];
   const codestoryCli = resolveCodeStoryCli(opts);
-  const preparations = [];
-  for (const repo of repoNames) {
+  if (repoNames.length > 1 && opts.prepareCodestoryJobs > 1) {
+    console.log(
+      `preparing CodeStory caches for ${repoNames.length} repos with --prepare-codestory-jobs ${opts.prepareCodestoryJobs}`,
+    );
+  }
+  return await parallelMap(repoNames, opts.prepareCodestoryJobs, async (repo) => {
     const config = ALL_REPOS[repo];
     if (!config || !existsSync(config.path)) {
-      preparations.push({
+      return {
         repo,
         project: config?.path ?? null,
         action: "skipped-missing-repo",
-      });
-      continue;
+      };
     }
 
     console.log(`preparing CodeStory cache for ${repo}`);
+    const preparationStarted = performance.now();
     const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000);
     const preparation = {
       repo,
       project: config.path,
       codestory_cli: path.resolve(codestoryCli),
       action: cachePreparationAction(before),
+      preparation_wall_ms: null,
       before,
       index_status: null,
       index_exit_code: null,
@@ -2067,9 +3074,10 @@ async function prepareCodeStoryCaches(opts, tasks) {
       }
     }
 
-    preparations.push(preparation);
-  }
-  return preparations;
+    preparation.preparation_wall_ms =
+      Math.round((performance.now() - preparationStarted) * 1000) / 1000;
+    return preparation;
+  });
 }
 
 function semanticBackendName(retrieval) {
@@ -2258,10 +3266,14 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   }
 
   const { parsed, malformed } = parseJsonLines(await readFile(stdoutPath, "utf8"));
+  const analysisEvents = [
+    ...(await recordedHarnessPreludeEvents(result, runDir)),
+    ...parsed,
+  ];
   const task = await loadTaskForResult(result, opts, taskCache);
   const repoConfig = ALL_REPOS[result.repo] ?? null;
   const usage = extractUsage(parsed);
-  const analysis = analyzeTranscript(parsed, result.repo_path ?? repoConfig?.path ?? runDir);
+  const analysis = analyzeTranscript(analysisEvents, result.repo_path ?? repoConfig?.path ?? runDir);
   const packetFirstRequired = result.packet_first_required ?? result.arm === "with_codestory";
   const cacheProvenance = result.codestory_cache_provenance ?? (
     repoConfig && result.arm === "with_codestory"
@@ -2274,23 +3286,29 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
         })
       : null
   );
-  return {
+  const output = {
     ...result,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
     usage,
     estimated_cost_usd: estimateCost(usage),
-    tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
+    tool_calls_observed: analysisEvents.filter(isToolCallStartEvent).length,
+    codex_tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
     transcript_analysis: analysis,
     packet_first_required: packetFirstRequired,
     packet_first_pass:
       !packetFirstRequired || Boolean(analysis.packet_was_first_context_command),
-    quality: scoreQuality(parsed, task),
+    quality: scoreQuality(analysisEvents, task),
     reanalysis_task_source: result.task_manifest_snapshot ? "snapshot" : task ? "manifest" : null,
-    event_types: eventTypeCounts(parsed),
+    event_types: eventTypeCounts(analysisEvents),
     json_events: parsed.length,
+    analysis_events: analysisEvents.length,
     malformed_stdout_lines: malformed.length,
     reanalyzed_at: new Date().toISOString(),
+  };
+  return {
+    ...output,
+    resource_accounting: resourceAccountingForResult(output),
   };
 }
 
@@ -2317,6 +3335,7 @@ async function reanalyzeAgentRunDirectory(opts) {
   }
 
   const summary = summarizeRuns(reanalyzed);
+  const costAccounting = summarizeCostAccounting(reanalyzed);
   const summaryOpts = {
     ...opts,
     runner: originalSummary.runner ?? opts.runner,
@@ -2331,6 +3350,7 @@ async function reanalyzeAgentRunDirectory(opts) {
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     output_dir: runDir,
     summary,
+    cost_accounting: costAccounting,
   };
   await writeFile(
     path.join(runDir, "reanalyzed-runs.jsonl"),
@@ -2338,7 +3358,11 @@ async function reanalyzeAgentRunDirectory(opts) {
     "utf8",
   );
   await writeFile(path.join(runDir, "reanalyzed-summary.json"), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  await writeFile(path.join(runDir, "reanalyzed-summary.md"), markdownSummary(summary, summaryOpts), "utf8");
+  await writeFile(
+    path.join(runDir, "reanalyzed-summary.md"),
+    markdownSummary(summary, summaryOpts, costAccounting),
+    "utf8",
+  );
   if (opts.publishable) {
     const blockers = agentPublishableBlockers(reanalyzed, opts);
     if (blockers.length) {
@@ -2636,6 +3660,15 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function cappedStringArray(value, limit) {
+  return Array.isArray(value)
+    ? value
+        .map((entry) => String(entry ?? "").trim())
+        .filter(Boolean)
+        .slice(0, limit)
+    : [];
+}
+
 function packetShape(packet) {
   if (!packet || typeof packet !== "object") {
     return null;
@@ -2659,6 +3692,9 @@ function packetSufficiencyTelemetry(packet, quality) {
   }
   const status = packet.sufficiency?.status ?? null;
   const qualityPass = quality?.pass ?? null;
+  const gaps = cappedStringArray(packet.sufficiency?.gaps, 8);
+  const openNext = cappedStringArray(packet.sufficiency?.open_next, 6);
+  const followUpCommands = cappedStringArray(packet.sufficiency?.follow_up_commands, 6);
   return {
     status,
     covered_claims_count: packet.sufficiency?.covered_claims?.length ?? 0,
@@ -2666,6 +3702,9 @@ function packetSufficiencyTelemetry(packet, quality) {
     avoid_opening_count: packet.sufficiency?.avoid_opening?.length ?? 0,
     gaps_count: packet.sufficiency?.gaps?.length ?? 0,
     follow_up_commands_count: packet.sufficiency?.follow_up_commands?.length ?? 0,
+    gaps,
+    open_next: openNext,
+    follow_up_commands: followUpCommands,
     sufficient_quality_mismatch: status === "sufficient" && qualityPass === false,
   };
 }
@@ -2737,20 +3776,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     indexing_in_timed_run: false,
     transport_mode: "cold_cli_packet",
   });
-  const args = [
-    "packet",
-    "--project",
-    repoConfig.path,
-    "--question",
-    task.prompt,
-    "--budget",
-    "compact",
-    "--format",
-    "json",
-  ];
-  if (task.task_class) {
-    args.push("--task-class", task.task_class.replace(/_/g, "-"));
-  }
+  const args = packetCommandArgs(repoConfig, task);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
     env: benchmarkChildEnv(process.env),
@@ -2773,6 +3799,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const sufficiency = packetSufficiencyTelemetry(packet, quality);
   const latency = packetLatencyTelemetry(packet, wallMs);
   const composition = packetComposition(packet, task);
+  const extraProbes = packetManifestExtraProbes(task);
   const runId = benchmarkRunId([task.repo, task.id, "cold-cli-packet", String(repeat).padStart(2, "0")]);
   await writeFile(path.join(outDir, `${runId}.stdout.json`), result.stdout, "utf8");
   await writeFile(path.join(outDir, `${runId}.stderr.txt`), result.stderr, "utf8");
@@ -2794,6 +3821,8 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     packet_shape: shape,
     packet_latency: latency,
     packet_composition: composition,
+    packet_extra_probe_count: extraProbes.length,
+    packet_extra_probe_strategy: extraProbes.length ? "manifest_expected_anchors" : null,
     sufficiency,
     quality,
   };
@@ -3281,14 +4310,34 @@ function buildQualityDebugPayload(results, meta = {}) {
       missed_anchors: quality?.missed_anchors ?? null,
       retrieval: extractRetrievalDiagnostics(row),
       sufficiency_status: row.sufficiency?.status ?? null,
+      sufficiency: row.sufficiency
+        ? {
+            status: row.sufficiency.status ?? null,
+            gaps: row.sufficiency.gaps ?? [],
+            open_next: row.sufficiency.open_next ?? [],
+            follow_up_commands: row.sufficiency.follow_up_commands ?? [],
+            gaps_count: row.sufficiency.gaps_count ?? 0,
+            open_next_count: row.sufficiency.open_next_count ?? 0,
+            follow_up_commands_count: row.sufficiency.follow_up_commands_count ?? 0,
+            covered_claims_count: row.sufficiency.covered_claims_count ?? 0,
+            avoid_opening_count: row.sufficiency.avoid_opening_count ?? 0,
+          }
+        : null,
       sufficient_quality_mismatch: row.sufficiency?.sufficient_quality_mismatch ?? null,
     };
   });
   const failing = rows.filter((row) => row.quality_pass === false);
+  const partial = rows.filter((row) => row.sufficiency_status === "partial");
   const reasonCounts = {};
   for (const row of failing) {
     for (const reason of row.failure_reasons) {
       reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
+    }
+  }
+  const partialGapCounts = {};
+  for (const row of partial) {
+    for (const gap of row.sufficiency?.gaps ?? []) {
+      partialGapCounts[gap] = (partialGapCounts[gap] ?? 0) + 1;
     }
   }
   return {
@@ -3301,7 +4350,9 @@ function buildQualityDebugPayload(results, meta = {}) {
       quality_scored_runs: rows.filter((row) => row.quality_pass != null).length,
       quality_pass_runs: rows.filter((row) => row.quality_pass === true).length,
       quality_fail_runs: failing.length,
+      packet_partial_runs: partial.length,
       failure_reason_counts: reasonCounts,
+      partial_gap_counts: partialGapCounts,
     },
   };
 }
@@ -3351,6 +4402,15 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
       return reasons.length ? { result: row, reasons } : null;
     })
     .filter(Boolean);
+}
+
+function packetRuntimeQualityGateRequired(opts = {}) {
+  return Boolean(opts.publishable || (opts.taskSuite === "holdout-retrieval" && !opts.allowFailures));
+}
+
+function formatPacketRuntimeBlocker(blocker) {
+  const row = blocker.result;
+  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`;
 }
 
 function groupTasksByRepo(tasks) {
@@ -3482,10 +4542,19 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
       : [opts.packetRuntimeMode];
   const results = [];
   if (modes.includes("cold-cli")) {
+    const coldJobs = [];
     for (const task of tasks) {
       for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
-        console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
-        results.push(await runColdPacketRuntime(opts, task, repeat, outDir));
+        coldJobs.push({ task, repeat });
+      }
+    }
+    const coldResults = await parallelMap(coldJobs, opts.jobs, async ({ task, repeat }) => {
+      console.log(`packet-runtime cold-cli ${task.repo} ${task.id} repeat ${repeat}/${opts.repeats}`);
+      return await runColdPacketRuntime(opts, task, repeat, outDir);
+    });
+    for (const result of coldResults) {
+      if (result) {
+        results.push(result);
       }
     }
   }
@@ -3552,10 +4621,19 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
 
   const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
-    console.error("--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.");
+    console.error(
+      "--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.",
+    );
     for (const blocker of blockers) {
-      const row = blocker.result;
-      console.error(`  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`);
+      console.error(formatPacketRuntimeBlocker(blocker));
+    }
+    process.exitCode = 1;
+  } else if (packetRuntimeQualityGateRequired(opts) && blockers.length) {
+    console.error(
+      "holdout-retrieval packet-runtime gate failed: every row must pass manifest quality thresholds. Use --allow-failures only for exploratory diagnostics.",
+    );
+    for (const blocker of blockers) {
+      console.error(formatPacketRuntimeBlocker(blocker));
     }
     process.exitCode = 1;
   }
@@ -3569,6 +4647,241 @@ function median(values) {
   }
   const middle = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function presentFiniteNumber(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sumFinite(values) {
+  return values.reduce((sum, value) => {
+    const number = presentFiniteNumber(value);
+    return number == null ? sum : sum + number;
+  }, 0);
+}
+
+function sumPresentFinite(values) {
+  let seen = false;
+  let sum = 0;
+  for (const value of values) {
+    const number = presentFiniteNumber(value);
+    if (number == null) {
+      continue;
+    }
+    seen = true;
+    sum += number;
+  }
+  return seen ? sum : null;
+}
+
+function sumCategories(rows, categories, accessor) {
+  const totals = Object.fromEntries(categories.map((category) => [category, 0]));
+  for (const row of rows) {
+    const values = accessor(row) ?? {};
+    for (const [category, value] of Object.entries(values)) {
+      const number = presentFiniteNumber(value);
+      if (number == null) {
+        continue;
+      }
+      totals[category] = (totals[category] ?? 0) + number;
+    }
+  }
+  return totals;
+}
+
+function resourceAccountingForResult(result) {
+  const analysis = result.transcript_analysis ?? {};
+  const usage = result.usage ?? {};
+  const wallMs = presentFiniteNumber(result.wall_ms);
+  const agentRunnerWallMs = presentFiniteNumber(result.agent_runner_wall_ms);
+  const baselineHarnessPreludeWallMs = presentFiniteNumber(result.baseline_harness_prelude?.wall_ms);
+  const codestoryHarnessPreludeWallMs = presentFiniteNumber(result.codestory_harness_prelude?.wall_ms);
+  const preparationWallMs = cachePreparationWallMs(
+    result.codestory_cache_provenance?.cache_preparation,
+  );
+  return {
+    measurement_source: "runner_process_wall_clock_codex_jsonl_and_harness_prelude",
+    status: result.status ?? null,
+    wall_ms: wallMs,
+    agent_runner_wall_ms: agentRunnerWallMs,
+    baseline_harness_prelude_wall_ms: baselineHarnessPreludeWallMs,
+    codestory_harness_prelude_wall_ms: codestoryHarnessPreludeWallMs,
+    codestory_cache_preparation_wall_ms: preparationWallMs,
+    all_in_wall_ms: wallMs == null ? null : wallMs + (preparationWallMs ?? 0),
+    usage: {
+      input_tokens: usage.input_tokens ?? null,
+      output_tokens: usage.output_tokens ?? null,
+      total_tokens: usage.total_tokens ?? null,
+      cached_input_tokens: usage.cached_input_tokens ?? null,
+      reasoning_tokens: usage.reasoning_tokens ?? null,
+    },
+    estimated_cost_usd: result.estimated_cost_usd ?? null,
+    tool_calls_observed: presentFiniteNumber(result.tool_calls_observed),
+    codex_tool_calls_observed: presentFiniteNumber(result.codex_tool_calls_observed),
+    tool_categories: analysis.tool_categories ?? {},
+    command_count: presentFiniteNumber(analysis.command_count),
+    command_categories: analysis.command_categories ?? {},
+    external_context_tool_calls: presentFiniteNumber(analysis.external_context_tool_calls) ?? 0,
+    direct_source_reads_total: presentFiniteNumber(analysis.direct_source_reads_total),
+    ordinary_source_reads_after_first_codestory:
+      presentFiniteNumber(analysis.ordinary_source_reads_after_first_codestory),
+    ordinary_source_reads_after_first_packet:
+      presentFiniteNumber(analysis.ordinary_source_reads_after_first_packet),
+  };
+}
+
+function summarizeArmCostAccounting(rows) {
+  const successful = rows.filter((row) => row.status === "pass");
+  const wallMs = sumFinite(rows.map((row) => row.wall_ms));
+  const agentRunnerWallMs = sumFinite(
+    rows.map((row) => row.agent_runner_wall_ms ?? row.wall_ms),
+  );
+  const baselineHarnessPreludeWallMs = sumFinite(
+    rows.map((row) => row.baseline_harness_prelude?.wall_ms),
+  );
+  const codestoryHarnessPreludeWallMs = sumFinite(
+    rows.map((row) => row.codestory_harness_prelude?.wall_ms),
+  );
+  const preparationWallMs = sumFinite(
+    rows.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
+  );
+  return {
+    runs: rows.length,
+    successful_runs: successful.length,
+    failed_runs: rows.filter((row) => row.status === "fail").length,
+    timeout_runs: rows.filter((row) => row.status === "timeout").length,
+    missing_token_usage_runs: rows.filter((row) => row.usage?.total_tokens == null).length,
+    time_spent_ms: {
+      runner_wall: wallMs,
+      agent_runner: agentRunnerWallMs,
+      baseline_harness_prelude: baselineHarnessPreludeWallMs,
+      codestory_harness_prelude: codestoryHarnessPreludeWallMs,
+      codestory_cache_preparation: preparationWallMs,
+      all_in: wallMs + preparationWallMs,
+    },
+    tokens_spent: {
+      input_tokens: sumPresentFinite(rows.map((row) => row.usage?.input_tokens)),
+      output_tokens: sumPresentFinite(rows.map((row) => row.usage?.output_tokens)),
+      total_tokens: sumPresentFinite(rows.map((row) => row.usage?.total_tokens)),
+      cached_input_tokens: sumPresentFinite(rows.map((row) => row.usage?.cached_input_tokens)),
+      reasoning_tokens: sumPresentFinite(rows.map((row) => row.usage?.reasoning_tokens)),
+    },
+    estimated_cost_usd: sumPresentFinite(rows.map((row) => row.estimated_cost_usd)),
+    tool_calls: {
+      observed: sumFinite(rows.map((row) => row.tool_calls_observed)),
+      codex_observed: sumFinite(rows.map((row) => row.codex_tool_calls_observed)),
+      categories: sumCategories(
+        rows,
+        TOOL_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.tool_categories,
+      ),
+    },
+    commands: {
+      observed: sumFinite(rows.map((row) => row.transcript_analysis?.command_count)),
+      categories: sumCategories(
+        rows,
+        COMMAND_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.command_categories,
+      ),
+    },
+    source_reads: {
+      direct_source_reads_total: sumFinite(
+        rows.map((row) => row.transcript_analysis?.direct_source_reads_total),
+      ),
+      ordinary_source_reads_after_first_codestory: sumFinite(
+        rows.map((row) => row.transcript_analysis?.ordinary_source_reads_after_first_codestory),
+      ),
+      ordinary_source_reads_after_first_packet: sumFinite(
+        rows.map((row) => row.transcript_analysis?.ordinary_source_reads_after_first_packet),
+      ),
+    },
+    external_context_tool_calls: sumFinite(
+      rows.map((row) => row.transcript_analysis?.external_context_tool_calls),
+    ),
+  };
+}
+
+function accountingComparison(withValue, withoutValue) {
+  const withNumber = presentFiniteNumber(withValue);
+  const withoutNumber = presentFiniteNumber(withoutValue);
+  return {
+    with_codestory: withNumber,
+    without_codestory: withoutNumber,
+    with_minus_without:
+      withNumber == null || withoutNumber == null ? null : withNumber - withoutNumber,
+    ratio:
+      withNumber == null || withoutNumber == null || withoutNumber <= 0
+        ? null
+        : withNumber / withoutNumber,
+  };
+}
+
+function summarizeCostAccounting(results) {
+  const byArm = new Map();
+  for (const row of results) {
+    if (!byArm.has(row.arm)) {
+      byArm.set(row.arm, []);
+    }
+    byArm.get(row.arm).push(row);
+  }
+
+  const arms = {};
+  for (const [arm, rows] of byArm.entries()) {
+    arms[arm] = summarizeArmCostAccounting(rows);
+  }
+
+  const withCodeStory = arms.with_codestory ?? null;
+  const withoutCodeStory = arms.without_codestory ?? null;
+  const withVsWithout =
+    withCodeStory && withoutCodeStory
+      ? {
+          runner_wall_ms: accountingComparison(
+            withCodeStory.time_spent_ms.runner_wall,
+            withoutCodeStory.time_spent_ms.runner_wall,
+          ),
+          all_in_wall_ms: accountingComparison(
+            withCodeStory.time_spent_ms.all_in,
+            withoutCodeStory.time_spent_ms.all_in,
+          ),
+          total_tokens: accountingComparison(
+            withCodeStory.tokens_spent.total_tokens,
+            withoutCodeStory.tokens_spent.total_tokens,
+          ),
+          input_tokens: accountingComparison(
+            withCodeStory.tokens_spent.input_tokens,
+            withoutCodeStory.tokens_spent.input_tokens,
+          ),
+          output_tokens: accountingComparison(
+            withCodeStory.tokens_spent.output_tokens,
+            withoutCodeStory.tokens_spent.output_tokens,
+          ),
+          tool_calls: accountingComparison(
+            withCodeStory.tool_calls.observed,
+            withoutCodeStory.tool_calls.observed,
+          ),
+          commands: accountingComparison(
+            withCodeStory.commands.observed,
+            withoutCodeStory.commands.observed,
+          ),
+          estimated_cost_usd: accountingComparison(
+            withCodeStory.estimated_cost_usd,
+            withoutCodeStory.estimated_cost_usd,
+          ),
+        }
+      : null;
+
+  return {
+    measurement_source: "runner_process_wall_clock_codex_jsonl_and_harness_prelude",
+    note:
+      "Token values are parsed from Codex JSONL stdout. Tool-call and command totals include harness-run baseline and CodeStory preludes when present. Wall time includes the agent runner plus any harness prelude. CodeStory cache preparation is tracked separately and included in all-in wall time.",
+    generated_at: new Date().toISOString(),
+    arms,
+    with_vs_without: withVsWithout,
+  };
 }
 
 function summarizeRuns(results) {
@@ -3587,19 +4900,25 @@ function summarizeRuns(results) {
     const successful = rows.filter((row) => row.status === "pass");
     const qualityRows = successful.filter((row) => row.quality);
     const packetFirstRows = successful.filter((row) => row.packet_first_required);
+    const packetManifestRows = successful.filter(
+      (row) => row.codestory_harness_prelude?.packet_manifest_quality,
+    );
     const categoryMedians = {};
-    for (const category of [
-      "codestory_cli",
-      "shell_search",
-      "direct_file_read",
-      "git",
-      "build_test",
-      "other",
-    ]) {
+    for (const category of COMMAND_ACCOUNTING_CATEGORIES) {
       categoryMedians[category] = median(
         successful.map((row) => row.transcript_analysis?.command_categories?.[category] ?? 0),
       );
     }
+    const toolCategoryMedians = {};
+    for (const category of TOOL_ACCOUNTING_CATEGORIES) {
+      toolCategoryMedians[category] = median(
+        successful.map((row) => row.transcript_analysis?.tool_categories?.[category] ?? 0),
+      );
+    }
+    const totalCodestoryCachePreparationWallMs = sumFinite(
+      successful.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
+    );
+    const totalWallMs = sumFinite(successful.map((row) => row.wall_ms));
     summaries.push({
       repo,
       task_id: taskId || null,
@@ -3610,14 +4929,48 @@ function summarizeRuns(results) {
       successful_runs: successful.length,
       packet_first_pass_runs: packetFirstRows.filter((row) => row.packet_first_pass).length,
       packet_first_required_runs: packetFirstRows.length,
+      packet_manifest_quality_pass_runs: packetManifestRows.filter(
+        (row) => row.codestory_harness_prelude?.packet_manifest_quality?.pass,
+      ).length,
+      packet_manifest_quality_scored_runs: packetManifestRows.length,
+      packet_partial_runs: successful.filter(
+        (row) => row.codestory_harness_prelude?.packet_sufficiency_status === "partial",
+      ).length,
       quality_scored_runs: qualityRows.length,
       quality_pass_runs: qualityRows.filter((row) => row.quality?.pass).length,
+      total_wall_ms: totalWallMs,
+      total_codestory_cache_preparation_wall_ms: totalCodestoryCachePreparationWallMs,
+      total_wall_ms_including_codestory_preparation:
+        totalWallMs + totalCodestoryCachePreparationWallMs,
+      total_input_tokens: sumPresentFinite(successful.map((row) => row.usage?.input_tokens)),
+      total_output_tokens: sumPresentFinite(successful.map((row) => row.usage?.output_tokens)),
+      total_tokens: sumPresentFinite(successful.map((row) => row.usage?.total_tokens)),
+      total_estimated_cost_usd: sumPresentFinite(successful.map((row) => row.estimated_cost_usd)),
+      total_tool_calls_observed: sumFinite(successful.map((row) => row.tool_calls_observed)),
+      total_command_count: sumFinite(successful.map((row) => row.transcript_analysis?.command_count)),
+      total_web_search_tool_calls: sumFinite(
+        successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
+      ),
+      total_direct_source_reads_total: sumFinite(
+        successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
+      ),
+      missing_token_usage_runs: successful.filter((row) => row.usage?.total_tokens == null).length,
       median_wall_ms: median(successful.map((row) => row.wall_ms)),
-      median_total_tokens: median(successful.map((row) => row.usage.total_tokens)),
-      median_input_tokens: median(successful.map((row) => row.usage.input_tokens)),
-      median_output_tokens: median(successful.map((row) => row.usage.output_tokens)),
+      median_codestory_cache_preparation_wall_ms: median(
+        successful.map((row) => cachePreparationWallMs(row.codestory_cache_provenance?.cache_preparation)),
+      ),
+      median_codestory_retrieval_index_wall_ms: median(
+        successful.map((row) => row.codestory_cache_provenance?.cache_preparation?.retrieval_index_wall_ms),
+      ),
+      median_total_tokens: median(successful.map((row) => row.usage?.total_tokens)),
+      median_input_tokens: median(successful.map((row) => row.usage?.input_tokens)),
+      median_output_tokens: median(successful.map((row) => row.usage?.output_tokens)),
       median_estimated_cost_usd: median(successful.map((row) => row.estimated_cost_usd)),
+      median_command_count: median(successful.map((row) => row.transcript_analysis?.command_count)),
       median_tool_calls_observed: median(successful.map((row) => row.tool_calls_observed)),
+      median_web_search_tool_calls: median(
+        successful.map((row) => row.transcript_analysis?.tool_categories?.web_search ?? 0),
+      ),
       median_direct_source_reads_total: median(
         successful.map((row) => row.transcript_analysis?.direct_source_reads_total),
       ),
@@ -3646,9 +4999,35 @@ function summarizeRuns(results) {
         qualityRows.map((row) => usefulAnchorHitsPer10kContextChars(row)),
       ),
       median_command_categories: categoryMedians,
+      median_tool_categories: toolCategoryMedians,
+      total_command_categories: sumCategories(
+        successful,
+        COMMAND_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.command_categories,
+      ),
+      total_tool_categories: sumCategories(
+        successful,
+        TOOL_ACCOUNTING_CATEGORIES,
+        (row) => row.transcript_analysis?.tool_categories,
+      ),
     });
   }
   return summaries;
+}
+
+function cachePreparationWallMs(preparation) {
+  if (!preparation) {
+    return null;
+  }
+  if (Number.isFinite(preparation.preparation_wall_ms)) {
+    return preparation.preparation_wall_ms;
+  }
+  const indexMs = Number.isFinite(preparation.index_wall_ms) ? preparation.index_wall_ms : 0;
+  const retrievalIndexMs = Number.isFinite(preparation.retrieval_index_wall_ms)
+    ? preparation.retrieval_index_wall_ms
+    : 0;
+  const fallback = indexMs + retrievalIndexMs;
+  return fallback > 0 ? fallback : null;
 }
 
 function repositoryContextOutputChars(analysis) {
@@ -3671,7 +5050,7 @@ function usefulAnchorHitsPer10kContextChars(row) {
 }
 
 function agentPublishableBlockers(results, opts = {}) {
-  const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket ?? 0;
+  const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket;
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
   return results
     .map((result) => {
@@ -3679,8 +5058,30 @@ function agentPublishableBlockers(results, opts = {}) {
       if (result.status !== "pass") {
         reasons.push(`status=${result.status}`);
       }
+      if (presentFiniteNumber(result.wall_ms) == null) {
+        reasons.push("missing wall time");
+      }
       if (result.usage?.total_tokens == null) {
         reasons.push("missing total token usage");
+      }
+      if (presentFiniteNumber(result.tool_calls_observed) == null) {
+        reasons.push("missing tool call count");
+      }
+      if (presentFiniteNumber(result.transcript_analysis?.command_count) == null) {
+        reasons.push("missing command count");
+      }
+      if (
+        result.arm === "without_codestory" &&
+        (result.transcript_analysis?.command_categories?.codestory_cli ?? 0) > 0
+      ) {
+        reasons.push("without_codestory arm used CodeStory");
+      }
+      if (
+        result.arm === "without_codestory" &&
+        result.task_id &&
+        (presentFiniteNumber(result.transcript_analysis?.command_count) ?? 0) <= 0
+      ) {
+        reasons.push("without_codestory arm did not inspect local repository");
       }
       if (result.packet_first_required && !result.packet_first_pass) {
         reasons.push("missing answer packet as first successful context command");
@@ -3694,6 +5095,7 @@ function agentPublishableBlockers(results, opts = {}) {
       const readsAfterPacket = result.transcript_analysis?.ordinary_source_reads_after_first_packet;
       if (
         result.packet_first_required &&
+        maxSourceReadsAfterPacket != null &&
         readsAfterPacket != null &&
         readsAfterPacket > maxSourceReadsAfterPacket
       ) {
@@ -3701,6 +5103,10 @@ function agentPublishableBlockers(results, opts = {}) {
       }
       if (enforceRepoProvenance) {
         reasons.push(...repoProvenanceBlockers(result));
+      }
+      const externalContextCalls = result.transcript_analysis?.external_context_tool_calls ?? 0;
+      if (externalContextCalls > 0) {
+        reasons.push(`external web/search tool calls=${externalContextCalls} > 0`);
       }
       if (result.arm === "with_codestory" && (opts.publishable || opts.enforceCacheProvenance)) {
         reasons.push(...cacheProvenanceBlockers(result));
@@ -3710,7 +5116,7 @@ function agentPublishableBlockers(results, opts = {}) {
     .filter(Boolean);
 }
 
-function markdownSummary(summary, opts) {
+function markdownSummary(summary, opts, costAccounting = null) {
   const lines = [
     "# CodeStory Agent A/B Benchmark",
     "",
@@ -3719,9 +5125,16 @@ function markdownSummary(summary, opts) {
     `Sandbox: \`${opts.sandbox}\``,
     `Host: \`${os.hostname()}\``,
     "",
-    "| Repo | Task | Arm | Runs | Success | Packet first | Quality pass | Median wall ms | Median tokens | Median cost USD | Median tool calls | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
+  if (costAccounting) {
+    lines.push(...markdownCostAccounting(costAccounting), "");
+  }
+  lines.push(
+    "## Per-task Summary",
+    "",
+    "| Repo | Task | Arm | Runs | Success | Packet first | Packet manifest | Quality pass | Median wall ms | CodeStory prep ms | Retrieval index ms | Median tokens | Median cost USD | Median tool calls | Web searches | Median commands | CodeStory cmds | Shell searches | File-read cmds | Source reads | After CodeStory | After Packet | File recall | Citation coverage | Context chars | Useful anchors / 10k context chars |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  );
   for (const row of summary) {
     lines.push(markdownSummaryRow(row));
   }
@@ -3734,6 +5147,38 @@ function markdownSummary(summary, opts) {
   return lines.join("\n");
 }
 
+function markdownCostAccounting(costAccounting) {
+  const lines = [
+    "## Cost Accounting",
+    "",
+    "| Arm | Runs | Success | Wall ms | Agent runner ms | Baseline prelude ms | CodeStory prelude ms | All-in wall ms | Input tokens | Output tokens | Total tokens | Tool calls | Codex tool calls | Commands | Web searches | Source reads | Est. cost USD |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  ];
+  for (const [arm, row] of Object.entries(costAccounting.arms ?? {})) {
+    lines.push(
+      `| ${arm} | ${row.runs} | ${row.successful_runs} | ${formatValue(row.time_spent_ms?.runner_wall)} | ${formatValue(row.time_spent_ms?.agent_runner)} | ${formatValue(row.time_spent_ms?.baseline_harness_prelude)} | ${formatValue(row.time_spent_ms?.codestory_harness_prelude)} | ${formatValue(row.time_spent_ms?.all_in)} | ${formatValue(row.tokens_spent?.input_tokens)} | ${formatValue(row.tokens_spent?.output_tokens)} | ${formatValue(row.tokens_spent?.total_tokens)} | ${formatValue(row.tool_calls?.observed)} | ${formatValue(row.tool_calls?.codex_observed)} | ${formatValue(row.commands?.observed)} | ${formatValue(row.tool_calls?.categories?.web_search)} | ${formatValue(row.source_reads?.direct_source_reads_total)} | ${formatValue(row.estimated_cost_usd)} |`,
+    );
+  }
+  const comparison = costAccounting.with_vs_without;
+  if (comparison) {
+    lines.push(
+      "",
+      "| Comparison | With | Without | Delta | Ratio |",
+      "| --- | ---: | ---: | ---: | ---: |",
+    );
+    for (const [label, values] of Object.entries(comparison)) {
+      lines.push(
+        `| ${label} | ${formatValue(values.with_codestory)} | ${formatValue(values.without_codestory)} | ${formatValue(values.with_minus_without)} | ${formatValue(values.ratio)} |`,
+      );
+    }
+  }
+  lines.push(
+    "",
+    "Accounting source: wall time includes the agent runner and any harness-run baseline or CodeStory prelude; tokens are parsed from Codex JSONL stdout; tool-call and command totals include harness preludes when present; CodeStory cache preparation is tracked separately and included in all-in wall time.",
+  );
+  return lines;
+}
+
 function markdownSummaryRow(row) {
   const cells = [
     row.repo,
@@ -3742,11 +5187,19 @@ function markdownSummaryRow(row) {
     row.runs,
     row.successful_runs,
     packetFirstLabel(row),
+    packetManifestLabel(row),
     qualityPassLabel(row),
     formatValue(row.median_wall_ms),
+    formatValue(row.median_codestory_cache_preparation_wall_ms),
+    formatValue(row.median_codestory_retrieval_index_wall_ms),
     formatValue(row.median_total_tokens),
     formatValue(row.median_estimated_cost_usd),
     formatValue(row.median_tool_calls_observed),
+    formatValue(row.median_web_search_tool_calls),
+    formatValue(row.median_command_count),
+    formatValue(row.median_command_categories?.codestory_cli),
+    formatValue(row.median_command_categories?.shell_search),
+    formatValue(row.median_command_categories?.direct_file_read),
     formatValue(row.median_direct_source_reads_total),
     formatValue(row.median_source_reads_after_codestory),
     formatValue(row.median_source_reads_after_packet),
@@ -3770,6 +5223,14 @@ function packetFirstLabel(row) {
     return "";
   }
   return `${row.packet_first_pass_runs}/${row.packet_first_required_runs}`;
+}
+
+function packetManifestLabel(row) {
+  if (!row.packet_manifest_quality_scored_runs) {
+    return "";
+  }
+  const partialSuffix = row.packet_partial_runs ? `; partial ${row.packet_partial_runs}` : "";
+  return `${row.packet_manifest_quality_pass_runs}/${row.packet_manifest_quality_scored_runs}${partialSuffix}`;
 }
 
 function formatValue(value) {
@@ -3903,6 +5364,15 @@ function runSelfTest() {
     }),
     [null, false, true, "fail"],
   );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }), true);
+  assert.equal(
+    packetRuntimeQualityGateRequired({
+      taskSuite: "holdout-retrieval",
+      allowFailures: true,
+    }),
+    false,
+  );
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
   assert.equal(
     cachePreparationAction({
       status: "pass",
@@ -3920,6 +5390,29 @@ function runSelfTest() {
       semantic_ready: true,
     }),
     "already-ready",
+  );
+
+  const plannedAgentRuns = planAgentRuns(
+    { arms: ["without_codestory", "with_codestory"], repeats: 1, repos: null },
+    [
+      { id: "task-a", repo: "repo-a" },
+      { id: "task-b", repo: "repo-b" },
+      { id: "task-c", repo: "repo-a" },
+    ],
+  );
+  const plannedGroups = groupPlannedAgentRuns(plannedAgentRuns);
+  assert.deepEqual(
+    plannedGroups.map((group) => group.key),
+    ["repo-a", "repo-b"],
+  );
+  assert.deepEqual(
+    plannedGroups[0].runs.map((run) => `${run.task.id}:${run.arm}`),
+    [
+      "task-a:without_codestory",
+      "task-a:with_codestory",
+      "task-c:without_codestory",
+      "task-c:with_codestory",
+    ],
   );
 
   console.log("self-test passed");
@@ -3945,6 +5438,163 @@ function planAgentRuns(opts, tasks) {
     }
   }
   return plannedRuns;
+}
+
+function agentRunKey(run) {
+  const taskId = run.task?.id ?? run.task_id ?? "";
+  return [run.repo, taskId, run.arm, String(run.repeat)].join("\t");
+}
+
+function agentRunIsolationGroupKey(run) {
+  return run.repo;
+}
+
+function groupPlannedAgentRuns(plannedRuns) {
+  const groupsByKey = new Map();
+  for (const run of plannedRuns) {
+    const key = agentRunIsolationGroupKey(run);
+    if (!groupsByKey.has(key)) {
+      groupsByKey.set(key, { key, runs: [] });
+    }
+    groupsByKey.get(key).runs.push(run);
+  }
+  return [...groupsByKey.values()];
+}
+
+function taskSnapshotMatches(currentTask, candidate) {
+  const current = taskSnapshotForResult(currentTask);
+  const previous = candidate?.task_manifest_snapshot ?? null;
+  return JSON.stringify(current ?? null) === JSON.stringify(previous ?? null);
+}
+
+function resolveRunArtifactPath(runDir, artifactPath) {
+  if (!artifactPath) {
+    return null;
+  }
+  return path.isAbsolute(artifactPath) ? artifactPath : path.resolve(runDir, artifactPath);
+}
+
+async function copyResultArtifact(runDir, outDir, artifactPath, nextName) {
+  const source = resolveRunArtifactPath(runDir, artifactPath);
+  if (!source || !existsSync(source)) {
+    return artifactPath ?? null;
+  }
+  const destination = path.join(outDir, nextName);
+  await copyFile(source, destination);
+  return destination;
+}
+
+async function copyReusableBaselineArtifacts(row, sourceRunDir, outDir, runId) {
+  const copied = {
+    ...row,
+    stdout_path: await copyResultArtifact(sourceRunDir, outDir, row.stdout_path, `${runId}.stdout.jsonl`),
+    stderr_path: await copyResultArtifact(sourceRunDir, outDir, row.stderr_path, `${runId}.stderr.txt`),
+  };
+  if (copied.baseline_harness_prelude?.context_path) {
+    copied.baseline_harness_prelude = {
+      ...copied.baseline_harness_prelude,
+      context_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        copied.baseline_harness_prelude.context_path,
+        `${runId}.baseline-context.json`,
+      ),
+      stderr_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        copied.baseline_harness_prelude.stderr_path,
+        `${runId}.baseline-context.stderr.txt`,
+      ),
+    };
+  }
+  return copied;
+}
+
+async function loadReusableBaselines(opts, plannedRuns, outDir) {
+  if (!opts.reuseBaselineFrom) {
+    return new Map();
+  }
+  const sourceRunDir = path.resolve(opts.reuseBaselineFrom);
+  const runsPath = path.join(sourceRunDir, "runs.jsonl");
+  if (!existsSync(runsPath)) {
+    throw new Error(`--reuse-baseline-from must contain runs.jsonl: ${sourceRunDir}`);
+  }
+  const wanted = new Map(
+    plannedRuns
+      .filter((run) => run.arm === "without_codestory")
+      .map((run) => [agentRunKey(run), run]),
+  );
+  if (!wanted.size) {
+    return new Map();
+  }
+
+  const rows = (await readFile(runsPath, "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const taskCache = new Map();
+  const reusable = new Map();
+  for (const row of rows) {
+    if (row.arm !== "without_codestory") {
+      continue;
+    }
+    const key = agentRunKey(row);
+    const planned = wanted.get(key);
+    if (!planned || !taskSnapshotMatches(planned.task, row)) {
+      continue;
+    }
+    const reanalyzed = await recomputeRunAnalysis(row, opts, sourceRunDir, taskCache);
+    const runId = benchmarkRunId([
+      planned.repo,
+      ...(planned.task ? [planned.task.id] : []),
+      planned.arm,
+      String(planned.repeat).padStart(2, "0"),
+    ]);
+    const copied = await copyReusableBaselineArtifacts(reanalyzed, sourceRunDir, outDir, runId);
+    reusable.set(key, {
+      ...copied,
+      reused_from: sourceRunDir,
+      reused_at: new Date().toISOString(),
+      resource_accounting: resourceAccountingForResult(copied),
+    });
+  }
+  return reusable;
+}
+
+async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
+  const reusable = reusableBaselines.get(agentRunKey(run));
+  if (reusable) {
+    console.log(`reusing ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats} from ${opts.reuseBaselineFrom}`);
+    return reusable;
+  }
+  console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
+  return await runOne(opts, run, outDir);
+}
+
+async function runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir) {
+  const runsPath = path.join(outDir, "runs.jsonl");
+  if (opts.jobs <= 1 || plannedRuns.length <= 1) {
+    const results = [];
+    for (const run of plannedRuns) {
+      results.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
+      await writeJsonlRows(runsPath, results);
+    }
+    return results;
+  }
+
+  const groups = groupPlannedAgentRuns(plannedRuns);
+  console.log(`running ${plannedRuns.length} planned agent rows across ${groups.length} repo groups with --jobs ${opts.jobs}`);
+  const groupedResults = await parallelMap(groups, opts.jobs, async (group) => {
+    const rows = [];
+    for (const run of group.runs) {
+      rows.push(await runPlannedAgentRun(opts, run, outDir, reusableBaselines));
+    }
+    return rows;
+  });
+  const results = groupedResults.flat();
+  await writeJsonlRows(runsPath, results);
+  return results;
 }
 
 async function main() {
@@ -3999,6 +5649,7 @@ async function main() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
+  const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
   const cachePreparation = opts.prepareCodestoryCache
     ? await prepareCodeStoryCaches(opts, tasks)
     : [];
@@ -4011,15 +5662,10 @@ async function main() {
     );
   }
 
-  const results = [];
-  for (const run of plannedRuns) {
-    console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
-    const result = await runOne(opts, run, outDir);
-    results.push(result);
-    await writeJsonlRows(path.join(outDir, "runs.jsonl"), results);
-  }
+  const results = await runPlannedAgentRuns(opts, plannedRuns, reusableBaselines, outDir);
 
   const summary = summarizeRuns(results);
+  const costAccounting = summarizeCostAccounting(results);
   const summaryPayload = {
     generated_at: new Date().toISOString(),
     runner: opts.runner,
@@ -4040,6 +5686,8 @@ async function main() {
     repeats: opts.repeats,
     publishable: opts.publishable,
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
+    reuse_baseline_from: opts.reuseBaselineFrom,
+    reused_baseline_runs: results.filter((row) => row.reused_from).length,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
@@ -4047,9 +5695,10 @@ async function main() {
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
     summary,
+    cost_accounting: costAccounting,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
-  await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts), "utf8");
+  await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
 
   const failedRuns = results.filter((result) => result.status !== "pass");
   let exitCode = 0;
@@ -4063,13 +5712,13 @@ async function main() {
 
   if (opts.publishable) {
     const blockers = agentPublishableBlockers(results, opts);
-      if (blockers.length) {
-        console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
-        for (const blocker of blockers) {
-          console.error(formatAgentPublishableBlocker(blocker));
-        }
-        exitCode = 1;
+    if (blockers.length) {
+      console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
+      for (const blocker of blockers) {
+        console.error(formatAgentPublishableBlocker(blocker));
       }
+      exitCode = 1;
+    }
   }
 
   console.log(`wrote ${outDir}`);
@@ -4095,8 +5744,14 @@ export {
   parseArgs,
   parseJsonLines,
   packetComposition,
+  packetCommandArgs,
+  packetForAgentPrompt,
+  packetManifestExtraProbes,
+  packetManifestQualitySummary,
+  packetPreludeManifestComplete,
   packetLatencyTelemetry,
   packetRuntimePublishableBlockers,
+  packetRuntimeQualityGateRequired,
   PACKET_COMPOSITION_WEIGHTS,
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
@@ -4105,6 +5760,7 @@ export {
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,
+  summarizeCostAccounting,
   summarizePacketRuntimeRuns,
   taskSnapshotForResult,
 };

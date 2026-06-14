@@ -39,6 +39,7 @@ impl RustSemanticResolver {
         let Some(symbol) = namespace_tail(alias_target(target), "::") else {
             return Ok(Vec::new());
         };
+        let symbol = symbol.trim_end_matches(" (import)").trim();
 
         let kinds = [
             NodeKind::MODULE as i32,

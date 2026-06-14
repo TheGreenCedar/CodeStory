@@ -1026,7 +1026,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "string",
                 "packet outputSchema should expose a stable packet id: {tool}"
             );
-            for field in ["plan", "answer", "budget", "sufficiency", "benchmark_trace"] {
+            for field in [
+                "plan",
+                "answer",
+                "budget",
+                "sufficiency",
+                "retrieval_trace_summary",
+            ] {
                 assert!(
                     required_fields(output_schema).contains(field),
                     "packet outputSchema should require {field}: {tool}"
@@ -1359,6 +1365,21 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should include semantic readiness/doc count/fallback information: {status}"
     );
     let next_call_text = status["recommended_next_calls"].to_string();
+    let readiness = status["readiness"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status should include readiness verdicts: {status}"));
+    assert!(
+        readiness
+            .iter()
+            .any(|verdict| verdict["goal"] == "agent_packet_search"
+                && verdict["minimum_next"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty())
+                && verdict["full_repair"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty())),
+        "status should expose agent readiness with minimum_next/full_repair: {status}"
+    );
     assert!(
         next_call_text
             .find("retrieval status")
@@ -1665,6 +1686,18 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include next_commands: {response}"));
     assert!(
+        details["minimum_next"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "stdio search error should include minimum_next: {response}"
+    );
+    assert!(
+        details["full_repair"]
+            .as_array()
+            .is_some_and(|commands| commands.len() >= next_commands.len()),
+        "stdio search error should include full_repair: {response}"
+    );
+    assert!(
         next_commands
             .iter()
             .any(|command| command.as_str().is_some_and(|text| text
@@ -1854,10 +1887,10 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
     );
     assert!(
         packet
-            .pointer("/benchmark_trace/source_read_steps")
+            .pointer("/retrieval_trace_summary/source_read_steps")
             .and_then(Value::as_u64)
             .is_some(),
-        "stdio packet should include benchmark trace counters: {packet}"
+        "stdio packet should include retrieval trace summary counters: {packet}"
     );
 
     let repeated_response = send_json(

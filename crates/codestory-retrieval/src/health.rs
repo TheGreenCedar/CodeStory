@@ -254,61 +254,79 @@ pub fn probe_sidecar_health(
         capabilities: zoekt_capabilities,
     };
 
-    let collection = manifest.qdrant_collection.clone();
-    let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);
-    let expected_qdrant_points = manifest
-        .projection_count
-        .and_then(|count| u64::try_from(count).ok());
-    let qdrant_point_count_incomplete =
-        qdrant_point_count_incomplete(&qdrant_probe, expected_qdrant_points);
-    let product_embedding_backend =
-        manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref());
     let current_embedding_backend = crate::embeddings::embedding_runtime_id();
-    let current_product_embedding_backend =
-        manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
-    let qdrant_capabilities = qdrant_capabilities(
-        layout,
-        &collection,
-        &qdrant_probe,
-        expected_qdrant_points,
-        product_embedding_backend,
-        current_product_embedding_backend,
-    );
-    let qdrant_semantic_stub =
-        qdrant_probe.reachable && qdrant_probe.collection_exists && !qdrant_capabilities.semantic;
-    let qdrant = ComponentHealth {
-        name: "qdrant".into(),
-        status: if !qdrant_probe.reachable {
-            ComponentStatus::Unavailable
-        } else if !qdrant_probe.collection_exists || qdrant_semantic_stub {
-            ComponentStatus::Degraded
-        } else if qdrant_probe.latency_ms <= QDRANT_HEALTH_BUDGET.as_millis() as u64 {
-            ComponentStatus::Healthy
-        } else {
-            ComponentStatus::Degraded
-        },
-        latency_ms: Some(qdrant_probe.latency_ms),
-        detail: qdrant_probe.detail,
-        degraded_reason: if !qdrant_probe.reachable {
-            Some("qdrant_unreachable".into())
-        } else if !qdrant_probe.collection_exists {
-            Some("qdrant_collection_missing".into())
-        } else if qdrant_point_count_incomplete {
-            Some("qdrant_point_count_incomplete".into())
-        } else if !product_embedding_backend {
-            Some("qdrant_non_product_embedding_backend".into())
-        } else if !current_product_embedding_backend {
-            Some("qdrant_current_embedding_backend_not_product".into())
-        } else if qdrant_semantic_stub {
-            Some(if qdrant_semantic_vectors_enabled() {
-                "qdrant_semantic_smoke_failed".into()
+    let dense_anchor_count = manifest
+        .dense_projection_count
+        .or(manifest.projection_count)
+        .unwrap_or(0);
+    let qdrant = if dense_anchor_count == 0 {
+        ComponentHealth {
+            name: "qdrant".into(),
+            status: ComponentStatus::Healthy,
+            latency_ms: None,
+            detail: "graph_first_v1 selected zero dense anchors; qdrant not required".into(),
+            degraded_reason: None,
+            capabilities: SidecarCapabilities {
+                lexical: false,
+                semantic: true,
+                graph: false,
+            },
+        }
+    } else {
+        let collection = manifest.qdrant_collection.clone();
+        let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);
+        let expected_qdrant_points = Some(u64::try_from(dense_anchor_count).unwrap_or(u64::MAX));
+        let qdrant_point_count_incomplete =
+            qdrant_point_count_incomplete(&qdrant_probe, expected_qdrant_points);
+        let product_embedding_backend =
+            manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref());
+        let current_product_embedding_backend =
+            manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
+        let qdrant_capabilities = qdrant_capabilities(
+            layout,
+            &collection,
+            &qdrant_probe,
+            expected_qdrant_points,
+            product_embedding_backend,
+            current_product_embedding_backend,
+        );
+        let qdrant_semantic_stub = qdrant_probe.reachable
+            && qdrant_probe.collection_exists
+            && !qdrant_capabilities.semantic;
+        ComponentHealth {
+            name: "qdrant".into(),
+            status: if !qdrant_probe.reachable {
+                ComponentStatus::Unavailable
+            } else if !qdrant_probe.collection_exists || qdrant_semantic_stub {
+                ComponentStatus::Degraded
+            } else if qdrant_probe.latency_ms <= QDRANT_HEALTH_BUDGET.as_millis() as u64 {
+                ComponentStatus::Healthy
             } else {
-                "qdrant_hash_vectors_only".into()
-            })
-        } else {
-            None
-        },
-        capabilities: qdrant_capabilities,
+                ComponentStatus::Degraded
+            },
+            latency_ms: Some(qdrant_probe.latency_ms),
+            detail: qdrant_probe.detail,
+            degraded_reason: if !qdrant_probe.reachable {
+                Some("qdrant_unreachable".into())
+            } else if !qdrant_probe.collection_exists {
+                Some("qdrant_collection_missing".into())
+            } else if qdrant_point_count_incomplete {
+                Some("qdrant_point_count_incomplete".into())
+            } else if !product_embedding_backend {
+                Some("qdrant_non_product_embedding_backend".into())
+            } else if !current_product_embedding_backend {
+                Some("qdrant_current_embedding_backend_not_product".into())
+            } else if qdrant_semantic_stub {
+                Some(if qdrant_semantic_vectors_enabled() {
+                    "qdrant_semantic_smoke_failed".into()
+                } else {
+                    "qdrant_hash_vectors_only".into()
+                })
+            } else {
+                None
+            },
+            capabilities: qdrant_capabilities,
+        }
     };
 
     let scip_project_dir = layout.scip_project_dir(sidecar_generation);
@@ -384,6 +402,11 @@ mod tests {
             sidecar_input_hash: None,
             sidecar_generation: None,
             projection_count: None,
+            symbol_doc_count: None,
+            dense_projection_count: None,
+            semantic_policy_version: None,
+            graph_artifact_hash: None,
+            dense_reason_counts_json: None,
         };
 
         let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
