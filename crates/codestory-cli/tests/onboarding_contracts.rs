@@ -165,15 +165,13 @@ fn cli_package_metadata_is_adoption_ready() {
 fn readme_keeps_customer_first_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
-    assert!(readme.contains("Why CodeStory"));
     assert!(readme.contains("How it works"));
     assert!(readme.contains("Try it"));
     assert!(readme.contains("Local codebase grounding for coding agents"));
     assert!(readme.contains("Install as an agent skill"));
-    assert!(readme.contains("Command cheat sheet"));
-    assert!(readme.contains("Your code stays on your machine"));
+    assert!(readme.contains("## Commands"));
     assert!(readme.contains("retrieval_mode=full"));
-    assert!(readme.contains("Optional sidecar indexes"));
+    assert!(readme.contains("retrieval index"));
     assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
@@ -184,10 +182,8 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains("docs/contributors/getting-started.md"));
     assert!(
         readme.find("Try it").expect("quickstart section")
-            < readme
-                .find("Languages, evidence, contributing")
-                .expect("reference section"),
-        "README should show the usable path before benchmark evidence"
+            < readme.find("## Docs").expect("reference section"),
+        "README should show the usable path before doc links"
     );
 
     for path in [

@@ -10,60 +10,46 @@ Local codebase grounding for coding agents.
 <a href="docs/testing/benchmark-ledger.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
-## Why CodeStory
+CodeStory indexes a git workspace into a local SQLite graph: files, symbols, call
+and import edges, and source snippets. You query that graph through a CLI (or
+`serve --stdio`) instead of having an agent grep the tree blind.
 
-Agents fail on real repos the same way humans do when they are new: they open the
-wrong files, chase a plausible name, and call it done. CodeStory indexes the
-repository first — who calls whom, where symbols live, the actual source — so
-the next step is evidence, not guesswork.
-
-It runs locally. Your code stays on your machine.
+Everything stays on disk under your user cache unless you opt into managed
+embedding assets. Packet and full search need local sidecars (Zoekt, Qdrant,
+SCIP, llama.cpp); browsing with `ground`, `trail`, and `snippet` does not.
 
 ## How it works
 
-**1. Index the repo.** CodeStory walks your tree (honoring normal ignore rules),
-parses supported languages into symbols and edges — calls, imports, overrides —
-and stores snippets plus a searchable graph in a per-project SQLite cache. One
-full `index` up front; incremental refresh after edits.
+Run `index` once per repo. The indexer parses supported languages with
+tree-sitter, resolves what it can, and writes nodes, edges, occurrences, and
+symbol search docs into a per-project database.
 
-**2. Find a foothold.** Ask where something lives: a handler name, a route, a
-type, a string literal. `ground` summarizes a repo you have never seen; `search`
-returns ranked candidates with file paths and graph ids.
+From there:
 
-**3. Follow the graph.** Pick one symbol. `trail` shows callers and callees;
-`snippet` returns the surrounding source. You are walking relationships in the
-index, not grepping random directories.
+- `ground` — repo summary and gaps
+- `search` — candidates by symbol name, path, literal, or behavior term
+- `trail` — callers, callees, references for one node id
+- `snippet` — source lines around a node
+- `context` — bundled evidence for one target
+- `packet` — wide task question with citations (requires `retrieval_mode=full`)
 
-**4. Answer with proof.** `context` bundles trails, neighbors, and citations
-around one target. For broad questions ("how does indexing persist state?"),
-`packet` assembles a bounded evidence packet — but only when sidecar retrieval
-is fully healthy (`retrieval_mode=full`).
-
-**Embeddings are optional, not step one.** Most symbols are found through the
-graph and lexical symbol docs. A separate `retrieval index` pass builds Zoekt,
-Qdrant, and SCIP sidecars and embeds only policy-selected anchors (entry
-points, public APIs, high-centrality nodes) when you need agent-grade
-`packet`/`search`. Details: [docs/usage.md](docs/usage.md),
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
+Vectors are not built for every symbol. The graph and lexical symbol docs handle
+most lookup. Run `retrieval index` when you want sidecar-backed `packet`/`search`;
+that pass embeds a policy-selected set of anchors only.
 
 ```mermaid
 flowchart LR
-    files[Source files] --> index[Parse into symbols and edges]
-    index --> graph[(Local graph and snippets)]
-    question[Question or symbol] --> graph
-    graph --> match[Matching files and symbols]
-    match --> walk[Caller and callee paths]
-    walk --> source[Source at file and line]
-    source --> cite[Answer with citations]
-    graph --> sidecars[Optional sidecar indexes]
-    sidecars --> cite
+    repo[Workspace files] --> idx[index]
+    idx --> db[(SQLite graph)]
+    db --> q[search or ground]
+    q --> t[trail and snippet]
+    t --> out[context or packet]
+    idx --> side[retrieval index]
+    side --> out
 ```
 
-Example: *"Who calls `WorkspaceIndexer`?"* → search returns the symbol → trail
-lists callers across crates → snippet shows the call sites → you edit with paths
-already in hand.
-
-More depth: [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md).
+Operator detail: [docs/usage.md](docs/usage.md). Sidecar setup:
+[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
 
 ## Try it
 
@@ -78,49 +64,36 @@ export TARGET_WORKSPACE="/path/to/repo"
 "$CODESTORY_CLI" search --project "$TARGET_WORKSPACE" --query "WorkspaceIndexer" --why
 ```
 
-On Windows use `.\target\release\codestory-cli.exe` and `$env:TARGET_WORKSPACE = "C:\path\to\repo"`.
-
-That gets you a local graph you can browse with `trail`, `snippet`, `symbol`,
-`explore`, `context`, and `report`. Add sidecars when you need `packet`; see
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
+Windows: `.\target\release\codestory-cli.exe`, `$env:TARGET_WORKSPACE = "C:\path\to\repo"`.
 
 ## Install as an agent skill
 
-Copy [`.agents/skills/codestory-grounding`](.agents/skills/codestory-grounding) into
-your agent skill directory and run `scripts/setup.sh` (or `setup.ps1` on
-Windows). Skill source: [`.agents/skills/codestory-grounding/SKILL.md`](.agents/skills/codestory-grounding/SKILL.md).
-The setup script prints `CODESTORY_CLI=` — point it at any workspace with
-`--project`.
+Copy [`.agents/skills/codestory-grounding`](.agents/skills/codestory-grounding) to
+your skill directory. Run `scripts/setup.sh` or `scripts/setup.ps1`. See
+[`.agents/skills/codestory-grounding/SKILL.md`](.agents/skills/codestory-grounding/SKILL.md).
 
-## Command cheat sheet
+## Commands
 
-| When you need… | Command |
+| Task | Command |
 | --- | --- |
-| Check cache health | `doctor --project <repo>` |
-| Build or refresh the index | `index --project <repo> --refresh full` |
-| Repo orientation | `ground --project <repo> --why` |
-| Find a symbol or path | `search --project <repo> --query "…" --why` |
-| Call graph around one symbol | `trail --project <repo> --id <node-id> --story` |
-| Source around a symbol | `snippet --project <repo> --id <node-id>` |
-| Deep bundle on one target | `context --project <repo> --id <node-id>` |
-| Broad task question (sidecars required) | `packet --project <repo> --question "…"` |
-| Warm agent read surface | `serve --project <repo> --stdio` |
+| Cache health | `doctor --project <repo>` |
+| Index | `index --project <repo> --refresh full` |
+| Orientation | `ground --project <repo> --why` |
+| Lookup | `search --project <repo> --query "…" --why` |
+| Call graph | `trail --project <repo> --id <node-id> --story` |
+| Source | `snippet --project <repo> --id <node-id>` |
+| Target bundle | `context --project <repo> --id <node-id>` |
+| Task packet (sidecars) | `packet --project <repo> --question "…"` |
+| Persistent reads | `serve --project <repo> --stdio` |
 
-Full operator guide: [docs/usage.md](docs/usage.md).
+## Docs
 
-## Languages, evidence, contributing
-
-Parser-backed graph indexing covers Python, Java, Rust, JavaScript,
-TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, and Bash; HTML,
-CSS, and SQL use structural collectors. Claim details:
-[docs/architecture/language-support.md](docs/architecture/language-support.md).
-
-Benchmark notes and caveats live in
-[docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md). Timing
-history: [docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md).
-
-To hack on CodeStory: [docs/contributors/getting-started.md](docs/contributors/getting-started.md).
-Architecture: [docs/architecture/overview.md](docs/architecture/overview.md).
+- Usage: [docs/usage.md](docs/usage.md)
+- Concepts: [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md)
+- Architecture: [docs/architecture/overview.md](docs/architecture/overview.md)
+- Languages: [docs/architecture/language-support.md](docs/architecture/language-support.md)
+- Benchmarks: [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
+- Contributing: [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
 
 ## License
 
