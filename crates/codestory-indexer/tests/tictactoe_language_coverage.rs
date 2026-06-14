@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{AccessKind, Edge, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::language_support::{LANGUAGE_SUPPORT_PROFILES, LanguageSupportMode};
 use codestory_indexer::{get_language_for_ext, index_file};
 use std::path::Path;
 
@@ -14,6 +15,10 @@ const GO_SOURCE: &str = include_str!("fixtures/tictactoe/go_tictactoe.go");
 const RUBY_SOURCE: &str = include_str!("fixtures/tictactoe/ruby_tictactoe.rb");
 const PHP_SOURCE: &str = include_str!("fixtures/tictactoe/php_tictactoe.php");
 const CSHARP_SOURCE: &str = include_str!("fixtures/tictactoe/csharp_tictactoe.cs");
+const KOTLIN_SOURCE: &str = include_str!("fixtures/tictactoe/kotlin_tictactoe.kt");
+const SWIFT_SOURCE: &str = include_str!("fixtures/tictactoe/swift_tictactoe.swift");
+const DART_SOURCE: &str = include_str!("fixtures/tictactoe/dart_tictactoe.dart");
+const BASH_SOURCE: &str = include_str!("fixtures/tictactoe/bash_tictactoe.sh");
 
 type NamePair = (&'static str, &'static str);
 
@@ -47,20 +52,20 @@ const JAVA_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::CLASS, "Move"),
     (NodeKind::CLASS, "Node"),
     (NodeKind::CLASS, "TicTacToe"),
-    (NodeKind::FUNCTION, "numberIn"),
-    (NodeKind::FUNCTION, "numberOut"),
-    (NodeKind::FUNCTION, "stringOut"),
-    (NodeKind::FUNCTION, "sameInRow"),
-    (NodeKind::FUNCTION, "makeMove"),
-    (NodeKind::FUNCTION, "turn"),
-    (NodeKind::FUNCTION, "_input"),
-    (NodeKind::FUNCTION, "_check"),
-    (NodeKind::FUNCTION, "checkWinner"),
-    (NodeKind::FUNCTION, "isDraw"),
-    (NodeKind::FUNCTION, "probeCalls"),
-    (NodeKind::FUNCTION, "run"),
-    (NodeKind::FUNCTION, "main"),
-    (NodeKind::FUNCTION, "_minMax"),
+    (NodeKind::METHOD, "numberIn"),
+    (NodeKind::METHOD, "numberOut"),
+    (NodeKind::METHOD, "stringOut"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "_input"),
+    (NodeKind::METHOD, "_check"),
+    (NodeKind::METHOD, "checkWinner"),
+    (NodeKind::METHOD, "isDraw"),
+    (NodeKind::METHOD, "probeCalls"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::METHOD, "main"),
+    (NodeKind::METHOD, "_minMax"),
 ];
 const RUST_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::STRUCT, "GameObject"),
@@ -75,16 +80,16 @@ const RUST_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::FUNCTION, "number_in"),
     (NodeKind::FUNCTION, "number_out"),
     (NodeKind::FUNCTION, "string_out"),
-    (NodeKind::FUNCTION, "same_in_row"),
-    (NodeKind::FUNCTION, "make_move"),
+    (NodeKind::METHOD, "same_in_row"),
+    (NodeKind::METHOD, "make_move"),
     (NodeKind::FUNCTION, "check_winner"),
     (NodeKind::FUNCTION, "is_draw"),
-    (NodeKind::FUNCTION, "turn"),
-    (NodeKind::FUNCTION, "run"),
-    (NodeKind::FUNCTION, "start"),
-    (NodeKind::FUNCTION, "_select_player"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::METHOD, "start"),
+    (NodeKind::METHOD, "_select_player"),
     (NodeKind::FUNCTION, "main"),
-    (NodeKind::FUNCTION, "min_max"),
+    (NodeKind::METHOD, "min_max"),
 ];
 const JAVASCRIPT_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::CLASS, "GameObject"),
@@ -96,17 +101,17 @@ const JAVASCRIPT_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::FUNCTION, "numberIn"),
     (NodeKind::FUNCTION, "numberOut"),
     (NodeKind::FUNCTION, "stringOut"),
-    (NodeKind::FUNCTION, "sameInRow"),
-    (NodeKind::FUNCTION, "makeMove"),
-    (NodeKind::FUNCTION, "turn"),
-    (NodeKind::FUNCTION, "selectPlayer"),
-    (NodeKind::FUNCTION, "start"),
-    (NodeKind::FUNCTION, "run"),
-    (NodeKind::FUNCTION, "probeCalls"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "selectPlayer"),
+    (NodeKind::METHOD, "start"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::METHOD, "probeCalls"),
     (NodeKind::FUNCTION, "main"),
-    (NodeKind::FUNCTION, "checkWinner"),
-    (NodeKind::FUNCTION, "isDraw"),
-    (NodeKind::FUNCTION, "minMax"),
+    (NodeKind::METHOD, "checkWinner"),
+    (NodeKind::METHOD, "isDraw"),
+    (NodeKind::METHOD, "minMax"),
 ];
 const TYPESCRIPT_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::CLASS, "GameObject"),
@@ -118,17 +123,17 @@ const TYPESCRIPT_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::FUNCTION, "numberIn"),
     (NodeKind::FUNCTION, "numberOut"),
     (NodeKind::FUNCTION, "stringOut"),
-    (NodeKind::FUNCTION, "sameInRow"),
-    (NodeKind::FUNCTION, "makeMove"),
-    (NodeKind::FUNCTION, "turn"),
-    (NodeKind::FUNCTION, "selectPlayer"),
-    (NodeKind::FUNCTION, "start"),
-    (NodeKind::FUNCTION, "run"),
-    (NodeKind::FUNCTION, "probeCalls"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "selectPlayer"),
+    (NodeKind::METHOD, "start"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::METHOD, "probeCalls"),
     (NodeKind::FUNCTION, "main"),
-    (NodeKind::FUNCTION, "checkWinner"),
-    (NodeKind::FUNCTION, "isDraw"),
-    (NodeKind::FUNCTION, "minMax"),
+    (NodeKind::METHOD, "checkWinner"),
+    (NodeKind::METHOD, "isDraw"),
+    (NodeKind::METHOD, "minMax"),
 ];
 const CPP_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::CLASS, "GameObject"),
@@ -272,9 +277,9 @@ const RUBY_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::CLASS, "HumanPlayer"),
     (NodeKind::CLASS, "ArtificialPlayer"),
     (NodeKind::CLASS, "TicTacToe"),
-    (NodeKind::FUNCTION, "numberIn"),
-    (NodeKind::FUNCTION, "numberOut"),
-    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "numberIn"),
+    (NodeKind::METHOD, "numberOut"),
+    (NodeKind::METHOD, "stringOut"),
     (NodeKind::METHOD, "makeMove"),
     (NodeKind::METHOD, "sameInRow"),
     (NodeKind::METHOD, "turn"),
@@ -314,21 +319,145 @@ const CSHARP_SYMBOLS: &[(NodeKind, &str)] = &[
     (NodeKind::METHOD, "run"),
     (NodeKind::METHOD, "Main"),
 ];
+const KOTLIN_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::CLASS, "GameObject"),
+    (NodeKind::CLASS, "Field"),
+    (NodeKind::INTERFACE, "Player"),
+    (NodeKind::CLASS, "HumanPlayer"),
+    (NodeKind::CLASS, "ArtificialPlayer"),
+    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::FUNCTION, "main"),
+];
+const SWIFT_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::CLASS, "GameObject"),
+    (NodeKind::CLASS, "Field"),
+    (NodeKind::INTERFACE, "Player"),
+    (NodeKind::CLASS, "HumanPlayer"),
+    (NodeKind::CLASS, "ArtificialPlayer"),
+    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::FUNCTION, "main"),
+];
+const DART_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::CLASS, "GameObject"),
+    (NodeKind::CLASS, "Field"),
+    (NodeKind::INTERFACE, "Player"),
+    (NodeKind::CLASS, "HumanPlayer"),
+    (NodeKind::CLASS, "ArtificialPlayer"),
+    (NodeKind::CLASS, "TicTacToe"),
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::METHOD, "makeMove"),
+    (NodeKind::METHOD, "sameInRow"),
+    (NodeKind::METHOD, "turn"),
+    (NodeKind::METHOD, "minMax"),
+    (NodeKind::METHOD, "run"),
+    (NodeKind::FUNCTION, "main"),
+];
+const BASH_SYMBOLS: &[(NodeKind, &str)] = &[
+    (NodeKind::FUNCTION, "numberIn"),
+    (NodeKind::FUNCTION, "numberOut"),
+    (NodeKind::FUNCTION, "stringOut"),
+    (NodeKind::FUNCTION, "sameInRow"),
+    (NodeKind::FUNCTION, "makeMove"),
+    (NodeKind::FUNCTION, "turn"),
+    (NodeKind::FUNCTION, "minMax"),
+    (NodeKind::FUNCTION, "run"),
+    (NodeKind::FUNCTION, "main"),
+    (NodeKind::VARIABLE, "token"),
+    (NodeKind::VARIABLE, "amount"),
+    (NodeKind::VARIABLE, "depth"),
+];
 
 const GO_IMPORTS: &[&str] = &["\"fmt\"", "\"math/rand\""];
 const RUBY_IMPORTS: &[&str] = &["\"random\""];
 const PHP_IMPORTS: &[&str] = &["Random\\Randomizer"];
 const CSHARP_IMPORTS: &[&str] = &["System"];
+const KOTLIN_IMPORTS: &[&str] = &["kotlin.random.Random"];
+const SWIFT_IMPORTS: &[&str] = &["Foundation"];
+const DART_IMPORTS: &[&str] = &["'dart:math'"];
+const BASH_IMPORTS: &[&str] = &["./random.sh"];
 
 const GO_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
 const RUBY_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
 const PHP_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
 const CSHARP_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const KOTLIN_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const SWIFT_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const DART_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
+const BASH_CALLS: &[&str] = &["numberIn", "stringOut", "makeMove", "minMax"];
 
-const GO_MEMBERS: &[NamePair] = &[];
-const RUBY_MEMBERS: &[NamePair] = &[];
-const PHP_MEMBERS: &[NamePair] = &[];
-const CSHARP_MEMBERS: &[NamePair] = &[];
+const GO_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+];
+const RUBY_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+];
+const PHP_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("Player", "turn"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+];
+const CSHARP_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("Player", "turn"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+    ("Program", "Main"),
+];
+const KOTLIN_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+];
+const SWIFT_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("Player", "turn"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+];
+const DART_MEMBERS: &[NamePair] = &[
+    ("Field", "makeMove"),
+    ("Field", "sameInRow"),
+    ("Player", "turn"),
+    ("HumanPlayer", "turn"),
+    ("ArtificialPlayer", "minMax"),
+    ("TicTacToe", "run"),
+];
+const BASH_MEMBERS: &[NamePair] = &[];
 
 const GO_INHERITANCE: &[NamePair] = &[];
 const RUBY_INHERITANCE: &[NamePair] = &[
@@ -339,6 +468,25 @@ const RUBY_INHERITANCE: &[NamePair] = &[
 ];
 const PHP_INHERITANCE: &[NamePair] = &[("Field", "GameObject"), ("TicTacToe", "GameObject")];
 const CSHARP_INHERITANCE: &[NamePair] = &[("Field", "GameObject"), ("TicTacToe", "GameObject")];
+const KOTLIN_INHERITANCE: &[NamePair] = &[
+    ("Field", "GameObject"),
+    ("HumanPlayer", "Player"),
+    ("ArtificialPlayer", "Player"),
+    ("TicTacToe", "GameObject"),
+];
+const SWIFT_INHERITANCE: &[NamePair] = &[
+    ("Field", "GameObject"),
+    ("HumanPlayer", "Player"),
+    ("ArtificialPlayer", "Player"),
+    ("TicTacToe", "GameObject"),
+];
+const DART_INHERITANCE: &[NamePair] = &[
+    ("Field", "GameObject"),
+    ("HumanPlayer", "Player"),
+    ("ArtificialPlayer", "Player"),
+    ("TicTacToe", "GameObject"),
+];
+const BASH_INHERITANCE: &[NamePair] = &[];
 
 #[derive(Clone, Copy)]
 struct FixtureCase {
@@ -500,6 +648,58 @@ fn fixture_cases() -> Vec<FixtureCase> {
             required_member_pairs: CSHARP_MEMBERS,
             required_inheritance_pairs: CSHARP_INHERITANCE,
         },
+        FixtureCase {
+            language: "kotlin",
+            filename: "game.kt",
+            extension: "kt",
+            source: KOTLIN_SOURCE,
+            min_nodes: 15,
+            min_edges: 12,
+            required_symbols: KOTLIN_SYMBOLS,
+            required_import_targets: KOTLIN_IMPORTS,
+            required_call_targets: KOTLIN_CALLS,
+            required_member_pairs: KOTLIN_MEMBERS,
+            required_inheritance_pairs: KOTLIN_INHERITANCE,
+        },
+        FixtureCase {
+            language: "swift",
+            filename: "game.swift",
+            extension: "swift",
+            source: SWIFT_SOURCE,
+            min_nodes: 15,
+            min_edges: 12,
+            required_symbols: SWIFT_SYMBOLS,
+            required_import_targets: SWIFT_IMPORTS,
+            required_call_targets: SWIFT_CALLS,
+            required_member_pairs: SWIFT_MEMBERS,
+            required_inheritance_pairs: SWIFT_INHERITANCE,
+        },
+        FixtureCase {
+            language: "dart",
+            filename: "game.dart",
+            extension: "dart",
+            source: DART_SOURCE,
+            min_nodes: 15,
+            min_edges: 12,
+            required_symbols: DART_SYMBOLS,
+            required_import_targets: DART_IMPORTS,
+            required_call_targets: DART_CALLS,
+            required_member_pairs: DART_MEMBERS,
+            required_inheritance_pairs: DART_INHERITANCE,
+        },
+        FixtureCase {
+            language: "bash",
+            filename: "game.sh",
+            extension: "sh",
+            source: BASH_SOURCE,
+            min_nodes: 10,
+            min_edges: 8,
+            required_symbols: BASH_SYMBOLS,
+            required_import_targets: BASH_IMPORTS,
+            required_call_targets: BASH_CALLS,
+            required_member_pairs: BASH_MEMBERS,
+            required_inheritance_pairs: BASH_INHERITANCE,
+        },
     ]
 }
 
@@ -526,9 +726,7 @@ fn is_matching_name(serialized_name: &str, wanted_name: &str) -> bool {
 
 fn has_node(nodes: &[Node], kind: NodeKind, name: &str) -> bool {
     nodes.iter().any(|node| {
-        let kind_matches = if kind == NodeKind::FUNCTION {
-            node.kind == NodeKind::FUNCTION || node.kind == NodeKind::METHOD
-        } else if kind == NodeKind::VARIABLE {
+        let kind_matches = if kind == NodeKind::VARIABLE {
             node.kind == NodeKind::VARIABLE || node.kind == NodeKind::FIELD
         } else {
             node.kind == kind
@@ -590,44 +788,31 @@ fn access_for_name(
 
 #[test]
 fn test_language_extension_coverage_and_names() {
-    let expected = [
-        ("py", "python"),
-        ("pyi", "python"),
-        ("java", "java"),
-        ("rs", "rust"),
-        ("js", "javascript"),
-        ("jsx", "javascript"),
-        ("mjs", "javascript"),
-        ("cjs", "javascript"),
-        ("ts", "typescript"),
-        ("tsx", "typescript"),
-        ("mts", "typescript"),
-        ("cts", "typescript"),
-        ("cpp", "cpp"),
-        ("cc", "cpp"),
-        ("cxx", "cpp"),
-        ("h", "c"),
-        ("hh", "cpp"),
-        ("hpp", "cpp"),
-        ("hxx", "cpp"),
-        ("c", "c"),
-        ("go", "go"),
-        ("rb", "ruby"),
-        ("php", "php"),
-        ("cs", "csharp"),
-    ];
-
-    for (ext, expected_name) in expected {
-        let language_config =
-            get_language_for_ext(ext).expect("Extension should resolve to a language");
-        assert_eq!(
-            language_config.language_name, expected_name,
-            "Wrong language name for extension {ext}"
-        );
-        assert!(
-            !language_config.graph_query.trim().is_empty(),
-            "Expected non-empty graph query for extension {ext}"
-        );
+    for profile in LANGUAGE_SUPPORT_PROFILES {
+        for ext in profile.extensions {
+            let language_config = get_language_for_ext(ext);
+            match profile.support_mode {
+                LanguageSupportMode::ParserBackedGraph => {
+                    let language_config = language_config.unwrap_or_else(|| {
+                        panic!("Parser-backed registry extension should route to indexer: {ext}")
+                    });
+                    assert_eq!(
+                        language_config.language_name, profile.language_name,
+                        "Wrong language name for extension {ext}"
+                    );
+                    assert!(
+                        !language_config.graph_query.trim().is_empty(),
+                        "Expected non-empty graph query for extension {ext}"
+                    );
+                }
+                LanguageSupportMode::StructuralCollector => {
+                    assert!(
+                        language_config.is_none(),
+                        "Structural collector extension should not route through tree-sitter graph parser: {ext}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -640,6 +825,10 @@ fn test_language_extension_coverage_is_case_insensitive() {
         ("JSX", "javascript"),
         ("TSX", "typescript"),
         ("CPP", "cpp"),
+        ("KT", "kotlin"),
+        ("SWIFT", "swift"),
+        ("DART", "dart"),
+        ("SH", "bash"),
     ];
     for (ext, expected_name) in expected {
         let language_config =

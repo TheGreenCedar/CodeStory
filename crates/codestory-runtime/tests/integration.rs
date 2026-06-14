@@ -1,5 +1,6 @@
 use codestory_contracts::api::{
-    IndexMode, LayoutDirection, OpenProjectRequest, TrailCallerScope, TrailDirection, TrailMode,
+    IndexMode, LayoutDirection, ListRootSymbolsRequest, OpenProjectRequest, TrailCallerScope,
+    TrailDirection, TrailMode,
 };
 use codestory_runtime::AppController;
 use codestory_store::Store;
@@ -55,24 +56,18 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
         .unwrap();
     assert!(summary.stats.node_count > 0);
 
-    // 3. Search for a symbol
-    let hits = controller
-        .search(codestory_contracts::api::SearchRequest {
-            query: "f0".to_string(),
-            repo_text: codestory_contracts::api::SearchRepoTextMode::Off,
-            limit_per_source: 10,
-            expand_search_plan: false,
-            hybrid_weights: None,
-            hybrid_limits: None,
-        })
+    // 3. Resolve an indexed symbol through the graph surface. Search is sidecar-primary and
+    // requires retrieval sidecars, which this lifecycle smoke intentionally does not build.
+    let symbols = controller
+        .list_root_symbols(ListRootSymbolsRequest { limit: Some(50) })
         .unwrap();
-    assert!(!hits.is_empty(), "Search should find f0");
+    assert!(!symbols.is_empty(), "Root symbols should include f0");
 
-    let main_id = hits
+    let main_id = symbols
         .into_iter()
-        .find(|h| h.display_name.contains("f0"))
+        .find(|symbol| symbol.label.contains("f0"))
         .unwrap()
-        .node_id;
+        .id;
 
     // 4. Trail query with max_nodes = 10 to force truncation
     // This is the regression test around truncated trails not emitting fallback node IDs

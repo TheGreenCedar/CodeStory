@@ -15,8 +15,9 @@ doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
 
 - `doctor` checks whether the cache, index, retrieval mode, and local embedding
   setup are usable.
-- `index` builds or refreshes local graph, search, snapshot, and semantic-doc
-  state for one target repository.
+- `index` builds or refreshes local graph, search, snapshot, graph-native
+  symbol-doc, component-report, and selected dense-anchor state for one target
+  repository.
 - `ground` gives broad orientation and reports limited coverage or gaps.
 - `search` finds candidate files, symbols, routes, literals, modules, or behavior
   terms.
@@ -38,7 +39,10 @@ workspace path. The cache can include:
 - source snippets and occurrence locations
 - search projection rows and local search indexes
 - grounding snapshots rebuilt from the graph
-- semantic docs, which are generated searchable summaries for durable symbols
+- graph-native symbol docs, which are deterministic searchable summaries for
+  durable AST symbols
+- selected dense anchors, which are the only generated docs embedded as vectors
+  under the active semantic policy
 
 Repository data stays local. Managed setup may fetch tool or model assets, but
 the indexed project evidence lives in the local cache.
@@ -47,8 +51,12 @@ the indexed project evidence lives in the local cache.
 
 - Grounding is source-backed context: the files, symbols, and summaries a command
   returns so an answer can be tied back to repository evidence.
-- A semantic doc is generated text for a symbol, stored so hybrid retrieval can
-  find relevant code even when the query words are not exact.
+- A symbol doc is deterministic generated text for a symbol, stored so lexical
+  and graph retrieval can find relevant code even when the query words are not
+  exact.
+- A dense anchor is a policy-selected symbol, component report, or unstructured
+  doc that receives a vector embedding. Code symbols do not need dense vectors
+  to be product-searchable.
 - A snapshot is a cached read model rebuilt from the local graph. If a snapshot
   is stale, the tool should say so.
 - A trail is a focused graph walk around one symbol: callers, callees,

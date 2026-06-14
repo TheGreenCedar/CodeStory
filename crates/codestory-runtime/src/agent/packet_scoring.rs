@@ -61,7 +61,11 @@ pub(crate) fn packet_citation_rank(
     {
         score -= 3.0;
     }
-    if path.starts_with("extensions/") || path.starts_with("vendor/") {
+    if path.starts_with("extensions/")
+        || path.starts_with("vendor/")
+        || path.starts_with("deps/")
+        || path.contains("/deps/")
+    {
         score -= 20.0;
     }
     if packet_path_is_test_segment(&path) {
@@ -258,7 +262,6 @@ const PACKET_QUERY_STOP_TERMS: &[&str] = &[
     "it",
     "its",
     "like",
-    "main",
     "module",
     "modules",
     "move",
@@ -334,11 +337,11 @@ pub(crate) fn normalize_identifier(value: &str) -> String {
 
 pub(crate) fn packet_display_path(path: &str) -> String {
     let normalized = path.trim_start_matches("\\\\?\\").replace('\\', "/");
-    if !normalized.contains(':') && !normalized.starts_with('/') {
-        return normalized;
-    }
     if let Some(path) = path_after_named_repo_root(&normalized) {
         return path;
+    }
+    if !normalized.contains(':') && !normalized.starts_with('/') {
+        return normalized;
     }
     for prefix in [
         "crates/",
@@ -370,12 +373,9 @@ pub(crate) fn packet_display_path(path: &str) -> String {
 }
 
 fn path_after_named_repo_root(normalized: &str) -> Option<String> {
-    for marker in [
-        "/source/repos/",
-        "/target/agent-benchmark/repos/",
-        "/repos/",
-    ] {
-        let Some(index) = normalized.find(marker) else {
+    let mut best_match: Option<(usize, String)> = None;
+    for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+        let Some(index) = normalized.rfind(marker) else {
             continue;
         };
         let suffix = &normalized[index + marker.len()..];
@@ -384,8 +384,14 @@ fn path_after_named_repo_root(normalized: &str) -> Option<String> {
         };
         let path = &suffix[repo_name_end + 1..];
         if !path.is_empty() {
-            return Some(path.to_string());
+            let candidate = path.to_string();
+            if best_match
+                .as_ref()
+                .is_none_or(|(best_index, _)| index > *best_index)
+            {
+                best_match = Some((index, candidate));
+            }
         }
     }
-    None
+    best_match.map(|(_, path)| path)
 }

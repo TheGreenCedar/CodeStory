@@ -14,11 +14,15 @@ pub struct RankFeatures {
 /// Unified retrieval candidate from any sidecar lane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateHit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub file_path: String,
     pub symbol_name: Option<String>,
     pub start_line: Option<u32>,
     pub score: f32,
     pub source: CandidateSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_role: Option<FileRole>,
     /// SCIP graph hops from anchor (lower is better).
@@ -52,11 +56,13 @@ pub fn phantom_sidecar_candidates_only(candidates: &[CandidateHit]) -> bool {
 impl CandidateHit {
     pub fn lexical_stub(file_path: impl Into<String>, score: f32) -> Self {
         Self {
+            node_id: None,
             file_path: file_path.into(),
             symbol_name: None,
             start_line: None,
             score,
             source: CandidateSource::Zoekt,
+            provenance: vec!["lexical_source".into()],
             file_role: None,
             scip_hop_distance: None,
             rank_features: None,
@@ -70,14 +76,23 @@ impl CandidateHit {
         source: CandidateSource,
     ) -> Self {
         Self {
+            node_id: None,
             file_path: file_path.into(),
             symbol_name,
             start_line: None,
             score,
             source,
+            provenance: Vec::new(),
             file_role: None,
             scip_hop_distance: None,
             rank_features: None,
+        }
+    }
+
+    pub fn add_provenance(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        if !self.provenance.iter().any(|existing| existing == &label) {
+            self.provenance.push(label);
         }
     }
 }

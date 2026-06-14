@@ -341,7 +341,7 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
 
 #[test]
 fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
-    let gate = read("docs/architecture/browser-surface-gate.md");
+    let gate = read("docs/architecture/overview.md");
     let warm_stats = read("docs/testing/codestory-stdio-warm-loop-stats.md");
     let runtime_path = read("docs/architecture/runtime-execution-path.md");
     let cli_args = read("crates/codestory-cli/src/args.rs");

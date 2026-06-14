@@ -218,10 +218,23 @@ impl<'a> QueryExecutor<'a> {
                 ));
                 continue;
             }
+            if should_skip_zero_dense_stage(stage, self.manifest.as_ref()) {
+                stage_traces.push(stage_trace(
+                    stage,
+                    0,
+                    0,
+                    0.0,
+                    Some("zero_dense_anchors".into()),
+                    false,
+                    None,
+                ));
+                continue;
+            }
 
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
-            let stage_hits = self.run_stage(stage, features, candidates)?;
+            let mut stage_hits = self.run_stage(stage, features, candidates)?;
+            annotate_stage_provenance(stage, &mut stage_hits);
             let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
             let added = merge_candidates(candidates, stage_hits);
             let after_score = candidate_mass(candidates);
@@ -306,6 +319,38 @@ fn should_skip_after_exact_symbol_anchor(
         .any(|candidate| candidate_is_exact_symbol_anchor(&features.raw_query, candidate))
 }
 
+fn should_skip_zero_dense_stage(
+    stage: &PlannedStage,
+    manifest: Option<&RetrievalIndexManifest>,
+) -> bool {
+    if !matches!(stage.kind, RetrievalStageKind::Stage1bQdrantSemantic) {
+        return false;
+    }
+    let dense_count = manifest
+        .and_then(|manifest| {
+            manifest
+                .dense_projection_count
+                .or(manifest.projection_count)
+        })
+        .unwrap_or(0);
+    dense_count <= 0
+}
+
+fn annotate_stage_provenance(stage: &PlannedStage, hits: &mut [CandidateHit]) {
+    let label = match stage.kind {
+        RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
+        RetrievalStageKind::Stage1ZoektLexical => None,
+        RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
+        RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
+        RetrievalStageKind::Stage3RepoTextFallback => None,
+    };
+    if let Some(label) = label {
+        for hit in hits {
+            hit.add_provenance(label);
+        }
+    }
+}
+
 fn candidate_is_exact_symbol_anchor(query: &str, candidate: &CandidateHit) -> bool {
     if matches!(
         candidate.source,
@@ -355,13 +400,24 @@ fn stage_stub_metadata(hits: &[CandidateHit]) -> (Option<String>, bool) {
 fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) -> usize {
     let mut added = 0usize;
     for hit in incoming {
-        let duplicate = acc.iter().any(|existing| {
+        let duplicate = acc.iter_mut().find(|existing| {
             existing.file_path == hit.file_path && existing.symbol_name == hit.symbol_name
         });
-        if !duplicate {
-            acc.push(hit);
-            added += 1;
+        if let Some(existing) = duplicate {
+            existing.score = existing.score.max(hit.score);
+            if existing.node_id.is_none() {
+                existing.node_id = hit.node_id.clone();
+            }
+            if existing.start_line.is_none() {
+                existing.start_line = hit.start_line;
+            }
+            for label in hit.provenance {
+                existing.add_provenance(label);
+            }
+            continue;
         }
+        acc.push(hit);
+        added += 1;
     }
     added
 }
@@ -420,7 +476,12 @@ mod tests {
             sidecar_schema_version: None,
             sidecar_input_hash: None,
             sidecar_generation: None,
-            projection_count: None,
+            projection_count: Some(10),
+            symbol_doc_count: Some(20),
+            dense_projection_count: Some(10),
+            semantic_policy_version: None,
+            graph_artifact_hash: None,
+            dense_reason_counts_json: None,
         }
     }
 
@@ -678,6 +739,114 @@ mod tests {
             "expected semantic hit after empty lexical stages: {:?}",
             result.hits
         );
+    }
+
+    #[test]
+    fn executor_skips_qdrant_when_policy_selects_zero_dense_anchors() {
+        let mock = MockSidecarSearch {
+            qdrant: Mutex::new(HashMap::from([(
+                "how does startup sequence work".into(),
+                vec![CandidateHit::with_source(
+                    "src/semantic.rs",
+                    Some("SemanticAnchor".into()),
+                    0.8,
+                    CandidateSource::Qdrant,
+                )],
+            )])),
+            zoekt: Mutex::new(HashMap::from([(
+                "how does startup sequence work".into(),
+                vec![CandidateHit::with_source(
+                    "src/lexical.rs",
+                    Some("LexicalAnchor".into()),
+                    0.7,
+                    CandidateSource::Zoekt,
+                )],
+            )])),
+            ..Default::default()
+        };
+        let mut manifest = sample_manifest();
+        manifest.projection_count = Some(0);
+        manifest.dense_projection_count = Some(0);
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: &mock,
+            cache: &mut cache,
+            manifest: Some(manifest),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor
+            .execute("how does startup sequence work", Some(800))
+            .expect("query");
+        assert!(
+            result.trace.stages.iter().any(|stage| stage.stage
+                == RetrievalStageKind::Stage1bQdrantSemantic
+                && stage.cancel_reason.as_deref() == Some("zero_dense_anchors")),
+            "zero dense policy should skip qdrant explicitly: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.file_path != "src/semantic.rs"),
+            "qdrant hits must not be recalled when dense count is zero: {:?}",
+            result.hits
+        );
+    }
+
+    #[test]
+    fn executor_merges_duplicate_candidate_provenance() {
+        let query = "how extension service starts";
+        let mock = MockSidecarSearch {
+            zoekt: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/service.rs",
+                    Some("ExtensionService".into()),
+                    0.70,
+                    CandidateSource::Zoekt,
+                )],
+            )])),
+            qdrant: Mutex::new(HashMap::from([(
+                query.into(),
+                vec![CandidateHit::with_source(
+                    "src/service.rs",
+                    Some("ExtensionService".into()),
+                    0.85,
+                    CandidateSource::Qdrant,
+                )],
+            )])),
+            scip_expand: Mutex::new(vec![CandidateHit::with_source(
+                "src/service.rs",
+                Some("ExtensionService".into()),
+                0.75,
+                CandidateSource::Scip,
+            )]),
+            ..Default::default()
+        };
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: &mock,
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor.execute(query, Some(800)).expect("query");
+        let hit = result
+            .hits
+            .iter()
+            .find(|hit| hit.file_path == "src/service.rs")
+            .expect("merged candidate");
+        assert!(
+            hit.score > 0.70,
+            "merged candidate should keep ranker-adjusted score above lexical-only input: {hit:?}"
+        );
+        assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));
+        assert!(hit.provenance.iter().any(|label| label == "dense_anchor"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 Run these from the repo root:
 
-```powershell
+```sh
 cargo fmt --check
 cargo check
 cargo test -p codestory-cli
@@ -19,29 +19,45 @@ If you touch runtime search, grounding, or repo-scale indexing behavior, check t
 
 After the basic cargo checks, verify the shipped CLI flow with the built binary instead of `cargo run`:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
-.\target\release\codestory-cli.exe setup embeddings --project . --dry-run
-.\target\release\codestory-cli.exe index --project . --refresh auto
-.\target\release\codestory-cli.exe search --project . --query WorkspaceIndexer --why
-.\target\release\codestory-cli.exe context --project . --query WorkspaceIndexer
-.\target\release\codestory-cli.exe doctor --project .
+./target/release/codestory-cli setup embeddings --project . --dry-run
+./target/release/codestory-cli index --project . --refresh auto
+./target/release/codestory-cli ready --project . --goal local
+./target/release/codestory-cli ground --project . --why
+./target/release/codestory-cli files --project . --limit 20
+./target/release/codestory-cli doctor --project .
 ```
 
+On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
+
 Read commands default to `--refresh none`. If a read command says the cache is empty, either run `index --refresh full` first or rerun the read command with an explicit refresh mode.
+The first loop above exercises local navigation only. Agent-facing `packet` and
+`search` evidence require full retrieval sidecars; prepare the sidecar lane
+below before treating those commands as product-quality proof.
 
 ## Hybrid Retrieval Setup
 
 Use the managed full-sidecar path before debugging ranking quality:
 
 - managed real-model setup: `node scripts/setup-retrieval-env.mjs --fetch-embed-model`, then `codestory-cli retrieval bootstrap --project .`
-- default semantic scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol semantic doc set
+- default symbol-doc scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol diagnostic symbol-doc set
+- default dense policy: `graph_first_v1` embeds only selected dense anchors; private trivial code remains searchable through symbol docs, lexical source, and graph expansion
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and local llama.cpp sidecar settings
 
 Hash embeddings, ONNX-only flows, and lexical-only switches are diagnostic or
 historical comparison modes only; they are not valid agent-facing retrieval
 setup.
+
+After bootstrap, run a target-repo sidecar index before using packet/search:
+
+```sh
+./target/release/codestory-cli index --project . --refresh full
+./target/release/codestory-cli retrieval index --project . --refresh full
+./target/release/codestory-cli retrieval status --project . --format json
+./target/release/codestory-cli ready --project . --goal agent
+```
 
 `index`, `ground`, `search`, `context`, and `doctor` report the active retrieval mode plus any degraded-state reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Agent-facing retrieval requires `retrieval_mode=full`.
 

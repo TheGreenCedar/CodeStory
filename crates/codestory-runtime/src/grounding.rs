@@ -571,6 +571,7 @@ fn search_hit_from_grounding_recommendation(candidate: &RecommendationCandidate<
             semantic: 0.0,
             graph: 0.55,
             total: 1.0,
+            provenance: Vec::new(),
         }),
     }
 }
@@ -619,6 +620,7 @@ impl AppController {
             edge_count: clamp_i64_to_u32(stats.edge_count),
             file_count: clamp_i64_to_u32(derived_file_count),
             error_count: clamp_i64_to_u32(stats.error_count),
+            fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
 
         let mut file_coverages = Vec::with_capacity(file_summaries.len());

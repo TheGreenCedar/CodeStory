@@ -86,6 +86,45 @@ Important rules:
 
 ## Operating Constraints
 
+### Browser surface gate
+
+Status: deferred.
+
+`codestory-cli` `explore` and `serve --stdio` remain the current browser
+surfaces. Do not add a new `browse` command, web UI route, or browser-specific UI
+until all of the gates below have current evidence in the repo.
+
+Before starting web UI work:
+
+- Tool, resource, and prompt manifests must be stable under stdio catalog tests.
+- HTTP and stdio browser contracts must stay aligned with the read-only browser
+  service.
+- Warm stdio/browser-loop p50, p95, and p99 timings must be recorded and must
+  meet the active Current Promotion Budget in
+  `docs/testing/codestory-stdio-warm-loop-stats.md`: small-fixture smoke p95
+  stays under the smoke budget, and a current real-repo run meets the Web
+  Cockpit Promotion Budget.
+- Browser stress lanes must pass at the intended scale, and synthetic evidence
+  must not be treated as real-repository promotion proof.
+- `explore` must demonstrate the browser workflow in JSON/Markdown and
+  keyboard-first TUI paths.
+- Screenshot-visible review must be planned before implementation, with one
+  reviewer for the full viewport and one reviewer for the changed surface or
+  acceptance path.
+
+Evidence sources: `crates/codestory-cli/tests/stdio_protocol_contracts.rs`,
+`crates/codestory-cli/tests/http_transport_contracts.rs`,
+`crates/codestory-cli/tests/stdio_warm_loop_stats.rs`,
+`docs/testing/codestory-stdio-warm-loop-stats.md`,
+`docs/testing/codestory-stress-lanes.md`, and
+`crates/codestory-cli/tests/cli_golden_path.rs`.
+
+If the gates are satisfied, start with a written implementation plan that names
+why the new surface is not a duplicate of `explore`, the exact routes or
+commands to add, the screenshot-visible review loop, and the rollback path.
+
+### Layer boundaries
+
 - Keep the public command surface centered on grounding, target context,
   navigation, health, and serving workflows.
 - Add shared graph, DTO, grounding, and event types to `codestory-contracts`, not
@@ -101,5 +140,5 @@ Important rules:
 - Product mental model: [../concepts/how-codestory-works.md](../concepts/how-codestory-works.md)
 - System behavior: [runtime-execution-path.md](runtime-execution-path.md)
 - Indexing lifecycle: [indexing-pipeline.md](indexing-pipeline.md)
+- Language support claims: [language-support.md](language-support.md)
 - Ownership details: [subsystems/contracts.md](subsystems/contracts.md), [subsystems/workspace.md](subsystems/workspace.md), [subsystems/indexer.md](subsystems/indexer.md), [subsystems/store.md](subsystems/store.md), [subsystems/runtime.md](subsystems/runtime.md), [subsystems/cli.md](subsystems/cli.md)
-- Historical context: [../decision-log.md](../decision-log.md)

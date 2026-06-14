@@ -38,6 +38,7 @@ mod http_transport;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
+mod readiness;
 mod report;
 mod retrieval;
 mod runtime;
@@ -63,9 +64,10 @@ use args::{
     DrillSummaryVerdictOutput, DrillVerificationChecklistItemOutput, FilesCommand,
     GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
     PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
-    QuerySelectorOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
-    SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
-    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    QuerySelectorOutput, ReadyCommand, ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput,
+    SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput,
+    SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
+    build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -75,9 +77,10 @@ use output::{
     context_packet_json, emit, emit_text, render_agent_citation, render_context_markdown,
     render_doctor_markdown, render_drill_markdown, render_ground_markdown,
     render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_search_hit_output, render_search_markdown, render_snippet_markdown,
-    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
-    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
+    render_ready_markdown, render_search_hit_output, render_search_markdown,
+    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
+    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
+    validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -183,6 +186,7 @@ fn main() -> Result<()> {
         Command::Context(cmd) => run_context(cmd),
         Command::Packet(cmd) => run_packet(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
+        Command::Ready(cmd) => run_ready(cmd),
         Command::Setup(cmd) => run_setup(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Drill(cmd) => run_drill(cmd),
@@ -240,32 +244,15 @@ fn setup_embeddings_next_commands(
 }
 
 fn quote_command_path(path: &std::path::Path) -> String {
-    let value = display::clean_path_string(&path.to_string_lossy());
-    if command_value_needs_single_quotes(&value) {
-        quote_powershell_single_quoted_value(&value)
-    } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
+    display::quote_command_path(path)
 }
 
 fn quote_command_value(value: &str) -> String {
-    quote_powershell_single_quoted_value(value)
+    display::quote_command_value(value)
 }
 
 fn quote_command_argument_value(value: &str) -> String {
-    if command_value_needs_single_quotes(value) {
-        quote_command_value(value)
-    } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
-}
-
-fn command_value_needs_single_quotes(value: &str) -> bool {
-    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
-}
-
-fn quote_powershell_single_quoted_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    display::quote_command_argument_value(value)
 }
 
 fn run_index(cmd: IndexCommand) -> Result<()> {
@@ -379,12 +366,14 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         .context("Open project summary did not include retrieval state")?;
     let refresh_label = refresh_label(cmd.refresh, opened.refresh_mode);
     let storage_path = runtime.storage_path.to_string_lossy().to_string();
-    let sidecar_is_full = codestory_retrieval::strict_sidecar_status(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-    )
-    .map(|status| status.retrieval_mode == "full")
-    .unwrap_or(false);
+    let sidecar_retrieval = doctor_sidecar_status(&runtime);
+    let readiness = build_summary_readiness(
+        &opened.summary.root,
+        &opened.summary.stats,
+        opened.summary.freshness.as_ref(),
+        &sidecar_retrieval,
+    );
+    let next_commands = readiness::compatibility_next_commands(&readiness);
     let output = IndexOutput {
         project: &opened.summary.root,
         storage_path: &storage_path,
@@ -393,12 +382,8 @@ fn run_index_once(cmd: &IndexCommand) -> Result<()> {
         retrieval,
         phase_timings: opened.phase_timings.as_ref(),
         summary_generation: summary_generation.as_ref(),
-        next_commands: index_next_commands(
-            &opened.summary.root,
-            Some(retrieval),
-            opened.summary.freshness.as_ref(),
-            sidecar_is_full,
-        ),
+        readiness,
+        next_commands,
     };
 
     let markdown = render_index_markdown(&output);
@@ -591,6 +576,7 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
             question: cmd.question,
             budget: cmd.budget.into(),
             task_class: cmd.task_class.map(Into::into),
+            extra_probes: cmd.extra_probes,
             include_evidence: !cmd.no_evidence,
             latency_budget_ms: cmd.latency_budget_ms,
         })
@@ -758,7 +744,7 @@ fn packet_sufficiency_label(status: PacketSufficiencyStatusDto) -> &'static str 
     match status {
         PacketSufficiencyStatusDto::Sufficient => "sufficient",
         PacketSufficiencyStatusDto::Partial => "partial",
-        PacketSufficiencyStatusDto::Insufficient => "insufficient",
+        PacketSufficiencyStatusDto::Insufficient => "blocked",
     }
 }
 
@@ -1106,6 +1092,27 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
+fn run_ready(cmd: ReadyCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "ready")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let summary = runtime.open_project_summary()?;
+    let sidecar = doctor_sidecar_status(&runtime);
+    let mut verdicts = build_summary_readiness(
+        &summary.root,
+        &summary.stats,
+        summary.freshness.as_ref(),
+        &sidecar,
+    );
+    if let Some(goal) = cmd.goal {
+        let goal = goal.as_dto();
+        verdicts.retain(|verdict| verdict.goal == goal);
+    }
+    let output = ReadyOutput { verdicts };
+    let markdown = render_ready_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -1196,6 +1203,10 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
     let before = runtime.open_project_summary()?;
     let opened = runtime.ensure_open_from_summary(cmd.refresh, before.clone())?;
     ensure_index_ready(&opened, "drill")?;
+    if cmd.refresh != args::RefreshMode::None {
+        retrieval::finalize_retrieval_index_for_runtime(&runtime)
+            .context("drill retrieval index finalize")?;
+    }
     let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -3109,7 +3120,10 @@ fn drill_answer_quality_status(needs_source_truth: bool, claim_count: usize) -> 
 }
 
 fn drill_bridge_status_is_graph(status: &str) -> bool {
-    matches!(status, "graph_path" | "reverse_graph_path")
+    matches!(
+        status,
+        "graph_path" | "reverse_graph_path" | "graph_shared_file"
+    )
 }
 
 fn drill_bridge_status_is_partial(status: &str) -> bool {
@@ -4261,7 +4275,8 @@ fn build_drill_bridge_evidence(
             }
 
             let shared_files = neighborhood_file_cache.shared_files(runtime, &from_id, &to_id);
-            fallback_drill_bridge(
+            fallback_drill_bridge_with_search_hints(
+                runtime,
                 &runtime.project_root,
                 from,
                 to,
@@ -4398,6 +4413,7 @@ fn reverse_graph_path_drill_bridge(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn fallback_drill_bridge(
     project_root: &std::path::Path,
     from: &DrillAnchorOutput,
@@ -4410,6 +4426,262 @@ fn fallback_drill_bridge(
 ) -> DrillBridgeEvidenceOutput {
     let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
     let evidence_files = drill_bridge_evidence_hint_files(from, to);
+    fallback_drill_bridge_with_evidence_files(
+        project_root,
+        from,
+        to,
+        from_node,
+        to_node,
+        trail,
+        shared_files,
+        endpoint_files,
+        evidence_files,
+        stale_freshness,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fallback_drill_bridge_with_search_hints(
+    runtime: &RuntimeContext,
+    project_root: &std::path::Path,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: SearchHitOutput,
+    to_node: SearchHitOutput,
+    trail: &TrailContextDto,
+    shared_files: Vec<String>,
+    stale_freshness: bool,
+) -> DrillBridgeEvidenceOutput {
+    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
+    let mut evidence_files = drill_bridge_evidence_hint_files(from, to);
+    let import_hints = drill_bridge_import_hub_hint_files(runtime, from, to, &from_node, &to_node);
+    evidence_files.extend(import_hints.iter().cloned());
+    if import_hints.is_empty() {
+        evidence_files.extend(drill_bridge_search_hint_files(
+            runtime,
+            from,
+            to,
+            &endpoint_files,
+        ));
+    }
+    dedupe_and_rank_drill_files(&mut evidence_files);
+    evidence_files.truncate(12);
+    fallback_drill_bridge_with_evidence_files(
+        project_root,
+        from,
+        to,
+        from_node,
+        to_node,
+        trail,
+        shared_files,
+        endpoint_files,
+        evidence_files,
+        stale_freshness,
+    )
+}
+
+fn drill_bridge_import_hub_hint_files(
+    runtime: &RuntimeContext,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: &SearchHitOutput,
+    to_node: &SearchHitOutput,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Some(path) = from_node.file_path.as_deref() {
+        files.extend(drill_bridge_import_hub_candidates_from_endpoint(
+            runtime, path, &to.anchor,
+        ));
+    }
+    if let Some(path) = to_node.file_path.as_deref() {
+        files.extend(drill_bridge_import_hub_candidates_from_endpoint(
+            runtime,
+            path,
+            &from.anchor,
+        ));
+    }
+    dedupe_and_rank_drill_files(&mut files);
+    files.truncate(12);
+    files
+}
+
+fn drill_bridge_import_hub_candidates_from_endpoint(
+    runtime: &RuntimeContext,
+    endpoint_file: &str,
+    opposite_anchor: &str,
+) -> Vec<String> {
+    let Some(endpoint_path) = drill_relative_source_path(&runtime.project_root, endpoint_file)
+    else {
+        return Vec::new();
+    };
+    let Some(source) = drill_read_source_file(&endpoint_path) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for specifier in drill_js_relative_import_specifiers(&source)
+        .into_iter()
+        .take(32)
+    {
+        let Some(candidate) =
+            drill_resolve_relative_import(&runtime.project_root, &endpoint_path, &specifier)
+        else {
+            continue;
+        };
+        let relative = display::relative_path(&runtime.project_root, &candidate.to_string_lossy());
+        if drill_bridge_evidence_file_rank(&relative) >= 9 {
+            continue;
+        }
+        let Some(candidate_source) = drill_read_source_file(&candidate) else {
+            continue;
+        };
+        if candidate_source.contains(opposite_anchor) {
+            files.push(relative);
+        }
+    }
+    files
+}
+
+fn drill_bridge_search_hint_files(
+    runtime: &RuntimeContext,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    endpoint_files: &[String],
+) -> Vec<String> {
+    let Ok(results) = runtime.browser.search_results(SearchRequest {
+        query: format!("{} {}", from.anchor, to.anchor),
+        repo_text: SearchRepoTextMode::On,
+        limit_per_source: 25,
+        expand_search_plan: false,
+        hybrid_weights: None,
+        hybrid_limits: None,
+    }) else {
+        return Vec::new();
+    };
+    let mut files = drill_bridge_search_hint_files_from_hits(
+        &runtime.project_root,
+        endpoint_files,
+        &results.repo_text_hits,
+        &results.indexed_symbol_hits,
+    );
+    files.retain(|path| {
+        drill_file_contains_terms(&runtime.project_root, path, &[&from.anchor, &to.anchor])
+    });
+    files
+}
+
+fn drill_relative_source_path(
+    project_root: &std::path::Path,
+    path: &str,
+) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() || drill_path_has_escape_component(path) {
+        return None;
+    }
+    let root = fs::canonicalize(project_root).ok()?;
+    let candidate = fs::canonicalize(project_root.join(path)).ok()?;
+    candidate.starts_with(&root).then_some(candidate)
+}
+
+fn drill_path_has_escape_component(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
+fn drill_read_source_file(path: &std::path::Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 1_000_000 {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn drill_file_contains_terms(project_root: &std::path::Path, path: &str, terms: &[&str]) -> bool {
+    let Some(path) = drill_relative_source_path(project_root, path) else {
+        return false;
+    };
+    let Some(source) = drill_read_source_file(&path) else {
+        return false;
+    };
+    terms.iter().all(|term| source.contains(term))
+}
+
+fn drill_js_relative_import_specifiers(source: &str) -> Vec<String> {
+    let mut specifiers = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("import ") {
+            continue;
+        }
+        if let Some(specifier) = drill_quoted_js_specifier(trimmed)
+            && specifier.starts_with('.')
+        {
+            specifiers.push(specifier.to_string());
+        }
+    }
+    specifiers
+}
+
+fn drill_quoted_js_specifier(line: &str) -> Option<&str> {
+    let from_index = line.find(" from ");
+    let search = from_index
+        .map(|index| &line[index + " from ".len()..])
+        .unwrap_or(line);
+    let quote_index = search.find(['\'', '"'])?;
+    let quote = search[quote_index..].chars().next()?;
+    let rest = &search[quote_index + quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(&rest[..end])
+}
+
+fn drill_resolve_relative_import(
+    project_root: &std::path::Path,
+    endpoint_path: &std::path::Path,
+    specifier: &str,
+) -> Option<std::path::PathBuf> {
+    let specifier_path = std::path::Path::new(specifier);
+    if specifier_path.is_absolute() || !specifier.starts_with('.') {
+        return None;
+    }
+    let root = fs::canonicalize(project_root).ok()?;
+    let endpoint = fs::canonicalize(endpoint_path).ok()?;
+    if !endpoint.starts_with(&root) {
+        return None;
+    }
+    let base = endpoint.parent()?.join(specifier_path);
+    let mut candidates = vec![base.clone()];
+    if base.extension().is_none() {
+        for extension in ["js", "jsx", "ts", "tsx", "mjs", "cjs"] {
+            candidates.push(base.with_extension(extension));
+        }
+        for extension in ["js", "jsx", "ts", "tsx", "mjs", "cjs"] {
+            candidates.push(base.join(format!("index.{extension}")));
+        }
+    }
+    candidates.into_iter().find_map(|candidate| {
+        let candidate = fs::canonicalize(candidate).ok()?;
+        (candidate.is_file() && candidate.starts_with(&root)).then_some(candidate)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fallback_drill_bridge_with_evidence_files(
+    project_root: &std::path::Path,
+    from: &DrillAnchorOutput,
+    to: &DrillAnchorOutput,
+    from_node: SearchHitOutput,
+    to_node: SearchHitOutput,
+    trail: &TrailContextDto,
+    shared_files: Vec<String>,
+    endpoint_files: Vec<String>,
+    evidence_files: Vec<String>,
+    stale_freshness: bool,
+) -> DrillBridgeEvidenceOutput {
     let classification = drill_fallback_bridge_classification(
         from,
         to,
@@ -4473,11 +4745,11 @@ fn drill_fallback_bridge_classification(
 ) -> DrillFallbackBridgeClassification {
     if !shared_files.is_empty() {
         return DrillFallbackBridgeClassification {
-            status: "shared_file_only".to_string(),
-            strategy: "to_target_symbol_then_shared_files".to_string(),
-            confidence: "low".to_string(),
-            evidence_kind: "shared_file".to_string(),
-            note: "shared-file evidence is a containment hint; verify source before claiming runtime flow"
+            status: "graph_shared_file".to_string(),
+            strategy: "to_target_symbol_then_graph_shared_files".to_string(),
+            confidence: "medium".to_string(),
+            evidence_kind: "graph_shared_file".to_string(),
+            note: "typed graph neighborhoods found shared source files; this proves shared graph context, not execution direction"
                 .to_string(),
         };
     }
@@ -4775,6 +5047,39 @@ fn drill_bridge_evidence_hint_files(
     push_anchor_evidence_hint_files(&mut files, to);
     let mut seen = HashSet::new();
     files.retain(|path| seen.insert(path.clone()));
+    rank_drill_bridge_evidence_files(&mut files);
+    files.truncate(12);
+    files
+}
+
+fn drill_bridge_search_hint_files_from_hits(
+    project_root: &std::path::Path,
+    endpoint_files: &[String],
+    repo_text_hits: &[SearchHit],
+    indexed_symbol_hits: &[SearchHit],
+) -> Vec<String> {
+    let endpoint_keys = endpoint_files
+        .iter()
+        .map(|path| normalize_drill_path(path))
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for hit in repo_text_hits.iter().chain(indexed_symbol_hits.iter()) {
+        let Some(path) = hit.file_path.as_deref() else {
+            continue;
+        };
+        let path = display::relative_path(project_root, path);
+        let key = normalize_drill_path(&path);
+        if endpoint_keys.contains(&key)
+            || drill_question_target_is_low_signal(&path)
+            || drill_bridge_evidence_file_rank(&path) >= 9
+        {
+            continue;
+        }
+        if seen.insert(key) {
+            files.push(path);
+        }
+    }
     rank_drill_bridge_evidence_files(&mut files);
     files.truncate(12);
     files
@@ -7392,21 +7697,37 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
     let status = if output.usable { "usable" } else { "empty" };
     let _ = writeln!(
         markdown,
-        "- index: {status}; files: {}; indexed: {}; incomplete: {}; error files: {}",
+        "- index: {status}; whole index files: {}; indexed: {}; incomplete: {}; error files: {}; filtered files: {}; visible rows: {}; truncated: {}",
         output.summary.file_count,
         output.summary.indexed_file_count,
         output.summary.incomplete_file_count,
-        output.summary.error_file_count
+        output.summary.error_file_count,
+        output.summary.filtered_file_count,
+        output.summary.visible_file_count,
+        output.summary.truncated
     );
     if !output.summary.language_counts.is_empty() {
         let languages = output
             .summary
             .language_counts
             .iter()
-            .map(|entry| format!("{}={}", entry.language, entry.file_count))
+            .map(|entry| {
+                format!(
+                    "{}={} [{}; {}]",
+                    entry.language, entry.file_count, entry.support_mode, entry.evidence_tier
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let _ = writeln!(markdown, "- languages: {languages}");
+        let claim_labels = output
+            .summary
+            .language_counts
+            .iter()
+            .map(|entry| format!("{}={}", entry.language, entry.claim_label))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "- language_support_claims: {claim_labels}");
     }
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");
@@ -7427,11 +7748,11 @@ fn render_framework_route_coverage(
 
 fn framework_route_coverage_row(entry: &FrameworkRouteCoverageDto) -> String {
     format!(
-        "- {} ({}) status={} fixture_status={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
+        "- {} ({}) status={} coverage_evidence={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
         entry.framework,
         entry.language,
         entry.status,
-        entry.fixture_status,
+        entry.coverage_evidence,
         entry.confidence_floor,
         entry.handler_link_support,
         entry.promotable,
@@ -7934,7 +8255,13 @@ fn build_doctor_output(
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
     let sidecar_retrieval = doctor_sidecar_status(runtime);
-    let sidecar_is_full = sidecar_retrieval.retrieval_mode == "full";
+    let readiness = build_summary_readiness(
+        &project,
+        &summary.stats,
+        summary.freshness.as_ref(),
+        &sidecar_retrieval,
+    );
+    let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
         "project",
@@ -8023,14 +8350,35 @@ fn build_doctor_output(
         sidecar_retrieval,
         retrieval,
         freshness: summary.freshness.clone(),
+        readiness,
         checks,
-        next_commands: index_next_commands(
-            &project,
-            summary.retrieval.as_ref(),
-            summary.freshness.as_ref(),
-            sidecar_is_full,
-        ),
+        next_commands,
         environment,
+    }
+}
+
+fn build_summary_readiness(
+    project: &str,
+    stats: &codestory_contracts::api::StorageStatsDto,
+    freshness: Option<&IndexFreshnessDto>,
+    sidecar: &DoctorSidecarStatusOutput,
+) -> Vec<codestory_contracts::api::ReadinessVerdictDto> {
+    readiness::build_readiness_verdicts(readiness::ReadinessInputs {
+        project,
+        stats,
+        freshness,
+        sidecar: Some(readiness_sidecar_input(sidecar)),
+    })
+}
+
+fn readiness_sidecar_input(
+    sidecar: &DoctorSidecarStatusOutput,
+) -> readiness::ReadinessSidecarInput<'_> {
+    readiness::ReadinessSidecarInput {
+        retrieval_mode: sidecar.retrieval_mode.as_str(),
+        degraded_reason: sidecar.degraded_reason.as_deref(),
+        manifest_generation: sidecar.manifest_generation.as_deref(),
+        manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
     }
 }
 
@@ -8355,6 +8703,7 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
     )
 }
 
+#[cfg(test)]
 fn index_next_commands(
     project: &str,
     retrieval: Option<&codestory_contracts::api::RetrievalStateDto>,
@@ -9596,6 +9945,7 @@ mod tests {
                 semantic_fallbacks: Vec::new(),
                 annotations: Vec::new(),
                 steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
         }
@@ -9609,6 +9959,7 @@ mod tests {
                 edge_count: 0,
                 file_count,
                 error_count: 0,
+                fatal_error_count: 0,
             },
             members: Vec::new(),
             retrieval: None,
@@ -9636,6 +9987,14 @@ mod tests {
             semantic_docs_embedded: Some(12),
             semantic_docs_pending: Some(13),
             semantic_docs_stale: Some(14),
+            symbol_search_docs_written: Some(15),
+            semantic_dense_docs_skipped: Some(16),
+            semantic_dense_public_api: Some(17),
+            semantic_dense_entrypoint: Some(18),
+            semantic_dense_documented_nontrivial: Some(19),
+            semantic_dense_central_graph_node: Some(20),
+            semantic_dense_component_report: Some(21),
+            semantic_dense_unstructured_doc: Some(22),
             deferred_indexes_ms: Some(7),
             summary_snapshot_ms: Some(8),
             detail_snapshot_ms: Some(9),
@@ -9929,6 +10288,144 @@ mod tests {
     }
 
     #[test]
+    fn drill_bridge_search_hints_keep_middle_source_files() {
+        fn search_hit(
+            name: &str,
+            path: &str,
+            origin: codestory_contracts::api::SearchHitOrigin,
+        ) -> SearchHit {
+            SearchHit {
+                node_id: NodeId(format!("{path}:{name}")),
+                display_name: name.to_string(),
+                kind: NodeKind::FUNCTION,
+                file_path: Some(path.to_string()),
+                line: Some(1),
+                score: 1.0,
+                origin,
+                match_quality: None,
+                resolvable: true,
+                score_breakdown: None,
+            }
+        }
+
+        let endpoint_files = vec![
+            "lib/axios.js".to_string(),
+            "lib/core/dispatchRequest.js".to_string(),
+        ];
+        let repo_text_hits = vec![
+            search_hit(
+                "Axios.js",
+                "lib/core/Axios.js",
+                codestory_contracts::api::SearchHitOrigin::TextMatch,
+            ),
+            search_hit(
+                "axios.js",
+                "lib/axios.js",
+                codestory_contracts::api::SearchHitOrigin::TextMatch,
+            ),
+            search_hit(
+                "bundle.js",
+                "dist/bundle.js",
+                codestory_contracts::api::SearchHitOrigin::TextMatch,
+            ),
+        ];
+        let indexed_symbol_hits = vec![
+            search_hit(
+                "Axios",
+                "lib/core/Axios.js",
+                codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            ),
+            search_hit(
+                "InterceptorManager",
+                "lib/core/InterceptorManager.js",
+                codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            ),
+        ];
+
+        let files = drill_bridge_search_hint_files_from_hits(
+            Path::new("C:/repo"),
+            &endpoint_files,
+            &repo_text_hits,
+            &indexed_symbol_hits,
+        );
+
+        assert_eq!(
+            files,
+            vec![
+                "lib/core/Axios.js".to_string(),
+                "lib/core/InterceptorManager.js".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn drill_import_hub_helpers_resolve_relative_js_imports() {
+        let temp = tempdir().expect("temp dir");
+        let lib_dir = temp.path().join("lib");
+        let core_dir = lib_dir.join("core");
+        fs::create_dir_all(&core_dir).expect("create dirs");
+        let endpoint = lib_dir.join("axios.js");
+        let axios_core = core_dir.join("Axios.js");
+        fs::write(
+            &endpoint,
+            "import Axios from './core/Axios.js';\nimport './polyfill.js';\n",
+        )
+        .expect("write endpoint");
+        fs::write(
+            &axios_core,
+            "import dispatchRequest from './dispatchRequest.js';\nclass Axios {}\n",
+        )
+        .expect("write candidate");
+        let outside = temp.path().with_file_name(format!(
+            "{}-outside.js",
+            temp.path().file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "class Outside {}\n").expect("write outside file");
+
+        let source = fs::read_to_string(&endpoint).expect("read endpoint");
+        let specifiers = drill_js_relative_import_specifiers(&source);
+
+        assert_eq!(
+            specifiers,
+            vec!["./core/Axios.js".to_string(), "./polyfill.js".to_string()]
+        );
+        assert_eq!(
+            drill_resolve_relative_import(temp.path(), &endpoint, "./core/Axios.js"),
+            Some(fs::canonicalize(&axios_core).expect("canonical axios core"))
+        );
+        assert_eq!(
+            drill_relative_source_path(temp.path(), &axios_core.to_string_lossy()),
+            None
+        );
+        assert_eq!(
+            drill_relative_source_path(temp.path(), "../outside.js"),
+            None
+        );
+        assert_eq!(
+            drill_resolve_relative_import(
+                temp.path(),
+                &endpoint,
+                &format!("../{}", outside.file_name().unwrap().to_string_lossy())
+            ),
+            None
+        );
+        assert_eq!(
+            drill_resolve_relative_import(temp.path(), &endpoint, &outside.to_string_lossy()),
+            None
+        );
+        assert!(drill_file_contains_terms(
+            temp.path(),
+            "lib/core/Axios.js",
+            &["dispatchRequest", "Axios"]
+        ));
+        assert!(!drill_file_contains_terms(
+            temp.path(),
+            "lib/core/Axios.js",
+            &["createInstance", "dispatchRequest"]
+        ));
+    }
+
+    #[test]
     fn drill_bridge_constructors_preserve_status_contract() {
         let from = sample_drill_anchor("FromAnchor", "a");
         let to = sample_drill_anchor("ToAnchor", "b");
@@ -9975,9 +10472,12 @@ mod tests {
             vec!["src/lib.rs".to_string()],
             false,
         );
-        assert_eq!(shared_file.status, "shared_file_only");
-        assert_eq!(shared_file.strategy, "to_target_symbol_then_shared_files");
-        assert_eq!(shared_file.confidence, "low");
+        assert_eq!(shared_file.status, "graph_shared_file");
+        assert_eq!(
+            shared_file.strategy,
+            "to_target_symbol_then_graph_shared_files"
+        );
+        assert_eq!(shared_file.confidence, "medium");
 
         let mut hinted_from = sample_drill_anchor("FromAnchor", "a");
         hinted_from.consumer_summary = Some(DrillAnchorConsumerSummaryOutput {
@@ -10059,7 +10559,7 @@ mod tests {
             vec!["src/shared.rs".to_string()],
             false,
         );
-        assert_eq!(shared_with_hints.status, "shared_file_only");
+        assert_eq!(shared_with_hints.status, "graph_shared_file");
         assert_eq!(shared_with_hints.shared_files, vec!["src/shared.rs"]);
         assert_eq!(shared_with_hints.evidence_files, vec!["src/from-user.rs"]);
 
@@ -10528,6 +11028,7 @@ mod tests {
             retrieval: &retrieval,
             phase_timings: Some(&timings),
             summary_generation: None,
+            readiness: Vec::new(),
             next_commands: Vec::new(),
         };
 
@@ -11175,6 +11676,7 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.1,
                 total: 0.9,
+                provenance: Vec::new(),
             }),
         }];
 
@@ -11269,9 +11771,15 @@ mod tests {
 
     #[test]
     fn command_quoting_single_quotes_shell_sensitive_values() {
+        #[cfg(windows)]
         assert_eq!(
             quote_command_value("Inspect $env:SECRET and $(Get-ChildItem) and 'literal'"),
             "'Inspect $env:SECRET and $(Get-ChildItem) and ''literal'''"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            quote_command_value("Inspect $env:SECRET and $(Get-ChildItem) and 'literal'"),
+            r"'Inspect $env:SECRET and $(Get-ChildItem) and '\''literal'\'''"
         );
         assert_eq!(
             quote_command_path(Path::new("C:/repo/$hidden")),

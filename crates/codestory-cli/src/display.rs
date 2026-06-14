@@ -13,6 +13,37 @@ pub(crate) fn clean_path_string(path: &str) -> String {
     stringified
 }
 
+pub(crate) fn quote_command_path(path: &Path) -> String {
+    let value = clean_path_string(&path.to_string_lossy());
+    quote_command_argument_value(&value)
+}
+
+pub(crate) fn quote_command_value(value: &str) -> String {
+    quote_shell_single_quoted_value(value)
+}
+
+pub(crate) fn quote_command_argument_value(value: &str) -> String {
+    if command_value_needs_single_quotes(value) {
+        quote_command_value(value)
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
+fn command_value_needs_single_quotes(value: &str) -> bool {
+    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
+}
+
+#[cfg(windows)]
+fn quote_shell_single_quoted_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn quote_shell_single_quoted_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 pub(crate) fn relative_path(project_root: &Path, raw: &str) -> String {
     let normalized_root = clean_path_string(&project_root.to_string_lossy());
     let normalized_raw = clean_path_string(raw);

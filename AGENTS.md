@@ -40,7 +40,17 @@
 - PRs should include a summary, tests run, linked issues, and relevant artifacts for behavior changes.
 
 ## Retrieval documentation
-- Canonical sidecar retrieval docs are `docs/architecture/retrieval-design.md`, `docs/architecture/retrieval-parser-compat-matrix.md`, `docs/testing/retrieval-architecture.md`, and `docs/ops/retrieval-sidecars.md`.
+- Canonical sidecar retrieval docs are `docs/architecture/retrieval-design.md`, `docs/testing/retrieval-architecture.md`, and `docs/ops/retrieval-sidecars.md`. Parser compatibility records live in `docs/architecture/language-support.md`.
+
+## Coding & Design Constraints
+
+Current merge bar for production changes:
+
+1. No holdout literals in production paths — packet/search code must not depend on benchmark holdout repo names, fixture paths, or expected-answer shapes.
+2. Eval probes stay test-only — benchmark-shaped probe catalogs remain behind the test-only eval-probe boundary.
+3. Language support claims match claim tier definitions — distinguish parser-backed graph coverage, structural collectors, and agent-facing packet quality.
+4. Benchmark assertions reference living stats, not hard-coded baselines — repo-scale timing belongs in `docs/testing/codestory-e2e-stats-log.md`.
+5. Retrieval mode changes require sidecar evidence — agent packet/search readiness must report full sidecar retrieval, not semantic-only fallback.
 
 ## Security & Configuration Tips
 - Keep secrets out of the repo; pass credentials via environment variables.

@@ -3,29 +3,16 @@
 This is the operator guide. It keeps setup, common workflows, retrieval defaults,
 and recovery notes in one place.
 
+Examples use POSIX shell syntax unless a block is labeled PowerShell. On
+Windows, use `.\target\release\codestory-cli.exe` for the release binary,
+`$env:NAME = "value"` for environment variables, and Windows paths when that is
+the workspace you are indexing.
+
 ## Install The Skill
 
 Install the grounding skill once, then point it at explicit target workspaces.
-
-```powershell
-$SkillHome = "<agent-global-skill-directory>"
-New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
-Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
-& "$SkillHome\codestory-grounding\scripts\setup.ps1"
-```
-
-On Unix-like systems:
-
-```sh
-bash "<agent-global-skill-directory>/codestory-grounding/scripts/setup.sh"
-```
-
-The setup script prints the resolved `CODESTORY_CLI` path. Persist it if your
-agent environment does not already preserve the variable between sessions.
-
-```powershell
-setx CODESTORY_CLI "C:\Users\you\AppData\Local\CodeStory\bin\codestory-cli.exe"
-```
+See [README — Install As An Agent Skill](../README.md#install-as-an-agent-skill)
+for the full copy/setup commands and Windows PowerShell variant.
 
 The source skill package lives at
 [../.agents/skills/codestory-grounding/SKILL.md](../.agents/skills/codestory-grounding/SKILL.md).
@@ -38,19 +25,19 @@ setup fetches and builds the remote default branch.
 Use this path when you are changing CodeStory itself or testing the current
 checkout.
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
-$CodeStoryCli = ".\target\release\codestory-cli.exe"
-& $CodeStoryCli --help
+CODESTORY_CLI="./target/release/codestory-cli"
+"$CODESTORY_CLI" --help
 ```
 
 Pick a target workspace explicitly:
 
-```powershell
-$TargetWorkspace = "C:\path\to\repo"
-& $CodeStoryCli doctor --project $TargetWorkspace
-& $CodeStoryCli index --project $TargetWorkspace --refresh auto
-& $CodeStoryCli ground --project $TargetWorkspace --why
+```sh
+TARGET_WORKSPACE="/path/to/repo"
+"$CODESTORY_CLI" doctor --project "$TARGET_WORKSPACE"
+"$CODESTORY_CLI" index --project "$TARGET_WORKSPACE" --refresh auto
+"$CODESTORY_CLI" ground --project "$TARGET_WORKSPACE" --why
 ```
 
 ## Readiness Tracks
@@ -58,7 +45,7 @@ $TargetWorkspace = "C:\path\to\repo"
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
 
-### Local navigation readiness
+### Local navigation/cache readiness
 
 This lane is for local browsing and source navigation. It uses the project
 SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
@@ -68,7 +55,7 @@ SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
 means the local cache, graph, lexical index, and DB-backed navigation commands
 are usable. It does not prove agent packet/search readiness.
 
-### Agent packet/search readiness
+### Agent packet/search sidecar readiness
 
 This lane is for agent-facing `packet` and `search` evidence. It requires the
 sidecar retrieval stack to be built and healthy: Zoekt lexical shards, Qdrant
@@ -85,7 +72,7 @@ described as agent packet/search readiness.
 
 ### I need a repo overview
 
-```powershell
+```sh
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
@@ -105,18 +92,20 @@ files as outputs to regenerate, not source-of-truth state.
 
 ### I need evidence for a broad question
 
-```powershell
+```sh
 codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 ```
 
 Use `packet` for questions like "how does routing work?" or "what owns indexing
-state?" It returns citations, gaps, and follow-up commands. If the packet says
-the evidence is incomplete, follow the named commands instead of opening
-unstructured source files directly.
+state?" It returns a `sufficient`, `partial`, or `blocked` status with
+citations, trust limits, gaps, and follow-up commands. If the packet is
+`partial` or `blocked`, follow the named source-truth commands instead of
+opening unstructured source files directly. Treat `sufficient` as evidence
+coverage, not final answer-quality proof.
 
 ### I need to understand one symbol or file
 
-```powershell
+```sh
 codestory-cli search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
 codestory-cli explore --project <target-workspace> --id <node-id> --no-tui
 codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative
@@ -126,7 +115,7 @@ codestory-cli snippet --project <target-workspace> --id <node-id> --context 40
 Start with `search`, pick a concrete `node-id`, then inspect the relationships
 and source. Use `context` when you want a bundled handoff around that target:
 
-```powershell
+```sh
 codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-name
 ```
 
@@ -136,7 +125,7 @@ target-first; it is not an open chat endpoint and is not a replacement for broad
 
 ### I changed files and need likely impact
 
-```powershell
+```sh
 codestory-cli index --project <target-workspace> --refresh incremental
 codestory-cli affected --project <target-workspace> --format markdown
 git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
@@ -147,25 +136,42 @@ Treat `affected` as test-selection evidence, not a replacement for tests. The
 default command preserves git name-status records; path-only stdin remains
 available when another tool already chose the file list.
 
-### The cache or retrieval looks stale
+### The cache or local navigation looks stale
 
-```powershell
+```sh
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli doctor --project <target-workspace>
 ```
 
-If `doctor` reports stale inventory, semantic contract mismatch, missing managed
-assets, or a non-`full` retrieval mode, fix that layer before investigating
-answer quality. Treat the health report as the first source of truth for cache
-and retrieval state.
+If `doctor` reports stale inventory, dense-anchor contract mismatch, missing
+managed assets, or a non-`full` retrieval mode, fix that layer before
+investigating answer quality. Treat the health report as the first source of
+truth for cache and retrieval state.
+
+For agent-facing packet/search recovery, use the full sidecar repair sequence
+that `ready --goal agent` reports:
+
+```sh
+codestory-cli retrieval bootstrap --project <target-workspace> --format json
+codestory-cli retrieval index --project <target-workspace> --refresh full --format json
+codestory-cli retrieval status --project <target-workspace> --format json
+codestory-cli doctor --project <target-workspace> --format markdown
+```
+
+When the core index is missing, stale, unchecked, or has recorded fatal indexing
+errors, `ready` reports the necessary `codestory-cli index` repair first.
+Otherwise, sidecar recovery does not need to repeat a full core reindex.
+`retrieval bootstrap` prepares or checks the local sidecar services. The target
+workspace is not packet/search-ready until `retrieval index` writes a current
+target manifest and `doctor` or `retrieval status` reports `retrieval_mode=full`.
 
 ## Core Commands
 
 - `doctor`: read-only health check for project, cache, index, retrieval, and
   environment readiness.
-- `index`: build or refresh the SQLite graph, snapshots, search state, and
-  semantic docs.
+- `index`: build or refresh the SQLite graph, snapshots, search state,
+  graph-native symbol docs, component reports, and selected dense anchors.
 - `ground`: broad repo-level orientation snapshot; `--why` explains retrieval
   mode, coverage, gaps, and next commands.
 - `report`: derived Markdown repo report or JSON graph export from the current
@@ -224,32 +230,13 @@ reset, schema change, or suspected stale-state incident.
 
 ## Predictable Output Modes
 
-Most commands default to Markdown because the normal operator path is human
-review. Use `--format markdown` when the output will be read directly in a
-terminal, pasted into a report, or inspected during recovery.
+Most commands default to Markdown for human review. Use `--format json` when automation needs the complete structured result, including exact field comparisons such as `retrieval_mode` or cache paths. Use `--output-file <PATH>` when the artifact should live outside terminal logs. The parent directory must already exist.
 
-Agent-facing Markdown starts with an operator header when the command has enough
-status evidence to do so: `Status`, `Trust`, `Next Action`, and `Proof Tier`
-come before dense citations, diagnostics, or graph details. This is the default
-shape for `doctor`, `ground --why`, `search --why`, `packet`, and `context`.
+`explore` opens the terminal UI by default when a TUI is available. Use `--no-tui`, `--plain`, or `CODESTORY_NO_TUI=1` for predictable command output in agent runs, tests, non-interactive terminals, and CI logs.
 
-`search --why` keeps provenance compact by default. Use
-`search --why --plan-details` only when you need the full broad-query search
-plan, including subqueries, candidate windows, bridge evidence, rejected
-candidates, and source-truth checks.
-
-Use `--format json` when automation needs the complete structured result,
-including fields that Markdown may summarize. JSON is the safer choice for
-tests, scripts, status gates, and any workflow that must compare exact values
-such as `retrieval_mode`, cache paths, or timing fields.
-
-Use `--output-file <PATH>` when a command produces an artifact that should be
-kept separate from terminal logs. The parent directory must already exist.
-Treat the file as the durable result and stdout/stderr as command status.
-
-`explore` opens the terminal UI by default when a TUI is available. Use `--no-tui`
-for predictable command output in agent runs, tests, non-interactive terminals,
-and CI logs.
+Agent-facing Markdown may start with `Status`, `Trust`, `Next Action`, and
+`Proof Tier` before dense citations. Use `search --why --plan-details` only when
+you need the full broad-query search plan.
 
 ## Retrieval Defaults
 
@@ -261,7 +248,7 @@ older local search path.
 
 Basic local index:
 
-```powershell
+```sh
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
@@ -272,11 +259,11 @@ write the retrieval manifest, or prove agent packet/search readiness.
 
 Product sidecar setup for agent-facing packet/search:
 
-```powershell
+```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
-$env:CODESTORY_EMBED_MODEL_DIR = (Resolve-Path .\target\retrieval-models).Path
-$env:CODESTORY_EMBED_BACKEND = "llamacpp"
-$env:CODESTORY_EMBED_LLAMACPP_URL = "http://127.0.0.1:8080/v1/embeddings"
+export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
+export CODESTORY_EMBED_BACKEND="llamacpp"
+export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
 cargo retrieval-setup
 
 codestory-cli index --project <target-workspace> --refresh full
@@ -284,6 +271,13 @@ codestory-cli retrieval index --project <target-workspace> --refresh full
 codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace>
 ```
+
+`setup-retrieval-env.mjs --fetch-embed-model` downloads the configured GGUF to a
+temporary path and verifies the pinned artifact before renaming it into
+`CODESTORY_EMBED_MODEL_DIR`. The accepted artifact is exactly `117974304` bytes
+with SHA-256
+`ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`; all
+configured mirrors must pass the same check.
 
 Run `codestory-cli retrieval index` only after the local sidecar services,
 llama.cpp embedding endpoint, and `bge-base-en-v1.5` model configuration are
@@ -295,7 +289,7 @@ so backend drift is visible.
 
 Legacy managed embedding setup is local semantic/diagnostic only:
 
-```powershell
+```sh
 codestory-cli setup embeddings --project <target-workspace> --dry-run --format json
 codestory-cli setup embeddings --project <target-workspace>
 ```
@@ -384,7 +378,7 @@ Other values currently resolve to the durable default.
 
 Typical recovery flow:
 
-```powershell
+```sh
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli search --project <target-workspace> --query WorkspaceIndexer
@@ -394,20 +388,20 @@ If the cache directory itself is suspect, get the exact project cache path from
 `doctor`, verify that it is under the CodeStory cache root, move it aside first,
 then rebuild. Remove the backup only after the fresh index is healthy:
 
-```powershell
-$cacheDir = "<project-cache-dir-from-doctor>"
-$cacheRoot = Join-Path $env:LOCALAPPDATA "CodeStory"
-$resolvedCache = (Resolve-Path -LiteralPath $cacheDir).Path
-$resolvedRoot = (Resolve-Path -LiteralPath $cacheRoot).Path
-$relative = [System.IO.Path]::GetRelativePath($resolvedRoot, $resolvedCache)
-if ($relative.StartsWith("..") -or [System.IO.Path]::IsPathRooted($relative)) {
-  throw "Refusing to touch cache outside CodeStory cache root: $resolvedCache"
-}
-$backup = "$resolvedCache.bak-$(Get-Date -Format yyyyMMddHHmmss)"
-Rename-Item -LiteralPath $resolvedCache -NewName (Split-Path -Leaf $backup)
+```sh
+cache_dir="<project-cache-dir-from-doctor>"
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/codestory"
+resolved_cache="$(realpath "$cache_dir")"
+resolved_root="$(realpath "$cache_root")"
+case "$resolved_cache" in
+  "$resolved_root"/*) ;;
+  *) echo "Refusing to touch cache outside CodeStory cache root: $resolved_cache" >&2; exit 1 ;;
+esac
+backup="${resolved_cache}.bak-$(date +%Y%m%d%H%M%S)"
+mv "$resolved_cache" "$backup"
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli doctor --project <target-workspace>
-Remove-Item -LiteralPath $backup -Recurse -Force
+rm -rf "$backup"
 ```
 
 Low-memory guidance:
@@ -423,7 +417,7 @@ Low-memory guidance:
 
 Run Cargo commands serially in this repo:
 
-```powershell
+```sh
 cargo fmt --check
 cargo check
 cargo test
@@ -432,13 +426,13 @@ cargo clippy --all-targets -- -D warnings
 
 Focused docs/onboarding lane:
 
-```powershell
+```sh
 cargo test -p codestory-cli --test onboarding_contracts
 ```
 
 Release-blocking fidelity lanes:
 
-```powershell
+```sh
 cargo test -p codestory-indexer --test fidelity_regression
 cargo test -p codestory-indexer --test tictactoe_language_coverage
 cargo test -p codestory-runtime --test retrieval_eval
@@ -450,7 +444,7 @@ semantic quality assertions.
 
 Heavy repo-scale timing lane:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
@@ -467,5 +461,5 @@ changes.
 - [architecture/runtime-execution-path.md](architecture/runtime-execution-path.md)
 - [contributors/debugging.md](contributors/debugging.md)
 - [contributors/testing-matrix.md](contributors/testing-matrix.md)
-- [testing/benchmark-results.md](testing/benchmark-results.md)
+- [testing/benchmark-ledger.md](testing/benchmark-ledger.md)
 - [testing/codestory-stdio-warm-loop-stats.md](testing/codestory-stdio-warm-loop-stats.md)

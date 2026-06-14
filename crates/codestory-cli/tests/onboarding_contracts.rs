@@ -186,8 +186,11 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
-    assert!(readme.contains("docs/testing/benchmark-results.md"));
-    assert!(readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"));
+    assert!(readme.contains("docs/architecture/language-support.md"));
+    assert!(readme.contains("docs/testing/benchmark-ledger.md"));
+    assert!(readme.contains(
+        r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
+    ));
     assert!(readme.contains("serve --stdio"));
     assert!(readme.contains("docs/architecture/overview.md"));
     assert!(readme.contains("docs/contributors/debugging.md"));
@@ -203,6 +206,7 @@ fn readme_keeps_customer_first_onboarding() {
         "docs/concepts/how-codestory-works.md",
         "docs/architecture/overview.md",
         "docs/architecture/runtime-execution-path.md",
+        "docs/architecture/language-support.md",
         "docs/architecture/subsystems/contracts.md",
         "docs/architecture/subsystems/workspace.md",
         "docs/architecture/subsystems/indexer.md",
@@ -212,7 +216,6 @@ fn readme_keeps_customer_first_onboarding() {
         "docs/contributors/getting-started.md",
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
-        "docs/decision-log.md",
         ".agents/skills/codestory-grounding/scripts/setup.ps1",
         ".agents/skills/codestory-grounding/scripts/setup.sh",
         "scripts/codestory-agent-ab-benchmark.mjs",
@@ -250,11 +253,15 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
     let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
     let testing_matrix = fs::read_to_string(root.join("docs/contributors/testing-matrix.md"))
         .expect("testing matrix should exist");
-    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
-        .expect("benchmark scorecard should exist");
+    let language_support = fs::read_to_string(root.join("docs/architecture/language-support.md"))
+        .expect("language support doc should exist");
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-ledger.md"))
+        .expect("benchmark ledger should exist");
 
     assert!(
-        readme.contains("setup embeddings --project $TargetWorkspace --dry-run --format json"),
+        readme.contains(
+            r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
+        ),
         "README quickstart should show first-run semantic setup dry-run"
     );
     assert!(
@@ -279,9 +286,37 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
         "testing matrix should not present an old hard-coded baseline as current"
     );
     assert!(
-        benchmark_scorecard.contains("[benchmark ledger](benchmark-ledger.md)")
+        benchmark_scorecard.contains("## Current Scorecard")
             && benchmark_scorecard.contains("codestory-e2e-stats-log.md"),
-        "benchmark scorecard should link detailed history and living timing logs"
+        "benchmark ledger should keep the scorecard and living timing log references"
+    );
+    for required in [
+        "parser-backed graph",
+        "fidelity-gated",
+        "structural collector",
+        "candidate parser compatibility record",
+        "Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash",
+        "Kotlin, Swift, Dart, Bash",
+    ] {
+        assert!(
+            language_support.contains(required),
+            "language support doc should preserve support-claim term `{required}`"
+        );
+    }
+    for required in [
+        "crates/codestory-contracts/src/language_support.rs",
+        "language_support_profile_for_ext",
+        "language_support_profile_for_language_name",
+        "get_language_for_ext",
+    ] {
+        assert!(
+            language_support.contains(required),
+            "language support docs should mention `{required}`"
+        );
+    }
+    assert!(
+        testing_matrix.contains("../architecture/language-support.md"),
+        "testing matrix should link the language support claim contract"
     );
     assert!(
         root.join("docs/testing/benchmark-ledger.md").exists(),
@@ -309,7 +344,11 @@ fn usage_doc_keeps_agent_contract_terms_out_of_operator_flow() {
     assert!(usage.contains("Common Workflows"));
     assert!(usage.contains("I need a repo overview"));
     assert!(usage.contains("I need evidence for a broad question"));
-    assert!(usage.contains("The cache or retrieval looks stale"));
+    assert!(usage.contains("The cache or local navigation looks stale"));
+    assert!(usage.contains("For agent-facing packet/search recovery"));
+    assert!(usage.contains(
+        "codestory-cli retrieval index --project <target-workspace> --refresh full --format json"
+    ));
     for blocked in [
         "sufficiency.avoid_opening",
         "supported-claim wording",
@@ -357,8 +396,8 @@ fn usage_doc_names_two_readiness_tracks_and_predictable_output_modes() {
 #[test]
 fn benchmark_docs_show_proof_tier_ladder() {
     let root = repo_root();
-    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
-        .expect("benchmark scorecard should exist");
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-ledger.md"))
+        .expect("benchmark ledger should exist");
 
     assert!(benchmark_scorecard.contains("## Proof Tier Ladder"));
     for tier in [
@@ -369,7 +408,7 @@ fn benchmark_docs_show_proof_tier_ladder() {
     ] {
         assert!(
             benchmark_scorecard.contains(tier),
-            "benchmark scorecard should explain proof tier {tier}"
+            "benchmark ledger should explain proof tier {tier}"
         );
     }
     assert!(benchmark_scorecard.contains("Full sidecar readiness, agent packet/search readiness"));

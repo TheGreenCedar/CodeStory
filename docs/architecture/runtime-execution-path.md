@@ -6,36 +6,15 @@ This page describes the current command path for the core CLI workflows:
 
 ## Index Command
 
-```mermaid
-sequenceDiagram
-    participant CLI as codestory-cli
-    participant Runtime as codestory-runtime
-    participant Workspace as codestory-workspace
-    participant Indexer as codestory-indexer
-    participant Store as codestory-store
-    participant Search as runtime search
+See [indexing pipeline](indexing-pipeline.md) for the full indexing lifecycle,
+refresh modes, and staged snapshot publish path.
 
-    CLI->>Runtime: parse args and build context
-    Runtime->>Workspace: open project and compute refresh inputs
-    Workspace-->>Runtime: refresh plan
-    Runtime->>Store: open staged or live store
-    Runtime->>Indexer: run WorkspaceIndexer
-    Indexer->>Store: flush graph, projections, search docs
-    Runtime->>Store: publish staged snapshot when a full refresh completes
-    Runtime->>Search: sync lexical projection and semantic docs
-    Search->>Store: reuse, embed, upsert, reload, and prune semantic docs
-```
+At runtime, `codestory-cli` delegates to `codestory-runtime`, which opens the
+workspace refresh plan, runs `codestory-indexer::WorkspaceIndexer`, flushes graph
+and search projections through `codestory-store`, and synchronizes symbol docs,
+component reports, and selected dense anchors before returning the index summary.
 
-1. `codestory-cli` parses the request and builds a runtime context.
-2. `codestory-runtime` opens the project root, store path, and workspace manifest.
-3. `codestory-workspace` computes the refresh plan from discovery plus stored file inventory.
-4. `codestory-runtime` opens a staged or live store depending on refresh mode.
-5. `codestory-indexer::WorkspaceIndexer` parses files, extracts graph artifacts, flushes projection batches, and runs resolution.
-6. `codestory-store` updates graph rows, occurrence rows, callable projection state, search-doc rows, and snapshot invalidation state.
-7. Runtime finalizes staged builds through `SnapshotStore` and publishes the finished snapshot when a full refresh completes.
-8. Runtime refreshes the search-symbol projection and synchronizes semantic docs before returning the index summary.
-
-Default index runs do not defer semantic docs. When embedding assets are available, the returned retrieval state should have `semantic_ready = true` and a non-zero semantic doc count. If semantic assets are missing or hybrid retrieval is disabled, runtime still completes graph and lexical state and reports the degraded-state reason.
+Default index runs do not defer symbol docs. When embedding assets are available, the returned retrieval state reports the selected dense-anchor corpus for `graph_first_v1`; that corpus may be zero for graph-only projects. If embedding assets are missing, runtime still completes graph, lexical, symbol-doc, and component-report state and reports the degraded-state reason instead of pretending dense retrieval is ready.
 
 ## Search Command
 
@@ -61,13 +40,15 @@ sequenceDiagram
 2. Runtime asks `codestory-retrieval` for sidecar status before serving results.
 3. Retrieval status loads the stored retrieval manifest, applies stale-manifest checks, and reports the exact degraded reason before any healthy sidecar probe can bless an invalid manifest.
 4. `retrieval_mode = full` is the only product-serving search path. Missing, stale, partial, or non-product sidecar state fails closed with the degraded reason.
-5. Runtime executes the mandatory sidecar query, resolves returned candidates back into indexed symbols, and rejects unresolved or non-full candidate sets before returning product hits.
+5. Runtime executes the mandatory sidecar query in AST-first order: exact symbol/AST lookup, lexical source and virtual-doc search, graph expansion, then dense-anchor augmentation. It resolves returned candidates back into indexed symbols and rejects unresolved or non-full candidate sets before returning product hits.
 6. Hybrid semantic state, repo-text matches, and local lexical search are diagnostic/navigation surfaces only; they are not a product fallback for `search`.
 7. For broad architecture-style queries, runtime may assemble a Search Plan with extracted/dropped terms, bounded subqueries, candidate windows, anchor groups, bridge evidence, next commands, and source-truth checks.
 8. Runtime maps retrieval state plus resolved sidecar matches into contract DTOs and CLI renders them.
 
 When `search --why` is requested, the CLI renders compact explanations from the
 same DTO surface: sidecar origin, degraded/fail-closed state, candidate
+provenance (`exact`, `lexical_source`, `symbol_doc`, `graph_neighbor`,
+`component_report`, `dense_anchor`),
 resolution details, and the Search Plan when the broad-query planner emitted
 one. Legacy hybrid score details may appear only as diagnostic data from
 non-serving paths.
@@ -119,7 +100,7 @@ stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
 reports cache/index/retrieval health without mutating state.
 
 `explore` remains the browser surface until the
-[browser surface gate](browser-surface-gate.md) is satisfied. Do not add a
+[browser surface gate](overview.md#browser-surface-gate) is satisfied. Do not add a
 separate `browse` command, web UI route, or browser-specific UI without
 current manifest, warm-loop, stress-lane, explore, and screenshot-review
 evidence.

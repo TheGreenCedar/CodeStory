@@ -1026,7 +1026,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "string",
                 "packet outputSchema should expose a stable packet id: {tool}"
             );
-            for field in ["plan", "answer", "budget", "sufficiency", "benchmark_trace"] {
+            for field in [
+                "plan",
+                "answer",
+                "budget",
+                "sufficiency",
+                "retrieval_trace_summary",
+            ] {
                 assert!(
                     required_fields(output_schema).contains(field),
                     "packet outputSchema should require {field}: {tool}"
@@ -1359,12 +1365,35 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should include semantic readiness/doc count/fallback information: {status}"
     );
     let next_call_text = status["recommended_next_calls"].to_string();
+    let readiness = status["readiness"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status should include readiness verdicts: {status}"));
     assert!(
-        next_call_text
-            .find("retrieval status")
-            .unwrap_or(usize::MAX)
-            < next_call_text.find("search").unwrap_or(usize::MAX),
-        "status should recommend sidecar status/index repair before search when mode is not full: {status}"
+        readiness
+            .iter()
+            .any(|verdict| verdict["goal"] == "agent_packet_search"
+                && verdict["minimum_next"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty())
+                && verdict["full_repair"]
+                    .as_array()
+                    .is_some_and(|commands| !commands.is_empty())),
+        "status should expose agent readiness with minimum_next/full_repair: {status}"
+    );
+    assert!(
+        !next_call_text.contains("\"tool\":\"packet\"")
+            && !next_call_text.contains("\"tool\":\"search\""),
+        "status should recommend repair, not packet/search calls, when mode is not full: {status}"
+    );
+    assert!(
+        !next_call_text.contains("codestory-cli index --project")
+            && next_call_text.contains("--refresh full")
+            && next_call_text.contains("retrieval bootstrap")
+            && next_call_text.contains("retrieval index")
+            && next_call_text.contains("retrieval status")
+            && next_call_text.contains("codestory://status")
+            && next_call_text.contains("codestory://agent-guide"),
+        "status should recommend sidecar repair without repeating a fresh core index when mode is not full: {status}"
     );
     assert!(
         status
@@ -1432,6 +1461,18 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     }
 
     assert_stale_freshness_counts(&last_status, "codestory://status");
+    let status_next_call_text = last_status["recommended_next_calls"].to_string();
+    assert!(
+        !status_next_call_text.contains("\"tool\":\"packet\"")
+            && !status_next_call_text.contains("\"tool\":\"search\""),
+        "stale index readiness should recommend repair, not packet/search calls: {last_status}"
+    );
+    assert!(
+        status_next_call_text.contains("codestory-cli index --project")
+            && status_next_call_text.contains("--refresh incremental")
+            && status_next_call_text.contains("codestory://status"),
+        "stale index readiness should recommend index repair and a status recheck: {last_status}"
+    );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];
     let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
@@ -1665,18 +1706,35 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include next_commands: {response}"));
     assert!(
-        next_commands
-            .iter()
-            .any(|command| command.as_str().is_some_and(|text| text
-                .contains("codestory-cli index")
-                && text.contains("--refresh full"))),
-        "stdio search error should include index repair command: {response}"
+        details["minimum_next"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty()),
+        "stdio search error should include minimum_next: {response}"
+    );
+    assert!(
+        details["full_repair"]
+            .as_array()
+            .is_some_and(|commands| commands.len() >= next_commands.len()),
+        "stdio search error should include full_repair: {response}"
+    );
+    assert!(
+        next_commands.iter().all(|command| command
+            .as_str()
+            .is_some_and(|text| !text.contains("codestory-cli index"))),
+        "stdio search sidecar errors should not repeat core index repair commands: {response}"
     );
     assert!(
         next_commands.iter().any(|command| command
             .as_str()
             .is_some_and(|text| text.contains("codestory-cli retrieval bootstrap"))),
         "stdio search error should include sidecar bootstrap repair command: {response}"
+    );
+    assert!(
+        next_commands.iter().any(|command| command
+            .as_str()
+            .is_some_and(|text| text.contains("codestory-cli retrieval status")
+                && text.contains("--format json"))),
+        "stdio search error should include sidecar status proof command: {response}"
     );
 }
 
@@ -1854,10 +1912,10 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
     );
     assert!(
         packet
-            .pointer("/benchmark_trace/source_read_steps")
+            .pointer("/retrieval_trace_summary/source_read_steps")
             .and_then(Value::as_u64)
             .is_some(),
-        "stdio packet should include benchmark trace counters: {packet}"
+        "stdio packet should include retrieval trace summary counters: {packet}"
     );
 
     let repeated_response = send_json(

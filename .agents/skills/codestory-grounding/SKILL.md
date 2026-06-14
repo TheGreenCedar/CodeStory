@@ -41,9 +41,11 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 - When `packet` reports `sufficient` and `follow_up_commands` is empty, answer
   from the packet; budget truncation alone is not a gap. Preserve supported-claim
   wording and include a compact "Support files" list from `answer.citations` and
-  `sufficiency.avoid_opening`. Do not run ordinary source reads, `rg`, `grep`, or
-  `git show` only to verify packet citations; run more commands only for a named
-  unresolved gap, an edit target, or a user-requested worktree proof.
+  `sufficiency.avoid_opening_paths`. The older `sufficiency.avoid_opening` field
+  is human-readable compatibility prose, not the raw path contract. Do not run
+  ordinary source reads, `rg`, `grep`, or `git show` only to verify packet
+  citations; run more commands only for a named unresolved gap, an edit target,
+  or a user-requested worktree proof.
 - When `packet` reports `partial`, read `sufficiency.follow_up_commands` and run
   those commands in order. Prefer listed targeted `search --why` commands before
   escalating to a larger packet budget. As soon as a follow-up packet becomes
@@ -61,6 +63,13 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
   failed, treat product retrieval as unavailable until `retrieval_mode=full` is
   restored. Repo-text output is diagnostic only; do not use it as a substitute
   for mandatory sidecar evidence.
+- Under `graph_first_v1`, `retrieval_mode=full` means graph and lexical sidecars
+  are complete, generated `symbol_search_doc` and component-report virtual docs
+  are current, and Qdrant is complete only for selected dense anchors. A zero
+  dense-anchor manifest is valid only when reported explicitly; otherwise
+  Qdrant mismatch or unavailability is fail-closed. Search evidence should name
+  provenance such as `exact`, `lexical_source`, `symbol_doc`, `graph_neighbor`,
+  `component_report`, or `dense_anchor`.
 
 ## Command Routing
 

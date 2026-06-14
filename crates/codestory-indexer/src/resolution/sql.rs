@@ -90,11 +90,12 @@ pub(super) fn unresolved_edges(
     }
 
     let mut query = String::from(
-        "SELECT e.id, caller.file_node_id, caller.qualified_name, caller.serialized_name, target.serialized_name, file_node.serialized_name, e.callsite_identity
+        "SELECT e.id, COALESCE(caller.file_node_id, e.file_node_id), caller.qualified_name, caller.serialized_name, target.serialized_name, e.target_node_id,
+                file_node.serialized_name, e.callsite_identity
          FROM edge e
          JOIN node caller ON caller.id = e.source_node_id
          JOIN node target ON target.id = e.target_node_id
-         LEFT JOIN node file_node ON file_node.id = caller.file_node_id
+         LEFT JOIN node file_node ON file_node.id = COALESCE(caller.file_node_id, e.file_node_id)
          WHERE e.kind = ?1 AND e.resolved_target_node_id IS NULL
            AND (target.canonical_id IS NULL OR (
              target.canonical_id NOT LIKE 'tauri:command:%'
@@ -211,7 +212,8 @@ fn map_unresolved_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Unresolv
         row.get::<_, Option<String>>(2)?,
         row.get::<_, String>(3)?,
         row.get::<_, String>(4)?,
-        row.get::<_, Option<String>>(5)?,
+        row.get::<_, i64>(5)?,
         row.get::<_, Option<String>>(6)?,
+        row.get::<_, Option<String>>(7)?,
     ))
 }

@@ -289,9 +289,8 @@ fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
         details
             .next_commands
             .iter()
-            .any(|command| command.contains("codestory-cli index")
-                && command.contains("--refresh full")),
-        "retrieval error should include index recovery command: {error:?}"
+            .all(|command| !command.contains("codestory-cli index")),
+        "sidecar retrieval errors should not repeat core index repair commands: {error:?}"
     );
     assert!(
         details
@@ -307,6 +306,14 @@ fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
             .any(|command| command.contains("codestory-cli retrieval index")
                 && command.contains("--refresh full")),
         "retrieval error should include sidecar index recovery command: {error:?}"
+    );
+    assert!(
+        details
+            .next_commands
+            .iter()
+            .any(|command| command.contains("codestory-cli retrieval status")
+                && command.contains("--format json")),
+        "retrieval error should include sidecar status proof command: {error:?}"
     );
 }
 

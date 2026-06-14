@@ -258,7 +258,8 @@ fn qualified_symbol_query_parts(query: &str) -> Option<(&str, &str)> {
 }
 
 pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
-    let normalized = normalize_retrieval_path(path);
+    let normalized_raw = normalize_retrieval_path(path);
+    let normalized = strip_materialized_repo_cache_prefix(&normalized_raw).to_string();
     let marked = format!("/{normalized}");
     let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
 
@@ -268,6 +269,7 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
             "/node_modules/",
             "/src/external/",
             "/external/",
+            "/deps/",
             "/vendor/",
             "/vendors/",
             "/third_party/",
@@ -354,6 +356,27 @@ fn normalize_retrieval_path(path: &str) -> String {
         .trim_start_matches("./")
         .trim_start_matches('/')
         .to_ascii_lowercase()
+}
+
+fn strip_materialized_repo_cache_prefix(path: &str) -> &str {
+    let mut best_match: Option<(usize, &str)> = None;
+    for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
+        let Some(index) = path.rfind(marker) else {
+            continue;
+        };
+        let after_marker = &path[index + marker.len()..];
+        if let Some((_, repo_relative)) = after_marker.split_once('/')
+            && !repo_relative.is_empty()
+            && best_match
+                .as_ref()
+                .is_none_or(|(best_index, _)| index > *best_index)
+        {
+            best_match = Some((index, repo_relative));
+        }
+    }
+    best_match
+        .map(|(_, repo_relative)| repo_relative)
+        .unwrap_or(path)
 }
 
 fn path_contains_any(path: &str, markers: &[&str]) -> bool {
@@ -1927,6 +1950,20 @@ mod tests {
                 "codex-rs/app-server-protocol/schema/typescript/index.ts"
             ),
             RetrievalFileRole::Generated
+        );
+        assert_eq!(
+            retrieval_file_role_from_path(
+                r"\\?\C:\repo\codestory\target\repo-cache\repos\expressjs-express\lib\response.js"
+            ),
+            RetrievalFileRole::Source
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("target/generated/client.ts"),
+            RetrievalFileRole::Generated
+        );
+        assert_eq!(
+            retrieval_file_role_from_path("redis/deps/hiredis/examples/example-ae.c"),
+            RetrievalFileRole::Vendor
         );
     }
 

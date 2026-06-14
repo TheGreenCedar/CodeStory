@@ -64,22 +64,11 @@ fn index_workspace(
     Ok((storage.get_nodes()?, storage.get_edges()?))
 }
 
-fn assert_imports_resolved(edges: &[codestory_contracts::graph::Edge]) {
-    let imports: Vec<_> = edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::IMPORT)
-        .collect();
-    assert!(!imports.is_empty(), "IMPORT edge not found");
-    for edge in imports {
-        if edge.resolved_target.is_some() {
-            let confidence = edge.confidence.unwrap_or(0.0);
-            assert!(
-                confidence >= 0.55,
-                "Resolved IMPORT edge confidence too low: {}",
-                confidence
-            );
-        }
-    }
+fn assert_import_edges_extracted(edges: &[codestory_contracts::graph::Edge]) {
+    assert!(
+        edges.iter().any(|edge| edge.kind == EdgeKind::IMPORT),
+        "IMPORT edge not found"
+    );
 }
 
 fn matches_name(actual: &str, wanted: &str) -> bool {
@@ -94,8 +83,144 @@ fn has_node_kind(nodes: &[codestory_contracts::graph::Node], name: &str, kind: N
         .any(|node| matches_name(&node.serialized_name, name) && node.kind == kind)
 }
 
+fn file_path_for_node<'a>(
+    nodes_by_id: &std::collections::HashMap<
+        codestory_contracts::graph::NodeId,
+        &'a codestory_contracts::graph::Node,
+    >,
+    node: &codestory_contracts::graph::Node,
+) -> Option<&'a str> {
+    node.file_node_id
+        .and_then(|file_id| nodes_by_id.get(&file_id).copied())
+        .map(|file| file.serialized_name.as_str())
+}
+
+fn node_in_file<'a>(
+    nodes: &'a [codestory_contracts::graph::Node],
+    nodes_by_id: &std::collections::HashMap<
+        codestory_contracts::graph::NodeId,
+        &'a codestory_contracts::graph::Node,
+    >,
+    name: &str,
+    kind: NodeKind,
+    file_suffix: &str,
+) -> Option<&'a codestory_contracts::graph::Node> {
+    nodes.iter().find(|node| {
+        matches_name(&node.serialized_name, name)
+            && node.kind == kind
+            && file_path_for_node(nodes_by_id, node)
+                .map(|path| path.replace('\\', "/").ends_with(file_suffix))
+                .unwrap_or(false)
+    })
+}
+
+fn edge_importer_path<'a>(
+    nodes_by_id: &std::collections::HashMap<
+        codestory_contracts::graph::NodeId,
+        &'a codestory_contracts::graph::Node,
+    >,
+    edge: &codestory_contracts::graph::Edge,
+) -> Option<&'a str> {
+    if let Some(file_id) = edge.file_node_id {
+        return nodes_by_id
+            .get(&file_id)
+            .map(|file| file.serialized_name.as_str());
+    }
+
+    nodes_by_id.get(&edge.source).and_then(|source| {
+        if source.kind == NodeKind::FILE {
+            Some(source.serialized_name.as_str())
+        } else {
+            file_path_for_node(nodes_by_id, source)
+        }
+    })
+}
+
+fn path_ends_with(path: &str, suffix: &str) -> bool {
+    path.replace('\\', "/").ends_with(suffix)
+}
+
+fn assert_import_resolved_to(
+    nodes: &[codestory_contracts::graph::Node],
+    edges: &[codestory_contracts::graph::Edge],
+    importer_suffix: &str,
+    target_suffix: &str,
+    target_name: &str,
+) {
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let resolved = edges.iter().any(|edge| {
+        if edge.kind != EdgeKind::IMPORT {
+            return false;
+        }
+        if !edge_importer_path(&nodes_by_id, edge)
+            .map(|path| path_ends_with(path, importer_suffix))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        if edge.confidence.unwrap_or(0.0) < 0.55 {
+            return false;
+        }
+
+        let Some(target_id) = edge.resolved_target else {
+            return false;
+        };
+        let Some(target) = nodes_by_id.get(&target_id) else {
+            return false;
+        };
+
+        matches_name(&target.serialized_name, target_name)
+            && file_path_for_node(&nodes_by_id, target)
+                .map(|path| path_ends_with(path, target_suffix))
+                .unwrap_or(false)
+    });
+
+    if !resolved {
+        let import_edges = edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::IMPORT)
+            .map(|edge| {
+                let importer = edge_importer_path(&nodes_by_id, edge).unwrap_or("<unknown>");
+                let source = nodes_by_id
+                    .get(&edge.source)
+                    .map(|node| node.serialized_name.as_str())
+                    .unwrap_or("<missing>");
+                let target = nodes_by_id
+                    .get(&edge.target)
+                    .map(|node| node.serialized_name.as_str())
+                    .unwrap_or("<missing>");
+                let resolved = edge
+                    .resolved_target
+                    .and_then(|target_id| nodes_by_id.get(&target_id).copied())
+                    .map(|node| node.serialized_name.as_str())
+                    .unwrap_or("<unresolved>");
+                format!(
+                    "{importer}: {source} -> {target} resolved={resolved} confidence={:?}",
+                    edge.confidence
+                )
+            })
+            .collect::<Vec<_>>();
+        let target_candidates = nodes
+            .iter()
+            .filter(|node| matches_name(&node.serialized_name, target_name))
+            .map(|node| {
+                let file = file_path_for_node(&nodes_by_id, node).unwrap_or("<unknown>");
+                format!("{:?} {} in {file}", node.kind, node.serialized_name)
+            })
+            .collect::<Vec<_>>();
+
+        panic!(
+            "expected import from {importer_suffix} to resolve to {target_name} in {target_suffix}. IMPORT edges: {import_edges:?}. Target candidates: {target_candidates:?}"
+        );
+    }
+}
+
 #[test]
-fn test_import_resolution_across_languages() -> anyhow::Result<()> {
+fn test_import_edges_are_extracted_across_languages() -> anyhow::Result<()> {
     let cases = [
         (
             "main.ts",
@@ -123,92 +248,51 @@ fn main() {}
 
     for (filename, code) in cases {
         let edges = index_single_file(filename, code)?;
-        assert_imports_resolved(&edges);
+        assert_import_edges_extracted(&edges);
     }
 
     Ok(())
 }
 
 #[test]
-fn test_cross_file_alias_default_named_and_type_imports() -> anyhow::Result<()> {
+fn test_cross_file_imports_resolve_to_indexed_targets() -> anyhow::Result<()> {
     let (nodes, edges) = index_workspace(&[
         (
-            "main.rs",
+            "src/foo.ts",
             r#"
-mod lib;
-use crate::lib::Repository as Repo;
-fn run() {
-    let _repository = Repo::new();
+export interface Foo {
+    id: number;
 }
 "#,
         ),
         (
-            "lib.rs",
+            "src/main.ts",
             r#"
-pub struct Repository;
-impl Repository {
-    pub fn new() -> Self { Self }
+import type { Foo } from "./foo";
+const value: Foo = { id: 1 };
+"#,
+        ),
+        (
+            "src/widget.rs",
+            r#"
+pub struct Widget;
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod widget;
+use crate::widget::Widget;
+
+pub fn make_widget() -> Widget {
+    Widget
 }
 "#,
         ),
     ])?;
 
-    let main_file = nodes
-        .iter()
-        .find(|node| {
-            node.kind == codestory_contracts::graph::NodeKind::FILE
-                && node.serialized_name.contains("main.rs")
-        })
-        .or_else(|| {
-            nodes
-                .iter()
-                .find(|node| node.kind == codestory_contracts::graph::NodeKind::FILE)
-        })
-        .ok_or_else(|| anyhow::anyhow!("main.rs file node not found"))?;
-    let node_by_id = nodes
-        .iter()
-        .map(|node| (node.id, node))
-        .collect::<std::collections::HashMap<_, _>>();
-
-    let mut import_edges: Vec<_> = edges
-        .iter()
-        .filter(|edge| edge.kind == EdgeKind::IMPORT && edge.file_node_id == Some(main_file.id))
-        .collect();
-    if import_edges.is_empty() {
-        import_edges = edges
-            .iter()
-            .filter(|edge| edge.kind == EdgeKind::IMPORT)
-            .collect();
-    }
-
-    assert!(
-        !import_edges.is_empty(),
-        "expected IMPORT edges from main.rs"
-    );
-
-    let mut resolved_to_same_file = 0usize;
-    let mut unresolved_edges = 0usize;
-    for edge in import_edges {
-        let Some(target_id) = edge.resolved_target else {
-            unresolved_edges += 1;
-            continue;
-        };
-        let Some(target) = node_by_id.get(&target_id) else {
-            continue;
-        };
-        if target.file_node_id == Some(main_file.id) {
-            resolved_to_same_file += 1;
-        }
-    }
-
-    assert!(
-        resolved_to_same_file == 0,
-        "import should not resolve back to symbols in the caller file"
-    );
-    assert!(
-        unresolved_edges > 0,
-        "expected unresolved imports to remain explicit when cross-file resolution is uncertain"
-    );
+    assert_import_resolved_to(&nodes, &edges, "src/main.ts", "src/foo.ts", "Foo");
+    assert_import_resolved_to(&nodes, &edges, "src/lib.rs", "src/widget.rs", "Widget");
     Ok(())
 }
 
@@ -269,6 +353,153 @@ async function load() {
     assert!(
         generic_runtime_calls.is_empty(),
         "expected runtime module loading to avoid generic CALL placeholders, found {generic_runtime_calls:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_javascript_static_import_aliases_resolve_and_feed_constructor_calls() -> anyhow::Result<()>
+{
+    let (nodes, edges) = index_workspace(&[
+        (
+            "app.js",
+            r#"
+import Client from "./client.js";
+
+function makeClient() {
+    const client = new Client();
+    return client;
+}
+"#,
+        ),
+        (
+            "client.js",
+            r#"
+class Client {
+    request() {}
+}
+
+export default Client;
+"#,
+        ),
+    ])?;
+
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let make_client = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "makeClient",
+        NodeKind::FUNCTION,
+        "app.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("makeClient node not found"))?;
+    let import_alias = node_in_file(&nodes, &nodes_by_id, "Client", NodeKind::UNKNOWN, "app.js")
+        .ok_or_else(|| anyhow::anyhow!("Client import alias node not found"))?;
+    let imported_class = node_in_file(&nodes, &nodes_by_id, "Client", NodeKind::CLASS, "client.js")
+        .ok_or_else(|| anyhow::anyhow!("Client class node not found"))?;
+
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == make_client.id
+                && edge.effective_target() == import_alias.id
+        }),
+        "new Client() should create a CALL edge from makeClient to the imported alias"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge.source == import_alias.id
+                && edge.effective_target() == imported_class.id
+                && edge.certainty.is_some_and(|certainty| {
+                    certainty == codestory_contracts::graph::ResolutionCertainty::Certain
+                })
+        }),
+        "Client default import should resolve by relative path to the class in client.js"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_javascript_bound_function_receiver_calls_imported_default() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[
+        (
+            "client.js",
+            r#"
+import dispatchRequest from "./dispatchRequest.js";
+
+class Client {
+    _request(config) {
+        return dispatchRequest.call(this, config);
+    }
+}
+
+export default Client;
+"#,
+        ),
+        (
+            "dispatchRequest.js",
+            r#"
+export default function dispatchRequest(config) {
+    return config;
+}
+"#,
+        ),
+    ])?;
+
+    let nodes_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+    let request_method = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "_request",
+        NodeKind::METHOD,
+        "client.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("Client._request method not found"))?;
+    let import_alias = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "dispatchRequest",
+        NodeKind::UNKNOWN,
+        "client.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("dispatchRequest import alias not found"))?;
+    let imported_function = node_in_file(
+        &nodes,
+        &nodes_by_id,
+        "dispatchRequest",
+        NodeKind::FUNCTION,
+        "dispatchRequest.js",
+    )
+    .ok_or_else(|| anyhow::anyhow!("dispatchRequest function not found"))?;
+
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.source == request_method.id
+                && edge.target == import_alias.id
+                && edge.effective_target() == import_alias.id
+                && edge.certainty.is_some_and(|certainty| {
+                    certainty == codestory_contracts::graph::ResolutionCertainty::Certain
+                })
+        }),
+        "dispatchRequest.call(...) should create a certain CALL edge to the imported dispatchRequest alias"
+    );
+    assert!(
+        edges.iter().any(|edge| {
+            edge.kind == EdgeKind::IMPORT
+                && edge.source == import_alias.id
+                && edge.effective_target() == imported_function.id
+        }),
+        "dispatchRequest default import should resolve by relative path to dispatchRequest.js"
     );
 
     Ok(())

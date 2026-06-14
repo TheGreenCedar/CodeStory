@@ -6,6 +6,9 @@ use crate::generation::{
 use crate::health::{RetrievalStatusReport, probe_sidecar_health};
 use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
 use anyhow::{Context, Result};
+use codestory_contracts::language_support::{
+    LanguageSupportMode, language_support_profile_for_ext,
+};
 use codestory_store::Store;
 use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
@@ -75,9 +78,14 @@ fn sidecar_status_inner(
             .context("load retrieval manifest")?;
         if strict
             && let Some(manifest) = manifest.as_ref()
-            && let Some(reason) =
-                strict_readiness_unavailable_reason(project_root, &storage, &project_id, manifest)
-                    .context("check strict sidecar readiness")?
+            && let Some(reason) = strict_readiness_unavailable_reason(
+                project_root,
+                path,
+                &storage,
+                &project_id,
+                manifest,
+            )
+            .context("check strict sidecar readiness")?
         {
             return Ok(enrich_status_with_semantic_doc_stats(
                 crate::health::unavailable_status_report(
@@ -117,6 +125,7 @@ fn enrich_status_with_semantic_doc_stats(
 
 pub(crate) fn validate_strict_sidecar_readiness(
     project_root: &Path,
+    storage_path: &Path,
     storage: &Store,
 ) -> Result<()> {
     let project_id = project_id_for_root(project_root);
@@ -126,9 +135,13 @@ pub(crate) fn validate_strict_sidecar_readiness(
     else {
         return Ok(());
     };
-    if let Some(reason) =
-        strict_readiness_unavailable_reason(project_root, storage, &project_id, &manifest)?
-    {
+    if let Some(reason) = strict_readiness_unavailable_reason(
+        project_root,
+        storage_path,
+        storage,
+        &project_id,
+        &manifest,
+    )? {
         anyhow::bail!("sidecar_manifest_stale: {reason}");
     }
     Ok(())
@@ -136,6 +149,7 @@ pub(crate) fn validate_strict_sidecar_readiness(
 
 fn strict_readiness_unavailable_reason(
     project_root: &Path,
+    storage_path: &Path,
     storage: &Store,
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
@@ -154,6 +168,7 @@ fn strict_readiness_unavailable_reason(
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     let current_input = compute_sidecar_input_fingerprint(
         storage,
+        storage_path,
         project_root,
         project_id,
         &embedding_backend,
@@ -162,6 +177,13 @@ fn strict_readiness_unavailable_reason(
     .context("compute strict sidecar input fingerprint")?;
     if manifest.sidecar_input_hash.as_deref() == Some(current_input.hash.as_str())
         && manifest.projection_count == Some(current_input.projection_count)
+        && manifest.symbol_doc_count == Some(current_input.symbol_doc_count)
+        && manifest.dense_projection_count == Some(current_input.dense_projection_count)
+        && manifest.semantic_policy_version == current_input.semantic_policy_version
+        && manifest.graph_artifact_hash.as_deref()
+            == Some(current_input.graph_artifact_hash.as_str())
+        && manifest.dense_reason_counts_json.as_deref()
+            == Some(current_input.dense_reason_counts_json.as_str())
     {
         return Ok(None);
     }
@@ -200,12 +222,22 @@ fn strict_readiness_unavailable_reason(
         )));
     }
     Ok(Some(format!(
-        "sidecar_input_hash_changed: manifest={} current={}; projection_count manifest={} current={}",
+        "sidecar_input_hash_changed: manifest={} current={}; symbol_doc_count manifest={} current={}; dense_projection_count manifest={} current={}; projection_count manifest={} current={}",
         manifest
             .sidecar_input_hash
             .as_deref()
             .unwrap_or("<missing>"),
         current_input.hash,
+        manifest
+            .symbol_doc_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "<missing>".into()),
+        current_input.symbol_doc_count,
+        manifest
+            .dense_projection_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "<missing>".into()),
+        current_input.dense_projection_count,
         manifest
             .projection_count
             .map(|count| count.to_string())
@@ -215,41 +247,10 @@ fn strict_readiness_unavailable_reason(
 }
 
 fn graph_indexed_source_path(path: &Path) -> bool {
-    let extension = path
-        .extension()
+    path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-    matches!(
-        extension.as_deref(),
-        Some(
-            "rs" | "py"
-                | "pyi"
-                | "java"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "svelte"
-                | "vue"
-                | "astro"
-                | "ts"
-                | "tsx"
-                | "mts"
-                | "cts"
-                | "c"
-                | "cc"
-                | "cpp"
-                | "cxx"
-                | "h"
-                | "hh"
-                | "hpp"
-                | "hxx"
-                | "go"
-                | "rb"
-                | "php"
-                | "cs"
-        )
-    )
+        .and_then(language_support_profile_for_ext)
+        .is_some_and(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
 }
 
 fn manifest_contract_drift_should_win(reason: &str) -> bool {
@@ -292,6 +293,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(10),
+                    symbol_doc_count: Some(10),
+                    dense_projection_count: Some(10),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{\"public_api\":10}".into()),
                 })
                 .expect("manifest");
         }
@@ -350,6 +358,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
                 })
                 .expect("manifest");
         }
@@ -423,6 +438,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
                 })
                 .expect("manifest");
         }
@@ -497,6 +519,13 @@ mod tests {
                     sidecar_input_hash: Some(hash.into()),
                     sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
                     projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
                 })
                 .expect("manifest");
         }
@@ -518,6 +547,78 @@ mod tests {
                 .unwrap_or_default()
                 .contains("indexable_file_added_or_changed_after_sidecar_manifest"),
             "new indexable file should make strict status fail closed: {report:?}"
+        );
+    }
+
+    #[test]
+    fn strict_status_rejects_manifest_when_new_parser_backed_language_file_is_added() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let source_path = project.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let indexed_mtime = live_mtime_millis(&source_path);
+        let project_id = project_id_for_root(project.path());
+        let hash = "ba5eba11feedface";
+        {
+            let mut storage = Store::open(&storage_path).expect("open db");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path.clone(),
+                    language: "rust".into(),
+                    modification_time: indexed_mtime,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert indexed file");
+            storage
+                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                    project_id: project_id.clone(),
+                    zoekt_version: "zoekt-real-v1".into(),
+                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
+                    scip_revision: Some("graph-test".into()),
+                    built_at_epoch_ms: indexed_mtime,
+                    disk_bytes: None,
+                    degraded_modes_json: "[]".into(),
+                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
+                    embedding_dim: Some(768),
+                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
+                    sidecar_input_hash: Some(hash.into()),
+                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
+                    projection_count: Some(0),
+                    symbol_doc_count: Some(0),
+                    dense_projection_count: Some(0),
+                    semantic_policy_version: Some(
+                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                    ),
+                    graph_artifact_hash: Some("graph-test-hash".into()),
+                    dense_reason_counts_json: Some("{}".into()),
+                })
+                .expect("manifest");
+        }
+
+        std::fs::write(
+            project.path().join("src").join("Routes.kt"),
+            "fun routeUsers() = Unit\n",
+        )
+        .expect("write kotlin source");
+
+        let report =
+            strict_sidecar_status(project.path(), Some(&storage_path)).expect("strict status");
+
+        assert_eq!(report.retrieval_mode, "unavailable");
+        assert!(
+            report
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("indexable_file_added_or_changed_after_sidecar_manifest"),
+            "new registry-backed parser file should make strict status fail closed: {report:?}"
         );
     }
 
@@ -550,6 +651,7 @@ mod tests {
             .expect("insert indexed file");
         let input = compute_sidecar_input_fingerprint(
             &storage,
+            &storage_path,
             project.path(),
             &project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
@@ -571,14 +673,19 @@ mod tests {
                 sidecar_input_hash: Some(input.hash.clone()),
                 sidecar_generation: Some(sidecar_generation_id(&project_id, &input.hash)),
                 projection_count: Some(input.projection_count),
+                symbol_doc_count: Some(input.symbol_doc_count),
+                dense_projection_count: Some(input.dense_projection_count),
+                semantic_policy_version: input.semantic_policy_version.clone(),
+                graph_artifact_hash: Some(input.graph_artifact_hash.clone()),
+                dense_reason_counts_json: Some(input.dense_reason_counts_json.clone()),
             })
             .expect("manifest");
 
-        validate_strict_sidecar_readiness(project.path(), &storage)
+        validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
             .expect("markdown already covered by sidecar input should not look stale");
 
         std::fs::write(project.path().join("README.md"), "# New docs\n").expect("write new docs");
-        let stale = validate_strict_sidecar_readiness(project.path(), &storage)
+        let stale = validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
             .expect_err("new sidecar-only docs should stale the manifest");
         assert!(
             stale.to_string().contains("sidecar_input_hash_changed"),

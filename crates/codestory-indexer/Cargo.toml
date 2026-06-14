@@ -1,6 +1,6 @@
 [package]
 name = "codestory-indexer"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 
 [dev-dependencies]
@@ -35,3 +35,7 @@ tree-sitter-go = { workspace = true }
 tree-sitter-ruby = { workspace = true }
 tree-sitter-php = { workspace = true }
 tree-sitter-c-sharp = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
+tree-sitter-swift = { workspace = true }
+tree-sitter-dart-orchard = { workspace = true }
+tree-sitter-bash = { workspace = true }

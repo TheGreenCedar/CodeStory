@@ -13,9 +13,9 @@ use crate::zoekt_client::ZoektClient;
 use crate::zoekt_index::{build_zoekt_shard, lexical_input_fingerprint};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store};
+use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, SymbolSearchDoc};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -42,7 +42,12 @@ pub struct ProjectQdrantRepairOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidecarInputFingerprint {
     pub(crate) hash: String,
+    pub(crate) symbol_doc_count: i64,
     pub(crate) projection_count: i64,
+    pub(crate) dense_projection_count: i64,
+    pub(crate) semantic_policy_version: Option<String>,
+    pub(crate) graph_artifact_hash: String,
+    pub(crate) dense_reason_counts_json: String,
     pub(crate) lexical_file_count: u32,
     pub(crate) lexical_hash: String,
 }
@@ -202,6 +207,7 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
     ensure_search_symbol_projection(&mut storage)?;
     let sidecar_input = compute_sidecar_input_fingerprint(
         &storage,
+        storage_path,
         project_root,
         &project_id,
         &embedding_backend,
@@ -314,6 +320,7 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
 
     let zoekt_version = ensure_zoekt_generation(
         project_root,
+        storage_path,
         &layout,
         &project_id,
         &generation,
@@ -363,6 +370,7 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
 
 fn ensure_zoekt_generation(
     project_root: &Path,
+    storage_path: &Path,
     layout: &SidecarLayout,
     project_id: &str,
     generation: &str,
@@ -374,6 +382,7 @@ fn ensure_zoekt_generation(
     } else {
         match build_zoekt_shard(
             project_root,
+            Some(storage_path),
             &layout.zoekt_data_dir,
             generation,
             zoekt_probe_reachable,
@@ -404,6 +413,14 @@ fn ensure_qdrant_collection(
     projection_count: i64,
     mut qdrant_ready_points: Option<u64>,
 ) -> Result<u64> {
+    if projection_count == 0 {
+        info!(
+            project_id = %project_id,
+            collection = %collection,
+            "Qdrant collection skipped because graph_first_v1 selected zero dense anchors"
+        );
+        return Ok(0);
+    }
     let qdrant_probe = qdrant_client.health_probe(collection);
     if !qdrant_probe.reachable {
         bail!(
@@ -544,6 +561,13 @@ fn manifest_matches_sidecar_input(
     manifest.sidecar_schema_version == Some(SIDECAR_SCHEMA_VERSION)
         && manifest.sidecar_input_hash.as_deref() == Some(sidecar_input.hash.as_str())
         && manifest.projection_count == Some(sidecar_input.projection_count)
+        && manifest.symbol_doc_count == Some(sidecar_input.symbol_doc_count)
+        && manifest.dense_projection_count == Some(sidecar_input.dense_projection_count)
+        && manifest.semantic_policy_version == sidecar_input.semantic_policy_version
+        && manifest.graph_artifact_hash.as_deref()
+            == Some(sidecar_input.graph_artifact_hash.as_str())
+        && manifest.dense_reason_counts_json.as_deref()
+            == Some(sidecar_input.dense_reason_counts_json.as_str())
         && manifest.embedding_backend.as_deref() == Some(embedding_backend)
         && manifest.embedding_dim == Some(embedding_dim)
 }
@@ -570,6 +594,11 @@ fn retrieval_manifest_for_sidecar(
         sidecar_input_hash: Some(sidecar_input.hash.clone()),
         sidecar_generation: Some(generation.to_string()),
         projection_count: Some(sidecar_input.projection_count),
+        symbol_doc_count: Some(sidecar_input.symbol_doc_count),
+        dense_projection_count: Some(sidecar_input.dense_projection_count),
+        semantic_policy_version: sidecar_input.semantic_policy_version.clone(),
+        graph_artifact_hash: Some(sidecar_input.graph_artifact_hash.clone()),
+        dense_reason_counts_json: Some(sidecar_input.dense_reason_counts_json.clone()),
     }
 }
 
@@ -595,7 +624,7 @@ fn qdrant_ready_point_count(
 ) -> Option<u64> {
     let expected_points = u64::try_from(expected_points).ok()?;
     if expected_points == 0 {
-        return None;
+        return Some(0);
     }
     match qdrant_client.count_points_exact(collection) {
         Ok(actual) if actual >= expected_points => Some(actual),
@@ -662,14 +691,18 @@ fn persist_finalized_manifest(
 
 pub(crate) fn compute_sidecar_input_fingerprint(
     storage: &Store,
+    storage_path: &Path,
     project_root: &Path,
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
 ) -> Result<SidecarInputFingerprint> {
-    let lexical = lexical_input_fingerprint(project_root).context("hash lexical sidecar input")?;
+    let lexical = lexical_input_fingerprint(project_root, Some(storage_path))
+        .context("hash lexical sidecar input")?;
     let mut hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v4");
+    let mut graph_hasher = Sha256::new();
+    hash_part(&mut hasher, "codestory-sidecar-input-v5");
+    hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
     hash_part(&mut hasher, ZOEKT_REAL_VERSION_PIN);
@@ -699,7 +732,29 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     );
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
-    let mut projection_count = 0_i64;
+    let mut symbol_doc_count = 0_i64;
+    let mut policy_versions = BTreeSet::<String>::new();
+    let mut after_symbol_doc = None;
+    loop {
+        let batch = storage
+            .get_symbol_search_docs_batch_after(after_symbol_doc, SIDECAR_INPUT_BATCH_SIZE)
+            .context("load symbol search docs for sidecar hash")?;
+        if batch.is_empty() {
+            break;
+        }
+        after_symbol_doc = batch.last().map(|doc| doc.node_id);
+        symbol_doc_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
+        for doc in batch {
+            observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
+            hash_symbol_search_doc_detail(&mut graph_hasher, project_root, &doc);
+        }
+    }
+    let graph_artifact_hash = format!("{:x}", graph_hasher.finalize());
+    hash_part(&mut hasher, &symbol_doc_count.to_string());
+    hash_part(&mut hasher, &graph_artifact_hash);
+
+    let mut dense_projection_count = 0_i64;
+    let mut dense_reason_counts = BTreeMap::<String, i64>::new();
     let mut after = None;
     loop {
         let batch = storage
@@ -713,18 +768,85 @@ pub(crate) fn compute_sidecar_input_fingerprint(
             .into_iter()
             .filter(qdrant_semantic_doc_row)
             .collect::<Vec<_>>();
-        projection_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
+        dense_projection_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
         for doc in batch {
+            observe_policy_version(&mut policy_versions, doc.semantic_policy_version.as_deref());
+            let reason = doc.dense_reason.as_deref().unwrap_or("unknown").to_string();
+            *dense_reason_counts.entry(reason).or_insert(0) += 1;
             hash_semantic_doc_detail(&mut hasher, project_root, &doc);
         }
     }
+    let dense_reason_counts_json =
+        serde_json::to_string(&dense_reason_counts).unwrap_or_else(|_| "{}".into());
+    let semantic_policy_version = policy_version_from_observed(&policy_versions)
+        .or_else(|| Some(crate::generation::SEMANTIC_POLICY_VERSION.into()));
+    hash_part(
+        &mut hasher,
+        semantic_policy_version.as_deref().unwrap_or("<missing>"),
+    );
+    hash_part(&mut hasher, &dense_projection_count.to_string());
+    hash_part(&mut hasher, &dense_reason_counts_json);
 
     Ok(SidecarInputFingerprint {
         hash: format!("{:x}", hasher.finalize()),
-        projection_count,
+        symbol_doc_count,
+        projection_count: dense_projection_count,
+        dense_projection_count,
+        semantic_policy_version,
+        graph_artifact_hash,
+        dense_reason_counts_json,
         lexical_file_count: lexical.file_count,
         lexical_hash: lexical.hash,
     })
+}
+
+fn observe_policy_version(policy_versions: &mut BTreeSet<String>, policy: Option<&str>) {
+    if let Some(policy) = policy.map(str::trim).filter(|policy| !policy.is_empty()) {
+        policy_versions.insert(policy.to_string());
+    }
+}
+
+fn policy_version_from_observed(policy_versions: &BTreeSet<String>) -> Option<String> {
+    match policy_versions.len() {
+        0 => None,
+        1 => policy_versions.iter().next().cloned(),
+        _ => Some("mixed".into()),
+    }
+}
+
+fn hash_symbol_search_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &SymbolSearchDoc) {
+    let file_path = doc
+        .file_path
+        .as_deref()
+        .and_then(|path| normalize_sidecar_file_path(path, project_root).ok())
+        .unwrap_or_default();
+    let file_role = if file_path.is_empty() {
+        ""
+    } else {
+        FileRole::classify_path(Path::new(&file_path)).as_str()
+    };
+    hash_part(hasher, &doc.node_id.0.to_string());
+    hash_part(
+        hasher,
+        &doc.file_node_id
+            .map(|node_id| node_id.0.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(hasher, &(doc.kind as i32).to_string());
+    hash_part(hasher, &doc.display_name);
+    hash_part(hasher, doc.qualified_name.as_deref().unwrap_or(""));
+    hash_part(hasher, &file_path);
+    hash_part(hasher, file_role);
+    hash_part(
+        hasher,
+        &doc.start_line
+            .map(|line| line.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(hasher, &doc.doc_version.to_string());
+    hash_part(hasher, &doc.doc_hash);
+    hash_part(hasher, &doc.policy_version);
+    hash_part(hasher, &doc.source_provenance);
 }
 
 fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmSymbolDoc) {
@@ -752,6 +874,8 @@ fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmS
     );
     hash_part(hasher, &doc.doc_version.to_string());
     hash_part(hasher, &doc.doc_hash);
+    hash_part(hasher, doc.semantic_policy_version.as_deref().unwrap_or(""));
+    hash_part(hasher, doc.dense_reason.as_deref().unwrap_or(""));
     hash_part(hasher, doc.embedding_profile.as_deref().unwrap_or(""));
     hash_part(hasher, &doc.embedding_model);
     hash_part(hasher, doc.embedding_backend.as_deref().unwrap_or(""));
@@ -835,6 +959,7 @@ fn upsert_qdrant_points_from_store(
                     node_id: doc.node_id.0.to_string(),
                     file_path,
                     file_role,
+                    dense_reason: doc.dense_reason.clone(),
                     vector: Some(doc.embedding),
                 }
             })
@@ -945,7 +1070,12 @@ mod tests {
         let project_id = "proj";
         let input = SidecarInputFingerprint {
             hash: "0123456789abcdef0123456789abcdef".into(),
+            symbol_doc_count: 42,
             projection_count: 42,
+            dense_projection_count: 42,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: "graph-hash".into(),
+            dense_reason_counts_json: "{\"public_api\":42}".into(),
             lexical_file_count: 3,
             lexical_hash: "lexical".into(),
         };
@@ -963,6 +1093,12 @@ mod tests {
 
         assert!(manifest_has_current_sidecar_contract(project_id, &manifest));
         assert_eq!(manifest.projection_count, Some(42));
+        assert_eq!(manifest.symbol_doc_count, Some(42));
+        assert_eq!(manifest.dense_projection_count, Some(42));
+        assert_eq!(
+            manifest.semantic_policy_version.as_deref(),
+            Some(crate::generation::SEMANTIC_POLICY_VERSION)
+        );
         assert_eq!(
             manifest.sidecar_generation.as_deref(),
             Some(generation.as_str())
@@ -1008,6 +1144,8 @@ mod tests {
             embedding_backend: backend.map(str::to_string),
             embedding_dim: dim,
             doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            dense_reason: Some("public_api".into()),
             embedding: vec![0.01; dim as usize],
             updated_at_epoch_ms: 123,
         };
@@ -1071,6 +1209,8 @@ mod tests {
             embedding_backend: Some("onnx".into()),
             embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            dense_reason: Some("public_api".into()),
             embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
             updated_at_epoch_ms: 123,
         };
@@ -1079,6 +1219,7 @@ mod tests {
             .expect("first doc");
         let first = compute_sidecar_input_fingerprint(
             &storage,
+            &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
@@ -1091,6 +1232,7 @@ mod tests {
             .expect("second doc");
         let second = compute_sidecar_input_fingerprint(
             &storage,
+            &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
@@ -1100,6 +1242,8 @@ mod tests {
 
         assert_eq!(first.projection_count, 1);
         assert_eq!(second.projection_count, 1);
+        assert_eq!(first.dense_projection_count, 1);
+        assert_eq!(first.dense_reason_counts_json, "{\"public_api\":1}");
         assert_ne!(first.hash, second.hash);
     }
 }

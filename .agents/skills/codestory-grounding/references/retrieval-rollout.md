@@ -10,11 +10,29 @@ trustworthy; running retrieval alone is not enough.
 | Rollout layer | Trustworthy proof | Run when | Does not prove |
 | --- | --- | --- | --- |
 | Indexer coverage | `cargo test -p codestory-indexer --test fidelity_regression`; `cargo test -p codestory-indexer --test tictactoe_language_coverage`; targeted `files` or `affected` checks for changed paths | Parser, tree-sitter, semantic-resolution, symbol, edge, file-role, or coverage changes | Sidecar readiness, runtime packet behavior, or CLI search contract |
-| Retrieval sidecar crate | `cargo test -p codestory-retrieval`; then live `retrieval bootstrap`, `retrieval index --project <repo> --refresh full`, and `retrieval status --project <repo> --format json` reporting `retrieval_mode="full"` | Zoekt, Qdrant, SCIP, manifest generation, sidecar status, embedding backend/dim, or Qdrant client changes | Runtime admission, stdio cache invalidation, or full CLI output shape |
+| Retrieval sidecar crate | `cargo test -p codestory-retrieval`; then live `retrieval bootstrap`, `retrieval index --project <repo> --refresh full`, and `retrieval status --project <repo> --format json` reporting `retrieval_mode="full"` plus current `symbol_doc_count`, `dense_projection_count`, `semantic_policy_version`, `graph_artifact_hash`, and dense reason counts | Zoekt, Qdrant, SCIP, manifest generation, sidecar status, symbol-doc virtual docs, dense-anchor policy, embedding backend/dim, or Qdrant client changes | Runtime admission, stdio cache invalidation, or full CLI output shape |
 | Runtime integration | `cargo test -p codestory-runtime --lib`; `cargo test -p codestory-runtime --test retrieval_generalization_guard`; `cargo test -p codestory-runtime --test retrieval_eval`; set `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` only after real sidecars are prepared | Packet/search orchestration, fail-closed modes, retrieval shadow traces, rollback-warning logic, or runtime use of sidecar results | CLI argument/output behavior or GitHub smoke workflow behavior |
 | CLI surface | `cargo test -p codestory-cli --test retrieval_bootstrap_contracts`; `cargo test -p codestory-cli --test stdio_protocol_contracts`; `cargo test -p codestory-cli --test search_json_output`; with real sidecars, run the ignored full-mode search JSON test explicitly | `retrieval bootstrap/status/index` contracts, stdio protocol/cache fingerprints, fail-closed search JSON, or user-facing command shape | Full product readiness unless `retrieval status` is `full` after live sidecar indexing |
-| Benchmark harness | `cargo check -p codestory-bench --benches`; the relevant Criterion bench only when it isolates the hot path; release e2e stats for real-repo timing | New benchmark code, latency/timing claims, rollback baseline updates, or performance-sensitive retrieval/index changes | Promotion by itself; synthetic or narrow benches are scouts until real-repo evidence exists |
-| Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/contributors/retrieval-sidecar-smoke-ci.md` pass criteria | PRs touching retrieval crate, runtime/stdio/search wiring, indexer retrieval hooks, retrieval docs, scripts, Docker sidecar config, or the workflow | Full sidecar readiness. CI smoke uses `--skip-compose --wait-secs 0` and proves manifest-missing fail-closed shape only |
+| Benchmark harness | `cargo check -p codestory-bench --benches`; the relevant Criterion bench only when it isolates the hot path; release e2e stats for real-repo timing; for AST-first retrieval, include same-run baseline/candidate rows for cold total index time, `semantic_embedding_ms`, dense doc count reduction, repeat refresh embedded-doc count, holdout MRR@10/Hit@10/exact-symbol Hit@1, packet lazy-search source reads, and peak descendant working set | New benchmark code, latency/timing claims, rollback baseline updates, dense-policy changes, or performance-sensitive retrieval/index changes | Promotion by itself; synthetic or narrow benches are scouts until real-repo evidence exists |
+| Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/ops/retrieval-sidecars.md#preflight-smoke-contract` pass criteria | PRs touching retrieval crate, runtime/stdio/search wiring, indexer retrieval hooks, retrieval docs, scripts, Docker sidecar config, or the workflow | Full sidecar readiness. CI smoke uses `--skip-compose --wait-secs 0` and proves manifest-missing fail-closed shape only |
+
+## Agent-Grounding Release Gates
+
+Use the highest completed tier as the only claim level in docs, PRs, or final
+handoffs:
+
+| Tier | Required evidence | Claim boundary |
+| --- | --- | --- |
+| CodeStory self-e2e | Generalization lint, targeted runtime/indexer tests, release CLI build, `doctor`, and repo-scale e2e stats | This branch still works on CodeStory and product Rust has no banned holdout literals |
+| Local-real drill suite | Self-e2e plus local-real packet/drill rows without skip allowances | Product tuning survived realistic local repos |
+| Holdout-retrieval drill suite | Local-real plus materialized holdout-retrieval rows, required recall/quality thresholds, and forbidden-claim checks with no skip allowances | Retrieval behavior is generalized for the public holdout suite |
+| Promotion-grade paired benchmark | Holdout plus repeated CodeStory/no-CodeStory rows, timing/cost accounting, answer-quality ledger classifications, and packet-first source-read avoidance checks | Useful-for-agents, speed, or savings claims |
+
+Packet statuses (`sufficient`, `partial`, `blocked`) describe evidence coverage
+only. Final answer quality is promoted only by `drill`/`drill-suite` ledger
+classifications. Holdout literals belong in manifests, tests, benchmark
+harnesses, or the `CODESTORY_EVAL_PROBES` eval module, not production
+planner/ranker/runtime code.
 
 ## CI Smoke Triage
 
@@ -38,9 +56,10 @@ evidence is trustworthy only after live sidecars are indexed and status is full.
 | Symptom | Likely layer | Action |
 | --- | --- | --- |
 | `retrieval_manifest_missing` | Bootstrap/state exists but no project manifest was finalized | In CI smoke this is expected. For product proof, run live `retrieval index --refresh full` and recheck status |
-| `sidecar_manifest_stale`, input-hash drift, or embedding-backend drift | Source, SQLite projection, semantic docs, backend, dimension, or schema changed after the manifest | Rerun `retrieval index --refresh full`; `--refresh auto` may repair stale stored semantic-doc contracts once, but explicit failures still fail closed |
-| `no_semantic`, `lexical_only`, or `unavailable` with Qdrant errors | Qdrant, embedding endpoint, or semantic smoke failed | Run bootstrap, confirm ports `6333`/`6334` and the embedding endpoint, then rebuild sidecar indexes |
-| Qdrant collection exists but point count is below the semantic-doc projection count, is one-point, or has a stub marker | Partial or obsolete collection | Rerun `retrieval index`; do not bless semantic smoke alone as full readiness |
+| `sidecar_manifest_stale`, input-hash drift, policy-version drift, graph-artifact-hash drift, dense-reason drift, or embedding-backend drift | Source, SQLite projection, `symbol_search_doc`, dense anchors, backend, dimension, policy, or schema changed after the manifest | Rerun `retrieval index --refresh full`; `--refresh auto` may repair stale stored symbol-doc or dense-anchor contracts once, but explicit failures still fail closed |
+| `no_semantic`, `lexical_only`, or `unavailable` with Qdrant errors while dense anchors are expected | Qdrant, embedding endpoint, or semantic smoke failed | Run bootstrap, confirm ports `6333`/`6334` and the embedding endpoint, then rebuild sidecar indexes |
+| Qdrant skipped while manifest dense-anchor count is `0` | Expected `graph_first_v1` graph/lexical full mode | Verify Zoekt and SCIP are healthy and manifest symbol-doc count, policy version, graph hash, and dense reason counts match |
+| Qdrant collection exists but point count is below the dense-anchor projection count, is one-point, or has a stub marker | Partial or obsolete collection | Rerun `retrieval index`; do not bless semantic smoke alone as full readiness |
 | Qdrant response lacks `result.points[]` | Qdrant client/API contract drift or wrong image | Verify the pinned Qdrant image and update the client/test contract deliberately |
 | `storage_repair.scan_errors` appears during bootstrap | Cache protection scan was incomplete | Resolve unreadable cache roots or DBs before relying on retention pruning; do not treat suppressed pruning as readiness proof |
 
@@ -55,8 +74,8 @@ cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocap
 ```
 
 This log is especially mandatory for retrieval rollout changes that affect
-default indexing, semantic-doc persistence or reuse, sidecar indexing/status,
-packet/search behavior, runtime grounding surfaces, CLI command shape, or any
-performance/timing claim. A stats-only row with
+default indexing, symbol-doc persistence, dense-anchor persistence or reuse,
+sidecar indexing/status, packet/search behavior, runtime grounding surfaces, CLI
+command shape, or any performance/timing claim. A stats-only row with
 `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1` can record local timing, but it
 is not real-drill release evidence.

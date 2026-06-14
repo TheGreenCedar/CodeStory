@@ -2,9 +2,14 @@
 
 CodeStory indexes framework routes as graph symbols when extraction is backed by
 fixtures and confidence labels. Do not claim full framework support from a
-single heuristic hit.
+single heuristic hit. Language support tiers are defined separately in
+[language-support.md](../architecture/language-support.md).
 
-## Current Coverage Target
+## Current Route Extraction Scope
+
+These bullets list extractor coverage or tracked fixture targets, not full
+framework parity; use `summary.framework_route_coverage` for per-framework
+status, confidence floor, handler-link support, known gaps, and promotability.
 
 - JavaScript/TypeScript: Express, React Router, SvelteKit, Next.js,
   Remix, Fastify, Koa, Hono, NestJS.
@@ -15,10 +20,9 @@ single heuristic hit.
 - Rust: Axum, Actix, Rocket.
 - Go: Gin, Chi, Echo, Fiber as text-only partial route extraction until Go
   parser-backed handler links exist.
-- Kotlin/Swift/Dart (unmapped today): Ktor, Vapor, and Shelf heuristics are
-  implemented in `collect_framework_routes` for when those language paths index
-  source files; fixture coverage lives in
-  `test_framework_route_extractors_cover_requested_web_stacks`.
+- Kotlin/Swift/Dart: Ktor, Vapor, and Shelf extractor fixtures exist, but
+  published framework coverage is not promoted until the runtime coverage
+  matrix lists status, gaps, and handler-link support.
 - Existing OpenAPI endpoint indexing remains separate and should continue to
   produce endpoint symbols and speculative client-call edges.
 - Payload collection config and usage extraction is tracked as data bridge
@@ -67,7 +71,7 @@ be checked with `files --path <fragment>` or a fresh index.
    identity.
 5. Run `codestory-cli files --project <fixture> --format json` and inspect
    `summary.framework_route_coverage` for framework, language, status,
-   fixture status, confidence floor, handler-link support, unsupported
+   coverage evidence, confidence floor, handler-link support, unsupported
    patterns, known gaps, and promotable status.
 6. Run `cargo test -p codestory-indexer --lib framework_route`.
 7. Run the search-quality eval harness when route names should be discoverable:

@@ -116,6 +116,15 @@ struct ScoredClaim {
 }
 
 const MIN_CONFIDENCE_CALIBRATION: f64 = 0.70;
+const ALLOW_ZERO_REAL_REPO_EVAL_ENV: &str = "CODESTORY_ALLOW_SKIP_LOCAL_REAL_AGENT_QUALITY";
+
+fn allow_zero_real_repo_eval_value(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+fn allow_zero_real_repo_eval_from_env() -> bool {
+    allow_zero_real_repo_eval_value(std::env::var(ALLOW_ZERO_REAL_REPO_EVAL_ENV).ok().as_deref())
+}
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -564,6 +573,18 @@ fn local_evidence_path_validation_rejects_stale_sources() {
 }
 
 #[test]
+fn zero_real_repo_eval_escape_hatch_requires_exact_one() {
+    assert!(allow_zero_real_repo_eval_value(Some("1")));
+    assert!(allow_zero_real_repo_eval_value(Some(" 1 ")));
+    for value in [None, Some(""), Some("0"), Some("true"), Some("yes")] {
+        assert!(
+            !allow_zero_real_repo_eval_value(value),
+            "only {ALLOW_ZERO_REAL_REPO_EVAL_ENV}=1 should allow skip-only local evidence; got {value:?}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "local-only real-repo evaluator; run on the Windows workstation with sibling repos present"]
 fn local_real_repo_manifests_score_or_explicitly_skip_missing_repos() {
     let source_repos = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -610,8 +631,16 @@ fn local_real_repo_manifests_score_or_explicitly_skip_missing_repos() {
         evaluated += 1;
     }
 
-    assert!(
-        evaluated > 0 || !skipped.is_empty(),
-        "local-only path should either evaluate manifests or report explicit skips"
-    );
+    if evaluated == 0 {
+        assert!(
+            allow_zero_real_repo_eval_from_env(),
+            "local-only real-repo quality evaluator evaluated 0 repos; missing repos: {}. \
+Set {ALLOW_ZERO_REAL_REPO_EVAL_ENV}=1 only when intentionally collecting skip-only local evidence.",
+            skipped.join(", ")
+        );
+        eprintln!(
+            "intentionally skipping local-only agent-quality manifests because {ALLOW_ZERO_REAL_REPO_EVAL_ENV}=1; missing repos: {}",
+            skipped.join(", ")
+        );
+    }
 }

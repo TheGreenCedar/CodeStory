@@ -21,6 +21,13 @@ pub struct RetrievalIndexManifest {
     pub sidecar_generation: Option<String>,
     /// Number of symbol projection rows included in the sidecar input hash.
     pub projection_count: Option<i64>,
+    /// Number of graph-native symbol-search docs included in the sidecar input hash.
+    pub symbol_doc_count: Option<i64>,
+    /// Number of dense semantic anchors included in Qdrant.
+    pub dense_projection_count: Option<i64>,
+    pub semantic_policy_version: Option<String>,
+    pub graph_artifact_hash: Option<String>,
+    pub dense_reason_counts_json: Option<String>,
 }
 
 impl Storage {
@@ -42,8 +49,13 @@ impl Storage {
                 sidecar_schema_version,
                 sidecar_input_hash,
                 sidecar_generation,
-                projection_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                projection_count,
+                symbol_doc_count,
+                dense_projection_count,
+                semantic_policy_version,
+                graph_artifact_hash,
+                dense_reason_counts_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(project_id) DO UPDATE SET
                 zoekt_version = excluded.zoekt_version,
                 qdrant_collection = excluded.qdrant_collection,
@@ -56,7 +68,12 @@ impl Storage {
                 sidecar_schema_version = excluded.sidecar_schema_version,
                 sidecar_input_hash = excluded.sidecar_input_hash,
                 sidecar_generation = excluded.sidecar_generation,
-                projection_count = excluded.projection_count",
+                projection_count = excluded.projection_count,
+                symbol_doc_count = excluded.symbol_doc_count,
+                dense_projection_count = excluded.dense_projection_count,
+                semantic_policy_version = excluded.semantic_policy_version,
+                graph_artifact_hash = excluded.graph_artifact_hash,
+                dense_reason_counts_json = excluded.dense_reason_counts_json",
             rusqlite::params![
                 manifest.project_id,
                 manifest.zoekt_version,
@@ -71,6 +88,11 @@ impl Storage {
                 manifest.sidecar_input_hash,
                 manifest.sidecar_generation,
                 manifest.projection_count,
+                manifest.symbol_doc_count,
+                manifest.dense_projection_count,
+                manifest.semantic_policy_version,
+                manifest.graph_artifact_hash,
+                manifest.dense_reason_counts_json,
             ],
         )?;
         Ok(())
@@ -94,7 +116,12 @@ impl Storage {
                 sidecar_schema_version,
                 sidecar_input_hash,
                 sidecar_generation,
-                projection_count
+                projection_count,
+                symbol_doc_count,
+                dense_projection_count,
+                semantic_policy_version,
+                graph_artifact_hash,
+                dense_reason_counts_json
              FROM retrieval_index_manifest
              WHERE project_id = ?1",
         )?;
@@ -116,6 +143,11 @@ impl Storage {
             sidecar_input_hash: row.get(10)?,
             sidecar_generation: row.get(11)?,
             projection_count: row.get(12)?,
+            symbol_doc_count: row.get(13)?,
+            dense_projection_count: row.get(14)?,
+            semantic_policy_version: row.get(15)?,
+            graph_artifact_hash: row.get(16)?,
+            dense_reason_counts_json: row.get(17)?,
         }))
     }
 
@@ -180,6 +212,11 @@ mod tests {
                     sidecar_input_hash: None,
                     sidecar_generation: None,
                     projection_count: None,
+                    symbol_doc_count: None,
+                    dense_projection_count: None,
+                    semantic_policy_version: None,
+                    graph_artifact_hash: None,
+                    dense_reason_counts_json: None,
                 })
                 .expect("upsert manifest");
         }
@@ -215,6 +252,11 @@ mod tests {
             sidecar_input_hash: Some("deadbeefcafebabe".into()),
             sidecar_generation: Some("proj-deadbeefcafebabe".into()),
             projection_count: Some(99),
+            symbol_doc_count: Some(120),
+            dense_projection_count: Some(99),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph-hash".into()),
+            dense_reason_counts_json: Some("{\"public_api\":99}".into()),
         };
         storage
             .upsert_retrieval_index_manifest(&manifest)
@@ -253,6 +295,11 @@ mod tests {
                     sidecar_input_hash: None,
                     sidecar_generation: None,
                     projection_count: None,
+                    symbol_doc_count: None,
+                    dense_projection_count: None,
+                    semantic_policy_version: None,
+                    graph_artifact_hash: None,
+                    dense_reason_counts_json: None,
                 })
                 .expect("upsert manifest");
         }

@@ -54,7 +54,7 @@ command flags before and after.
 
 Prefer existing gates before adding a new harness:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
@@ -86,13 +86,10 @@ Before/after rows in that log require a serialized full ignored e2e run. If the
 branch cannot run it yet, leave the log unchanged and put this exact deferred
 verification plan in the PR or final notes:
 
-```powershell
+```sh
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
-
-For the CLI navigation branch baseline, see
-[cli-navigation-next-wave-performance-review.md](cli-navigation-next-wave-performance-review.md).
 
 ## Parallelization Candidate Gate
 

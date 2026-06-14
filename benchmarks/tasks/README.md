@@ -36,16 +36,16 @@ files, symbols, claims, citations, and forbidden-claim checks for that manifest.
 It does not by itself establish speed, cost, or product headline claims.
 
 Repository metadata in each manifest records the intended public clone target,
-immutable commit or tag ref, optional workspace root, languages, and lightweight setup notes. The
-benchmark harness must still know how to map each `repo.name` to a local clone
-before it can execute the task. Until that mapping exists, the manifest remains
-valid corpus data but is not runnable through the harness.
+a full 40-character immutable Git commit SHA, optional workspace root,
+languages, and lightweight setup notes. The benchmark harness must still know
+how to map each `repo.name` to a local clone before it can execute the task.
+Until that mapping exists, the manifest remains valid corpus data but is not
+runnable through the harness.
 
 Expected setup is intentionally simple:
 
-- Clone the public repository URL at the manifest `repo.ref`; branch-like refs
-  such as `main` are allowed for local diagnostics only and fail publishable
-  provenance gates.
+- Clone the public repository URL at the manifest `repo.ref`. Branches, tags,
+  and short SHAs are intentionally excluded so benchmark provenance is stable.
 - Run the listed setup commands only when the benchmark runner needs local
   dependency metadata or tests.
 - Treat `repo.workspace_root` as the benchmark working directory when it is
@@ -62,6 +62,90 @@ the harness does not run arbitrary setup commands.
 Direct packet runtime rows are available with `--packet-runtime`. They compare
 cold CLI packet calls with warm `serve --stdio` packet calls while reusing the
 same expected-anchor quality gates.
+
+## Language Expansion Holdout
+
+The `language-expansion-holdout` suite is the triggerable agent A/B suite for
+public language-support profiles. It is separate from the OSS language corpus:
+
+- The OSS corpus checks whether CodeStory can index pinned real projects.
+- This suite runs paired `without_codestory` and `with_codestory` agent arms
+  against those pinned projects and records elapsed time, token usage, estimated
+  cost, observed tool calls, command counts, command categories, source reads,
+  source reads after the first CodeStory packet, and manifest quality gates.
+- The `without_codestory` arm mechanically runs a harness-owned local `rg` plus
+  bounded source-read prelude. The `with_codestory` arm mechanically runs a
+  harness-owned `codestory-cli packet` prelude. Both preludes count their wall
+  time and command/tool accounting. The CodeStory arm is packet-first, not
+  packet-only by default: if the packet and CodeStory follow-ups are partial,
+  ordinary local source reads are allowed after CodeStory and counted as
+  post-packet overhead. Pass `--max-source-reads-after-packet 0` only when you
+  want stricter packet-only promotion evidence. The `without_codestory` arm is
+  invalid for publishable evidence if it calls CodeStory or never inspects the
+  local repository.
+
+The suite currently has one medium-sized open source project per public
+language-support profile: parser-backed graph languages (Python, Java, Rust,
+JavaScript, TypeScript, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash)
+plus structural collectors (HTML, CSS, SQL).
+
+Materialize the pinned repos:
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --list --task-suite language-expansion-holdout --materialize-repos
+```
+
+Run a strict paired comparison:
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --task-suite language-expansion-holdout `
+  --arms without_codestory,with_codestory `
+  --repeats 3 --materialize-repos --prepare-codestory-cache `
+  --out-dir target/agent-benchmark/language-expansion-holdout `
+  --timeout-ms 600000
+```
+
+Use `--task-ids <id>` for a cheaper targeted run. The Markdown summary table
+includes the human-readable A/B columns; `runs.jsonl` remains the source of
+truth for per-run metrics.
+
+For runtime packet fixes, prefer a packet-first gated loop before launching
+nested agents:
+
+```powershell
+node scripts/codestory-agent-ab-score.mjs `
+  --packet-gate --packet-probe-jobs 4 `
+  --packet-gate-improved-from target/agent-benchmark/<previous-run> `
+  --reuse-baseline-from target/agent-benchmark/<previous-run> `
+  --prepare-codestory-jobs 2 `
+  --task-ids <comma-separated-task-ids> `
+  --out-dir target/agent-benchmark/<run-name>
+```
+
+`--packet-probe-jobs` controls cheap packet probes, `--jobs` controls
+independent nested A/B repo groups, and `--prepare-codestory-jobs` caps cache
+prep across repos. If a packet probe fails from transient sidecar
+unavailability, the score wrapper reruns just those task ids serially in a
+`packet-probes-retry` artifact before deciding which rows enter the A/B phase.
+Baseline reuse is valid only when the task manifest and scorer boundary are
+unchanged.
+
+For anti-overfit language checks, run promotion-oriented packet gates with
+production defaults. Exact benchmark probes belong in benchmark manifests,
+explicit `--extra-probe` inputs, or eval-only diagnostics; they are benchmark
+fixture behavior, not production steering. Framework/domain semantics belong in
+product code when they generalize to real projects.
+
+Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize the
+durable result in [language-expansion-ab-report.md](../../docs/testing/language-expansion-ab-report.md)
+instead of preserving local run directory catalogs here. The current packet
+runtime artifact passes manifest quality for `12/18` rows and is
+packet-sufficient for `9/18`; the packet-eligible A/B slice is a quality
+and efficiency win for its selected `9/9` CodeStory rows only. Treat that as
+packet-eligible slice evidence, not broad promotion proof for all public
+language-support profiles.
 
 ## Local Real-Repo Corpus
 
@@ -140,6 +224,10 @@ may exceed the default timeout on cold index; increase `--timeout-ms` when neede
 
 - Do **not** add repo-name, path, or display-name literals for `ripgrep`, `axios`,
   or `redis` in v2 planner or ranker code.
+- Keep holdout-specific probes and claim templates in manifests, benchmark
+  harnesses, tests, or `crates/codestory-runtime/src/agent/eval_probes.rs`
+  behind `CODESTORY_EVAL_PROBES`; do not put them in product packet/search
+  planning or ranking paths.
 - Do **not** iterate KPI fixes against holdout manifests; use `local-real` for
   in-scope tuning and treat holdout rows as promotion-only evidence.
 - Legacy sibling apps (`freelancer`, `traderotate`) are removed from default

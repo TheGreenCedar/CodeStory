@@ -14,12 +14,12 @@ pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
 };
 pub use storage_impl::{
-    CallerProjectionRemovalSummary, FileInfo, FileProjectionRemovalSummary, FileRole,
-    GroundingEdgeKindCount, GroundingFileSummary, GroundingNodeRecord, GroundingSnapshotMetadata,
-    GroundingSnapshotState, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, RetrievalIndexManifest, SearchSymbolProjection,
+    CallerProjectionRemovalSummary, DenseReasonCounts, FileInfo, FileProjectionRemovalSummary,
+    FileRole, GroundingEdgeKindCount, GroundingFileSummary, GroundingNodeRecord,
+    GroundingSnapshotMetadata, GroundingSnapshotState, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
+    LlmSymbolDocStats, ProjectionFlushBreakdown, RetrievalIndexManifest, SearchSymbolProjection,
     SearchSymbolProjectionDetail, Storage as Store, StorageError, StorageOpenMode, StorageStats,
-    SymbolSummaryRecord,
+    SymbolSearchDoc, SymbolSummaryRecord,
 };
 pub use trail_store::TrailStore;
 

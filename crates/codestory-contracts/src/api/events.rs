@@ -34,6 +34,22 @@ pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_docs_stale: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_search_docs_written: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_docs_skipped: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_public_api: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_entrypoint: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_documented_nontrivial: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_central_graph_node: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_component_report: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_dense_unstructured_doc: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_indexes_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_snapshot_ms: Option<u32>,
@@ -184,6 +200,14 @@ mod tests {
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
             semantic_docs_stale: None,
+            symbol_search_docs_written: None,
+            semantic_dense_docs_skipped: None,
+            semantic_dense_public_api: None,
+            semantic_dense_entrypoint: None,
+            semantic_dense_documented_nontrivial: None,
+            semantic_dense_central_graph_node: None,
+            semantic_dense_component_report: None,
+            semantic_dense_unstructured_doc: None,
             deferred_indexes_ms: None,
             summary_snapshot_ms: None,
             detail_snapshot_ms: None,
@@ -252,6 +276,14 @@ mod tests {
         assert!(value.get("semantic_docs_embedded").is_none());
         assert!(value.get("semantic_docs_pending").is_none());
         assert!(value.get("semantic_docs_stale").is_none());
+        assert!(value.get("symbol_search_docs_written").is_none());
+        assert!(value.get("semantic_dense_docs_skipped").is_none());
+        assert!(value.get("semantic_dense_public_api").is_none());
+        assert!(value.get("semantic_dense_entrypoint").is_none());
+        assert!(value.get("semantic_dense_documented_nontrivial").is_none());
+        assert!(value.get("semantic_dense_central_graph_node").is_none());
+        assert!(value.get("semantic_dense_component_report").is_none());
+        assert!(value.get("semantic_dense_unstructured_doc").is_none());
         assert!(value.get("resolution_call_candidate_index_ms").is_none());
         assert!(value.get("resolution_import_candidate_index_ms").is_none());
         assert!(value.get("resolution_call_semantic_index_ms").is_none());

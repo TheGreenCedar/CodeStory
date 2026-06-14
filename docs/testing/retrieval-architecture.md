@@ -1,13 +1,14 @@
 # Sidecar retrieval — architecture and promotion guide
 
-Sidecar-primary packet retrieval (Zoekt lexical, Qdrant semantic, SCIP graph) orchestrated by
+Sidecar-primary packet retrieval (Zoekt lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
 `codestory-retrieval` and integrated in `codestory-runtime`. Production packet paths use
 generic symbol/path roles; benchmark-only probe catalogs remain behind test-only eval harness hooks.
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
 configuration error, not a diagnostic route.
 
-**Related:** [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) (operator runbook),
-[`../architecture/retrieval-design.md`](../architecture/retrieval-design.md) (module contracts).
+**Related:** [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) (setup,
+env vars, CI smoke), [`../architecture/retrieval-design.md`](../architecture/retrieval-design.md)
+(mode definitions, cost envelopes, promotion guards).
 
 ---
 
@@ -17,99 +18,64 @@ configuration error, not a diagnostic route.
 |-------|----------|------|
 | Sidecar clients | `crates/codestory-retrieval/` (`zoekt_client`, `qdrant_client`, `scip_client`, `health`) | HTTP probes, staged search, timeouts |
 | Planner / executor / ranker | `codestory-retrieval` (`planner`, `executor`, `ranker`, `query_features`, `mode`) | Repo-agnostic staged plan, deadlines, degraded modes |
-| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, and mandatory real sidecar artifact paths |
+| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, and mandatory real sidecar artifact paths |
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
-| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts may name holdout repos only inside their manifest/eval boundary |
+| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts and `codestory-runtime/src/agent/eval_probes.rs` may name holdout repos only inside their manifest/eval boundary |
 
-**Modes:** `full`, `no_scip`, `no_semantic`, `lexical_only`, `unavailable` — only
-`full` may serve primary packet/search results. All non-`full` modes fail closed. See
-[`retrieval-design.md`](../architecture/retrieval-design.md#mandatory-sidecar-mode-matrix).
+**Modes:** See the canonical
+[mode matrix](../architecture/retrieval-design.md#mode-matrix). Only `full` may
+serve primary packet/search results.
 
 **Benchmark manifests:** `benchmarks/tasks/local-real/` is the realistic local
 product corpus; `benchmarks/tasks/holdout-retrieval/` is the public
 generalization corpus. Holdout rows are promotion evidence only, not a tuning
 loop.
 
-## Environment flags
+## Proof tiers and claims
 
-### Runtime variables
+Do not describe a branch as generalized or useful for agents until the matching
+proof tier has run cleanly on the current branch. Docs and PRs must state only
+the highest tier actually reached:
 
-`CODESTORY_RETRIEVAL_V2` and `CODESTORY_RETRIEVAL_V2_SHADOW` are no longer migration aliases.
-If either legacy variable is present, packet retrieval fails closed instead of silently mapping it
-to the sidecar-primary contract.
+| Tier | Proof | Claim allowed |
+|------|-------|---------------|
+| 1. CodeStory self-e2e | Generalization lint, targeted runtime/indexer tests, release CLI build, `doctor`, and repo-scale e2e stats | CodeStory still works on itself and production code has no banned holdout literals |
+| 2. Local-real drill suite | Tier 1 plus local-real packet/drill rows with no skip allowances | Product tuning survived realistic local repos |
+| 3. Holdout-retrieval drill suite | Tier 2 plus holdout-retrieval materialized repos, no skip allowances, required recall/quality thresholds, and forbidden-claim checks | Retrieval behavior is generalized enough for the public holdout suite |
+| 4. Promotion-grade paired benchmark | Tier 3 plus repeated paired CodeStory/no-CodeStory rows, quality gates, timing/cost accounting, and source-read avoidance checks | Promotion language about agent usefulness, speed, or savings |
 
-| Variable | Default (production) | Purpose |
-|----------|----------------------|---------|
-| `CODESTORY_RETRIEVAL` | unset → sidecar primary when manifest + `full` mode (else fail closed) | `1` force sidecar primary attempt; `0` is unsupported and fails closed |
-| `CODESTORY_RETRIEVAL_SHADOW` | unsupported for product benchmarks | Historical diagnostic switch; benchmark contract rejects it |
-| `CODESTORY_ZOEKT_ENABLED` | on | `0` is unsupported for product retrieval |
-| `CODESTORY_QDRANT_ENABLED` | on | `0` is unsupported for product retrieval |
-| `CODESTORY_RETRIEVAL_REAL_EMBEDDINGS` | `1` | `0` is unsupported for product retrieval |
-| `CODESTORY_RETRIEVAL_COMPOSE_PROFILE` | `real` | every other profile is unsupported for product bootstrap |
-| `CODESTORY_EMBED_BACKEND` | `llamacpp` | product manifests require llama.cpp bge-base embeddings |
-| `CODESTORY_EMBED_LLAMACPP_URL` | `http://127.0.0.1:8080/v1/embeddings` | local embedding sidecar endpoint |
-| `CODESTORY_ZOEKT_PORT` | `6070` | Zoekt HTTP |
-| `CODESTORY_QDRANT_HTTP_PORT` | `6333` | Qdrant HTTP |
-| `CODESTORY_QDRANT_GRPC_PORT` | `6334` | Qdrant gRPC |
+`packet` status is evidence sufficiency, not final answer quality. Only
+`drill`/`drill-suite` rows with ledger classifications can promote answer
+quality. Packet-first runs count as agent-useful only when packets marked
+`sufficient` avoid post-packet source reads, or when those reads are explicitly
+classified as source-truth follow-up rather than hidden grounding.
 
-### Benchmark-only flags
+## Environment and setup
 
-Use these when running promotion harnesses. Do not enable in normal production packet runs.
+Version pins, env vars, bootstrap commands, troubleshooting, and CI smoke
+sequences are owned by
+[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md). AST-first policy gates
+and dense-anchor promotion fields are summarized there and in
+[`retrieval-design.md`](../architecture/retrieval-design.md#ast-first-semantic-contract).
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `CODESTORY_EVAL_PROBES` | ignored in production runtime | Benchmark-shaped probe catalog (`eval_probes.rs`) is test-only; promotion bundles do not inject it. |
-
-**Sidecar promotion candidate (typical):**
-
-```powershell
-Remove-Item Env:CODESTORY_RETRIEVAL -ErrorAction SilentlyContinue
-Remove-Item Env:CODESTORY_EVAL_PROBES -ErrorAction SilentlyContinue
-.\target\release\codestory-cli.exe retrieval up
-.\target\release\codestory-cli.exe retrieval index --project . --refresh auto
-```
+Benchmark-only flag: `CODESTORY_EVAL_PROBES` is ignored in production runtime
+and must stay test-only.
 
 ---
 
-## Local workflows
-
-### One-command environment setup
-
-From the CodeStory repository root:
-
-```sh
-cargo retrieval-setup
-cargo retrieval-status
-```
-
-Optional Node wrapper (prerequisite report, optional holdout clone):
-`node scripts/setup-retrieval-env.mjs`.
-See [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md#quick-start-one-command).
-
-### Sidecars and index
-
-```sh
-cargo retrieval-setup
-cargo run -p codestory-cli -- retrieval index --project <repo-root> --refresh auto
-cargo run -p codestory-cli -- retrieval query "main" --project <repo-root>
-```
-
-`retrieval bootstrap` (alias `cargo retrieval-setup`) starts Docker Compose when Docker is installed.
-`retrieval up` alone only prepares cache dirs and state (see runbook).
-
-### local-real packet suite (in-scope tuning)
+## Local test workflows
 
 Repos: `codex`, `rootandruntime`, `sourcetrail`, `vscode` — manifests under
 `benchmarks/tasks/local-real/`.
 
-```powershell
-node scripts/codestory-agent-ab-benchmark.mjs `
-  --packet-runtime --packet-runtime-mode cold-cli `
-  --task-suite local-real --repeats 1 `
-  --out-dir target/agent-benchmark/packet-runtime-sidecar-promotion `
-  --codestory-cli target/release/codestory-cli.exe `
+```sh
+node scripts/codestory-agent-ab-benchmark.mjs \
+  --packet-runtime --packet-runtime-mode cold-cli \
+  --task-suite local-real --repeats 1 \
+  --out-dir target/agent-benchmark/packet-runtime-sidecar-promotion \
+  --codestory-cli target/release/codestory-cli \
   --timeout-ms 300000
 ```
 
@@ -119,27 +85,31 @@ before promotion language.
 
 ### holdout-retrieval (generalization)
 
-```powershell
+```sh
 node scripts/fetch-holdout-repos.mjs
 # or:
-node scripts/codestory-agent-ab-benchmark.mjs `
+node scripts/codestory-agent-ab-benchmark.mjs \
   --list --task-suite holdout-retrieval --materialize-repos
 
-node scripts/codestory-agent-ab-benchmark.mjs `
-  --packet-runtime --packet-runtime-mode cold-cli `
-  --task-suite holdout-retrieval --materialize-repos `
-  --repeats 1 `
-  --out-dir target/agent-benchmark/holdout-retrieval-smoke `
-  --codestory-cli target/release/codestory-cli.exe `
+node scripts/codestory-agent-ab-benchmark.mjs \
+  --packet-runtime --packet-runtime-mode cold-cli \
+  --task-suite holdout-retrieval --materialize-repos \
+  --repeats 1 \
+  --out-dir target/agent-benchmark/holdout-retrieval-smoke \
+  --codestory-cli target/release/codestory-cli \
   --timeout-ms 180000
 ```
 
 Holdout failures should block promotion or trigger diagnosis; do not add
 repo-name/path literals or tune planner/ranker heuristics against holdout rows.
+The generalization lint currently fails production Rust on holdout names and
+anchors such as repository names, specific source paths, and manifest-specific
+symbols. Keep those strings in manifests, tests, benchmark harnesses, or the
+test-only eval probe module.
 
 ## Fast CI-style checks (automated in Phase 6)
 
-```powershell
+```sh
 cargo test -p codestory-runtime --test retrieval_generalization_guard
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 cargo test -p codestory-cli --test onboarding_contracts
@@ -147,7 +117,7 @@ cargo test -p codestory-cli --test onboarding_contracts
 
 Optional broader lane:
 
-```powershell
+```sh
 cargo test -p codestory-retrieval
 cargo test -p codestory-runtime
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
@@ -177,22 +147,28 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | Warning config | done | `docs/architecture/retrieval-rollback.json` |
 | Markdown link contract (`onboarding_contracts`) | verify | `cargo test -p codestory-cli --test onboarding_contracts` |
 | local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
-| holdout-retrieval 2/3 pass | **human** | Requires materialized OSS repos + index |
+| holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
 | `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
-| Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecar-smoke-ci.md`](../contributors/retrieval-sidecar-smoke-ci.md) |
+| Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract) |
 | Ragas/Phoenix nightly eval | optional | Not configured |
 
 ### North-star SLOs (targets — measure before claiming pass)
 
 | Metric | Target |
 |--------|--------|
+| Cold CodeStory product index | under 180 s |
+| Cold semantic embedding time | at least 70% lower than same-run baseline |
+| Dense embedded docs | at least 65% lower than same-run baseline |
+| Repeat full refresh | 0 unchanged dense docs embedded and under 25 s |
+| Holdout MRR@10 | no more than 1 percentage-point drop versus same-run baseline |
+| Hit@10 / exact-symbol Hit@1 | no regression |
 | Retrieval p50 | ≤ 250 ms |
 | Retrieval p90 | ≤ 600 ms |
 | Retrieval p99 | ≤ 1,000 ms |
 | Worst-case packet wall | ≤ 1,500 ms |
 | local-real quality pass | ≥ 3/4 repos |
 | `agent_value_gap` | &lt; 0.20 |
-| holdout generalization | 2/3 of `ripgrep`, `axios`, `redis` |
+| holdout generalization | Required manifest thresholds across the full holdout-retrieval suite |
 | Sidecar planner/ranker repo literals | 0 (lint clean) |
 
 ---
@@ -207,7 +183,7 @@ After promotion runs, verify rollback warnings:
 
 **One-shot operator drill (after each promotion run):**
 
-```powershell
+```sh
 cargo test -p codestory-runtime retrieval_rollback::tests::rollback_drill_warns_without_setting_legacy_env -- --nocapture
 ```
 

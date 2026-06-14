@@ -285,8 +285,9 @@ fn search_json_fails_closed_without_full_sidecars() {
         "search should report mandatory sidecar full-mode boundary: {stderr}"
     );
     assert!(
-        stderr.contains("Next commands:")
-            && stderr.contains("codestory-cli index")
+        stderr.contains("Minimum next:")
+            && stderr.contains("Full repair:")
+            && stderr.contains("codestory-cli retrieval index")
             && stderr.contains("--refresh full")
             && stderr.contains("codestory-cli retrieval bootstrap")
             && stderr.contains("codestory-cli doctor"),
@@ -1717,6 +1718,22 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         index.status.success(),
         "index command failed: {}",
         String::from_utf8_lossy(&index.stderr)
+    );
+    let retrieval_index = run_cli(
+        workspace.path(),
+        &[
+            "retrieval",
+            "index",
+            "--refresh",
+            "full",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        retrieval_index.status.success(),
+        "retrieval index command failed: {}",
+        String::from_utf8_lossy(&retrieval_index.stderr)
     );
 
     let expectations = [

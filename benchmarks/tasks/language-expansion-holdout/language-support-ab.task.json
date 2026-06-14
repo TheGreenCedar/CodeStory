@@ -1,0 +1,1706 @@
+{
+  "tasks": [
+    {
+      "id": "python-requests-session-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "psf-requests",
+        "url": "https://github.com/psf/requests.git",
+        "ref": "6f66281a1d6326b1b9c4ac09ca30de0fc4e6ef43",
+        "workspace_root": ".",
+        "languages": [
+          "Python"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "src/requests/api.py",
+        "src/requests/sessions.py",
+        "src/requests/models.py",
+        "src/requests/adapters.py"
+      ],
+      "expected_symbols": [
+        {
+          "name": "request",
+          "path": "src/requests/api.py",
+          "kind": "function",
+          "why": "Top-level helper that creates a Session and delegates request execution."
+        },
+        {
+          "name": "Session",
+          "path": "src/requests/sessions.py",
+          "kind": "class",
+          "why": "Owns request preparation, adapter lookup, and sending."
+        },
+        {
+          "name": "Session.request",
+          "path": "src/requests/sessions.py",
+          "kind": "method",
+          "why": "Builds and prepares the Request before sending."
+        },
+        {
+          "name": "Session.send",
+          "path": "src/requests/sessions.py",
+          "kind": "method",
+          "why": "Dispatches a PreparedRequest through the selected adapter."
+        },
+        {
+          "name": "PreparedRequest.prepare",
+          "path": "src/requests/models.py",
+          "kind": "method",
+          "why": "Materializes method, URL, headers, body, auth, cookies, and hooks."
+        },
+        {
+          "name": "HTTPAdapter.send",
+          "path": "src/requests/adapters.py",
+          "kind": "method",
+          "why": "Performs the transport-level send."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "The top-level request helper opens a Session and delegates to Session.request."
+        },
+        {
+          "text": "Session.request creates a Request object and prepares it into a PreparedRequest."
+        },
+        {
+          "text": "Session.send chooses an adapter and calls the adapter send method."
+        },
+        {
+          "text": "HTTPAdapter.send is the transport boundary that returns the response."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "The top-level request helper sends directly over the network without a Session.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "python",
+        "http"
+      ]
+    },
+    {
+      "id": "java-commons-lang-string-utils",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "apache-commons-lang",
+        "url": "https://github.com/apache/commons-lang.git",
+        "ref": "57f39420fef8413ea42f045f1bdba4864ff75a0c",
+        "workspace_root": ".",
+        "languages": [
+          "Java"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how Commons Lang implements blank, empty, and case-sensitive string checks across StringUtils, Strings, and CharSequenceUtils. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "src/main/java/org/apache/commons/lang3/StringUtils.java",
+        "src/main/java/org/apache/commons/lang3/Strings.java",
+        "src/main/java/org/apache/commons/lang3/CharSequenceUtils.java"
+      ],
+      "expected_symbols": [
+        {
+          "name": "StringUtils",
+          "path": "src/main/java/org/apache/commons/lang3/StringUtils.java",
+          "kind": "class",
+          "why": "Public string helper surface."
+        },
+        {
+          "name": "StringUtils.isBlank",
+          "path": "src/main/java/org/apache/commons/lang3/StringUtils.java",
+          "kind": "method",
+          "why": "Blank predicate under test."
+        },
+        {
+          "name": "StringUtils.isEmpty",
+          "path": "src/main/java/org/apache/commons/lang3/StringUtils.java",
+          "kind": "method",
+          "why": "Empty predicate under test."
+        },
+        {
+          "name": "Strings",
+          "path": "src/main/java/org/apache/commons/lang3/Strings.java",
+          "kind": "class",
+          "why": "Case-sensitive and case-insensitive string operations."
+        },
+        {
+          "name": "CharSequenceUtils.regionMatches",
+          "path": "src/main/java/org/apache/commons/lang3/CharSequenceUtils.java",
+          "kind": "method",
+          "why": "Shared region comparison helper."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "StringUtils.isBlank treats null, empty, and whitespace-only inputs as blank."
+        },
+        {
+          "text": "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
+        },
+        {
+          "text": "Strings delegates region matching work to CharSequenceUtils.regionMatches."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "StringUtils.isEmpty treats whitespace-only strings as empty.",
+          "severity": "major"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "java",
+        "strings"
+      ]
+    },
+    {
+      "id": "rust-ripgrep-search-pipeline",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "BurntSushi-ripgrep",
+        "url": "https://github.com/BurntSushi/ripgrep.git",
+        "ref": "82313cf95849bfe425109ad9506a52154879b1b1",
+        "workspace_root": ".",
+        "languages": [
+          "Rust"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "crates/core/main.rs",
+        "crates/core/flags/mod.rs",
+        "crates/core/flags/hiargs.rs",
+        "crates/core/haystack.rs",
+        "crates/core/search.rs"
+      ],
+      "expected_symbols": [
+        {
+          "name": "main",
+          "path": "crates/core/main.rs",
+          "kind": "function",
+          "why": "CLI entry point."
+        },
+        {
+          "name": "run",
+          "path": "crates/core/main.rs",
+          "kind": "function",
+          "why": "Routes parsed args to the selected operating mode."
+        },
+        {
+          "name": "search",
+          "path": "crates/core/main.rs",
+          "kind": "function",
+          "why": "Single-threaded walk and per-file search loop."
+        },
+        {
+          "name": "SearchWorker",
+          "path": "crates/core/search.rs",
+          "kind": "struct",
+          "why": "Coordinates matcher, searcher, and printer."
+        },
+        {
+          "name": "SearchWorker::search",
+          "path": "crates/core/search.rs",
+          "kind": "method",
+          "why": "Executes one haystack search."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "main calls run after flags are parsed."
+        },
+        {
+          "text": "HiArgs builds walkers, matchers, searchers, and printers for the search driver."
+        },
+        {
+          "text": "SearchWorker connects a matcher, grep searcher, and printer for each haystack."
+        },
+        {
+          "text": "Parallel search uses the walker parallel builder to distribute file work."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Flag parsing happens inside SearchWorker instead of before run selects a mode.",
+          "severity": "major"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "rust",
+        "search"
+      ]
+    },
+    {
+      "id": "javascript-express-routing-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "route_tracing",
+      "repo": {
+        "name": "expressjs-express",
+        "url": "https://github.com/expressjs/express.git",
+        "ref": "dae209ae6559c29cfca2a1f4414c51d89ea643d5",
+        "workspace_root": ".",
+        "languages": [
+          "JavaScript"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "lib/express.js",
+        "lib/application.js",
+        "lib/request.js",
+        "lib/response.js"
+      ],
+      "expected_symbols": [
+        {
+          "name": "createApplication",
+          "path": "lib/express.js",
+          "kind": "function",
+          "why": "Creates the callable app object."
+        },
+        {
+          "name": "app.init",
+          "path": "lib/application.js",
+          "kind": "method",
+          "why": "Initializes app state."
+        },
+        {
+          "name": "app.handle",
+          "path": "lib/application.js",
+          "kind": "method",
+          "why": "Handles incoming requests."
+        },
+        {
+          "name": "app.use",
+          "path": "lib/application.js",
+          "kind": "method",
+          "why": "Registers middleware."
+        },
+        {
+          "name": "app.route",
+          "path": "lib/application.js",
+          "kind": "method",
+          "why": "Creates route entries."
+        },
+        {
+          "name": "res.send",
+          "path": "lib/response.js",
+          "kind": "method",
+          "why": "Sends response bodies."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "createApplication builds a callable app object and mixes in request and response prototypes."
+        },
+        {
+          "text": "app.use registers middleware on the router."
+        },
+        {
+          "text": "app.handle delegates request handling to the router."
+        },
+        {
+          "text": "res.send prepares and sends the response body."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Express handles requests without delegating to a router.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "javascript",
+        "routing"
+      ]
+    },
+    {
+      "id": "typescript-swr-hook-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "vercel-swr",
+        "url": "https://github.com/vercel/swr.git",
+        "ref": "f8d4995ac555f02a2784c8fc40bc819782c60568",
+        "workspace_root": ".",
+        "languages": [
+          "TypeScript"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how SWR exposes useSWR, serializes keys, connects cache helpers, and routes mutate behavior through the internal mutation helper. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "src/index/use-swr.ts",
+        "src/index/index.ts",
+        "src/_internal/utils/serialize.ts",
+        "src/_internal/utils/helper.ts",
+        "src/_internal/utils/mutate.ts",
+        "src/_internal/utils/with-middleware.ts"
+      ],
+      "expected_symbols": [
+        {
+          "name": "useSWRHandler",
+          "path": "src/index/use-swr.ts",
+          "kind": "function",
+          "why": "Core hook implementation."
+        },
+        {
+          "name": "useSWR",
+          "path": "src/index/index.ts",
+          "kind": "function",
+          "why": "Public default hook export."
+        },
+        {
+          "name": "serialize",
+          "path": "src/_internal/utils/serialize.ts",
+          "kind": "function",
+          "why": "Normalizes cache keys."
+        },
+        {
+          "name": "createCacheHelper",
+          "path": "src/_internal/utils/helper.ts",
+          "kind": "function",
+          "why": "Builds cache accessors for SWR state."
+        },
+        {
+          "name": "internalMutate",
+          "path": "src/_internal/utils/mutate.ts",
+          "kind": "function",
+          "why": "Shared mutation path."
+        },
+        {
+          "name": "withMiddleware",
+          "path": "src/_internal/utils/with-middleware.ts",
+          "kind": "function",
+          "why": "Wraps hooks with middleware."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "The public useSWR export wraps useSWRHandler with argument normalization."
+        },
+        {
+          "text": "useSWRHandler serializes the key before reading cache state."
+        },
+        {
+          "text": "createCacheHelper provides cache get, set, subscribe, and snapshot helpers."
+        },
+        {
+          "text": "mutate behavior flows through internalMutate."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "SWR stores hook state without serializing the cache key.",
+          "severity": "major"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "typescript",
+        "react"
+      ]
+    },
+    {
+      "id": "cpp-fmt-formatting-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "fmtlib-fmt",
+        "url": "https://github.com/fmtlib/fmt.git",
+        "ref": "e8deaf2ec3b53ced589fce6f640061e5b32eeeaa",
+        "workspace_root": ".",
+        "languages": [
+          "C++"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "include/fmt/base.h",
+        "include/fmt/format.h",
+        "include/fmt/args.h",
+        "src/format.cc",
+        "src/os.cc"
+      ],
+      "expected_symbols": [
+        {
+          "name": "vformat",
+          "path": "include/fmt/format.h",
+          "kind": "function",
+          "why": "Central type-erased formatting entry point."
+        },
+        {
+          "name": "format_to",
+          "path": "include/fmt/base.h",
+          "kind": "function",
+          "why": "Writes formatted output to an iterator."
+        },
+        {
+          "name": "format_arg_store",
+          "path": "include/fmt/base.h",
+          "kind": "template",
+          "why": "Stores type-erased formatting arguments."
+        },
+        {
+          "name": "dynamic_format_arg_store",
+          "path": "include/fmt/args.h",
+          "kind": "class",
+          "why": "Runtime-owned argument store."
+        },
+        {
+          "name": "format_error",
+          "path": "include/fmt/format.h",
+          "kind": "class",
+          "why": "Reports formatting failures."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "fmt builds type-erased format argument stores before dispatching formatting."
+        },
+        {
+          "text": "vformat is the central formatting path for runtime format arguments."
+        },
+        {
+          "text": "format_to writes formatted output through an output iterator."
+        },
+        {
+          "text": "format_error represents formatting failures."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "fmt only supports compile-time formatting and has no runtime vformat path.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "cpp",
+        "formatting"
+      ]
+    },
+    {
+      "id": "c-redis-command-loop",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "route_tracing",
+      "repo": {
+        "name": "redis-redis",
+        "url": "https://github.com/redis/redis.git",
+        "ref": "df63a65d4d4ee33ae67e9f101885074febe0bccb",
+        "workspace_root": ".",
+        "languages": [
+          "C"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Trace how Redis initializes the server, enters the event loop, reads client input, and routes a command for execution. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "src/server.c",
+        "src/server.h",
+        "src/ae.c",
+        "src/networking.c"
+      ],
+      "expected_symbols": [
+        {
+          "name": "main",
+          "path": "src/server.c",
+          "kind": "function",
+          "why": "Server process entry point."
+        },
+        {
+          "name": "initServer",
+          "path": "src/server.c",
+          "kind": "function",
+          "why": "Initializes server state and event handlers."
+        },
+        {
+          "name": "aeMain",
+          "path": "src/ae.c",
+          "kind": "function",
+          "why": "Event loop runner."
+        },
+        {
+          "name": "readQueryFromClient",
+          "path": "src/networking.c",
+          "kind": "function",
+          "why": "Reads client query buffers."
+        },
+        {
+          "name": "processCommand",
+          "path": "src/server.c",
+          "kind": "function",
+          "why": "Routes parsed commands to execution."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Redis main initializes server state before entering the event loop."
+        },
+        {
+          "text": "aeMain drives registered file and time events."
+        },
+        {
+          "text": "readQueryFromClient reads client input into query buffers."
+        },
+        {
+          "text": "processCommand performs command routing and execution checks."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Redis executes commands directly from the TCP accept path without the event loop.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "c",
+        "server"
+      ]
+    },
+    {
+      "id": "go-gin-route-dispatch",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "route_tracing",
+      "repo": {
+        "name": "gin-gonic-gin",
+        "url": "https://github.com/gin-gonic/gin.git",
+        "ref": "d75fcd4c9ab260e5225de590f1f0f8c0e0e12d11",
+        "workspace_root": ".",
+        "languages": [
+          "Go"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Trace how Gin creates an engine, registers routes through router groups, stores them in method trees, and dispatches handlers for a request. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "gin.go",
+        "routergroup.go",
+        "tree.go",
+        "context.go"
+      ],
+      "expected_symbols": [
+        {
+          "name": "New",
+          "path": "gin.go",
+          "kind": "function",
+          "why": "Creates an Engine."
+        },
+        {
+          "name": "Default",
+          "path": "gin.go",
+          "kind": "function",
+          "why": "Creates an Engine with default middleware."
+        },
+        {
+          "name": "RouterGroup.Handle",
+          "path": "routergroup.go",
+          "kind": "method",
+          "why": "Public route registration API."
+        },
+        {
+          "name": "Engine.addRoute",
+          "path": "gin.go",
+          "kind": "method",
+          "why": "Adds route handlers to method trees."
+        },
+        {
+          "name": "node.addRoute",
+          "path": "tree.go",
+          "kind": "method",
+          "why": "Inserts a route into the radix tree."
+        },
+        {
+          "name": "Engine.handleHTTPRequest",
+          "path": "gin.go",
+          "kind": "method",
+          "why": "Matches request paths and dispatches handlers."
+        },
+        {
+          "name": "Context.Next",
+          "path": "context.go",
+          "kind": "method",
+          "why": "Runs the handler chain."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "RouterGroup.Handle registers routes by delegating to the group handle path."
+        },
+        {
+          "text": "Engine.addRoute inserts handlers into the per-method route tree."
+        },
+        {
+          "text": "Engine.handleHTTPRequest finds a route and installs handlers on the context."
+        },
+        {
+          "text": "Context.Next advances through the handler chain."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Gin dispatches handlers without storing routes in method trees.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "go",
+        "routing"
+      ]
+    },
+    {
+      "id": "ruby-jekyll-site-build",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "route_tracing",
+      "repo": {
+        "name": "jekyll-jekyll",
+        "url": "https://github.com/jekyll/jekyll.git",
+        "ref": "202df571314ba1d18e9fccd81d12aaad4a703c38",
+        "workspace_root": ".",
+        "languages": [
+          "Ruby"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "lib/jekyll/commands/build.rb",
+        "lib/jekyll/site.rb",
+        "lib/jekyll/reader.rb",
+        "lib/jekyll/renderer.rb"
+      ],
+      "expected_symbols": [
+        {
+          "name": "Jekyll::Commands::Build.process",
+          "path": "lib/jekyll/commands/build.rb",
+          "kind": "method",
+          "why": "Build command entry point."
+        },
+        {
+          "name": "Jekyll::Site",
+          "path": "lib/jekyll/site.rb",
+          "kind": "class",
+          "why": "Coordinates the site build."
+        },
+        {
+          "name": "Site#process",
+          "path": "lib/jekyll/site.rb",
+          "kind": "method",
+          "why": "Runs the full build pipeline."
+        },
+        {
+          "name": "Site#read",
+          "path": "lib/jekyll/site.rb",
+          "kind": "method",
+          "why": "Starts content reading."
+        },
+        {
+          "name": "Site#render",
+          "path": "lib/jekyll/site.rb",
+          "kind": "method",
+          "why": "Starts rendering."
+        },
+        {
+          "name": "Site#write",
+          "path": "lib/jekyll/site.rb",
+          "kind": "method",
+          "why": "Writes generated output."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Build.process constructs or processes a Jekyll site."
+        },
+        {
+          "text": "Site.process runs reset, read, generate, render, cleanup, and write phases."
+        },
+        {
+          "text": "Reader is responsible for reading site content."
+        },
+        {
+          "text": "Renderer renders pages and documents."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Jekyll writes output before reading and rendering the site.",
+          "severity": "major"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "ruby",
+        "static-site"
+      ]
+    },
+    {
+      "id": "php-monolog-record-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "data_flow",
+      "repo": {
+        "name": "Seldaek-monolog",
+        "url": "https://github.com/Seldaek/monolog.git",
+        "ref": "04c3499db98d7471abd9261dc83232f8fe1a252d",
+        "workspace_root": ".",
+        "languages": [
+          "PHP"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how Monolog turns a log call into a LogRecord and passes it through handlers. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "src/Monolog/Logger.php",
+        "src/Monolog/LogRecord.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Handler/AbstractProcessingHandler.php"
+      ],
+      "expected_symbols": [
+        {
+          "name": "Logger",
+          "path": "src/Monolog/Logger.php",
+          "kind": "class",
+          "why": "Public logging API and handler owner."
+        },
+        {
+          "name": "Logger::pushHandler",
+          "path": "src/Monolog/Logger.php",
+          "kind": "method",
+          "why": "Registers handlers."
+        },
+        {
+          "name": "Logger::addRecord",
+          "path": "src/Monolog/Logger.php",
+          "kind": "method",
+          "why": "Creates records and invokes handlers."
+        },
+        {
+          "name": "Logger::log",
+          "path": "src/Monolog/Logger.php",
+          "kind": "method",
+          "why": "Generic log entry point."
+        },
+        {
+          "name": "LogRecord",
+          "path": "src/Monolog/LogRecord.php",
+          "kind": "class",
+          "why": "Carries structured log data."
+        },
+        {
+          "name": "AbstractProcessingHandler::handle",
+          "path": "src/Monolog/Handler/AbstractProcessingHandler.php",
+          "kind": "method",
+          "why": "Processes records before writing."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Logger owns a stack of handlers registered by pushHandler."
+        },
+        {
+          "text": "Logger::log delegates into addRecord."
+        },
+        {
+          "text": "addRecord creates a LogRecord before passing it to handlers."
+        },
+        {
+          "text": "AbstractProcessingHandler handles records by processing and writing them."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Monolog sends log messages directly to handlers without creating a LogRecord.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "php",
+        "logging"
+      ]
+    },
+    {
+      "id": "csharp-automapper-map-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "data_flow",
+      "repo": {
+        "name": "AutoMapper-AutoMapper",
+        "url": "https://github.com/AutoMapper/AutoMapper.git",
+        "ref": "b57c206dc7291821e42bdf816a5637a5c1d8cb54",
+        "workspace_root": ".",
+        "languages": [
+          "C#"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "src/AutoMapper/Mapper.cs",
+        "src/AutoMapper/Configuration/MapperConfiguration.cs",
+        "src/AutoMapper/TypeMap.cs",
+        "src/AutoMapper/Execution/TypeMapPlanBuilder.cs"
+      ],
+      "expected_symbols": [
+        {
+          "name": "IMapperBase",
+          "path": "src/AutoMapper/Mapper.cs",
+          "kind": "interface",
+          "why": "Base mapping API."
+        },
+        {
+          "name": "IMapper",
+          "path": "src/AutoMapper/Mapper.cs",
+          "kind": "interface",
+          "why": "Runtime mapper API."
+        },
+        {
+          "name": "Mapper",
+          "path": "src/AutoMapper/Mapper.cs",
+          "kind": "class",
+          "why": "Runtime mapper implementation."
+        },
+        {
+          "name": "Mapper.Map",
+          "path": "src/AutoMapper/Mapper.cs",
+          "kind": "method",
+          "why": "Public object mapping entry point."
+        },
+        {
+          "name": "MapperConfiguration",
+          "path": "src/AutoMapper/Configuration/MapperConfiguration.cs",
+          "kind": "class",
+          "why": "Builds and owns mapping configuration."
+        },
+        {
+          "name": "TypeMap.CreateMapperLambda",
+          "path": "src/AutoMapper/TypeMap.cs",
+          "kind": "method",
+          "why": "Creates mapping execution plan."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "MapperConfiguration builds and owns the mapping configuration used at runtime."
+        },
+        {
+          "text": "Mapper.Map is the public runtime entry point for object mapping."
+        },
+        {
+          "text": "TypeMap contributes mapper lambda plans used by the execution pipeline."
+        },
+        {
+          "text": "TypeMapPlanBuilder participates in building expression plans for mappings."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "AutoMapper maps objects without using configuration or type maps.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "csharp",
+        "mapping"
+      ]
+    },
+    {
+      "id": "kotlin-okio-buffer-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "data_flow",
+      "repo": {
+        "name": "square-okio",
+        "url": "https://github.com/square/okio.git",
+        "ref": "722c8be0043d99b7b08d169b0ae90a24c15267ff",
+        "workspace_root": ".",
+        "languages": [
+          "Kotlin"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how Okio's Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "okio/src/commonMain/kotlin/okio/Buffer.kt",
+        "okio/src/commonMain/kotlin/okio/BufferedSource.kt",
+        "okio/src/commonMain/kotlin/okio/BufferedSink.kt",
+        "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt",
+        "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt",
+        "okio/src/commonMain/kotlin/okio/Okio.kt"
+      ],
+      "expected_symbols": [
+        {
+          "name": "Buffer",
+          "path": "okio/src/commonMain/kotlin/okio/Buffer.kt",
+          "kind": "class",
+          "why": "In-memory byte queue."
+        },
+        {
+          "name": "Buffer.read",
+          "path": "okio/src/commonMain/kotlin/okio/Buffer.kt",
+          "kind": "function",
+          "why": "Reads bytes from the buffer."
+        },
+        {
+          "name": "Buffer.write",
+          "path": "okio/src/commonMain/kotlin/okio/Buffer.kt",
+          "kind": "function",
+          "why": "Writes bytes into the buffer."
+        },
+        {
+          "name": "RealBufferedSource",
+          "path": "okio/src/commonMain/kotlin/okio/RealBufferedSource.kt",
+          "kind": "class",
+          "why": "Buffered source implementation."
+        },
+        {
+          "name": "RealBufferedSink",
+          "path": "okio/src/commonMain/kotlin/okio/RealBufferedSink.kt",
+          "kind": "class",
+          "why": "Buffered sink implementation."
+        },
+        {
+          "name": "buffer",
+          "path": "okio/src/commonMain/kotlin/okio/Okio.kt",
+          "kind": "function",
+          "why": "Wraps raw sources or sinks in buffered implementations."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Buffer is the in-memory byte store used by Okio reads and writes."
+        },
+        {
+          "text": "RealBufferedSource reads from an upstream Source into a Buffer."
+        },
+        {
+          "text": "RealBufferedSink writes buffered bytes to an upstream Sink."
+        },
+        {
+          "text": "Okio buffer helpers wrap Source and Sink instances with buffered implementations."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Okio buffered wrappers bypass Buffer and write every byte directly.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "kotlin",
+        "io"
+      ]
+    },
+    {
+      "id": "swift-alamofire-request-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "route_tracing",
+      "repo": {
+        "name": "Alamofire-Alamofire",
+        "url": "https://github.com/Alamofire/Alamofire.git",
+        "ref": "7595cbcf59809f9977c5f6378500de2ad73b7ddb",
+        "workspace_root": ".",
+        "languages": [
+          "Swift"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "Source/Core/Session.swift",
+        "Source/Core/Request.swift",
+        "Source/Core/DataRequest.swift",
+        "Source/Core/SessionDelegate.swift"
+      ],
+      "expected_symbols": [
+        {
+          "name": "Session",
+          "path": "Source/Core/Session.swift",
+          "kind": "class",
+          "why": "Owns request creation and URLSession integration."
+        },
+        {
+          "name": "Session.request",
+          "path": "Source/Core/Session.swift",
+          "kind": "method",
+          "why": "Creates DataRequest instances."
+        },
+        {
+          "name": "Request.resume",
+          "path": "Source/Core/Request.swift",
+          "kind": "method",
+          "why": "Resumes the underlying task."
+        },
+        {
+          "name": "DataRequest",
+          "path": "Source/Core/DataRequest.swift",
+          "kind": "class",
+          "why": "Represents data request behavior."
+        },
+        {
+          "name": "DataRequest.validate",
+          "path": "Source/Core/DataRequest.swift",
+          "kind": "method",
+          "why": "Adds validation."
+        },
+        {
+          "name": "SessionDelegate",
+          "path": "Source/Core/SessionDelegate.swift",
+          "kind": "class",
+          "why": "Handles URLSession delegate callbacks."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Session creates request objects such as DataRequest."
+        },
+        {
+          "text": "Request.resume resumes the underlying URLSession task."
+        },
+        {
+          "text": "DataRequest.validate attaches validation behavior."
+        },
+        {
+          "text": "SessionDelegate receives URLSession callback events."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "Alamofire sends requests without a Session or URLSession delegate path.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "swift",
+        "http"
+      ]
+    },
+    {
+      "id": "dart-http-client-flow",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "data_flow",
+      "repo": {
+        "name": "dart-lang-http",
+        "url": "https://github.com/dart-lang/http.git",
+        "ref": "89cec60a4249ae0a0316f7a50d37ac56597f52c3",
+        "workspace_root": ".",
+        "languages": [
+          "Dart"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "pkgs/http/lib/http.dart",
+        "pkgs/http/lib/src/client.dart",
+        "pkgs/http/lib/src/base_client.dart",
+        "pkgs/http/lib/src/base_request.dart",
+        "pkgs/http/lib/src/io_client.dart",
+        "pkgs/http/lib/src/request.dart",
+        "pkgs/http/lib/src/response.dart"
+      ],
+      "expected_symbols": [
+        {
+          "name": "Client",
+          "path": "pkgs/http/lib/src/client.dart",
+          "kind": "class",
+          "why": "Public HTTP client API."
+        },
+        {
+          "name": "Client.get",
+          "path": "pkgs/http/lib/src/client.dart",
+          "kind": "method",
+          "why": "Convenience request API."
+        },
+        {
+          "name": "BaseClient",
+          "path": "pkgs/http/lib/src/base_client.dart",
+          "kind": "class",
+          "why": "Implements convenience methods over send."
+        },
+        {
+          "name": "BaseRequest",
+          "path": "pkgs/http/lib/src/base_request.dart",
+          "kind": "class",
+          "why": "Base request object with finalization."
+        },
+        {
+          "name": "BaseRequest.finalize",
+          "path": "pkgs/http/lib/src/base_request.dart",
+          "kind": "method",
+          "why": "Freezes request body before sending."
+        },
+        {
+          "name": "IOClient.send",
+          "path": "pkgs/http/lib/src/io_client.dart",
+          "kind": "method",
+          "why": "dart:io transport implementation."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Top-level package:http helpers delegate to a Client."
+        },
+        {
+          "text": "BaseClient implements convenience methods in terms of send."
+        },
+        {
+          "text": "BaseRequest.finalize prepares the request body for sending."
+        },
+        {
+          "text": "IOClient.send is the dart:io transport implementation."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "package:http top-level helpers bypass Client and IOClient entirely.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "dart",
+        "http"
+      ]
+    },
+    {
+      "id": "bash-nvm-install-dispatch",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "route_tracing",
+      "repo": {
+        "name": "nvm-sh-nvm",
+        "url": "https://github.com/nvm-sh/nvm.git",
+        "ref": "7079a5d61c2b49c7d35a72006860ce5edb0fac51",
+        "workspace_root": ".",
+        "languages": [
+          "Bash"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Trace how nvm's install script bootstraps the shell function and how nvm.sh dispatches install, download, and use commands. Cite the source files and name the supporting symbols.",
+      "expected_files": [
+        "install.sh",
+        "nvm.sh",
+        "bash_completion"
+      ],
+      "expected_symbols": [
+        {
+          "name": "nvm_do_install",
+          "path": "install.sh",
+          "kind": "function",
+          "why": "Installer orchestration function."
+        },
+        {
+          "name": "nvm",
+          "path": "nvm.sh",
+          "kind": "function",
+          "why": "Main command dispatcher."
+        },
+        {
+          "name": "nvm_install_node",
+          "path": "install.sh",
+          "kind": "function",
+          "why": "Installs Node versions."
+        },
+        {
+          "name": "nvm_download",
+          "path": "nvm.sh",
+          "kind": "function",
+          "why": "Downloads remote assets."
+        },
+        {
+          "name": "nvm_use_if_needed",
+          "path": "nvm.sh",
+          "kind": "function",
+          "why": "Switches active version when needed."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "install.sh bootstraps installation and arranges for nvm.sh to be sourced."
+        },
+        {
+          "text": "nvm.sh defines the main nvm dispatcher function."
+        },
+        {
+          "text": "nvm_install_node and nvm_download participate in installing Node versions."
+        },
+        {
+          "text": "nvm_use_if_needed switches versions only when the requested version is not already active."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "nvm is a compiled binary and does not dispatch through shell functions.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "bash",
+        "shell"
+      ]
+    },
+    {
+      "id": "html-mdn-form-validation",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "mdn-learning-area",
+        "url": "https://github.com/mdn/learning-area.git",
+        "ref": "ca1ff0bd06e12b96a6742ffdf040bb22966e5a5e",
+        "workspace_root": ".",
+        "languages": [
+          "HTML"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how the MDN form validation examples combine native HTML constraints with custom JavaScript validation. Cite the source files and name the supporting elements or functions.",
+      "expected_files": [
+        "html/forms/form-validation/full-example.html",
+        "html/forms/form-validation/detailed-custom-validation.html",
+        "html/forms/form-validation/fruit-pattern.html",
+        "html/forms/form-validation/min-max.html"
+      ],
+      "expected_symbols": [
+        {
+          "name": "form",
+          "path": "html/forms/form-validation/detailed-custom-validation.html",
+          "kind": "element",
+          "why": "Validation form root."
+        },
+        {
+          "name": "input#mail",
+          "path": "html/forms/form-validation/detailed-custom-validation.html",
+          "kind": "element",
+          "why": "Email input validated by JavaScript."
+        },
+        {
+          "name": "novalidate",
+          "path": "html/forms/form-validation/detailed-custom-validation.html",
+          "kind": "attribute",
+          "why": "Disables browser UI for custom validation."
+        },
+        {
+          "name": "showError",
+          "path": "html/forms/form-validation/detailed-custom-validation.html",
+          "kind": "function",
+          "why": "Reports custom validation messages."
+        },
+        {
+          "name": "pattern",
+          "path": "html/forms/form-validation/fruit-pattern.html",
+          "kind": "attribute",
+          "why": "Native pattern constraint."
+        },
+        {
+          "name": "min",
+          "path": "html/forms/form-validation/min-max.html",
+          "kind": "attribute",
+          "why": "Native numeric constraint."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "The examples use native required, pattern, min, and max constraints."
+        },
+        {
+          "text": "The detailed custom validation example uses novalidate to suppress the browser default UI."
+        },
+        {
+          "text": "The showError function branches on ValidityState fields to choose messages."
+        },
+        {
+          "text": "Submit handlers prevent submission when the form is invalid."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "The examples rely only on JavaScript and do not use native HTML constraints.",
+          "severity": "major"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "html",
+        "forms"
+      ]
+    },
+    {
+      "id": "css-animate-base-and-keyframes",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "architecture_explanation",
+      "repo": {
+        "name": "animate-css-animate-css",
+        "url": "https://github.com/animate-css/animate.css.git",
+        "ref": "3f8ab233dbbd9d2fe577528d2296382954be3d1a",
+        "workspace_root": ".",
+        "languages": [
+          "CSS"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain how animate.css defines shared animation variables/base classes and connects named animation classes to keyframes. Cite the source files and name the supporting selectors or keyframes.",
+      "expected_files": [
+        "source/_vars.css",
+        "source/_base.css",
+        "source/animate.css",
+        "source/attention_seekers/bounce.css",
+        "source/attention_seekers/flash.css"
+      ],
+      "expected_symbols": [
+        {
+          "name": "--animate-duration",
+          "path": "source/_vars.css",
+          "kind": "custom-property",
+          "why": "Shared animation duration variable."
+        },
+        {
+          "name": "--animate-delay",
+          "path": "source/_vars.css",
+          "kind": "custom-property",
+          "why": "Shared animation delay variable."
+        },
+        {
+          "name": ".animated",
+          "path": "source/_base.css",
+          "kind": "selector",
+          "why": "Base animation class."
+        },
+        {
+          "name": "@keyframes bounce",
+          "path": "source/attention_seekers/bounce.css",
+          "kind": "keyframes",
+          "why": "Bounce animation keyframes."
+        },
+        {
+          "name": ".bounce",
+          "path": "source/attention_seekers/bounce.css",
+          "kind": "selector",
+          "why": "Class that selects bounce keyframes."
+        },
+        {
+          "name": "@keyframes flash",
+          "path": "source/attention_seekers/flash.css",
+          "kind": "keyframes",
+          "why": "Flash animation keyframes."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Shared CSS custom properties define animation duration, delay, and repeat defaults."
+        },
+        {
+          "text": ".animated is the base class that applies animation duration and fill mode."
+        },
+        {
+          "text": "Named classes such as .bounce set animation-name to matching keyframes."
+        },
+        {
+          "text": "The source/animate.css file imports the variable, base, and individual animation files."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "animate.css defines animations only in JavaScript and not in CSS keyframes.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "css",
+        "animation"
+      ]
+    },
+    {
+      "id": "sql-chinook-schema-relations",
+      "version": 1,
+      "suite": "language-expansion-holdout",
+      "task_class": "data_flow",
+      "repo": {
+        "name": "lerocha-chinook-database",
+        "url": "https://github.com/lerocha/chinook-database.git",
+        "ref": "7f67772503d71ba90f19283c38e93923addb43fa",
+        "workspace_root": ".",
+        "languages": [
+          "SQL"
+        ],
+        "setup": [
+          "No dependency setup is required for read-only benchmark inspection."
+        ]
+      },
+      "prompt": "Explain the core Chinook schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL seed scripts. Cite the source files and name the supporting tables or constraints.",
+      "expected_files": [
+        "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+        "ChinookDatabase/DataSources/Chinook_MySql.sql",
+        "ChinookDatabase/DataSources/Chinook_PostgreSql.sql"
+      ],
+      "expected_symbols": [
+        {
+          "name": "CREATE TABLE Artist",
+          "path": "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+          "kind": "table",
+          "why": "Artist table definition."
+        },
+        {
+          "name": "CREATE TABLE Album",
+          "path": "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+          "kind": "table",
+          "why": "Album table definition."
+        },
+        {
+          "name": "CREATE TABLE Track",
+          "path": "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+          "kind": "table",
+          "why": "Track table definition."
+        },
+        {
+          "name": "CREATE TABLE InvoiceLine",
+          "path": "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+          "kind": "table",
+          "why": "Invoice line table definition."
+        },
+        {
+          "name": "FOREIGN KEY",
+          "path": "ChinookDatabase/DataSources/Chinook_Sqlite.sql",
+          "kind": "constraint",
+          "why": "Relationship constraints between schema tables."
+        }
+      ],
+      "expected_claims": [
+        {
+          "text": "Album rows reference Artist rows through ArtistId."
+        },
+        {
+          "text": "Track rows reference Album, MediaType, and Genre rows."
+        },
+        {
+          "text": "InvoiceLine rows reference Invoice and Track rows."
+        },
+        {
+          "text": "The repository carries multiple SQL dialect scripts for the same Chinook schema."
+        }
+      ],
+      "forbidden_claims": [
+        {
+          "text": "The Chinook SQL scripts define tables without foreign key relationships.",
+          "severity": "critical"
+        }
+      ],
+      "quality_thresholds": {
+        "min_expected_anchor_recall": 0.62,
+        "min_expected_file_recall": 0.6,
+        "min_expected_symbol_recall": 0.55,
+        "min_expected_claim_recall": 0.65,
+        "min_citation_coverage": 0.6,
+        "max_forbidden_claims": 0
+      },
+      "tags": [
+        "language-expansion",
+        "sql",
+        "schema"
+      ]
+    }
+  ]
+}

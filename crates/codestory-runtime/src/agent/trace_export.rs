@@ -3,6 +3,7 @@
 
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto,
+    PacketRetrievalTraceSummaryDto,
 };
 use serde_json::{Value, json};
 
@@ -80,6 +81,66 @@ pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
     payload
 }
 
+pub(crate) fn packet_retrieval_trace_summary(
+    answer: &AgentAnswerDto,
+) -> PacketRetrievalTraceSummaryDto {
+    let mut source_read_steps = 0;
+    let mut search_steps = 0;
+    let mut trail_steps = 0;
+    for step in &answer.retrieval_trace.steps {
+        match step.kind {
+            AgentRetrievalStepKindDto::SourceRead => source_read_steps += 1,
+            AgentRetrievalStepKindDto::Search
+            | AgentRetrievalStepKindDto::SemanticQueryEmbedding
+            | AgentRetrievalStepKindDto::SemanticCandidateRetrieval
+            | AgentRetrievalStepKindDto::HybridRerank
+            | AgentRetrievalStepKindDto::QueryExpansion => search_steps += 1,
+            AgentRetrievalStepKindDto::Trail
+            | AgentRetrievalStepKindDto::Neighborhood
+            | AgentRetrievalStepKindDto::TrailFilterOptions => trail_steps += 1,
+            AgentRetrievalStepKindDto::NodeDetails
+            | AgentRetrievalStepKindDto::NodeOccurrences
+            | AgentRetrievalStepKindDto::EdgeOccurrences
+            | AgentRetrievalStepKindDto::RepoTextFallback
+            | AgentRetrievalStepKindDto::MermaidSynthesis
+            | AgentRetrievalStepKindDto::AnswerSynthesis => {}
+        }
+    }
+
+    let mut trace_summary = answer.retrieval_trace.clone();
+    // The full step trace already lives under answer.retrieval_trace. Keep the
+    // retrieval trace summary scalar-sized so compact packets do not serialize it twice.
+    trace_summary.annotations.clear();
+    trace_summary.steps.clear();
+
+    PacketRetrievalTraceSummaryDto {
+        retrieval_trace: trace_summary,
+        source_read_steps,
+        search_steps,
+        trail_steps,
+    }
+}
+
+pub(crate) fn write_packet_step_trace_from_env(answer: &AgentAnswerDto) -> Option<String> {
+    let trace_path = std::env::var("CODESTORY_PACKET_STEP_TRACE_OUT").ok()?;
+    let payload = match serde_json::to_string_pretty(&packet_step_trace_json(answer)) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Some(format!(
+                "packet_step_trace_out error=serialize path={} message={error}",
+                trace_path
+            ));
+        }
+    };
+    match std::fs::write(&trace_path, payload) {
+        Ok(()) => None,
+        Err(error) => Some(format!(
+            "packet_step_trace_out error=write path={} message={error}",
+            trace_path
+        )),
+    }
+}
+
 fn attributable_step_rows(rows: &[PacketStepTraceRow]) -> Vec<&PacketStepTraceRow> {
     rows.iter()
         .filter(|row| row.status != format!("{:?}", AgentRetrievalStepStatusDto::Skipped))
@@ -147,6 +208,7 @@ mod tests {
                 semantic_fallback_count: 0,
                 semantic_fallbacks: Vec::new(),
                 steps,
+                packet_sidecar_diagnostics: Vec::new(),
                 annotations: Vec::new(),
                 retrieval_shadow: None,
             },
@@ -242,6 +304,37 @@ mod tests {
         let json = packet_step_trace_json(&answer);
         assert_eq!(json["retrieval_shadow"]["retrieval_mode"], "full");
         assert_eq!(json["retrieval_shadow"]["would_rank"][0], "src/main.rs");
+    }
+
+    #[test]
+    fn env_step_trace_write_error_is_reported() {
+        let _lock = crate::process_env_test_lock();
+        let missing_parent = std::env::temp_dir().join(format!(
+            "codestory-missing-trace-parent-{}",
+            std::process::id()
+        ));
+        let trace_path = missing_parent.join("trace.json");
+        // SAFETY: this test holds the process env lock and restores the variable below.
+        unsafe {
+            std::env::set_var("CODESTORY_PACKET_STEP_TRACE_OUT", &trace_path);
+        }
+
+        let answer = sample_answer(Vec::new());
+        let diagnostic = write_packet_step_trace_from_env(&answer)
+            .expect("missing parent should produce a write diagnostic");
+        assert!(
+            diagnostic.starts_with("packet_step_trace_out error=write "),
+            "diagnostic should report the write error: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(trace_path.to_string_lossy().as_ref()),
+            "diagnostic should include the configured trace path: {diagnostic}"
+        );
+
+        // SAFETY: this test holds the process env lock.
+        unsafe {
+            std::env::remove_var("CODESTORY_PACKET_STEP_TRACE_OUT");
+        }
     }
 
     #[test]

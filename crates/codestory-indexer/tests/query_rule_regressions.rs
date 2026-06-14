@@ -48,6 +48,13 @@ fn has_node_kind(nodes: &[Node], name: &str, kind: NodeKind) -> bool {
         .any(|node| matches_name(&node.serialized_name, name) && node.kind == kind)
 }
 
+fn node_kind_count(nodes: &[Node], name: &str, kind: NodeKind) -> usize {
+    nodes
+        .iter()
+        .filter(|node| matches_name(&node.serialized_name, name) && node.kind == kind)
+        .count()
+}
+
 fn edge_between(
     nodes: &[Node],
     edges: &[Edge],
@@ -609,6 +616,51 @@ class Example implements Runner {
             .all(|edge| edge.source != edge.target),
         "Java CALL edges should not remain reflexive self-loops after attribution"
     );
+
+    Ok(())
+}
+
+#[test]
+fn test_java_field_lambda_does_not_duplicate_local_lambda_rule() -> anyhow::Result<()> {
+    let (nodes, _) = index_project(&[(
+        "Main.java",
+        r#"
+import java.util.function.Predicate;
+
+class Example {
+    private static final Predicate<String> NON_EMPTY = value -> !value.isEmpty();
+
+    void run() {
+        Predicate<String> local = value -> value.length() > 1;
+    }
+}
+"#,
+    )])?;
+
+    assert!(has_node_kind(&nodes, "NON_EMPTY", NodeKind::FIELD));
+    assert!(
+        !has_node_kind(&nodes, "NON_EMPTY", NodeKind::FUNCTION),
+        "field-assigned lambda should not also match the local lambda rule"
+    );
+    assert!(has_node_kind(&nodes, "local", NodeKind::FUNCTION));
+
+    Ok(())
+}
+
+#[test]
+fn test_bash_declaration_assignment_does_not_duplicate_variable_rule() -> anyhow::Result<()> {
+    let (nodes, _) = index_project(&[(
+        "script.sh",
+        r#"
+run() {
+  local ROOT="$PWD"
+  readonly NAME="codestory"
+}
+"#,
+    )])?;
+
+    assert_eq!(node_kind_count(&nodes, "ROOT", NodeKind::VARIABLE), 1);
+    assert_eq!(node_kind_count(&nodes, "NAME", NodeKind::VARIABLE), 1);
 
     Ok(())
 }

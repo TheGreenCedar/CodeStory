@@ -28,12 +28,17 @@ use codestory_contracts::api::{
     WorkspaceMemberIndexDto, WriteFileResponse, WriteFileTextRequest,
 };
 use codestory_contracts::events::{Event, EventBus};
-use codestory_contracts::graph::{Edge as GraphEdge, Node as GraphNode};
+use codestory_contracts::graph::{AccessKind, Edge as GraphEdge, Node as GraphNode};
+use codestory_contracts::language_support::{
+    LanguageSupportProfile, language_support_profile_for_ext,
+    language_support_profile_for_language_name,
+};
 use codestory_indexer::IncrementalIndexingStats;
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
-    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSummaryRecord,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
+    SymbolSummaryRecord,
 };
 use codestory_workspace::{
     IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
@@ -73,6 +78,14 @@ pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub(crate) use search_runtime::SearchEngine;
+
+#[cfg(test)]
+static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn process_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_ENV_TEST_LOCK.lock().expect("process env test lock")
+}
 pub use search_runtime::*;
 use semantic_doc_text::{
     runtime_concept_phrases, semantic_doc_language_from_path, semantic_path_aliases,
@@ -83,10 +96,11 @@ pub use services::{
     TrailService,
 };
 pub(crate) use support::{
-    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, aggregate_symbol_matches, clamp_i64_to_u32,
-    clamp_u64_to_u32, clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms,
-    file_text_match_line, hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name,
-    preferred_occurrence, query_has_symbol_or_literal_signal, read_searchable_file_contents,
+    FocusedSourceContext, HYBRID_RETRIEVAL_ENABLED_ENV, SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
+    SEMANTIC_FILE_TEXT_MAX_BYTES, aggregate_symbol_matches, clamp_i64_to_u32, clamp_u64_to_u32,
+    clamp_u128_to_u32, clamp_usize_to_u32, extract_symbol_search_terms, file_text_match_line,
+    hybrid_retrieval_enabled, looks_like_repo_text_query, node_display_name, preferred_occurrence,
+    query_has_symbol_or_literal_signal, read_file_text_limited, read_searchable_file_contents,
     should_expand_symbol_query,
 };
 #[cfg(test)]
@@ -352,7 +366,7 @@ struct FrameworkRouteCoverageEntry {
     framework: &'static str,
     language: &'static str,
     status: &'static str,
-    fixture_status: &'static str,
+    coverage_evidence: &'static str,
     confidence_floor: &'static str,
     handler_link_support: &'static str,
     unsupported_patterns: &'static [&'static str],
@@ -365,7 +379,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "express",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &[
@@ -379,7 +393,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "react-router",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &[
@@ -392,7 +406,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "sveltekit",
         language: "svelte/javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_server_method_exports",
         unsupported_patterns: &[
@@ -405,7 +419,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "nextjs",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_route_method_exports",
         unsupported_patterns: &["middleware rewrites and route groups require source review"],
@@ -416,7 +430,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "remix",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_loader_action_exports",
         unsupported_patterns: &["route config composition and resource routes are partial"],
@@ -427,7 +441,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "astro",
         language: "astro/javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_endpoint_method_exports",
         unsupported_patterns: &["redirects and integration-generated routes are not expanded"],
@@ -438,7 +452,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "nuxt",
         language: "vue/javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_server_handlers",
         unsupported_patterns: &["route middleware and generated module routes are partial"],
@@ -449,7 +463,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fastify",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["plugin prefixes and schema-only route declarations are partial"],
@@ -460,7 +474,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "koa",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["router prefixes and middleware arrays are partial"],
@@ -471,7 +485,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "hono",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["basePath/grouped routes are partial"],
@@ -482,7 +496,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "nestjs",
         language: "typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "decorator",
         handler_link_support: "probable_for_controller_method",
         unsupported_patterns: &["global prefixes and dynamic decorator expressions are partial"],
@@ -493,7 +507,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "django",
         language: "python",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["include() trees and namespaced URLConfs are not fully expanded"],
@@ -504,7 +518,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "flask",
         language: "python",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "decorator",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["blueprint prefixes and dynamic method declarations are partial"],
@@ -515,7 +529,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fastapi",
         language: "python",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "decorator",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["router prefixes and dependency-driven routing are partial"],
@@ -526,7 +540,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "rails",
         language: "ruby",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["resource expansion is not fully enumerated"],
@@ -537,7 +551,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "laravel",
         language: "php",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["controller arrays and route groups are partial"],
@@ -548,7 +562,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "spring",
         language: "java",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "annotation",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["class-level prefixes are not fully combined in every case"],
@@ -559,7 +573,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "aspnet",
         language: "csharp",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "attribute",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["controller-level route templates are partial"],
@@ -570,7 +584,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "axum",
         language: "rust",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["nested routers and stateful route composition are partial"],
@@ -581,7 +595,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "actix",
         language: "rust",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["scoped services and macros are partial"],
@@ -592,7 +606,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "rocket",
         language: "rust",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "attribute",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["mount prefixes are not fully combined"],
@@ -603,7 +617,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "gin",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["router groups and middleware chains are partial"],
@@ -614,7 +628,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "chi",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["route groups and mounted subrouters are partial"],
@@ -625,7 +639,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "echo",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["group prefixes are partial"],
@@ -636,7 +650,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fiber",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["group prefixes and mounted apps are partial"],
@@ -647,7 +661,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "vue-router",
         language: "vue",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["imported route arrays and generated routes are partial"],
@@ -668,7 +682,7 @@ fn framework_route_coverage_dto(entry: &FrameworkRouteCoverageEntry) -> Framewor
         framework: entry.framework.to_string(),
         language: entry.language.to_string(),
         status: entry.status.to_string(),
-        fixture_status: entry.fixture_status.to_string(),
+        coverage_evidence: entry.coverage_evidence.to_string(),
         confidence_floor: entry.confidence_floor.to_string(),
         handler_link_support: entry.handler_link_support.to_string(),
         unsupported_patterns: entry
@@ -683,6 +697,26 @@ fn framework_route_coverage_dto(entry: &FrameworkRouteCoverageEntry) -> Framewor
             .collect(),
         promotable: entry.promotable,
     }
+}
+
+struct LanguageSupportSummary {
+    support_mode: String,
+    evidence_tier: String,
+    claim_label: String,
+}
+
+fn language_support_summary_for_language(language: &str) -> LanguageSupportSummary {
+    language_support_profile_for_language_name(language)
+        .map(|profile| LanguageSupportSummary {
+            support_mode: profile.support_mode.as_str().to_string(),
+            evidence_tier: profile.evidence_tier.as_str().to_string(),
+            claim_label: profile.claim_label.to_string(),
+        })
+        .unwrap_or_else(|| LanguageSupportSummary {
+            support_mode: "unknown".to_string(),
+            evidence_tier: "unknown".to_string(),
+            claim_label: "no support claim recorded".to_string(),
+        })
 }
 
 const REPO_TEXT_SCAN_FILE_CAP: usize = 2_000;
@@ -885,41 +919,68 @@ fn search_hit_name_matches(display_name: &str, requested: &str) -> bool {
 }
 
 fn language_filter_matches_path(requested: &str, path: &str) -> bool {
-    let requested_lower = requested.trim().to_ascii_lowercase();
-    let requested_normalized = normalize_filter_token(&requested_lower);
+    let requested_lower = requested
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if requested_lower.is_empty() {
+        return false;
+    }
     let extension = Path::new(path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if extension.is_empty() {
+        return false;
+    }
 
+    if let Some(language_name) = language_family_alias(&requested_lower) {
+        return language_profile_matches_extension_name(language_name, &extension);
+    }
+
+    if let Some(profile) = language_support_profile_for_language_name(&requested_lower) {
+        return language_profile_matches_extension(profile, &extension);
+    }
+
+    if language_support_profile_for_ext(&requested_lower).is_some() {
+        return requested_lower == extension;
+    }
+
+    let requested_normalized = normalize_filter_token(&requested_lower);
     match requested_normalized.as_str() {
-        "rs" | "rust" => extension == "rs",
-        "ts" | "typescript" => matches!(extension.as_str(), "ts" | "tsx"),
-        "tsx" => extension == "tsx",
-        "js" | "javascript" => matches!(extension.as_str(), "js" | "jsx" | "mjs" | "cjs"),
-        "jsx" => extension == "jsx",
-        "py" | "python" => extension == "py",
-        "java" => extension == "java",
-        "cpp" | "cxx" | "cc" | "hpp" | "hxx" | "cplusplus" if requested_lower != "c" => {
-            matches!(extension.as_str(), "cpp" | "cxx" | "cc" | "hpp" | "hxx")
-        }
-        _ if requested_lower == "c++" => {
-            matches!(extension.as_str(), "cpp" | "cxx" | "cc" | "hpp" | "hxx")
-        }
-        _ if requested_lower == "c#" => extension == "cs",
-        "c" => matches!(extension.as_str(), "c" | "h"),
-        "cs" | "csharp" => extension == "cs",
-        "go" => extension == "go",
-        "svelte" => extension == "svelte",
-        "json" => extension == "json",
-        "md" | "markdown" => matches!(extension.as_str(), "md" | "mdx"),
-        "rb" | "ruby" => extension == "rb",
-        "php" => extension == "php",
-        "kt" | "kotlin" => matches!(extension.as_str(), "kt" | "kts"),
-        "swift" => extension == "swift",
+        "markdown" => matches!(extension.as_str(), "md" | "mdx"),
         _ => requested_normalized == normalize_filter_token(&extension),
     }
+}
+
+fn indexed_file_matches_language_filter(
+    stored_language: &str,
+    path: &Path,
+    requested: &str,
+) -> bool {
+    stored_language.eq_ignore_ascii_case(requested)
+        || language_filter_matches_path(requested, &path.to_string_lossy())
+}
+
+fn language_family_alias(requested: &str) -> Option<&'static str> {
+    match requested {
+        "ts" => Some("typescript"),
+        "js" => Some("javascript"),
+        "kt" => Some("kotlin"),
+        "c++" | "cplusplus" => Some("cpp"),
+        "c#" | "cs" => Some("csharp"),
+        _ => None,
+    }
+}
+
+fn language_profile_matches_extension(profile: &LanguageSupportProfile, extension: &str) -> bool {
+    profile.extensions.contains(&extension)
+}
+
+fn language_profile_matches_extension_name(language_name: &str, extension: &str) -> bool {
+    language_support_profile_for_language_name(language_name)
+        .is_some_and(|profile| language_profile_matches_extension(profile, extension))
 }
 
 fn normalize_filter_token(value: &str) -> String {
@@ -3190,6 +3251,14 @@ struct SemanticProjectionStats {
     docs_embedded: u32,
     docs_pending: u32,
     docs_stale: u32,
+    symbol_search_docs_written: u32,
+    dense_docs_skipped: u32,
+    dense_public_api: u32,
+    dense_entrypoint: u32,
+    dense_documented_nontrivial: u32,
+    dense_central_graph_node: u32,
+    dense_component_report: u32,
+    dense_unstructured_doc: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3228,6 +3297,14 @@ fn apply_semantic_projection_stats(
     timings.semantic_docs_embedded = Some(stats.docs_embedded);
     timings.semantic_docs_pending = Some(stats.docs_pending);
     timings.semantic_docs_stale = Some(stats.docs_stale);
+    timings.symbol_search_docs_written = Some(stats.symbol_search_docs_written);
+    timings.semantic_dense_docs_skipped = Some(stats.dense_docs_skipped);
+    timings.semantic_dense_public_api = Some(stats.dense_public_api);
+    timings.semantic_dense_entrypoint = Some(stats.dense_entrypoint);
+    timings.semantic_dense_documented_nontrivial = Some(stats.dense_documented_nontrivial);
+    timings.semantic_dense_central_graph_node = Some(stats.dense_central_graph_node);
+    timings.semantic_dense_component_report = Some(stats.dense_component_report);
+    timings.semantic_dense_unstructured_doc = Some(stats.dense_unstructured_doc);
 }
 
 fn apply_cache_refresh_stats(timings: &mut IndexingPhaseTimings, stats: CacheRefreshStats) {
@@ -3404,6 +3481,8 @@ fn indexable_source_path(path: &Path) -> bool {
         .and_then(codestory_indexer::get_language_for_ext)
         .is_some();
     tree_sitter_supported
+        || codestory_indexer::template_pipeline::template_kind_for_path(path).is_some()
+        || codestory_indexer::structural::is_structural_candidate_path(path)
         || codestory_indexer::is_text_only_candidate_path(path)
         || looks_like_openapi_source_path(path)
 }
@@ -3765,7 +3844,7 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 4;
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 5;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
@@ -3780,6 +3859,33 @@ const SEMANTIC_STREAM_PENDING_DOCS_ENV: &str = "CODESTORY_SEMANTIC_STREAM_PENDIN
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV: &str =
     "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES";
 const SEMANTIC_STREAM_SORT_WINDOW_BATCHES: usize = 1;
+const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
+const SYMBOL_SEARCH_DOC_PROVENANCE: &str = "extracted";
+const DENSE_CENTRAL_LABEL_THRESHOLD: usize = 12;
+const DENSE_CENTRAL_SCORE_THRESHOLD: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseAnchorReason {
+    PublicApi,
+    Entrypoint,
+    DocumentedNontrivial,
+    CentralGraphNode,
+    ComponentReport,
+    UnstructuredDoc,
+}
+
+impl DenseAnchorReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicApi => "public_api",
+            Self::Entrypoint => "entrypoint",
+            Self::DocumentedNontrivial => "documented_nontrivial",
+            Self::CentralGraphNode => "central_graph_node",
+            Self::ComponentReport => "component_report",
+            Self::UnstructuredDoc => "unstructured_doc",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticDocScope {
@@ -4133,6 +4239,8 @@ fn stored_semantic_docs_contract_from_stats(
         mixed_doc_versions: stats.mixed_doc_versions,
         mixed_doc_shapes: stats.mixed_doc_shapes,
         doc_shape: stats.doc_shape.clone(),
+        semantic_policy_version: stats.semantic_policy_version.clone(),
+        mixed_semantic_policy_versions: stats.mixed_semantic_policy_versions,
     }
 }
 
@@ -4227,12 +4335,110 @@ fn llm_indexable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
     llm_indexable_kind_for_scope(kind, semantic_doc_scope_from_env())
 }
 
+fn normalize_semantic_store_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = path.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = path.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    path
+}
+
+fn semantic_path_is_absolute_like(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() > 2
+            && bytes[1] == b':'
+            && bytes[2] == b'/'
+            && bytes[0].is_ascii_alphabetic())
+}
+
+fn semantic_path_parent(path: &str) -> Option<&str> {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty())
+}
+
+fn common_semantic_path_prefix(left: &str, right: &str) -> String {
+    let left_parts = left.split('/').collect::<Vec<_>>();
+    let right_parts = right.split('/').collect::<Vec<_>>();
+    let mut common = Vec::new();
+    for (left, right) in left_parts.iter().zip(right_parts.iter()) {
+        if left != right {
+            break;
+        }
+        common.push(*left);
+    }
+    common.join("/")
+}
+
+fn common_absolute_semantic_parent(paths: &[(GraphNodeId, String)]) -> Option<String> {
+    let mut parents = paths
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .filter(|path| semantic_path_is_absolute_like(path))
+        .filter_map(semantic_path_parent);
+    let mut common = parents.next()?.to_string();
+    for parent in parents {
+        common = common_semantic_path_prefix(&common, parent);
+        if common.is_empty() {
+            return None;
+        }
+    }
+    Some(common).filter(|common| !common.is_empty())
+}
+
+fn strip_semantic_common_parent(path: &str, common_parent: &str) -> Option<String> {
+    let rest = path.strip_prefix(common_parent)?;
+    let rest = rest.strip_prefix('/')?;
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+fn semantic_file_table_path_maps(
+    files: Vec<FileInfo>,
+) -> (HashMap<GraphNodeId, String>, HashMap<GraphNodeId, String>) {
+    let rows = files
+        .into_iter()
+        .map(|file| {
+            (
+                codestory_contracts::graph::NodeId(file.id),
+                normalize_semantic_store_path(&file.path),
+            )
+        })
+        .collect::<Vec<_>>();
+    let common_parent = common_absolute_semantic_parent(&rows);
+    let mut display_paths = HashMap::new();
+    let mut read_paths = HashMap::new();
+    for (id, path) in rows {
+        let normalized = common_parent
+            .as_deref()
+            .and_then(|common_parent| strip_semantic_common_parent(&path, common_parent))
+            .unwrap_or_else(|| path.clone());
+        display_paths.insert(id, normalized);
+        read_paths.insert(id, path);
+    }
+    (display_paths, read_paths)
+}
+
+fn semantic_file_table_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
+    let (display_paths, _) = semantic_file_table_path_maps(files);
+    display_paths
+}
+
+fn semantic_file_table_read_path_map(files: Vec<FileInfo>) -> HashMap<GraphNodeId, String> {
+    let (_, read_paths) = semantic_file_table_path_maps(files);
+    read_paths
+}
+
 #[derive(Default)]
 struct SemanticDocGraphContext {
     child_labels: HashMap<GraphNodeId, Vec<String>>,
     referenced_labels: HashMap<GraphNodeId, Vec<String>>,
     edge_digests: HashMap<GraphNodeId, Vec<String>>,
     file_paths: HashMap<GraphNodeId, String>,
+    file_read_paths: HashMap<GraphNodeId, String>,
 }
 
 impl SemanticDocGraphContext {
@@ -4252,15 +4458,27 @@ impl SemanticDocGraphContext {
         let edges_by_node = storage.get_edges_for_node_ids(&node_ids).map_err(|e| {
             ApiError::internal(format!("Failed to load semantic doc graph context: {e}"))
         })?;
+        let files = storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?;
+        let file_table_paths = semantic_file_table_path_map(files.clone());
+        let file_table_read_paths = semantic_file_table_read_path_map(files);
 
         let mut context = Self::default();
         for node in semantic_nodes {
             if let Some(file_id) = node.file_node_id
                 && let Some(file_node) = nodes_by_id.get(&file_id)
             {
-                context
-                    .file_paths
-                    .insert(node.id, file_node.serialized_name.clone());
+                let file_path = file_table_paths
+                    .get(&file_id)
+                    .cloned()
+                    .unwrap_or_else(|| file_node.serialized_name.clone());
+                context.file_paths.insert(node.id, file_path);
+                let read_path = file_table_read_paths
+                    .get(&file_id)
+                    .cloned()
+                    .unwrap_or_else(|| file_node.serialized_name.clone());
+                context.file_read_paths.insert(node.id, read_path);
             }
 
             let edges = edges_by_node
@@ -4286,27 +4504,76 @@ impl SemanticDocGraphContext {
     fn file_path_for_node(&self, node: &GraphNode) -> Option<&str> {
         self.file_paths.get(&node.id).map(String::as_str)
     }
+
+    fn file_read_path_for_node(&self, node: &GraphNode) -> Option<&str> {
+        self.file_read_paths
+            .get(&node.id)
+            .or_else(|| self.file_paths.get(&node.id))
+            .map(String::as_str)
+    }
 }
 
 fn build_semantic_file_text_cache(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
 ) -> HashMap<String, Option<String>> {
+    build_semantic_file_text_cache_with_limits(
+        graph_context,
+        semantic_nodes,
+        SEMANTIC_FILE_TEXT_MAX_BYTES,
+        SEMANTIC_FILE_TEXT_CACHE_MAX_BYTES,
+    )
+}
+
+fn build_semantic_file_text_cache_with_limits(
+    graph_context: &SemanticDocGraphContext,
+    semantic_nodes: &[&GraphNode],
+    max_file_bytes: u64,
+    max_cache_bytes: usize,
+) -> HashMap<String, Option<String>> {
     let mut file_paths = semantic_nodes
         .iter()
-        .filter_map(|node| graph_context.file_path_for_node(node).map(str::to_string))
-        .collect::<HashSet<_>>()
+        .filter_map(|node| {
+            let display_path = graph_context.file_path_for_node(node)?.to_string();
+            let read_path = graph_context
+                .file_read_path_for_node(node)
+                .unwrap_or(display_path.as_str())
+                .to_string();
+            Some((display_path, read_path))
+        })
+        .collect::<HashMap<_, _>>()
         .into_iter()
         .collect::<Vec<_>>();
-    file_paths.sort();
+    file_paths.sort_by(|left, right| left.0.cmp(&right.0));
 
-    file_paths
-        .into_par_iter()
-        .map(|path| {
-            let contents = read_searchable_file_contents(&path);
-            (path, contents)
-        })
-        .collect()
+    let mut cached_bytes = 0usize;
+    let mut cache_exhausted = false;
+    let mut cache = HashMap::with_capacity(file_paths.len());
+    for (display_path, read_path) in file_paths {
+        if cache_exhausted {
+            cache.insert(display_path, None);
+            continue;
+        }
+
+        let contents = read_file_text_limited(Path::new(&read_path), max_file_bytes)
+            .ok()
+            .flatten();
+        let Some(contents) = contents else {
+            cache.insert(display_path, None);
+            continue;
+        };
+
+        let body_bytes = contents.len();
+        if cached_bytes.saturating_add(body_bytes) > max_cache_bytes {
+            cache_exhausted = true;
+            cache.insert(display_path, None);
+            continue;
+        }
+
+        cached_bytes = cached_bytes.saturating_add(body_bytes);
+        cache.insert(display_path, Some(contents));
+    }
+    cache
 }
 
 fn edge_digest_for_edges(edges: &[GraphEdge], limit: usize) -> Vec<String> {
@@ -4525,23 +4792,15 @@ fn build_llm_symbol_doc_text(
     );
     let _ = writeln!(out, "symbol: {display_name}");
     let _ = writeln!(out, "kind: {:?}", node.kind);
-    if let Some(path) = file_path {
-        let _ = writeln!(out, "file: {path}");
-        let path_lower = path.to_ascii_lowercase();
-        if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
-            let _ = writeln!(out, "file_role: test");
-        } else if path_lower.contains("/docs/")
-            || path_lower.contains("\\docs\\")
-            || path_lower.ends_with(".md")
-        {
-            let _ = writeln!(out, "file_role: docs");
-        }
-    }
     if let Some(line) = node.start_line {
         let _ = writeln!(out, "line: {line}");
     }
     if let Some(qualified_name) = node.qualified_name.as_deref() {
         let _ = writeln!(out, "qualified_name: {qualified_name}");
+    }
+    let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
+    if !comments.is_empty() {
+        let _ = writeln!(out, "comments: {}", comments.join(" "));
     }
     if alias_mode != SemanticDocAliasMode::NoAlias {
         if let Some(language) = semantic_doc_language_from_path(file_path) {
@@ -4574,16 +4833,23 @@ fn build_llm_symbol_doc_text(
             semantic_symbol_role_aliases(node.kind)
         );
     }
-
-    let (signature, comments, body) = symbol_excerpt(node, file_path, file_text_cache);
     if !signature.is_empty() {
         let _ = writeln!(out, "signature: {}", signature.join(" "));
     }
-    if !comments.is_empty() {
-        let _ = writeln!(out, "comments: {}", comments.join(" "));
-    }
     if !body.is_empty() {
         let _ = writeln!(out, "body_summary: {}", body.join(" "));
+    }
+    if let Some(path) = file_path {
+        let _ = writeln!(out, "file: {path}");
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.contains("/tests/") || path_lower.contains("\\tests\\") {
+            let _ = writeln!(out, "file_role: test");
+        } else if path_lower.contains("/docs/")
+            || path_lower.contains("\\docs\\")
+            || path_lower.ends_with(".md")
+        {
+            let _ = writeln!(out, "file_role: docs");
+        }
     }
 
     let children = graph_context
@@ -4647,11 +4913,13 @@ struct PendingLlmSymbolDoc {
     start_line: Option<u32>,
     doc_text: String,
     doc_hash: String,
+    dense_reason: DenseAnchorReason,
 }
 
 #[derive(Debug)]
 struct BuiltLlmSymbolDoc {
-    pending: PendingLlmSymbolDoc,
+    symbol_doc: SymbolSearchDoc,
+    pending: Option<PendingLlmSymbolDoc>,
     reusable: bool,
 }
 
@@ -4662,6 +4930,7 @@ struct SemanticVectorReuseContractKey {
     model_id: String,
     dimension: u32,
     doc_shape: String,
+    semantic_policy_version: String,
 }
 
 impl SemanticVectorReuseContractKey {
@@ -4677,6 +4946,7 @@ impl SemanticVectorReuseContractKey {
             model_id: existing_doc.embedding_model.clone(),
             dimension: existing_doc.embedding_dim,
             doc_shape: existing_doc.doc_shape.clone()?,
+            semantic_policy_version: existing_doc.semantic_policy_version.clone()?,
         })
     }
 
@@ -4687,6 +4957,7 @@ impl SemanticVectorReuseContractKey {
             model_id: embedding_contract.cache_key.clone(),
             dimension,
             doc_shape: embedding_contract.doc_shape.clone(),
+            semantic_policy_version: SEMANTIC_POLICY_VERSION.to_string(),
         }
     }
 
@@ -4699,6 +4970,7 @@ impl SemanticVectorReuseContractKey {
             && self.model_id.as_str() == embedding_contract.cache_key.as_str()
             && self.dimension > 0
             && self.doc_shape.as_str() == embedding_contract.doc_shape.as_str()
+            && self.semantic_policy_version.as_str() == SEMANTIC_POLICY_VERSION
     }
 }
 
@@ -4790,6 +5062,490 @@ fn llm_symbol_doc_can_reuse(
     existing_key.matches_current_without_known_dimension(doc_hash, embedding_contract)
 }
 
+fn observe_dense_anchor_reason(stats: &mut SemanticProjectionStats, reason: DenseAnchorReason) {
+    match reason {
+        DenseAnchorReason::PublicApi => {
+            stats.dense_public_api = stats.dense_public_api.saturating_add(1);
+        }
+        DenseAnchorReason::Entrypoint => {
+            stats.dense_entrypoint = stats.dense_entrypoint.saturating_add(1);
+        }
+        DenseAnchorReason::DocumentedNontrivial => {
+            stats.dense_documented_nontrivial = stats.dense_documented_nontrivial.saturating_add(1);
+        }
+        DenseAnchorReason::CentralGraphNode => {
+            stats.dense_central_graph_node = stats.dense_central_graph_node.saturating_add(1);
+        }
+        DenseAnchorReason::ComponentReport => {
+            stats.dense_component_report = stats.dense_component_report.saturating_add(1);
+        }
+        DenseAnchorReason::UnstructuredDoc => {
+            stats.dense_unstructured_doc = stats.dense_unstructured_doc.saturating_add(1);
+        }
+    }
+}
+
+fn semantic_edge_count(edge_digests: &[String]) -> usize {
+    edge_digests
+        .iter()
+        .filter_map(|digest| digest.rsplit_once('='))
+        .filter_map(|(_, raw)| raw.parse::<usize>().ok())
+        .sum()
+}
+
+fn dense_anchor_score(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> usize {
+    let child_count = graph_context
+        .child_labels
+        .get(&node_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let related_count = graph_context
+        .referenced_labels
+        .get(&node_id)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let edge_count = graph_context
+        .edge_digests
+        .get(&node_id)
+        .map(|digests| semantic_edge_count(digests))
+        .unwrap_or(0);
+    child_count
+        .saturating_add(related_count)
+        .saturating_add(edge_count)
+}
+
+fn dense_anchor_is_central(graph_context: &SemanticDocGraphContext, node_id: GraphNodeId) -> bool {
+    let label_count = graph_context
+        .child_labels
+        .get(&node_id)
+        .map(Vec::len)
+        .unwrap_or(0)
+        .saturating_add(
+            graph_context
+                .referenced_labels
+                .get(&node_id)
+                .map(Vec::len)
+                .unwrap_or(0),
+        );
+    label_count >= DENSE_CENTRAL_LABEL_THRESHOLD
+        && dense_anchor_score(graph_context, node_id) >= DENSE_CENTRAL_SCORE_THRESHOLD
+}
+
+fn semantic_component_key_for_path(path: Option<&str>) -> Option<String> {
+    let path = path?.replace('\\', "/");
+    let parent = path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let parts = parent
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Some("dir:.".into());
+    }
+    if let Some(index) = parts.iter().position(|part| *part == "crates")
+        && let Some(crate_name) = parts.get(index.saturating_add(1))
+    {
+        return Some(format!("crate:{crate_name}"));
+    }
+    if let Some(index) = parts.iter().position(|part| *part == "src") {
+        if let Some(module) = parts.get(index.saturating_add(1)) {
+            return Some(format!("module:src/{module}"));
+        }
+        return Some("module:src".into());
+    }
+    Some(format!(
+        "dir:{}",
+        parts.iter().take(2).copied().collect::<Vec<_>>().join("/")
+    ))
+}
+
+fn virtual_component_report_node_id(component_key: &str) -> GraphNodeId {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in component_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let value = ((hash & 0x3fff_ffff_ffff_ffff) as i64).max(1);
+    codestory_contracts::graph::NodeId(-value)
+}
+
+fn semantic_file_is_entrypoint(path: Option<&str>, display_name: &str) -> bool {
+    let name = display_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(display_name)
+        .to_ascii_lowercase();
+    if name == "main" {
+        return true;
+    }
+    semantic_path_is_entrypoint_file(path)
+        && matches!(
+            name.as_str(),
+            "__main__"
+                | "app"
+                | "application"
+                | "asgi"
+                | "function"
+                | "handler"
+                | "index"
+                | "program"
+                | "route"
+                | "routes"
+                | "run"
+                | "server"
+                | "start"
+                | "startup"
+                | "wsgi"
+        )
+}
+
+fn semantic_path_is_entrypoint_file(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    [
+        "/main.rs",
+        "/main.c",
+        "/main.cc",
+        "/main.cpp",
+        "/main.cxx",
+        "/main.go",
+        "/main.java",
+        "/main.py",
+        "/app.js",
+        "/app.jsx",
+        "/app.py",
+        "/app.rb",
+        "/app.ts",
+        "/app.tsx",
+        "/application.java",
+        "/asgi.py",
+        "/config.ru",
+        "/index.js",
+        "/index.jsx",
+        "/index.php",
+        "/index.rb",
+        "/index.ts",
+        "/index.tsx",
+        "/program.cs",
+        "/route.js",
+        "/route.jsx",
+        "/route.ts",
+        "/route.tsx",
+        "/server.js",
+        "/server.jsx",
+        "/server.py",
+        "/server.rb",
+        "/server.ts",
+        "/server.tsx",
+        "/startup.cs",
+        "/wsgi.py",
+    ]
+    .iter()
+    .any(|suffix| normalized.ends_with(suffix))
+        || (normalized.contains("/cmd/") && normalized.ends_with("/main.go"))
+        || (normalized.contains("/src/main/java/") && normalized.ends_with("application.java"))
+        || (normalized.contains("/src/main/kotlin/") && normalized.ends_with("application.kt"))
+}
+
+fn semantic_file_is_public_surface(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with("/lib.rs")
+        || normalized.ends_with("/mod.rs")
+        || normalized.ends_with("/public.rs")
+        || normalized.ends_with("/__init__.py")
+        || normalized.ends_with("/index.js")
+        || normalized.ends_with("/index.jsx")
+        || normalized.ends_with("/index.php")
+        || normalized.ends_with("/index.rb")
+        || normalized.ends_with("/index.ts")
+        || normalized.ends_with("/index.tsx")
+        || normalized.ends_with("/package.json")
+        || normalized.starts_with("api/")
+        || normalized.contains("/api/")
+        || normalized.starts_with("apps/")
+        || normalized.contains("/apps/")
+        || normalized.starts_with("include/")
+        || normalized.contains("/include/")
+        || normalized.starts_with("pkg/")
+        || normalized.contains("/pkg/")
+        || normalized.starts_with("public/")
+        || normalized.contains("/public/")
+        || normalized.starts_with("routes/")
+        || normalized.contains("/routes/")
+        || normalized.starts_with("controllers/")
+        || normalized.contains("/controllers/")
+        || normalized.starts_with("components/")
+        || normalized.contains("/components/")
+        || normalized.contains("/src/main/java/")
+        || normalized.contains("/src/main/kotlin/")
+}
+
+fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_contracts::graph::NodeKind::STRUCT
+            | codestory_contracts::graph::NodeKind::CLASS
+            | codestory_contracts::graph::NodeKind::INTERFACE
+            | codestory_contracts::graph::NodeKind::ANNOTATION
+            | codestory_contracts::graph::NodeKind::UNION
+            | codestory_contracts::graph::NodeKind::ENUM
+            | codestory_contracts::graph::NodeKind::TYPEDEF
+            | codestory_contracts::graph::NodeKind::GLOBAL_VARIABLE
+            | codestory_contracts::graph::NodeKind::CONSTANT
+    )
+}
+
+fn dense_anchor_callable_kind(kind: codestory_contracts::graph::NodeKind) -> bool {
+    matches!(
+        kind,
+        codestory_contracts::graph::NodeKind::FUNCTION
+            | codestory_contracts::graph::NodeKind::METHOD
+            | codestory_contracts::graph::NodeKind::MACRO
+    )
+}
+
+fn semantic_file_is_package_callable_surface(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let source_extension = [
+        ".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".dart", ".fish", ".go", ".h", ".hpp",
+        ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".sh", ".swift",
+        ".ts", ".tsx", ".zsh",
+    ]
+    .iter()
+    .any(|suffix| file_name.ends_with(suffix));
+    if !source_extension {
+        return false;
+    }
+    normalized.contains("/lib/")
+        || normalized.contains("/src/")
+        || normalized.contains("/pkg/")
+        || normalized.contains("/packages/")
+        || normalized.contains("/routes/")
+        || normalized.contains("/router/")
+        || normalized.contains("/controllers/")
+        || normalized.contains("/middleware/")
+        || normalized.contains("/sources/")
+        || matches!(
+            file_name,
+            "application.js"
+                | "context.go"
+                | "gin.go"
+                | "http.dart"
+                | "nvm.sh"
+                | "request.js"
+                | "response.js"
+                | "routergroup.go"
+                | "sessions.py"
+                | "tree.go"
+        )
+}
+
+fn semantic_doc_is_documented_nontrivial(doc_text: &str) -> bool {
+    if !doc_text.contains("comments:") {
+        return false;
+    }
+    doc_text
+        .lines()
+        .find_map(|line| line.strip_prefix("body_summary:"))
+        .is_some_and(|body| body.split_whitespace().count() >= 8)
+}
+
+fn dense_anchor_reason_for_node(
+    graph_context: &SemanticDocGraphContext,
+    node: &GraphNode,
+    display_name: &str,
+    file_path: Option<&str>,
+    doc_text: &str,
+    access: Option<AccessKind>,
+) -> Option<DenseAnchorReason> {
+    let file_role = file_path
+        .map(retrieval_file_role_from_path)
+        .unwrap_or(RetrievalFileRole::Source);
+    let central = dense_anchor_is_central(graph_context, node.id);
+
+    if file_role == RetrievalFileRole::Docs {
+        return Some(DenseAnchorReason::UnstructuredDoc);
+    }
+    if file_role.is_non_primary() && !central {
+        return None;
+    }
+    if semantic_file_is_entrypoint(file_path, display_name) {
+        return Some(DenseAnchorReason::Entrypoint);
+    }
+    if central {
+        return Some(DenseAnchorReason::CentralGraphNode);
+    }
+    if dense_anchor_public_kind(node.kind)
+        && (matches!(access, Some(AccessKind::Public | AccessKind::Protected))
+            || semantic_file_is_public_surface(file_path))
+    {
+        return Some(DenseAnchorReason::PublicApi);
+    }
+    if dense_anchor_callable_kind(node.kind) && semantic_file_is_package_callable_surface(file_path)
+    {
+        return Some(DenseAnchorReason::PublicApi);
+    }
+    if semantic_doc_is_documented_nontrivial(doc_text) {
+        return Some(DenseAnchorReason::DocumentedNontrivial);
+    }
+    None
+}
+
+fn is_retrieval_artifact_node(node: &GraphNode) -> bool {
+    node.serialized_name.starts_with("component_report:")
+        || node
+            .canonical_id
+            .as_deref()
+            .is_some_and(|canonical_id| canonical_id.starts_with("codestory:component_report:"))
+}
+
+fn build_component_report_docs(
+    graph_context: &SemanticDocGraphContext,
+    semantic_nodes: &[&GraphNode],
+    existing_docs: &HashMap<GraphNodeId, LlmSymbolDocReuseMetadata>,
+    embedding_contract: Option<&EmbeddingProfileContractDto>,
+    updated_at_epoch_ms: i64,
+) -> Vec<BuiltLlmSymbolDoc> {
+    let mut components = BTreeMap::<String, Vec<&GraphNode>>::new();
+    for node in semantic_nodes {
+        let file_path = graph_context.file_path_for_node(node);
+        let Some(component_key) = semantic_component_key_for_path(file_path) else {
+            continue;
+        };
+        components.entry(component_key).or_default().push(*node);
+    }
+
+    components
+        .into_iter()
+        .filter_map(|(component_key, mut component_nodes)| {
+            component_nodes.sort_by(|left, right| {
+                dense_anchor_score(graph_context, right.id)
+                    .cmp(&dense_anchor_score(graph_context, left.id))
+                    .then_with(|| node_display_name(left).cmp(&node_display_name(right)))
+                    .then_with(|| left.id.0.cmp(&right.id.0))
+            });
+            let god_nodes = component_nodes
+                .iter()
+                .take(8)
+                .map(|node| {
+                    let file = graph_context.file_path_for_node(node).unwrap_or("");
+                    format!(
+                        "- {} kind={:?} file={} centrality={}",
+                        node_display_name(node),
+                        node.kind,
+                        file,
+                        dense_anchor_score(graph_context, node.id)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if god_nodes.is_empty() {
+                return None;
+            }
+            let mut files = component_nodes
+                .iter()
+                .filter_map(|node| graph_context.file_path_for_node(node))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            files.sort();
+            files.dedup();
+            files.truncate(12);
+            let representative_file_path = files.first().cloned();
+
+            let mut doc_text = String::new();
+            let _ = writeln!(
+                doc_text,
+                "{LLM_SYMBOL_DOC_VERSION_PREFIX} {LLM_SYMBOL_DOC_SCHEMA_VERSION}"
+            );
+            let _ = writeln!(doc_text, "component_report: {component_key}");
+            let _ = writeln!(
+                doc_text,
+                "source_provenance: {SYMBOL_SEARCH_DOC_PROVENANCE}"
+            );
+            let _ = writeln!(doc_text, "policy_version: {SEMANTIC_POLICY_VERSION}");
+            if let Some(path) = representative_file_path.as_deref() {
+                let _ = writeln!(doc_text, "representative_file: {path}");
+            }
+            let _ = writeln!(doc_text, "symbol_count: {}", component_nodes.len());
+            let _ = writeln!(doc_text, "file_count: {}", files.len());
+            if !files.is_empty() {
+                let _ = writeln!(doc_text, "files: {}", files.join("; "));
+            }
+            let _ = writeln!(doc_text, "god_nodes:");
+            for line in god_nodes {
+                let _ = writeln!(doc_text, "{line}");
+            }
+            doc_text = truncate_semantic_doc_text_to_token_budget(
+                &doc_text,
+                semantic_doc_max_tokens_from_env(),
+            );
+            let doc_hash = llm_symbol_doc_hash(&doc_text);
+            let node_id = virtual_component_report_node_id(&component_key);
+            let display_name = format!("component_report:{component_key}");
+            let qualified_name = Some(format!("codestory::component_report::{component_key}"));
+            let kind = codestory_contracts::graph::NodeKind::MODULE;
+            let symbol_doc = SymbolSearchDoc {
+                node_id,
+                file_node_id: None,
+                kind,
+                display_name: display_name.clone(),
+                qualified_name: qualified_name.clone(),
+                file_path: representative_file_path.clone(),
+                start_line: None,
+                doc_text: doc_text.clone(),
+                doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                doc_hash: doc_hash.clone(),
+                policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                updated_at_epoch_ms,
+            };
+            let pending = embedding_contract.map(|embedding_contract| {
+                let dense_reason = DenseAnchorReason::ComponentReport;
+                let reusable = existing_docs.get(&node_id).is_some_and(|existing_doc| {
+                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, embedding_contract)
+                        && existing_doc.dense_reason.as_deref() == Some(dense_reason.as_str())
+                });
+                (
+                    PendingLlmSymbolDoc {
+                        node_id,
+                        file_node_id: None,
+                        kind,
+                        display_name,
+                        qualified_name,
+                        file_path: representative_file_path,
+                        start_line: None,
+                        doc_text,
+                        doc_hash,
+                        dense_reason,
+                    },
+                    reusable,
+                )
+            });
+            let (pending, reusable) = pending
+                .map(|(pending, reusable)| (Some(pending), reusable))
+                .unwrap_or((None, false));
+            Some(BuiltLlmSymbolDoc {
+                symbol_doc,
+                pending,
+                reusable,
+            })
+        })
+        .collect()
+}
+
 fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
     docs.sort_by(|left, right| {
         left.doc_text
@@ -4842,6 +5598,8 @@ fn flush_pending_llm_symbol_docs(
             embedding_backend: Some(embedding_contract.backend.clone()),
             embedding_dim: embedding.len() as u32,
             doc_shape: Some(embedding_contract.doc_shape.clone()),
+            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.to_string()),
+            dense_reason: Some(doc.dense_reason.as_str().to_string()),
             embedding,
             updated_at_epoch_ms,
         })
@@ -4907,23 +5665,19 @@ fn sync_llm_symbol_projection(
         return Ok(stats);
     }
 
-    if let Err(error) = engine.set_embedding_runtime_from_env() {
-        tracing::warn!(
-            "embedding runtime unavailable ({error}); semantic ask retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
-        );
-        if hydrate_semantic_docs {
-            let reload_started = Instant::now();
-            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-            stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+    let embedding_contract = match engine.set_embedding_runtime_from_env() {
+        Ok(()) => Some(current_embedding_contract_from_env().ok_or_else(|| {
+            ApiError::internal(
+                "Failed to resolve current embedding profile contract after configuring runtime",
+            )
+        })?),
+        Err(error) => {
+            tracing::warn!(
+                "embedding runtime unavailable ({error}); graph-native symbol docs will still be refreshed, but dense anchor retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
+            );
+            None
         }
-        return Ok(stats);
-    }
-
-    let embedding_contract = current_embedding_contract_from_env().ok_or_else(|| {
-        ApiError::internal(
-            "Failed to resolve current embedding profile contract after configuring runtime",
-        )
-    })?;
+    };
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
@@ -4933,10 +5687,15 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    let expand_semantic_scope_for_contract_repair = llm_refresh_file_scope.is_some()
-        && existing_docs.values().any(|existing_doc| {
-            !llm_symbol_doc_contract_matches(existing_doc, &embedding_contract)
-        });
+    let expand_semantic_scope_for_contract_repair =
+        if let Some(embedding_contract) = embedding_contract.as_ref() {
+            llm_refresh_file_scope.is_some()
+                && existing_docs.values().any(|existing_doc| {
+                    !llm_symbol_doc_contract_matches(existing_doc, embedding_contract)
+                })
+        } else {
+            false
+        };
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
             "Stored semantic-doc contract differs from current embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
@@ -4965,11 +5724,13 @@ fn sync_llm_symbol_projection(
     let stream_sort_window_size = embed_batch_size.saturating_mul(stream_sort_window_batches);
     tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
-    let mut seen_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut seen_symbol_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut seen_dense_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut doc_build_ns = 0_u128;
     let semantic_nodes = nodes
         .iter()
         .filter(|node| llm_indexable_kind(node.kind))
+        .filter(|node| !is_retrieval_artifact_node(node))
         .filter(|node| {
             effective_llm_refresh_file_scope
                 .map(|scope| {
@@ -4980,6 +5741,13 @@ fn sync_llm_symbol_projection(
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
+    let semantic_node_ids = semantic_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let component_access = storage
+        .get_component_access_map_for_nodes(&semantic_node_ids)
+        .map_err(|e| ApiError::internal(format!("Failed to load symbol access metadata: {e}")))?;
     let graph_context = SemanticDocGraphContext::build(storage, &semantic_nodes, nodes)?;
     let file_cache_started = Instant::now();
     let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
@@ -5005,49 +5773,197 @@ fn sync_llm_symbol_projection(
                     &file_text_cache,
                 );
                 let doc_hash = llm_symbol_doc_hash(&doc_text);
-                let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
-                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, &embedding_contract)
-                });
+                let dense_reason = dense_anchor_reason_for_node(
+                    &graph_context,
+                    node,
+                    &display_name,
+                    file_path.as_deref(),
+                    &doc_text,
+                    component_access.get(&node.id).copied(),
+                );
+                let symbol_doc = SymbolSearchDoc {
+                    node_id: node.id,
+                    file_node_id: node.file_node_id,
+                    kind: node.kind,
+                    display_name: display_name.clone(),
+                    qualified_name: node.qualified_name.clone(),
+                    file_path: file_path.clone(),
+                    start_line: node.start_line,
+                    doc_text: doc_text.clone(),
+                    doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
+                    doc_hash: doc_hash.clone(),
+                    policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+                    source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+                    updated_at_epoch_ms,
+                };
+                let pending_with_reuse =
+                    embedding_contract.as_ref().and_then(|embedding_contract| {
+                        dense_reason.map(|dense_reason| {
+                            let reusable =
+                                existing_docs.get(&node.id).is_some_and(|existing_doc| {
+                                    llm_symbol_doc_can_reuse(
+                                        existing_doc,
+                                        &doc_hash,
+                                        embedding_contract,
+                                    ) && existing_doc.dense_reason.as_deref()
+                                        == Some(dense_reason.as_str())
+                                });
+                            (
+                                PendingLlmSymbolDoc {
+                                    node_id: node.id,
+                                    file_node_id: node.file_node_id,
+                                    kind: node.kind,
+                                    display_name,
+                                    qualified_name: node.qualified_name.clone(),
+                                    file_path,
+                                    start_line: node.start_line,
+                                    doc_text,
+                                    doc_hash,
+                                    dense_reason,
+                                },
+                                reusable,
+                            )
+                        })
+                    });
+                let (pending, reusable) = pending_with_reuse
+                    .map(|(pending, reusable)| (Some(pending), reusable))
+                    .unwrap_or((None, false));
 
                 BuiltLlmSymbolDoc {
-                    pending: PendingLlmSymbolDoc {
-                        node_id: node.id,
-                        file_node_id: node.file_node_id,
-                        kind: node.kind,
-                        display_name,
-                        qualified_name: node.qualified_name.clone(),
-                        file_path,
-                        start_line: node.start_line,
-                        doc_text,
-                        doc_hash,
-                    },
+                    symbol_doc,
+                    pending,
                     reusable,
                 }
             })
             .collect::<Vec<_>>();
         doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
 
+        let symbol_docs = built_docs
+            .iter()
+            .map(|built_doc| built_doc.symbol_doc.clone())
+            .collect::<Vec<_>>();
+        let symbol_upsert_started = Instant::now();
+        storage
+            .upsert_symbol_search_docs_batch(&symbol_docs)
+            .map_err(|e| ApiError::internal(format!("Failed to upsert symbol search docs: {e}")))?;
+        stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
+            symbol_upsert_started.elapsed().as_millis(),
+        ));
+        stats.symbol_search_docs_written = stats
+            .symbol_search_docs_written
+            .saturating_add(clamp_usize_to_u32(symbol_docs.len()));
+
         for built_doc in built_docs {
-            seen_node_ids.push(built_doc.pending.node_id);
+            seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+            let Some(pending_doc) = built_doc.pending else {
+                stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
+                continue;
+            };
+            seen_dense_node_ids.push(pending_doc.node_id);
+            observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
             if built_doc.reusable {
                 stats.docs_reused = stats.docs_reused.saturating_add(1);
                 continue;
             }
 
             stats.docs_pending = stats.docs_pending.saturating_add(1);
-            pending_docs.push(built_doc.pending);
+            pending_docs.push(pending_doc);
         }
 
         while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+            let Some(embedding_contract) = embedding_contract.as_ref() else {
+                break;
+            };
             flush_streaming_llm_symbol_doc_window(
                 storage,
                 engine,
                 &mut pending_docs,
                 embed_batch_size,
-                &embedding_contract,
+                embedding_contract,
                 updated_at_epoch_ms,
                 &mut stats,
             )?;
+        }
+    }
+
+    if effective_llm_refresh_file_scope.is_none() {
+        let report_build_started = Instant::now();
+        let built_reports = build_component_report_docs(
+            &graph_context,
+            &semantic_nodes,
+            &existing_docs,
+            embedding_contract.as_ref(),
+            updated_at_epoch_ms,
+        );
+        doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
+        if !built_reports.is_empty() {
+            let report_symbol_docs = built_reports
+                .iter()
+                .map(|built_doc| built_doc.symbol_doc.clone())
+                .collect::<Vec<_>>();
+            let report_nodes = report_symbol_docs
+                .iter()
+                .map(|doc| GraphNode {
+                    id: doc.node_id,
+                    kind: doc.kind,
+                    serialized_name: doc.display_name.clone(),
+                    qualified_name: doc.qualified_name.clone(),
+                    canonical_id: Some(format!("codestory:{}", doc.display_name)),
+                    file_node_id: None,
+                    start_line: None,
+                    start_col: None,
+                    end_line: None,
+                    end_col: None,
+                })
+                .collect::<Vec<_>>();
+            storage
+                .upsert_retrieval_artifact_nodes_batch(&report_nodes)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to upsert component report nodes: {e}"))
+                })?;
+            let symbol_upsert_started = Instant::now();
+            storage
+                .upsert_symbol_search_docs_batch(&report_symbol_docs)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to upsert component report docs: {e}"))
+                })?;
+            stats.db_upsert_ms = stats.db_upsert_ms.saturating_add(clamp_u128_to_u32(
+                symbol_upsert_started.elapsed().as_millis(),
+            ));
+            stats.symbol_search_docs_written = stats
+                .symbol_search_docs_written
+                .saturating_add(clamp_usize_to_u32(report_symbol_docs.len()));
+
+            for built_doc in built_reports {
+                seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+                let Some(pending_doc) = built_doc.pending else {
+                    stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
+                    continue;
+                };
+                seen_dense_node_ids.push(pending_doc.node_id);
+                observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
+                if built_doc.reusable {
+                    stats.docs_reused = stats.docs_reused.saturating_add(1);
+                    continue;
+                }
+                stats.docs_pending = stats.docs_pending.saturating_add(1);
+                pending_docs.push(pending_doc);
+            }
+
+            while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+                let Some(embedding_contract) = embedding_contract.as_ref() else {
+                    break;
+                };
+                flush_streaming_llm_symbol_doc_window(
+                    storage,
+                    engine,
+                    &mut pending_docs,
+                    embed_batch_size,
+                    embedding_contract,
+                    updated_at_epoch_ms,
+                    &mut stats,
+                )?;
+            }
         }
     }
     stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
@@ -5055,30 +5971,52 @@ fn sync_llm_symbol_projection(
     if !stream_pending_docs {
         sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
     }
-    for batch in pending_docs.chunks(embed_batch_size) {
-        flush_pending_llm_symbol_docs(
-            storage,
-            engine,
-            batch,
-            &embedding_contract,
-            updated_at_epoch_ms,
-            &mut stats,
-        )?;
+    if let Some(embedding_contract) = embedding_contract.as_ref() {
+        for batch in pending_docs.chunks(embed_batch_size) {
+            flush_pending_llm_symbol_docs(
+                storage,
+                engine,
+                batch,
+                embedding_contract,
+                updated_at_epoch_ms,
+                &mut stats,
+            )?;
+        }
     }
 
     let prune_started = Instant::now();
-    let stale_docs = if let Some(scope) = effective_llm_refresh_file_scope {
+    let stale_symbol_docs = if let Some(scope) = effective_llm_refresh_file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
         storage
-            .delete_llm_symbol_docs_for_files_except_node_ids(&file_node_ids, &seen_node_ids)
-            .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+            .delete_symbol_search_docs_for_files_except_node_ids(
+                &file_node_ids,
+                &seen_symbol_node_ids,
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
     } else {
         storage
-            .prune_llm_symbol_docs_to_node_ids(&seen_node_ids)
-            .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+            .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
+    };
+    let stale_dense_docs = if embedding_contract.is_some() {
+        if let Some(scope) = effective_llm_refresh_file_scope {
+            let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
+            storage
+                .delete_llm_symbol_docs_for_files_except_node_ids(
+                    &file_node_ids,
+                    &seen_dense_node_ids,
+                )
+                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+        } else {
+            storage
+                .prune_llm_symbol_docs_to_node_ids(&seen_dense_node_ids)
+                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
+        }
+    } else {
+        0
     };
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
-    stats.docs_stale = clamp_usize_to_u32(stale_docs);
+    stats.docs_stale = clamp_usize_to_u32(stale_dense_docs.saturating_add(stale_symbol_docs));
 
     if hydrate_semantic_docs {
         let reload_started = Instant::now();
@@ -6774,6 +7712,7 @@ impl AppController {
             edge_count: clamp_i64_to_u32(stats.edge_count),
             file_count: clamp_i64_to_u32(derived_file_count),
             error_count: clamp_i64_to_u32(stats.error_count),
+            fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
         let workspace = Workspace::open(root.to_path_buf())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
@@ -7665,7 +8604,15 @@ impl AppController {
                 &query_result.hits,
                 limit_per_source,
             )
-            .unwrap_or_default();
+            .map_err(|error| {
+                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                    self,
+                    format!(
+                        "sidecar search rejected query: candidate resolution failed: {}",
+                        error.message
+                    ),
+                )
+            })?;
         if let Some(reason) = agent::retrieval_primary::sidecar_result_rejection_reason(
             &query_result,
             &indexed_symbol_hits,
@@ -7851,9 +8798,9 @@ impl AppController {
                         normalize_path_key(&runtime_relative_path(&root, &file.path))
                             .contains(needle)
                     })
-                    && language_filter
-                        .as_deref()
-                        .is_none_or(|language| file.language.eq_ignore_ascii_case(language))
+                    && language_filter.as_deref().is_none_or(|language| {
+                        indexed_file_matches_language_filter(&file.language, &file.path, language)
+                    })
             })
             .map(|file| IndexedFileDto {
                 path: runtime_relative_path(&root, &file.path),
@@ -7866,8 +8813,10 @@ impl AppController {
             })
             .collect::<Vec<_>>();
         let limit = req.limit.unwrap_or(500).clamp(1, 5000) as usize;
+        let filtered_file_count = visible.len().min(u32::MAX as usize) as u32;
         let truncated = visible.len() > limit;
         visible.truncate(limit);
+        let visible_file_count = visible.len().min(u32::MAX as usize) as u32;
 
         let mut coverage_notes = Vec::new();
         if incomplete_file_count > 0 || error_file_count > 0 {
@@ -7879,9 +8828,15 @@ impl AppController {
         }
         let language_counts = language_counts
             .into_iter()
-            .map(|(language, file_count)| IndexedFileLanguageCountDto {
-                language,
-                file_count,
+            .map(|(language, file_count)| {
+                let support = language_support_summary_for_language(&language);
+                IndexedFileLanguageCountDto {
+                    language,
+                    file_count,
+                    support_mode: support.support_mode,
+                    evidence_tier: support.evidence_tier,
+                    claim_label: support.claim_label,
+                }
             })
             .collect::<Vec<_>>();
         let file_count = language_counts
@@ -7895,6 +8850,8 @@ impl AppController {
             summary: IndexedFilesSummaryDto {
                 file_count,
                 indexed_file_count,
+                filtered_file_count,
+                visible_file_count,
                 incomplete_file_count,
                 error_file_count,
                 truncated,
@@ -8591,6 +9548,7 @@ impl AppController {
                     semantic: scored.semantic_score,
                     graph: scored.graph_score,
                     total: scored.total_score,
+                    provenance: Vec::new(),
                 });
                 out.push(HybridSearchScoredHit {
                     hit,
@@ -9286,6 +10244,31 @@ fn index_full(
         }
     };
     if can_copy_forward {
+        match staged
+            .store_mut()
+            .copy_retrieval_artifact_nodes_from(storage_path)
+        {
+            Ok(copied) => {
+                tracing::debug!(
+                    copied,
+                    "Copied retrieval artifact nodes into staged storage"
+                )
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to copy retrieval artifact nodes into staged storage: {error}"
+                )
+            }
+        }
+        match staged
+            .store_mut()
+            .copy_symbol_search_docs_from(storage_path)
+        {
+            Ok(copied) => tracing::debug!(copied, "Copied symbol docs into staged storage"),
+            Err(error) => {
+                tracing::warn!("Failed to copy symbol docs into staged storage: {error}")
+            }
+        }
         match staged.store_mut().copy_llm_symbol_docs_from(storage_path) {
             Ok(copied) => tracing::debug!(copied, "Copied semantic docs into staged storage"),
             Err(error) => {
@@ -9334,6 +10317,14 @@ fn index_full(
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
             semantic_docs_stale: None,
+            symbol_search_docs_written: None,
+            semantic_dense_docs_skipped: None,
+            semantic_dense_public_api: None,
+            semantic_dense_entrypoint: None,
+            semantic_dense_documented_nontrivial: None,
+            semantic_dense_central_graph_node: None,
+            semantic_dense_component_report: None,
+            semantic_dense_unstructured_doc: None,
             deferred_indexes_ms: Some(deferred_indexes_ms),
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: None,
@@ -9511,6 +10502,14 @@ where
             semantic_docs_embedded: None,
             semantic_docs_pending: None,
             semantic_docs_stale: None,
+            symbol_search_docs_written: None,
+            semantic_dense_docs_skipped: None,
+            semantic_dense_public_api: None,
+            semantic_dense_entrypoint: None,
+            semantic_dense_documented_nontrivial: None,
+            semantic_dense_central_graph_node: None,
+            semantic_dense_component_report: None,
+            semantic_dense_unstructured_doc: None,
             deferred_indexes_ms: None,
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: Some(detail_snapshot_ms),
@@ -9659,7 +10658,7 @@ mod tests {
     };
     use crossbeam_channel::unbounded;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use tempfile::tempdir;
 
@@ -9716,6 +10715,33 @@ mod tests {
         assert!(
             !details.next_commands.is_empty(),
             "retrieval error should include repair commands: {error:?}"
+        );
+    }
+
+    #[test]
+    fn indexable_source_path_tracks_indexer_structural_and_template_surfaces() {
+        for relative_path in [
+            "src/lib.rs",
+            "src/main.go",
+            "src/App.vue",
+            "src/App.svelte",
+            "src/pages/index.astro",
+            "public/index.html",
+            "public/site.css",
+            "db/schema.sql",
+        ] {
+            assert!(
+                indexable_source_path(Path::new(relative_path)),
+                "runtime freshness should count indexer-indexable path: {relative_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexable_source_path_keeps_non_code_data_outside_freshness_gate() {
+        assert!(
+            !indexable_source_path(Path::new("target/run-output.log")),
+            "runtime freshness should not count unsupported output artifacts"
         );
     }
 
@@ -9882,12 +10908,65 @@ mod tests {
     }
 
     #[test]
+    fn language_filter_uses_shared_registry_extensions() {
+        for (requested, path) in [
+            ("bash", "scripts/bootstrap.sh"),
+            ("bash", "scripts/bootstrap.bash"),
+            ("sh", "scripts/bootstrap.sh"),
+            ("python", "pkg/types.pyi"),
+            ("ts", "src/server.mts"),
+            ("typescript", "src/server.cts"),
+            ("dart", "lib/main.dart"),
+            ("html", "templates/index.htm"),
+            ("css", "assets/site.css"),
+            ("sql", "db/schema.sql"),
+            ("c++", "include/runtime.hh"),
+            ("c#", "src/App.cs"),
+            ("markdown", "docs/guide.mdx"),
+        ] {
+            assert!(
+                language_filter_matches_path(requested, path),
+                "expected language:{requested} to match {path}"
+            );
+        }
+
+        assert!(!language_filter_matches_path("bash", "src/main.py"));
+        assert!(!language_filter_matches_path(
+            "sh",
+            "scripts/bootstrap.bash"
+        ));
+        assert!(!language_filter_matches_path("tsx", "src/server.ts"));
+        assert!(!language_filter_matches_path("jsx", "src/app.js"));
+
+        assert!(indexed_file_matches_language_filter(
+            "typescript",
+            Path::new("src/Widget.tsx"),
+            "tsx"
+        ));
+        assert!(indexed_file_matches_language_filter(
+            "bash",
+            Path::new("scripts/bootstrap.sh"),
+            "bash"
+        ));
+        assert!(!indexed_file_matches_language_filter(
+            "typescript",
+            Path::new("src/server.ts"),
+            "tsx"
+        ));
+    }
+
+    #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
+
         assert_eq!(llm_doc_embed_batch_size(), 128);
     }
 
     #[test]
-    fn framework_route_coverage_matrix_lists_fixture_status_and_known_gaps() {
+    fn framework_route_coverage_matrix_lists_coverage_evidence_and_known_gaps() {
         let coverage = framework_route_coverage_matrix();
         let frameworks = coverage
             .iter()
@@ -9927,7 +11006,7 @@ mod tests {
             );
         }
         assert!(coverage.iter().all(|entry| {
-            !entry.fixture_status.is_empty()
+            !entry.coverage_evidence.is_empty()
                 && !entry.confidence_floor.is_empty()
                 && !entry.handler_link_support.is_empty()
                 && !entry.unsupported_patterns.is_empty()
@@ -10080,7 +11159,472 @@ mod tests {
             start_line: None,
             doc_text: doc_text.to_string(),
             doc_hash: llm_symbol_doc_hash(doc_text),
+            dense_reason: DenseAnchorReason::PublicApi,
         }
+    }
+
+    fn semantic_policy_node(id: i64, kind: NodeKind, name: &str, file_id: i64) -> Node {
+        Node {
+            id: CoreNodeId(id),
+            kind,
+            serialized_name: name.to_string(),
+            qualified_name: Some(format!("pkg::{name}")),
+            file_node_id: Some(CoreNodeId(file_id)),
+            start_line: Some(1),
+            end_line: Some(3),
+            ..Default::default()
+        }
+    }
+
+    fn semantic_policy_context(path: &str, node_id: CoreNodeId) -> SemanticDocGraphContext {
+        let mut context = SemanticDocGraphContext::default();
+        context.file_paths.insert(node_id, path.to_string());
+        context
+    }
+
+    #[test]
+    fn dense_policy_skips_private_trivial_helpers() {
+        let node = semantic_policy_node(10, NodeKind::FUNCTION, "helper", 1);
+        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "helper",
+            Some("src/internal/helper.rs"),
+            "semantic_doc_version: 4\nsymbol: helper\nkind: FUNCTION\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dense_policy_does_not_treat_every_handler_name_as_entrypoint() {
+        let node = semantic_policy_node(14, NodeKind::FUNCTION, "handler", 1);
+        let context = semantic_policy_context("src/internal/request.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "handler",
+            Some("src/internal/request.rs"),
+            "semantic_doc_version: 4\nsymbol: handler\nkind: FUNCTION\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dense_policy_only_embeds_high_signal_central_nodes() {
+        let ordinary = semantic_policy_node(15, NodeKind::FUNCTION, "ordinary", 1);
+        let central = semantic_policy_node(16, NodeKind::FUNCTION, "central", 1);
+        let mut context = semantic_policy_context("src/internal/graph.rs", ordinary.id);
+        context
+            .file_paths
+            .insert(central.id, "src/internal/graph.rs".to_string());
+        context.child_labels.insert(
+            ordinary.id,
+            ["a", "b", "c", "d"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+        context.referenced_labels.insert(
+            central.id,
+            (0..DENSE_CENTRAL_LABEL_THRESHOLD)
+                .map(|index| format!("ref_{index}"))
+                .collect(),
+        );
+        context
+            .edge_digests
+            .insert(central.id, vec!["CALL=24".to_string()]);
+
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &ordinary,
+                "ordinary",
+                Some("src/internal/graph.rs"),
+                "semantic_doc_version: 4\nsymbol: ordinary\nkind: FUNCTION\n",
+                Some(AccessKind::Private),
+            ),
+            None
+        );
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &central,
+                "central",
+                Some("src/internal/graph.rs"),
+                "semantic_doc_version: 4\nsymbol: central\nkind: FUNCTION\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::CentralGraphNode)
+        );
+    }
+
+    #[test]
+    fn dense_policy_classifies_public_entrypoint_and_documented_symbols() {
+        let public_node = semantic_policy_node(11, NodeKind::STRUCT, "ReportBuilder", 1);
+        let entrypoint_node = semantic_policy_node(12, NodeKind::FUNCTION, "main", 1);
+        let documented_node = semantic_policy_node(13, NodeKind::METHOD, "parse_config", 1);
+        let context = semantic_policy_context("src/lib.rs", public_node.id);
+
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &public_node,
+                "ReportBuilder",
+                Some("src/lib.rs"),
+                "semantic_doc_version: 4\nsymbol: ReportBuilder\nkind: STRUCT\n",
+                Some(AccessKind::Public),
+            ),
+            Some(DenseAnchorReason::PublicApi)
+        );
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &entrypoint_node,
+                "main",
+                Some("src/main.rs"),
+                "semantic_doc_version: 4\nsymbol: main\nkind: FUNCTION\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::Entrypoint)
+        );
+        assert_eq!(
+            dense_anchor_reason_for_node(
+                &context,
+                &documented_node,
+                "parse_config",
+                Some("src/internal/config.rs"),
+                "semantic_doc_version: 4\ncomments: parses user-visible configuration\nbody_summary: validates and normalizes the configuration before runtime startup\n",
+                Some(AccessKind::Private),
+            ),
+            Some(DenseAnchorReason::DocumentedNontrivial)
+        );
+    }
+
+    #[test]
+    fn dense_policy_classifies_cross_language_entrypoints_and_surfaces() {
+        let python_app = semantic_policy_node(21, NodeKind::FUNCTION, "app", 1);
+        let go_command = semantic_policy_node(22, NodeKind::FUNCTION, "run", 1);
+        let csharp_program = semantic_policy_node(23, NodeKind::CLASS, "Program", 1);
+        let java_application = semantic_policy_node(24, NodeKind::CLASS, "Application", 1);
+        let c_header_api = semantic_policy_node(25, NodeKind::STRUCT, "ClientApi", 1);
+        let python_package_api = semantic_policy_node(26, NodeKind::CLASS, "PackageClient", 1);
+        let mut context = SemanticDocGraphContext::default();
+        context
+            .file_paths
+            .insert(python_app.id, "service/app.py".to_string());
+        context
+            .file_paths
+            .insert(go_command.id, "cmd/server/main.go".to_string());
+        context
+            .file_paths
+            .insert(csharp_program.id, "src/Program.cs".to_string());
+        context.file_paths.insert(
+            java_application.id,
+            "src/main/java/com/acme/Application.java".to_string(),
+        );
+        context
+            .file_paths
+            .insert(c_header_api.id, "include/acme/client_api.hpp".to_string());
+        context.file_paths.insert(
+            python_package_api.id,
+            "packages/acme_sdk/__init__.py".to_string(),
+        );
+
+        for (node, display_name, file_path) in [
+            (&python_app, "app", "service/app.py"),
+            (&go_command, "run", "cmd/server/main.go"),
+            (&csharp_program, "Program", "src/Program.cs"),
+            (
+                &java_application,
+                "Application",
+                "src/main/java/com/acme/Application.java",
+            ),
+        ] {
+            assert_eq!(
+                dense_anchor_reason_for_node(
+                    &context,
+                    node,
+                    display_name,
+                    Some(file_path),
+                    "semantic_doc_version: 4\nsymbol: entrypoint\nkind: FUNCTION\n",
+                    Some(AccessKind::Private),
+                ),
+                Some(DenseAnchorReason::Entrypoint),
+                "{file_path} should classify as an entrypoint"
+            );
+        }
+
+        for (node, display_name, file_path) in [
+            (&c_header_api, "ClientApi", "include/acme/client_api.hpp"),
+            (
+                &python_package_api,
+                "PackageClient",
+                "packages/acme_sdk/__init__.py",
+            ),
+        ] {
+            assert_eq!(
+                dense_anchor_reason_for_node(
+                    &context,
+                    node,
+                    display_name,
+                    Some(file_path),
+                    "semantic_doc_version: 4\nsymbol: api\nkind: STRUCT\n",
+                    Some(AccessKind::Private),
+                ),
+                Some(DenseAnchorReason::PublicApi),
+                "{file_path} should classify as a public surface"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_policy_does_not_embed_plain_public_callables_by_default() {
+        let node = semantic_policy_node(17, NodeKind::FUNCTION, "plain_public_function", 1);
+        let context = semantic_policy_context("src/lib.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "plain_public_function",
+            Some("src/lib.rs"),
+            "semantic_doc_version: 4\nsymbol: plain_public_function\nkind: FUNCTION\n",
+            Some(AccessKind::Public),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn dense_policy_embeds_package_public_callables_for_dynamic_frameworks() {
+        let node = semantic_policy_node(19, NodeKind::FUNCTION, "handle", 1);
+        let context = semantic_policy_context("lib/router/index.js", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "handle",
+            Some("lib/router/index.js"),
+            "semantic_doc_version: 4\nsymbol: handle\nkind: FUNCTION\nsignature: function handle(req, res, next) {}\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, Some(DenseAnchorReason::PublicApi));
+
+        let windows_node = semantic_policy_node(29, NodeKind::METHOD, "GET /json", 1);
+        let windows_path = r"\\?\C:\repo\expressjs-express\lib\response.js";
+        let windows_context = semantic_policy_context(windows_path, windows_node.id);
+
+        let windows_reason = dense_anchor_reason_for_node(
+            &windows_context,
+            &windows_node,
+            "GET /json",
+            Some(windows_path),
+            "semantic_doc_version: 4\nsymbol: GET /json\nkind: METHOD\nsignature: .get('/json')\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(windows_reason, Some(DenseAnchorReason::PublicApi));
+    }
+
+    #[test]
+    fn dense_policy_does_not_embed_comment_only_symbols_by_default() {
+        let node = semantic_policy_node(18, NodeKind::FUNCTION, "commented_helper", 1);
+        let context = semantic_policy_context("src/internal/helper.rs", node.id);
+
+        let reason = dense_anchor_reason_for_node(
+            &context,
+            &node,
+            "commented_helper",
+            Some("src/internal/helper.rs"),
+            "semantic_doc_version: 4\ncomments: explains how helper is used by nearby code\nsignature: fn commented_helper() {}\n",
+            Some(AccessKind::Private),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn component_reports_are_extracted_dense_anchors_with_virtual_ids() {
+        let node = semantic_policy_node(20, NodeKind::FUNCTION, "central_service", 1);
+        let mut context = semantic_policy_context("crates/app/src/service.rs", node.id);
+        context
+            .edge_digests
+            .insert(node.id, vec!["CALL=9".to_string()]);
+        let reports = build_component_report_docs(
+            &context,
+            &[&node],
+            &std::collections::HashMap::new(),
+            None,
+            123,
+        );
+
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert!(report.symbol_doc.node_id.0 < 0);
+        assert_eq!(report.symbol_doc.source_provenance, "extracted");
+        assert_eq!(report.symbol_doc.policy_version, SEMANTIC_POLICY_VERSION);
+        assert!(
+            report
+                .symbol_doc
+                .doc_text
+                .contains("component_report: crate:app")
+        );
+        assert_eq!(
+            report.symbol_doc.file_path.as_deref(),
+            Some("crates/app/src/service.rs")
+        );
+        assert!(report.symbol_doc.doc_text.contains("god_nodes:"));
+        assert!(report.pending.is_none());
+    }
+
+    #[test]
+    fn component_reports_group_root_level_source_files() {
+        assert_eq!(
+            semantic_component_key_for_path(Some("nvm.sh")).as_deref(),
+            Some("dir:.")
+        );
+    }
+
+    #[test]
+    fn semantic_graph_context_uses_repo_relative_file_table_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        let verbatim_path = PathBuf::from(r"\\?\C:\work\nvm\nvm.sh");
+        storage
+            .insert_file(&FileInfo {
+                id: 11,
+                path: verbatim_path.clone(),
+                language: "bash".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 12,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert file");
+        let file_node = Node {
+            id: CoreNodeId(11),
+            kind: NodeKind::FILE,
+            serialized_name: verbatim_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let function_node = Node {
+            id: CoreNodeId(101),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "nvm".to_string(),
+            file_node_id: Some(CoreNodeId(11)),
+            start_line: Some(1),
+            ..Default::default()
+        };
+        storage
+            .insert_nodes_batch(&[file_node.clone(), function_node.clone()])
+            .expect("insert nodes");
+        let nodes = vec![file_node, function_node.clone()];
+        let semantic_nodes = vec![&function_node];
+        let context =
+            SemanticDocGraphContext::build(&storage, &semantic_nodes, &nodes).expect("context");
+
+        assert_eq!(context.file_path_for_node(&function_node), Some("nvm.sh"));
+        assert_eq!(
+            context.file_read_path_for_node(&function_node),
+            Some("C:/work/nvm/nvm.sh")
+        );
+        let reports = build_component_report_docs(
+            &context,
+            &semantic_nodes,
+            &std::collections::HashMap::new(),
+            None,
+            123,
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].symbol_doc.file_path.as_deref(), Some("nvm.sh"));
+        assert!(
+            reports[0]
+                .symbol_doc
+                .doc_text
+                .contains("component_report: dir:.")
+        );
+    }
+
+    fn semantic_file_text_cache_node(
+        id: i64,
+        display_path: &str,
+        read_path: &Path,
+        context: &mut SemanticDocGraphContext,
+    ) -> Node {
+        let node = Node {
+            id: CoreNodeId(id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("symbol_{id}"),
+            file_node_id: Some(CoreNodeId(id + 100)),
+            start_line: Some(1),
+            ..Default::default()
+        };
+        context.file_paths.insert(node.id, display_path.to_string());
+        context
+            .file_read_paths
+            .insert(node.id, read_path.to_string_lossy().to_string());
+        node
+    }
+
+    #[test]
+    fn semantic_file_text_cache_skips_files_above_byte_limit() {
+        let temp = tempdir().expect("create temp dir");
+        let small_path = temp.path().join("small.rs");
+        let large_path = temp.path().join("large.rs");
+        fs::write(&small_path, "small").expect("write small file");
+        fs::write(&large_path, "too-large").expect("write large file");
+        let mut context = SemanticDocGraphContext::default();
+        let nodes = [
+            semantic_file_text_cache_node(1, "small.rs", &small_path, &mut context),
+            semantic_file_text_cache_node(2, "large.rs", &large_path, &mut context),
+        ];
+        let semantic_nodes = nodes.iter().collect::<Vec<_>>();
+
+        let cache = build_semantic_file_text_cache_with_limits(&context, &semantic_nodes, 5, 100);
+
+        assert_eq!(
+            cache
+                .get("small.rs")
+                .and_then(|contents| contents.as_deref()),
+            Some("small")
+        );
+        assert_eq!(cache.get("large.rs"), Some(&None));
+    }
+
+    #[test]
+    fn semantic_file_text_cache_respects_aggregate_byte_limit() {
+        let temp = tempdir().expect("create temp dir");
+        let a_path = temp.path().join("a.rs");
+        let b_path = temp.path().join("b.rs");
+        let c_path = temp.path().join("c.rs");
+        fs::write(&a_path, "aaaa").expect("write a file");
+        fs::write(&b_path, "bbbb").expect("write b file");
+        fs::write(&c_path, "cc").expect("write c file");
+        let mut context = SemanticDocGraphContext::default();
+        let nodes = [
+            semantic_file_text_cache_node(1, "a.rs", &a_path, &mut context),
+            semantic_file_text_cache_node(2, "b.rs", &b_path, &mut context),
+            semantic_file_text_cache_node(3, "c.rs", &c_path, &mut context),
+        ];
+        let semantic_nodes = nodes.iter().collect::<Vec<_>>();
+
+        let cache = build_semantic_file_text_cache_with_limits(&context, &semantic_nodes, 100, 7);
+
+        assert_eq!(
+            cache.get("a.rs").and_then(|contents| contents.as_deref()),
+            Some("aaaa")
+        );
+        assert_eq!(cache.get("b.rs"), Some(&None));
+        assert_eq!(cache.get("c.rs"), Some(&None));
     }
 
     fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
@@ -10264,6 +11808,48 @@ mod tests {
         assert!(
             doc.contains("path_aliases: crates, codestory-runtime, codestory runtime, src, lib"),
             "method docs should expose file path aliases:\n{doc}"
+        );
+    }
+
+    #[test]
+    fn semantic_doc_text_keeps_comments_before_long_file_path() {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
+        let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "128");
+        let file_path = r"\\?\C:\Users\alber\AppData\Local\Temp\codestory-search-quality-fixture-with-a-long-path\src\architecture.ts";
+        let file_text = r#"// Project source groups create indexing commands and storage access.
+export class SourceGroupCxxCdb {
+  getIndexerCommands() { return []; }
+}
+"#;
+        let node = Node {
+            id: CoreNodeId(10),
+            kind: NodeKind::CLASS,
+            serialized_name: "SourceGroupCxxCdb".to_string(),
+            qualified_name: Some("SourceGroupCxxCdb".to_string()),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(2),
+            end_line: Some(4),
+            ..Default::default()
+        };
+        let mut file_text_cache = HashMap::new();
+        file_text_cache.insert(file_path.to_string(), Some(file_text.to_string()));
+
+        let doc = build_llm_symbol_doc_text(
+            &SemanticDocGraphContext::default(),
+            &node,
+            "SourceGroupCxxCdb",
+            Some(file_path),
+            &file_text_cache,
+        );
+
+        assert!(
+            doc.contains(
+                "comments: // Project source groups create indexing commands and storage access."
+            ),
+            "symbol docs should preserve nearby comments before long file paths consume the token budget:\n{doc}"
         );
     }
 
@@ -12949,16 +14535,18 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incremental index");
         assert!(
-            incremental_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "new semantic docs from the touched file should be embedded"
+            incremental_timings.symbol_search_docs_written.unwrap_or(0) > 0,
+            "new symbols from the touched file should update graph-native symbol docs"
         );
-        assert!(
-            incremental_timings
-                .semantic_docs_embedded
-                .unwrap_or(u32::MAX)
-                < clamp_usize_to_u32(before_docs.len()),
-            "incremental semantic sync should not re-embed untouched files"
-        );
+        if incremental_timings.semantic_docs_embedded.unwrap_or(0) > 0 {
+            assert!(
+                incremental_timings
+                    .semantic_docs_embedded
+                    .unwrap_or(u32::MAX)
+                    < clamp_usize_to_u32(before_docs.len()),
+                "incremental dense sync should not re-embed untouched files"
+            );
+        }
         assert_eq!(
             incremental_timings.semantic_docs_stale.unwrap_or(0),
             0,
@@ -12967,12 +14555,12 @@ fn build_llm_symbol_doc_text() -> String {
 
         let docs = Storage::open(&storage_path)
             .expect("reopen storage")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after incremental");
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbol docs after incremental");
         assert!(
             docs.iter()
                 .any(|doc| doc.display_name.contains("codestory_added_move_hint")),
-            "incremental semantic docs should include the new symbol"
+            "incremental symbol docs should include the new symbol"
         );
     }
 
@@ -13034,11 +14622,15 @@ fn build_llm_symbol_doc_text() -> String {
                 .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
             "incremental repair should leave all stored semantic docs on the current contract"
         );
+        let repaired_symbol_docs = Storage::open(&storage_path)
+            .expect("open storage after drift repair for symbol docs")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbol docs after drift repair");
         assert!(
-            repaired_docs.iter().any(|doc| doc
+            repaired_symbol_docs.iter().any(|doc| doc
                 .display_name
                 .contains("codestory_contract_drift_added_hint")),
-            "incremental repair should still include symbols from the touched file"
+            "incremental repair should still include symbol docs from the touched file"
         );
     }
 
@@ -13669,16 +15261,37 @@ fn build_llm_symbol_doc_text() -> String {
                 .as_deref(),
             Some("model-a")
         );
+        let mut seeded_docs = storage
+            .get_all_llm_symbol_docs()
+            .expect("initial semantic docs");
+        if seeded_docs.len() == 1 {
+            let mut extra = seeded_docs[0].clone();
+            extra.node_id = CoreNodeId(3);
+            extra.display_name = "beta".to_string();
+            extra.qualified_name = Some("pkg::beta".to_string());
+            extra.dense_reason = Some("documented_nontrivial".to_string());
+            storage
+                .upsert_llm_symbol_docs_batch(&[extra])
+                .expect("seed second dense doc");
+            seeded_docs = storage
+                .get_all_llm_symbol_docs()
+                .expect("seeded semantic docs");
+        }
+        let mixed_node_id = seeded_docs
+            .last()
+            .expect("at least one semantic doc")
+            .node_id
+            .0;
 
         storage
             .get_connection()
             .execute(
                 "UPDATE llm_symbol_doc
                  SET embedding_model = CASE
-                     WHEN node_id = 2 THEN 'model-b'
+                     WHEN node_id = ?1 THEN 'model-b'
                      ELSE embedding_model
                  END",
-                [],
+                [mixed_node_id],
             )
             .expect("mark one semantic doc as mixed");
         assert_eq!(
@@ -14149,8 +15762,8 @@ fn build_llm_symbol_doc_text() -> String {
 
         let storage = Storage::open(&storage_path).expect("open storage after initial index");
         let initial_docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("load initial semantic docs")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load initial symbol docs")
             .into_iter()
             .filter(|doc| doc.display_name == "build_snapshot_digest")
             .collect::<Vec<_>>();
@@ -14174,8 +15787,8 @@ fn build_llm_symbol_doc_text() -> String {
 
         let storage = Storage::open(&storage_path).expect("open storage after rerun");
         let updated_docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("load updated semantic docs")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load updated symbol docs")
             .into_iter()
             .filter(|doc| doc.display_name == "build_snapshot_digest")
             .collect::<Vec<_>>();
@@ -14194,7 +15807,7 @@ fn build_llm_symbol_doc_text() -> String {
             !updated_docs
                 .iter()
                 .any(|doc| doc.doc_text.contains("initial_compressed_digest")),
-            "full index should rebuild semantic docs instead of reusing stale persisted content"
+            "full index should rebuild symbol docs instead of reusing stale persisted content"
         );
     }
 
