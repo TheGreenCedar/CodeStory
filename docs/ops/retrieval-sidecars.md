@@ -35,11 +35,13 @@ flowchart LR
 From the CodeStory repository root (Windows, macOS, Linux):
 
 ```sh
-cargo retrieval-setup
+cargo run -p codestory-cli -- retrieval bootstrap --project . --format json
 ```
 
 This starts or checks the local sidecar services for the CodeStory checkout; it
 does not by itself finalize the retrieval manifest for every target workspace.
+The `--project .` is intentional here. For another repo, pass that repo path to
+`--project`.
 
 Plain `codestory-cli index` builds the core SQLite code index only. It can make
 the local navigation lane usable, but it does not generate sidecar artifacts or
@@ -56,7 +58,7 @@ node scripts/setup-retrieval-env.mjs --fetch-embed-model
 export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
 export CODESTORY_EMBED_BACKEND="llamacpp"
 export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
-cargo retrieval-setup
+./target/release/codestory-cli retrieval bootstrap --project <repo> --format json
 ./target/release/codestory-cli index --project <repo> --refresh full
 ./target/release/codestory-cli retrieval index --project <repo> --refresh full
 ./target/release/codestory-cli retrieval status --project <repo> --format json
@@ -75,12 +77,11 @@ Qdrant component as policy-skipped rather than querying a missing collection.
 Status after bootstrap:
 
 ```sh
-cargo retrieval-status
+cargo run -p codestory-cli -- retrieval status --project . --format json
 ```
 
-Aliases are defined in [`.cargo/config.toml`](../../.cargo/config.toml). They run
-`codestory retrieval bootstrap --project .` and `retrieval status --project .`, building the CLI
-when needed.
+Optional aliases are defined in [`.cargo/config.toml`](../../.cargo/config.toml).
+They wrap the same project-dot bootstrap and status commands.
 
 **Bootstrap flags** (via `cargo run -p codestory-cli -- retrieval bootstrap ...`):
 
@@ -103,7 +104,7 @@ node scripts/setup-retrieval-env.mjs --with-holdout-clone
 |------|---------|
 | `--check-only` | Prerequisites report only; exit 1 if required tools missing |
 | `--skip-compose` | Passed to bootstrap |
-| `--skip-build` | Skip `cargo build` (alias still builds on first `cargo retrieval-setup`) |
+| `--skip-build` | Skip `cargo build` when the wrapper invokes bootstrap directly |
 | `--with-holdout-clone` | Also run `scripts/fetch-holdout-repos.mjs` (large git clones under `target/`) |
 
 When `--fetch-embed-model` is present, the wrapper downloads
@@ -129,7 +130,7 @@ Compose file: [`docker/retrieval-compose.yml`](../../docker/retrieval-compose.ym
 
 | Dependency | Pin policy | Pinned version | Notes |
 |------------|------------|----------------|-------|
-| Zoekt real (Phase 2) | `COMPOSE_PROFILES=real` | `zoekt-20250506123554` | `sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4` + lexical shards |
+| Zoekt real | `COMPOSE_PROFILES=real` | `zoekt-20250506123554` | `sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4` + lexical shards |
 | Qdrant | Fixed container image tag | `qdrant/qdrant:v1.12.5` | HTTP `6333`, gRPC `6334` |
 | SCIP | CodeStory graph artifact emitter | `graph-<hash>` | Generated local graph artifacts under the sidecar generation |
 
@@ -258,7 +259,7 @@ Managed `setup embeddings` output is not a substitute for this lane: it may
 install local semantic assets, but it does not start llama.cpp, build the
 retrieval manifest, or make `retrieval status` report `full`.
 
-**Phase 2 (shipped in crate):**
+**Shipped component status:**
 
 | Component | Status |
 |-----------|--------|
@@ -281,7 +282,8 @@ diagnostic only and never produce `retrieval_mode=full`.
    - `CODESTORY_EMBED_MODEL_DIR=<repo>/target/retrieval-models`
    - `CODESTORY_EMBED_BACKEND=llamacpp` (recommended explicit product mode; unset is also product mode for retrieval commands)
    - `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings`
-3. `cargo retrieval-setup` (starts Qdrant, Zoekt webserver, `codestory-embed` on `:8080`)
+3. `./target/release/codestory-cli retrieval bootstrap --project <repo> --format json`
+   starts Qdrant, Zoekt webserver, and `codestory-embed` on `:8080`.
 4. Dim smoke: `curl -s http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d "{\"input\":[\"function\"]}"` → embedding length **768**
 5. `retrieval index --project <repo> --refresh full` (manifest records `embedding_backend`, `embedding_dim`, `sidecar_input_hash`, `sidecar_generation`, the generated Qdrant collection, `symbol_doc_count`, `dense_projection_count`, `semantic_policy_version`, `graph_artifact_hash`, and dense reason counts; the input hash includes symbol-doc and dense-anchor metadata plus the embedding contract)
 6. `retrieval status` → `retrieval_mode: full` and `capabilities.semantic=true`
@@ -323,7 +325,7 @@ count is zero, Qdrant reuse is skipped explicitly and cannot mask stale graph/le
 ./target/release/codestory-cli retrieval down
 ```
 
-### Standalone query (Phase 2+)
+### Standalone Query
 
 ```sh
 ./target/release/codestory-cli retrieval query "ExtensionService" --project .
@@ -343,7 +345,7 @@ GGUF embedding model.
 1. `retrieval up` - exit 0
 2. `retrieval status` - JSON with expected shape; non-`full` status is a failure for agent use
 3. `retrieval index --project <fixture>` - manifest row in SQLite only when all sidecars are real
-4. `retrieval query "<smoke query>"` - Phase 2+
+4. `retrieval query "<smoke query>"` - standalone sidecar query
 5. `retrieval down` - clean shutdown
 
 **CI reduced sequence:**

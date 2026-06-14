@@ -73,7 +73,7 @@ for `packet` or `search`.
 For agent-facing packet/search evidence, build and verify sidecars first:
 
 ```sh
-cargo retrieval-setup
+"$CODESTORY_CLI" retrieval bootstrap --project "$TARGET_WORKSPACE" --format json
 "$CODESTORY_CLI" retrieval index --project "$TARGET_WORKSPACE" --refresh full
 "$CODESTORY_CLI" retrieval status --project "$TARGET_WORKSPACE" --format json
 "$CODESTORY_CLI" packet --project "$TARGET_WORKSPACE" --question "what owns request routing?"

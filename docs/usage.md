@@ -59,8 +59,8 @@ Two lanes - do not mix them when judging `packet` or `search` output.
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
-codestory-cli report --project <target-workspace> --output-file out/codestory-report.md
-codestory-cli report --project <target-workspace> --format json --output-file out/codestory-graph.json
+codestory-cli report --project <target-workspace> --output-file codestory-report.md
+codestory-cli report --project <target-workspace> --format json --output-file codestory-graph.json
 ```
 
 Health check, orientation, optional report and graph export. Regenerate reports
@@ -90,7 +90,7 @@ target:
 
 ```sh
 codestory-cli ground --project <target-workspace> --why
-codestory-cli report --project <target-workspace> --output-file out/codestory-report.md
+codestory-cli report --project <target-workspace> --output-file codestory-report.md
 codestory-cli files --project <target-workspace> --path src --limit 80
 ```
 
@@ -237,7 +237,7 @@ node scripts/setup-retrieval-env.mjs --fetch-embed-model
 export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
 export CODESTORY_EMBED_BACKEND="llamacpp"
 export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
-cargo retrieval-setup
+codestory-cli retrieval bootstrap --project <target-workspace> --format json
 
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli retrieval index --project <target-workspace> --refresh full
@@ -252,9 +252,10 @@ with SHA-256
 `ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`; all
 configured mirrors must pass the same check.
 
-Run `codestory-cli retrieval index` only after the local sidecar services,
-llama.cpp embedding endpoint, and `bge-base-en-v1.5` model configuration are
-ready, then require `retrieval status --format json` to report
+Run `codestory-cli retrieval bootstrap` for the same target workspace you will
+query. Then run `codestory-cli retrieval index` only after the local sidecar
+services, llama.cpp embedding endpoint, and `bge-base-en-v1.5` model
+configuration are ready. Require `retrieval status --format json` to report
 `retrieval_mode: "full"` before trusting agent-facing packet/search evidence.
 The status JSON also reports `query_embedding_backend`,
 `manifest_vector_embedding_backend`, and `stored_doc_vector_producer_backend`

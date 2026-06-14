@@ -12,7 +12,7 @@ env vars, CI smoke), [`../architecture/retrieval-design.md`](../architecture/ret
 
 ---
 
-## Implemented stack (Phases 0–5)
+## Implemented Stack
 
 | Layer | Location | Role |
 |-------|----------|------|
@@ -107,7 +107,7 @@ anchors such as repository names, specific source paths, and manifest-specific
 symbols. Keep those strings in manifests, tests, benchmark harnesses, or the
 test-only eval probe module.
 
-## Fast CI-style checks (automated in Phase 6)
+## Required Checks
 
 ```sh
 cargo test -p codestory-runtime --test retrieval_generalization_guard
@@ -124,10 +124,10 @@ node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 
 ---
 
-## Promotion checklist
+## Promotion Checklist
 
-Status as of Phase 6 documentation pass. **Benchmark pass columns require a human run** with
-repos, sidecars, and release CLI — not claimed here.
+**Benchmark pass columns require a human run** with repos, sidecars, and release
+CLI. This page records the gates; it does not claim those rows have passed.
 
 ### Language support audit alignment
 
@@ -136,7 +136,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Phases 0–5 code landed | done | See implemented stack above |
+| Core sidecar stack | done | See implemented stack above |
 | Architecture / design docs | done | `docs/architecture/retrieval-design.md` |
 | Sidecar runbook | done | `docs/ops/retrieval-sidecars.md` |
 | Local-real manifests | done | `benchmarks/tasks/local-real/` |
@@ -150,7 +150,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract) |
 | Ragas/Phoenix nightly eval | optional | Not configured |
 
-### North-star SLOs (targets — measure before claiming pass)
+### North-Star SLOs
 
 | Metric | Target |
 |--------|--------|
@@ -171,13 +171,13 @@ tests in the branch. Do not infer support for languages without direct benchmark
 
 ---
 
-## Rollback drill (REQ-RES-005)
+## Rollback Warning Drill
 
 After promotion runs, verify rollback warnings:
 
 1. Point `retrieval_rollback` at a baseline `packet-runtime-summary.json` with thresholds that will trip on the current summary (or use unit test `rollback_drill_warns_without_setting_legacy_env` in `retrieval_rollback.rs`).
 2. Confirm `check_and_log_rollback_warnings` logs trigger ids without setting `CODESTORY_RETRIEVAL=0`.
-3. File a one-line incident note in this doc with date and trigger id if rollback fires in production promotion.
+3. Record the trigger id with the promotion evidence if rollback fires during production promotion.
 
 **One-shot operator drill (after each promotion run):**
 
@@ -187,7 +187,9 @@ cargo test -p codestory-runtime retrieval_rollback::tests::rollback_drill_warns_
 
 Expect rollback warnings only when configured thresholds fire (see `docs/architecture/retrieval-rollback.json`). Sidecar retrieval remains mandatory.
 
-**Closure status (2026-05-27, semantic promotion pass):** Phase A shipped (bge-base 768-d, llama.cpp `embed` compose service, manifest `embedding_backend`/`embedding_dim`, Qdrant collection migration, llamacpp dim hard-fail). Local `retrieval status` reaches `full` with default 768-d vectors after Qdrant re-index. Sidecar-primary is the intended product path, but product promotion remains gated until fresh benchmark evidence passes.
+**Promotion note:** Local `retrieval status` can report `full` after Qdrant
+re-index. Sidecar-primary is the intended product path, but product promotion
+still requires fresh benchmark evidence.
 
 ---
 

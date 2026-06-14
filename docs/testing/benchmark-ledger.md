@@ -172,7 +172,7 @@ mismatches. Warm stdio task medians ranged from `2.69s` to `3.60s`, with an
 aggregate task median of `3.13s`; cold CLI task medians ranged from `4.22s` to
 `5.76s`, with an aggregate task median of `4.86s`.
 
-## Methodology
+## Harness Contract
 
 The agent A/B harness runs the same repository prompt in two arms:
 
