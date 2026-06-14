@@ -11,7 +11,7 @@ plans a change.
 
 `doctor` → `index` → `ground` or `search` → inspect with `symbol` / `trail` / `snippet` / `explore` → `context` or `packet`.
 
-For the two-lane system map (SQLite cache vs sidecars), see [README — What It Builds](../README.md#what-it-builds).
+For the two-lane system map (SQLite cache vs sidecars), see [README — How it fits together](../README.md#how-it-fits-together).
 
 - `doctor` checks whether the cache, index, retrieval mode, and local embedding
   setup are usable.

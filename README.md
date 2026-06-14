@@ -10,32 +10,40 @@ Local codebase grounding for coding agents.
 <a href="docs/testing/benchmark-ledger.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
-CodeStory builds a local evidence layer for a repository. It indexes files,
-symbols, relationships, snippets, search state, and freshness notes into a
-per-project SQLite cache, then exposes that evidence through a CLI and
-`serve --stdio`.
+## Why CodeStory
 
-Use it when a coding agent needs repository context before explaining behavior,
-planning a change, or choosing files to inspect. The workflow is explicit: check
-cache health, build or refresh the index, find candidate symbols, inspect
-relationships, pull snippets, and return an answer tied to source evidence.
+You've watched an agent grep the wrong folder, explain code it never opened, or
+spend half a session rediscovering the same files. Big repos are not hard because
+the model is dumb — they are hard because **nobody gave the agent a map of the
+codebase**.
 
-Repository contents and inference stay local after the required tool or model
-assets are installed. Setup can fetch the CodeStory source artifact or managed
-embedding assets; the indexed project data stays in the user cache and commands
-stay explicit about which workspace they read.
+CodeStory is that map. It indexes your repository locally — symbols, calls,
+relationships, snippets — so you or your coding agent can orient before guessing.
+Good answers name the files they used. Thin evidence gets called out instead of
+papered over.
 
-## Public Promise
+Your code stays on your machine. The index lives in a local cache you control.
 
-CodeStory is a local evidence layer for repositories, not an automatic
-correctness guarantee. It gives operators and coding agents explicit commands
-for cache health, indexing, search, trails, snippets, and source-backed answers
-that name the files they used. The per-project SQLite cache is separate from
-the optional local retrieval sidecars used by packet/search workflows; a healthy
-local navigation readiness report does not by itself prove agent packet/search
-readiness and does not by itself prove sidecar readiness. Benchmark notes are
-environment- and repository-specific evidence, so public claims should cite the
-checked setup instead of promising universal speedups or savings.
+## How it fits together
+
+```mermaid
+flowchart TB
+    repo[Target repository] --> index[index]
+    index --> sqlite[(SQLite cache per project)]
+    index --> rindex[retrieval index]
+    rindex --> sidecars["Sidecars: Zoekt, Qdrant, SCIP, llama.cpp"]
+    sqlite --> localCmds["Browse the repo: ground, symbol, trail, snippet, explore, context, report"]
+    sidecars --> agentCmds["Broad agent tasks: packet and search when retrieval_mode=full"]
+    sqlite --> runtime[codestory-runtime]
+    sidecars --> runtime
+    runtime --> cli[CLI and serve stdio]
+    cli --> agent[Coding agent]
+    sqlite -.->|"cache alone is not enough for packet/search"| agentCmds
+```
+
+Most people start with the left path — index once, then explore. The right path
+adds sidecars when you want agent-grade `packet` and `search`; see
+[docs/usage.md](docs/usage.md) and [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
 
 ## Try It On A Repo
 
@@ -58,20 +66,10 @@ On Windows PowerShell, use `.\target\release\codestory-cli.exe`, environment
 assignments such as `$env:NAME = "value"`, and normal Windows paths such as
 `C:\path\to\repo`.
 
-That basic path establishes local navigation readiness: the local cache, graph,
-lexical index, and DB-backed navigation commands are usable for health, file,
-symbol, trail, snippet, context, orientation checks, and derived report/export
-artifacts.
-`report` reads the current SQLite store and writes generated artifacts; the
-Markdown report and full JSON graph export are not source-of-truth state. The managed
-embedding dry-run is a local semantic setup check; it does not prove agent
-packet/search readiness.
-
-Agent packet/search readiness requires `retrieval_mode=full` from local Zoekt,
-Qdrant, SCIP, and llama.cpp sidecars. See [docs/usage.md](docs/usage.md) for the
-full local-navigation versus sidecar-readiness split and
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for sidecar
-setup.
+That basic path gets you browsing: health checks, orientation, symbol trails,
+snippets, and a generated repo report. For full agent `packet`/`search`, you
+also need sidecars at `retrieval_mode=full` — covered in the usage and sidecar
+docs linked above.
 
 After that first index, use narrower commands instead of asking the agent to
 start over:
@@ -146,29 +144,7 @@ sidecar retrieval. For local cache-only inspection, start with `ground`,
 you have a concrete target. Use `doctor` when output looks stale, incomplete, or
 inconsistent.
 
-## What It Builds
-
-```mermaid
-flowchart TB
-    repo[Target repository] --> index[index]
-    index --> sqlite[(SQLite cache per project)]
-    index --> rindex[retrieval index]
-    rindex --> sidecars["Sidecars: Zoekt, Qdrant, SCIP, llama.cpp"]
-    sqlite --> localCmds["Local navigation: ground, symbol, trail, snippet, explore, context, files, affected, report"]
-    sidecars --> agentCmds["Agent packet/search when retrieval_mode=full"]
-    sqlite --> runtime[codestory-runtime]
-    sidecars --> runtime
-    runtime --> cli[CLI and serve stdio]
-    cli --> agent[Coding agent]
-    sqlite -.->|"cache alone does not prove sidecar readiness"| agentCmds
-```
-
-Crate and layer detail: [docs/architecture/overview.md](docs/architecture/overview.md).
-
-CodeStory builds a local evidence layer so agents can request grounded context
-instead of relying on ad hoc file reads.
-
-## Language Support Claims
+## Language Support
 
 CodeStory separates parser-backed graph indexing, regression-tested accuracy,
 structural extraction, framework route coverage, and agent packet/search
@@ -192,11 +168,11 @@ For the system model, start with
 [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md),
 then [docs/architecture/overview.md](docs/architecture/overview.md).
 
-## Evidence
+## Evidence and claims
 
-The benchmark docs are deliberately cautious. They separate current checked-in
-benchmark history from the state of your local cache, which can drift and should
-be checked with `doctor`.
+Benchmark rows are environment-specific — see the ledger before repeating any
+number. CodeStory helps agents find evidence; it does not guarantee correct
+answers on its own.
 
 - Public evidence summary and caveats:
   [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
