@@ -149,14 +149,21 @@ inconsistent.
 ## What It Builds
 
 ```mermaid
-flowchart LR
-    Repo["repository"] --> Workspace["workspace discovery"]
-    Workspace --> Indexer["symbol and edge extraction"]
-    Indexer --> Store["SQLite store"]
-    Store --> Runtime["retrieval and context assembly"]
-    Runtime --> CLI["CLI and stdio reads"]
-    CLI --> Agent["coding agent"]
+flowchart TB
+    repo[Target repository] --> index[index]
+    index --> sqlite[(SQLite cache per project)]
+    index --> rindex[retrieval index]
+    rindex --> sidecars["Sidecars: Zoekt, Qdrant, SCIP, llama.cpp"]
+    sqlite --> localCmds["Local navigation: ground, symbol, trail, snippet, explore, context, files, affected, report"]
+    sidecars --> agentCmds["Agent packet/search when retrieval_mode=full"]
+    sqlite --> runtime[codestory-runtime]
+    sidecars --> runtime
+    runtime --> cli[CLI and serve stdio]
+    cli --> agent[Coding agent]
+    sqlite -.->|"cache alone does not prove sidecar readiness"| agentCmds
 ```
+
+Crate and layer detail: [docs/architecture/overview.md](docs/architecture/overview.md).
 
 CodeStory builds a local evidence layer so agents can request grounded context
 instead of relying on ad hoc file reads.

@@ -45,6 +45,16 @@ TARGET_WORKSPACE="/path/to/repo"
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
 
+| | Local navigation | Agent packet/search |
+| --- | --- | --- |
+| Lane id | `local_navigation` | `agent_packet_search` |
+| Built by | `index` | `index` then `retrieval index` |
+| Requires | Healthy SQLite cache and graph | Sidecars healthy and `retrieval_mode=full` |
+| Commands | `ground`, `symbol`, `trail`, `snippet`, `explore`, `context`, `files`, `affected`, `report` | `packet`, `search` |
+| Does not prove | Sidecar or agent packet/search readiness | That local cache-only navigation is enough |
+
+System map: [README — What It Builds](../README.md#what-it-builds).
+
 ### Local navigation/cache readiness
 
 This lane is for local browsing and source navigation. It uses the project

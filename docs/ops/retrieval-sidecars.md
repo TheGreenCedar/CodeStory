@@ -17,6 +17,14 @@ does not prove packet/search sidecar readiness.
 vars, troubleshooting, and CI smoke sequences. Proof tiers and promotion
 checklists live in [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
 
+```mermaid
+flowchart LR
+    cli[codestory-cli] --> zoekt["Zoekt localhost:6070"]
+    cli --> qdrant["Qdrant localhost:6333"]
+    cli --> scip[SCIP artifacts in user cache]
+    cli --> embed[llama.cpp embedding endpoint]
+```
+
 ---
 
 ## Prerequisites
