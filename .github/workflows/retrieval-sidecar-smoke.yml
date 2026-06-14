@@ -42,13 +42,10 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: "true"
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
