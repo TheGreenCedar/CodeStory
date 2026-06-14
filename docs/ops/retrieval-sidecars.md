@@ -1,19 +1,14 @@
 # Retrieval sidecars — Operations runbook
 
-**Situation.** `packet` or `search` fail closed; `doctor` shows sidecars down or
-`retrieval_mode` not `full`. Local browse commands still work from SQLite alone.
+Local Zoekt, Qdrant, SCIP, and llama.cpp processes for agent `packet` and
+`search`. Data dirs live under the user cache; default ports are 6070 (Zoekt)
+and 6333 (Qdrant).
 
-**Task.** Run Zoekt, Qdrant, SCIP, and the llama.cpp embed endpoint locally; build
-a current retrieval manifest for the target workspace.
-
-**Action.** Bootstrap services, `retrieval index`, verify with `retrieval status`
-and `doctor`. Commands and pins live in this runbook.
-
-**Result.** Agent-facing retrieval serves from sidecars with `retrieval_mode=full`.
-Cache-only navigation never implied sidecar readiness.
+Required for `agent_packet_search` readiness (`retrieval_mode=full`). A healthy
+SQLite cache alone does not satisfy that lane.
 
 Design: [`retrieval-design.md`](../architecture/retrieval-design.md).
-Proof tiers: [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
+Promotion checks: [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
 
 ```mermaid
 flowchart LR

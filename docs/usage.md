@@ -1,10 +1,7 @@
 # CodeStory Usage
 
-Operator guide: setup, workflows, sidecars, recovery. Start with the
-[README STAR intro](../README.md) if you are new.
-
-Examples use POSIX shell unless labeled PowerShell. Windows:
-`.\target\release\codestory-cli.exe`, `$env:NAME = "value"`.
+Setup, workflows, sidecars, recovery. Shell examples are POSIX unless noted.
+Windows: `.\target\release\codestory-cli.exe`, `$env:NAME = "value"`.
 
 ## Install The Skill
 
@@ -56,15 +53,7 @@ Two lanes — do not mix them when judging `packet` or `search` output.
 
 ## Common Workflows
 
-Each block is STAR-shaped: situation → commands → what you should have after.
-
 ### I need a repo overview
-
-**Situation.** New workspace for you or the agent.
-
-**Task.** Confirm cache health and get a map before deep reads.
-
-**Action.**
 
 ```sh
 codestory-cli doctor --project <target-workspace>
@@ -73,32 +62,19 @@ codestory-cli ground --project <target-workspace> --why
 codestory-cli report --project <target-workspace> --output-file out/codestory-report.md
 ```
 
-**Result.** Orientation plus optional Markdown report (hotspots, entry points).
-Report files are generated output — regenerate after index changes.
+Health check, orientation, optional report (hotspots, entry points). Regenerate
+the report after index changes — it is not source-of-truth state.
 
 ### I need evidence for a broad question
-
-**Situation.** Task spans modules ("how does routing work?", "what owns index state?").
-
-**Task.** Collect citations without opening the tree file by file.
-
-**Action.**
 
 ```sh
 codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 ```
 
-**Result.** `sufficient`, `partial`, or `blocked` with citations and follow-up
-commands. Requires `retrieval_mode=full`. `sufficient` means evidence coverage,
-not answer-quality proof.
+Returns `sufficient`, `partial`, or `blocked` with citations and follow-ups.
+Requires `retrieval_mode=full`.
 
 ### I need to understand one symbol or file
-
-**Situation.** You have a name or error pointing at one area of the code.
-
-**Task.** Confirm the symbol, its callers, and the source lines.
-
-**Action.**
 
 ```sh
 codestory-cli search --project <target-workspace> --query "<symbol/file/literal>" --why
@@ -106,16 +82,10 @@ codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-s
 codestory-cli snippet --project <target-workspace> --id <node-id> --context 40
 ```
 
-**Result.** A concrete node id, call paths, and source. Use `context` when you
-need a handoff bundle for one target.
+Pick a node id from `search`, then inspect call paths and source. `context`
+bundles one target for handoff.
 
 ### I changed files and need likely impact
-
-**Situation.** Local edits landed; you need test or symbol blast radius.
-
-**Task.** Map changed paths to indexed symbols and likely tests.
-
-**Action.**
 
 ```sh
 codestory-cli index --project <target-workspace> --refresh incremental
@@ -123,15 +93,9 @@ codestory-cli affected --project <target-workspace> --format markdown
 git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
 ```
 
-**Result.** Impacted symbols and test hints — input for selection, not a substitute for running tests.
+Impacted symbols and test hints — not a substitute for running tests.
 
 ### The cache or local navigation looks stale
-
-**Situation.** Missing symbols, old paths, or `doctor` warnings.
-
-**Task.** Refresh truth before trusting search or trails.
-
-**Action.**
 
 ```sh
 codestory-cli doctor --project <target-workspace>
@@ -139,15 +103,9 @@ codestory-cli index --project <target-workspace> --refresh full
 codestory-cli doctor --project <target-workspace>
 ```
 
-**Result.** Fresh inventory or explicit errors to fix before continuing.
+Fix inventory or indexing errors before trusting search output.
 
 ### For agent-facing packet/search recovery
-
-**Situation.** `packet` or `search` blocked; sidecars or manifest unhealthy.
-
-**Task.** Restore `retrieval_mode=full` without guessing which layer failed.
-
-**Action.**
 
 ```sh
 codestory-cli retrieval bootstrap --project <target-workspace> --format json
@@ -156,8 +114,8 @@ codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace> --format markdown
 ```
 
-**Result.** Status JSON shows mode and degraded reason. If core index is broken,
-`ready` may require `index` before sidecar repair.
+Target `retrieval_mode=full`. Core index problems may require `index` first —
+see `ready --goal agent`.
 
 ## Core Commands
 

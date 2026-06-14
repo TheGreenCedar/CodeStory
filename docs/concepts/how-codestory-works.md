@@ -1,24 +1,11 @@
 # How CodeStory Works
 
-Product framing lives in the [README](../../README.md). This page is the concept
-layer: what gets stored, what the commands mean, and what a good run looks like.
+CodeStory indexes a workspace into a local graph, then serves read commands
+against that graph. It does not replace tests or judgment; it structures the
+first pass.
 
-## STAR for one change
-
-**Situation.** You need to edit behavior that lives somewhere in the graph, not in
-the file you already have open.
-
-**Task.** Land on the owning symbol, see call paths, read the running code, ship
-the change without a blind file walk.
-
-**Action.** `index` builds the graph; `search` or `ground` picks a node;
-`trail` / `snippet` / `symbol` inspect it; `context` or `packet` bundles an
-answer. See [README — How it works](../../README.md#how-it-works).
-
-**Result.** Citations point at paths in the repo. Partial or stale index state
-is reported instead of implied.
-
-Readiness lanes (cache-only vs sidecars): [usage.md](../usage.md#readiness-tracks).
+Command loop: [README — How it works](../../README.md#how-it-works).
+Readiness lanes: [usage.md](../usage.md#readiness-tracks).
 
 ## What gets stored
 
@@ -47,10 +34,10 @@ does not leave the cache unless you copy it.
 | Trail | Graph walk from one symbol: callers, callees, neighbors |
 | Packet | Bounded task evidence with citations, gaps, next commands |
 
-Full list: [glossary.md](../glossary.md).
+More: [glossary.md](../glossary.md).
 
-## Where to go next
+## Related
 
-- Operator flows: [usage.md](../usage.md)
-- Crates and boundaries: [architecture/overview.md](../architecture/overview.md)
-- Wrong output: [contributors/debugging.md](../contributors/debugging.md)
+- [usage.md](../usage.md)
+- [architecture/overview.md](../architecture/overview.md)
+- [contributors/debugging.md](../contributors/debugging.md)

@@ -1,7 +1,5 @@
 # Glossary
 
-Short definitions for terms used across README, usage, and architecture docs.
-
 ## Readiness
 
 - **local navigation readiness** — SQLite cache, graph, and DB-backed browse commands (`ground`, `trail`, `snippet`, etc.) are usable

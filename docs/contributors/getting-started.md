@@ -1,13 +1,5 @@
 # Contributor Setup
 
-**Situation.** You are patching CodeStory itself — indexer, store, runtime, or CLI.
-
-**Task.** Build cleanly, run the CLI on this repo, and know which tests gate your change.
-
-**Action.** Commands below, then the reading order and subsystem page for the crate you touch.
-
-**Result.** A local cache of this workspace plus the test lane that matches your diff.
-
 ## First Commands
 
 Run these from the repo root:

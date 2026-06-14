@@ -1,15 +1,8 @@
 # CodeStory Benchmark Ledger
 
-**Situation.** Someone asks whether CodeStory saves tokens, time, or tool calls.
-
-**Task.** Answer from logged rows, not from README vibes or one good run.
-
-**Action.** Read the scorecard and linked stats logs; cite setup, date, and harness tier.
-
-**Result.** A claim no stronger than the row supports — or an explicit "not claimed yet."
-
-Treat every row as machine-, cache-, runner-, and date-specific. Promote only rows
-that pass the current harness gates documented below.
+Decision-grade scorecard and benchmark history — too dense for the README.
+Treat every row as machine-, cache-, runner-, and date-specific. Do not quote a
+row as a universal savings claim without checking harness tier and setup.
 
 Runs recorded before the 2026-05-24 harness tightening are historical unless
 they are reanalyzed or rerun with answer-level expected-file/symbol recall,
