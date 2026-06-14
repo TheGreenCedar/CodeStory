@@ -11,7 +11,7 @@ the workspace you are indexing.
 ## Install The Skill
 
 Install the grounding skill once, then point it at explicit target workspaces.
-See [README — Install As An Agent Skill](../README.md#install-as-an-agent-skill)
+See [README — Install as an agent skill](../README.md#install-as-an-agent-skill)
 for the full copy/setup commands and Windows PowerShell variant.
 
 The source skill package lives at
@@ -44,6 +44,17 @@ TARGET_WORKSPACE="/path/to/repo"
 
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
+
+| | Local navigation | Agent packet/search |
+| --- | --- | --- |
+| Lane id | `local_navigation` | `agent_packet_search` |
+| Built by | `index` | `index` then `retrieval index` |
+| Requires | Healthy SQLite cache and graph | Sidecars healthy and `retrieval_mode=full` |
+| Commands | `ground`, `symbol`, `trail`, `snippet`, `explore`, `context`, `files`, `affected`, `report` | `packet`, `search` |
+| Does not prove | Sidecar or agent packet/search readiness | That local cache-only navigation is enough |
+
+Architecture and sidecar topology: [architecture/overview.md](../architecture/overview.md),
+[ops/retrieval-sidecars.md](../ops/retrieval-sidecars.md).
 
 ### Local navigation/cache readiness
 

@@ -9,9 +9,9 @@ plans a change.
 
 ## The Loop
 
-```text
-doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
-```
+See [README — How it works](../README.md#how-it-works) for the indexing → search → trail → answer flow.
+
+Readiness lanes (local cache vs sidecars): [usage.md](../usage.md#readiness-tracks).
 
 - `doctor` checks whether the cache, index, retrieval mode, and local embedding
   setup are usable.

@@ -165,39 +165,28 @@ fn cli_package_metadata_is_adoption_ready() {
 fn readme_keeps_customer_first_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
-    assert!(readme.contains("Public Promise"));
-    assert!(readme.contains("Try It On A Repo"));
-    assert!(readme.contains("What It Builds"));
+    assert!(readme.contains("Why CodeStory"));
+    assert!(readme.contains("How it works"));
+    assert!(readme.contains("Try it"));
     assert!(readme.contains("Local codebase grounding for coding agents"));
-    assert!(readme.contains("Install As An Agent Skill"));
-    assert!(readme.contains("Core Flow"));
-    assert!(readme.contains("Hack On CodeStory"));
-    assert!(readme.contains("A good CodeStory-backed answer should name"));
-    assert!(readme.contains("local evidence layer for repositories"));
-    assert!(readme.contains("explicit commands"));
-    assert!(readme.contains("source-backed answers"));
-    assert!(readme.contains("per-project SQLite cache is separate"));
-    assert!(readme.contains("local retrieval sidecars"));
-    assert!(readme.contains("does not by itself prove sidecar readiness"));
-    assert!(readme.contains("environment- and repository-specific evidence"));
-    assert!(readme.contains("instead of promising universal speedups or savings"));
-    assert!(readme.contains("benchmark history"));
-    assert!(readme.contains("checked with `doctor`"));
+    assert!(readme.contains("Install as an agent skill"));
+    assert!(readme.contains("Command cheat sheet"));
+    assert!(readme.contains("Your code stays on your machine"));
+    assert!(readme.contains("retrieval_mode=full"));
+    assert!(readme.contains("Optional sidecar indexes"));
     assert!(readme.contains(".agents/skills/codestory-grounding/SKILL.md"));
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
     assert!(readme.contains("docs/architecture/language-support.md"));
     assert!(readme.contains("docs/testing/benchmark-ledger.md"));
-    assert!(readme.contains(
-        r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
-    ));
-    assert!(readme.contains("serve --stdio"));
+    assert!(readme.contains("serve --project"));
     assert!(readme.contains("docs/architecture/overview.md"));
-    assert!(readme.contains("docs/contributors/debugging.md"));
-    assert!(readme.contains("docs/contributors/testing-matrix.md"));
+    assert!(readme.contains("docs/contributors/getting-started.md"));
     assert!(
-        readme.find("Try It On A Repo").expect("quickstart section")
-            < readme.find("Evidence").expect("evidence section"),
+        readme.find("Try it").expect("quickstart section")
+            < readme
+                .find("Languages, evidence, contributing")
+                .expect("reference section"),
         "README should show the usable path before benchmark evidence"
     );
 
