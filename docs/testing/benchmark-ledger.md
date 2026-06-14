@@ -11,6 +11,20 @@ immutable manifest refs, and CodeStory cache provenance. The harness now keeps
 transcript-observed anchors separate from anchors actually present in the final
 answer, so tool output alone cannot make a row quality-pass.
 
+## Evidence taxonomy
+
+```mermaid
+flowchart TB
+    solid[What is solid — repeatable behavior evidence]
+    exploratory[Exploratory local-real rows — no promotion claim]
+    notClaimed[What is not claimed — no universal savings]
+    solid --> exploratory
+    exploratory -.->|"needs Tier 4"| notClaimed
+```
+
+Do not copy token counts or timings from the scorecard into diagrams. Use the
+table below for numeric detail.
+
 ## Current Scorecard
 
 | Lane | Current status | Public claim status |

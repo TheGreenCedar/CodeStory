@@ -2,6 +2,16 @@
 
 `codestory-contracts` owns the shared model used by the final V2 crates.
 
+```mermaid
+flowchart LR
+    contracts[codestory-contracts] --> workspace[codestory-workspace]
+    contracts --> store[codestory-store]
+    contracts --> indexer[codestory-indexer]
+    contracts --> runtime[codestory-runtime]
+```
+
+Full layer model: [../overview.md](../overview.md).
+
 ## Ownership
 
 - graph/domain primitives such as nodes, edges, occurrences, trail config, and bookmarks

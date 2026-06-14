@@ -25,6 +25,21 @@ Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 ONNX-only paths, old env aliases, and `CODESTORY_RETRIEVAL=0` fail closed for
 agent-facing packet/search.
 
+## Mode Decision
+
+```mermaid
+flowchart TD
+    zoektUp{Zoekt up?}
+    zoektUp -->|no| unavailable["unavailable — fail closed"]
+    zoektUp -->|yes| scipUp{SCIP up?}
+    scipUp -->|no| noScip["no_scip — fail closed"]
+    scipUp -->|yes| densePolicy{Dense anchors required?}
+    densePolicy -->|no| fullZero["full — dense skipped by policy"]
+    densePolicy -->|yes| qdrantUp{Qdrant up?}
+    qdrantUp -->|yes| full["full — serve packet/search"]
+    qdrantUp -->|no| noSemantic["no_semantic or lexical_only — fail closed"]
+```
+
 ## Ownership
 
 | Area | Owner | Supporting areas |
@@ -68,6 +83,13 @@ If inputs match but health is not `full`, CodeStory rebuilds the unhealthy
 component and persists the manifest only after the full stack is healthy.
 
 ## AST-First Semantic Contract
+
+```mermaid
+flowchart LR
+    exact[Exact symbol lookup] --> lexical[Lexical source and symbol docs]
+    lexical --> graph[Graph expansion]
+    graph --> dense[Dense-anchor augmentation optional]
+```
 
 Code structure is graph-native first. Runtime writes a deterministic
 `symbol_search_doc` for every durable AST symbol. These docs contain symbol name,

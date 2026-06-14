@@ -7,21 +7,22 @@ assignments such as `$env:NAME = "value"`.
 ```mermaid
 flowchart TD
     change["What changed?"] --> docs["Docs or README only"]
-    change["What changed?"] --> always["Always consider the fast lane first"]
+    change --> always["Always consider the fast lane first"]
     change --> indexer["Indexer, graph, or language work"]
     change --> store["Store, snapshot, trail, or search-doc work"]
     change --> runtime["Runtime, search, grounding, or orchestration work"]
     change --> cli["CLI args or output boundary work"]
     change --> bench["Bench or perf-surface work"]
     change --> e2e["Repo-scale semantic or cold-start behavior"]
-    docs --> docs_checks["markdown/link checks + any touched doc contracts"]
+    docs --> docs_checks["markdown/link checks + onboarding_contracts"]
     always --> workspace["fmt, check, targeted tests, clippy"]
-    indexer --> fidelity["fidelity_regression, tictactoe_language_coverage, integration"]
+    indexer --> fidelity["fidelity_regression, tictactoe_language_coverage"]
     store --> store_tests["cargo test -p codestory-store"]
     runtime --> runtime_tests["cargo test -p codestory-runtime and retrieval_eval"]
     cli --> cli_tests["cargo test -p codestory-cli"]
     bench --> bench_checks["cargo check -p codestory-bench --benches"]
     e2e --> e2e_stats["release build + codestory_repo_e2e_stats"]
+    e2e_stats --> statsLog["Append row to codestory-e2e-stats-log.md"]
 ```
 
 ## Whole Workspace

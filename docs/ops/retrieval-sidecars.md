@@ -19,6 +19,19 @@ checklists live in [`retrieval-architecture.md`](../testing/retrieval-architectu
 
 ---
 
+## Sidecar topology
+
+```mermaid
+flowchart LR
+    cli[codestory-cli / runtime] --> zoekt["Zoekt localhost:6070"]
+    cli --> qdrant["Qdrant localhost:6333"]
+    cli --> scip[SCIP graph artifacts]
+    cli --> embed["llama.cpp embed endpoint"]
+    cli --> cache[User cache data dirs]
+```
+
+---
+
 ## Prerequisites
 
 - Rust toolchain with `cargo` (primary path)
@@ -49,6 +62,15 @@ SCIP sidecar artifacts, then use `codestory-cli retrieval status --project
 agent-facing packet/search evidence.
 
 First-run evidence path:
+
+```mermaid
+flowchart LR
+    setupEnv[setup-retrieval-env] --> cargoSetup[cargo retrieval-setup]
+    cargoSetup --> index[index --refresh full]
+    index --> rindex["retrieval index --refresh full"]
+    rindex --> status[retrieval status]
+    status --> ready["ready --goal agent or doctor"]
+```
 
 ```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model

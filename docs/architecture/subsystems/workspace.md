@@ -2,6 +2,15 @@
 
 `codestory-workspace` owns repo discovery and refresh planning.
 
+```mermaid
+flowchart LR
+    repo[Repository root] --> manifest[Manifest and discovery]
+    manifest --> plan[Refresh execution plan]
+    plan --> runtime[codestory-runtime / indexer]
+```
+
+Full layer model: [../overview.md](../overview.md).
+
 ## Ownership
 
 - manifest loading and default manifest creation

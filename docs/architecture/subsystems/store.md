@@ -2,6 +2,15 @@
 
 `codestory-store` is the only persistence crate.
 
+```mermaid
+flowchart LR
+    indexer[codestory-indexer] --> store[codestory-store SQLite]
+    runtime[codestory-runtime] --> store
+    retrieval[codestory-retrieval] --> store
+```
+
+Full layer model: [../overview.md](../overview.md).
+
 ## Ownership
 
 - SQLite open/build lifecycle

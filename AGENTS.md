@@ -42,6 +42,9 @@
 ## Retrieval documentation
 - Canonical sidecar retrieval docs are `docs/architecture/retrieval-design.md`, `docs/testing/retrieval-architecture.md`, and `docs/ops/retrieval-sidecars.md`. Parser compatibility records live in `docs/architecture/language-support.md`.
 
+## Documentation
+- Mermaid diagram conventions and canonical diagram index: `docs/contributors/documentation-visuals.md`.
+
 ## Coding & Design Constraints
 
 Current merge bar for production changes:
