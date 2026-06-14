@@ -9,6 +9,7 @@
  * SCIP language indexers are documented only — not installed by this script.
  */
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -205,6 +206,8 @@ function printPrereqReport(opts) {
 }
 
 const BGE_GGUF = "bge-base-en-v1.5.Q8_0.gguf";
+const BGE_GGUF_SHA256 = "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c";
+const BGE_GGUF_BYTES = 117_974_304;
 const BGE_URLS = [
   "https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf",
   "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf",
@@ -217,12 +220,49 @@ function embedModelDir() {
   return path.join(repoRoot, "target", "retrieval-models");
 }
 
+function sha256File(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = fs.createReadStream(file);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+async function verifyEmbedModel(file) {
+  const stat = fs.statSync(file);
+  if (!stat.isFile()) {
+    throw new Error(`Embed model path is not a file: ${file}`);
+  }
+  if (stat.size !== BGE_GGUF_BYTES) {
+    throw new Error(
+      `Embed model size mismatch for ${file}: got ${stat.size} bytes, expected ${BGE_GGUF_BYTES}`,
+    );
+  }
+  const actual = await sha256File(file);
+  if (actual !== BGE_GGUF_SHA256) {
+    throw new Error(
+      `Embed model SHA-256 mismatch for ${file}: got ${actual}, expected ${BGE_GGUF_SHA256}`,
+    );
+  }
+  return actual;
+}
+
 async function fetchEmbedModel() {
   const dir = embedModelDir();
   fs.mkdirSync(dir, { recursive: true });
   const dest = path.join(dir, BGE_GGUF);
   if (fs.existsSync(dest) && fs.statSync(dest).size > 1_000_000) {
-    console.log(`Embed model already present: ${dest}`);
+    let checksum;
+    try {
+      checksum = await verifyEmbedModel(dest);
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : error}. Remove ${dest} and rerun --fetch-embed-model.`,
+      );
+    }
+    console.log(`Embed model already present and verified: ${dest} sha256=${checksum}`);
     return dest;
   }
   let lastError = null;
@@ -234,9 +274,17 @@ async function fetchEmbedModel() {
       continue;
     }
     const buffer = Buffer.from(await response.arrayBuffer());
-    fs.writeFileSync(dest, buffer);
-    console.log(`Wrote ${dest} (${buffer.length} bytes)`);
-    return dest;
+    const tempDest = `${dest}.tmp-${process.pid}`;
+    try {
+      fs.writeFileSync(tempDest, buffer);
+      const checksum = await verifyEmbedModel(tempDest);
+      fs.renameSync(tempDest, dest);
+      console.log(`Wrote ${dest} (${buffer.length} bytes, sha256=${checksum})`);
+      return dest;
+    } catch (error) {
+      fs.rmSync(tempDest, { force: true });
+      lastError = `${error instanceof Error ? error.message : error} from ${url}`;
+    }
   }
   throw new Error(`Failed to download embed model: ${lastError ?? "no URLs configured"}`);
 }

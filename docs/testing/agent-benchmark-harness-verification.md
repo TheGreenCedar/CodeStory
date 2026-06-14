@@ -131,7 +131,9 @@ node scripts\codestory-agent-ab-score.mjs `
 The packet gate runs cold `codestory-cli packet` probes first, with independent
 rows parallelized by `--packet-probe-jobs`. Only tasks whose packet manifest
 quality passes are sent to the nested A/B harness. If no task passes the packet
-gate, the wrapper emits `packet_gate_*` metrics and skips nested agents.
+gate, the wrapper emits `packet_gate_*` metrics and exits non-zero before
+nested agents run. Pass `--allow-empty-packet-gate` only for exploratory
+diagnostics where an empty nested A/B run is intentional.
 Rows that fail because the packet process temporarily cannot reach mandatory
 sidecars are retried once, serially, in `packet-probes-retry`; the wrapper
 emits `packet_gate_retry_tasks` plus retry artifact paths and uses the merged

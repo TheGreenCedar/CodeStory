@@ -83,7 +83,6 @@ pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
         ReadinessStatusDto::RepairIndex => "repair_index",
         ReadinessStatusDto::CheckIndex => "check_index",
         ReadinessStatusDto::RepairRetrieval => "repair_retrieval",
-        ReadinessStatusDto::CacheBusy => "cache_busy",
     }
 }
 
@@ -258,4 +257,152 @@ fn dedupe_commands(commands: impl IntoIterator<Item = String>) -> Vec<String> {
 
 fn project_arg(project: &str) -> String {
     quote_command_argument_value(&clean_path_string(project))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(node_count: u32) -> StorageStatsDto {
+        StorageStatsDto {
+            node_count,
+            edge_count: node_count.saturating_sub(1),
+            file_count: u32::from(node_count > 0),
+            error_count: 0,
+        }
+    }
+
+    fn freshness(status: IndexFreshnessStatusDto) -> IndexFreshnessDto {
+        IndexFreshnessDto {
+            status,
+            changed_file_count: u32::from(status == IndexFreshnessStatusDto::Stale),
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 1,
+            indexed_file_count: 1,
+            duration_ms: 1,
+            reason: None,
+            samples: Vec::new(),
+        }
+    }
+
+    fn inputs<'a>(
+        stats: &'a StorageStatsDto,
+        freshness: Option<&'a IndexFreshnessDto>,
+        sidecar: Option<ReadinessSidecarInput<'a>>,
+    ) -> ReadinessInputs<'a> {
+        ReadinessInputs {
+            project: "C:/workspace/project",
+            stats,
+            freshness,
+            sidecar,
+        }
+    }
+
+    #[test]
+    fn missing_index_requires_index_repair_for_all_goals() {
+        let stats = stats(0);
+        let verdicts = build_readiness_verdicts(inputs(&stats, None, None));
+
+        assert_eq!(verdicts.len(), 2);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| verdict.status == ReadinessStatusDto::RepairIndex),
+            "missing index should block all readiness goals: {verdicts:?}"
+        );
+        assert!(
+            verdicts[0].minimum_next[0].contains("--refresh full"),
+            "missing index repair should request full refresh: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn unchecked_index_requires_drift_check_before_ready() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::NotChecked);
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::LocalNavigation,
+            inputs(&stats, Some(&freshness), None),
+        );
+
+        assert_eq!(verdict.status, ReadinessStatusDto::CheckIndex);
+        assert_eq!(
+            verdict.index.as_ref().and_then(|index| index.status),
+            Some(IndexFreshnessStatusDto::NotChecked)
+        );
+        assert!(verdict.minimum_next[0].contains("--refresh incremental"));
+    }
+
+    #[test]
+    fn stale_index_requires_incremental_repair() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Stale);
+        let verdict = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(
+                &stats,
+                Some(&freshness),
+                Some(ReadinessSidecarInput {
+                    retrieval_mode: "full",
+                    degraded_reason: None,
+                    manifest_generation: Some("generation"),
+                    manifest_input_hash: Some("hash"),
+                }),
+            ),
+        );
+
+        assert_eq!(verdict.status, ReadinessStatusDto::RepairIndex);
+        assert!(verdict.minimum_next[0].contains("--refresh incremental"));
+        assert!(verdict.summary.contains("changed, new, or removed files"));
+    }
+
+    #[test]
+    fn agent_readiness_requires_full_sidecar_retrieval() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
+        let unavailable = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(&stats, Some(&freshness), None),
+        );
+
+        assert_eq!(unavailable.status, ReadinessStatusDto::RepairRetrieval);
+        assert!(
+            unavailable
+                .summary
+                .contains("current mode is `unavailable`")
+        );
+        assert!(unavailable.sidecar.is_none());
+
+        let degraded = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(
+                &stats,
+                Some(&freshness),
+                Some(ReadinessSidecarInput {
+                    retrieval_mode: "no_semantic",
+                    degraded_reason: Some("semantic store unavailable"),
+                    manifest_generation: Some("generation"),
+                    manifest_input_hash: Some("hash"),
+                }),
+            ),
+        );
+
+        assert_eq!(degraded.status, ReadinessStatusDto::RepairRetrieval);
+        assert_eq!(
+            degraded
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.degraded_reason.as_deref()),
+            Some("semantic store unavailable")
+        );
+        assert!(
+            degraded
+                .full_repair
+                .iter()
+                .any(|command| command.contains("retrieval index")
+                    && command.contains("--refresh full")),
+            "non-full sidecar repair should include full retrieval index: {degraded:?}"
+        );
+    }
 }

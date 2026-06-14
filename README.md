@@ -85,6 +85,13 @@ cargo retrieval-setup
 "$CODESTORY_CLI" doctor --project "$TARGET_WORKSPACE"
 ```
 
+The setup wrapper accepts either configured GGUF mirror, but every download is
+written to a temporary file and accepted only when the size is `117974304` bytes
+and the SHA-256 is
+`ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`.
+If an existing model fails that check, remove it and rerun
+`--fetch-embed-model`.
+
 Missing sidecars, stale manifests, disabled sidecars, mixed stored-doc vector
 contracts, or diagnostic embedding modes are setup failures to fix before
 trusting agent-facing packet/search evidence.

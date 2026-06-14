@@ -98,6 +98,14 @@ node scripts/setup-retrieval-env.mjs --with-holdout-clone
 | `--skip-build` | Skip `cargo build` (alias still builds on first `cargo retrieval-setup`) |
 | `--with-holdout-clone` | Also run `scripts/fetch-holdout-repos.mjs` (large git clones under `target/`) |
 
+When `--fetch-embed-model` is present, the wrapper downloads
+`bge-base-en-v1.5.Q8_0.gguf` to a process-scoped temporary file, verifies the
+exact size (`117974304` bytes) and SHA-256
+(`ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`), and only
+then renames it into `CODESTORY_EMBED_MODEL_DIR` or `target/retrieval-models`.
+Existing model files must pass the same verification. Configured fallback URLs
+are mirrors only because the same checksum gates every accepted artifact.
+
 **Direct CLI** (equivalent to alias):
 
 ```sh
@@ -260,6 +268,7 @@ backend means this product llama.cpp contract; explicit ONNX or hash modes are
 diagnostic only and never produce `retrieval_mode=full`.
 
 1. Download GGUF (once): `node scripts/setup-retrieval-env.mjs --fetch-embed-model`
+   verifies the pinned size/SHA-256 before the model is accepted.
 2. Export (see [`docker/retrieval.env.example`](../../docker/retrieval.env.example)):
    - `CODESTORY_EMBED_MODEL_DIR=<repo>/target/retrieval-models`
    - `CODESTORY_EMBED_BACKEND=llamacpp` (recommended explicit product mode; unset is also product mode for retrieval commands)
@@ -332,24 +341,26 @@ GGUF embedding model.
 **CI reduced sequence:**
 
 1. generalization lint - exit 0
-2. release `codestory-cli` build - exit 0
-3. `retrieval bootstrap --project . --skip-compose --wait-secs 0` - exit 0
-4. `retrieval status --project .` - JSON reports the clean pre-index
-   `degraded_reason == "retrieval_manifest_missing"` state and must not report `retrieval_mode=full`
-5. `cargo test -p codestory-runtime --lib` - exit 0
-6. `cargo test -p codestory-runtime --test retrieval_generalization_guard` - exit 0
-7. `cargo test -p codestory-cli --test stdio_protocol_contracts` - exit 0
-8. `cargo test -p codestory-cli --test search_json_output` - exit 0 for non-live fail-closed search contracts
-9. `cargo test -p codestory-retrieval` - exit 0
+2. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` - exit 0;
+   this integration suite runs the clean pre-index bootstrap/status shape and
+   asserts `degraded_reason == "retrieval_manifest_missing"` without reporting
+   `retrieval_mode=full`
+3. `cargo test -p codestory-runtime --lib` - exit 0
+4. `cargo test -p codestory-runtime --test retrieval_generalization_guard` - exit 0
+5. `cargo test -p codestory-cli --test stdio_protocol_contracts` - exit 0
+6. `cargo test -p codestory-cli --test search_json_output` - exit 0 for non-live fail-closed search contracts
+7. `cargo test -p codestory-retrieval` - exit 0
 
 The reduced CI sequence is a manifest-missing shape check only. It creates local cache/state
 directories and verifies status JSON plus runtime/stdio/search/retrieval contracts, but it does
 not start sidecars, fetch `bge-base-en-v1.5.Q8_0.gguf`, or build the project manifest required for
-`retrieval_mode=full`. The included `search_json_output` suite covers non-live fail-closed search
-behavior; it does not claim stdio, CLI, or runtime full-mode success. Full-mode gates must start
-real sidecars, provision the GGUF model, index a fixture or target workspace, and verify
-`retrieval_mode == "full"`. The live full-mode contracts are ignored or env-gated by default and
-should be run explicitly only after those dependencies are prepared: set
+`retrieval_mode=full`. The included `retrieval_bootstrap_contracts` suite builds the CLI through
+Cargo's integration-test path instead of a standalone release build step. The included
+`search_json_output` suite covers non-live fail-closed search behavior; it does not claim stdio,
+CLI, or runtime full-mode success. Full-mode gates must start real sidecars, provision the GGUF
+model, index a fixture or target workspace, and verify `retrieval_mode == "full"`. The live
+full-mode contracts are ignored or env-gated by default and should be run explicitly only after
+those dependencies are prepared: set
 `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before running stdio full-mode contracts
 with `-- --ignored --nocapture`,
 `cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_json_emits_sidecar_primary_results_without_repo_text_fallback`

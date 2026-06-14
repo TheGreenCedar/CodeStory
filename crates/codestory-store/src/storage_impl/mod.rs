@@ -370,13 +370,12 @@ impl FileRole {
         for marker in ["/source/repos/", "source/repos/", "/repos/", "repos/"] {
             if let Some(index) = normalized.rfind(marker) {
                 let remainder = &normalized[index + marker.len()..];
-                if let Some((_, repo_relative)) = remainder.split_once('/') {
-                    if best_repo_relative
+                if let Some((_, repo_relative)) = remainder.split_once('/')
+                    && best_repo_relative
                         .as_ref()
                         .is_none_or(|(best_index, _)| index > *best_index)
-                    {
-                        best_repo_relative = Some((index, repo_relative.to_string()));
-                    }
+                {
+                    best_repo_relative = Some((index, repo_relative.to_string()));
                 }
             }
         }

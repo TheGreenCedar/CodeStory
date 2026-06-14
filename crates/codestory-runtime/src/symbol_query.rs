@@ -367,13 +367,11 @@ fn strip_materialized_repo_cache_prefix(path: &str) -> &str {
         let after_marker = &path[index + marker.len()..];
         if let Some((_, repo_relative)) = after_marker.split_once('/')
             && !repo_relative.is_empty()
-        {
-            if best_match
+            && best_match
                 .as_ref()
                 .is_none_or(|(best_index, _)| index > *best_index)
-            {
-                best_match = Some((index, repo_relative));
-            }
+        {
+            best_match = Some((index, repo_relative));
         }
     }
     best_match

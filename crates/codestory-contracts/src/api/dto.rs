@@ -247,7 +247,6 @@ pub enum ReadinessStatusDto {
     RepairIndex,
     CheckIndex,
     RepairRetrieval,
-    CacheBusy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -1818,6 +1817,8 @@ pub struct PacketSufficiencyDto {
     #[serde(default)]
     pub avoid_opening: Vec<String>,
     #[serde(default)]
+    pub avoid_opening_paths: Vec<String>,
+    #[serde(default)]
     pub gaps: Vec<String>,
     #[serde(default)]
     pub follow_up_commands: Vec<String>,
@@ -2021,6 +2022,7 @@ mod packet_tests {
             covered_claims: Vec::new(),
             open_next: vec!["codestory-cli search --query runtime".to_string()],
             avoid_opening: Vec::new(),
+            avoid_opening_paths: Vec::new(),
             gaps: vec!["No focused symbol selected.".to_string()],
             follow_up_commands: Vec::new(),
         })
@@ -2033,12 +2035,29 @@ mod packet_tests {
             covered_claims: Vec::new(),
             open_next: Vec::new(),
             avoid_opening: Vec::new(),
+            avoid_opening_paths: vec!["crates/codestory-cli/src/main.rs".to_string()],
             gaps: vec!["Sidecar readiness is not full.".to_string()],
             follow_up_commands: Vec::new(),
         })
         .expect("serialize");
 
         assert_eq!(blocked["status"], "blocked");
+        assert_eq!(
+            blocked["avoid_opening_paths"],
+            serde_json::json!(["crates/codestory-cli/src/main.rs"])
+        );
+        let legacy: PacketSufficiencyDto = serde_json::from_str(
+            r#"{
+                "status": "partial",
+                "covered_claims": [],
+                "open_next": [],
+                "avoid_opening": ["crates/codestory-cli/src/main.rs because cited"],
+                "gaps": [],
+                "follow_up_commands": []
+            }"#,
+        )
+        .expect("deserialize legacy sufficiency without raw paths");
+        assert!(legacy.avoid_opening_paths.is_empty());
         let legacy: PacketSufficiencyStatusDto =
             serde_json::from_str("\"insufficient\"").expect("deserialize legacy status");
         assert_eq!(legacy, PacketSufficiencyStatusDto::Insufficient);

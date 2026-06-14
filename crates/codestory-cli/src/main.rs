@@ -4522,7 +4522,9 @@ fn drill_bridge_import_hub_candidates_from_endpoint(
         .into_iter()
         .take(32)
     {
-        let Some(candidate) = drill_resolve_relative_import(&endpoint_path, &specifier) else {
+        let Some(candidate) =
+            drill_resolve_relative_import(&runtime.project_root, &endpoint_path, &specifier)
+        else {
             continue;
         };
         let relative = display::relative_path(&runtime.project_root, &candidate.to_string_lossy());
@@ -4572,10 +4574,22 @@ fn drill_relative_source_path(
     path: &str,
 ) -> Option<std::path::PathBuf> {
     let path = std::path::Path::new(path);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
+    if path.is_absolute() || drill_path_has_escape_component(path) {
+        return None;
+    }
+    let root = fs::canonicalize(project_root).ok()?;
+    let candidate = fs::canonicalize(project_root.join(path)).ok()?;
+    candidate.starts_with(&root).then_some(candidate)
+}
+
+fn drill_path_has_escape_component(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
     })
 }
 
@@ -4626,10 +4640,20 @@ fn drill_quoted_js_specifier(line: &str) -> Option<&str> {
 }
 
 fn drill_resolve_relative_import(
+    project_root: &std::path::Path,
     endpoint_path: &std::path::Path,
     specifier: &str,
 ) -> Option<std::path::PathBuf> {
-    let base = endpoint_path.parent()?.join(specifier);
+    let specifier_path = std::path::Path::new(specifier);
+    if specifier_path.is_absolute() || !specifier.starts_with('.') {
+        return None;
+    }
+    let root = fs::canonicalize(project_root).ok()?;
+    let endpoint = fs::canonicalize(endpoint_path).ok()?;
+    if !endpoint.starts_with(&root) {
+        return None;
+    }
+    let base = endpoint.parent()?.join(specifier_path);
     let mut candidates = vec![base.clone()];
     if base.extension().is_none() {
         for extension in ["js", "jsx", "ts", "tsx", "mjs", "cjs"] {
@@ -4639,7 +4663,10 @@ fn drill_resolve_relative_import(
             candidates.push(base.join(format!("index.{extension}")));
         }
     }
-    candidates.into_iter().find(|candidate| candidate.is_file())
+    candidates.into_iter().find_map(|candidate| {
+        let candidate = fs::canonicalize(candidate).ok()?;
+        (candidate.is_file() && candidate.starts_with(&root)).then_some(candidate)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10348,6 +10375,11 @@ mod tests {
             "import dispatchRequest from './dispatchRequest.js';\nclass Axios {}\n",
         )
         .expect("write candidate");
+        let outside = temp.path().with_file_name(format!(
+            "{}-outside.js",
+            temp.path().file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&outside, "class Outside {}\n").expect("write outside file");
 
         let source = fs::read_to_string(&endpoint).expect("read endpoint");
         let specifiers = drill_js_relative_import_specifiers(&source);
@@ -10357,8 +10389,28 @@ mod tests {
             vec!["./core/Axios.js".to_string(), "./polyfill.js".to_string()]
         );
         assert_eq!(
-            drill_resolve_relative_import(&endpoint, "./core/Axios.js"),
-            Some(axios_core.clone())
+            drill_resolve_relative_import(temp.path(), &endpoint, "./core/Axios.js"),
+            Some(fs::canonicalize(&axios_core).expect("canonical axios core"))
+        );
+        assert_eq!(
+            drill_relative_source_path(temp.path(), &axios_core.to_string_lossy()),
+            None
+        );
+        assert_eq!(
+            drill_relative_source_path(temp.path(), "../outside.js"),
+            None
+        );
+        assert_eq!(
+            drill_resolve_relative_import(
+                temp.path(),
+                &endpoint,
+                &format!("../{}", outside.file_name().unwrap().to_string_lossy())
+            ),
+            None
+        );
+        assert_eq!(
+            drill_resolve_relative_import(temp.path(), &endpoint, &outside.to_string_lossy()),
+            None
         );
         assert!(drill_file_contains_terms(
             temp.path(),

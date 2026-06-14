@@ -24,6 +24,7 @@ function parseArgs(argv) {
     materializeRepos: true,
     jobs: 1,
     packetGate: false,
+    allowEmptyPacketGate: false,
     packetProbeJobs: 1,
     packetProbeRepeats: 1,
     packetGateImprovedFrom: null,
@@ -78,6 +79,10 @@ function parseArgs(argv) {
     }
     if (arg === "--packet-gate") {
       opts.packetGate = true;
+      continue;
+    }
+    if (arg === "--allow-empty-packet-gate") {
+      opts.allowEmptyPacketGate = true;
       continue;
     }
     if (arg === "--packet-probe-jobs") {
@@ -140,14 +145,16 @@ function parseArgs(argv) {
 function usage() {
   console.log(`Usage:
   node scripts/codestory-agent-ab-score.mjs [--task-ids ids] [--repeats n] [--out-dir dir] [--prepare-codestory-timeout-ms ms]
-      [--jobs n] [--prepare-codestory-jobs n] [--packet-gate] [--packet-probe-jobs n]
+      [--jobs n] [--prepare-codestory-jobs n] [--packet-gate] [--allow-empty-packet-gate] [--packet-probe-jobs n]
       [--packet-gate-improved-from dir] [--reuse-baseline-from dir]
   node scripts/codestory-agent-ab-score.mjs --reanalyze-dir target/agent-benchmark/<run>
 
 Runs the real CodeStory agent A/B harness, reanalyzes it with the current
 transcript analyzer, and emits METRIC lines for Codex Autoresearch.
 Packet-gate mode automatically retries transient sidecar-unavailable packet
-probe rows once, serially, before selecting nested A/B tasks.
+probe rows once, serially, before selecting nested A/B tasks. It exits non-zero
+when no tasks are selected unless --allow-empty-packet-gate is present for an
+exploratory diagnostic run.
 
 Default smoke task ids: ${defaultSmokeTaskIds}`);
 }
@@ -406,13 +413,28 @@ async function runPacketGate(opts, outDir) {
         `packet gate skipped unchanged tasks: ${unchangedOrMissing.map((row) => `${row.taskId}:${row.reason}`).join(",")}`,
       );
     }
-    return null;
+    return packetGateSelectionOrThrow(selected, unchangedOrMissing, opts);
   }
   if (improved.length) {
     console.log(`packet gate improved tasks: ${improved.map((row) => `${row.taskId}:${row.reason}`).join(",")}`);
   }
   console.log(`packet gate selected tasks: ${selected.join(",")}`);
   return selected;
+}
+
+function packetGateSelectionOrThrow(selected, unchangedOrMissing = [], opts = {}) {
+  if (selected.length) {
+    return selected;
+  }
+  if (opts.allowEmptyPacketGate) {
+    return null;
+  }
+  const skipped = unchangedOrMissing.length
+    ? ` Skipped tasks: ${unchangedOrMissing.map((row) => `${row.taskId}:${row.reason}`).join(",")}.`
+    : "";
+  throw new Error(
+    `packet gate selected no nested A/B tasks; pass --allow-empty-packet-gate only for exploratory diagnostics.${skipped}`,
+  );
 }
 
 function readJsonl(filePath) {
@@ -931,7 +953,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   mergePacketGateRows,
+  packetGateSelectionOrThrow,
   packetGateStderrPath,
   packetGateRowHasTransientSidecarFailure,
+  parseArgs,
   retryablePacketGateTaskIds,
 };

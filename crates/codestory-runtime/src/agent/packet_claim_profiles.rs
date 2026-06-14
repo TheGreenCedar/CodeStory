@@ -601,16 +601,15 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
-    if normalized_symbol == "session" || normalized_symbol.ends_with("sessionrequest") {
-        if source_lower.contains("open func request")
-            && source_lower.contains("let request =")
-            && source_lower.contains("performeagerlyifnecessary")
-        {
-            claims.push(
-                "Session request creation builds request objects and schedules eager execution."
-                    .to_string(),
-            );
-        }
+    if (normalized_symbol == "session" || normalized_symbol.ends_with("sessionrequest"))
+        && source_lower.contains("open func request")
+        && source_lower.contains("let request =")
+        && source_lower.contains("performeagerlyifnecessary")
+    {
+        claims.push(
+            "Session request creation builds request objects and schedules eager execution."
+                .to_string(),
+        );
     }
 
     if normalized_symbol.ends_with("requestresume")
@@ -960,8 +959,7 @@ fn packet_first_identifier(value: &str) -> Option<String> {
 fn packet_last_identifier(value: &str) -> Option<String> {
     value
         .split(|ch: char| !is_ident_continue(ch))
-        .filter(|part| part.chars().next().is_some_and(is_ident_start))
-        .last()
+        .rfind(|part| part.chars().next().is_some_and(is_ident_start))
         .map(str::to_string)
 }
 

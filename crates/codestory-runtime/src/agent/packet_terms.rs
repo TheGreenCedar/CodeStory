@@ -330,7 +330,7 @@ pub(crate) fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
     let hook_signal = packet_terms_have_any(terms, &["hook", "hooks"])
         || terms.iter().any(|term| {
             let normalized = normalize_identifier(term);
-            normalized.as_bytes() == &[115, 119, 114]
+            normalized.as_bytes() == [115, 119, 114]
                 || (normalized.len() > 3 && normalized.starts_with("use"))
         });
     let cache_or_public_api_intent = packet_terms_have_any(

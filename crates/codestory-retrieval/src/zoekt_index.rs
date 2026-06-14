@@ -140,38 +140,56 @@ pub fn lexical_input_fingerprint(
     project_root: &Path,
     storage_path: Option<&Path>,
 ) -> Result<LexicalInputFingerprint> {
-    let entries = collect_lexical_entries(project_root, storage_path)?;
+    let mut hasher = new_lexical_entries_hasher();
+    let mut file_count = 0_usize;
+    hash_lexical_entries_inner(project_root, project_root, &mut hasher, &mut file_count)?;
+    hash_symbol_doc_entries(project_root, storage_path, &mut hasher, &mut file_count)?;
     Ok(LexicalInputFingerprint {
-        file_count: entries.len().min(u32::MAX as usize) as u32,
-        hash: lexical_entries_hash(&entries),
+        file_count: file_count.min(u32::MAX as usize) as u32,
+        hash: finalize_lexical_entries_hash(hasher),
     })
 }
 
 fn lexical_entries_hash(entries: &[LexicalIndexEntry]) -> String {
-    let mut hasher = sha2::Sha256::new();
+    let mut hasher = new_lexical_entries_hasher();
+    for entry in entries {
+        update_lexical_entries_hash(&mut hasher, entry);
+    }
+    finalize_lexical_entries_hash(hasher)
+}
+
+fn new_lexical_entries_hasher() -> sha2::Sha256 {
     use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
     hasher.update(b"codestory-zoekt-lexical-v1");
     hasher.update(ZOEKT_REAL_VERSION_PIN.as_bytes());
-    for entry in entries {
-        hasher.update(entry.path.as_bytes());
-        hasher.update([0]);
-        hasher.update(entry.content.as_bytes());
-        hasher.update([0]);
-        hasher.update(entry.source.provenance_label().as_bytes());
-        hasher.update([0]);
-        if let Some(node_id) = entry.node_id.as_deref() {
-            hasher.update(node_id.as_bytes());
-        }
-        hasher.update([0]);
-        if let Some(symbol_name) = entry.symbol_name.as_deref() {
-            hasher.update(symbol_name.as_bytes());
-        }
-        hasher.update([0]);
-        if let Some(start_line) = entry.start_line {
-            hasher.update(start_line.to_le_bytes());
-        }
-        hasher.update([0]);
+    hasher
+}
+
+fn update_lexical_entries_hash(hasher: &mut sha2::Sha256, entry: &LexicalIndexEntry) {
+    use sha2::Digest;
+    hasher.update(entry.path.as_bytes());
+    hasher.update([0]);
+    hasher.update(entry.content.as_bytes());
+    hasher.update([0]);
+    hasher.update(entry.source.provenance_label().as_bytes());
+    hasher.update([0]);
+    if let Some(node_id) = entry.node_id.as_deref() {
+        hasher.update(node_id.as_bytes());
     }
+    hasher.update([0]);
+    if let Some(symbol_name) = entry.symbol_name.as_deref() {
+        hasher.update(symbol_name.as_bytes());
+    }
+    hasher.update([0]);
+    if let Some(start_line) = entry.start_line {
+        hasher.update(start_line.to_le_bytes());
+    }
+    hasher.update([0]);
+}
+
+fn finalize_lexical_entries_hash(hasher: sha2::Sha256) -> String {
+    use sha2::Digest;
     format!("{:x}", hasher.finalize())
 }
 
@@ -503,6 +521,65 @@ fn collect_lexical_entries_inner(
     Ok(())
 }
 
+fn hash_lexical_entries_inner(
+    project_root: &Path,
+    dir: &Path,
+    hasher: &mut sha2::Sha256,
+    file_count: &mut usize,
+) -> Result<()> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return Ok(()),
+    };
+    let mut dir_entries = read_dir.flatten().collect::<Vec<_>>();
+    dir_entries.sort_by_key(|entry| entry.path());
+
+    for entry in dir_entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if should_skip_dir(&name) {
+                continue;
+            }
+            hash_lexical_entries_inner(project_root, &path, hasher, file_count)?;
+            continue;
+        }
+        if !should_index_file(&name) {
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        if metadata
+            .as_ref()
+            .and_then(|meta| meta.len().try_into().ok())
+            .is_some_and(|len: usize| len > MAX_FILE_BYTES)
+        {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        update_lexical_entries_hash(
+            hasher,
+            &LexicalIndexEntry {
+                path: rel,
+                content,
+                source: LexicalDocumentSource::LexicalSource,
+                node_id: None,
+                symbol_name: None,
+                start_line: None,
+            },
+        );
+        *file_count = file_count.saturating_add(1);
+    }
+    Ok(())
+}
+
 fn collect_symbol_doc_entries(
     project_root: &Path,
     storage_path: Option<&Path>,
@@ -523,6 +600,33 @@ fn collect_symbol_doc_entries(
         after = batch.last().map(|doc| doc.node_id);
         for doc in batch {
             entries.push(symbol_doc_lexical_entry(project_root, &doc));
+        }
+    }
+    Ok(())
+}
+
+fn hash_symbol_doc_entries(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    hasher: &mut sha2::Sha256,
+    file_count: &mut usize,
+) -> Result<()> {
+    let Some(storage_path) = storage_path.filter(|path| path.is_file()) else {
+        return Ok(());
+    };
+    let storage = Store::open(storage_path).context("open storage for lexical symbol docs")?;
+    let mut after = None;
+    loop {
+        let batch = storage
+            .get_symbol_search_docs_batch_after(after, 4096)
+            .context("load symbol search docs for lexical shard")?;
+        if batch.is_empty() {
+            break;
+        }
+        after = batch.last().map(|doc| doc.node_id);
+        for doc in batch {
+            update_lexical_entries_hash(hasher, &symbol_doc_lexical_entry(project_root, &doc));
+            *file_count = file_count.saturating_add(1);
         }
     }
     Ok(())
@@ -699,6 +803,20 @@ mod tests {
             }])
             .expect("upsert symbol doc");
         drop(storage);
+
+        let collected_entries =
+            collect_lexical_entries(project.path(), Some(&storage_path)).expect("collect entries");
+        let streaming_fingerprint =
+            lexical_input_fingerprint(project.path(), Some(&storage_path)).expect("fingerprint");
+        assert_eq!(
+            streaming_fingerprint.file_count as usize,
+            collected_entries.len()
+        );
+        assert_eq!(
+            streaming_fingerprint.hash,
+            lexical_entries_hash(&collected_entries),
+            "streaming lexical fingerprint must match collected-entry hash"
+        );
 
         let zoekt_root = TempDir::new().expect("zoekt");
         build_zoekt_shard(

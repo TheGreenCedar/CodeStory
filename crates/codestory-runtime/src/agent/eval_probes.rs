@@ -1027,17 +1027,16 @@ fn gin_route_dispatch_flow_claims(path: &str, source: &str) -> Vec<String> {
         }
     }
 
-    if normalized_path.ends_with("routergroup.go") {
-        if source_lower.contains("func (group *routergroup) handle")
-            && source_lower.contains("group.engine.addroute")
-            && source_lower.contains("handlers ...handlerfunc")
-            && source_lower.contains("return group.handle(httpmethod, relativepath, handlers)")
-        {
-            claims.push(
-                "RouterGroup.Handle registers routes by delegating to the group handle path."
-                    .to_string(),
-            );
-        }
+    if normalized_path.ends_with("routergroup.go")
+        && source_lower.contains("func (group *routergroup) handle")
+        && source_lower.contains("group.engine.addroute")
+        && source_lower.contains("handlers ...handlerfunc")
+        && source_lower.contains("return group.handle(httpmethod, relativepath, handlers)")
+    {
+        claims.push(
+            "RouterGroup.Handle registers routes by delegating to the group handle path."
+                .to_string(),
+        );
     }
 
     if normalized_path.ends_with("tree.go")

@@ -3010,6 +3010,39 @@ mod tests {
     }
 
     #[test]
+    fn packet_sufficiency_does_not_promote_summary_to_covered_claim() {
+        let question = "Explain packet sufficiency proof boundaries.";
+        let answer = packet_answer_fixture(question, Vec::new());
+        let budget = PacketBudgetDto {
+            requested: PacketBudgetModeDto::Compact,
+            limits: packet_budget_limits(PacketBudgetModeDto::Compact),
+            used: PacketBudgetUsageDto {
+                anchors: 0,
+                files: 0,
+                snippets: 0,
+                trail_edges: 0,
+                output_bytes: 0,
+            },
+            truncated: false,
+            omitted_sections: Vec::new(),
+            next_deeper_command: None,
+        };
+        let sufficiency = build_packet_sufficiency(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            &answer,
+            &budget,
+        );
+
+        assert_ne!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(
+            sufficiency.covered_claims.is_empty(),
+            "covered_claims must only contain source-backed claims, not summary fallback: {sufficiency:?}"
+        );
+    }
+
+    #[test]
     fn packet_symbol_probes_prioritize_flow_specific_terms() {
         let _eval_probes = EvalProbesGuard::enabled();
         let queries = packet_symbol_probe_queries(
@@ -6836,6 +6869,13 @@ mod tests {
                     .any(|entry| entry.contains(avoid_path)),
                 "sufficient {task_class:?} packet should discourage reopening cited path `{avoid_path}`: {sufficiency:?}"
             );
+            assert!(
+                sufficiency
+                    .avoid_opening_paths
+                    .iter()
+                    .any(|entry| entry == avoid_path),
+                "sufficient {task_class:?} packet should expose raw avoid-opening path `{avoid_path}`: {sufficiency:?}"
+            );
         }
     }
 
@@ -7891,6 +7931,13 @@ mod tests {
                 .iter()
                 .any(|path| path.contains("crates/app-cli/src/main.rs")),
             "sufficient packets should tell agents cited files do not need broad re-opening: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .avoid_opening_paths
+                .iter()
+                .any(|path| path == "crates/app-cli/src/main.rs"),
+            "sufficient packets should expose raw cited paths separately from prose: {sufficiency:?}"
         );
     }
 

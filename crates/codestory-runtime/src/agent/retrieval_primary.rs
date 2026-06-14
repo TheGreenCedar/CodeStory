@@ -390,12 +390,28 @@ pub(crate) fn try_sidecar_primary_search(
     max_results: usize,
     latency_budget_ms: Option<u32>,
 ) -> Option<SidecarPrimarySearchOutcome> {
+    try_sidecar_primary_search_inner_with_query(
+        controller,
+        prompt,
+        max_results,
+        latency_budget_ms,
+        run_sidecar_query,
+    )
+}
+
+fn try_sidecar_primary_search_inner_with_query(
+    controller: &AppController,
+    prompt: &str,
+    max_results: usize,
+    latency_budget_ms: Option<u32>,
+    mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
+) -> Option<SidecarPrimarySearchOutcome> {
     if !sidecar_retrieval_primary_enabled(controller) {
         return sidecar_retrieval_unavailable_reason(controller)
             .map(|reason| SidecarPrimarySearchOutcome::Unavailable { reason });
     }
 
-    let query_result = match run_sidecar_query(controller, prompt, latency_budget_ms) {
+    let query_result = match run_query(controller, prompt, latency_budget_ms) {
         Ok(result) => result,
         Err(error) => {
             return Some(SidecarPrimarySearchOutcome::Unavailable {
@@ -404,10 +420,34 @@ pub(crate) fn try_sidecar_primary_search(
         }
     };
 
+    Some(sidecar_primary_search_outcome_from_query_result(
+        controller,
+        query_result,
+        max_results,
+    ))
+}
+
+fn sidecar_primary_search_outcome_from_query_result(
+    controller: &AppController,
+    query_result: QueryResult,
+    max_results: usize,
+) -> SidecarPrimarySearchOutcome {
     let candidate_count = query_result.hits.len();
-    let resolved_hits =
-        resolve_sidecar_candidates_to_search_hits(controller, &query_result.hits, max_results)
-            .unwrap_or_default();
+    let resolved_hits = match resolve_sidecar_candidates_to_search_hits(
+        controller,
+        &query_result.hits,
+        max_results,
+    ) {
+        Ok(hits) => hits,
+        Err(error) => {
+            return SidecarPrimarySearchOutcome::Unavailable {
+                reason: format!(
+                    "sidecar retrieval primary unavailable: candidate resolution failed: {}",
+                    error.message
+                ),
+            };
+        }
+    };
     let shadow = shadow_from_query_result_with_candidate_admission_diagnostics(
         controller,
         query_result.clone(),
@@ -420,7 +460,7 @@ pub(crate) fn try_sidecar_primary_search(
     if let Some(reason) = sidecar_result_rejection_reason(&query_result, &resolved_hits) {
         let diagnostic = sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
         let reason = format!("{reason}; {diagnostic}");
-        return Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason });
+        return SidecarPrimarySearchOutcome::Rejected { shadow, reason };
     }
 
     let hits = resolved_hits;
@@ -436,11 +476,11 @@ pub(crate) fn try_sidecar_primary_search(
         })
         .collect();
 
-    Some(SidecarPrimarySearchOutcome::Served {
+    SidecarPrimarySearchOutcome::Served {
         hits,
         scored_hits,
         shadow,
-    })
+    }
 }
 
 pub(crate) fn search_sidecar_packet_batch(
@@ -2183,6 +2223,51 @@ mod tests {
             "error should preserve candidate resolution failure: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn sidecar_primary_search_reports_candidate_resolution_errors() {
+        use codestory_retrieval::CandidateSource;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path.clone())
+            .expect("open project");
+        std::fs::remove_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("remove storage parent");
+
+        let query_result = QueryResult {
+            query: "handler".into(),
+            features: classify_query("handler"),
+            hits: vec![CandidateHit::with_source(
+                "src/lib.rs",
+                Some("handler".into()),
+                0.5,
+                CandidateSource::Scip,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+
+        let outcome =
+            sidecar_primary_search_outcome_from_query_result(&controller, query_result, 5);
+
+        match outcome {
+            SidecarPrimarySearchOutcome::Unavailable { reason } => assert!(
+                reason.contains("candidate resolution failed"),
+                "reason should preserve candidate resolution failure: {reason}"
+            ),
+            _ => panic!("candidate resolution errors must make primary search unavailable"),
+        }
     }
 
     #[test]

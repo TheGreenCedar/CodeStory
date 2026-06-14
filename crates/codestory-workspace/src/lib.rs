@@ -925,7 +925,7 @@ mod tests {
         ];
 
         for profile in codestory_contracts::language_support::LANGUAGE_SUPPORT_PROFILES {
-            for extension in profile.extensions.iter().copied() {
+            for extension in profile.extensions {
                 let file_name = format!("main.{extension}");
                 assert_eq!(
                     registry_language_for_path(Path::new(&file_name)),

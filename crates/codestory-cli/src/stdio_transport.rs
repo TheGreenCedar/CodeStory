@@ -481,16 +481,19 @@ fn handle_stdio_packet(
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    let cache_key = stdio_packet_cache_key(
-        stdio_storage_fingerprint(&runtime.storage_path),
-        stdio_mandatory_sidecar_fingerprint(&runtime.project_root, &runtime.storage_path),
+    let cache_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
+        storage_fingerprint: stdio_storage_fingerprint(&runtime.storage_path),
+        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(
+            &runtime.project_root,
+            &runtime.storage_path,
+        ),
         question,
         budget,
         task_class,
-        &extra_probes,
+        extra_probes: &extra_probes,
         include_evidence,
         latency_budget_ms,
-    );
+    });
     if let Some(cached) = state.packet_cache.get(&cache_key) {
         return cached;
     }
@@ -585,25 +588,27 @@ impl StdioPacketCache {
     }
 }
 
-fn stdio_packet_cache_key(
+struct StdioPacketCacheKeyInput<'a> {
     storage_fingerprint: String,
     sidecar_fingerprint: String,
-    question: &str,
+    question: &'a str,
     budget: PacketBudgetModeDto,
     task_class: Option<PacketTaskClassDto>,
-    extra_probes: &[String],
+    extra_probes: &'a [String],
     include_evidence: bool,
     latency_budget_ms: Option<u32>,
-) -> StdioPacketCacheKey {
+}
+
+fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCacheKey {
     StdioPacketCacheKey {
-        storage_fingerprint,
-        sidecar_fingerprint,
-        question: question.to_string(),
-        budget: stdio_packet_budget_label(budget),
-        task_class: task_class.map(stdio_packet_task_class_label),
-        extra_probes: extra_probes.to_vec(),
-        include_evidence,
-        latency_budget_ms,
+        storage_fingerprint: input.storage_fingerprint,
+        sidecar_fingerprint: input.sidecar_fingerprint,
+        question: input.question.to_string(),
+        budget: stdio_packet_budget_label(input.budget),
+        task_class: input.task_class.map(stdio_packet_task_class_label),
+        extra_probes: input.extra_probes.to_vec(),
+        include_evidence: input.include_evidence,
+        latency_budget_ms: input.latency_budget_ms,
     }
 }
 
@@ -1757,17 +1762,24 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn packet_key(question: &str, storage_fingerprint: &str) -> StdioPacketCacheKey {
-        stdio_packet_cache_key(
-            storage_fingerprint.to_string(),
-            "sidecar-full".to_string(),
+    fn base_packet_cache_key_input(question: &str) -> StdioPacketCacheKeyInput<'_> {
+        StdioPacketCacheKeyInput {
+            storage_fingerprint: "snapshot-a".to_string(),
+            sidecar_fingerprint: "sidecar-full".to_string(),
             question,
-            PacketBudgetModeDto::Compact,
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            &[],
-            true,
-            Some(15_000),
-        )
+            budget: PacketBudgetModeDto::Compact,
+            task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
+            extra_probes: &[],
+            include_evidence: true,
+            latency_budget_ms: Some(15_000),
+        }
+    }
+
+    fn packet_key(question: &str, storage_fingerprint: &str) -> StdioPacketCacheKey {
+        stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            storage_fingerprint: storage_fingerprint.to_string(),
+            ..base_packet_cache_key_input(question)
+        })
     }
 
     #[test]
@@ -1863,93 +1875,50 @@ mod tests {
 
     #[test]
     fn stdio_packet_cache_key_changes_with_request_arguments_and_snapshot() {
-        let base = stdio_packet_cache_key(
-            "snapshot-a".to_string(),
-            "sidecar-full".to_string(),
-            "Explain packet caching.",
-            PacketBudgetModeDto::Compact,
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            &[],
-            true,
-            Some(15_000),
+        let base_input = base_packet_cache_key_input("Explain packet caching.");
+        let base = stdio_packet_cache_key(base_input);
+        assert_ne!(
+            base,
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                storage_fingerprint: "snapshot-b".to_string(),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
         );
         assert_ne!(
             base,
-            stdio_packet_cache_key(
-                "snapshot-b".to_string(),
-                "sidecar-full".to_string(),
-                "Explain packet caching.",
-                PacketBudgetModeDto::Compact,
-                Some(PacketTaskClassDto::ArchitectureExplanation),
-                &[],
-                true,
-                Some(15_000),
-            )
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                budget: PacketBudgetModeDto::Tiny,
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
         );
         assert_ne!(
             base,
-            stdio_packet_cache_key(
-                "snapshot-a".to_string(),
-                "sidecar-full".to_string(),
-                "Explain packet caching.",
-                PacketBudgetModeDto::Tiny,
-                Some(PacketTaskClassDto::ArchitectureExplanation),
-                &[],
-                true,
-                Some(15_000),
-            )
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                task_class: Some(PacketTaskClassDto::EditPlanning),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
         );
         assert_ne!(
             base,
-            stdio_packet_cache_key(
-                "snapshot-a".to_string(),
-                "sidecar-full".to_string(),
-                "Explain packet caching.",
-                PacketBudgetModeDto::Compact,
-                Some(PacketTaskClassDto::EditPlanning),
-                &[],
-                true,
-                Some(15_000),
-            )
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                include_evidence: false,
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
         );
         assert_ne!(
             base,
-            stdio_packet_cache_key(
-                "snapshot-a".to_string(),
-                "sidecar-full".to_string(),
-                "Explain packet caching.",
-                PacketBudgetModeDto::Compact,
-                Some(PacketTaskClassDto::ArchitectureExplanation),
-                &[],
-                false,
-                Some(15_000),
-            )
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                latency_budget_ms: Some(30_000),
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
         );
+        let extra_probes = ["src/lib.rs run".to_string()];
         assert_ne!(
             base,
-            stdio_packet_cache_key(
-                "snapshot-a".to_string(),
-                "sidecar-full".to_string(),
-                "Explain packet caching.",
-                PacketBudgetModeDto::Compact,
-                Some(PacketTaskClassDto::ArchitectureExplanation),
-                &[],
-                true,
-                Some(30_000),
-            )
-        );
-        assert_ne!(
-            base,
-            stdio_packet_cache_key(
-                "snapshot-a".to_string(),
-                "sidecar-full".to_string(),
-                "Explain packet caching.",
-                PacketBudgetModeDto::Compact,
-                Some(PacketTaskClassDto::ArchitectureExplanation),
-                &["src/lib.rs run".to_string()],
-                true,
-                Some(15_000),
-            )
+            stdio_packet_cache_key(StdioPacketCacheKeyInput {
+                extra_probes: &extra_probes,
+                ..base_packet_cache_key_input("Explain packet caching.")
+            })
         );
     }
 
@@ -1960,26 +1929,16 @@ mod tests {
             "retrieval_mode:full|manifest_generation:project-a|manifest_input_hash:hash-a";
         let stale_sidecar = "retrieval_mode:unavailable|degraded_reason:sidecar_manifest_stale";
 
-        let packet_full = stdio_packet_cache_key(
-            storage_fingerprint.clone(),
-            full_sidecar.to_string(),
-            "Explain packet caching.",
-            PacketBudgetModeDto::Compact,
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            &[],
-            true,
-            Some(15_000),
-        );
-        let packet_stale = stdio_packet_cache_key(
-            storage_fingerprint.clone(),
-            stale_sidecar.to_string(),
-            "Explain packet caching.",
-            PacketBudgetModeDto::Compact,
-            Some(PacketTaskClassDto::ArchitectureExplanation),
-            &[],
-            true,
-            Some(15_000),
-        );
+        let packet_full = stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            storage_fingerprint: storage_fingerprint.clone(),
+            sidecar_fingerprint: full_sidecar.to_string(),
+            ..base_packet_cache_key_input("Explain packet caching.")
+        });
+        let packet_stale = stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            storage_fingerprint: storage_fingerprint.clone(),
+            sidecar_fingerprint: stale_sidecar.to_string(),
+            ..base_packet_cache_key_input("Explain packet caching.")
+        });
         assert_ne!(packet_full, packet_stale);
 
         let search_full = StdioSearchFragmentCacheKey {
@@ -2032,16 +1991,14 @@ mod tests {
                 manifest: Some(manifest.clone()),
             }),
         );
-        let successful_key = stdio_packet_cache_key(
-            storage_fingerprint.clone(),
-            before_stale.clone(),
-            "Explain strict readiness.",
-            PacketBudgetModeDto::Compact,
-            None,
-            &[],
-            true,
-            None,
-        );
+        let successful_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            storage_fingerprint: storage_fingerprint.clone(),
+            sidecar_fingerprint: before_stale.clone(),
+            question: "Explain strict readiness.",
+            task_class: None,
+            latency_budget_ms: None,
+            ..base_packet_cache_key_input("Explain strict readiness.")
+        });
         let mut cache = StdioPacketCache::default();
         cache.insert(
             successful_key.clone(),
@@ -2060,16 +2017,14 @@ mod tests {
                 manifest: Some(manifest),
             }),
         );
-        let stale_key = stdio_packet_cache_key(
-            storage_fingerprint.clone(),
-            after_stale.clone(),
-            "Explain strict readiness.",
-            PacketBudgetModeDto::Compact,
-            None,
-            &[],
-            true,
-            None,
-        );
+        let stale_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            storage_fingerprint: storage_fingerprint.clone(),
+            sidecar_fingerprint: after_stale.clone(),
+            question: "Explain strict readiness.",
+            task_class: None,
+            latency_budget_ms: None,
+            ..base_packet_cache_key_input("Explain strict readiness.")
+        });
 
         assert_ne!(before_stale, after_stale);
         assert!(

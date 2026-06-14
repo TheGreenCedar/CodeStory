@@ -8,7 +8,7 @@ use codestory_contracts::api::{
     PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketSufficiencyDto,
     PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 pub(crate) const PACKET_MARKDOWN_TRUNCATION_SUFFIX: &str =
@@ -71,7 +71,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         task_class,
         answer,
         budget,
-        mut supported_claims,
+        supported_claims,
         missing_required_probe_queries,
         targeted_follow_up_queries,
     } = input;
@@ -96,7 +96,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         supported_claims.len(),
     );
     let unresolved_sidecar_queries = unresolved_sidecar_queries(answer);
-    let status = packet_sufficiency_status(
+    let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
         answer,
         budget,
         has_errors,
@@ -104,9 +104,9 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_minimum_claims,
         has_minimum_claim_families,
         has_sufficiency_blocking_budget_omission,
-        &missing_required_probe_queries,
-        &unresolved_sidecar_queries,
-    );
+        missing_required_probe_queries: &missing_required_probe_queries,
+        unresolved_sidecar_queries: &unresolved_sidecar_queries,
+    });
 
     let gaps = packet_sufficiency_gaps(
         task_class,
@@ -133,14 +133,17 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         targeted_follow_up_queries,
     );
     let open_next = follow_up_commands.clone();
-    let avoid_opening = answer
+    let avoid_opening_paths = answer
         .citations
         .iter()
         .filter_map(|citation| citation.file_path.as_ref())
         .map(|path| packet_display_path(path))
-        .collect::<HashSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .take(12)
+        .collect::<Vec<_>>();
+    let avoid_opening = avoid_opening_paths
+        .iter()
         .map(|path| {
             format!(
                 "{} because this packet already includes a citation for the current answer.",
@@ -149,18 +152,12 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         })
         .collect::<Vec<_>>();
 
-    if supported_claims.is_empty() {
-        supported_claims.push(PacketClaimDto {
-            claim: answer.summary.clone(),
-            citations: answer.citations.iter().take(6).cloned().collect(),
-        });
-    }
-
     PacketSufficiencyDto {
         status,
         covered_claims: supported_claims,
         open_next,
         avoid_opening,
+        avoid_opening_paths,
         gaps,
         follow_up_commands,
     }
@@ -186,27 +183,31 @@ fn is_packet_structured_follow_up_query(query: &str) -> bool {
         || query.contains("Subcommand")
 }
 
-fn packet_sufficiency_status(
-    answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
+struct PacketSufficiencyStatusInput<'a> {
+    answer: &'a AgentAnswerDto,
+    budget: &'a PacketBudgetDto,
     has_errors: bool,
     has_minimum_coverage: bool,
     has_minimum_claims: bool,
     has_minimum_claim_families: bool,
     has_sufficiency_blocking_budget_omission: bool,
-    missing_required_probe_queries: &[String],
-    unresolved_sidecar_queries: &[String],
+    missing_required_probe_queries: &'a [String],
+    unresolved_sidecar_queries: &'a [String],
+}
+
+fn packet_sufficiency_status(
+    input: PacketSufficiencyStatusInput<'_>,
 ) -> PacketSufficiencyStatusDto {
-    if answer.citations.is_empty() {
+    if input.answer.citations.is_empty() {
         PacketSufficiencyStatusDto::Insufficient
-    } else if has_errors
-        || !has_minimum_coverage
-        || !has_minimum_claims
-        || !has_minimum_claim_families
-        || !missing_required_probe_queries.is_empty()
-        || !unresolved_sidecar_queries.is_empty()
-        || has_sufficiency_blocking_budget_omission
-        || packet_budget_exceeded_hard_output_cap(budget)
+    } else if input.has_errors
+        || !input.has_minimum_coverage
+        || !input.has_minimum_claims
+        || !input.has_minimum_claim_families
+        || !input.missing_required_probe_queries.is_empty()
+        || !input.unresolved_sidecar_queries.is_empty()
+        || input.has_sufficiency_blocking_budget_omission
+        || packet_budget_exceeded_hard_output_cap(input.budget)
     {
         PacketSufficiencyStatusDto::Partial
     } else {
@@ -306,10 +307,8 @@ fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
                 && diagnostic.resolved_hit_count == 0
                 && diagnostic.unresolved_candidate_count > 0
         })
-        .filter_map(|diagnostic| {
-            seen.insert(diagnostic.query.clone())
-                .then(|| diagnostic.query.clone())
-        })
+        .filter(|diagnostic| seen.insert(diagnostic.query.clone()))
+        .map(|diagnostic| diagnostic.query.clone())
         .collect()
 }
 

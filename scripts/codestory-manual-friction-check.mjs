@@ -214,6 +214,7 @@ function checkPacket(repoName, packetJson) {
   }
   const citations = packetJson?.answer?.citations ?? [];
   const avoidOpening = sufficiency.avoid_opening ?? [];
+  const avoidOpeningPaths = sufficiency.avoid_opening_paths ?? null;
   if (!Array.isArray(citations) || citations.length === 0) {
     addGap(repoName, "packet_missing_citations", 1, "packet answer has no structured citations");
   }
@@ -226,8 +227,16 @@ function checkPacket(repoName, packetJson) {
       follow_up_commands: sufficiency.follow_up_commands,
     });
   }
-  if (!Array.isArray(avoidOpening)) {
+  if (avoidOpening != null && !Array.isArray(avoidOpening)) {
     addGap(repoName, "packet_avoid_opening_malformed", 2, "packet sufficiency avoid_opening is not a list");
+  }
+  if (!Array.isArray(avoidOpeningPaths)) {
+    addGap(
+      repoName,
+      "packet_avoid_opening_paths_malformed",
+      2,
+      "packet sufficiency avoid_opening_paths is not a raw path list",
+    );
   }
   const retrievalTrace = packetJson?.answer?.retrieval_trace;
   if (!retrievalTrace || typeof retrievalTrace !== "object") {

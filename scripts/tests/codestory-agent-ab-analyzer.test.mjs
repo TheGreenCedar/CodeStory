@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -10,9 +10,11 @@ import {
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
   commandCategory,
+  copyResultArtifact,
   isPathInside,
   loadTaskForResult,
   loadTasks,
+  MAX_REUSED_ARTIFACT_BYTES,
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
   packetComposition,
@@ -27,6 +29,7 @@ import {
   packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
+  resolveRunArtifactPath,
   resolveCodeStoryCli,
   scoreQuality,
   summarizeCostAccounting,
@@ -36,7 +39,9 @@ import {
   taskSnapshotForResult,
 } from "../codestory-agent-ab-benchmark.mjs";
 import {
+  packetGateSelectionOrThrow,
   packetGateStderrPath,
+  parseArgs as parseScoreArgs,
   retryablePacketGateTaskIds,
 } from "../codestory-agent-ab-score.mjs";
 
@@ -294,6 +299,29 @@ test("packet gate retries only transient sidecar packet failures", async () => {
   }
 });
 
+test("packet gate empty selection is explicit exploratory behavior", () => {
+  assert.throws(
+    () =>
+      packetGateSelectionOrThrow(
+        [],
+        [
+          {
+            taskId: "python-requests-session-flow",
+            reason: "not_improved",
+          },
+        ],
+        {},
+      ),
+    /allow-empty-packet-gate/,
+  );
+
+  assert.equal(packetGateSelectionOrThrow([], [], { allowEmptyPacketGate: true }), null);
+  assert.deepEqual(packetGateSelectionOrThrow(["python-requests-session-flow"], [], {}), [
+    "python-requests-session-flow",
+  ]);
+  assert.equal(parseScoreArgs(["--packet-gate", "--allow-empty-packet-gate"]).allowEmptyPacketGate, true);
+});
+
 test("rejects manifest repo and workspace paths outside the cache", async () => {
   await withManifestFile(
     manifestFixture({
@@ -361,7 +389,7 @@ test("packet-first command renders manifest text for host shells", () => {
   );
 });
 
-test("packet command carries bounded manifest-derived extra probes", () => {
+test("packet command keeps manifest-derived extra probes diagnostic-only", () => {
   const task = {
     prompt: "Explain how Requests dispatch works.",
     task_class: "architecture_explanation",
@@ -383,13 +411,20 @@ test("packet command carries bounded manifest-derived extra probes", () => {
   ]);
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
-  const extraProbeIndexes = args
+  assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
+
+  const diagnosticArgs = packetCommandArgs(
+    { path: "C:\\repo" },
+    task,
+    { diagnosticExtraProbesFromManifest: true },
+  );
+  const extraProbeIndexes = diagnosticArgs
     .map((arg, index) => (arg === "--extra-probe" ? index : -1))
     .filter((index) => index >= 0);
 
   assert.equal(extraProbeIndexes.length, 5);
-  assert.equal(args[extraProbeIndexes[0] + 1], "src/requests/api.py");
-  assert.equal(args[extraProbeIndexes[3] + 1], "src/requests/sessions.py Session.request");
+  assert.equal(diagnosticArgs[extraProbeIndexes[0] + 1], "src/requests/api.py");
+  assert.equal(diagnosticArgs[extraProbeIndexes[3] + 1], "src/requests/sessions.py Session.request");
 });
 
 test("benchmark artifact run ids strip path separators from dynamic parts", () => {
@@ -399,10 +434,69 @@ test("benchmark artifact run ids strip path separators from dynamic parts", () =
   );
 });
 
+test("publishable benchmark args reject diagnostic packet probes", () => {
+  assert.throws(
+    () =>
+      parseBenchmarkArgs([
+        "--publishable",
+        "--diagnostic-extra-probes-from-manifest",
+      ]),
+    /diagnostic-only/,
+  );
+});
+
 test("path containment rejects sibling-prefix directories", () => {
   const root = path.join(os.tmpdir(), "codestory-agent-benchmark", "repos");
   assert.equal(isPathInside(root, path.join(root, "express")), true);
   assert.equal(isPathInside(root, path.join(os.tmpdir(), "codestory-agent-benchmark", "repos2", "evil")), false);
+});
+
+test("reused baseline artifact paths stay inside the previous run directory", () => {
+  const runDir = path.join(os.tmpdir(), "codestory-agent-benchmark", "previous-run");
+  assert.equal(
+    resolveRunArtifactPath(runDir, "codestory.without.01.stdout.jsonl"),
+    path.resolve(runDir, "codestory.without.01.stdout.jsonl"),
+  );
+  assert.equal(resolveRunArtifactPath(runDir, path.join(runDir, "codestory.without.01.stdout.jsonl")), null);
+  assert.equal(resolveRunArtifactPath(runDir, "..\\outside.stdout.jsonl"), null);
+  assert.equal(resolveRunArtifactPath(runDir, "codestory.without.01.env"), null);
+});
+
+test("copying reused baseline artifacts rejects oversized files", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-reused-artifacts-"));
+  try {
+    const runDir = path.join(root, "previous");
+    const outDir = path.join(root, "next");
+    await mkdir(runDir, { recursive: true });
+    await mkdir(outDir, { recursive: true });
+    const sourceName = "codestory.without.01.stdout.jsonl";
+    const sourcePath = path.join(runDir, sourceName);
+    await writeFile(sourcePath, "");
+    await truncate(sourcePath, MAX_REUSED_ARTIFACT_BYTES + 1);
+
+    await assert.rejects(
+      () => copyResultArtifact(runDir, outDir, sourceName, "copied.stdout.jsonl"),
+      /Refusing to reuse oversized baseline artifact/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("copying reused baseline artifacts rejects absolute source paths", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-reused-artifacts-"));
+  try {
+    const runDir = path.join(root, "previous");
+    const outDir = path.join(root, "next");
+    await mkdir(runDir, { recursive: true });
+    await mkdir(outDir, { recursive: true });
+    const sourcePath = path.join(runDir, "codestory.without.01.stdout.jsonl");
+    await writeFile(sourcePath, "{}\n");
+
+    assert.equal(await copyResultArtifact(runDir, outDir, sourcePath, "copied.stdout.jsonl"), null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Windows Codex runner args reject cmd metacharacters", () => {
@@ -942,7 +1036,8 @@ test("packet composition separates citations, answer surfaces, and structured-on
         ],
       },
       sufficiency: {
-        avoid_opening: ["src/lib/data/storage/PersistentStorage.cpp"],
+        avoid_opening: ["src/lib/data/storage/LegacyOnly.cpp because this is legacy prose"],
+        avoid_opening_paths: ["src/lib/data/storage/PersistentStorage.cpp"],
         covered_claims: [
           {
             claim: "Hidden trace source mentions src/lib_cxx/project/SourceGroupCxxCdb.cpp.",
@@ -1012,6 +1107,9 @@ test("packet prompt excerpt keeps answer support while dropping bulky packet fie
       gaps: ["drop me"],
       open_next: ["drop me too"],
       avoid_opening: [
+        "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/legacy.py because legacy prose",
+      ],
+      avoid_opening_paths: [
         "C:/repo/target/agent-benchmark/repos/psf-requests/src/requests/api.py",
       ],
       follow_up_commands: ["a", "b", "c", "d", "e"],
@@ -1403,6 +1501,33 @@ test("publishable gate records but does not block post-packet reads by default",
   assert.deepEqual(blockers, []);
 });
 
+test("publishable gate requires explicit post-packet source-read budget", () => {
+  const blockers = agentPublishableBlockers(
+    [publishableWithCodeStoryResult()],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /missing explicit post-packet source-read budget/);
+});
+
+test("publishable gate rejects diagnostic packet probes", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      publishableWithCodeStoryResult({
+        codestory_harness_prelude: {
+          packet_extra_probe_count: 2,
+          packet_extra_probe_strategy: "diagnostic_manifest_expected_anchors",
+        },
+      }),
+    ],
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
+});
+
 test("publishable gate requires packet before ordinary context exploration", () => {
   const blockers = agentPublishableBlockers(
     [
@@ -1574,7 +1699,7 @@ test("publishable gate requires CodeStory cache provenance for CodeStory arm", (
         codestory_cache_provenance: null,
       }),
     ],
-    { publishable: true },
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
   );
 
   assert.equal(blockers.length, 1);
@@ -1584,7 +1709,7 @@ test("publishable gate requires CodeStory cache provenance for CodeStory arm", (
 test("publishable gate accepts local-only CodeStory cache provenance", () => {
   const blockers = agentPublishableBlockers(
     [publishableWithCodeStoryResult()],
-    { publishable: true },
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
   );
 
   assert.deepEqual(blockers, []);
@@ -1602,7 +1727,7 @@ test("publishable gate requires resource accounting fields", () => {
         },
       }),
     ],
-    { publishable: true },
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
   );
 
   assert.equal(blockers.length, 1);
@@ -1623,7 +1748,7 @@ test("publishable gate requires CodeStory local-only provenance", () => {
         }),
       }),
     ],
-    { publishable: true },
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
   );
 
   assert.equal(blockers.length, 1);
@@ -1682,6 +1807,21 @@ test("packet runtime publishable gate requires SLA pass and full retrieval shado
   assert.match(blockers[0].reasons.join("\n"), /packet retrieval SLA missed=true; expected false/);
   assert.match(blockers[1].reasons.join("\n"), /missing retrieval shadow telemetry/);
   assert.match(blockers[2].reasons.join("\n"), /packet retrieval shadow mode=degraded; expected full/);
+});
+
+test("packet runtime publishable gate rejects diagnostic packet probes", () => {
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        packet_extra_probe_count: 1,
+        packet_extra_probe_strategy: "diagnostic_manifest_expected_anchors",
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
 });
 
 test("holdout packet runtime requires quality gate unless failures are allowed", () => {

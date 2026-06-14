@@ -28,6 +28,9 @@ const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "r
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 const MANIFEST_TASK_ID_PATTERN = /^[a-z0-9][a-z0-9.-]*$/;
 const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
+const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
+  /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt)$/;
 const PACKET_TASK_CLASSES = new Set([
   "architecture_explanation",
   "bug_localization",
@@ -104,7 +107,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -158,7 +161,10 @@ Options:
                   Timeout for each pre-run CodeStory index refresh. Default: 1800000.
   --max-source-reads-after-packet
                   Publishable with-CodeStory runs fail above this post-packet ordinary source-read count.
-                  Default: unbounded; pass 0 for packet-only promotion evidence.
+                  Required with --publishable; pass 0 for packet-only promotion evidence.
+  --diagnostic-extra-probes-from-manifest
+                  Inject expected file/symbol anchors as packet --extra-probe values.
+                  Diagnostic only; cannot be combined with --publishable.
   --allow-failures Exit 0 even when a run fails. Intended only for exploratory dry runs.
   --publishable   Fail unless every run succeeds and reports token usage.
 
@@ -204,6 +210,7 @@ function parseArgs(argv) {
     prepareCodestoryTimeoutMs: 1_800_000,
     cachePreparationByRepo: null,
     maxSourceReadsAfterPacket: null,
+    diagnosticExtraProbesFromManifest: false,
     allowFailures: false,
     publishable: false,
   };
@@ -236,6 +243,10 @@ function parseArgs(argv) {
     }
     if (arg === "--allow-failures") {
       opts.allowFailures = true;
+      continue;
+    }
+    if (arg === "--diagnostic-extra-probes-from-manifest") {
+      opts.diagnosticExtraProbesFromManifest = true;
       continue;
     }
     if (arg === "--include-local-repos") {
@@ -397,6 +408,9 @@ function parseArgs(argv) {
     (!Number.isInteger(opts.maxSourceReadsAfterPacket) || opts.maxSourceReadsAfterPacket < 0)
   ) {
     throw new Error("--max-source-reads-after-packet must be a non-negative integer");
+  }
+  if (opts.publishable && opts.diagnosticExtraProbesFromManifest) {
+    throw new Error("--diagnostic-extra-probes-from-manifest is diagnostic-only and cannot be combined with --publishable");
   }
   opts.repoCacheDir = path.resolve(opts.repoCacheDir ?? defaultRepoCacheRoot);
   if (opts.reuseBaselineFrom) {
@@ -677,6 +691,14 @@ function packetManifestExtraProbes(task) {
     ...(task.expected_files ?? []),
     ...(task.expected_symbol_probes ?? task.expected_symbols ?? []),
   ]).slice(0, MAX_PACKET_MANIFEST_EXTRA_PROBES);
+}
+
+function packetCommandExtraProbes(task, opts = {}) {
+  return opts.diagnosticExtraProbesFromManifest ? packetManifestExtraProbes(task) : [];
+}
+
+function packetExtraProbeStrategy(extraProbes) {
+  return extraProbes.length ? "diagnostic_manifest_expected_anchors" : null;
 }
 
 function normalizeManifestTask(filePath, raw, opts = {}) {
@@ -1177,7 +1199,7 @@ function packetForAgentPrompt(packet) {
           covered_claims: (packet.sufficiency.covered_claims ?? [])
             .map((claim) => String(claim?.claim ?? "").trim())
             .filter(Boolean),
-          avoid_opening: (packet.sufficiency.avoid_opening ?? []).map(packetPromptPath),
+          avoid_opening: packetAvoidOpeningRawPaths(packet),
           follow_up_commands: (packet.sufficiency.follow_up_commands ?? []).slice(0, 4),
         }
       : null,
@@ -1283,6 +1305,21 @@ function packetPromptPath(value) {
   return normalized;
 }
 
+function legacyAvoidOpeningPath(value) {
+  const text = String(value ?? "").trim();
+  const marker = " because ";
+  const markerIndex = text.toLowerCase().indexOf(marker);
+  return markerIndex >= 0 ? text.slice(0, markerIndex).trim() : text;
+}
+
+function packetAvoidOpeningRawPaths(packet) {
+  const rawPaths = packet?.sufficiency?.avoid_opening_paths;
+  const values = Array.isArray(rawPaths)
+    ? rawPaths
+    : (packet?.sufficiency?.avoid_opening ?? []).map(legacyAvoidOpeningPath);
+  return values.map(packetPromptPath).filter(Boolean);
+}
+
 function packetSupportPaths(packet) {
   const paths = [];
   for (const citation of packet?.answer?.citations ?? []) {
@@ -1290,9 +1327,9 @@ function packetSupportPaths(packet) {
       paths.push(packetPromptPath(citation.file_path));
     }
   }
-  for (const filePath of packet?.sufficiency?.avoid_opening ?? []) {
+  for (const filePath of packetAvoidOpeningRawPaths(packet)) {
     if (filePath) {
-      paths.push(packetPromptPath(filePath));
+      paths.push(filePath);
     }
   }
   return [...new Set(paths)];
@@ -2151,7 +2188,7 @@ function estimateCost(usage) {
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
 }
 
-function packetCommandArgs(repoConfig, task) {
+function packetCommandArgs(repoConfig, task, opts = {}) {
   const args = [
     "packet",
     "--project",
@@ -2166,7 +2203,7 @@ function packetCommandArgs(repoConfig, task) {
   if (task?.task_class) {
     args.push("--task-class", validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"));
   }
-  for (const probe of packetManifestExtraProbes(task)) {
+  for (const probe of packetCommandExtraProbes(task, opts)) {
     args.push("--extra-probe", probe);
   }
   return args;
@@ -2596,8 +2633,8 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
 }
 
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli) {
-  const args = packetCommandArgs(repoConfig, run.task);
-  const extraProbes = packetManifestExtraProbes(run.task);
+  const args = packetCommandArgs(repoConfig, run.task, opts);
+  const extraProbes = packetCommandExtraProbes(run.task, opts);
   const command = displayCommand(codestoryCli, args);
   const stdoutPath = path.join(outDir, `${runId}.codestory-packet.stdout.json`);
   const stderrPath = path.join(outDir, `${runId}.codestory-packet.stderr.txt`);
@@ -2639,14 +2676,12 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_citation_count: Array.isArray(packet?.answer?.citations)
       ? packet.answer.citations.length
       : null,
-    packet_avoid_opening_count: Array.isArray(packet?.sufficiency?.avoid_opening)
-      ? packet.sufficiency.avoid_opening.length
-      : null,
+    packet_avoid_opening_count: packet ? packetAvoidOpeningRawPaths(packet).length : null,
     packet_latency: packetLatencyTelemetry(packet, wallMs),
     packet_composition: packetComposition(packet, run.task),
     packet_manifest_quality: packetManifestQualitySummary(packet, run.task),
     packet_extra_probe_count: extraProbes.length,
-    packet_extra_probe_strategy: extraProbes.length ? "manifest_expected_anchors" : null,
+    packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
   });
   return {
     public: publicPrelude,
@@ -3414,7 +3449,7 @@ function packetPayloadText(packet) {
   for (const claim of packet.sufficiency?.covered_claims ?? []) {
     chunks.push(claim.claim);
   }
-  for (const path of packet.sufficiency?.avoid_opening ?? []) {
+  for (const path of packetAvoidOpeningRawPaths(packet)) {
     chunks.push(path);
   }
   return chunks.filter(Boolean).join("\n");
@@ -3462,9 +3497,9 @@ function packetComposition(packet, task) {
       line: citation.line ?? null,
     }))
     .filter((entry) => entry.path);
-  const avoidOpeningPaths = (packet.sufficiency?.avoid_opening ?? [])
+  const avoidOpeningPaths = packetAvoidOpeningRawPaths(packet)
     .map((pathValue, index) => ({
-      source: "sufficiency.avoid_opening",
+      source: "sufficiency.avoid_opening_paths",
       path: pathValue,
       rank: index + 1,
       display_name: null,
@@ -3699,7 +3734,7 @@ function packetSufficiencyTelemetry(packet, quality) {
     status,
     covered_claims_count: packet.sufficiency?.covered_claims?.length ?? 0,
     open_next_count: packet.sufficiency?.open_next?.length ?? 0,
-    avoid_opening_count: packet.sufficiency?.avoid_opening?.length ?? 0,
+    avoid_opening_count: packetAvoidOpeningRawPaths(packet).length,
     gaps_count: packet.sufficiency?.gaps?.length ?? 0,
     follow_up_commands_count: packet.sufficiency?.follow_up_commands?.length ?? 0,
     gaps,
@@ -3776,7 +3811,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     indexing_in_timed_run: false,
     transport_mode: "cold_cli_packet",
   });
-  const args = packetCommandArgs(repoConfig, task);
+  const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
     env: benchmarkChildEnv(process.env),
@@ -3799,7 +3834,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const sufficiency = packetSufficiencyTelemetry(packet, quality);
   const latency = packetLatencyTelemetry(packet, wallMs);
   const composition = packetComposition(packet, task);
-  const extraProbes = packetManifestExtraProbes(task);
+  const extraProbes = packetCommandExtraProbes(task, opts);
   const runId = benchmarkRunId([task.repo, task.id, "cold-cli-packet", String(repeat).padStart(2, "0")]);
   await writeFile(path.join(outDir, `${runId}.stdout.json`), result.stdout, "utf8");
   await writeFile(path.join(outDir, `${runId}.stderr.txt`), result.stderr, "utf8");
@@ -3822,7 +3857,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
     packet_latency: latency,
     packet_composition: composition,
     packet_extra_probe_count: extraProbes.length,
-    packet_extra_probe_strategy: extraProbes.length ? "manifest_expected_anchors" : null,
+    packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
     sufficiency,
     quality,
   };
@@ -4375,6 +4410,9 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
         reasons.push("packet sufficiency says sufficient but manifest quality failed");
       }
       if (enforcePacketRuntimeTelemetry) {
+        if (row.packet_extra_probe_strategy) {
+          reasons.push(`diagnostic packet extra probes used: ${row.packet_extra_probe_strategy}`);
+        }
         if (!row.sufficiency) {
           reasons.push("missing packet sufficiency telemetry");
         } else if (row.sufficiency.status !== "sufficient") {
@@ -5086,6 +5124,21 @@ function agentPublishableBlockers(results, opts = {}) {
       if (result.packet_first_required && !result.packet_first_pass) {
         reasons.push("missing answer packet as first successful context command");
       }
+      if (
+        opts.publishable &&
+        result.arm === "with_codestory" &&
+        result.packet_first_required &&
+        maxSourceReadsAfterPacket == null
+      ) {
+        reasons.push("missing explicit post-packet source-read budget");
+      }
+      const packetExtraProbeStrategy =
+        result.codestory_harness_prelude?.packet_extra_probe_strategy ??
+        result.packet_extra_probe_strategy ??
+        null;
+      if (opts.publishable && result.arm === "with_codestory" && packetExtraProbeStrategy) {
+        reasons.push(`diagnostic packet extra probes used: ${packetExtraProbeStrategy}`);
+      }
       if (result.task_id && !result.quality) {
         reasons.push("missing manifest quality score");
       }
@@ -5331,6 +5384,7 @@ function runSelfTest() {
       covered_claims: [{ claim: "covered" }],
       open_next: [],
       avoid_opening: ["crates/codestory-cli/src/main.rs because already cited"],
+      avoid_opening_paths: ["crates/codestory-cli/src/main.rs"],
       gaps: [],
       follow_up_commands: [],
     },
@@ -5471,13 +5525,33 @@ function resolveRunArtifactPath(runDir, artifactPath) {
   if (!artifactPath) {
     return null;
   }
-  return path.isAbsolute(artifactPath) ? artifactPath : path.resolve(runDir, artifactPath);
+  const artifactText = String(artifactPath).trim();
+  if (!artifactText || path.isAbsolute(artifactText)) {
+    return null;
+  }
+  if (!REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN.test(path.basename(artifactText))) {
+    return null;
+  }
+  const resolved = path.resolve(runDir, artifactText);
+  return isPathInside(runDir, resolved) ? resolved : null;
 }
 
 async function copyResultArtifact(runDir, outDir, artifactPath, nextName) {
   const source = resolveRunArtifactPath(runDir, artifactPath);
-  if (!source || !existsSync(source)) {
+  if (!source) {
+    return null;
+  }
+  if (!existsSync(source)) {
     return artifactPath ?? null;
+  }
+  const sourceStat = statSync(source);
+  if (!sourceStat.isFile()) {
+    return null;
+  }
+  if (sourceStat.size > MAX_REUSED_ARTIFACT_BYTES) {
+    throw new Error(
+      `Refusing to reuse oversized baseline artifact ${source}: ${sourceStat.size} bytes exceeds ${MAX_REUSED_ARTIFACT_BYTES}`,
+    );
   }
   const destination = path.join(outDir, nextName);
   await copyFile(source, destination);
@@ -5734,6 +5808,7 @@ export {
   benchmarkRunId,
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
+  copyResultArtifact,
   qualityFailureReasons,
   commandCategory,
   extractCommandExecutions,
@@ -5753,10 +5828,12 @@ export {
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   PACKET_COMPOSITION_WEIGHTS,
+  MAX_REUSED_ARTIFACT_BYTES,
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
   repoProvenanceBlockers,
+  resolveRunArtifactPath,
   repoConfigFromManifest,
   resolveCodeStoryCli,
   scoreQuality,

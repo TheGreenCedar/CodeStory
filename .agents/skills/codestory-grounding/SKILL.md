@@ -41,9 +41,11 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 - When `packet` reports `sufficient` and `follow_up_commands` is empty, answer
   from the packet; budget truncation alone is not a gap. Preserve supported-claim
   wording and include a compact "Support files" list from `answer.citations` and
-  `sufficiency.avoid_opening`. Do not run ordinary source reads, `rg`, `grep`, or
-  `git show` only to verify packet citations; run more commands only for a named
-  unresolved gap, an edit target, or a user-requested worktree proof.
+  `sufficiency.avoid_opening_paths`. The older `sufficiency.avoid_opening` field
+  is human-readable compatibility prose, not the raw path contract. Do not run
+  ordinary source reads, `rg`, `grep`, or `git show` only to verify packet
+  citations; run more commands only for a named unresolved gap, an edit target,
+  or a user-requested worktree proof.
 - When `packet` reports `partial`, read `sufficiency.follow_up_commands` and run
   those commands in order. Prefer listed targeted `search --why` commands before
   escalating to a larger packet budget. As soon as a follow-up packet becomes

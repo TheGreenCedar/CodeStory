@@ -301,6 +301,13 @@ codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace>
 ```
 
+`setup-retrieval-env.mjs --fetch-embed-model` downloads the configured GGUF to a
+temporary path and verifies the pinned artifact before renaming it into
+`CODESTORY_EMBED_MODEL_DIR`. The accepted artifact is exactly `117974304` bytes
+with SHA-256
+`ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`; all
+configured mirrors must pass the same check.
+
 Run `codestory-cli retrieval index` only after the local sidecar services,
 llama.cpp embedding endpoint, and `bge-base-en-v1.5` model configuration are
 ready, then require `retrieval status --format json` to report

@@ -23,6 +23,7 @@ mod cache;
 pub mod cancellation;
 pub mod compilation_database;
 pub mod intermediate_storage;
+mod language_configs;
 pub mod resolution;
 pub mod semantic;
 pub mod structural;
@@ -10929,123 +10930,7 @@ pub fn language_support_profile_for_language_name(
 }
 
 pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
-    let ext = codestory_contracts::language_support::normalize_extension(ext);
-    match ext.as_str() {
-        // Keep this extension map aligned with the top-level live rule registry.
-        "py" | "pyi" => Some(make_language_config(
-            tree_sitter_python::LANGUAGE.into(),
-            "python",
-            PYTHON_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Python,
-        )),
-        "java" => Some(make_language_config(
-            tree_sitter_java::LANGUAGE.into(),
-            "java",
-            JAVA_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Java,
-        )),
-        "rs" => Some(make_language_config(
-            tree_sitter_rust::LANGUAGE.into(),
-            "rust",
-            RUST_GRAPH_QUERY,
-            Some(RUST_TAGS_QUERY),
-            LanguageRuleset::Rust,
-        )),
-        "js" | "jsx" | "mjs" | "cjs" => Some(make_language_config(
-            tree_sitter_javascript::LANGUAGE.into(),
-            "javascript",
-            JAVASCRIPT_GRAPH_QUERY,
-            None,
-            LanguageRuleset::JavaScript,
-        )),
-        "ts" | "mts" | "cts" => Some(make_language_config(
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "typescript",
-            TYPESCRIPT_GRAPH_QUERY,
-            Some(TYPESCRIPT_TAGS_QUERY),
-            LanguageRuleset::TypeScript,
-        )),
-        "tsx" => Some(make_language_config(
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            "typescript",
-            TSX_GRAPH_QUERY,
-            Some(TSX_TAGS_QUERY),
-            LanguageRuleset::Tsx,
-        )),
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(make_language_config(
-            tree_sitter_cpp::LANGUAGE.into(),
-            "cpp",
-            CPP_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Cpp,
-        )),
-        "c" | "h" => Some(make_language_config(
-            tree_sitter_c::LANGUAGE.into(),
-            "c",
-            C_GRAPH_QUERY,
-            None,
-            LanguageRuleset::C,
-        )),
-        "go" => Some(make_language_config(
-            tree_sitter_go::LANGUAGE.into(),
-            "go",
-            GO_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Go,
-        )),
-        "rb" => Some(make_language_config(
-            tree_sitter_ruby::LANGUAGE.into(),
-            "ruby",
-            RUBY_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Ruby,
-        )),
-        "php" => Some(make_language_config(
-            tree_sitter_php::LANGUAGE_PHP.into(),
-            "php",
-            PHP_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Php,
-        )),
-        "cs" => Some(make_language_config(
-            tree_sitter_c_sharp::LANGUAGE.into(),
-            "csharp",
-            CSHARP_GRAPH_QUERY,
-            None,
-            LanguageRuleset::CSharp,
-        )),
-        "kt" | "kts" => Some(make_language_config(
-            tree_sitter_kotlin_ng::LANGUAGE.into(),
-            "kotlin",
-            KOTLIN_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Kotlin,
-        )),
-        "swift" => Some(make_language_config(
-            tree_sitter_swift::LANGUAGE.into(),
-            "swift",
-            SWIFT_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Swift,
-        )),
-        "dart" => Some(make_language_config(
-            tree_sitter_dart_orchard::LANGUAGE.into(),
-            "dart",
-            DART_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Dart,
-        )),
-        "sh" | "bash" => Some(make_language_config(
-            tree_sitter_bash::LANGUAGE.into(),
-            "bash",
-            BASH_GRAPH_QUERY,
-            None,
-            LanguageRuleset::Bash,
-        )),
-        _ => None,
-    }
+    language_configs::get_language_for_ext(ext)
 }
 
 pub fn generate_id(name: &str) -> i64 {

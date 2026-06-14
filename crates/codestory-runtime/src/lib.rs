@@ -975,10 +975,7 @@ fn language_family_alias(requested: &str) -> Option<&'static str> {
 }
 
 fn language_profile_matches_extension(profile: &LanguageSupportProfile, extension: &str) -> bool {
-    profile
-        .extensions
-        .iter()
-        .any(|candidate| *candidate == extension)
+    profile.extensions.contains(&extension)
 }
 
 fn language_profile_matches_extension_name(language_name: &str, extension: &str) -> bool {
@@ -8606,7 +8603,15 @@ impl AppController {
                 &query_result.hits,
                 limit_per_source,
             )
-            .unwrap_or_default();
+            .map_err(|error| {
+                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
+                    self,
+                    format!(
+                        "sidecar search rejected query: candidate resolution failed: {}",
+                        error.message
+                    ),
+                )
+            })?;
         if let Some(reason) = agent::retrieval_primary::sidecar_result_rejection_reason(
             &query_result,
             &indexed_symbol_hits,
@@ -11577,7 +11582,7 @@ mod tests {
         fs::write(&small_path, "small").expect("write small file");
         fs::write(&large_path, "too-large").expect("write large file");
         let mut context = SemanticDocGraphContext::default();
-        let nodes = vec![
+        let nodes = [
             semantic_file_text_cache_node(1, "small.rs", &small_path, &mut context),
             semantic_file_text_cache_node(2, "large.rs", &large_path, &mut context),
         ];
@@ -11604,7 +11609,7 @@ mod tests {
         fs::write(&b_path, "bbbb").expect("write b file");
         fs::write(&c_path, "cc").expect("write c file");
         let mut context = SemanticDocGraphContext::default();
-        let nodes = vec![
+        let nodes = [
             semantic_file_text_cache_node(1, "a.rs", &a_path, &mut context),
             semantic_file_text_cache_node(2, "b.rs", &b_path, &mut context),
             semantic_file_text_cache_node(3, "c.rs", &c_path, &mut context),

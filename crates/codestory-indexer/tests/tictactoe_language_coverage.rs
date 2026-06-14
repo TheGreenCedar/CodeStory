@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{AccessKind, Edge, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::language_support::{LANGUAGE_SUPPORT_PROFILES, LanguageSupportMode};
 use codestory_indexer::{get_language_for_ext, index_file};
 use std::path::Path;
 
@@ -787,50 +788,31 @@ fn access_for_name(
 
 #[test]
 fn test_language_extension_coverage_and_names() {
-    let expected = [
-        ("py", "python"),
-        ("pyi", "python"),
-        ("java", "java"),
-        ("rs", "rust"),
-        ("js", "javascript"),
-        ("jsx", "javascript"),
-        ("mjs", "javascript"),
-        ("cjs", "javascript"),
-        ("ts", "typescript"),
-        ("tsx", "typescript"),
-        ("mts", "typescript"),
-        ("cts", "typescript"),
-        ("cpp", "cpp"),
-        ("cc", "cpp"),
-        ("cxx", "cpp"),
-        ("h", "c"),
-        ("hh", "cpp"),
-        ("hpp", "cpp"),
-        ("hxx", "cpp"),
-        ("c", "c"),
-        ("go", "go"),
-        ("rb", "ruby"),
-        ("php", "php"),
-        ("cs", "csharp"),
-        ("kt", "kotlin"),
-        ("kts", "kotlin"),
-        ("swift", "swift"),
-        ("dart", "dart"),
-        ("sh", "bash"),
-        ("bash", "bash"),
-    ];
-
-    for (ext, expected_name) in expected {
-        let language_config =
-            get_language_for_ext(ext).expect("Extension should resolve to a language");
-        assert_eq!(
-            language_config.language_name, expected_name,
-            "Wrong language name for extension {ext}"
-        );
-        assert!(
-            !language_config.graph_query.trim().is_empty(),
-            "Expected non-empty graph query for extension {ext}"
-        );
+    for profile in LANGUAGE_SUPPORT_PROFILES {
+        for ext in profile.extensions {
+            let language_config = get_language_for_ext(ext);
+            match profile.support_mode {
+                LanguageSupportMode::ParserBackedGraph => {
+                    let language_config = language_config.unwrap_or_else(|| {
+                        panic!("Parser-backed registry extension should route to indexer: {ext}")
+                    });
+                    assert_eq!(
+                        language_config.language_name, profile.language_name,
+                        "Wrong language name for extension {ext}"
+                    );
+                    assert!(
+                        !language_config.graph_query.trim().is_empty(),
+                        "Expected non-empty graph query for extension {ext}"
+                    );
+                }
+                LanguageSupportMode::StructuralCollector => {
+                    assert!(
+                        language_config.is_none(),
+                        "Structural collector extension should not route through tree-sitter graph parser: {ext}"
+                    );
+                }
+            }
+        }
     }
 }
 

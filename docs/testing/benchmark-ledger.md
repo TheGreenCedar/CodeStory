@@ -90,9 +90,12 @@ and model.
 Use `--publishable` only when the selected runner reports token usage and every
 run succeeds. For agent A/B rows, `--publishable` also requires with-CodeStory
 runs to execute an answer packet with `--question` first and stay within the
-post-packet ordinary source-read budget. Publishable rows must carry clean
-repository provenance pinned to an immutable commit or tag plus CodeStory cache
-provenance from `doctor --format json`.
+explicit post-packet ordinary source-read budget supplied through
+`--max-source-reads-after-packet <n>`. Use `0` for packet-only promotion
+evidence; use a larger number only when the row is intentionally CodeStory-first
+but not packet-only. Publishable rows must carry clean repository provenance
+pinned to an immutable commit or tag plus CodeStory cache provenance from
+`doctor --format json`.
 
 Packet runtime runs compare cold CLI `packet` invocations with warm
 `serve --stdio` packet calls. They are runtime rows, not agent-token rows, and
@@ -102,7 +105,7 @@ still use manifest quality gates before promotion.
 
 ```sh
 node ./scripts/codestory-agent-ab-benchmark.mjs --list
-node ./scripts/codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable
+node ./scripts/codestory-agent-ab-benchmark.mjs --quick --repos codestory --repeats 3 --timeout-ms 600000 --publishable --max-source-reads-after-packet 0
 node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --list
 node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite public-core --task-ids codestory-indexing-flow,vite-dev-server-architecture --arms with_codestory --repeats 3 --max-source-reads-after-packet 0 --allow-failures
 node ./scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
