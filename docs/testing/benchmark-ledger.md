@@ -1,6 +1,6 @@
 # CodeStory Benchmark Ledger
 
-Decision-grade scorecard and benchmark history — too dense for the README.
+Decision-grade scorecard and benchmark history - too dense for the README.
 Treat every row as machine-, cache-, runner-, and date-specific. Do not quote a
 row as a universal savings claim without checking harness tier and setup.
 

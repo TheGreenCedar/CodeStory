@@ -112,7 +112,6 @@ test-only eval probe module.
 ```sh
 cargo test -p codestory-runtime --test retrieval_generalization_guard
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
-cargo test -p codestory-cli --test onboarding_contracts
 ```
 
 Optional broader lane:
@@ -145,7 +144,6 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | `freelancer` / `traderotate` removed from default holdouts | done | OSS holdouts only |
 | Generalization lint + guard test | done | `lint-retrieval-generalization.mjs`, `retrieval_generalization_guard` |
 | Warning config | done | `docs/architecture/retrieval-rollback.json` |
-| Markdown link contract (`onboarding_contracts`) | verify | `cargo test -p codestory-cli --test onboarding_contracts` |
 | local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
 | holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
 | `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
