@@ -78,6 +78,14 @@ pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub(crate) use search_runtime::SearchEngine;
+
+#[cfg(test)]
+static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn process_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_ENV_TEST_LOCK.lock().expect("process env test lock")
+}
 pub use search_runtime::*;
 use semantic_doc_text::{
     runtime_concept_phrases, semantic_doc_language_from_path, semantic_path_aliases,
@@ -358,7 +366,7 @@ struct FrameworkRouteCoverageEntry {
     framework: &'static str,
     language: &'static str,
     status: &'static str,
-    fixture_status: &'static str,
+    coverage_evidence: &'static str,
     confidence_floor: &'static str,
     handler_link_support: &'static str,
     unsupported_patterns: &'static [&'static str],
@@ -371,7 +379,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "express",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &[
@@ -385,7 +393,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "react-router",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &[
@@ -398,7 +406,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "sveltekit",
         language: "svelte/javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_server_method_exports",
         unsupported_patterns: &[
@@ -411,7 +419,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "nextjs",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_route_method_exports",
         unsupported_patterns: &["middleware rewrites and route groups require source review"],
@@ -422,7 +430,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "remix",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_loader_action_exports",
         unsupported_patterns: &["route config composition and resource routes are partial"],
@@ -433,7 +441,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "astro",
         language: "astro/javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_endpoint_method_exports",
         unsupported_patterns: &["redirects and integration-generated routes are not expanded"],
@@ -444,7 +452,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "nuxt",
         language: "vue/javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "file_convention",
         handler_link_support: "probable_for_server_handlers",
         unsupported_patterns: &["route middleware and generated module routes are partial"],
@@ -455,7 +463,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fastify",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["plugin prefixes and schema-only route declarations are partial"],
@@ -466,7 +474,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "koa",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["router prefixes and middleware arrays are partial"],
@@ -477,7 +485,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "hono",
         language: "javascript/typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["basePath/grouped routes are partial"],
@@ -488,7 +496,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "nestjs",
         language: "typescript",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "decorator",
         handler_link_support: "probable_for_controller_method",
         unsupported_patterns: &["global prefixes and dynamic decorator expressions are partial"],
@@ -499,7 +507,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "django",
         language: "python",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["include() trees and namespaced URLConfs are not fully expanded"],
@@ -510,7 +518,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "flask",
         language: "python",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "decorator",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["blueprint prefixes and dynamic method declarations are partial"],
@@ -521,7 +529,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fastapi",
         language: "python",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "decorator",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["router prefixes and dependency-driven routing are partial"],
@@ -532,7 +540,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "rails",
         language: "ruby",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["resource expansion is not fully enumerated"],
@@ -543,7 +551,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "laravel",
         language: "php",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["controller arrays and route groups are partial"],
@@ -554,7 +562,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "spring",
         language: "java",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "annotation",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["class-level prefixes are not fully combined in every case"],
@@ -565,7 +573,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "aspnet",
         language: "csharp",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "attribute",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["controller-level route templates are partial"],
@@ -576,7 +584,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "axum",
         language: "rust",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["nested routers and stateful route composition are partial"],
@@ -587,7 +595,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "actix",
         language: "rust",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "probable_when_handler_name_resolves",
         unsupported_patterns: &["scoped services and macros are partial"],
@@ -598,7 +606,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "rocket",
         language: "rust",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "attribute",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["mount prefixes are not fully combined"],
@@ -609,7 +617,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "gin",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["router groups and middleware chains are partial"],
@@ -620,7 +628,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "chi",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["route groups and mounted subrouters are partial"],
@@ -631,7 +639,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "echo",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["group prefixes are partial"],
@@ -642,7 +650,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fiber",
         language: "go",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed_text_only",
         unsupported_patterns: &["group prefixes and mounted apps are partial"],
@@ -653,7 +661,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "vue-router",
         language: "vue",
         status: "partial",
-        fixture_status: "covered_by_indexer_unit_fixture",
+        coverage_evidence: "validated_by_indexer_regression",
         confidence_floor: "heuristic",
         handler_link_support: "not_claimed",
         unsupported_patterns: &["imported route arrays and generated routes are partial"],
@@ -674,7 +682,7 @@ fn framework_route_coverage_dto(entry: &FrameworkRouteCoverageEntry) -> Framewor
         framework: entry.framework.to_string(),
         language: entry.language.to_string(),
         status: entry.status.to_string(),
-        fixture_status: entry.fixture_status.to_string(),
+        coverage_evidence: entry.coverage_evidence.to_string(),
         confidence_floor: entry.confidence_floor.to_string(),
         handler_link_support: entry.handler_link_support.to_string(),
         unsupported_patterns: entry
@@ -10952,7 +10960,7 @@ mod tests {
     }
 
     #[test]
-    fn framework_route_coverage_matrix_lists_fixture_status_and_known_gaps() {
+    fn framework_route_coverage_matrix_lists_coverage_evidence_and_known_gaps() {
         let coverage = framework_route_coverage_matrix();
         let frameworks = coverage
             .iter()
@@ -10992,7 +11000,7 @@ mod tests {
             );
         }
         assert!(coverage.iter().all(|entry| {
-            !entry.fixture_status.is_empty()
+            !entry.coverage_evidence.is_empty()
                 && !entry.confidence_floor.is_empty()
                 && !entry.handler_link_support.is_empty()
                 && !entry.unsupported_patterns.is_empty()

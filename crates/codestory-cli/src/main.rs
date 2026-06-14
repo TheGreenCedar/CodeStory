@@ -7721,11 +7721,11 @@ fn render_framework_route_coverage(
 
 fn framework_route_coverage_row(entry: &FrameworkRouteCoverageDto) -> String {
     format!(
-        "- {} ({}) status={} fixture_status={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
+        "- {} ({}) status={} coverage_evidence={} confidence_floor={} handler_link={} promotable={} unsupported={} known_gaps={}",
         entry.framework,
         entry.language,
         entry.status,
-        entry.fixture_status,
+        entry.coverage_evidence,
         entry.confidence_floor,
         entry.handler_link_support,
         entry.promotable,

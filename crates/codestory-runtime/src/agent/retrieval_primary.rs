@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_000;
+const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
+const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
@@ -303,6 +305,13 @@ pub(crate) fn sidecar_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
         .max(100)
 }
 
+fn sidecar_packet_batch_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
+    latency_budget_ms
+        .map(u64::from)
+        .unwrap_or(DEFAULT_PACKET_BATCH_BUDGET_MS)
+        .clamp(100, MAX_PACKET_BATCH_BUDGET_MS)
+}
+
 pub(crate) fn run_sidecar_query(
     controller: &AppController,
     query: &str,
@@ -490,7 +499,7 @@ fn search_sidecar_packet_batch_inner_with_query(
     latency_budget_ms: Option<u32>,
     mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
-    let per_query_budget = sidecar_budget_ms(latency_budget_ms)
+    let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
         .checked_div(queries.len().max(1) as u64)
         .unwrap_or(100)
         .max(100);
@@ -538,16 +547,13 @@ fn search_sidecar_packet_batch_inner_with_query(
 
 fn sidecar_packet_batch_rejection_reason(
     query_result: &QueryResult,
-    resolved_hits: &[SearchHit],
+    _resolved_hits: &[SearchHit],
 ) -> Option<String> {
     if !sidecar_mode_can_serve_primary(&query_result.trace.retrieval_mode) {
         return Some(format!(
             "sidecar retrieval mode `{}` is not eligible for packet batch results",
             query_result.trace.retrieval_mode
         ));
-    }
-    if !query_result.hits.is_empty() && resolved_hits.is_empty() {
-        return Some("sidecar candidates did not resolve to indexed symbols".to_string());
     }
     None
 }
@@ -1302,12 +1308,9 @@ mod tests {
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
     };
-    use std::sync::{Mutex, MutexGuard};
 
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_test_lock() -> MutexGuard<'static, ()> {
-        ENV_TEST_LOCK.lock().expect("env test lock")
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::process_env_test_lock()
     }
 
     #[test]
@@ -1623,6 +1626,21 @@ mod tests {
         assert_eq!(sidecar_budget_ms(Some(400)), 400);
         assert_eq!(sidecar_budget_ms(Some(5_000)), DEFAULT_SIDECAR_BUDGET_MS);
         assert_eq!(sidecar_budget_ms(None), DEFAULT_SIDECAR_BUDGET_MS);
+    }
+
+    #[test]
+    fn packet_batch_budget_uses_packet_latency_budget() {
+        assert_eq!(
+            sidecar_packet_batch_budget_ms(None),
+            DEFAULT_PACKET_BATCH_BUDGET_MS
+        );
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(18_000)), 18_000);
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(5_000)), 5_000);
+        assert_eq!(sidecar_packet_batch_budget_ms(Some(5)), 100);
+        assert_eq!(
+            sidecar_packet_batch_budget_ms(Some(250_000)),
+            MAX_PACKET_BATCH_BUDGET_MS
+        );
     }
 
     #[test]
@@ -1993,7 +2011,123 @@ mod tests {
         };
         assert_eq!(
             sidecar_packet_batch_rejection_reason(&unresolved, &[]).as_deref(),
-            Some("sidecar candidates did not resolve to indexed symbols")
+            None,
+            "packet subqueries should report unresolved full-mode candidates as diagnostics instead of aborting the whole packet"
+        );
+    }
+
+    #[test]
+    fn packet_batch_reports_unresolved_full_mode_candidates_without_rejecting() {
+        use codestory_retrieval::CandidateSource;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let queries = vec![("helpers".to_string(), 5)];
+        let outcome = search_sidecar_packet_batch_inner_with_query(
+            &controller,
+            &queries,
+            Some(500),
+            |_, _, _| {
+                Ok(QueryResult {
+                    query: "helpers".into(),
+                    features: classify_query("helpers"),
+                    hits: vec![CandidateHit::with_source(
+                        "docs/helpers.md",
+                        Some("helpers".into()),
+                        0.5,
+                        CandidateSource::Scip,
+                    )],
+                    trace: QueryTrace {
+                        retrieval_mode: "full".into(),
+                        degraded_reason: None,
+                        total_budget_ms: 500,
+                        elapsed_ms: 1,
+                        cancel_reason: None,
+                        cache_hit: false,
+                        stages: Vec::new(),
+                    },
+                })
+            },
+        )
+        .expect("full-mode unresolved candidates should not reject packet batch");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].0, "helpers");
+        assert!(
+            outcome.results[0].1.is_empty(),
+            "unresolved packet query should contribute no resolved hits"
+        );
+        assert_eq!(outcome.diagnostics.len(), 1);
+        let diagnostic = &outcome.diagnostics[0];
+        assert_eq!(diagnostic.query, "helpers");
+        assert_eq!(diagnostic.retrieval_mode, "full");
+        assert_eq!(diagnostic.candidate_count, 1);
+        assert_eq!(diagnostic.resolved_hit_count, 0);
+        assert_eq!(diagnostic.unresolved_candidate_count, 1);
+        assert!(
+            diagnostic
+                .diagnostic
+                .as_deref()
+                .is_some_and(|value| value.contains("did not all resolve")),
+            "diagnostic should preserve unresolved sidecar detail: {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn packet_batch_divides_request_budget_across_queries() {
+        use codestory_retrieval::classify_query;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+
+        let queries = vec![
+            ("entrypoint".to_string(), 5),
+            ("file discovery".to_string(), 5),
+            ("symbol extraction".to_string(), 5),
+            ("search projection".to_string(), 5),
+        ];
+        let mut observed_budgets = Vec::new();
+        let outcome = search_sidecar_packet_batch_inner_with_query(
+            &controller,
+            &queries,
+            Some(18_000),
+            |_, query, budget| {
+                observed_budgets.push(budget);
+                Ok(QueryResult {
+                    query: query.to_string(),
+                    features: classify_query(query),
+                    hits: Vec::new(),
+                    trace: QueryTrace {
+                        retrieval_mode: "full".into(),
+                        degraded_reason: None,
+                        total_budget_ms: u64::from(budget.unwrap_or_default()),
+                        elapsed_ms: 1,
+                        cancel_reason: None,
+                        cache_hit: false,
+                        stages: Vec::new(),
+                    },
+                })
+            },
+        )
+        .expect("empty full-mode packet query results should not reject");
+
+        assert_eq!(outcome.results.len(), queries.len());
+        assert_eq!(
+            observed_budgets,
+            vec![Some(4_500), Some(4_500), Some(4_500), Some(4_500)]
         );
     }
 

@@ -7,9 +7,11 @@ use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
 
-// Repo-scale wall-clock guard; the zero-reembed assertion below carries the
-// stronger semantic reuse contract.
-const REPEAT_FULL_REFRESH_SECONDS_BUDGET: f64 = 30.0;
+// Repo-scale smoke guard. Phase-specific assertions below carry the product
+// repeat-refresh contract; wall-clock process timing remains telemetry.
+const REPEAT_FULL_REFRESH_SMOKE_SECONDS_BUDGET: f64 = 45.0;
+const REPEAT_GRAPH_PHASE_SECONDS_BUDGET: f64 = 20.0;
+const REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET: f64 = 3.0;
 
 #[derive(Debug, Serialize)]
 struct RepoE2eStats {
@@ -45,6 +47,10 @@ struct RepoE2eStats {
     repeat_semantic_db_upsert_ms: u64,
     repeat_semantic_reload_ms: u64,
     repeat_semantic_prune_ms: u64,
+    repeat_cache_refresh_ms: u64,
+    repeat_search_projection_rebuild_ms: u64,
+    repeat_search_symbol_index_ms: u64,
+    repeat_runtime_cache_publish_ms: u64,
     repeat_semantic_docs_reused: u64,
     repeat_semantic_docs_embedded: u64,
     repeat_semantic_docs_pending: u64,
@@ -778,6 +784,22 @@ fn codestory_repo_release_e2e_emits_stats() {
         repeat_semantic_db_upsert_ms,
         repeat_semantic_reload_ms,
         repeat_semantic_prune_ms,
+        repeat_cache_refresh_ms: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "cache_refresh_ms"],
+        ),
+        repeat_search_projection_rebuild_ms: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "search_projection_rebuild_ms"],
+        ),
+        repeat_search_symbol_index_ms: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "search_symbol_index_ms"],
+        ),
+        repeat_runtime_cache_publish_ms: optional_u64_field(
+            &repeat_index_json,
+            &["phase_timings", "runtime_cache_publish_ms"],
+        ),
         repeat_semantic_docs_reused: optional_u64_field(
             &repeat_index_json,
             &["phase_timings", "semantic_docs_reused"],
@@ -924,9 +946,21 @@ fn codestory_repo_release_e2e_emits_stats() {
         "repeat full refresh should embed zero unchanged dense docs"
     );
     assert!(
-        stats.repeat_full_refresh_seconds < REPEAT_FULL_REFRESH_SECONDS_BUDGET,
-        "repeat full refresh should stay under {:.0} seconds, got {:.2}s",
-        REPEAT_FULL_REFRESH_SECONDS_BUDGET,
+        stats.repeat_graph_phase_seconds < REPEAT_GRAPH_PHASE_SECONDS_BUDGET,
+        "repeat graph phase should stay under {:.0} seconds, got {:.2}s",
+        REPEAT_GRAPH_PHASE_SECONDS_BUDGET,
+        stats.repeat_graph_phase_seconds
+    );
+    assert!(
+        stats.repeat_semantic_phase_seconds < REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
+        "repeat semantic reuse phase should stay under {:.0} seconds, got {:.2}s",
+        REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
+        stats.repeat_semantic_phase_seconds
+    );
+    assert!(
+        stats.repeat_full_refresh_seconds < REPEAT_FULL_REFRESH_SMOKE_SECONDS_BUDGET,
+        "repeat full refresh process smoke cap should stay under {:.0} seconds, got {:.2}s",
+        REPEAT_FULL_REFRESH_SMOKE_SECONDS_BUDGET,
         stats.repeat_full_refresh_seconds
     );
     assert!(

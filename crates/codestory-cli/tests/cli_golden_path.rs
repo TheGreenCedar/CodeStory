@@ -1664,7 +1664,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             .is_some_and(
                 |items| items.iter().any(|item| item["framework"] == "express"
                     && item["promotable"] == true
-                    && item["fixture_status"].is_string()
+                    && item["coverage_evidence"].is_string()
                     && item["unsupported_patterns"].is_array())
                     && items.iter().any(|item| item["framework"] == "nextjs"
                         && item["confidence_floor"] == "file_convention"

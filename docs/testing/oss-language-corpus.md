@@ -1,7 +1,7 @@
 # OSS Language Corpus
 
 The OSS language corpus is an ignored, opt-in test suite for checking each
-runtime-supported language against a pinned medium-sized open source project.
+public language-support profile against a pinned medium-sized open source project.
 It is intentionally outside the default test lane because it clones external
 repositories and can take several minutes.
 
@@ -96,7 +96,7 @@ $env:CODESTORY_OSS_CORPUS_CACHE = "target\agent-benchmark\repos"
 cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapture
 ```
 
-Result: 18/18 languages passed. The run compared 4,308 raw files and
+Result: 18/18 public language-support profiles passed the indexing-only corpus. The run compared 4,308 raw files and
 1,272,498 raw LOC against CodeStory indexing of the same file lists. CodeStory
 indexed 4,308 files and produced 385,735 nodes and 312,268 edges with 0 errors
 and 0 fatal errors. The latest per-language JSONL evidence is in

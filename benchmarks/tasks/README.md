@@ -66,7 +66,7 @@ same expected-anchor quality gates.
 ## Language Expansion Holdout
 
 The `language-expansion-holdout` suite is the triggerable agent A/B suite for
-runtime-supported languages. It is separate from the OSS language corpus:
+public language-support profiles. It is separate from the OSS language corpus:
 
 - The OSS corpus checks whether CodeStory can index pinned real projects.
 - This suite runs paired `without_codestory` and `with_codestory` agent arms
@@ -84,9 +84,10 @@ runtime-supported languages. It is separate from the OSS language corpus:
   invalid for publishable evidence if it calls CodeStory or never inspects the
   local repository.
 
-The suite currently has one medium-sized open source project per supported
-language: Python, Java, Rust, JavaScript, TypeScript, C++, C, Go, Ruby, PHP,
-C#, Kotlin, Swift, Dart, Bash, HTML, CSS, and SQL.
+The suite currently has one medium-sized open source project per public
+language-support profile: parser-backed graph languages (Python, Java, Rust,
+JavaScript, TypeScript, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash)
+plus structural collectors (HTML, CSS, SQL).
 
 Materialize the pinned repos:
 
@@ -140,11 +141,11 @@ product code when they generalize to real projects.
 Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize the
 durable result in [language-expansion-ab-report.md](../../docs/testing/language-expansion-ab-report.md)
 instead of preserving local run directory catalogs here. The current packet
-runtime artifact passes manifest quality for `18/18` rows but is
-packet-sufficient for only `6/18`; the packet-eligible A/B slice is a quality
+runtime artifact passes manifest quality for `12/18` rows and is
+packet-sufficient for `9/18`; the packet-eligible A/B slice is a quality
 and efficiency win for its selected `9/9` CodeStory rows only. Treat that as
-packet-eligible slice evidence, not broad promotion proof for all supported
-languages.
+packet-eligible slice evidence, not broad promotion proof for all public
+language-support profiles.
 
 ## Local Real-Repo Corpus
 

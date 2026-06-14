@@ -203,7 +203,7 @@ In short: Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby,
 PHP, C#, Kotlin, Swift, Dart, and Bash are fidelity-gated parser-backed graph
 languages; HTML, CSS, and SQL use structural collectors.
 
-The opt-in OSS language corpus pairs each runtime-supported language with a
+The opt-in OSS language corpus pairs each public language-support profile with a
 pinned medium-sized open source project and compares raw filesystem counts
 against CodeStory indexing of the same files:
 [docs/testing/oss-language-corpus.md](docs/testing/oss-language-corpus.md).

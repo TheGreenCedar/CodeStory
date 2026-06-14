@@ -74,7 +74,7 @@ Before adding a new parser-backed language or broader framework claim:
    `get_language_for_ext`, and this page in the same change.
 6. Add or update the
    [OSS language corpus](../testing/oss-language-corpus.md) entry so the new
-   runtime-supported language has a pinned medium-sized open source project and
+   public language-support profile has a pinned medium-sized open source project and
    a raw-without-CodeStory indexing comparison lane.
 7. Add or update the `language-expansion-holdout` task manifest so the language
    also has a strict `without_codestory` versus `with_codestory` agent A/B task

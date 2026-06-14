@@ -145,13 +145,13 @@ For anti-overfit language work, run packet probes with production defaults and
 keep exact benchmark probes behind manifests, explicit request probes, or
 `CODESTORY_EVAL_PROBES=1` diagnostics only. Do not treat general
 framework/domain semantics as overfit when they apply to real projects.
-The current clean serial packet runtime scores `18/18` manifest-quality passes
-without sidecar failures, but only `6/18` rows are packet-sufficient without
-follow-up commands and Java/Redis still miss the retrieval latency SLA. The
+The current clean serial packet runtime scores `12/18` manifest-quality passes
+without sidecar failures, with `9/18` rows packet-sufficient without follow-up
+commands and Java, Redis, and Okio still missing the retrieval latency SLA. The
 matching packet-gated A/B slice is useful for cost/time/tool-call accounting
 (`9/9` CodeStory quality versus `6/9` baseline), but it is not promotion
-evidence for all supported languages because the slice is selected from rows
-that are useful to compare today.
+evidence for all public language-support profiles because the slice is selected
+from rows that are useful to compare today.
 
 The lower-level packet runtime mode can also be run directly with row-level
 parallelism:
@@ -205,6 +205,7 @@ invalid local-repo evidence. For local smoke verification on a trusted checkout,
 rerun with `--sandbox danger-full-access` and confirm the summary shows local
 command/tool counts and zero web searches.
 
-Do not make public savings claims from these fixtures. They only prove parser
-and scorer behavior. Promotion evidence still requires real benchmark runs with
-raw transcripts, repeated medians, and quality thresholds.
+Do not make public savings claims from these fixtures. They only prove
+transcript analyzer/parser and scorer behavior. Promotion evidence still
+requires real benchmark runs with raw transcripts, repeated medians, and quality
+thresholds.

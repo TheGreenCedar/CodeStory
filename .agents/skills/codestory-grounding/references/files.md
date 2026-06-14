@@ -35,7 +35,7 @@ claims about what the graph can see.
 
 - `files` reads persisted `FileInfo`; it does not scan the repo live unless `--refresh` asks for an index refresh.
 - Treat `index usable` with incomplete or error counts as a partial-coverage signal, not a failure.
-- `summary.framework_route_coverage` is the support matrix for framework route extraction. It includes `status`, `fixture_status`, `confidence_floor`, `handler_link_support`, `unsupported_patterns`, `known_gaps`, and `promotable`. Treat `partial`, `heuristic`, text-only handler support, and `promotable=false` as review prompts, not proof of full framework parity.
+- `summary.framework_route_coverage` is the support matrix for framework route extraction. It includes `status`, `coverage_evidence`, `confidence_floor`, `handler_link_support`, `unsupported_patterns`, `known_gaps`, and `promotable`. Treat `partial`, `heuristic`, text-only handler support, and `promotable=false` as review prompts, not proof of full framework parity.
 - Route coverage statuses:
   - `supported`: fixture-backed behavior is passing and documented coverage is met.
   - `heuristic`: pattern-backed evidence that needs source review.

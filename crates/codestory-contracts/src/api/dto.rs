@@ -598,7 +598,8 @@ pub struct FrameworkRouteCoverageDto {
     pub framework: String,
     pub language: String,
     pub status: String,
-    pub fixture_status: String,
+    #[serde(alias = "fixture_status")]
+    pub coverage_evidence: String,
     pub confidence_floor: String,
     pub handler_link_support: String,
     #[serde(default)]
@@ -1823,7 +1824,7 @@ pub struct PacketSufficiencyDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct PacketBenchmarkTraceDto {
+pub struct PacketRetrievalTraceSummaryDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
     pub source_read_steps: u32,
     pub search_steps: u32,
@@ -1840,7 +1841,8 @@ pub struct AgentPacketDto {
     pub answer: AgentAnswerDto,
     pub budget: PacketBudgetDto,
     pub sufficiency: PacketSufficiencyDto,
-    pub benchmark_trace: PacketBenchmarkTraceDto,
+    #[serde(alias = "benchmark_trace")]
+    pub retrieval_trace_summary: PacketRetrievalTraceSummaryDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1969,6 +1971,47 @@ mod packet_tests {
                 .map(|shadow| shadow.retrieval_mode.as_str()),
             Some("unavailable")
         );
+    }
+
+    #[test]
+    fn framework_route_coverage_uses_product_evidence_field_with_legacy_alias() {
+        let coverage = FrameworkRouteCoverageDto {
+            framework: "express".to_string(),
+            language: "javascript/typescript".to_string(),
+            status: "partial".to_string(),
+            coverage_evidence: "validated_by_indexer_regression".to_string(),
+            confidence_floor: "heuristic".to_string(),
+            handler_link_support: "probable_when_handler_name_resolves".to_string(),
+            unsupported_patterns: vec!["router composition is partial".to_string()],
+            known_gaps: vec!["mounted prefixes are not globally propagated".to_string()],
+            promotable: true,
+        };
+
+        let value = serde_json::to_value(&coverage).expect("serialize");
+        assert_eq!(
+            value["coverage_evidence"],
+            "validated_by_indexer_regression"
+        );
+        assert!(
+            value.get("fixture_status").is_none(),
+            "product JSON should use coverage_evidence, not fixture_status"
+        );
+
+        let legacy: FrameworkRouteCoverageDto = serde_json::from_str(
+            r#"{
+                "framework":"express",
+                "language":"javascript/typescript",
+                "status":"partial",
+                "fixture_status":"covered_by_indexer_unit_fixture",
+                "confidence_floor":"heuristic",
+                "handler_link_support":"probable_when_handler_name_resolves",
+                "unsupported_patterns":[],
+                "known_gaps":[],
+                "promotable":true
+            }"#,
+        )
+        .expect("deserialize legacy field spelling");
+        assert_eq!(legacy.coverage_evidence, "covered_by_indexer_unit_fixture");
     }
 
     #[test]

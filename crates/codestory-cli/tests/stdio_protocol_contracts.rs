@@ -1026,7 +1026,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "string",
                 "packet outputSchema should expose a stable packet id: {tool}"
             );
-            for field in ["plan", "answer", "budget", "sufficiency", "benchmark_trace"] {
+            for field in [
+                "plan",
+                "answer",
+                "budget",
+                "sufficiency",
+                "retrieval_trace_summary",
+            ] {
                 assert!(
                     required_fields(output_schema).contains(field),
                     "packet outputSchema should require {field}: {tool}"
@@ -1881,10 +1887,10 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
     );
     assert!(
         packet
-            .pointer("/benchmark_trace/source_read_steps")
+            .pointer("/retrieval_trace_summary/source_read_steps")
             .and_then(Value::as_u64)
             .is_some(),
-        "stdio packet should include benchmark trace counters: {packet}"
+        "stdio packet should include retrieval trace summary counters: {packet}"
     );
 
     let repeated_response = send_json(

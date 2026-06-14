@@ -61,7 +61,7 @@ Use [language-support.md](../architecture/language-support.md) when deciding
 whether a language claim is parser-backed graph, structural collector, or only
 a candidate parser compatibility record.
 
-The opt-in OSS corpus lane checks every runtime-supported language against a
+The opt-in OSS corpus lane checks every public language-support profile against a
 pinned medium-sized open source project and compares a raw filesystem baseline
 with CodeStory indexing of the same file set:
 
@@ -129,7 +129,14 @@ only to make that separate drill skip explicit during local release-evidence
 collection. A skipped drill means the release evidence is not real-repo drill
 proof; it does not rename the `proof_tier` emitted by the stats JSON.
 
-Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic seconds, symbol docs written, dense docs skipped, dense reason counts, dense docs reused, dense docs embedded, total index seconds, `repeat_full_refresh_seconds`, `retrieval_index_seconds`, `retrieval_status_seconds`, `report_seconds`, `proof_tier`, any `warnings`, and whether `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode` were `full`.
+Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`.
+Include graph seconds, semantic seconds, symbol docs written, dense docs skipped,
+dense reason counts, dense docs reused, dense docs embedded, total index
+seconds, `repeat_full_refresh_seconds`, repeat graph/semantic/cache/search
+timings, `retrieval_index_seconds`, `retrieval_status_seconds`,
+`report_seconds`, `proof_tier`, any `warnings`, and whether
+`sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode`
+were `full`.
 
 Release-readiness evidence is tiered:
 

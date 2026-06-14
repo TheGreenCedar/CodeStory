@@ -1,26 +1,71 @@
 use crate::agent::citation::{evidence_edge_ids_for_node, to_citation_from_hit};
-use crate::agent::eval_probes::{
-    eval_citation_shaped_claim, eval_flow_template_claims, eval_probes_enabled,
-    eval_supporting_claim_flow_sentence, push_eval_architecture_flow_probe_terms,
-    push_eval_flow_hint_packet_queries, push_eval_required_probe_queries,
-    push_index_derived_architecture_probes, push_prompt_concept_derived_symbol_probes,
-    push_prompt_named_file_probe_queries,
-};
 use crate::agent::packet_batch::{
-    PacketLatencyBudget, packet_anchor_probe_queries, packet_file_stem_matches_query,
-    run_packet_anchor_expansion, run_packet_planned_subqueries,
+    PacketLatencyBudget, packet_anchor_probe_queries, run_packet_anchor_expansion,
+    run_packet_planned_subqueries,
 };
 #[cfg(test)]
 use crate::agent::packet_batch::{
     packet_anchor_hit_is_relevant, packet_anchor_probe_limit_for_budget,
 };
-use crate::agent::packet_scoring::{
-    normalize_identifier, packet_adjacent_query_stop_term, packet_citation_key,
-    packet_citation_rank, packet_claim_carry_rank, packet_display_name_is_import_literal,
-    packet_display_name_is_test_like, packet_display_path, packet_low_signal_display_name,
-    packet_query_stop_term,
+#[cfg(test)]
+use crate::agent::packet_budget::{apply_packet_budget, next_deeper_packet_command};
+use crate::agent::packet_budget::{
+    apply_packet_budget_with_extra, packet_budget_limits, packet_budget_usage,
+    truncate_answer_markdown_to_byte_cap,
 };
-use crate::agent::planning::dedupe_packet_plan_queries;
+#[cfg(test)]
+use crate::agent::packet_capping::{
+    cap_citations, cap_packet_citations, promote_focus_neighborhood_citations,
+    promote_required_probe_citations,
+};
+#[cfg(test)]
+use crate::agent::packet_claim_profiles::{
+    packet_generic_css_animation_flow_claims, packet_generic_string_predicate_flow_claims,
+    packet_source_derived_claims_for_citation,
+};
+#[cfg(test)]
+use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
+use crate::agent::packet_claims::{
+    append_flow_template_claims, append_ranked_citation_claims, packet_flow_claims_markdown,
+};
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
+};
+#[cfg(test)]
+use crate::agent::packet_plan::{build_packet_plan, packet_concept_queries};
+use crate::agent::packet_plan::{
+    build_packet_plan_with_extra, extract_packet_query_terms, infer_packet_task_class,
+    packet_explicit_request_probe_queries, packet_plan_annotation, packet_request_extra_probes,
+    packet_symbol_probe_queries, push_unique_term,
+};
+#[cfg(test)]
+use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
+use crate::agent::packet_required_probes::{
+    PacketFileScopedSymbolProbe, packet_file_scoped_symbol_probe_parts,
+    packet_missing_sufficiency_probe_queries_with_extra, packet_probe_query_is_cited,
+    packet_sufficiency_required_probe_queries_with_extra,
+};
+#[cfg(test)]
+use crate::agent::packet_scoring::packet_citation_key;
+use crate::agent::packet_scoring::{
+    normalize_identifier, packet_citation_rank, packet_display_path,
+};
+use crate::agent::packet_source_patterns::packet_sql_identifier_after;
+#[cfg(test)]
+use crate::agent::packet_sufficiency::{
+    PACKET_MARKDOWN_TRUNCATION_SUFFIX, quote_packet_command_value,
+};
+use crate::agent::packet_sufficiency::{
+    PacketSufficiencyInput, build_packet_sufficiency as assemble_packet_sufficiency,
+};
+#[cfg(test)]
+use crate::agent::packet_sufficiency::{
+    packet_budget_exceeded_hard_output_cap, packet_claim_family,
+    packet_supported_claim_family_count,
+};
+use crate::agent::packet_terms::{
+    packet_probe_terms, packet_terms_indicate_sql_schema_flow, prompt_search_terms,
+};
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
     RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_log_rollback_after_packet,
@@ -31,27 +76,27 @@ use crate::agent::retrieval_primary::{
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
 use crate::{
-    AppController, FocusedSourceContext, HybridSearchScoredHit, exact_symbol_query_terms,
-    fallback_mermaid as diagnostic_mermaid, hybrid_retrieval_enabled, is_non_primary_source_term,
-    looks_like_standalone_symbol_query, mermaid_flowchart, mermaid_gantt, mermaid_sequence,
-    query_mentions_non_primary_source, retrieval_file_role_from_path,
+    AppController, FocusedSourceContext, HybridSearchScoredHit,
+    fallback_mermaid as diagnostic_mermaid, hybrid_retrieval_enabled, mermaid_flowchart,
+    mermaid_gantt, mermaid_sequence, query_mentions_non_primary_source,
 };
 use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
     AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepKindDto,
-    AgentRetrievalStepStatusDto, ApiError, GraphArtifactDto, GraphRequest, GraphResponse,
-    GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBenchmarkTraceDto,
-    PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto,
-    PacketClaimDto, PacketPlanDto, PacketPlanQueryDto, PacketSufficiencyDto,
-    PacketSufficiencyStatusDto, PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHitOrigin, SearchRepoTextMode, SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
+    ApiError, GraphArtifactDto, GraphRequest, GraphResponse, GroundingBudgetDto, IndexFreshnessDto,
+    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto,
+    PacketClaimDto, PacketPlanDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
+    PacketTaskClassDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin, SearchRepoTextMode,
+    SearchRequest, TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
-    AgentRetrievalStepDto, EdgeId, PacketSidecarQueryDiagnosticDto, SearchMatchQualityDto,
+    AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetUsageDto,
+    PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyStatusDto,
+    SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -69,12 +114,9 @@ const WEAK_INITIAL_MIN_LEXICAL_ANCHOR: f32 = 0.01;
 const WEAK_INITIAL_MIN_GRAPH_ANCHOR: f32 = 0.25;
 const SOURCE_SNIPPET_TRUNCATION_SUFFIX: &str =
     "\n// ... source snippet truncated by investigation byte cap\n```";
-const PACKET_MARKDOWN_TRUNCATION_SUFFIX: &str = "\n\n... packet section truncated by budget ...\n";
 const GRAPH_ARTIFACT_BUNDLE_BYTE_CAP: usize = 512 * 1024;
 const RETRIEVAL_VERSION_HYBRID: &str = "hybrid-v1";
 const RETRIEVAL_VERSION_SIDECAR_BLOCKED: &str = "sidecar-blocked-v1";
-const PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT: usize = 4;
-const PACKET_SOURCE_DEFINITION_CLAIM_LIMIT: usize = 6;
 fn retrieval_version(controller: &AppController) -> &'static str {
     if sidecar_retrieval_primary_enabled(controller) {
         RETRIEVAL_VERSION_SIDECAR
@@ -410,6 +452,7 @@ pub(crate) fn agent_packet(
         answer.retrieval_trace.retrieval_shadow = Some(shadow);
     }
     maybe_log_rollback_after_packet(controller, answer.retrieval_trace.retrieval_shadow.as_ref());
+    append_packet_step_trace_annotation(&mut answer);
 
     let budget = apply_packet_budget_with_extra(
         &project_root,
@@ -429,7 +472,7 @@ pub(crate) fn agent_packet(
         &budget,
         &extra_probes,
     );
-    let benchmark_trace = packet_benchmark_trace(&answer);
+    let retrieval_trace_summary = packet_retrieval_trace_summary(&answer);
 
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
@@ -439,7 +482,7 @@ pub(crate) fn agent_packet(
         answer,
         budget,
         sufficiency,
-        benchmark_trace,
+        retrieval_trace_summary,
     };
     enforce_packet_output_budget(&project_root, &mut packet);
 
@@ -449,1194 +492,16 @@ pub(crate) fn agent_packet(
     {
         let _ = std::fs::write(trace_path, payload);
     }
-    packet.answer.retrieval_trace.annotations.push(format!(
-        "packet_step_trace search_total_ms={} step_count={}",
-        trace_export::search_step_total_ms(&packet.answer),
-        packet.answer.retrieval_trace.steps.len()
-    ));
 
     Ok(packet)
 }
 
-#[cfg(test)]
-fn build_packet_plan(
-    question: &str,
-    requested: Option<PacketTaskClassDto>,
-    budget: PacketBudgetModeDto,
-) -> PacketPlanDto {
-    build_packet_plan_with_extra(question, requested, budget, &[])
-}
-
-fn build_packet_plan_with_extra(
-    question: &str,
-    requested: Option<PacketTaskClassDto>,
-    budget: PacketBudgetModeDto,
-    extra_probes: &[String],
-) -> PacketPlanDto {
-    let task_class = requested.unwrap_or_else(|| infer_packet_task_class(question));
-    let mut queries = Vec::new();
-    push_packet_query(
-        &mut queries,
-        question,
-        "original task phrasing for sidecar-primary source-backed retrieval",
-    );
-    for term in extract_packet_query_terms(question) {
-        push_packet_query(
-            &mut queries,
-            &term,
-            "concrete symbol, file, route, or code term",
-        );
-    }
-    for query in extra_probes {
-        push_packet_query(
-            &mut queries,
-            query,
-            "explicit symbol probe from packet request",
-        );
-    }
-    for query in packet_symbol_probe_queries(question, task_class, budget) {
-        push_packet_query(
-            &mut queries,
-            &query,
-            "symbol probe expanded from task wording",
-        );
-    }
-    for query in task_class_seed_queries(task_class) {
-        push_packet_query(&mut queries, query, "task-class retrieval seed");
-    }
-    for query in packet_concept_queries(question) {
-        push_packet_query(
-            &mut queries,
-            &query,
-            "natural-language concept from task wording",
-        );
-    }
-    let query_cap = packet_plan_query_cap(budget);
-    queries.truncate(query_cap);
-
-    let mut trace = vec![format!(
-        "task_class={:?} source={}",
-        task_class,
-        if requested.is_some() {
-            "request"
-        } else {
-            "heuristic"
-        }
-    )];
-    trace.push(format!("planned_queries={}", queries.len()));
-    if !extra_probes.is_empty() {
-        trace.push(format!(
-            "explicit_extra_probes={} source=request",
-            extra_probes.len()
-        ));
-    }
-
-    let mut plan = PacketPlanDto {
-        task_class,
-        inferred_task_class: requested.is_none(),
-        queries,
-        trace,
-    };
-    dedupe_packet_plan_queries(&mut plan);
-    plan.trace.push(format!(
-        "deduped_queries={} eval_probes={}",
-        plan.queries.len(),
-        eval_probes_enabled()
+fn append_packet_step_trace_annotation(answer: &mut AgentAnswerDto) {
+    answer.retrieval_trace.annotations.push(format!(
+        "packet_step_trace search_total_ms={} step_count={}",
+        trace_export::search_step_total_ms(answer),
+        answer.retrieval_trace.steps.len()
     ));
-    plan
-}
-
-fn packet_request_extra_probes(extra_probes: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for probe in extra_probes {
-        let probe = probe.trim();
-        if probe.is_empty() || probe.len() > 240 {
-            continue;
-        }
-        if !normalized
-            .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(probe))
-        {
-            normalized.push(probe.to_string());
-        }
-        if normalized.len() >= 16 {
-            break;
-        }
-    }
-    normalized
-}
-
-fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
-    plan.queries
-        .iter()
-        .filter(|query| query.purpose.contains("explicit symbol probe"))
-        .map(|query| query.query.clone())
-        .collect()
-}
-
-fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
-    match budget {
-        PacketBudgetModeDto::Tiny => 20,
-        PacketBudgetModeDto::Compact => 32,
-        PacketBudgetModeDto::Standard => 48,
-        PacketBudgetModeDto::Deep => 56,
-    }
-}
-
-fn packet_symbol_probe_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
-    budget: PacketBudgetModeDto,
-) -> Vec<String> {
-    let terms = packet_probe_terms(question);
-    let mut queries = Vec::new();
-    let compact = matches!(
-        budget,
-        PacketBudgetModeDto::Compact | PacketBudgetModeDto::Tiny
-    );
-
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_command_role_probe_queries(question, task_class),
-    );
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_command_exact_probe_queries(question, task_class),
-    );
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
-    );
-    if eval_probes_enabled() {
-        push_prompt_named_file_probe_queries(&terms, &mut queries);
-    }
-    push_prompt_derived_exact_flow_anchor_queries(&terms, &mut queries);
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_sufficiency_required_probe_queries_from_terms(&terms, task_class),
-    );
-    let concrete_file_queries = packet_concrete_file_probe_queries_from_required(&queries);
-    push_unique_owned_terms(&mut queries, &concrete_file_queries);
-    push_flow_hint_packet_queries(&terms, &mut queries);
-    push_task_class_symbol_probe_queries(task_class, &mut queries);
-    if !compact {
-        push_adjacent_packet_term_queries(&terms, &mut queries, 8);
-    } else if matches!(task_class, PacketTaskClassDto::ArchitectureExplanation) {
-        push_adjacent_packet_term_queries(&terms, &mut queries, 12);
-    }
-    push_generic_symbol_probe_queries(&terms, &mut queries, compact);
-
-    queries.truncate(packet_plan_query_cap(budget));
-    queries
-}
-
-fn packet_prompt_exact_symbol_probe_queries(
-    question: &str,
-    terms: &[String],
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    if !matches!(
-        task_class,
-        PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::EditPlanning
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::BugLocalization
-    ) {
-        return Vec::new();
-    }
-
-    let mut queries = Vec::new();
-    for term in exact_symbol_query_terms(question) {
-        if packet_prompt_exact_symbol_term_is_probe(&term) {
-            push_unique_term(&mut queries, &term);
-        }
-    }
-    if eval_probes_enabled() {
-        push_prompt_concept_derived_symbol_probes(terms, &mut queries);
-    }
-    queries
-}
-
-fn packet_prompt_exact_symbol_term_is_probe(term: &str) -> bool {
-    let trimmed = term.trim();
-    if trimmed.len() < 3 {
-        return false;
-    }
-    let letters = trimmed
-        .chars()
-        .filter(|ch| ch.is_ascii_alphabetic())
-        .collect::<Vec<_>>();
-    !letters.is_empty() && !letters.iter().all(|ch| ch.is_ascii_uppercase())
-}
-
-fn packet_probe_terms(question: &str) -> Vec<String> {
-    let include_non_primary_terms = query_mentions_non_primary_source(question);
-    let brand_terms = brand_phrase_noise_terms(question);
-    let mut terms = prompt_search_terms(question)
-        .into_iter()
-        .filter(|term| {
-            include_non_primary_terms
-                || !is_non_primary_source_term(term)
-                || packet_retains_non_primary_probe_term(question, term)
-        })
-        .collect::<Vec<_>>();
-
-    if !brand_terms.is_empty() && packet_terms_have_specific_flow_anchor(&terms) {
-        terms.retain(|term| !brand_terms.contains(term.as_str()));
-    }
-
-    terms
-}
-
-fn packet_retains_non_primary_probe_term(question: &str, term: &str) -> bool {
-    if !matches!(term, "bench" | "benchmark" | "benchmarks") {
-        return false;
-    }
-    let lowered = question.to_ascii_lowercase();
-    lowered.contains("architecture")
-        && (lowered.contains("boundary")
-            || lowered.contains("boundaries")
-            || lowered.contains("across"))
-}
-
-fn packet_terms_have_specific_flow_anchor(terms: &[String]) -> bool {
-    let has = |term: &str| terms.iter().any(|value| value.eq_ignore_ascii_case(term));
-    let has_any = |needles: &[&str]| needles.iter().any(|needle| has(needle));
-    (has("extension") && has("host"))
-        || ((has("indexing") || has("indexer")) && (has("storage") || has("persistent")))
-        || ((has("json") || has("jsonl")) && (has("exec") || has("thread") || has("turn")))
-        || packet_terms_indicate_request_dispatch_flow(terms)
-        || (has("event") && has("loop"))
-        || (has_any(&["command", "commands"]) && has_any(&["dispatch", "dispatches"]))
-        || (has("search") && (has("flags") || has("matcher") || has("haystack")))
-        || has("payload")
-        || has("posts")
-        || has("post")
-        || has("comments")
-        || has("feed")
-        || has("rss")
-}
-
-fn brand_phrase_noise_terms(question: &str) -> HashSet<String> {
-    let mut terms = HashSet::new();
-    let tokens = question
-        .split_whitespace()
-        .map(|token| {
-            token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | '.' | ';' | ':' | '?' | '!' | '(' | ')' | '[' | ']' | '{' | '}'
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-
-    for window in tokens.windows(3) {
-        if let [left, joiner, right] = window
-            && *joiner == "&"
-        {
-            if let Some(term) = title_case_brand_token_term(left) {
-                terms.insert(term);
-            }
-            if let Some(term) = title_case_brand_token_term(right) {
-                terms.insert(term);
-            }
-        }
-    }
-
-    terms
-}
-
-fn title_case_brand_token_term(token: &str) -> Option<String> {
-    let mut chars = token.chars();
-    let first = chars.next()?;
-    let second = chars.next()?;
-    if first.is_ascii_uppercase()
-        && second.is_ascii_lowercase()
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        Some(token.to_ascii_lowercase())
-    } else {
-        None
-    }
-}
-
-fn push_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
-    push_prompt_derived_flow_hint_packet_queries(terms, queries);
-    push_eval_flow_hint_packet_queries(terms, queries);
-    if !eval_probes_enabled() {
-        push_index_derived_architecture_probes(
-            PacketTaskClassDto::ArchitectureExplanation,
-            terms,
-            queries,
-        );
-    }
-}
-
-fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    if has("exec") && has_any(&["runtime", "session"]) {
-        push_unique_terms(queries, &["exec runtime", "exec session"]);
-    }
-    if has("exec") && has_any(&["cli", "command", "subcommand"]) {
-        push_unique_terms(queries, &["exec cli", "exec command"]);
-    }
-    if has_any(&["json", "jsonl"]) && has_any(&["event", "events", "output"]) {
-        push_unique_terms(queries, &["json event output", "event output processor"]);
-    }
-    if has("exec") && has_any(&["event", "events", "json", "jsonl"]) {
-        push_unique_term(queries, "exec event output");
-    }
-    if has("thread") && has_any(&["start", "starts", "started"]) {
-        push_unique_term(queries, "thread start");
-    }
-    if has("turn") && has_any(&["start", "starts", "started"]) {
-        push_unique_term(queries, "turn start");
-    }
-    if packet_terms_indicate_indexing_flow(terms) {
-        push_indexing_flow_required_probe_queries(queries);
-    }
-    if packet_terms_indicate_request_dispatch_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "request interceptor",
-                "request dispatch",
-                "transport adapter",
-            ],
-        );
-    }
-    if has_any(&["adapter", "adapters", "transport"]) {
-        push_unique_terms(queries, &["transport adapter", "adapter selection"]);
-    }
-    if has("event") && has("loop") {
-        push_unique_terms(
-            queries,
-            &[
-                "event loop",
-                "event dispatch",
-                "network input",
-                "command dispatch",
-            ],
-        );
-    }
-    if has_any(&["client", "network", "reads", "socket"]) {
-        push_unique_terms(queries, &["client input", "network input"]);
-    }
-    if has("call") && has_any(&["command", "commands", "dispatch", "dispatches"]) {
-        push_unique_terms(queries, &["command dispatch", "command handler"]);
-    }
-    if packet_terms_indicate_search_execution_flow(terms) {
-        push_search_flow_probe_queries(queries);
-    }
-}
-
-fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    if packet_terms_indicate_indexing_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "index service",
-                "workspace execution plan",
-                "workspace indexer",
-                "symbol extraction indexer",
-                "projection batch",
-                "search projection",
-                "snapshot refresh",
-            ],
-        );
-    }
-    if has("exec") && has_any(&["runtime", "session"]) {
-        push_unique_terms(queries, &["exec runtime", "exec session", "run exec"]);
-    }
-    if has("exec") && has_any(&["cli", "command", "subcommand"]) {
-        push_unique_terms(queries, &["exec cli", "exec command", "subcommand"]);
-    }
-    if has_any(&["cli", "command", "subcommand"]) && has_any(&["runtime", "exec"]) {
-        push_unique_term(queries, "command runtime");
-    }
-    if has_any(&["json", "jsonl"]) && has_any(&["event", "events", "output"]) {
-        push_unique_terms(
-            queries,
-            &[
-                "json event output",
-                "jsonl event output",
-                "event output processor",
-            ],
-        );
-    }
-    if has("exec") && has_any(&["event", "events", "json", "jsonl"]) {
-        push_unique_terms(queries, &["exec event output", "exec events"]);
-    }
-    if has("thread") && has_any(&["start", "starts", "started"]) {
-        push_unique_terms(queries, &["thread start", "start thread"]);
-    }
-    if has("turn") && has_any(&["start", "starts", "started"]) {
-        push_unique_terms(queries, &["turn start", "start turn"]);
-    }
-    if packet_terms_indicate_request_dispatch_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "request interceptor",
-                "interceptor manager",
-                "dispatch request",
-            ],
-        );
-    }
-    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "request preparation",
-                "session request",
-                "session send",
-                "adapter send",
-                "adapter selection",
-            ],
-        );
-    }
-    if has_any(&["adapter", "adapters", "transport"]) {
-        push_unique_terms(queries, &["transport adapter", "adapter selection"]);
-    }
-    if has("event") && has("loop") {
-        push_unique_terms(queries, &["event loop", "main event loop"]);
-    }
-    if has_any(&["client", "network", "reads", "socket"]) {
-        push_unique_terms(
-            queries,
-            &["client command input", "networking command read"],
-        );
-    }
-    if has("command") && has_any(&["dispatch", "dispatches"]) {
-        push_unique_term(queries, "command dispatch");
-    }
-    if packet_terms_indicate_search_execution_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "flag parse search driver",
-                "cli flags search pipeline",
-                "entrypoint flag parse run search",
-                "run search mode",
-                "parallel walk builder search",
-                "high level arguments matcher searcher printer",
-                "walk haystack search worker",
-                "worker search haystack",
-                "matcher searcher printer",
-            ],
-        );
-    }
-}
-
-fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "search entrypoint",
-            "main",
-            "main flag parse search",
-            "entrypoint flag parse run search",
-            "run search mode",
-            "argument planning",
-            "high level arguments matcher searcher printer",
-            "args matcher searcher printer",
-            "walk builder matcher searcher printer",
-            "candidate file walk",
-            "walk builder parallel search",
-            "parallel walk builder search",
-            "search worker",
-            "search worker search",
-            "worker search haystack",
-            "result printer",
-        ],
-    );
-}
-
-fn packet_terms_have(terms: &[String], needle: &str) -> bool {
-    let normalized_needle = normalize_identifier(needle);
-    terms.iter().any(|value| {
-        value.eq_ignore_ascii_case(needle) || normalize_identifier(value) == normalized_needle
-    })
-}
-
-fn packet_terms_have_any(terms: &[String], needles: &[&str]) -> bool {
-    needles
-        .iter()
-        .any(|needle| packet_terms_have(terms, needle))
-}
-
-fn packet_terms_indicate_indexing_flow(terms: &[String]) -> bool {
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    has_any(&["index", "indexed", "indexer", "indexing"])
-        && has_any(&[
-            "cli",
-            "command",
-            "discovery",
-            "extraction",
-            "file",
-            "files",
-            "persistence",
-            "projection",
-            "refresh",
-            "runtime",
-            "search",
-            "snapshot",
-            "storage",
-            "store",
-            "symbol",
-            "workspace",
-        ])
-}
-
-fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    let explicit_client_transport = has_any(&[
-        "adapter",
-        "adapters",
-        "interceptor",
-        "interceptors",
-        "transport",
-    ]);
-    if packet_terms_indicate_server_route_dispatch_flow(terms) && !explicit_client_transport {
-        return false;
-    }
-    let has_compound_request_dispatch = terms.iter().any(|term| {
-        let normalized = normalize_identifier(term);
-        normalized.contains("dispatch") && normalized.contains("request")
-    });
-    has_any(&["interceptor", "interceptors"])
-        || has_compound_request_dispatch
-        || ((has("request") || has("http"))
-            && has_any(&["adapter", "adapters", "dispatch", "dispatches", "transport"]))
-}
-
-fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has_any(&["route", "routes", "router"])
-        && has_any(&[
-            "handler",
-            "handlers",
-            "middleware",
-            "dispatch",
-            "dispatches",
-        ])
-        && (has("request")
-            || has_any(&["server", "incoming", "http"])
-            || has_any(&["engine", "method", "methods"]))
-}
-
-fn packet_terms_indicate_prepared_session_adapter_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    (has("prepared") || has("prepare"))
-        && has_any(&["request", "requests"])
-        && has("session")
-        && has_any(&["adapter", "adapters", "send", "sends", "transport"])
-}
-
-fn packet_terms_indicate_search_execution_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has("search")
-        && has_any(&[
-            "candidate",
-            "flags",
-            "haystack",
-            "matcher",
-            "printer",
-            "searcher",
-            "walk",
-            "walks",
-        ])
-}
-
-fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) -> bool {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    let css_signal = has("css")
-        || has("animatecss")
-        || has_any(&[
-            "stylesheet",
-            "stylesheets",
-            "style",
-            "styles",
-            "selector",
-            "selectors",
-        ]);
-    let animation_signal = has_any(&[
-        "animate",
-        "animated",
-        "animation",
-        "animations",
-        "keyframe",
-        "keyframes",
-    ]);
-    let source_shape_signal = has_any(&[
-        "base",
-        "class",
-        "classes",
-        "custom",
-        "property",
-        "properties",
-        "selector",
-        "selectors",
-        "variable",
-        "variables",
-    ]);
-    css_signal && animation_signal && source_shape_signal
-}
-
-fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    has_any(&["sql", "schema", "schemas", "table", "tables"])
-        && has_any(&[
-            "relationship",
-            "relationships",
-            "relation",
-            "relations",
-            "foreign",
-            "constraint",
-            "constraints",
-            "reference",
-            "references",
-        ])
-        && has_any(&["table", "tables", "create", "schema", "schemas"])
-}
-fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>, _compact: bool) {
-    let term_cap = 12;
-    for term in terms
-        .iter()
-        .filter(|term| term.len() >= 4 && !packet_query_stop_term(term.as_str()))
-        .take(term_cap)
-    {
-        push_unique_term(queries, term);
-        push_unique_term(queries, &packet_camel_case(&[term.as_str()]));
-    }
-}
-
-fn push_task_class_symbol_probe_queries(task_class: PacketTaskClassDto, queries: &mut Vec<String>) {
-    let class_queries = match task_class {
-        PacketTaskClassDto::RouteTracing => {
-            &["router", "handler", "route", "middleware", "dispatch"][..]
-        }
-        PacketTaskClassDto::BugLocalization => &["error", "validate"],
-        PacketTaskClassDto::ChangeImpact => &["affected", "references"],
-        PacketTaskClassDto::SymbolOwnership => &["references", "callers"],
-        PacketTaskClassDto::EditPlanning => &["tests", "config"],
-        PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[],
-    };
-    push_unique_terms(queries, class_queries);
-}
-
-#[derive(Debug, Clone)]
-struct PacketCommandDescriptor {
-    command_title: String,
-    subcommand_title: String,
-    module: String,
-    crate_segment: String,
-}
-
-fn packet_command_descriptors(question: &str) -> Vec<PacketCommandDescriptor> {
-    let mut descriptors = Vec::new();
-    for span in packet_backtick_spans(question) {
-        let words = packet_command_words(span);
-        if words.len() < 2 {
-            continue;
-        }
-        let command = &words[0];
-        let subcommand = &words[1];
-        let Some(command_title) = packet_pascal_identifier(command) else {
-            continue;
-        };
-        let Some(subcommand_title) = packet_pascal_identifier(subcommand) else {
-            continue;
-        };
-        let Some(module) = packet_snake_identifier(&[command.as_str(), subcommand.as_str()]) else {
-            continue;
-        };
-        let Some(crate_segment) = packet_snake_identifier(&[subcommand.as_str()]) else {
-            continue;
-        };
-        descriptors.push(PacketCommandDescriptor {
-            command_title,
-            subcommand_title,
-            module,
-            crate_segment,
-        });
-    }
-    descriptors
-}
-
-fn packet_command_exact_probe_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    if !eval_probes_enabled() || !packet_allows_command_probe_queries(question, task_class) {
-        return Vec::new();
-    }
-
-    let mut queries = Vec::new();
-    for descriptor in packet_command_descriptors(question) {
-        push_unique_term(
-            &mut queries,
-            &format!("Subcommand::{}", descriptor.subcommand_title),
-        );
-        push_unique_term(&mut queries, &format!("{}::Cli", descriptor.module));
-        push_unique_term(&mut queries, &format!("{}::run_main", descriptor.module));
-    }
-    queries
-}
-
-fn packet_command_role_probe_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    if !packet_allows_command_probe_queries(question, task_class) {
-        return Vec::new();
-    }
-
-    let mut queries = Vec::new();
-    for descriptor in packet_command_descriptors(question) {
-        let command_phrase = descriptor.module.replace('_', " ");
-        let subcommand_phrase = descriptor.subcommand_title.to_ascii_lowercase();
-        push_unique_term(&mut queries, &command_phrase);
-        push_unique_term(&mut queries, &format!("{command_phrase} command"));
-        push_unique_term(&mut queries, &format!("{subcommand_phrase} command"));
-        push_unique_term(&mut queries, &format!("{subcommand_phrase} subcommand"));
-    }
-    queries
-}
-
-fn packet_allows_command_probe_queries(question: &str, task_class: PacketTaskClassDto) -> bool {
-    if !matches!(
-        task_class,
-        PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::EditPlanning
-    ) {
-        return false;
-    }
-    let lowered = question.to_ascii_lowercase();
-    contains_any(
-        &lowered,
-        &[
-            "cli",
-            "command",
-            "subcommand",
-            "entrypoint",
-            "entry point",
-            "runtime",
-            "flow",
-            "flows",
-        ],
-    )
-}
-
-fn packet_backtick_spans(question: &str) -> Vec<&str> {
-    let mut spans = Vec::new();
-    let mut start = None;
-    for (index, ch) in question.char_indices() {
-        if ch != '`' {
-            continue;
-        }
-        if let Some(open) = start.take() {
-            let span = question[open..index].trim();
-            if !span.is_empty() {
-                spans.push(span);
-            }
-        } else {
-            start = Some(index + ch.len_utf8());
-        }
-    }
-    spans
-}
-
-fn packet_command_words(span: &str) -> Vec<String> {
-    span.split_whitespace()
-        .filter_map(|token| {
-            let token = token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    ',' | '.'
-                        | ';'
-                        | ':'
-                        | '?'
-                        | '!'
-                        | '('
-                        | ')'
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | '"'
-                        | '\''
-                )
-            });
-            if token.starts_with('-')
-                || token.is_empty()
-                || !token.chars().any(|ch| ch.is_ascii_alphabetic())
-                || !token
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-            {
-                return None;
-            }
-            Some(token.to_string())
-        })
-        .take(3)
-        .collect()
-}
-
-fn packet_pascal_identifier(word: &str) -> Option<String> {
-    let mut value = String::new();
-    for part in word
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-    {
-        let mut chars = part.chars();
-        let first = chars.next()?;
-        value.push(first.to_ascii_uppercase());
-        value.extend(chars.map(|ch| ch.to_ascii_lowercase()));
-    }
-    (!value.is_empty()).then_some(value)
-}
-
-fn packet_snake_identifier(words: &[&str]) -> Option<String> {
-    let mut parts = Vec::new();
-    for word in words {
-        let mut normalized = String::new();
-        for (index, part) in word
-            .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .filter(|part| !part.is_empty())
-            .enumerate()
-        {
-            if index > 0 {
-                normalized.push('_');
-            }
-            normalized.push_str(&part.to_ascii_lowercase());
-        }
-        if normalized.is_empty() {
-            return None;
-        }
-        parts.push(normalized);
-    }
-    (!parts.is_empty()).then_some(parts.join("_"))
-}
-
-fn packet_concrete_file_probe_queries_from_required(required_queries: &[String]) -> Vec<String> {
-    let mut queries = Vec::new();
-    for query in required_queries {
-        if let Some(file_query) = packet_required_probe_file_query(query) {
-            push_unique_term(&mut queries, &file_query);
-        }
-    }
-    queries
-}
-
-fn packet_required_probe_file_query(query: &str) -> Option<String> {
-    if !packet_required_probe_needs_concrete_file(query) {
-        return None;
-    }
-    let normalized_query = normalize_identifier(query);
-    if normalized_query == "eventprocessor" {
-        return Some("event_processor.rs".to_string());
-    }
-    query
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        .then(|| format!("{query}.rs"))
-}
-
-fn push_adjacent_packet_term_queries(
-    terms: &[String],
-    queries: &mut Vec<String>,
-    window_cap: usize,
-) {
-    for window in terms.windows(2).take(window_cap) {
-        if let [left, right] = window {
-            if packet_adjacent_query_stop_term(left) || packet_adjacent_query_stop_term(right) {
-                continue;
-            }
-            push_unique_term(queries, &format!("{left}_{right}"));
-            push_unique_term(
-                queries,
-                &packet_camel_case(&[left.as_str(), right.as_str()]),
-            );
-        }
-    }
-}
-
-fn packet_concept_queries(question: &str) -> Vec<String> {
-    let include_non_primary_terms = query_mentions_non_primary_source(question);
-    prompt_search_terms(question)
-        .into_iter()
-        .filter(|term| {
-            term.len() >= 4
-                && (include_non_primary_terms || !is_non_primary_source_term(term.as_str()))
-                && !packet_query_stop_term(term.as_str())
-                && !matches!(
-                    term.as_str(),
-                    "answer"
-                        | "cite"
-                        | "cites"
-                        | "explain"
-                        | "files"
-                        | "full"
-                        | "into"
-                        | "moves"
-                        | "support"
-                        | "through"
-                )
-        })
-        .take(8)
-        .collect()
-}
-
-fn packet_camel_case(words: &[&str]) -> String {
-    let mut value = String::new();
-    for word in words {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            value.push(first.to_ascii_uppercase());
-            value.extend(chars.map(|ch| ch.to_ascii_lowercase()));
-        }
-    }
-    value
-}
-
-fn infer_packet_task_class(question: &str) -> PacketTaskClassDto {
-    let lower = question.to_ascii_lowercase();
-    if contains_any(
-        &lower,
-        &["bug", "error", "failing", "failed", "broken", "crash"],
-    ) {
-        PacketTaskClassDto::BugLocalization
-    } else if contains_any(
-        &lower,
-        &["impact", "affected", "regression", "blast radius"],
-    ) || risk_of_change_prompt(&lower)
-    {
-        PacketTaskClassDto::ChangeImpact
-    } else if contains_any(&lower, &["route", "endpoint", "handler", "api path"]) {
-        PacketTaskClassDto::RouteTracing
-    } else if contains_any(&lower, &["owner", "owns", "who calls", "references"]) {
-        PacketTaskClassDto::SymbolOwnership
-    } else if contains_any(
-        &lower,
-        &[
-            "data flow",
-            "flow from",
-            "flow into",
-            "flows from",
-            "flows into",
-            "pipeline",
-            "through",
-        ],
-    ) {
-        PacketTaskClassDto::DataFlow
-    } else if contains_any(
-        &lower,
-        &[
-            "where to edit",
-            "edit",
-            "change",
-            "modify",
-            "implement",
-            "add ",
-        ],
-    ) {
-        PacketTaskClassDto::EditPlanning
-    } else {
-        PacketTaskClassDto::ArchitectureExplanation
-    }
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-fn risk_of_change_prompt(lower: &str) -> bool {
-    lower.contains("risk if")
-        && contains_any(lower, &[" change", " changing", " modify", " modifying"])
-        || lower.contains("risk of changing")
-        || lower.contains("risk from changing")
-        || lower.contains("risk in changing")
-}
-
-fn extract_packet_query_terms(question: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut quoted = false;
-    let mut quote = '\0';
-    let mut start = 0usize;
-    for (index, ch) in question.char_indices() {
-        if matches!(ch, '`' | '"' | '\'') {
-            if quoted && ch == quote {
-                push_unique_term(&mut terms, question[start..index].trim());
-                quoted = false;
-            } else if !quoted {
-                quoted = true;
-                quote = ch;
-                start = index + ch.len_utf8();
-            }
-        }
-    }
-
-    for term in exact_symbol_query_terms(question) {
-        push_unique_term(&mut terms, &term);
-    }
-    for term in packet_architecture_flow_probe_terms(question) {
-        push_unique_term(&mut terms, &term);
-    }
-
-    for token in question.split_whitespace() {
-        let token = token.trim_matches(|ch: char| {
-            matches!(
-                ch,
-                ',' | '.' | ';' | ':' | '?' | '!' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '`'
-            )
-        });
-        if is_packet_code_like_term(token)
-            || (looks_like_standalone_symbol_query(token)
-                && token.len() >= 4
-                && !packet_extract_query_stop_term(token))
-        {
-            push_unique_term(&mut terms, token);
-        }
-    }
-    terms.truncate(16);
-    terms
-}
-
-fn packet_extract_query_stop_term(token: &str) -> bool {
-    packet_query_stop_term(token)
-        || matches!(
-            token.to_ascii_lowercase().as_str(),
-            "cite"
-                | "cites"
-                | "file"
-                | "files"
-                | "path"
-                | "paths"
-                | "that"
-                | "them"
-                | "they"
-                | "their"
-                | "your"
-                | "into"
-                | "from"
-                | "with"
-                | "have"
-                | "been"
-                | "will"
-                | "also"
-                | "only"
-                | "over"
-                | "under"
-                | "than"
-                | "then"
-                | "each"
-                | "such"
-                | "some"
-                | "more"
-                | "most"
-                | "many"
-                | "much"
-                | "very"
-                | "just"
-                | "like"
-                | "make"
-                | "made"
-                | "used"
-                | "uses"
-                | "using"
-                | "work"
-                | "works"
-                | "working"
-        )
-}
-
-fn is_packet_code_like_term(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    token.contains("::")
-        || token.contains('/')
-        || token.contains('\\')
-        || token.contains('.')
-        || token.contains('_')
-        || token.contains('-')
-        || token.chars().skip(1).any(|ch| ch.is_ascii_uppercase())
-}
-
-fn push_unique_term(terms: &mut Vec<String>, value: &str) {
-    let value = value.trim();
-    if value.len() < 3 {
-        return;
-    }
-    if !terms.iter().any(|term| term.eq_ignore_ascii_case(value)) {
-        terms.push(value.to_string());
-    }
-}
-
-fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
-    for value in values {
-        push_unique_term(terms, value);
-    }
-}
-
-fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
-    for value in values {
-        push_unique_term(terms, value);
-    }
-}
-
-fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => &[
-            "architecture entrypoint",
-            "runtime flow",
-            "main",
-            "run",
-            "entrypoint",
-        ],
-        PacketTaskClassDto::BugLocalization => &["error path", "failure handling"],
-        PacketTaskClassDto::ChangeImpact => &["affected symbols", "impacted tests"],
-        PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
-        PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
-        PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],
-        PacketTaskClassDto::EditPlanning => &["edit candidates", "test coverage"],
-    }
-}
-
-fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose: &str) {
-    let query = query.trim();
-    if query.is_empty() {
-        return;
-    }
-    if queries
-        .iter()
-        .any(|existing| existing.query.eq_ignore_ascii_case(query))
-    {
-        return;
-    }
-    queries.push(PacketPlanQueryDto {
-        query: query.to_string(),
-        purpose: purpose.to_string(),
-    });
 }
 
 fn packet_retrieval_prompt(
@@ -1720,19 +585,6 @@ fn packet_initial_retrieval_is_lexical_only(weights: Option<&AgentHybridWeightsD
         .is_some_and(|semantic| semantic <= f32::EPSILON)
 }
 
-fn packet_plan_annotation(plan: &PacketPlanDto) -> String {
-    let queries = plan
-        .queries
-        .iter()
-        .map(|query| query.query.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    format!(
-        "packet_plan task_class={:?} inferred={} queries={}",
-        plan.task_class, plan.inferred_task_class, queries
-    )
-}
-
 fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     let terms = packet_rank_terms(question);
     let prefer_primary_sources = !query_mentions_non_primary_source(question);
@@ -1741,486 +593,6 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
             .partial_cmp(&packet_citation_rank(left, &terms, prefer_primary_sources))
             .unwrap_or(Ordering::Equal)
     });
-}
-
-fn cap_packet_citations(
-    answer: &mut AgentAnswerDto,
-    limits: &PacketBudgetLimitsDto,
-    required_probe_queries: &[String],
-) -> bool {
-    let mut protected_citation_keys =
-        promote_required_probe_citations(answer, required_probe_queries);
-    let focus_neighborhood_keys =
-        promote_focus_neighborhood_citations(answer, &protected_citation_keys);
-    protected_citation_keys.extend(focus_neighborhood_keys);
-    if protected_citation_keys.is_empty() {
-        cap_citations(answer, limits)
-    } else {
-        cap_citations_with_protected(answer, limits, &protected_citation_keys)
-    }
-}
-
-fn promote_required_probe_citations(
-    answer: &mut AgentAnswerDto,
-    required_probe_queries: &[String],
-) -> HashSet<String> {
-    if required_probe_queries.is_empty() || answer.citations.is_empty() {
-        return HashSet::new();
-    }
-
-    let focus_roots = packet_command_focus_roots(&answer.citations);
-    let mut promoted_indices = Vec::new();
-    for query in required_probe_queries {
-        if promoted_indices
-            .iter()
-            .any(|index| packet_citation_satisfies_required_probe(query, &answer.citations[*index]))
-        {
-            continue;
-        }
-        let mut best_match = None;
-        for (index, citation) in answer.citations.iter().enumerate() {
-            if promoted_indices.contains(&index) {
-                continue;
-            }
-            let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
-                continue;
-            };
-            if packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
-                && !packet_citation_satisfies_required_probe(query, citation)
-            {
-                continue;
-            }
-            if best_match
-                .map(|(best_index, best_rank)| {
-                    packet_prefer_required_probe_match(
-                        query,
-                        citation,
-                        match_rank,
-                        &answer.citations[best_index],
-                        best_rank,
-                        &focus_roots,
-                    )
-                })
-                .unwrap_or(true)
-            {
-                best_match = Some((index, match_rank));
-            }
-        }
-        if let Some((index, _)) = best_match {
-            promoted_indices.push(index);
-        }
-    }
-    if promoted_indices.is_empty() {
-        return HashSet::new();
-    }
-
-    let protected_citation_keys = promoted_indices
-        .iter()
-        .map(|index| packet_citation_key(&answer.citations[*index]))
-        .collect::<HashSet<_>>();
-    let promoted_index_set = promoted_indices.iter().copied().collect::<HashSet<_>>();
-    let mut reordered = Vec::with_capacity(answer.citations.len());
-    for index in promoted_indices {
-        reordered.push(answer.citations[index].clone());
-    }
-    for (index, citation) in answer.citations.drain(..).enumerate() {
-        if !promoted_index_set.contains(&index) {
-            reordered.push(citation);
-        }
-    }
-    answer.citations = reordered;
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_required_probe_citations promoted={} required={}",
-        promoted_index_set.len(),
-        required_probe_queries.join("|").replace('`', "'")
-    ));
-    protected_citation_keys
-}
-
-fn promote_focus_neighborhood_citations(
-    answer: &mut AgentAnswerDto,
-    protected_citation_keys: &HashSet<String>,
-) -> HashSet<String> {
-    if answer.citations.is_empty() {
-        return HashSet::new();
-    }
-    let focus_roots = packet_command_focus_roots(&answer.citations);
-    if focus_roots.is_empty() {
-        return HashSet::new();
-    }
-    let protected_file_paths = answer
-        .citations
-        .iter()
-        .filter(|citation| protected_citation_keys.contains(&packet_citation_key(citation)))
-        .filter_map(packet_citation_file_path_key)
-        .collect::<HashSet<_>>();
-
-    let mut ranked_candidates = answer
-        .citations
-        .iter()
-        .enumerate()
-        .filter(|(_, citation)| {
-            packet_focus_neighborhood_candidate(
-                citation,
-                &focus_roots,
-                protected_citation_keys,
-                &protected_file_paths,
-            )
-        })
-        .map(|(index, citation)| {
-            (
-                index,
-                packet_focus_neighborhood_rank(citation, &focus_roots),
-            )
-        })
-        .collect::<Vec<_>>();
-    ranked_candidates.sort_by(|(left_index, left_rank), (right_index, right_rank)| {
-        right_rank
-            .cmp(left_rank)
-            .then_with(|| left_index.cmp(right_index))
-    });
-
-    let mut promoted_indices = Vec::new();
-    let mut promoted_file_paths = HashSet::new();
-    for (index, _) in ranked_candidates {
-        let Some(path) = packet_citation_file_path_key(&answer.citations[index]) else {
-            continue;
-        };
-        if !promoted_file_paths.insert(path) {
-            continue;
-        }
-        promoted_indices.push(index);
-        if promoted_indices.len() >= PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT {
-            break;
-        }
-    }
-    if promoted_indices.is_empty() {
-        return HashSet::new();
-    }
-
-    let promoted_index_set = promoted_indices.iter().copied().collect::<HashSet<_>>();
-    let promoted_keys = promoted_indices
-        .iter()
-        .map(|index| packet_citation_key(&answer.citations[*index]))
-        .collect::<HashSet<_>>();
-    let mut reordered = Vec::with_capacity(answer.citations.len());
-    for citation in &answer.citations {
-        if protected_citation_keys.contains(&packet_citation_key(citation)) {
-            reordered.push(citation.clone());
-        }
-    }
-    for index in promoted_indices {
-        reordered.push(answer.citations[index].clone());
-    }
-    for (index, citation) in answer.citations.drain(..).enumerate() {
-        let key = packet_citation_key(&citation);
-        if !protected_citation_keys.contains(&key) && !promoted_index_set.contains(&index) {
-            reordered.push(citation);
-        }
-    }
-    answer.citations = reordered;
-    answer.retrieval_trace.annotations.push(format!(
-        "packet_focus_neighborhood_citations promoted={} roots={}",
-        promoted_keys.len(),
-        focus_roots
-            .iter()
-            .map(|root| root.root.as_str())
-            .collect::<Vec<_>>()
-            .join("|")
-            .replace('`', "'")
-    ));
-    promoted_keys
-}
-
-fn packet_focus_neighborhood_candidate(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-    protected_citation_keys: &HashSet<String>,
-    protected_file_paths: &HashSet<String>,
-) -> bool {
-    if protected_citation_keys.contains(&packet_citation_key(citation))
-        || citation.origin != SearchHitOrigin::IndexedSymbol
-        || !citation.resolvable
-        || packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
-        || packet_display_name_is_test_like(&citation.display_name)
-    {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    if path.is_empty() || packet_citation_focus_root_score(citation, focus_roots) == 0 {
-        return false;
-    }
-    if protected_file_paths.contains(&path) {
-        return false;
-    }
-    !retrieval_file_role_from_path(&path.to_ascii_lowercase()).is_non_primary()
-}
-
-fn packet_citation_file_path_key(citation: &AgentCitationDto) -> Option<String> {
-    let path = citation.file_path.as_deref().map(packet_display_path)?;
-    if path.is_empty() { None } else { Some(path) }
-}
-
-fn packet_focus_neighborhood_rank(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> (u8, u8, u8, u8, u8, u8, i32) {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    let source_file: u8 = if retrieval_file_role_from_path(&path.to_ascii_lowercase())
-        == crate::RetrievalFileRole::Source
-    {
-        1
-    } else {
-        0
-    };
-    let direct_root_file = packet_citation_direct_focus_root_file_score(citation, focus_roots);
-    let role_backed: u8 = if packet_evidence_role(citation).is_some() {
-        1
-    } else {
-        0
-    };
-    let implementation_file: u8 = if packet_path_is_implementation(&path) {
-        1
-    } else {
-        0
-    };
-    let definition_file: u8 = if packet_primary_definition_file_citation(citation) {
-        1
-    } else {
-        0
-    };
-    (
-        packet_citation_focus_root_score(citation, focus_roots),
-        direct_root_file,
-        packet_source_navigation_file_score(&path),
-        source_file,
-        role_backed,
-        implementation_file.saturating_add(definition_file),
-        (citation.score * 1000.0).round() as i32,
-    )
-}
-
-fn packet_citation_direct_focus_root_file_score(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> u8 {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .replace('\\', "/");
-    let parent = path.rsplit_once('/').map(|(parent, _)| parent);
-    focus_roots
-        .iter()
-        .filter(|root| parent == Some(root.root.as_str()))
-        .map(|root| root.weight)
-        .max()
-        .unwrap_or_default()
-}
-
-fn packet_source_navigation_file_score(path: &str) -> u8 {
-    let normalized = packet_display_path(path).replace('\\', "/");
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name)
-        .to_ascii_lowercase();
-    match stem.as_str() {
-        "cli" | "cmd" | "command" | "commands" => 4,
-        "lib" | "mod" | "index" => 3,
-        "events" | "event" => 2,
-        "main" | "app" | "server" | "router" | "routes" => 2,
-        "handler" | "handlers" | "entrypoint" | "entrypoints" => 1,
-        _ if stem.ends_with("_events")
-            || stem.ends_with("_event")
-            || stem.ends_with("-events")
-            || stem.ends_with("-event") =>
-        {
-            2
-        }
-        _ => 0,
-    }
-}
-
-fn packet_prefer_required_probe_match(
-    query: &str,
-    candidate: &AgentCitationDto,
-    candidate_rank: u8,
-    existing: &AgentCitationDto,
-    existing_rank: u8,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> bool {
-    if !query_mentions_non_primary_source(query) {
-        let candidate_test_like = packet_display_name_is_test_like(&candidate.display_name);
-        let existing_test_like = packet_display_name_is_test_like(&existing.display_name);
-        if candidate_test_like != existing_test_like {
-            return !candidate_test_like;
-        }
-    }
-    if candidate_rank != existing_rank {
-        return candidate_rank > existing_rank;
-    }
-    if !packet_required_probe_needs_exact_match(query) {
-        let candidate_focus = packet_citation_focus_root_score(candidate, focus_roots);
-        let existing_focus = packet_citation_focus_root_score(existing, focus_roots);
-        if candidate_focus != existing_focus {
-            return candidate_focus > existing_focus;
-        }
-        let candidate_token_coverage = packet_citation_probe_token_coverage(query, candidate);
-        let existing_token_coverage = packet_citation_probe_token_coverage(query, existing);
-        if candidate_token_coverage != existing_token_coverage {
-            return candidate_token_coverage > existing_token_coverage;
-        }
-    }
-    if packet_prefer_flow_anchor_path_citation(candidate, existing) {
-        return true;
-    }
-    if packet_required_probe_prefers_implementation(query)
-        && packet_prefer_implementation_file(candidate, existing)
-    {
-        return true;
-    }
-    packet_exact_definition_file_citation(candidate)
-        && !packet_exact_definition_file_citation(existing)
-}
-
-fn packet_required_probe_prefers_implementation(query: &str) -> bool {
-    query.contains("::") || query.contains('.')
-}
-
-fn packet_prefer_implementation_file(
-    candidate: &AgentCitationDto,
-    existing: &AgentCitationDto,
-) -> bool {
-    let candidate_path = candidate
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    let existing_path = existing
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    packet_path_is_implementation(&candidate_path) && !packet_path_is_implementation(&existing_path)
-}
-
-fn packet_path_is_implementation(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    matches!(
-        lower.rsplit('.').next(),
-        Some(
-            "c" | "cc"
-                | "cpp"
-                | "cxx"
-                | "go"
-                | "java"
-                | "js"
-                | "jsx"
-                | "kt"
-                | "php"
-                | "py"
-                | "rb"
-                | "rs"
-                | "ts"
-                | "tsx"
-        )
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PacketCommandFocusRoot {
-    root: String,
-    weight: u8,
-}
-
-fn packet_command_focus_roots(citations: &[AgentCitationDto]) -> Vec<PacketCommandFocusRoot> {
-    let mut roots = Vec::<PacketCommandFocusRoot>::new();
-    for citation in citations {
-        let display = citation.display_name.as_str();
-        let normalized_display = normalize_identifier(display);
-        let path = citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .unwrap_or_default();
-        let Some(root) = packet_source_root_from_path(&path) else {
-            continue;
-        };
-        let normalized_path = path.replace('\\', "/");
-        let weight =
-            if normalized_display.ends_with("runmain") || normalized_display.contains("runexec") {
-                3
-            } else if display.contains("::Cli")
-                || display.contains("::cli")
-                || normalized_path.ends_with("/src/cli.rs")
-                || (normalized_path.ends_with("/main.rs") && normalized_display == "main")
-            {
-                2
-            } else if display.contains("Subcommand::") {
-                1
-            } else {
-                continue;
-            };
-        packet_push_focus_root(&mut roots, root, weight);
-    }
-    roots.sort_by(|left, right| {
-        right
-            .weight
-            .cmp(&left.weight)
-            .then_with(|| left.root.cmp(&right.root))
-    });
-    roots
-}
-
-fn packet_push_focus_root(roots: &mut Vec<PacketCommandFocusRoot>, root: String, weight: u8) {
-    if let Some(existing) = roots.iter_mut().find(|existing| existing.root == root) {
-        existing.weight = existing.weight.max(weight);
-    } else {
-        roots.push(PacketCommandFocusRoot { root, weight });
-    }
-}
-
-fn packet_source_root_from_path(path: &str) -> Option<String> {
-    let normalized = packet_display_path(path);
-    let normalized = normalized.trim_matches('/').replace('\\', "/");
-    if normalized.is_empty() {
-        return None;
-    }
-    if let Some(index) = normalized.find("/src/") {
-        let root = &normalized[..index + "/src".len()];
-        return (!root.is_empty()).then(|| root.to_string());
-    }
-    let (parent, _) = normalized.rsplit_once('/')?;
-    (!parent.is_empty()).then(|| parent.to_string())
-}
-
-fn packet_citation_focus_root_score(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> u8 {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .replace('\\', "/");
-    focus_roots
-        .iter()
-        .filter(|root| path == root.root || path.starts_with(&format!("{}/", root.root)))
-        .map(|root| root.weight)
-        .max()
-        .unwrap_or_default()
 }
 
 fn maybe_annotate_packet_candidate_window(
@@ -2298,6 +670,7 @@ fn packet_candidate_trace_row(
     let claim = role
         .map(|role| packet_claim_key_for_citation(role, citation))
         .unwrap_or_else(|| "-".to_string());
+    let role_label = role.map(PacketEvidenceRole::as_str).unwrap_or("-");
     format!(
         "#{}{} rank={:.3} score={:.3} claim={} role={} kind={:?} name=`{}` path={} line={}",
         index + 1,
@@ -2305,7 +678,7 @@ fn packet_candidate_trace_row(
         packet_citation_rank(citation, rank_terms, prefer_primary_sources),
         citation.score,
         claim,
-        role.unwrap_or("-"),
+        role_label,
         citation.kind,
         citation.display_name.replace('`', "'"),
         citation
@@ -2395,1606 +768,13 @@ fn packet_evidence_ledger_row(citation: &AgentCitationDto) -> String {
         .line
         .map(|line| format!(":{line}"))
         .unwrap_or_default();
-    let role = packet_evidence_role(citation).unwrap_or("source evidence");
+    let role = packet_evidence_role(citation)
+        .map(PacketEvidenceRole::as_str)
+        .unwrap_or("source evidence");
     format!(
         "- `{}` ({:?}) - `{}`{} - {} - score {:.3}",
         citation.display_name, citation.kind, path, line, role, citation.score
     )
-}
-
-fn packet_flow_claims_markdown(claims: &[PacketClaimDto]) -> String {
-    let mut markdown = String::new();
-    markdown.push_str("Supported claims for a compact agent answer:\n");
-    for claim in claims {
-        let citation = claim.citations.first();
-        let suffix = citation
-            .and_then(|citation| citation.file_path.as_deref())
-            .map(packet_display_path)
-            .map(|path| format!(" (`{path}`)"))
-            .unwrap_or_default();
-        let _ = writeln!(markdown, "- {}{}", claim.claim, suffix);
-    }
-    markdown
-}
-
-fn packet_architecture_flow_probe_terms(prompt: &str) -> Vec<String> {
-    let lower = prompt.to_ascii_lowercase();
-    let mut terms = Vec::new();
-    if prompt_mentions_indexing_flow(&lower) {
-        for term in [
-            "index service",
-            "workspace execution plan",
-            "workspace indexer",
-            "symbol extraction indexer",
-            "search projection",
-            "snapshot refresh",
-        ] {
-            push_unique_term(&mut terms, term);
-        }
-    }
-    push_eval_architecture_flow_probe_terms(&lower, &mut terms);
-    terms
-}
-
-fn prompt_mentions_indexing_flow(lower: &str) -> bool {
-    contains_any(lower, &["indexing", "indexer", "indexed", " index "])
-        && contains_any(
-            lower,
-            &[
-                "cli",
-                "command",
-                "discovery",
-                "extraction",
-                "file",
-                "persistence",
-                "projection",
-                "refresh",
-                "runtime",
-                "search",
-                "snapshot",
-                "storage",
-                "store",
-                "symbol",
-                "workspace",
-            ],
-        )
-}
-
-fn packet_push_flow_template_claim(
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-    claim_text: &str,
-    citation: Option<AgentCitationDto>,
-) {
-    packet_push_flow_template_claim_with_citations(
-        claims,
-        seen,
-        claim_text,
-        citation.map(|value| vec![value]).unwrap_or_default(),
-    );
-}
-
-fn packet_push_flow_template_claim_with_citations(
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-    claim_text: &str,
-    citations: Vec<AgentCitationDto>,
-) {
-    let key = normalize_identifier(claim_text);
-    if key.is_empty() || !seen.insert(key) {
-        return;
-    }
-    claims.push(PacketClaimDto {
-        claim: claim_text.to_string(),
-        citations,
-    });
-}
-
-fn packet_append_flow_template_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let normalized_prompt = normalize_identifier(prompt);
-
-    packet_append_command_flow_template_claims(prompt, citations, claims, seen);
-    packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
-    packet_append_source_derived_flow_claims(prompt, citations, claims, seen);
-    packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
-    if !eval_probes_enabled() {
-        return;
-    }
-    packet_append_indexing_storage_flow_template_claims(prompt, citations, claims, seen);
-    for (claim, citation) in eval_flow_template_claims(&normalized_prompt, citations) {
-        packet_push_flow_template_claim(claims, seen, &claim, Some(citation));
-    }
-}
-
-fn packet_append_indexing_pipeline_flow_template_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let normalized_prompt = normalize_identifier(prompt);
-    let indexing_prompt = normalized_prompt.contains("indexing")
-        || normalized_prompt.contains("indexed")
-        || normalized_prompt.contains("indexer")
-        || normalized_prompt.contains("indexcommand");
-    if !(indexing_prompt
-        && normalized_prompt.contains("runtime")
-        && (normalized_prompt.contains("workspace")
-            || normalized_prompt.contains("sourcefile")
-            || normalized_prompt.contains("filediscovery"))
-        && (normalized_prompt.contains("persistence") || normalized_prompt.contains("store"))
-        && normalized_prompt.contains("snapshot"))
-    {
-        return;
-    }
-
-    let cli_entry = packet_citation_matching_display(citations, "run_index")
-        .or_else(|| packet_citation_matching_display(citations, "Command::Index"))
-        .or_else(|| packet_citation_matching_display(citations, "IndexCommand"))
-        .or_else(|| packet_citation_matching_display(citations, "CliDirection"));
-    let runtime_entry =
-        packet_citation_matching_display_contains(citations, "IndexService::run_indexing")
-            .or_else(|| packet_citation_matching_display(citations, "Runtime::index_service"));
-    if let Some(runtime_entry) = runtime_entry {
-        let mut claim_citations = Vec::new();
-        if let Some(cli_entry) = cli_entry {
-            claim_citations.push(cli_entry.clone());
-        }
-        claim_citations.push(runtime_entry.clone());
-        packet_push_flow_template_claim_with_citations(
-            claims,
-            seen,
-            "The CLI index command prepares command options and delegates indexing work into the runtime layer.",
-            claim_citations,
-        );
-    }
-
-    let workspace_plan =
-        packet_citation_matching_display(citations, "WorkspaceManifest::build_execution_plan");
-    if let Some(runtime_entry) = runtime_entry {
-        let mut claim_citations = vec![runtime_entry.clone()];
-        if let Some(workspace_plan) = workspace_plan {
-            claim_citations.push(workspace_plan.clone());
-        }
-        packet_push_flow_template_claim_with_citations(
-            claims,
-            seen,
-            "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
-            claim_citations,
-        );
-    }
-
-    if let Some(workspace_plan) = workspace_plan {
-        packet_push_flow_template_claim(
-            claims,
-            seen,
-            "The workspace crate is responsible for source-file discovery and refresh-plan construction.",
-            Some(workspace_plan.clone()),
-        );
-    }
-
-    let workspace_indexer = packet_citation_matching_display(citations, "WorkspaceIndexer::run");
-    let index_file = packet_citation_matching_display(citations, "index_file");
-    if workspace_indexer.is_some() || index_file.is_some() {
-        let mut claim_citations = Vec::new();
-        if let Some(workspace_indexer) = workspace_indexer {
-            claim_citations.push(workspace_indexer.clone());
-        }
-        if let Some(index_file) = index_file {
-            claim_citations.push(index_file.clone());
-        }
-        packet_push_flow_template_claim_with_citations(
-            claims,
-            seen,
-            "The indexer extracts nodes, edges, occurrences, and related symbol data from source files.",
-            claim_citations,
-        );
-    }
-
-    let storage_flush =
-        packet_citation_matching_display(citations, "Storage::flush_projection_batch");
-    let search_projection = packet_citation_matching_display(
-        citations,
-        "Storage::rebuild_search_symbol_projection_from_node_table",
-    );
-    if storage_flush.is_some() || search_projection.is_some() {
-        let mut claim_citations = Vec::new();
-        if let Some(storage_flush) = storage_flush {
-            claim_citations.push(storage_flush.clone());
-        }
-        if let Some(search_projection) = search_projection {
-            claim_citations.push(search_projection.clone());
-        }
-        packet_push_flow_template_claim_with_citations(
-            claims,
-            seen,
-            "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data.",
-            claim_citations,
-        );
-    }
-
-    if let Some(snapshot_refresh) =
-        packet_citation_matching_display(citations, "SnapshotStore::refresh_all_with_stats")
-    {
-        packet_push_flow_template_claim(
-            claims,
-            seen,
-            "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state.",
-            Some(snapshot_refresh.clone()),
-        );
-    }
-}
-
-fn packet_append_source_derived_flow_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    for citation in citations.iter().take(24) {
-        let source = match packet_citation_source_text(citation) {
-            Some(source) if source.len() <= 800_000 => source,
-            _ => continue,
-        };
-        for claim in packet_source_derived_claims_for_citation(prompt, citation, &source) {
-            packet_push_flow_template_claim(claims, seen, &claim, Some(citation.clone()));
-            if claims.len() >= 18 {
-                return;
-            }
-        }
-    }
-}
-
-fn packet_source_derived_claims_for_citation(
-    prompt: &str,
-    citation: &AgentCitationDto,
-    source: &str,
-) -> Vec<String> {
-    let mut claims = Vec::new();
-    let symbol = citation.display_name.as_str();
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    let file_name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(symbol);
-    let normalized_prompt = normalize_identifier(prompt);
-    let prompt_terms = packet_probe_terms(prompt);
-    let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
-    let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
-
-    if eval_probes_enabled() {
-        claims.extend(
-            crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
-        );
-    }
-
-    if packet_terms_indicate_server_route_dispatch_flow(&prompt_terms) {
-        claims.extend(packet_generic_server_route_flow_claims(symbol, source));
-    }
-
-    if packet_terms_indicate_shell_version_use_flow(&prompt_terms) {
-        claims.extend(packet_generic_shell_version_use_flow_claims(symbol, source));
-    }
-
-    if packet_terms_indicate_hook_cache_flow(&prompt_terms) {
-        claims.extend(packet_generic_hook_cache_flow_claims(symbol, source));
-    }
-
-    if packet_terms_indicate_client_send_flow(&prompt_terms) {
-        claims.extend(packet_generic_client_send_flow_claims(symbol, source));
-    }
-
-    if packet_terms_indicate_string_predicate_flow(&prompt_terms) {
-        claims.extend(packet_generic_string_predicate_flow_claims(symbol, source));
-    }
-
-    if packet_terms_indicate_stylesheet_animation_flow(&prompt_terms) {
-        claims.extend(packet_generic_css_animation_flow_claims(source));
-    }
-
-    if packet_terms_indicate_sql_schema_flow(&prompt_terms) {
-        claims.extend(packet_generic_sql_schema_flow_claims(source));
-    }
-
-    if packet_terms_indicate_runtime_formatting_flow(&prompt_terms) {
-        claims.extend(packet_generic_runtime_formatting_flow_claims(source));
-    }
-
-    if request_flow && packet_source_has_all(source, &["new ", "prototype", "request", "extend"]) {
-        let context = packet_source_constructed_type(source).unwrap_or_else(|| "client".into());
-        claims.push(format!(
-            "`{symbol}` wraps a {context} context and exposes verb helpers bound to request."
-        ));
-    }
-
-    if request_flow
-        && packet_source_has_all(source, &["merge", "config", "interceptors", "request"])
-        && packet_source_has_any(source, &["dispatch", "adapter"])
-        && let Some(owner) = packet_display_owner(symbol)
-    {
-        let dispatch = packet_source_identifier_with_words(source, &["dispatch", "request"])
-            .unwrap_or_else(|| "request dispatch".to_string());
-        claims.push(format!(
-            "{owner}.request merges defaults, runs request interceptors, then calls {dispatch}."
-        ));
-    }
-
-    if request_flow
-        && packet_source_has_all(source, &["adapter", "transform"])
-        && packet_source_has_any(source, &["headers", "data", "body"])
-    {
-        claims.push(format!(
-            "`{symbol}` transforms the body/headers and invokes the configured adapter."
-        ));
-    }
-
-    if request_flow && packet_source_has_all(source, &["handlers", "fulfilled", "rejected"]) {
-        claims.push(format!(
-            "`{symbol}` stores interceptor pairs used by the promise chain in request."
-        ));
-    }
-
-    if request_flow
-        && packet_source_has_all(source, &["adapter"])
-        && packet_source_has_all(source, &["xhr", "http"])
-        && packet_source_has_any(source, &["known", "environment", "platform"])
-    {
-        claims.push(format!(
-            "`{file_name}` selects xhr or http transport based on environment capabilities."
-        ));
-    }
-
-    if normalized_prompt.contains("eventloop")
-        || (normalized_prompt.contains("event") && normalized_prompt.contains("loop"))
-    {
-        if packet_source_has_all(source, &["init", "event"])
-            && let Some(loop_entry) = packet_source_identifier_ending_with(source, "Main", "main")
-            && packet_source_identifier_exact(source, "main").is_some()
-        {
-            claims.push(format!(
-                "main initializes the server and enters {loop_entry} on the shared event loop."
-            ));
-        }
-        if let Some(process_events) =
-            packet_source_identifier_with_words(source, &["process", "events"])
-            && packet_source_has_any(source, &["readable", "writable"])
-        {
-            claims.push(format!(
-                "{process_events} polls readable/writable fds and invokes registered file event handlers."
-            ));
-        }
-    }
-
-    if let Some(read_client) = packet_source_identifier_with_words(source, &["read", "client"])
-        && let Some(process_input) =
-            packet_source_identifier_with_words(source, &["process", "input", "buffer"])
-    {
-        claims.push(format!(
-            "{read_client} appends socket input and drives {process_input} when a full command is available."
-        ));
-    }
-
-    if let Some(process_command) =
-        packet_source_identifier_with_words(source, &["process", "command"])
-        && packet_source_has_any(source, &["lookup", "arity", "acl", "cluster"])
-    {
-        claims.push(format!(
-            "{process_command} resolves the command table entry and enforces ACL, arity, and cluster checks."
-        ));
-    }
-    if let Some(call) = packet_source_identifier_exact(source, "call")
-        && packet_source_has_all(source, &["proc", "propagat"])
-        && packet_source_has_any(source, &["slowlog", "monitor"])
-    {
-        claims.push(format!(
-            "{call} executes the command proc and handles propagation, monitoring, and slowlog accounting."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(source, &["flags", "parse", "search"])
-        && let Some(main) = packet_source_identifier_exact(source, "main")
-    {
-        let run = packet_source_identifier_exact(source, "run").unwrap_or_else(|| "run".into());
-        claims.push(format!(
-            "{main} calls {run} after flags::parse and routes into search or parallel search modes."
-        ));
-    }
-
-    if search_flow && packet_source_has_all(source, &["walk", "matcher", "searcher", "printer"]) {
-        let owner = packet_display_owner(symbol)
-            .or_else(|| packet_source_identifier_with_words_shortest(source, &["args"]))
-            .unwrap_or_else(|| symbol.to_string());
-        claims.push(format!(
-            "`{owner}` builds walkers, matchers, searchers, and printers used by the search driver."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(source, &["matcher", "searcher", "printer"])
-        && packet_source_has_any(source, &["haystack", "path"])
-    {
-        let worker = packet_source_identifier_with_words_shortest(source, &["search", "worker"])
-            .unwrap_or_else(|| symbol.to_string());
-        claims.push(format!(
-            "`{worker}` connects a PatternMatcher, grep searcher, and Printer for each haystack."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(source, &["haystack", "searcher", "search"])
-        && let Some(worker) =
-            packet_source_identifier_with_words_shortest(source, &["search", "worker"])
-    {
-        claims.push(format!(
-            "search walks haystacks from the ignore crate and invokes {worker} per file."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(source, &["walk_builder", "build_parallel"])
-        && let Some(parallel_search) =
-            packet_source_identifier_with_words_shortest(source, &["search", "parallel"])
-    {
-        claims.push(format!(
-            "{parallel_search} uses walk_builder().build_parallel() to search files concurrently."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(source, &["matcher", "searcher", "printer", "haystack"])
-        && let Some(worker) =
-            packet_source_identifier_with_words_shortest(source, &["search", "worker"])
-        && let Some(search_method) = packet_source_identifier_exact(source, "search")
-    {
-        claims.push(format!(
-            "{worker}::{search_method} executes per-haystack search with matcher, searcher, and printer state."
-        ));
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &[
-            "hook",
-            "hooks",
-            "cache",
-            "helper",
-            "helpers",
-            "serialize",
-            "serializes",
-            "mutate",
-            "mutation",
-            "public",
-            "exposes",
-        ],
-    )
-}
-
-fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<String> {
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if source_lower.contains("withargs")
-        && source_lower.contains("export default")
-        && let Some((public_hook, handler)) = packet_source_with_args_wrapper(source)
-    {
-        claims.push(format!(
-            "The public {public_hook} export wraps {handler} with argument normalization."
-        ));
-    }
-
-    if source_lower.contains("serialize(_key)")
-        && (source_lower.contains("getcache")
-            || source_lower.contains("createcachehelper")
-            || source_lower.contains("cache"))
-    {
-        claims.push(format!(
-            "{symbol} serializes the key before reading cache state."
-        ));
-    }
-
-    if source_lower.contains("cache.get(key)")
-        && source_lower.contains("return [")
-        && (source_lower.contains("cache.set(key")
-            || source_lower.contains("state[5]")
-            || source_lower.contains("setter"))
-        && (source_lower.contains("subscribe")
-            || source_lower.contains("state[6]")
-            || source_lower.contains("subscriber"))
-        && (source_lower.contains("snapshot")
-            || source_lower.contains("initial_cache")
-            || source_lower.contains("initial cache"))
-    {
-        claims.push(format!(
-            "{symbol} provides cache get, set, subscribe, and snapshot helpers."
-        ));
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &[
-            "client",
-            "clients",
-            "request",
-            "requests",
-            "send",
-            "sending",
-            "transport",
-            "convenience",
-            "helper",
-            "helpers",
-        ],
-    )
-}
-
-fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<String> {
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-    let owner = packet_display_owner(symbol).unwrap_or_else(|| symbol.to_string());
-
-    if source_lower.contains("_sendunstreamed")
-        && source_lower.contains("response.fromstream")
-        && source_lower.contains("send(request)")
-        && (source_lower.contains("future<response>")
-            || source_lower.contains("response>")
-            || source_lower.contains("response "))
-        && packet_source_has_any(source, &["get(", "post(", "put(", "patch(", "delete("])
-    {
-        claims.push(format!(
-            "{owner} implements convenience methods in terms of send."
-        ));
-    }
-
-    if source_lower.contains("dart:io")
-        && source_lower.contains("httpclient")
-        && source_lower.contains("openurl")
-        && source_lower.contains("request.finalize")
-        && source_lower.contains("stream.pipe")
-        && source_lower.contains("httpclientresponse")
-    {
-        claims.push(format!(
-            "{owner}.send is the dart:io transport implementation."
-        ));
-    }
-
-    claims
-}
-
-fn packet_generic_string_predicate_flow_claims(symbol: &str, source: &str) -> Vec<String> {
-    let normalized_symbol = normalize_identifier(symbol);
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_symbol.ends_with("isblank")
-        && let Some(method) = packet_source_method_block(source, "boolean", "isBlank")
-    {
-        let method_lower = method.to_ascii_lowercase();
-        let null_empty_whitespace_documented = source_lower.contains("null, empty or whitespace")
-            || source_lower.contains("null, empty, or whitespace")
-            || source_lower.contains("null, empty and whitespace");
-        if method_lower.contains("character.iswhitespace")
-            && (method_lower.contains("null") || null_empty_whitespace_documented)
-            && method_lower.contains("length")
-        {
-            claims.push(
-                "isBlank treats null, empty, and whitespace-only inputs as blank.".to_string(),
-            );
-        }
-    }
-
-    if normalized_symbol.ends_with("isempty")
-        && let Some(method) = packet_source_method_block(source, "boolean", "isEmpty")
-    {
-        let method_lower = method.to_ascii_lowercase();
-        if method_lower.contains("null")
-            && method_lower.contains("length()")
-            && !method_lower.contains("trim(")
-            && !method_lower.contains(".trim")
-            && !method_lower.contains("strip(")
-            && !method_lower.contains(".strip")
-        {
-            claims.push("isEmpty does not trim whitespace before deciding emptiness.".to_string());
-        }
-    }
-
-    claims
-}
-
-fn packet_source_method_block(
-    source: &str,
-    return_type: &str,
-    method_name: &str,
-) -> Option<String> {
-    let lower = source.to_ascii_lowercase();
-    let method_lower = method_name.to_ascii_lowercase();
-    let return_lower = return_type.to_ascii_lowercase();
-    let patterns = [
-        format!("{return_lower} {method_lower}("),
-        format!("{return_lower}\n{method_lower}("),
-    ];
-    let method_start = patterns
-        .iter()
-        .filter_map(|pattern| lower.find(pattern))
-        .min()?;
-    let brace_start = lower[method_start..].find('{')? + method_start;
-    let bytes = source.as_bytes();
-    let mut depth = 0usize;
-    for index in brace_start..bytes.len() {
-        match bytes[index] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(source[method_start..=index].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<String> {
-    let mut claims = Vec::new();
-    let custom_properties = packet_css_custom_property_names(source);
-    let duration = packet_css_custom_property_with_fragment(&custom_properties, "duration");
-    let delay = packet_css_custom_property_with_fragment(&custom_properties, "delay");
-    let repeat = packet_css_custom_property_with_fragment(&custom_properties, "repeat");
-
-    if let (Some(duration), Some(delay), Some(repeat)) = (duration, delay, repeat) {
-        claims.push(format!(
-            "Shared CSS custom properties {duration}, {delay}, and {repeat} define animation duration, delay, and repeat defaults."
-        ));
-    }
-
-    if let Some(base_class) =
-        packet_css_class_with_properties(source, &["animation-duration", "animation-fill-mode"])
-    {
-        claims.push(format!(
-            ".{base_class} is the base class that applies animation duration and fill mode."
-        ));
-    }
-
-    for keyframe in packet_css_keyframe_names(source).into_iter().take(4) {
-        if packet_css_class_sets_animation_name(source, &keyframe) {
-            claims.push(format!(
-                "Named classes such as .{keyframe} set animation-name to matching keyframes; @keyframes {keyframe} defines the matching animation."
-            ));
-        }
-    }
-
-    claims
-}
-
-fn packet_css_custom_property_names(source: &str) -> Vec<String> {
-    let bytes = source.as_bytes();
-    let mut properties = Vec::new();
-    let mut seen = HashSet::new();
-    let mut index = 0usize;
-    while index + 1 < bytes.len() {
-        if bytes[index] != b'-' || bytes[index + 1] != b'-' {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        index += 2;
-        while index < bytes.len() && packet_css_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        if index > start + 2 {
-            let property = source[start..index].to_string();
-            if seen.insert(property.to_ascii_lowercase()) {
-                properties.push(property);
-            }
-        }
-    }
-    properties
-}
-
-fn packet_css_custom_property_with_fragment<'a>(
-    properties: &'a [String],
-    fragment: &str,
-) -> Option<&'a str> {
-    properties
-        .iter()
-        .find(|property| normalize_identifier(property).contains(fragment))
-        .map(String::as_str)
-}
-
-fn packet_css_class_with_properties(source: &str, required_properties: &[&str]) -> Option<String> {
-    let lower = source.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    let mut index = 0usize;
-    while let Some(dot_offset) = lower[index..].find('.') {
-        let dot = index + dot_offset;
-        let name_start = dot + 1;
-        if name_start >= bytes.len() || !packet_css_identifier_byte(bytes[name_start]) {
-            index = name_start.saturating_add(1);
-            continue;
-        }
-        let mut name_end = name_start;
-        while name_end < bytes.len() && packet_css_identifier_byte(bytes[name_end]) {
-            name_end += 1;
-        }
-        let Some(block_start_offset) = lower[name_end..].find('{') else {
-            break;
-        };
-        let block_start = name_end + block_start_offset + 1;
-        let Some(block_end_offset) = lower[block_start..].find('}') else {
-            break;
-        };
-        let block = &lower[block_start..block_start + block_end_offset];
-        if required_properties
-            .iter()
-            .all(|property| block.contains(&property.to_ascii_lowercase()))
-        {
-            return Some(source[name_start..name_end].to_string());
-        }
-        index = name_end;
-    }
-    None
-}
-
-fn packet_css_keyframe_names(source: &str) -> Vec<String> {
-    let lower = source.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    let mut names = Vec::new();
-    let mut seen = HashSet::new();
-    let mut search_from = 0usize;
-    while let Some(offset) = lower[search_from..].find("@keyframes") {
-        let mut index = search_from + offset + "@keyframes".len();
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        let name_start = index;
-        while index < bytes.len() && packet_css_identifier_byte(bytes[index]) {
-            index += 1;
-        }
-        if index > name_start {
-            let name = source[name_start..index].to_string();
-            if seen.insert(name.to_ascii_lowercase()) {
-                names.push(name);
-            }
-        }
-        search_from = index;
-    }
-    names
-}
-
-fn packet_css_class_sets_animation_name(source: &str, class_name: &str) -> bool {
-    let lower = source.to_ascii_lowercase();
-    let class_name = class_name.to_ascii_lowercase();
-    let class_selector = format!(".{class_name}");
-    if !lower.contains(&class_selector) {
-        return false;
-    }
-    let compact = lower
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    compact.contains(&format!("animation-name:{class_name}"))
-}
-
-fn packet_css_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
-}
-
-fn packet_source_with_args_wrapper(source: &str) -> Option<(String, String)> {
-    let lower = source.to_ascii_lowercase();
-    let mut search_from = 0usize;
-
-    while let Some(relative_at) = lower[search_from..].find("withargs") {
-        let with_args_at = search_from + relative_at;
-        let statement_start = source[..with_args_at]
-            .rfind(['\n', ';'])
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let before = &source[statement_start..with_args_at];
-        let Some(wrapper) = before
-            .rsplit_once('=')
-            .and_then(|(left, _)| packet_last_identifier(left))
-        else {
-            search_from = with_args_at + "withargs".len();
-            continue;
-        };
-
-        let after = &source[with_args_at..];
-        let Some(handler_start) = after.find('(').map(|idx| idx + 1) else {
-            search_from = with_args_at + "withargs".len();
-            continue;
-        };
-        let handler_tail = &after[handler_start..];
-        let Some(handler) = packet_first_identifier_after_type_arguments(handler_tail) else {
-            search_from = with_args_at + "withargs".len();
-            continue;
-        };
-
-        if packet_source_exports_default_identifier(after, &wrapper) {
-            return Some((wrapper, handler));
-        }
-
-        search_from = with_args_at + "withargs".len();
-    }
-
-    None
-}
-
-fn packet_source_exports_default_identifier(source: &str, identifier: &str) -> bool {
-    let lower = source.to_ascii_lowercase();
-    let mut search_from = 0usize;
-
-    while let Some(relative_at) = lower[search_from..].find("export default") {
-        let export_at = search_from + relative_at + "export default".len();
-        if packet_first_identifier(&source[export_at..]).as_deref() == Some(identifier) {
-            return true;
-        }
-        search_from = export_at;
-    }
-
-    false
-}
-
-fn packet_first_identifier_after_type_arguments(value: &str) -> Option<String> {
-    let mut start = 0usize;
-    let trimmed = value.trim_start();
-    if trimmed.starts_with('<') {
-        let mut depth = 0usize;
-        for (idx, ch) in trimmed.char_indices() {
-            match ch {
-                '<' => depth += 1,
-                '>' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        start = idx + ch.len_utf8();
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    packet_first_identifier(&trimmed[start..])
-}
-
-fn packet_first_identifier(value: &str) -> Option<String> {
-    let mut chars = value
-        .char_indices()
-        .skip_while(|(_, ch)| !is_ident_start(*ch));
-    let (start, _) = chars.next()?;
-    let mut end = value.len();
-    for (idx, ch) in value[start..].char_indices().skip(1) {
-        if !is_ident_continue(ch) {
-            end = start + idx;
-            break;
-        }
-    }
-    Some(value[start..end].to_string())
-}
-
-fn packet_last_identifier(value: &str) -> Option<String> {
-    value
-        .split(|ch: char| !is_ident_continue(ch))
-        .filter(|part| part.chars().next().is_some_and(is_ident_start))
-        .last()
-        .map(str::to_string)
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &[
-            "bash", "shell", "script", "command", "dispatch", "install", "version",
-        ],
-    ) && packet_terms_have_any(terms, &["use", "switch", "active", "current", "needed"])
-}
-
-fn packet_generic_shell_version_use_flow_claims(symbol: &str, source: &str) -> Vec<String> {
-    let normalized_symbol = normalize_identifier(symbol);
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if (normalized_symbol.contains("ifneeded") || normalized_symbol.contains("needed"))
-        && source_lower.contains("if ")
-        && source_lower.contains("${1-}")
-        && source_lower.contains("current")
-        && source_lower.contains("return")
-        && source_lower.contains("$@")
-        && source_lower.contains(" use ")
-    {
-        claims.push(format!(
-            "{symbol} switches versions only when the requested version is not already active."
-        ));
-    }
-
-    claims
-}
-
-fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &["string", "strings", "charsequence", "charsequences", "text"],
-    ) && packet_terms_have_any(
-        terms,
-        &[
-            "blank",
-            "empty",
-            "whitespace",
-            "trim",
-            "trims",
-            "predicate",
-            "predicates",
-        ],
-    )
-}
-
-fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<String> {
-    let normalized_symbol = normalize_identifier(symbol);
-    let source_lower = source.to_ascii_lowercase();
-    let mut claims = Vec::new();
-
-    if normalized_symbol.contains("handle")
-        && source_lower.contains("handlers")
-        && source_lower.contains("relativepath")
-        && (source_lower.contains(".handle(") || source_lower.contains(" handle("))
-        && source_lower.contains("return")
-    {
-        claims.push(format!(
-            "{symbol} registers routes by delegating to the group handle path."
-        ));
-    }
-
-    if normalized_symbol.ends_with("next")
-        && source_lower.contains("handlers")
-        && source_lower.contains("index")
-        && source_lower.contains("++")
-        && source_lower.contains("for ")
-    {
-        claims.push(format!("{symbol} advances through the handler chain."));
-    }
-
-    claims
-}
-
-fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
-    let mut claims = Vec::new();
-    let tables = packet_sql_create_table_names(source);
-    if !tables.is_empty() {
-        claims.push(format!(
-            "SQL schema defines tables {}.",
-            packet_human_join(&tables.iter().take(6).cloned().collect::<Vec<_>>())
-        ));
-    }
-    for claim in packet_sql_foreign_key_claims(source) {
-        if !claims.iter().any(|existing| existing == &claim) {
-            claims.push(claim);
-        }
-        if claims.len() >= 18 {
-            break;
-        }
-    }
-    claims
-}
-
-fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(
-        terms,
-        &["format", "formats", "formatting", "vformat", "format_to"],
-    ) && packet_terms_have_any(
-        terms,
-        &[
-            "arg",
-            "args",
-            "argument",
-            "arguments",
-            "runtime",
-            "type",
-            "erased",
-            "output",
-        ],
-    )
-}
-
-fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
-    let normalized_source = normalize_identifier(source);
-    let mut claims = Vec::new();
-
-    if normalized_source.contains("vformat")
-        && (normalized_source.contains("formatargs")
-            || normalized_source.contains("basicformatargs")
-            || normalized_source.contains("formatargstore"))
-        && (normalized_source.contains("vformatto") || normalized_source.contains("formatto"))
-    {
-        claims.push(
-            "vformat is the central formatting path for runtime format arguments.".to_string(),
-        );
-    }
-
-    if normalized_source.contains("formaterror")
-        && (normalized_source.contains("runtimeerror")
-            || normalized_source.contains("throwformaterror")
-            || normalized_source.contains("formatting"))
-    {
-        claims.push("format_error represents formatting failures.".to_string());
-    }
-
-    claims
-}
-
-fn packet_sql_create_table_names(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in source.lines() {
-        if let Some(name) = packet_sql_identifier_after(line, "create table")
-            && !names.iter().any(|existing| existing == &name)
-        {
-            names.push(name);
-        }
-        if names.len() >= 12 {
-            break;
-        }
-    }
-    names
-}
-
-fn packet_sql_foreign_key_claims(source: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    let mut current_table: Option<String> = None;
-    for line in source.lines() {
-        if let Some(table) = packet_sql_identifier_after(line, "create table") {
-            current_table = Some(table);
-        }
-        let normalized = line.to_ascii_lowercase();
-        if !normalized.contains("foreign key") || !normalized.contains("references") {
-            continue;
-        }
-        let Some(source_table) = current_table.clone() else {
-            continue;
-        };
-        let Some(local_key) = packet_sql_identifier_between(line, "foreign key", "references")
-        else {
-            continue;
-        };
-        let Some(target_table) = packet_sql_identifier_after(line, "references") else {
-            continue;
-        };
-        if !links
-            .iter()
-            .any(|(existing_source, existing_target, existing_key)| {
-                existing_source == &source_table
-                    && existing_target == &target_table
-                    && existing_key == &local_key
-            })
-        {
-            links.push((source_table, target_table, local_key));
-        }
-        if links.len() >= 18 {
-            break;
-        }
-    }
-
-    let mut claims = Vec::new();
-    for (source_table, target_table, local_key) in &links {
-        claims.push(format!(
-            "{source_table} rows reference {target_table} rows through {local_key}."
-        ));
-    }
-
-    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
-    for (source_table, target_table, _) in links {
-        if let Some((_, targets)) = grouped
-            .iter_mut()
-            .find(|(existing_source, _)| existing_source == &source_table)
-        {
-            if !targets.iter().any(|existing| existing == &target_table) {
-                targets.push(target_table);
-            }
-        } else {
-            grouped.push((source_table, vec![target_table]));
-        }
-    }
-    for (source_table, targets) in grouped {
-        if targets.len() < 2 {
-            continue;
-        }
-        let claim = format!(
-            "{source_table} rows reference {} rows.",
-            packet_human_join(&targets)
-        );
-        if !claims.iter().any(|existing| existing == &claim) {
-            claims.push(claim);
-        }
-    }
-
-    claims
-}
-
-fn packet_sql_identifier_between(line: &str, start: &str, end: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let start_at = lower.find(start)? + start.len();
-    let end_at = lower[start_at..].find(end)? + start_at;
-    packet_first_sql_identifier(&line[start_at..end_at])
-}
-
-fn packet_sql_identifier_after(line: &str, needle: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let at = lower.find(needle)? + needle.len();
-    if needle == "create table"
-        && lower[at..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-    {
-        return None;
-    }
-    let mut rest = line[at..].trim_start();
-    for prefix in ["if not exists", "only"] {
-        if rest.to_ascii_lowercase().starts_with(prefix) {
-            rest = rest[prefix.len()..].trim_start();
-        }
-    }
-    packet_first_sql_identifier(rest)
-}
-
-fn packet_first_sql_identifier(input: &str) -> Option<String> {
-    let mut token = String::new();
-    let mut in_identifier = false;
-    let mut quote: Option<char> = None;
-    for ch in input.chars() {
-        if !in_identifier {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '"' | '\'' | '`' | '[') {
-                in_identifier = true;
-                quote = match ch {
-                    '"' | '\'' | '`' => Some(ch),
-                    '[' => Some(']'),
-                    _ => None,
-                };
-                if quote.is_none() {
-                    token.push(ch);
-                }
-            }
-            continue;
-        }
-        if quote.is_some_and(|end| ch == end) {
-            break;
-        }
-        if quote.is_none() && !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$')) {
-            break;
-        }
-        token.push(ch);
-    }
-    let token = token
-        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']' | '(' | ')'))
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']'))
-        .trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
-}
-
-fn packet_human_join(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [first, second] => format!("{first} and {second}"),
-        _ => {
-            let mut parts = items.to_vec();
-            let last = parts.pop().unwrap_or_default();
-            format!("{}, and {last}", parts.join(", "))
-        }
-    }
-}
-
-fn packet_append_sql_schema_file_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let terms = packet_probe_terms(prompt);
-    if !packet_terms_indicate_sql_schema_flow(&terms) {
-        return;
-    }
-
-    let mut sql_schema_citations = Vec::new();
-    let mut seen_paths = HashSet::new();
-    let mut dialects = HashSet::new();
-    for citation in citations {
-        let Some(path) = citation.file_path.as_deref() else {
-            continue;
-        };
-        let display_path = packet_display_path(path);
-        if !display_path.to_ascii_lowercase().ends_with(".sql") {
-            continue;
-        }
-        let normalized_path = display_path.to_ascii_lowercase();
-        if !seen_paths.insert(normalized_path.clone()) {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        if !source.to_ascii_lowercase().contains("create table") {
-            continue;
-        }
-        if let Some(dialect) = packet_sql_dialect_key(&normalized_path) {
-            dialects.insert(dialect);
-        }
-        sql_schema_citations.push(citation.clone());
-    }
-
-    if sql_schema_citations.len() < 2 {
-        return;
-    }
-
-    let subject = packet_sql_schema_prompt_subject(prompt);
-    let claim = match (dialects.len() >= 2, subject.as_deref()) {
-        (true, Some(subject)) => {
-            format!(
-                "The repository carries multiple SQL dialect scripts for the same {subject} schema."
-            )
-        }
-        (true, None) => {
-            "The repository carries multiple SQL dialect scripts for the same schema.".to_string()
-        }
-        (false, Some(subject)) => {
-            format!(
-                "The repository carries multiple SQL schema scripts for the same {subject} schema."
-            )
-        }
-        (false, None) => {
-            "The repository carries multiple SQL schema scripts for the same schema.".to_string()
-        }
-    };
-    packet_push_flow_template_claim_with_citations(
-        claims,
-        seen,
-        &claim,
-        sql_schema_citations.into_iter().take(3).collect(),
-    );
-}
-
-fn packet_sql_dialect_key(normalized_path: &str) -> Option<&'static str> {
-    if normalized_path.contains("sqlite") {
-        Some("sqlite")
-    } else if normalized_path.contains("mysql") {
-        Some("mysql")
-    } else if normalized_path.contains("postgres") || normalized_path.contains("pgsql") {
-        Some("postgres")
-    } else if normalized_path.contains("sqlserver") || normalized_path.contains("mssql") {
-        Some("sqlserver")
-    } else if normalized_path.contains("db2") {
-        Some("db2")
-    } else if normalized_path.contains("oracle") {
-        Some("oracle")
-    } else {
-        None
-    }
-}
-
-fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
-    let stop_words = [
-        "Explain",
-        "Trace",
-        "Cite",
-        "Name",
-        "SQL",
-        "Schema",
-        "Relationships",
-        "Relation",
-        "Tables",
-        "Table",
-    ];
-    prompt
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .map(str::trim)
-        .find(|token| {
-            token.len() >= 4
-                && token
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
-                && !stop_words
-                    .iter()
-                    .any(|stop| stop.eq_ignore_ascii_case(token))
-        })
-        .map(str::to_string)
-}
-
-fn packet_append_indexing_storage_flow_template_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let normalized_prompt = normalize_identifier(prompt);
-    let indexing_prompt = normalized_prompt.contains("indexing")
-        || normalized_prompt.contains("indexed")
-        || normalized_prompt.contains("indexer");
-    let storage_prompt = normalized_prompt.contains("storage")
-        || normalized_prompt.contains("persistent")
-        || normalized_prompt.contains("sourcegroup")
-        || normalized_prompt.contains("sourcegroupconfiguration");
-    if !(indexing_prompt && storage_prompt) {
-        return;
-    }
-
-    let source_group = citations
-        .iter()
-        .find(|citation| packet_evidence_role(citation) == Some("source-group configuration"));
-    let indexing_work = citations
-        .iter()
-        .find(|citation| packet_evidence_role(citation) == Some("indexing work queue"));
-    if let Some(source_group) = source_group
-        && let Some(indexing_work) = indexing_work
-    {
-        packet_push_flow_template_claim_with_citations(
-            claims,
-            seen,
-            "Source-group configuration and indexing command evidence describe how repository configuration becomes indexing work.",
-            vec![source_group.clone(), indexing_work.clone()],
-        );
-    }
-
-    if let Some(persistence) = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some("persistence and search projection")
-    }) {
-        packet_push_flow_template_claim(
-            claims,
-            seen,
-            "Persistence/search-projection evidence describes how indexed data remains available to later application reads.",
-            Some(persistence.clone()),
-        );
-    }
-}
-
-fn packet_append_command_flow_template_claims(
-    prompt: &str,
-    citations: &[AgentCitationDto],
-    claims: &mut Vec<PacketClaimDto>,
-    seen: &mut HashSet<String>,
-) {
-    let normalized_prompt = normalize_identifier(prompt);
-    if !(normalized_prompt.contains("cli")
-        || normalized_prompt.contains("command")
-        || normalized_prompt.contains("subcommand"))
-    {
-        return;
-    }
-
-    for descriptor in packet_command_descriptors(prompt) {
-        let subcommand_display = format!("Subcommand::{}", descriptor.subcommand_title);
-        let cli_display = format!("{}::Cli", descriptor.module);
-        let run_main_display = format!("{}::run_main", descriptor.module);
-        let subcommand_citation = packet_citation_matching_display(citations, &subcommand_display);
-        let cli_citation = packet_citation_matching_display(citations, &cli_display);
-        let run_main_citation = packet_citation_matching_display(citations, &run_main_display)
-            .or_else(|| {
-                packet_citation_matching_path_and_display(
-                    citations,
-                    &descriptor.crate_segment,
-                    "run_main",
-                )
-            });
-
-        if let Some(subcommand_citation) = subcommand_citation
-            && (cli_citation.is_some() || run_main_citation.is_some())
-        {
-            let mut claim_citations = vec![subcommand_citation.clone()];
-            if let Some(cli_citation) = cli_citation {
-                claim_citations.push(cli_citation.clone());
-            } else if let Some(run_main_citation) = run_main_citation {
-                claim_citations.push(run_main_citation.clone());
-            }
-            let claim = format!(
-                "The top-level {} CLI has a cited {} subcommand and command-module entrypoint in `{}`.",
-                descriptor.command_title, descriptor.subcommand_title, descriptor.module
-            );
-            packet_push_flow_template_claim_with_citations(claims, seen, &claim, claim_citations);
-        }
-
-        if let Some(cli_citation) = cli_citation
-            && let Some(run_main_citation) = run_main_citation
-        {
-            packet_push_flow_template_claim_with_citations(
-                claims,
-                seen,
-                &format!(
-                    "The {} binary parses {}-specific CLI options and calls {}::run_main.",
-                    descriptor.module.replace('_', "-"),
-                    descriptor.crate_segment,
-                    descriptor.module
-                ),
-                vec![cli_citation.clone(), run_main_citation.clone()],
-            );
-            if (normalized_prompt.contains("json") || normalized_prompt.contains("jsonl"))
-                && packet_command_crate_sources_contain_all(
-                    citations,
-                    &descriptor.crate_segment,
-                    &[&["long = \"json\"", "--json"], &["jsonl"]],
-                )
-            {
-                packet_push_flow_template_claim(
-                    claims,
-                    seen,
-                    &format!(
-                        "The {} CLI defines --json as the switch that chooses JSONL stdout output.",
-                        descriptor.crate_segment
-                    ),
-                    Some(cli_citation.clone()),
-                );
-            }
-        }
-
-        let runtime_citation = run_main_citation.or_else(|| {
-            packet_citation_matching_path_and_display(
-                citations,
-                &descriptor.crate_segment,
-                "run_exec_session",
-            )
-        });
-        if let Some(runtime_citation) = runtime_citation
-            && (normalized_prompt.contains("appserver")
-                || normalized_prompt.contains("runtime")
-                || normalized_prompt.contains("thread")
-                || normalized_prompt.contains("turn"))
-            && packet_command_crate_sources_contain_all(
-                citations,
-                &descriptor.crate_segment,
-                &[
-                    &[
-                        "configbuilder",
-                        "configbuilder::default",
-                        "configbuilder::default()",
-                    ],
-                    &["approval"],
-                    &["sandbox"],
-                    &["inprocessclientstartargs"],
-                ],
-            )
-        {
-            packet_push_flow_template_claim(
-                claims,
-                seen,
-                "run_main loads config, resolves sandbox and approval settings, and builds the in-process app-server start arguments.",
-                Some(runtime_citation.clone()),
-            );
-        }
-    }
-
-    if (normalized_prompt.contains("json") || normalized_prompt.contains("jsonl"))
-        && (normalized_prompt.contains("event") || normalized_prompt.contains("output"))
-        && let Some(json_output_citation) = citations
-            .iter()
-            .find(|citation| packet_evidence_role(citation) == Some("event output processing"))
-    {
-        packet_push_flow_template_claim(
-            claims,
-            seen,
-            "Event-output processing evidence describes how structured runtime events are serialized for JSON/JSONL output.",
-            Some(json_output_citation.clone()),
-        );
-    }
-}
-
-fn packet_citation_matching_display<'a>(
-    citations: &'a [AgentCitationDto],
-    display_needle: &str,
-) -> Option<&'a AgentCitationDto> {
-    let needle = normalize_identifier(display_needle);
-    citations
-        .iter()
-        .find(|citation| normalize_identifier(&citation.display_name) == needle)
-}
-
-fn packet_citation_matching_display_contains<'a>(
-    citations: &'a [AgentCitationDto],
-    display_needle: &str,
-) -> Option<&'a AgentCitationDto> {
-    let needle = normalize_identifier(display_needle);
-    citations
-        .iter()
-        .find(|citation| normalize_identifier(&citation.display_name).contains(&needle))
-}
-
-fn packet_citation_matching_path_and_display<'a>(
-    citations: &'a [AgentCitationDto],
-    path_needle: &str,
-    display_needle: &str,
-) -> Option<&'a AgentCitationDto> {
-    let normalized_path_needle = normalize_identifier(path_needle);
-    let normalized_display_needle = normalize_identifier(display_needle);
-    citations.iter().find(|citation| {
-        let path_match = citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .map(|path| normalize_identifier(&path).contains(&normalized_path_needle))
-            .unwrap_or(false);
-        path_match
-            && normalize_identifier(&citation.display_name).contains(&normalized_display_needle)
-    })
-}
-
-fn packet_command_crate_sources_contain_all(
-    citations: &[AgentCitationDto],
-    crate_segment: &str,
-    groups: &[&[&str]],
-) -> bool {
-    let mut combined = String::new();
-    for citation in citations
-        .iter()
-        .filter(|citation| packet_citation_path_contains_crate_segment(citation, crate_segment))
-    {
-        let Some(source) = packet_citation_source_text(citation) else {
-            continue;
-        };
-        combined.push_str(&source.to_ascii_lowercase());
-        combined.push('\n');
-    }
-    !combined.is_empty()
-        && groups.iter().all(|terms| {
-            terms
-                .iter()
-                .any(|term| combined.contains(&term.to_ascii_lowercase()))
-        })
-}
-
-fn packet_citation_path_contains_crate_segment(
-    citation: &AgentCitationDto,
-    crate_segment: &str,
-) -> bool {
-    let crate_segment = normalize_identifier(crate_segment);
-    if crate_segment.is_empty() {
-        return false;
-    }
-    citation
-        .file_path
-        .as_deref()
-        .map(|path| {
-            let raw = path.trim_start_matches("\\\\?\\").replace('\\', "/");
-            let display = packet_display_path(path).replace('\\', "/");
-            format!("{raw}\n{display}").to_ascii_lowercase()
-        })
-        .map(|path| {
-            let needle = format!("/{crate_segment}/src/");
-            path.contains(&needle)
-        })
-        .unwrap_or(false)
-}
-
-fn packet_citation_source_text(citation: &AgentCitationDto) -> Option<String> {
-    let path = citation.file_path.as_deref()?;
-    std::fs::read_to_string(path).ok()
 }
 
 struct PacketSqlSchemaFileCandidate {
@@ -4598,189 +1378,6 @@ fn packet_source_probe_anchor_kind(line: &str, parts: &PacketFileScopedSymbolPro
         NodeKind::ANNOTATION
     }
 }
-fn packet_append_source_definition_claims(
-    citations: &[AgentCitationDto],
-    rank_terms: &[String],
-    claims: &mut Vec<PacketClaimDto>,
-    seen_claims: &mut HashSet<String>,
-) {
-    let normalized_terms = rank_terms
-        .iter()
-        .map(|term| normalize_identifier(term))
-        .filter(|term| term.len() >= 6)
-        .collect::<Vec<_>>();
-    let rank_tokens = packet_definition_rank_tokens(rank_terms);
-    if normalized_terms.is_empty() && rank_tokens.is_empty() {
-        return;
-    }
-
-    let mut seen_definitions = HashSet::new();
-    let mut appended = 0;
-    for citation in citations.iter().take(24) {
-        let Some(source) = packet_citation_source_text(citation) else {
-            continue;
-        };
-        if source.len() > 400_000 {
-            continue;
-        }
-        for line in source.lines().take(4_000) {
-            let Some(definition) = packet_source_definition_name(line) else {
-                continue;
-            };
-            let normalized_definition = normalize_identifier(&definition);
-            if !packet_definition_matches_rank_terms(
-                &definition,
-                &normalized_definition,
-                &normalized_terms,
-                &rank_tokens,
-            ) {
-                continue;
-            }
-            let path = citation
-                .file_path
-                .as_deref()
-                .map(packet_display_path)
-                .unwrap_or_else(|| "<unknown path>".to_string());
-            let definition_key = format!("{normalized_definition}:{path}");
-            if !seen_definitions.insert(definition_key) {
-                continue;
-            }
-            packet_push_flow_template_claim(
-                claims,
-                seen_claims,
-                &format!(
-                    "`{definition}` is defined in cited source `{path}` and should be treated as an exact source anchor for this flow."
-                ),
-                Some(citation.clone()),
-            );
-            appended += 1;
-            if claims.len() >= 18 {
-                return;
-            }
-            if appended >= PACKET_SOURCE_DEFINITION_CLAIM_LIMIT {
-                return;
-            }
-        }
-    }
-}
-
-fn packet_source_definition_name(line: &str) -> Option<String> {
-    let trimmed = line.trim_start();
-    for prefix in [
-        "pub async fn ",
-        "pub(crate) async fn ",
-        "async fn ",
-        "pub fn ",
-        "pub(crate) fn ",
-        "fn ",
-        "pub struct ",
-        "pub(crate) struct ",
-        "struct ",
-        "pub enum ",
-        "pub(crate) enum ",
-        "enum ",
-        "pub trait ",
-        "pub(crate) trait ",
-        "trait ",
-        "export class ",
-        "class ",
-        "export interface ",
-        "interface ",
-        "export function ",
-        "function ",
-        "export const ",
-        "const ",
-        "export type ",
-        "type ",
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return packet_take_definition_identifier(rest);
-        }
-    }
-    None
-}
-
-fn packet_take_definition_identifier(rest: &str) -> Option<String> {
-    let mut identifier = String::new();
-    for ch in rest.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
-            identifier.push(ch);
-        } else {
-            break;
-        }
-    }
-    (identifier.len() >= 3).then_some(identifier)
-}
-
-fn packet_definition_matches_rank_terms(
-    definition: &str,
-    normalized_definition: &str,
-    normalized_terms: &[String],
-    rank_tokens: &HashSet<String>,
-) -> bool {
-    if normalized_definition.len() < 6 {
-        return false;
-    }
-    if normalized_terms
-        .iter()
-        .any(|term| term == normalized_definition)
-    {
-        return true;
-    }
-    let definition_tokens = packet_identifier_tokens(definition);
-    let overlap = definition_tokens
-        .iter()
-        .filter(|token| rank_tokens.contains(token.as_str()))
-        .count();
-    overlap >= 2 || (definition_tokens.iter().any(|token| token == "exec") && overlap >= 1)
-}
-
-fn packet_definition_rank_tokens(rank_terms: &[String]) -> HashSet<String> {
-    rank_terms
-        .iter()
-        .flat_map(|term| packet_identifier_tokens(term))
-        .filter(|term| {
-            term.len() >= 3
-                && !matches!(
-                    term.as_str(),
-                    "the" | "and" | "for" | "with" | "from" | "into" | "flow" | "flows"
-                )
-        })
-        .collect()
-}
-
-fn packet_identifier_tokens(identifier: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut previous_lower_or_digit = false;
-    for ch in identifier.chars() {
-        if ch == '_' || ch == '-' || ch == '$' || ch.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-            previous_lower_or_digit = false;
-            continue;
-        }
-        if ch.is_ascii_uppercase() && previous_lower_or_digit && !current.is_empty() {
-            tokens.push(current.clone());
-            current.clear();
-        }
-        if ch.is_ascii_alphanumeric() {
-            current.extend(ch.to_lowercase());
-            previous_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-        } else if !current.is_empty() {
-            tokens.push(current.clone());
-            current.clear();
-            previous_lower_or_digit = false;
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
 fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
     let mut claims = Vec::new();
     let mut seen_claims = HashSet::new();
@@ -4788,758 +1385,26 @@ fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
     let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
     let citations = answer.citations.clone();
 
-    packet_append_flow_template_claims(&answer.prompt, &citations, &mut claims, &mut seen_claims);
-
-    let mut ordered_citations = citations;
-    ordered_citations.sort_by(|left, right| {
-        packet_claim_carry_rank(right, &rank_terms, prefer_primary_sources)
-            .partial_cmp(&packet_claim_carry_rank(
-                left,
-                &rank_terms,
-                prefer_primary_sources,
-            ))
-            .unwrap_or(Ordering::Equal)
-    });
-    for citation in &ordered_citations {
-        if let Some(shaped) = packet_citation_shaped_claim(citation, &answer.prompt) {
-            let key = normalize_identifier(&shaped);
-            if seen_claims.insert(key) {
-                claims.push(PacketClaimDto {
-                    claim: shaped,
-                    citations: vec![citation.clone()],
-                });
-            }
-            continue;
-        }
-        let role = match packet_evidence_role(citation) {
-            Some("tests and regression coverage") => {
-                let lower = answer.prompt.to_ascii_lowercase();
-                if lower.contains("test")
-                    || lower.contains("regression")
-                    || lower.contains("edit")
-                    || lower.contains("plan")
-                {
-                    "tests and regression coverage"
-                } else {
-                    continue;
-                }
-            }
-            Some(role) => role,
-            None => "source evidence",
-        };
-        let claim_key = packet_claim_key_for_citation(role, citation);
-        if !seen_claims.insert(claim_key.clone()) {
-            continue;
-        }
-        claims.push(PacketClaimDto {
-            claim: packet_claim_for_role(&claim_key, role, citation, &answer.prompt),
-            citations: vec![citation.clone()],
-        });
-        if claims.len() >= 18 {
-            break;
-        }
-    }
-    if claims.len() < 18 {
-        packet_append_source_definition_claims(
-            &ordered_citations,
-            &rank_terms,
-            &mut claims,
-            &mut seen_claims,
-        );
-    }
+    append_flow_template_claims(&answer.prompt, &citations, &mut claims, &mut seen_claims);
+    append_ranked_citation_claims(
+        &answer.prompt,
+        &citations,
+        &rank_terms,
+        prefer_primary_sources,
+        &mut claims,
+        &mut seen_claims,
+    );
     claims
 }
 
-fn packet_claim_key_for_citation(role: &'static str, citation: &AgentCitationDto) -> String {
-    format!("{role}:{}", normalize_identifier(&citation.display_name))
-}
-
-fn packet_evidence_role(citation: &AgentCitationDto) -> Option<&'static str> {
-    let display = citation.display_name.to_ascii_lowercase();
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if path.ends_with(".sql") && normalized_display.starts_with("createtable") {
-        Some("sql table definition")
-    } else if path.ends_with(".sql") && normalized_display == "foreignkey" {
-        Some("sql relationship constraint")
-    } else if path.ends_with(".sql") {
-        Some("sql schema file")
-    } else if path_contains_test_segment(&path)
-        || path.ends_with("_test.go")
-        || path.ends_with(".test.ts")
-        || packet_display_name_is_test_like(&display)
-    {
-        Some("tests and regression coverage")
-    } else if normalized_display.contains("sourcegroup")
-        || path.contains("source_group")
-        || path.contains("sourcegroup")
-    {
-        Some("source-group configuration")
-    } else if normalized_display.contains("buildindex")
-        || normalized_display.contains("taskfillindexercommandsqueue")
-        || normalized_display.contains("indexercommand")
-        || normalized_display.contains("javaindexer")
-        || path.contains("/data/indexer/")
-    {
-        Some("indexing work queue")
-    } else if normalized_display.contains("interceptor") || path.contains("interceptor") {
-        Some("interceptor management")
-    } else if (normalized_display.contains("dispatch")
-        || path.contains("/dispatch")
-        || path.contains("_dispatch"))
-        && !normalized_display.contains("event")
-    {
-        Some("request dispatch")
-    } else if path.contains("/adapters/") || normalized_display.contains("adapter") {
-        Some("transport adapter")
-    } else if (normalized_display.contains("factory") || normalized_display.contains("create"))
-        && (normalized_display.contains("client") || normalized_display.contains("instance"))
-    {
-        Some("client factory")
-    } else if normalized_display.contains("eventloop")
-        || normalized_display.contains("event_loop")
-        || (normalized_display.contains("event") && normalized_display.contains("poll"))
-        || (normalized_display.contains("event") && normalized_display.contains("dispatch"))
-        || path.contains("/event/")
-        || path.contains("/events/")
-    {
-        Some("event loop")
-    } else if (normalized_display.contains("read")
-        || normalized_display.contains("input")
-        || normalized_display.contains("receive"))
-        && (normalized_display.contains("client")
-            || normalized_display.contains("socket")
-            || normalized_display.contains("network")
-            || path.contains("/network"))
-    {
-        Some("network command input")
-    } else if normalized_display.contains("command")
-        && (normalized_display.contains("dispatch")
-            || normalized_display.contains("handler")
-            || normalized_display.contains("process")
-            || normalized_display.contains("execute"))
-    {
-        Some("command dispatch")
-    } else if (normalized_display.contains("args")
-        || normalized_display.contains("flags")
-        || path.contains("/flags/"))
-        && (normalized_display.contains("plan")
-            || normalized_display.contains("parse")
-            || normalized_display.contains("build")
-            || normalized_display.contains("walk")
-            || normalized_display.contains("matcher")
-            || normalized_display.contains("searcher")
-            || normalized_display.contains("printer")
-            || path.contains("/flags/"))
-    {
-        Some("argument planning")
-    } else if normalized_display.contains("search")
-        && (normalized_display.contains("worker")
-            || normalized_display.contains("runner")
-            || normalized_display.contains("executor"))
-    {
-        Some("search worker")
-    } else if normalized_display.contains("candidate")
-        && (normalized_display.contains("file") || normalized_display.contains("source"))
-    {
-        Some("candidate file construction")
-    } else if normalized_display.contains("search")
-        && (normalized_display.contains("driver")
-            || normalized_display.contains("entrypoint")
-            || normalized_display.contains("parallel")
-            || display_is_command_entrypoint(&citation.display_name, &normalized_display, &path))
-    {
-        Some("search driver")
-    } else if display_is_command_entrypoint(&citation.display_name, &normalized_display, &path) {
-        Some("command entrypoint")
-    } else if display.contains("eventprocessor")
-        || display.contains("event_processor")
-        || display.contains("jsonl")
-        || path.contains("event_processor")
-        || path.contains("_events")
-        || path.contains("-events")
-        || path.contains("jsonl")
-    {
-        Some("event output processing")
-    } else if (display.contains("thread") || display.contains("turn"))
-        && display.contains("startparams")
-        || path.contains("/protocol/")
-    {
-        Some("app-server request protocol")
-    } else if display.contains("run_exec")
-        || display.contains("run_main")
-        || display.contains("service")
-        || display.contains("orchestrat")
-        || display.contains("runtime")
-        || path.contains("runtime")
-    {
-        Some("runtime orchestration")
-    } else if display.contains("manifest") || display.contains("plan") || path.contains("workspace")
-    {
-        Some("workspace discovery and planning")
-    } else if display.contains("snapshot") || display.contains("refresh") {
-        Some("snapshot refresh")
-    } else if display.contains("projection")
-        || display.contains("persist")
-        || display.contains("storage")
-        || display.contains("store")
-        || path.contains("store")
-    {
-        Some("persistence and search projection")
-    } else if display.contains("indexer")
-        || display.contains("index_file")
-        || display.contains("symbol")
-        || path.contains("indexer")
-    {
-        Some("symbol extraction")
-    } else if display.contains("route")
-        || display.contains("router")
-        || packet_path_is_route_like(&path)
-    {
-        Some("route handling")
-    } else if path.contains("/collections/") {
-        Some("collection configuration")
-    } else if matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-        && retrieval_file_role_from_path(&path) == crate::RetrievalFileRole::Source
-    {
-        Some("source evidence")
-    } else {
-        None
-    }
-}
-
-fn packet_path_is_route_like(path: &str) -> bool {
-    let normalized_path = packet_display_path(path).replace('\\', "/");
-    normalized_path.contains("/routes/")
-        || normalized_path.contains("/router/")
-        || normalized_path.contains("/controllers/")
-        || normalized_path.contains("/views/")
-        || normalized_path.contains("/pages/")
-        || normalized_path.contains("/app/")
-        || normalized_path.contains("/route.")
-        || normalized_path.ends_with("/route.ts")
-        || normalized_path.ends_with("/route.tsx")
-}
-
-fn display_is_command_entrypoint(display: &str, normalized_display: &str, path: &str) -> bool {
-    if normalized_display == "main" || display.ends_with("::main") {
-        return true;
-    }
-    if display.starts_with("Cli")
-        && display
-            .chars()
-            .nth(3)
-            .is_some_and(|ch| ch.is_uppercase() || ch == '_')
-    {
-        return true;
-    }
-    if display.contains("::Cli") || display.contains("::cli") {
-        return true;
-    }
-    let normalized_path = packet_display_path(path).replace('\\', "/");
-    if normalized_path.ends_with("/main.rs") && normalized_display == "main" {
-        return true;
-    }
-    let lower = display.to_ascii_lowercase();
-    lower.contains("commands") && !lower.contains("process")
-}
-
-fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
-    let normalized_prompt = normalize_identifier(prompt);
-    if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
-        return sentence;
-    }
-    format!(
-        "supports {focus} in this flow; inspect the cited source, local definitions, and adjacent ownership there"
-    )
-}
-
-fn packet_source_has_all(source: &str, terms: &[&str]) -> bool {
-    let lower = source.to_ascii_lowercase();
-    terms
-        .iter()
-        .all(|term| lower.contains(&term.to_ascii_lowercase()))
-}
-
-fn packet_source_has_any(source: &str, terms: &[&str]) -> bool {
-    let lower = source.to_ascii_lowercase();
-    terms
-        .iter()
-        .any(|term| lower.contains(&term.to_ascii_lowercase()))
-}
-
-fn packet_source_identifier_with_words(source: &str, words: &[&str]) -> Option<String> {
-    if words.is_empty() {
-        return None;
-    }
-    for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let normalized = normalize_identifier(token);
-        if words.iter().all(|word| normalized.contains(word)) {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn packet_source_identifier_with_words_shortest(source: &str, words: &[&str]) -> Option<String> {
-    if words.is_empty() {
-        return None;
-    }
-    let mut best: Option<String> = None;
-    for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let normalized = normalize_identifier(token);
-        if !words.iter().all(|word| normalized.contains(word)) {
-            continue;
-        }
-        let replace = best
-            .as_ref()
-            .map(|existing| token.len() < existing.len())
-            .unwrap_or(true);
-        if replace {
-            best = Some(token.to_string());
-        }
-    }
-    best
-}
-
-fn packet_source_identifier_exact(source: &str, word: &str) -> Option<String> {
-    for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
-        let token = token.trim();
-        if token.eq_ignore_ascii_case(word) {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn packet_source_identifier_ending_with(
-    source: &str,
-    suffix: &str,
-    excluded: &str,
-) -> Option<String> {
-    for token in source.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
-        let token = token.trim();
-        if token.is_empty() || token.eq_ignore_ascii_case(excluded) {
-            continue;
-        }
-        if token.ends_with(suffix) {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn packet_source_constructed_type(source: &str) -> Option<String> {
-    let bytes = source.as_bytes();
-    let needle = b"new ";
-    let mut index = 0;
-    while index + needle.len() < bytes.len() {
-        if &bytes[index..index + needle.len()] != needle {
-            index += 1;
-            continue;
-        }
-        let mut start = index + needle.len();
-        while start < bytes.len() && bytes[start].is_ascii_whitespace() {
-            start += 1;
-        }
-        let mut end = start;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-            end += 1;
-        }
-        if end > start {
-            let value = &source[start..end];
-            if value
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-            {
-                return Some(value.to_string());
-            }
-        }
-        index = end.saturating_add(1);
-    }
-    None
-}
-
-fn packet_display_owner(display: &str) -> Option<String> {
-    let owner = display
-        .split(['.', ':', '#', '_'])
-        .find(|part| {
-            part.chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-        })?
-        .trim();
-    if owner.is_empty() {
-        None
-    } else {
-        Some(owner.to_string())
-    }
-}
-
-fn packet_source_derived_claim_for_role(
-    role: &str,
-    citation: &AgentCitationDto,
-    prompt: &str,
-) -> Option<String> {
-    let source = packet_citation_source_text(citation)?;
-    if source.len() > 800_000 {
-        return None;
-    }
-    let symbol = citation.display_name.as_str();
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    let file_name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(symbol);
-    let normalized_prompt = normalize_identifier(prompt);
-    let prompt_terms = packet_probe_terms(prompt);
-    let request_flow = packet_terms_indicate_request_dispatch_flow(&prompt_terms);
-    let search_flow = packet_terms_indicate_search_execution_flow(&prompt_terms);
-
-    if request_flow
-        && role == "client factory"
-        && packet_source_has_all(&source, &["new ", "prototype", "request", "extend"])
-    {
-        let context = packet_source_constructed_type(&source).unwrap_or_else(|| "client".into());
-        return Some(format!(
-            "`{symbol}` wraps a {context} context and exposes verb helpers bound to request."
-        ));
-    }
-
-    if request_flow
-        && packet_source_has_all(&source, &["merge", "config", "interceptors", "request"])
-        && packet_source_has_any(&source, &["dispatch", "adapter"])
-        && let Some(owner) = packet_display_owner(symbol)
-    {
-        let dispatch = packet_source_identifier_with_words(&source, &["dispatch", "request"])
-            .unwrap_or_else(|| "request dispatch".to_string());
-        return Some(format!(
-            "{owner}.request merges defaults, runs request interceptors, then calls {dispatch}."
-        ));
-    }
-
-    if request_flow
-        && role == "request dispatch"
-        && packet_source_has_all(&source, &["adapter", "transform"])
-        && packet_source_has_any(&source, &["headers", "data", "body"])
-    {
-        return Some(format!(
-            "`{symbol}` transforms the body/headers and invokes the configured adapter."
-        ));
-    }
-
-    if request_flow
-        && role == "interceptor management"
-        && packet_source_has_all(&source, &["handlers", "fulfilled", "rejected"])
-    {
-        return Some(format!(
-            "`{symbol}` stores interceptor pairs used by the promise chain in request."
-        ));
-    }
-
-    if request_flow
-        && role == "transport adapter"
-        && packet_source_has_all(&source, &["adapter"])
-        && packet_source_has_all(&source, &["xhr", "http"])
-        && packet_source_has_any(&source, &["known", "environment", "platform"])
-    {
-        return Some(format!(
-            "`{file_name}` selects xhr or http transport based on environment capabilities."
-        ));
-    }
-
-    if normalized_prompt.contains("eventloop")
-        || (normalized_prompt.contains("event") && normalized_prompt.contains("loop"))
-    {
-        if packet_source_has_all(&source, &["init", "event"])
-            && let Some(loop_entry) = packet_source_identifier_ending_with(&source, "Main", "main")
-            && packet_source_identifier_exact(&source, "main").is_some()
-        {
-            return Some(format!(
-                "main initializes the server and enters {loop_entry} on the shared event loop."
-            ));
-        }
-        if let Some(process_events) =
-            packet_source_identifier_with_words(&source, &["process", "events"])
-            && packet_source_has_any(&source, &["readable", "writable"])
-        {
-            return Some(format!(
-                "{process_events} polls readable/writable fds and invokes registered file event handlers."
-            ));
-        }
-    }
-
-    if role == "network command input"
-        && let Some(read_client) = packet_source_identifier_with_words(&source, &["read", "client"])
-        && let Some(process_input) =
-            packet_source_identifier_with_words(&source, &["process", "input", "buffer"])
-    {
-        return Some(format!(
-            "{read_client} appends socket input and drives {process_input} when a full command is available."
-        ));
-    }
-
-    if role == "command dispatch" {
-        if let Some(process_command) =
-            packet_source_identifier_with_words(&source, &["process", "command"])
-            && packet_source_has_any(&source, &["lookup", "arity", "acl", "cluster"])
-        {
-            return Some(format!(
-                "{process_command} resolves the command table entry and enforces ACL, arity, and cluster checks."
-            ));
-        }
-        if let Some(call) = packet_source_identifier_exact(&source, "call")
-            && packet_source_has_all(&source, &["proc", "propagat"])
-            && packet_source_has_any(&source, &["slowlog", "monitor"])
-        {
-            return Some(format!(
-                "{call} executes the command proc and handles propagation, monitoring, and slowlog accounting."
-            ));
-        }
-    }
-
-    if search_flow
-        && role == "search driver"
-        && packet_source_has_all(&source, &["flags", "parse", "search"])
-        && let Some(main) = packet_source_identifier_exact(&source, "main")
-    {
-        let run = packet_source_identifier_exact(&source, "run").unwrap_or_else(|| "run".into());
-        return Some(format!(
-            "{main} calls {run} after flags::parse and routes into search or parallel search modes."
-        ));
-    }
-
-    if search_flow
-        && role == "argument planning"
-        && packet_source_has_all(&source, &["walk", "matcher", "searcher", "printer"])
-    {
-        let owner = packet_display_owner(symbol)
-            .or_else(|| packet_source_identifier_with_words_shortest(&source, &["args"]))
-            .unwrap_or_else(|| symbol.to_string());
-        return Some(format!(
-            "`{owner}` builds walkers, matchers, searchers, and printers used by the search driver."
-        ));
-    }
-
-    if search_flow
-        && role == "search worker"
-        && packet_source_has_all(&source, &["matcher", "searcher", "printer"])
-        && packet_source_has_any(&source, &["haystack", "path"])
-    {
-        let worker = packet_source_identifier_with_words_shortest(&source, &["search", "worker"])
-            .unwrap_or_else(|| symbol.to_string());
-        return Some(format!(
-            "`{worker}` connects a PatternMatcher, grep searcher, and Printer for each haystack."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(&source, &["haystack", "searcher", "search"])
-        && let Some(worker) =
-            packet_source_identifier_with_words_shortest(&source, &["search", "worker"])
-    {
-        return Some(format!(
-            "search walks haystacks from the ignore crate and invokes {worker} per file."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(&source, &["walk_builder", "build_parallel"])
-        && let Some(parallel_search) =
-            packet_source_identifier_with_words_shortest(&source, &["search", "parallel"])
-    {
-        return Some(format!(
-            "{parallel_search} uses walk_builder().build_parallel() to search files concurrently."
-        ));
-    }
-
-    if search_flow
-        && packet_source_has_all(&source, &["matcher", "searcher", "printer", "haystack"])
-        && let Some(worker) =
-            packet_source_identifier_with_words_shortest(&source, &["search", "worker"])
-        && let Some(search_method) = packet_source_identifier_exact(&source, "search")
-    {
-        return Some(format!(
-            "{worker}::{search_method} executes per-haystack search with matcher, searcher, and printer state."
-        ));
-    }
-
-    None
-}
-
-fn packet_claim_flow_terms(prompt: &str, citation: &AgentCitationDto) -> Vec<String> {
-    let display = normalize_identifier(&citation.display_name);
-    let path = normalize_identifier(citation.file_path.as_deref().unwrap_or_default());
-    let mut terms = Vec::new();
-    for term in packet_rank_terms(prompt) {
-        if term.len() < 4 || packet_query_stop_term(&term) || packet_adjacent_query_stop_term(&term)
-        {
-            continue;
-        }
-        let normalized = normalize_identifier(&term);
-        if normalized.is_empty() {
-            continue;
-        }
-        if (display.contains(&normalized) || path.contains(&normalized))
-            && terms.iter().all(|existing| existing != &normalized)
-        {
-            terms.push(normalized);
-        }
-        if terms.len() >= 4 {
-            break;
-        }
-    }
-    terms
-}
-
-fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Option<String> {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    eval_citation_shaped_claim(citation, prompt, &path)
-}
-
+#[cfg(test)]
 fn packet_claim_for_role(
     _key: &str,
-    role: &str,
+    role: PacketEvidenceRole,
     citation: &AgentCitationDto,
     prompt: &str,
 ) -> String {
-    if let Some(shaped) = packet_citation_shaped_claim(citation, prompt) {
-        return shaped;
-    }
-    if let Some(source_derived) = packet_source_derived_claim_for_role(role, citation, prompt) {
-        return source_derived;
-    }
-    let symbol = citation.display_name.as_str();
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    match role {
-        "command entrypoint" => format!(
-            "The command or public entrypoint for this flow is anchored by `{symbol}`; inspect it before following downstream coordination."
-        ),
-        "client factory" => format!(
-            "Client factory behavior is anchored by `{symbol}`; inspect it for instance creation and request-method binding."
-        ),
-        "interceptor management" => format!(
-            "Interceptor management is anchored by `{symbol}`; inspect it for fulfilled/rejected handler registration and iteration."
-        ),
-        "request dispatch" => format!(
-            "Request dispatch is anchored by `{symbol}`; inspect it for config transformation and adapter handoff."
-        ),
-        "transport adapter" => format!(
-            "Transport adapter selection is anchored by `{symbol}`; inspect it for environment-specific transport choice."
-        ),
-        "event loop" => format!(
-            "Event-loop polling is anchored by `{symbol}`; inspect it for readable/writable file-event dispatch."
-        ),
-        "network command input" => format!(
-            "Network command input is anchored by `{symbol}`; inspect it for socket reads and command-buffer processing."
-        ),
-        "command dispatch" => format!(
-            "Command dispatch is anchored by `{symbol}`; inspect it for command lookup, validation, execution, and propagation."
-        ),
-        "argument planning" => format!(
-            "Argument planning is anchored by `{symbol}`; inspect it for walker, matcher, searcher, and printer construction."
-        ),
-        "search driver" => format!(
-            "Search driver behavior is anchored by `{symbol}`; inspect it for entrypoint routing and sequential or parallel search selection."
-        ),
-        "search worker" => format!(
-            "Search worker behavior is anchored by `{symbol}`; inspect it for per-haystack matcher/searcher/printer execution."
-        ),
-        "haystack construction" => format!(
-            "Haystack construction is anchored by `{symbol}`; inspect it for candidate-file conversion before search execution."
-        ),
-        "runtime orchestration" => format!(
-            "Runtime orchestration is anchored by `{symbol}`; verify coordination, state transitions, and downstream service calls there."
-        ),
-        "workspace discovery and planning" => format!(
-            "Workspace discovery or planning is anchored by `{symbol}`; inspect it for file selection, manifest, or execution-plan behavior."
-        ),
-        "source-group configuration" => format!(
-            "Source-group configuration is anchored by `{symbol}`; inspect it for how project settings become source-group-specific indexing inputs."
-        ),
-        "indexing work queue" => format!(
-            "Indexing work queue behavior is anchored by `{symbol}`; inspect it for build-index commands, parser handoff, or source-file work items."
-        ),
-        "symbol extraction" => format!(
-            "Symbol extraction is anchored by `{symbol}`; inspect it for nodes, edges, occurrences, or file-level indexing."
-        ),
-        "persistence and search projection" => format!(
-            "Persistence or search projection is anchored by `{symbol}`; inspect it for durable graph/search state."
-        ),
-        "snapshot refresh" => format!(
-            "Snapshot refresh is anchored by `{symbol}`; inspect it for post-write summary or cache refresh behavior."
-        ),
-        "route handling" => format!(
-            "Route handling is anchored by `{symbol}`; inspect it before tracing request dispatch or handler ownership."
-        ),
-        "collection configuration" => format!(
-            "Collection configuration is anchored by `{symbol}`; inspect schema fields, hooks, and access rules."
-        ),
-        "event output processing" => format!(
-            "JSON/event output processing is anchored by `{symbol}`; inspect it for typed event serialization and stdout behavior."
-        ),
-        "app-server request protocol" => format!(
-            "App-server request protocol evidence is anchored by `{symbol}`; inspect it for thread or turn start request shape."
-        ),
-        "tests and regression coverage" => format!(
-            "Regression coverage for this flow is anchored by `{symbol}`; use it to choose focused verification before broader suites."
-        ),
-        "source evidence" => {
-            let flow_terms = packet_claim_flow_terms(prompt, citation);
-            let focus = if flow_terms.is_empty() {
-                "this flow".to_string()
-            } else {
-                flow_terms.join(", ")
-            };
-            format!(
-                "`{symbol}` in `{path}` {}; inspect definitions and downstream handoff there.",
-                packet_source_evidence_flow_sentence(prompt, &focus)
-            )
-        }
-        _ => format!("Evidence for this flow is anchored by `{symbol}`."),
-    }
-}
-
-fn path_contains_test_segment(path: &str) -> bool {
-    path.starts_with("test/")
-        || path.starts_with("tests/")
-        || path.contains("/test/")
-        || path.contains("/tests/")
-        || path.contains("-test-")
-        || path.contains("_test_")
-        || path.contains("_tests.")
-        || path.starts_with("test\\")
-        || path.starts_with("tests\\")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
+    build_packet_claim_for_role(role, citation, prompt, &packet_rank_terms(prompt))
 }
 
 fn packet_retrieval_profile(
@@ -5585,108 +1450,6 @@ fn packet_retrieval_profile(
     AgentRetrievalProfileSelectionDto::Preset { preset }
 }
 
-fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
-    match mode {
-        PacketBudgetModeDto::Tiny => PacketBudgetLimitsDto {
-            max_anchors: 3,
-            max_files: 3,
-            max_snippets: 6,
-            max_trail_edges: 12,
-            max_output_bytes: 24 * 1024,
-        },
-        PacketBudgetModeDto::Compact => PacketBudgetLimitsDto {
-            max_anchors: 13,
-            max_files: 13,
-            max_snippets: 12,
-            max_trail_edges: 20,
-            max_output_bytes: 96 * 1024,
-        },
-        PacketBudgetModeDto::Standard => PacketBudgetLimitsDto {
-            max_anchors: 16,
-            max_files: 16,
-            max_snippets: 24,
-            max_trail_edges: 60,
-            max_output_bytes: 128 * 1024,
-        },
-        PacketBudgetModeDto::Deep => PacketBudgetLimitsDto {
-            max_anchors: 25,
-            max_files: 25,
-            max_snippets: 80,
-            max_trail_edges: 240,
-            max_output_bytes: 512 * 1024,
-        },
-    }
-}
-
-#[cfg(test)]
-fn apply_packet_budget(
-    project_root: &Path,
-    question: &str,
-    task_class: PacketTaskClassDto,
-    requested: PacketBudgetModeDto,
-    limits: PacketBudgetLimitsDto,
-    answer: &mut AgentAnswerDto,
-) -> PacketBudgetDto {
-    apply_packet_budget_with_extra(
-        project_root,
-        question,
-        task_class,
-        requested,
-        limits,
-        answer,
-        &[],
-    )
-}
-
-fn apply_packet_budget_with_extra(
-    project_root: &Path,
-    question: &str,
-    task_class: PacketTaskClassDto,
-    requested: PacketBudgetModeDto,
-    limits: PacketBudgetLimitsDto,
-    answer: &mut AgentAnswerDto,
-    extra_probes: &[String],
-) -> PacketBudgetDto {
-    let mut truncated = false;
-    let mut omitted_sections = Vec::new();
-
-    let mut protected_probe_queries = packet_command_exact_probe_queries(question, task_class);
-    push_unique_owned_terms(
-        &mut protected_probe_queries,
-        &packet_sufficiency_required_probe_queries_with_extra(question, task_class, extra_probes),
-    );
-    if cap_packet_citations(answer, &limits, &protected_probe_queries) {
-        truncated = true;
-        omitted_sections.push("citations".to_string());
-    }
-    if cap_graph_edges(answer, limits.max_trail_edges) {
-        truncated = true;
-        omitted_sections.push("trail_edges".to_string());
-    }
-    if truncate_answer_markdown_to_byte_cap(answer, limits.max_output_bytes as usize) {
-        truncated = true;
-        omitted_sections.push("markdown_blocks".to_string());
-    }
-
-    let used = packet_budget_usage(answer);
-    if used.output_bytes > limits.max_output_bytes {
-        truncated = true;
-        omitted_sections.push("output_bytes".to_string());
-    }
-
-    omitted_sections.sort();
-    omitted_sections.dedup();
-
-    PacketBudgetDto {
-        requested,
-        limits,
-        used,
-        truncated,
-        omitted_sections,
-        next_deeper_command: next_deeper_packet_command(project_root, question, requested),
-    }
-}
-
 fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto) {
     let extra_probes = packet_explicit_request_probe_queries(&packet.plan);
     for _ in 0..8 {
@@ -5710,7 +1473,7 @@ fn enforce_packet_output_budget(project_root: &Path, packet: &mut AgentPacketDto
         if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
             push_omitted_section(&mut packet.budget, "markdown_blocks");
             packet.budget.used = packet_budget_usage(&packet.answer);
-            packet.benchmark_trace = packet_benchmark_trace(&packet.answer);
+            packet.retrieval_trace_summary = packet_retrieval_trace_summary(&packet.answer);
             packet.sufficiency = build_packet_sufficiency_with_extra(
                 project_root,
                 &packet.question,
@@ -5794,684 +1557,6 @@ fn remove_omitted_section(budget: &mut PacketBudgetDto, section: &str) {
         .retain(|existing| existing != section);
 }
 
-fn cap_citations(answer: &mut AgentAnswerDto, limits: &PacketBudgetLimitsDto) -> bool {
-    cap_citations_with_protected(answer, limits, &HashSet::new())
-}
-
-fn cap_citations_with_protected(
-    answer: &mut AgentAnswerDto,
-    limits: &PacketBudgetLimitsDto,
-    protected_citation_keys: &HashSet<String>,
-) -> bool {
-    let original_len = answer.citations.len();
-    let mut files = HashSet::new();
-    let mut roles = HashSet::new();
-    let mut claim_keys: HashSet<String> = HashSet::new();
-    let mut secondary_claim_keys: HashSet<String> = HashSet::new();
-    let mut kept = Vec::new();
-    let mut deferred = Vec::new();
-
-    for citation in answer.citations.drain(..) {
-        let citation_key = packet_citation_key(&citation);
-        let file = citation.file_path.as_deref().map(packet_display_path);
-        let role = packet_evidence_role(&citation);
-        let claim_key = role.map(|role| packet_claim_key_for_citation(role, &citation));
-        let low_priority_role = packet_low_priority_cap_role(role);
-        let protected = protected_citation_keys.contains(&citation_key);
-        if protected
-            && kept.len() < limits.max_anchors as usize
-            && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
-        {
-            if let Some(path) = file {
-                files.insert(path);
-            }
-            if let Some(role) = role {
-                roles.insert(role);
-            }
-            if let Some(ref claim_key) = claim_key {
-                claim_keys.insert(claim_key.clone());
-            }
-            kept.push(citation);
-            continue;
-        }
-        if let Some(ref claim_key) = claim_key
-            && claim_keys.contains(claim_key)
-            && replace_weaker_duplicate_claim_citation(
-                &mut kept,
-                claim_key,
-                citation.clone(),
-                protected_citation_keys,
-            )
-        {
-            rebuild_packet_cap_tracking(&kept, &mut files, &mut roles, &mut claim_keys);
-            continue;
-        }
-        let file_is_new = file.as_ref().is_some_and(|path| !files.contains(path));
-        let role_is_new = role.is_some_and(|role| !roles.contains(role));
-        let claim_key_is_new = claim_key
-            .as_ref()
-            .is_some_and(|key| !claim_keys.contains(key));
-        let secondary_claim_definition = claim_key.as_ref().is_some_and(|key| {
-            claim_keys.contains(key)
-                && !secondary_claim_keys.contains(key)
-                && packet_keep_secondary_claim_definition(key, &citation)
-        });
-        let claim_key_expands_primary_packet_coverage =
-            !low_priority_role && claim_key_is_new && (role_is_new || file_is_new);
-        let expands_primary_packet_coverage = !low_priority_role
-            && (claim_key_expands_primary_packet_coverage
-                || role_is_new
-                || kept.is_empty()
-                || (claim_key.is_none() && file_is_new)
-                || secondary_claim_definition);
-        if kept.len() >= limits.max_anchors as usize
-            && packet_primary_definition_file_citation(&citation)
-            && replace_weaker_same_role_or_low_priority_citation(
-                &mut kept,
-                citation.clone(),
-                protected_citation_keys,
-                limits,
-            )
-        {
-            rebuild_packet_cap_tracking(&kept, &mut files, &mut roles, &mut claim_keys);
-            continue;
-        }
-        if kept.len() >= limits.max_anchors as usize
-            && !low_priority_role
-            && role_is_new
-            && replace_overrepresented_role_citation(
-                &mut kept,
-                citation.clone(),
-                protected_citation_keys,
-                limits,
-            )
-        {
-            rebuild_packet_cap_tracking(&kept, &mut files, &mut roles, &mut claim_keys);
-            continue;
-        }
-        if kept.len() < limits.max_anchors as usize
-            && expands_primary_packet_coverage
-            && packet_file_fits_limit(file.as_deref(), &files, limits.max_files)
-        {
-            if let Some(path) = file {
-                files.insert(path);
-            }
-            if let Some(role) = role {
-                roles.insert(role);
-            }
-            if let Some(ref claim_key) = claim_key {
-                claim_keys.insert(claim_key.clone());
-                if secondary_claim_definition {
-                    secondary_claim_keys.insert(claim_key.clone());
-                }
-            }
-            kept.push(citation);
-        } else {
-            deferred.push(citation);
-        }
-    }
-
-    let mut primary_new_files = Vec::new();
-    let mut primary_duplicate_files = Vec::new();
-    let mut low_priority_new_files = Vec::new();
-    let mut low_priority_duplicate_files = Vec::new();
-    for citation in deferred {
-        let file = citation.file_path.as_deref().map(packet_display_path);
-        let low_priority = packet_low_priority_cap_role(packet_evidence_role(&citation));
-        if file.as_ref().is_some_and(|path| files.contains(path)) {
-            if low_priority {
-                low_priority_duplicate_files.push(citation);
-            } else {
-                primary_duplicate_files.push(citation);
-            }
-        } else if low_priority {
-            low_priority_new_files.push(citation);
-        } else {
-            primary_new_files.push(citation);
-        }
-    }
-    for citation in primary_new_files
-        .into_iter()
-        .chain(primary_duplicate_files)
-        .chain(low_priority_new_files)
-        .chain(low_priority_duplicate_files)
-    {
-        if kept.len() >= limits.max_anchors as usize {
-            continue;
-        }
-        let file = citation.file_path.as_deref().map(packet_display_path);
-        if !packet_file_fits_limit(file.as_deref(), &files, limits.max_files) {
-            continue;
-        }
-        if let Some(path) = file {
-            files.insert(path);
-        }
-        kept.push(citation);
-    }
-
-    let truncated = kept.len() < original_len;
-    answer.citations = kept;
-    truncated
-}
-
-fn packet_low_priority_cap_role(role: Option<&str>) -> bool {
-    matches!(role, Some("tests and regression coverage"))
-}
-
-fn replace_weaker_same_role_or_low_priority_citation(
-    kept: &mut [AgentCitationDto],
-    candidate: AgentCitationDto,
-    protected_citation_keys: &HashSet<String>,
-    limits: &PacketBudgetLimitsDto,
-) -> bool {
-    let candidate_role = packet_evidence_role(&candidate);
-    let candidate_file = candidate.file_path.as_deref().map(packet_display_path);
-    let mut replacement: Option<(usize, u8, f32)> = None;
-
-    for (index, existing) in kept.iter().enumerate() {
-        if protected_citation_keys.contains(&packet_citation_key(existing)) {
-            continue;
-        }
-        if !packet_file_fits_limit_after_replacement(
-            candidate_file.as_deref(),
-            kept,
-            index,
-            limits.max_files,
-        ) {
-            continue;
-        }
-
-        let existing_role = packet_evidence_role(existing);
-        let replacement_priority = if packet_low_priority_cap_role(existing_role) {
-            3
-        } else if candidate_role.is_some()
-            && candidate_role == existing_role
-            && !packet_primary_definition_file_citation(existing)
-        {
-            2
-        } else {
-            0
-        };
-        if replacement_priority == 0 {
-            continue;
-        }
-
-        let existing_rank = existing.score;
-        let should_replace = replacement
-            .map(|(_, best_priority, best_rank)| {
-                replacement_priority > best_priority
-                    || (replacement_priority == best_priority && existing_rank < best_rank)
-            })
-            .unwrap_or(true);
-        if should_replace {
-            replacement = Some((index, replacement_priority, existing_rank));
-        }
-    }
-
-    let Some((index, _, _)) = replacement else {
-        return false;
-    };
-    kept[index] = candidate;
-    true
-}
-
-fn replace_overrepresented_role_citation(
-    kept: &mut [AgentCitationDto],
-    candidate: AgentCitationDto,
-    protected_citation_keys: &HashSet<String>,
-    limits: &PacketBudgetLimitsDto,
-) -> bool {
-    let Some(candidate_role) = packet_evidence_role(&candidate) else {
-        return false;
-    };
-    if kept
-        .iter()
-        .any(|citation| packet_evidence_role(citation) == Some(candidate_role))
-    {
-        return false;
-    }
-    let candidate_file = candidate.file_path.as_deref().map(packet_display_path);
-    let role_counts = kept.iter().filter_map(packet_evidence_role).fold(
-        HashMap::<&'static str, usize>::new(),
-        |mut counts, role| {
-            *counts.entry(role).or_insert(0) += 1;
-            counts
-        },
-    );
-
-    let mut replacement: Option<(usize, usize, f32)> = None;
-    for (index, existing) in kept.iter().enumerate() {
-        if protected_citation_keys.contains(&packet_citation_key(existing)) {
-            continue;
-        }
-        let Some(existing_role) = packet_evidence_role(existing) else {
-            continue;
-        };
-        let existing_role_count = role_counts.get(existing_role).copied().unwrap_or_default();
-        if existing_role_count <= 1 {
-            continue;
-        }
-        if !packet_file_fits_limit_after_replacement(
-            candidate_file.as_deref(),
-            kept,
-            index,
-            limits.max_files,
-        ) {
-            continue;
-        }
-        let existing_rank = existing.score;
-        let should_replace = replacement
-            .map(|(_, best_count, best_rank)| {
-                existing_role_count > best_count
-                    || (existing_role_count == best_count && existing_rank < best_rank)
-            })
-            .unwrap_or(true);
-        if should_replace {
-            replacement = Some((index, existing_role_count, existing_rank));
-        }
-    }
-
-    let Some((index, _, _)) = replacement else {
-        return false;
-    };
-    kept[index] = candidate;
-    true
-}
-
-fn packet_file_fits_limit_after_replacement(
-    path: Option<&str>,
-    kept: &[AgentCitationDto],
-    replacement_index: usize,
-    max_files: u32,
-) -> bool {
-    let files = kept
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != replacement_index)
-        .filter_map(|(_, citation)| citation.file_path.as_deref().map(packet_display_path))
-        .collect::<HashSet<_>>();
-    packet_file_fits_limit(path, &files, max_files)
-}
-
-fn replace_weaker_duplicate_claim_citation(
-    kept: &mut [AgentCitationDto],
-    claim_key: &str,
-    candidate: AgentCitationDto,
-    protected_citation_keys: &HashSet<String>,
-) -> bool {
-    let Some(index) = kept.iter().position(|citation| {
-        packet_evidence_role(citation)
-            .map(|role| packet_claim_key_for_citation(role, citation) == claim_key)
-            .unwrap_or(false)
-    }) else {
-        return false;
-    };
-    if protected_citation_keys.contains(&packet_citation_key(&kept[index])) {
-        return false;
-    }
-    if packet_prefer_duplicate_claim_citation(&candidate, &kept[index]) {
-        kept[index] = candidate;
-        return true;
-    }
-    false
-}
-
-fn packet_prefer_duplicate_claim_citation(
-    candidate: &AgentCitationDto,
-    existing: &AgentCitationDto,
-) -> bool {
-    if packet_prefer_flow_anchor_path_citation(candidate, existing) {
-        return true;
-    }
-    normalize_identifier(&candidate.display_name) == normalize_identifier(&existing.display_name)
-        && packet_exact_definition_file_citation(candidate)
-        && !packet_exact_definition_file_citation(existing)
-}
-
-fn packet_primary_definition_file_citation(citation: &AgentCitationDto) -> bool {
-    packet_exact_definition_file_citation(citation)
-        || packet_near_stem_type_definition_file(citation)
-}
-
-fn packet_near_stem_type_definition_file(citation: &AgentCitationDto) -> bool {
-    if citation.origin != SearchHitOrigin::IndexedSymbol
-        || !citation.resolvable
-        || !matches!(
-            citation.kind,
-            NodeKind::STRUCT
-                | NodeKind::CLASS
-                | NodeKind::INTERFACE
-                | NodeKind::UNION
-                | NodeKind::ENUM
-                | NodeKind::TYPEDEF
-        )
-    {
-        return false;
-    }
-    let normalized_display = normalize_identifier(&citation.display_name);
-    if normalized_display.is_empty()
-        || packet_low_signal_display_name(normalized_display.as_str())
-        || packet_exact_definition_file_citation(citation)
-    {
-        return false;
-    }
-    let stem = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .and_then(|path| {
-            let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-            file_name
-                .rsplit_once('.')
-                .map(|(stem, _)| stem.to_string())
-                .or_else(|| Some(file_name.to_string()))
-        })
-        .map(|stem| normalize_identifier(&stem))
-        .unwrap_or_default();
-    if stem.is_empty() {
-        return false;
-    }
-
-    let len_delta = normalized_display.len().abs_diff(stem.len());
-    if len_delta > 2 {
-        return false;
-    }
-    let shared_prefix = normalized_display
-        .chars()
-        .zip(stem.chars())
-        .take_while(|(left, right)| left == right)
-        .count();
-    shared_prefix >= 8
-        && shared_prefix.saturating_mul(5)
-            >= normalized_display.len().min(stem.len()).saturating_mul(4)
-}
-
-fn packet_prefer_flow_anchor_path_citation(
-    candidate: &AgentCitationDto,
-    existing: &AgentCitationDto,
-) -> bool {
-    let candidate_path = candidate
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let existing_path = existing
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if candidate_path == existing_path {
-        return false;
-    }
-    let candidate_role = retrieval_file_role_from_path(&candidate_path);
-    let existing_role = retrieval_file_role_from_path(&existing_path);
-    candidate_role == crate::RetrievalFileRole::Source && existing_role.is_non_primary()
-}
-
-fn packet_exact_definition_file_citation(citation: &AgentCitationDto) -> bool {
-    citation.origin == SearchHitOrigin::IndexedSymbol
-        && citation.resolvable
-        && matches!(
-            citation.kind,
-            NodeKind::STRUCT
-                | NodeKind::CLASS
-                | NodeKind::INTERFACE
-                | NodeKind::UNION
-                | NodeKind::ENUM
-                | NodeKind::TYPEDEF
-        )
-        && !packet_low_signal_display_name(normalize_identifier(&citation.display_name).as_str())
-        && packet_file_stem_matches_query(&citation.display_name, citation.file_path.as_deref())
-}
-
-fn packet_keep_secondary_claim_definition(_claim_key: &str, citation: &AgentCitationDto) -> bool {
-    if !packet_primary_definition_file_citation(citation) {
-        return false;
-    }
-    packet_mandatory_secondary_path_citation(citation)
-}
-
-fn packet_mandatory_secondary_path_citation(citation: &AgentCitationDto) -> bool {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    path.contains("event_processor")
-        || path.contains("_events")
-        || path.contains("-events")
-        || path.contains("/cli/")
-        || path.ends_with("/main.rs")
-}
-
-fn rebuild_packet_cap_tracking(
-    kept: &[AgentCitationDto],
-    files: &mut HashSet<String>,
-    roles: &mut HashSet<&'static str>,
-    claim_keys: &mut HashSet<String>,
-) {
-    files.clear();
-    roles.clear();
-    claim_keys.clear();
-    for citation in kept {
-        if let Some(path) = citation.file_path.as_deref().map(packet_display_path) {
-            files.insert(path);
-        }
-        if let Some(role) = packet_evidence_role(citation) {
-            roles.insert(role);
-            claim_keys.insert(packet_claim_key_for_citation(role, citation));
-        }
-    }
-}
-
-fn packet_file_fits_limit(path: Option<&str>, files: &HashSet<String>, max_files: u32) -> bool {
-    path.is_none_or(|path| files.contains(path) || files.len() < max_files as usize)
-}
-
-fn cap_graph_edges(answer: &mut AgentAnswerDto, max_edges: u32) -> bool {
-    let mut remaining = max_edges as usize;
-    let mut truncated = false;
-    for artifact in &mut answer.graphs {
-        let GraphArtifactDto::Uml { graph, .. } = artifact else {
-            continue;
-        };
-        if graph.edges.len() > remaining {
-            let omitted = graph.edges.len() - remaining;
-            graph.edges.truncate(remaining);
-            graph.truncated = true;
-            graph.omitted_edge_count = graph
-                .omitted_edge_count
-                .saturating_add(omitted.try_into().unwrap_or(u32::MAX));
-            truncated = true;
-            remaining = 0;
-        } else {
-            remaining = remaining.saturating_sub(graph.edges.len());
-        }
-        if prune_graph_to_retained_edges(graph) {
-            truncated = true;
-        }
-    }
-    truncated
-}
-
-fn prune_graph_to_retained_edges(graph: &mut GraphResponse) -> bool {
-    let original_nodes = graph.nodes.len();
-    let original_layout_nodes = graph
-        .canonical_layout
-        .as_ref()
-        .map(|layout| layout.nodes.len())
-        .unwrap_or_default();
-    let original_layout_edges = graph
-        .canonical_layout
-        .as_ref()
-        .map(|layout| layout.edges.len())
-        .unwrap_or_default();
-    let mut retained_node_ids = HashSet::new();
-    retained_node_ids.insert(graph.center_id.clone());
-    let retained_edge_ids = graph
-        .edges
-        .iter()
-        .map(|edge| edge.id.clone())
-        .collect::<HashSet<_>>();
-
-    for edge in &graph.edges {
-        retained_node_ids.insert(edge.source.clone());
-        retained_node_ids.insert(edge.target.clone());
-    }
-
-    graph
-        .nodes
-        .retain(|node| retained_node_ids.contains(&node.id));
-
-    if let Some(layout) = graph.canonical_layout.as_mut() {
-        layout.edges.retain(|edge| {
-            let endpoints_retained = retained_node_ids.contains(&edge.source)
-                && retained_node_ids.contains(&edge.target);
-            let source_edge_retained = edge.source_edge_ids.is_empty()
-                || edge
-                    .source_edge_ids
-                    .iter()
-                    .any(|edge_id| retained_edge_ids.contains(edge_id));
-            endpoints_retained && source_edge_retained
-        });
-        layout
-            .nodes
-            .retain(|node| retained_node_ids.contains(&node.id));
-    }
-
-    let pruned = graph.nodes.len() < original_nodes
-        || graph
-            .canonical_layout
-            .as_ref()
-            .map(|layout| layout.nodes.len() < original_layout_nodes)
-            .unwrap_or(false)
-        || graph
-            .canonical_layout
-            .as_ref()
-            .map(|layout| layout.edges.len() < original_layout_edges)
-            .unwrap_or(false);
-    if pruned {
-        graph.truncated = true;
-    }
-    pruned
-}
-
-fn truncate_answer_markdown_to_byte_cap(answer: &mut AgentAnswerDto, byte_cap: usize) -> bool {
-    let mut truncated = false;
-    for _ in 0..8 {
-        let Ok(bytes) = serde_json::to_vec(answer) else {
-            return truncated;
-        };
-        if bytes.len() <= byte_cap {
-            return truncated;
-        }
-        let Some((section_index, block_index, len)) = largest_markdown_block(answer) else {
-            return truncated;
-        };
-        if len <= 256 {
-            return truncated;
-        }
-        if let AgentResponseBlockDto::Markdown { markdown } =
-            &mut answer.sections[section_index].blocks[block_index]
-        {
-            truncate_markdown_block(markdown);
-            truncated = true;
-        }
-    }
-    truncated
-}
-
-fn largest_markdown_block(answer: &AgentAnswerDto) -> Option<(usize, usize, usize)> {
-    let mut largest = None;
-    for (section_index, section) in answer.sections.iter().enumerate() {
-        for (block_index, block) in section.blocks.iter().enumerate() {
-            if let AgentResponseBlockDto::Markdown { markdown } = block {
-                let len = markdown.len();
-                if largest.is_none_or(|(_, _, existing)| len > existing) {
-                    largest = Some((section_index, block_index, len));
-                }
-            }
-        }
-    }
-    largest
-}
-
-fn truncate_markdown_block(markdown: &mut String) {
-    let keep_chars = markdown.chars().count() / 2;
-    let mut keep_byte = markdown.len();
-    if let Some((index, _)) = markdown.char_indices().nth(keep_chars) {
-        keep_byte = index;
-    }
-    markdown.truncate(keep_byte);
-    markdown.push_str(PACKET_MARKDOWN_TRUNCATION_SUFFIX);
-}
-
-fn packet_budget_usage(answer: &AgentAnswerDto) -> PacketBudgetUsageDto {
-    let files = answer
-        .citations
-        .iter()
-        .filter_map(|citation| citation.file_path.as_deref())
-        .collect::<HashSet<_>>()
-        .len();
-    let trail_edges = answer
-        .graphs
-        .iter()
-        .map(|artifact| match artifact {
-            GraphArtifactDto::Uml { graph, .. } => graph.edges.len(),
-            GraphArtifactDto::Mermaid { .. } => 0,
-        })
-        .sum::<usize>();
-    let snippets = answer
-        .retrieval_trace
-        .steps
-        .iter()
-        .filter(|step| {
-            step.kind == AgentRetrievalStepKindDto::SourceRead
-                && step.status == AgentRetrievalStepStatusDto::Ok
-        })
-        .count();
-    let output_bytes = serde_json::to_vec(answer)
-        .map(|bytes| bytes.len())
-        .unwrap_or_default();
-
-    PacketBudgetUsageDto {
-        anchors: answer.citations.len().try_into().unwrap_or(u32::MAX),
-        files: files.try_into().unwrap_or(u32::MAX),
-        snippets: snippets.try_into().unwrap_or(u32::MAX),
-        trail_edges: trail_edges.try_into().unwrap_or(u32::MAX),
-        output_bytes: output_bytes.try_into().unwrap_or(u32::MAX),
-    }
-}
-
-fn next_deeper_packet_command(
-    project_root: &Path,
-    question: &str,
-    requested: PacketBudgetModeDto,
-) -> Option<String> {
-    let next = match requested {
-        PacketBudgetModeDto::Tiny => "compact",
-        PacketBudgetModeDto::Compact => "standard",
-        PacketBudgetModeDto::Standard => "deep",
-        PacketBudgetModeDto::Deep => return None,
-    };
-    let project = quote_packet_project_arg(project_root);
-    Some(format!(
-        "codestory-cli packet --project {project} --question {} --budget {next}",
-        quote_packet_command_value(question)
-    ))
-}
-
-fn quote_packet_project_arg(project_root: &Path) -> String {
-    quote_packet_command_value(project_root.to_string_lossy().as_ref())
-}
-
-fn quote_packet_command_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[cfg(test)]
 fn build_packet_sufficiency(
     project_root: &Path,
@@ -6491,19 +1576,7 @@ fn build_packet_sufficiency_with_extra(
     budget: &PacketBudgetDto,
     extra_probes: &[String],
 ) -> PacketSufficiencyDto {
-    let has_errors = answer
-        .retrieval_trace
-        .steps
-        .iter()
-        .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
-    let min_citations = packet_sufficiency_min_citations(task_class);
-    let min_claims = packet_sufficiency_min_claims(task_class);
     let supported_claims = packet_supported_claims(answer);
-    let has_minimum_coverage = answer.citations.len() >= min_citations;
-    let has_minimum_claims = supported_claims.len() >= min_claims;
-    let claim_family_count = packet_supported_claim_family_count(&supported_claims);
-    let has_minimum_claim_families =
-        packet_has_minimum_claim_family_coverage(task_class, &supported_claims);
     let missing_required_probe_queries = packet_missing_sufficiency_probe_queries_with_extra(
         question,
         task_class,
@@ -6511,843 +1584,16 @@ fn build_packet_sufficiency_with_extra(
         &supported_claims,
         extra_probes,
     );
-    let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
-        answer,
-        budget,
-        min_citations,
-        min_claims,
-        supported_claims.len(),
-    );
-    let mut seen_unresolved_sidecar_queries = std::collections::HashSet::new();
-    let unresolved_sidecar_queries = answer
-        .retrieval_trace
-        .packet_sidecar_diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.candidate_count > 0
-                && diagnostic.resolved_hit_count == 0
-                && diagnostic.unresolved_candidate_count > 0
-        })
-        .filter_map(|diagnostic| {
-            seen_unresolved_sidecar_queries
-                .insert(diagnostic.query.clone())
-                .then(|| diagnostic.query.clone())
-        })
-        .collect::<Vec<_>>();
-    let status = if answer.citations.is_empty() {
-        PacketSufficiencyStatusDto::Insufficient
-    } else if has_errors
-        || !has_minimum_coverage
-        || !has_minimum_claims
-        || !has_minimum_claim_families
-        || !missing_required_probe_queries.is_empty()
-        || !unresolved_sidecar_queries.is_empty()
-        || has_sufficiency_blocking_budget_omission
-        || packet_budget_exceeded_hard_output_cap(budget)
-    {
-        PacketSufficiencyStatusDto::Partial
-    } else {
-        PacketSufficiencyStatusDto::Sufficient
-    };
-
-    let mut gaps = Vec::new();
-    if answer.citations.is_empty() {
-        gaps.push("No cited anchors were found for the question.".to_string());
-    }
-    if !answer.citations.is_empty() && !has_minimum_coverage {
-        gaps.push(format!(
-            "{:?} packet found only {} cited anchor(s); at least {} are required before treating the packet as sufficient.",
-            task_class,
-            answer.citations.len(),
-            min_citations
-        ));
-    }
-    if !answer.citations.is_empty() && !has_minimum_claims {
-        gaps.push(format!(
-            "{:?} packet found only {} role-backed claim(s); at least {} are required before treating the packet as sufficient.",
-            task_class,
-            supported_claims.len(),
-            min_claims
-        ));
-    }
-    if !answer.citations.is_empty() && !has_minimum_claim_families {
-        gaps.push(format!(
-            "{:?} packet covered only {} distinct claim families; at least {} are required before treating the packet as sufficient.",
-            task_class,
-            claim_family_count,
-            packet_sufficiency_min_claim_families(task_class)
-        ));
-    }
-    if !missing_required_probe_queries.is_empty() {
-        gaps.push(format!(
-            "{:?} packet missed required planned flow probe(s): {}.",
-            task_class,
-            missing_required_probe_queries.join(", ")
-        ));
-    }
-    if !unresolved_sidecar_queries.is_empty() {
-        gaps.push(format!(
-            "{:?} packet had sidecar candidates that could not resolve to indexed symbols for: {}.",
-            task_class,
-            unresolved_sidecar_queries.join(", ")
-        ));
-    }
-    if budget.truncated && status != PacketSufficiencyStatusDto::Sufficient {
-        gaps.push(format!(
-            "Packet was truncated by {:?} budget: {}.",
-            budget.requested,
-            budget.omitted_sections.join(", ")
-        ));
-    }
-    if has_sufficiency_blocking_budget_omission {
-        gaps.push(format!(
-            "Packet omitted answer-critical evidence under {:?} budget; use a deeper packet before treating this as complete.",
-            budget.requested
-        ));
-    }
-    for step in answer
-        .retrieval_trace
-        .steps
-        .iter()
-        .filter(|step| step.status == AgentRetrievalStepStatusDto::Error)
-    {
-        gaps.push(format!("{:?} step failed.", step.kind));
-    }
-
-    let follow_up_commands = packet_follow_up_commands(
+    assemble_packet_sufficiency(PacketSufficiencyInput {
         project_root,
         question,
         task_class,
-        status,
+        answer,
         budget,
-        &missing_required_probe_queries,
-    );
-    let open_next = follow_up_commands.clone();
-    let avoid_opening = answer
-        .citations
-        .iter()
-        .filter_map(|citation| citation.file_path.as_ref())
-        .map(|path| packet_display_path(path))
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .take(12)
-        .map(|path| {
-            format!(
-                "{} because this packet already includes a citation for the current answer.",
-                path
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let mut covered_claims = supported_claims;
-    if covered_claims.is_empty() {
-        covered_claims.push(PacketClaimDto {
-            claim: answer.summary.clone(),
-            citations: answer.citations.iter().take(6).cloned().collect(),
-        });
-    }
-
-    PacketSufficiencyDto {
-        status,
-        covered_claims,
-        open_next,
-        avoid_opening,
-        gaps,
-        follow_up_commands,
-    }
-}
-
-fn packet_sufficiency_min_citations(task_class: PacketTaskClassDto) -> usize {
-    match task_class {
-        PacketTaskClassDto::BugLocalization | PacketTaskClassDto::SymbolOwnership => 2,
-        PacketTaskClassDto::ArchitectureExplanation
-        | PacketTaskClassDto::ChangeImpact
-        | PacketTaskClassDto::RouteTracing
-        | PacketTaskClassDto::DataFlow
-        | PacketTaskClassDto::EditPlanning => 3,
-    }
-}
-
-fn packet_sufficiency_min_claims(task_class: PacketTaskClassDto) -> usize {
-    match task_class {
-        PacketTaskClassDto::BugLocalization | PacketTaskClassDto::SymbolOwnership => 1,
-        PacketTaskClassDto::ArchitectureExplanation => 3,
-        PacketTaskClassDto::ChangeImpact
-        | PacketTaskClassDto::RouteTracing
-        | PacketTaskClassDto::DataFlow
-        | PacketTaskClassDto::EditPlanning => 2,
-    }
-}
-
-fn packet_sufficiency_min_claim_families(task_class: PacketTaskClassDto) -> usize {
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => 3,
-        PacketTaskClassDto::DataFlow => 2,
-        PacketTaskClassDto::BugLocalization
-        | PacketTaskClassDto::ChangeImpact
-        | PacketTaskClassDto::RouteTracing
-        | PacketTaskClassDto::SymbolOwnership
-        | PacketTaskClassDto::EditPlanning => 1,
-    }
-}
-
-fn packet_has_minimum_claim_family_coverage(
-    task_class: PacketTaskClassDto,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
-    packet_supported_claim_family_count(supported_claims)
-        >= packet_sufficiency_min_claim_families(task_class)
-}
-
-fn packet_supported_claim_family_count(supported_claims: &[PacketClaimDto]) -> usize {
-    let mut families: HashSet<&'static str> = HashSet::new();
-    for claim in supported_claims {
-        if let Some(family) = packet_claim_family(claim) {
-            families.insert(family);
-        }
-    }
-    families.len()
-}
-
-fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str> {
-    let normalized_claim = normalize_identifier(&claim.claim);
-    if !normalized_claim.is_empty() {
-        if normalized_claim.contains("serialize") && normalized_claim.contains("key") {
-            return Some("key serialization");
-        }
-        if normalized_claim.contains("cache")
-            && contains_any(
-                &normalized_claim,
-                &["helper", "state", "snapshot", "subscribe", "getset"],
-            )
-        {
-            return Some("cache state");
-        }
-        if contains_any(&normalized_claim, &["mutation", "mutate", "internalmutate"]) {
-            return Some("mutation flow");
-        }
-        if contains_any(
-            &normalized_claim,
-            &[
-                "blank",
-                "empty",
-                "casesensitive",
-                "ignorecase",
-                "whitespace",
-                "trim",
-            ],
-        ) && contains_any(
-            &normalized_claim,
-            &[
-                "treats", "tests", "doesnot", "deciding", "return", "compares",
-            ],
-        ) {
-            return Some("predicate behavior");
-        }
-        if normalized_claim.contains("public")
-            && contains_any(
-                &normalized_claim,
-                &["api", "export", "entrypoint", "hook", "method"],
-            )
-        {
-            return Some("public api/export");
-        }
-        if contains_any(
-            &normalized_claim,
-            &[
-                "delegates",
-                "delegate",
-                "handoff",
-                "wraps",
-                "invokes",
-                "callsinto",
-            ],
-        ) {
-            return Some("delegation/handoff");
-        }
-    }
-
-    claim
-        .citations
-        .iter()
-        .find_map(packet_evidence_role)
-        .or_else(|| (!claim.citations.is_empty()).then_some("source evidence"))
-}
-
-fn packet_missing_sufficiency_probe_queries_with_extra(
-    question: &str,
-    task_class: PacketTaskClassDto,
-    answer: &AgentAnswerDto,
-    supported_claims: &[PacketClaimDto],
-    extra_probes: &[String],
-) -> Vec<String> {
-    packet_sufficiency_required_probe_queries_with_extra(question, task_class, extra_probes)
-        .into_iter()
-        .filter(|query| !packet_probe_query_is_covered(query, answer, supported_claims))
-        .collect()
-}
-
-fn packet_probe_query_is_covered(
-    query: &str,
-    answer: &AgentAnswerDto,
-    supported_claims: &[PacketClaimDto],
-) -> bool {
-    packet_probe_query_is_cited(query, answer)
-        || packet_probe_query_is_claimed(query, supported_claims)
-}
-
-fn packet_probe_query_is_claimed(query: &str, supported_claims: &[PacketClaimDto]) -> bool {
-    if let Some(parts) = packet_file_scoped_symbol_probe_parts(query) {
-        return supported_claims
-            .iter()
-            .any(|claim| packet_claim_covers_file_scoped_probe(&parts, claim));
-    }
-
-    if !packet_probe_query_allows_claim_coverage(query) {
-        return false;
-    }
-    let normalized_query = normalize_identifier(query);
-    if normalized_query.is_empty() {
-        return false;
-    }
-    supported_claims.iter().any(|claim| {
-        let normalized_claim = normalize_identifier(&claim.claim);
-        normalized_claim.contains(&normalized_query)
+        supported_claims,
+        missing_required_probe_queries,
+        targeted_follow_up_queries: packet_targeted_follow_up_queries(question, task_class),
     })
-}
-
-fn packet_claim_covers_file_scoped_probe(
-    parts: &PacketFileScopedSymbolProbe,
-    claim: &PacketClaimDto,
-) -> bool {
-    let claim_file_matches = claim.citations.iter().any(|citation| {
-        citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .map(|path| {
-                path.rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(path.as_str())
-                    .eq_ignore_ascii_case(&parts.file_name)
-            })
-            .unwrap_or(false)
-    });
-    if !claim_file_matches {
-        return false;
-    }
-    let normalized_claim = normalize_identifier(&claim.claim);
-    parts
-        .symbols
-        .iter()
-        .all(|symbol| normalized_claim.contains(symbol))
-}
-
-fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
-    let trimmed = query.trim();
-    trimmed.contains('.')
-        && !trimmed.contains('/')
-        && !trimmed.contains('\\')
-        && !trimmed.chars().any(char::is_whitespace)
-}
-
-#[cfg(test)]
-fn packet_sufficiency_required_probe_queries(
-    question: &str,
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    packet_sufficiency_required_probe_queries_with_extra(question, task_class, &[])
-}
-
-fn packet_sufficiency_required_probe_queries_with_extra(
-    question: &str,
-    task_class: PacketTaskClassDto,
-    extra_probes: &[String],
-) -> Vec<String> {
-    let terms = packet_probe_terms(question);
-    let mut queries = packet_prompt_exact_symbol_probe_queries(question, &terms, task_class);
-    push_unique_owned_terms(&mut queries, extra_probes);
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_sufficiency_required_probe_queries_from_terms(&terms, task_class),
-    );
-    queries
-}
-
-fn packet_sufficiency_required_probe_queries_from_terms(
-    terms: &[String],
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    if !matches!(
-        task_class,
-        PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::EditPlanning
-    ) {
-        return Vec::new();
-    }
-
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    let mut queries = Vec::new();
-
-    if eval_probes_enabled() {
-        push_eval_required_probe_queries(terms, &mut queries);
-        return queries;
-    }
-
-    if has("exec") && has_any(&["runtime", "session"]) {
-        push_unique_terms(&mut queries, &["exec runtime", "exec session"]);
-    }
-    if has("exec") && has_any(&["cli", "command", "subcommand"]) {
-        push_unique_terms(&mut queries, &["exec cli", "exec command"]);
-    }
-    if has_any(&["json", "jsonl"]) && has_any(&["event", "events", "output"]) {
-        push_unique_terms(&mut queries, &["json event output", "jsonl event output"]);
-    }
-    if has("thread") && has_any(&["start", "starts", "started"]) {
-        push_unique_term(&mut queries, "thread start");
-    }
-    if has("turn") && has_any(&["start", "starts", "started"]) {
-        push_unique_term(&mut queries, "turn start");
-    }
-    if has_any(&["storage", "persistent"]) || (has("data") && has_any(&["access", "accessed"])) {
-        push_unique_terms(&mut queries, &["storage access", "persistent storage"]);
-    }
-    if packet_terms_indicate_indexing_flow(terms) {
-        push_indexing_flow_required_probe_queries(&mut queries);
-    }
-    if packet_terms_indicate_request_dispatch_flow(terms) {
-        push_unique_terms(
-            &mut queries,
-            &[
-                "request interceptor",
-                "request dispatch",
-                "transport adapter",
-            ],
-        );
-    }
-    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
-        push_unique_terms(
-            &mut queries,
-            &[
-                "request preparation",
-                "session request",
-                "session send",
-                "adapter send",
-                "adapter selection",
-            ],
-        );
-    }
-    if has("event") && has("loop") {
-        push_unique_terms(
-            &mut queries,
-            &[
-                "event loop",
-                "event dispatch",
-                "network input",
-                "command dispatch",
-            ],
-        );
-    }
-    if has("call") && has_any(&["command", "commands", "dispatch", "dispatches"]) {
-        push_unique_terms(&mut queries, &["command dispatch", "command handler"]);
-    }
-    if packet_terms_indicate_search_execution_flow(terms) {
-        push_search_flow_probe_queries(&mut queries);
-    }
-    if has_any(&["indexing", "indexed", "indexer"])
-        && (has_any(&["storage", "persistent", "project", "configuration", "group"])
-            || has_any(&["command", "commands"]))
-    {
-        push_unique_terms(
-            &mut queries,
-            &["build index", "source group indexing", "indexer command"],
-        );
-    }
-
-    queries
-}
-
-fn push_indexing_flow_required_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "Runtime::index_service",
-            "index service run indexing",
-            "workspace manifest build execution plan",
-            "workspace indexer run",
-            "index_file",
-            "storage flush projection batch",
-            "storage rebuild search symbol projection",
-            "snapshot refresh all stats",
-        ],
-    );
-}
-
-fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool {
-    answer
-        .citations
-        .iter()
-        .any(|citation| packet_citation_satisfies_required_probe(query, citation))
-}
-
-fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCitationDto) -> bool {
-    if let Some(matches_file_scoped_symbol) =
-        packet_file_scoped_symbol_probe_matches(query, citation)
-    {
-        return matches_file_scoped_symbol;
-    }
-    if packet_required_probe_needs_concrete_file(query) {
-        return packet_file_stem_matches_query(query, citation.file_path.as_deref());
-    }
-    if packet_required_probe_needs_full_token_coverage(query) {
-        if packet_citation_probe_has_exact_identifier_match(query, citation) {
-            return true;
-        }
-        let tokens = packet_probe_match_tokens(query);
-        return !tokens.is_empty()
-            && packet_citation_probe_token_coverage(query, citation) >= tokens.len();
-    }
-    let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
-        return false;
-    };
-    !packet_required_probe_needs_exact_match(query) || match_rank >= 4
-}
-
-fn packet_required_probe_needs_exact_match(query: &str) -> bool {
-    query.contains("::") || query.contains('.')
-}
-
-fn packet_required_probe_needs_concrete_file(query: &str) -> bool {
-    let normalized_query = normalize_identifier(query);
-    normalized_query.contains("execevents") || normalized_query == "eventprocessor"
-}
-
-fn packet_required_probe_needs_full_token_coverage(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "indexservicerunindexing"
-            | "workspacemanifestbuildexecutionplan"
-            | "workspaceindexerrun"
-            | "indexfile"
-            | "storageflushprojectionbatch"
-            | "storagerebuildsearchsymbolprojection"
-            | "snapshotrefreshallstats"
-    )
-}
-
-fn packet_citation_probe_has_exact_identifier_match(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let normalized_query = normalize_identifier(query);
-    if normalized_query.is_empty() {
-        return false;
-    }
-    let normalized_display = normalize_identifier(&citation.display_name);
-    normalized_display == normalized_query || normalized_display.ends_with(&normalized_query)
-}
-
-fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto) -> Option<u8> {
-    let normalized_query = normalize_identifier(query);
-    if normalized_query.is_empty() {
-        return Some(0);
-    }
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let normalized_path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .map(|path| normalize_identifier(&path))
-        .unwrap_or_default();
-    if let Some(matches_file_scoped_symbol) =
-        packet_file_scoped_symbol_probe_matches(query, citation)
-    {
-        if matches_file_scoped_symbol {
-            Some(6)
-        } else {
-            None
-        }
-    } else if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
-        Some(5)
-    } else if normalized_display == normalized_query
-        || normalized_display.ends_with(&normalized_query)
-        || (!packet_required_probe_needs_exact_match(query)
-            && packet_citation_probe_token_coverage(query, citation) >= 2)
-    {
-        Some(4)
-    } else if normalized_path.contains(&normalized_query) {
-        Some(3)
-    } else if normalized_display.contains(&normalized_query) {
-        Some(2)
-    } else if !normalized_display.is_empty() && normalized_query.contains(&normalized_display) {
-        Some(1)
-    } else {
-        None
-    }
-}
-
-fn packet_file_scoped_symbol_probe_matches(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> Option<bool> {
-    let parts = packet_file_scoped_symbol_probe_parts(query)?;
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    let file_name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path.as_str())
-        .to_ascii_lowercase();
-    if file_name != parts.file_name {
-        return Some(false);
-    }
-
-    let normalized_display = normalize_identifier(&citation.display_name);
-    if parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table" {
-        let Some(table_name) = parts.symbols.last() else {
-            return Some(false);
-        };
-        let expected = format!("createtable{table_name}");
-        return Some(normalized_display == expected || normalized_display.ends_with(&expected));
-    }
-    if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
-        return Some(
-            normalized_display == "foreignkey" || normalized_display.ends_with("foreignkey"),
-        );
-    }
-    Some(parts.symbols.iter().any(|symbol| {
-        normalized_display == *symbol
-            || normalized_display.ends_with(symbol)
-            || packet_file_scoped_short_symbol_matches(&citation.display_name, symbol)
-    }))
-}
-
-fn packet_file_scoped_short_symbol_matches(display_name: &str, symbol: &str) -> bool {
-    if symbol.len() > 3 {
-        return false;
-    }
-    display_name
-        .rsplit(['.', ':', '#'])
-        .next()
-        .map(normalize_identifier)
-        .is_some_and(|tail| tail == symbol)
-}
-
-struct PacketFileScopedSymbolProbe {
-    query_path: String,
-    file_name: String,
-    raw_symbols: Vec<String>,
-    symbols: Vec<String>,
-}
-
-fn packet_file_scoped_symbol_probe_parts(query: &str) -> Option<PacketFileScopedSymbolProbe> {
-    let mut parts = query.split_whitespace();
-    let file_part = parts
-        .next()?
-        .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\''));
-    let query_path = file_part.replace('\\', "/");
-    let file_name = file_part.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
-    if !file_name.contains('.') {
-        return None;
-    }
-
-    let raw_symbols = parts
-        .map(|part| {
-            part.trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | ',' | ';'))
-                .to_string()
-        })
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let symbols = raw_symbols
-        .iter()
-        .map(|part| normalize_identifier(part))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if symbols.is_empty() {
-        return None;
-    }
-
-    Some(PacketFileScopedSymbolProbe {
-        query_path,
-        file_name,
-        raw_symbols,
-        symbols,
-    })
-}
-
-fn packet_citation_probe_token_coverage(query: &str, citation: &AgentCitationDto) -> usize {
-    let tokens = packet_probe_match_tokens(query);
-    if tokens.len() < 2 {
-        return 0;
-    }
-    let display = normalize_identifier(&citation.display_name);
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .map(|path| normalize_identifier(&path))
-        .unwrap_or_default();
-    tokens
-        .iter()
-        .filter(|token| display.contains(token.as_str()) || path.contains(token.as_str()))
-        .count()
-}
-
-fn packet_probe_match_tokens(query: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for token in query
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| token.len() >= 3 && !packet_query_stop_term(token))
-    {
-        if !tokens.iter().any(|existing| existing == &token) {
-            tokens.push(token);
-        }
-    }
-    tokens
-}
-
-fn packet_has_sufficiency_blocking_budget_omission(
-    answer: &AgentAnswerDto,
-    budget: &PacketBudgetDto,
-    min_citations: usize,
-    min_claims: usize,
-    supported_claim_count: usize,
-) -> bool {
-    if !budget.truncated {
-        return false;
-    }
-
-    let has_claim_stop_signal =
-        answer.citations.len() >= min_citations && supported_claim_count >= min_claims;
-    let has_retained_graph = packet_has_retained_graph(answer);
-
-    budget
-        .omitted_sections
-        .iter()
-        .any(|section| match section.as_str() {
-            "packet_payload" => true,
-            "markdown_blocks" => {
-                !has_claim_stop_signal || packet_markdown_truncation_blocks_sufficiency(answer)
-            }
-            "trail_edges" => !has_claim_stop_signal || !has_retained_graph,
-            _ => false,
-        })
-}
-
-fn packet_has_retained_graph(answer: &AgentAnswerDto) -> bool {
-    answer.graphs.iter().any(|artifact| match artifact {
-        GraphArtifactDto::Uml { graph, .. } => !graph.edges.is_empty(),
-        GraphArtifactDto::Mermaid { .. } => false,
-    })
-}
-
-fn packet_markdown_truncation_blocks_sufficiency(answer: &AgentAnswerDto) -> bool {
-    let mut saw_truncated_markdown = false;
-    for section in &answer.sections {
-        for block in &section.blocks {
-            let AgentResponseBlockDto::Markdown { markdown } = block else {
-                continue;
-            };
-            if !markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim()) {
-                continue;
-            }
-            saw_truncated_markdown = true;
-            if !packet_section_allows_nonblocking_truncation(section.id.as_str()) {
-                return true;
-            }
-        }
-    }
-    !saw_truncated_markdown
-}
-
-fn packet_section_allows_nonblocking_truncation(section_id: &str) -> bool {
-    section_id == "retrieval-evidence"
-        || section_id == "diagrams"
-        || section_id.starts_with("packet-subquery-")
-}
-
-fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
-    budget.used.output_bytes > budget.limits.max_output_bytes
-}
-
-fn packet_follow_up_commands(
-    project_root: &Path,
-    question: &str,
-    task_class: PacketTaskClassDto,
-    status: PacketSufficiencyStatusDto,
-    budget: &PacketBudgetDto,
-    missing_required_probe_queries: &[String],
-) -> Vec<String> {
-    let project = quote_packet_project_arg(project_root);
-    match status {
-        PacketSufficiencyStatusDto::Sufficient => Vec::new(),
-        PacketSufficiencyStatusDto::Partial => {
-            let mut commands = Vec::new();
-            let targeted_searches = if missing_required_probe_queries.is_empty() {
-                packet_targeted_follow_up_searches(project.as_str(), question, task_class)
-            } else {
-                packet_missing_required_probe_searches(
-                    project.as_str(),
-                    missing_required_probe_queries,
-                )
-            };
-            for command in targeted_searches {
-                push_unique_term(&mut commands, &command);
-            }
-            commands
-                .into_iter()
-                .take(8)
-                .chain(budget.next_deeper_command.clone())
-                .chain(std::iter::once(format!(
-                    "codestory-cli search --project {project} --query {} --why",
-                    quote_packet_command_value(question)
-                )))
-                .collect()
-        }
-        PacketSufficiencyStatusDto::Insufficient => vec![
-            format!("codestory-cli index --project {project} --refresh full"),
-            format!(
-                "codestory-cli search --project {project} --query {} --why",
-                quote_packet_command_value(question)
-            ),
-        ],
-    }
-}
-
-fn packet_missing_required_probe_searches(quoted_project: &str, queries: &[String]) -> Vec<String> {
-    queries
-        .iter()
-        .map(|query| {
-            format!(
-                "codestory-cli search --project {quoted_project} --query {} --why",
-                quote_packet_command_value(query)
-            )
-        })
-        .collect()
-}
-
-fn packet_targeted_follow_up_searches(
-    quoted_project: &str,
-    question: &str,
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    packet_targeted_follow_up_queries(question, task_class)
-        .into_iter()
-        .map(|query| {
-            format!(
-                "codestory-cli search --project {quoted_project} --query {} --why",
-                quote_packet_command_value(&query)
-            )
-        })
-        .collect()
 }
 
 fn packet_targeted_follow_up_queries(
@@ -7373,7 +1619,7 @@ fn is_packet_structured_follow_up_query(query: &str) -> bool {
         || query.contains("Subcommand")
 }
 
-fn packet_benchmark_trace(answer: &AgentAnswerDto) -> PacketBenchmarkTraceDto {
+fn packet_retrieval_trace_summary(answer: &AgentAnswerDto) -> PacketRetrievalTraceSummaryDto {
     let mut source_read_steps = 0;
     let mut search_steps = 0;
     let mut trail_steps = 0;
@@ -7399,11 +1645,11 @@ fn packet_benchmark_trace(answer: &AgentAnswerDto) -> PacketBenchmarkTraceDto {
 
     let mut trace_summary = answer.retrieval_trace.clone();
     // The full step trace already lives under answer.retrieval_trace. Keep the
-    // benchmark trace scalar-sized so compact packets do not serialize it twice.
+    // retrieval trace summary scalar-sized so compact packets do not serialize it twice.
     trace_summary.annotations.clear();
     trace_summary.steps.clear();
 
-    PacketBenchmarkTraceDto {
+    PacketRetrievalTraceSummaryDto {
         retrieval_trace: trace_summary,
         source_read_steps,
         search_steps,
@@ -8727,85 +2973,6 @@ fn next_request_id() -> String {
 }
 
 #[allow(dead_code)]
-fn prompt_search_terms(prompt: &str) -> Vec<String> {
-    const STOPWORDS: &[&str] = &[
-        "a",
-        "actual",
-        "already",
-        "an",
-        "and",
-        "are",
-        "area",
-        "areas",
-        "across",
-        "as",
-        "at",
-        "be",
-        "boundaries",
-        "boundary",
-        "by",
-        "can",
-        "current",
-        "does",
-        "existing",
-        "for",
-        "from",
-        "how",
-        "implementation",
-        "implemented",
-        "in",
-        "is",
-        "it",
-        "of",
-        "on",
-        "or",
-        "repo",
-        "repository",
-        "risk",
-        "risks",
-        "study",
-        "surface",
-        "surfaces",
-        "the",
-        "this",
-        "to",
-        "what",
-        "where",
-        "which",
-        "why",
-        "with",
-        "work",
-        "works",
-    ];
-
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    let mut seen = HashSet::new();
-
-    for ch in prompt.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            current.push(ch.to_ascii_lowercase());
-            continue;
-        }
-
-        if current.len() >= 3
-            && !STOPWORDS.contains(&current.as_str())
-            && seen.insert(current.clone())
-        {
-            terms.push(current.clone());
-        }
-        current.clear();
-    }
-
-    if current.len() >= 3 && !STOPWORDS.contains(&current.as_str()) && seen.insert(current.clone())
-    {
-        terms.push(current);
-    }
-
-    terms
-}
-
-#[allow(dead_code)]
 fn merge_search_hits(into: &mut Vec<SearchHit>, additional: Vec<SearchHit>, max_candidates: usize) {
     let mut by_id = HashMap::<codestory_contracts::api::NodeId, SearchHit>::new();
 
@@ -9267,66 +3434,6 @@ mod tests {
                 > packet_citation_rank(&facade, &terms, true),
             "concrete module files should outrank lib/mod facade declarations for packet evidence"
         );
-    }
-
-    #[test]
-    fn packet_probe_match_rank_uses_multi_token_path_coverage() {
-        let mut citation = test_packet_citation(
-            "std::collections::HashMap",
-            "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
-            0.6,
-        );
-        citation.kind = NodeKind::MODULE;
-
-        assert_eq!(
-            packet_citation_probe_match_rank("jsonl event output", &citation),
-            Some(4)
-        );
-        assert_eq!(
-            packet_citation_probe_token_coverage("jsonl event output", &citation),
-            3
-        );
-    }
-
-    #[test]
-    fn packet_required_probe_matching_uses_file_stems_and_display_symbols() {
-        let event_loop_entry = test_packet_citation(
-            "service::main",
-            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\acme\src\event_loop.c",
-            0.9,
-        );
-        let command_handler = test_packet_citation(
-            "CommandHandler",
-            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\acme\src\commands.c",
-            0.9,
-        );
-        let search_entrypoint = test_packet_citation(
-            "search_driver::run",
-            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\acme\crates\search\src\main.rs",
-            0.9,
-        );
-        let candidate_builder = test_packet_citation(
-            "CandidateFiles",
-            r"\\?\C:\Users\alber\source\repos\codestory\target\agent-benchmark\repos\acme\crates\search\src\candidate_files.rs",
-            0.9,
-        );
-
-        assert!(packet_citation_satisfies_required_probe(
-            "event_loop.c main",
-            &event_loop_entry
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "command handler",
-            &command_handler
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "search driver run",
-            &search_entrypoint
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "candidate files",
-            &candidate_builder
-        ));
     }
 
     #[test]
@@ -10584,7 +4691,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_budget_protects_indexing_flow_action_probe_citations() {
+    fn packet_budget_protects_generic_indexing_flow_probe_citations() {
         let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
         let mut citations = (0..20)
             .map(|index| {
@@ -10612,53 +4719,32 @@ mod tests {
                 9.3,
             ),
             test_packet_citation(
-                "Runtime::index_service",
-                "crates/codestory-runtime/src/lib.rs",
-                9.0,
-            ),
-            test_packet_citation(
-                "WorkspaceIndexer",
-                "crates/codestory-indexer/src/lib.rs",
-                9.0,
-            ),
-            test_packet_citation(
-                "Storage::upsert_search_symbol_projection_batch",
-                "crates/codestory-store/src/storage_impl/mod.rs",
-                9.0,
-            ),
-            test_packet_citation(
-                "SnapshotRefreshStats",
-                "crates/codestory-store/src/snapshot_store.rs",
-                9.0,
-            ),
-            test_packet_citation(
-                "IndexService::run_indexing_blocking",
+                "indexing entrypoint",
                 "crates/codestory-runtime/src/services.rs",
                 0.1,
             ),
             test_packet_citation(
-                "WorkspaceManifest::build_execution_plan",
+                "file discovery",
                 "crates/codestory-workspace/src/lib.rs",
                 0.1,
             ),
             test_packet_citation(
-                "WorkspaceIndexer::run",
+                "symbol extraction",
                 "crates/codestory-indexer/src/lib.rs",
                 0.1,
             ),
-            test_packet_citation("index_file", "crates/codestory-indexer/src/lib.rs", 0.1),
             test_packet_citation(
-                "Storage::flush_projection_batch",
+                "storage persistence",
                 "crates/codestory-store/src/storage_impl/mod.rs",
                 0.1,
             ),
             test_packet_citation(
-                "Storage::rebuild_search_symbol_projection_from_node_table",
+                "search projection",
                 "crates/codestory-store/src/storage_impl/mod.rs",
                 0.1,
             ),
             test_packet_citation(
-                "SnapshotStore::refresh_all_with_stats",
+                "snapshot refresh",
                 "crates/codestory-store/src/snapshot_store.rs",
                 0.1,
             ),
@@ -10681,18 +4767,16 @@ mod tests {
             .map(|citation| citation.display_name.as_str())
             .collect::<Vec<_>>();
         for expected in [
-            "Runtime::index_service",
-            "IndexService::run_indexing_blocking",
-            "WorkspaceManifest::build_execution_plan",
-            "WorkspaceIndexer::run",
-            "index_file",
-            "Storage::flush_projection_batch",
-            "Storage::rebuild_search_symbol_projection_from_node_table",
-            "SnapshotStore::refresh_all_with_stats",
+            "indexing entrypoint",
+            "file discovery",
+            "symbol extraction",
+            "storage persistence",
+            "search projection",
+            "snapshot refresh",
         ] {
             assert!(
                 display_names.contains(&expected),
-                "compact packet cap should protect indexing-flow action probe {expected}: {display_names:?}"
+                "compact packet cap should protect generic indexing-flow probe {expected}: {display_names:?}"
             );
         }
         for low_value in [
@@ -11306,9 +5390,10 @@ mod tests {
                 "Explain how a search command parses CLI flags, walks candidate files, and executes a search through matcher, searcher, and printer components. Cite the source files that support the path.",
                 &[
                     "search entrypoint",
+                    "flag parsing",
                     "argument planning",
                     "candidate file walk",
-                    "search worker",
+                    "search execution",
                     "result printer",
                 ][..],
             ),
@@ -11347,6 +5432,9 @@ mod tests {
                 "HiArgs",
                 "SearchWorker::search",
                 "haystack.rs",
+                "walk builder",
+                "matcher searcher printer",
+                "search worker",
             ] {
                 assert!(
                     !queries
@@ -11562,7 +5650,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_packet_plan_protects_indexing_flow_action_probes() {
+    fn compact_packet_plan_protects_generic_indexing_flow_probes() {
         let plan = build_packet_plan(
             "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.",
             Some(PacketTaskClassDto::ArchitectureExplanation),
@@ -11575,29 +5663,37 @@ mod tests {
             .collect::<Vec<_>>();
 
         for expected in [
-            "index service run indexing",
-            "workspace manifest build execution plan",
-            "workspace indexer run",
-            "index_file",
-            "storage flush projection batch",
-            "storage rebuild search symbol projection",
-            "snapshot refresh all stats",
+            "indexing entrypoint",
+            "file discovery",
+            "symbol extraction",
+            "storage persistence",
+            "search projection",
+            "snapshot refresh",
         ] {
             assert!(
                 queries.contains(&expected),
-                "expected indexing-flow action probe {expected} in compact packet plan: {queries:?}"
+                "expected generic indexing-flow probe {expected} in compact packet plan: {queries:?}"
             );
         }
         for fixture_anchor in [
+            "Runtime::index_service",
             "IndexService::run_indexing_blocking",
+            "index service run indexing",
             "WorkspaceManifest::build_execution_plan",
+            "workspace manifest build execution plan",
             "WorkspaceIndexer::run",
+            "workspace indexer run",
+            "index_file",
+            "Storage::flush_projection_batch",
+            "storage flush projection batch",
             "Storage::rebuild_search_symbol_projection_from_node_table",
+            "storage rebuild search symbol projection",
             "SnapshotStore::refresh_all_with_stats",
+            "snapshot refresh all stats",
         ] {
             assert!(
                 !queries.contains(&fixture_anchor),
-                "packet planner should protect generic action probes without injecting fixture-specific anchor {fixture_anchor}: {queries:?}"
+                "packet planner should protect generic indexing probes without injecting fixture-specific anchor {fixture_anchor}: {queries:?}"
             );
         }
     }
@@ -12378,7 +6474,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_accepts_exact_single_token_index_file_probe() {
+    fn packet_sufficiency_accepts_generic_indexing_flow_probes() {
         let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
         let (_answer, sufficiency) = build_sufficient_packet_fixture(
             question,
@@ -12386,58 +6482,32 @@ mod tests {
             vec![
                 test_packet_citation("CliDirection", "crates/codestory-cli/src/args.rs", 0.8),
                 test_packet_citation(
-                    "Runtime::index_service",
+                    "indexing entrypoint",
                     "crates/codestory-runtime/src/services.rs",
                     0.8,
                 ),
                 test_packet_citation(
-                    "index service run indexing",
-                    "crates/codestory-runtime/src/services.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "IndexService::run_indexing_blocking_without_runtime_refresh",
-                    "crates/codestory-runtime/src/services.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "WorkspaceManifest::build_execution_plan",
+                    "file discovery",
                     "crates/codestory-workspace/src/lib.rs",
                     0.8,
                 ),
                 test_packet_citation(
-                    "symbol extraction indexer",
+                    "symbol extraction",
                     "crates/codestory-indexer/src/lib.rs",
                     0.8,
                 ),
                 test_packet_citation(
-                    "WorkspaceIndexer::run",
-                    "crates/codestory-indexer/src/lib.rs",
-                    0.8,
-                ),
-                test_packet_citation("index_file", "crates/codestory-indexer/src/lib.rs", 0.8),
-                test_packet_citation(
-                    "Storage::flush_projection_batch",
+                    "storage persistence",
                     "crates/codestory-store/src/storage_impl/mod.rs",
                     0.8,
                 ),
                 test_packet_citation(
-                    "Storage::rebuild_search_symbol_projection_from_node_table",
-                    "crates/codestory-store/src/storage_impl/mod.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "storage rebuild search symbol projection",
+                    "search projection",
                     "crates/codestory-store/src/storage_impl/mod.rs",
                     0.8,
                 ),
                 test_packet_citation(
                     "snapshot refresh",
-                    "crates/codestory-store/src/snapshot_store.rs",
-                    0.8,
-                ),
-                test_packet_citation(
-                    "snapshot refresh all stats",
                     "crates/codestory-store/src/snapshot_store.rs",
                     0.8,
                 ),
@@ -12449,20 +6519,26 @@ mod tests {
             PacketSufficiencyStatusDto::Sufficient,
             "{sufficiency:?}"
         );
-        assert!(
-            sufficiency
-                .gaps
-                .iter()
-                .all(|gap| !gap.contains("index_file")),
-            "exact cited index_file should satisfy required probe gaps: {sufficiency:?}"
-        );
-        assert!(
-            sufficiency
-                .follow_up_commands
-                .iter()
-                .all(|command| !command.contains("index_file")),
-            "exact cited index_file should not produce follow-up commands: {sufficiency:?}"
-        );
+        for probe in [
+            "indexing entrypoint",
+            "file discovery",
+            "symbol extraction",
+            "storage persistence",
+            "search projection",
+            "snapshot refresh",
+        ] {
+            assert!(
+                sufficiency.gaps.iter().all(|gap| !gap.contains(probe)),
+                "generic indexing-flow probe {probe} should satisfy required probe gaps: {sufficiency:?}"
+            );
+            assert!(
+                sufficiency
+                    .follow_up_commands
+                    .iter()
+                    .all(|command| !command.contains(probe)),
+                "generic indexing-flow probe {probe} should not produce follow-up commands: {sufficiency:?}"
+            );
+        }
     }
 
     #[test]
@@ -12802,11 +6878,11 @@ mod tests {
         );
         assert_eq!(
             packet_evidence_role(&answer.citations[1]),
-            Some("tests and regression coverage")
+            Some(PacketEvidenceRole::TestsAndRegressionCoverage)
         );
         assert_eq!(
             packet_evidence_role(&answer.citations[2]),
-            Some("tests and regression coverage")
+            Some(PacketEvidenceRole::TestsAndRegressionCoverage)
         );
     }
 
@@ -13089,7 +7165,7 @@ mod tests {
         let use_swr_handler = &claims[0].citations[0];
         assert_eq!(
             packet_evidence_role(use_swr_handler),
-            Some("source evidence"),
+            Some(PacketEvidenceRole::SourceEvidence),
             "a hook handler outside route-shaped paths should not become route handling"
         );
 
@@ -13350,9 +7426,9 @@ mod tests {
     }
 
     #[test]
-    fn packet_benchmark_trace_keeps_counters_without_duplicating_full_trace() {
+    fn packet_retrieval_trace_summary_keeps_counters_without_duplicating_full_trace() {
         let mut answer = packet_answer_fixture(
-            "Explain the packet benchmark trace.",
+            "Explain the packet retrieval trace summary.",
             vec![test_packet_citation(
                 "PacketTrace",
                 "src/packet_trace.rs",
@@ -13395,23 +7471,32 @@ mod tests {
         let full_trace_bytes = serde_json::to_vec(&answer.retrieval_trace)
             .expect("serialize canonical trace")
             .len();
-        let benchmark_trace = packet_benchmark_trace(&answer);
-        let benchmark_trace_bytes = serde_json::to_vec(&benchmark_trace.retrieval_trace)
-            .expect("serialize benchmark trace")
-            .len();
+        let retrieval_trace_summary = packet_retrieval_trace_summary(&answer);
+        let retrieval_trace_summary_bytes =
+            serde_json::to_vec(&retrieval_trace_summary.retrieval_trace)
+                .expect("serialize retrieval trace summary")
+                .len();
 
         assert_eq!(answer.retrieval_trace.steps.len(), 3);
-        assert_eq!(benchmark_trace.search_steps, 1);
-        assert_eq!(benchmark_trace.trail_steps, 1);
-        assert_eq!(benchmark_trace.source_read_steps, 1);
-        assert_eq!(benchmark_trace.retrieval_trace.total_latency_ms, 42);
-        assert_eq!(benchmark_trace.retrieval_trace.sla_target_ms, Some(1_000));
-        assert!(benchmark_trace.retrieval_trace.sla_missed);
-        assert!(benchmark_trace.retrieval_trace.steps.is_empty());
-        assert!(benchmark_trace.retrieval_trace.annotations.is_empty());
+        assert_eq!(retrieval_trace_summary.search_steps, 1);
+        assert_eq!(retrieval_trace_summary.trail_steps, 1);
+        assert_eq!(retrieval_trace_summary.source_read_steps, 1);
+        assert_eq!(retrieval_trace_summary.retrieval_trace.total_latency_ms, 42);
+        assert_eq!(
+            retrieval_trace_summary.retrieval_trace.sla_target_ms,
+            Some(1_000)
+        );
+        assert!(retrieval_trace_summary.retrieval_trace.sla_missed);
+        assert!(retrieval_trace_summary.retrieval_trace.steps.is_empty());
         assert!(
-            benchmark_trace_bytes < full_trace_bytes / 2,
-            "benchmark trace should stay scalar-sized: {benchmark_trace_bytes} >= {full_trace_bytes}/2"
+            retrieval_trace_summary
+                .retrieval_trace
+                .annotations
+                .is_empty()
+        );
+        assert!(
+            retrieval_trace_summary_bytes < full_trace_bytes / 2,
+            "retrieval trace summary should stay scalar-sized: {retrieval_trace_summary_bytes} >= {full_trace_bytes}/2"
         );
     }
 
@@ -13744,6 +7829,7 @@ mod tests {
         if let AgentResponseBlockDto::Markdown { markdown } = &mut answer.sections[0].blocks[0] {
             *markdown = "payload budget evidence ".repeat(6000);
         }
+        append_packet_step_trace_annotation(&mut answer);
         let budget = apply_packet_budget(
             packet_fixture_project_root(),
             question,
@@ -13759,7 +7845,7 @@ mod tests {
             &answer,
             &budget,
         );
-        let benchmark_trace = packet_benchmark_trace(&answer);
+        let retrieval_trace_summary = packet_retrieval_trace_summary(&answer);
         let mut packet = AgentPacketDto {
             packet_id: answer.answer_id.clone(),
             question: question.to_string(),
@@ -13776,7 +7862,7 @@ mod tests {
             answer,
             budget,
             sufficiency,
-            benchmark_trace,
+            retrieval_trace_summary,
         };
 
         enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
@@ -13788,6 +7874,15 @@ mod tests {
             max_output_bytes
         );
         assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.starts_with("packet_step_trace ")),
+            "packet step trace annotation should be present before final budget measurement"
+        );
         assert!(packet.budget.truncated);
         assert!(
             packet
@@ -14434,55 +8529,6 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn file_scoped_required_probes_match_symbol_inside_file() {
-        let gin_new = test_packet_citation("New", "gin.go", 0.9);
-        let gin_with = test_packet_citation("Engine.With", "gin.go", 0.9);
-        let binding_default = test_packet_citation("Default", "binding/binding.go", 0.9);
-        let router_group = test_packet_citation("RouterGroup", "routergroup.go", 0.9);
-        let router_group_handle = test_packet_citation("RouterGroup.Handle", "routergroup.go", 0.9);
-
-        assert!(packet_citation_satisfies_required_probe(
-            "gin.go New",
-            &gin_new
-        ));
-        assert!(!packet_citation_satisfies_required_probe(
-            "gin.go New",
-            &gin_with
-        ));
-        assert!(!packet_citation_satisfies_required_probe(
-            "gin.go Default",
-            &binding_default
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "routergroup.go RouterGroup.Handle",
-            &router_group_handle
-        ));
-        assert!(!packet_citation_satisfies_required_probe(
-            "routergroup.go RouterGroup.Handle",
-            &router_group
-        ));
-
-        let create_track = test_packet_citation(
-            "CREATE TABLE Track",
-            "SampleDatabase/DataSources/Sample_Sqlite.sql",
-            0.9,
-        );
-        let create_playlist_track = test_packet_citation(
-            "CREATE TABLE PlaylistTrack",
-            "SampleDatabase/DataSources/Sample_Sqlite.sql",
-            0.9,
-        );
-        assert!(packet_citation_satisfies_required_probe(
-            "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
-            &create_track
-        ));
-        assert!(!packet_citation_satisfies_required_probe(
-            "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
-            &create_playlist_track
-        ));
-    }
-
     #[test]
     fn gin_route_dispatch_source_claims_name_registration_and_context_flow() {
         let _eval_probes = EvalProbesGuard::enabled();
@@ -15401,26 +9447,38 @@ mod tests {
     }
     #[test]
     fn express_route_flow_source_claims_name_app_router_response_flow() {
-        let _eval_probes = EvalProbesGuard::enabled();
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
         let prompt = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
         let fixtures = [
             (
                 "createApplication",
                 "lib/express.js",
                 "function createApplication() { var app = function(req, res, next) { app.handle(req, res, next); }; mixin(app, proto, false); app.request = Object.create(req); app.response = Object.create(res); app.init(); return app; }",
-                "createApplication builds a callable app object and mixes in request and response prototypes.",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
             ),
             (
-                "logerror",
+                "app.handle",
                 "lib/application.js",
                 "app.init = function init() { var router = null; this.defaultConfiguration(); router = new Router({}); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\napp.use = function use(fn) { return router.use(path, fn); }\napp.route = function route(path) { return this.router.route(path); }",
-                "app.use registers middleware on the router.",
+                "The application handler delegates request handling to the router.",
             ),
             (
-                "content-disposition",
+                "app.use",
+                "lib/application.js",
+                "app.init = function init() { var router = null; this.defaultConfiguration(); router = new Router({}); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\napp.use = function use(fn) { return router.use(path, fn); }\napp.route = function route(path) { return this.router.route(path); }",
+                "Middleware registration delegates to the router.",
+            ),
+            (
+                "app.route",
+                "lib/application.js",
+                "app.init = function init() { var router = null; this.defaultConfiguration(); router = new Router({}); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\napp.use = function use(fn) { return router.use(path, fn); }\napp.route = function route(path) { return this.router.route(path); }",
+                "The route registration helper creates route entries through the router.",
+            ),
+            (
+                "res.send",
                 "lib/response.js",
                 "res.send = function send(body) { this.set('Content-Length', len); this.end(chunk, encoding); return this; }",
-                "res.send prepares and sends the response body.",
+                "The response send helper prepares and sends the response body.",
             ),
         ];
 
@@ -15435,26 +9493,42 @@ mod tests {
     }
 
     #[test]
-    fn route_sufficiency_probes_can_be_covered_by_source_claims() {
-        let claims = vec![
-            PacketClaimDto {
-                claim: "app.use registers middleware on the router.".to_string(),
-                citations: Vec::new(),
-            },
-            PacketClaimDto {
-                claim: "app.handle delegates request handling to the router.".to_string(),
-                citations: Vec::new(),
-            },
-            PacketClaimDto {
-                claim: "res.send prepares and sends the response body.".to_string(),
-                citations: Vec::new(),
-            },
+    fn url_session_request_claims_name_lifecycle_without_eval_probes() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
+        let fixtures = [
+            (
+                "Session.request",
+                "Source/Core/Session.swift",
+                "open func request(_ convertible: URLRequestConvertible) -> DataRequest { let request = DataRequest(); performEagerlyIfNecessary(request); return request }",
+                "Session request creation builds request objects and schedules eager execution.",
+            ),
+            (
+                "Request.resume",
+                "Source/Core/Request.swift",
+                "public func resume() -> Self { delegate?.readyToPerform(request: self); task.resume(); return self }",
+                "Request.resume resumes the underlying URLSession task.",
+            ),
+            (
+                "DataRequest.validate",
+                "Source/Core/DataRequest.swift",
+                "public func validate(_ validation: @escaping Validation) -> Self { validators.write { $0.append(validation) }; didValidateRequest(); return self }",
+                "Request validation attaches validation behavior.",
+            ),
+            (
+                "SessionDelegate",
+                "Source/Core/SessionDelegate.swift",
+                "open class SessionDelegate: NSObject, URLSessionDataDelegate { open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) { request.didReceive(data: data) } open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { request.didReceiveResponse(nil) } }",
+                "The URLSession delegate receives callback events.",
+            ),
         ];
 
-        for probe in ["app.use", "app.handle", "res.send"] {
+        for (symbol, path, source, expected) in fixtures {
+            let citation = test_packet_citation(symbol, path, 0.9);
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
             assert!(
-                packet_probe_query_is_claimed(probe, &claims),
-                "expected claim-backed coverage for {probe}: {claims:?}"
+                claims.iter().any(|claim| claim == expected),
+                "expected URLSession request lifecycle claim `{expected}` for {path}; got {claims:?}"
             );
         }
     }
@@ -15549,7 +9623,7 @@ mod tests {
                 "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
                 test_packet_citation("app.use", "lib/application.js", 0.9),
                 "app.use = function use(fn) { return router.use(path, fn); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\n",
-                &["app.use", "app.handle"][..],
+                &["createApplication", "lib/express.js"][..],
             ),
             (
                 "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.",
@@ -15577,7 +9651,7 @@ mod tests {
                 "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.",
                 test_packet_citation("DataRequest.validate", "Source/Core/DataRequest.swift", 0.9),
                 "public func validate(_ validation: @escaping Validation) -> Self { validators.write { $0.append(validation) }; didValidateRequest() }\n",
-                &["DataRequest.validate", "SessionDelegate"][..],
+                &["Alamofire", "Source/Core"][..],
             ),
         ];
 
@@ -15776,7 +9850,10 @@ mod tests {
             retrieval_score_breakdown: None,
         };
 
-        assert_eq!(packet_evidence_role(&citation), Some("command entrypoint"));
+        assert_eq!(
+            packet_evidence_role(&citation),
+            Some(PacketEvidenceRole::CommandEntrypoint)
+        );
         assert_eq!(
             packet_display_path(citation.file_path.as_deref().unwrap()),
             "crates/tool-cli/src/main.rs"
@@ -15784,7 +9861,7 @@ mod tests {
         assert!(
             packet_claim_for_role(
                 "command entrypoint",
-                "command entrypoint",
+                PacketEvidenceRole::CommandEntrypoint,
                 &citation,
                 "Explain the CLI entrypoint."
             )

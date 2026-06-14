@@ -766,8 +766,8 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
             "Covered claims, gaps, and follow-up contract.",
         ),
         SchemaProperty::object(
-            "benchmark_trace",
-            "Benchmark-oriented retrieval trace summary.",
+            "retrieval_trace_summary",
+            "Compact retrieval trace telemetry summary.",
         ),
     ],
     &[
@@ -777,7 +777,7 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
         "answer",
         "budget",
         "sufficiency",
-        "benchmark_trace",
+        "retrieval_trace_summary",
     ],
 );
 

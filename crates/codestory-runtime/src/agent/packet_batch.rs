@@ -55,6 +55,10 @@ impl PacketLatencyBudget {
         self.elapsed_ms() >= self.target_ms
     }
 
+    pub(crate) fn remaining_ms(&self) -> u32 {
+        clamp_u128_to_u32(self.target_ms.saturating_sub(self.elapsed_ms()).max(100))
+    }
+
     pub(crate) fn budget_usage_percent(&self, consumed_trace_ms: u32) -> u128 {
         (consumed_trace_ms as u128)
             .saturating_mul(100)
@@ -137,7 +141,7 @@ pub(crate) fn run_packet_planned_subqueries(
             .map(|(_, query)| (query.query.clone(), per_query_limit))
             .collect::<Vec<_>>();
         let started_at = Instant::now();
-        match controller.search_lexical_hybrid_batch(&batch) {
+        match controller.search_lexical_hybrid_batch(&batch, Some(packet_latency.remaining_ms())) {
             Ok(outcome) => {
                 let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
                 answer.retrieval_trace.total_latency_ms = answer
@@ -183,7 +187,10 @@ pub(crate) fn run_packet_planned_subqueries(
                         })
                         .collect::<Vec<_>>();
                     let retry_started = Instant::now();
-                    match controller.search_semantic_hybrid_batch(&retry_batch) {
+                    match controller.search_semantic_hybrid_batch(
+                        &retry_batch,
+                        Some(packet_latency.remaining_ms()),
+                    ) {
                         Ok(outcome) => {
                             let retry_duration_ms =
                                 clamp_u128_to_u32(retry_started.elapsed().as_millis());
@@ -244,7 +251,9 @@ pub(crate) fn run_packet_planned_subqueries(
                 })
                 .collect::<Vec<_>>();
             let started_at = Instant::now();
-            match controller.search_semantic_hybrid_batch(&batch) {
+            match controller
+                .search_semantic_hybrid_batch(&batch, Some(packet_latency.remaining_ms()))
+            {
                 Ok(outcome) => {
                     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
                     answer.retrieval_trace.total_latency_ms = answer
@@ -377,7 +386,11 @@ pub(crate) fn run_packet_anchor_expansion(
     }
 
     let started_at = Instant::now();
-    let result = controller.search_symbolic_packet_anchor_batch(&queries, per_query_limit);
+    let result = controller.search_symbolic_packet_anchor_batch(
+        &queries,
+        per_query_limit,
+        Some(packet_latency.remaining_ms()),
+    );
     let duration_ms = clamp_u128_to_u32(started_at.elapsed().as_millis());
     answer.retrieval_trace.total_latency_ms = answer
         .retrieval_trace
