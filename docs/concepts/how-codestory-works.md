@@ -1,84 +1,56 @@
 # How CodeStory Works
 
-CodeStory is a local evidence layer for codebases. It does not replace judgment,
-tests, or source reading. It makes the first pass more structured.
+Product framing lives in the [README](../../README.md). This page is the concept
+layer: what gets stored, what the commands mean, and what a good run looks like.
 
-An agent usually fails on a large repo by over-weighting the first few files it
-opens. CodeStory gives that agent an indexed map before it explains behavior or
-plans a change.
+## STAR for one change
 
-## The Loop
+**Situation.** You need to edit behavior that lives somewhere in the graph, not in
+the file you already have open.
 
-See [README — How it works](../README.md#how-it-works) for the indexing → search → trail → answer flow.
+**Task.** Land on the owning symbol, see call paths, read the running code, ship
+the change without a blind file walk.
 
-Readiness lanes (local cache vs sidecars): [usage.md](../usage.md#readiness-tracks).
+**Action.** `index` builds the graph; `search` or `ground` picks a node;
+`trail` / `snippet` / `symbol` inspect it; `context` or `packet` bundles an
+answer. See [README — How it works](../../README.md#how-it-works).
 
-- `doctor` checks whether the cache, index, retrieval mode, and local embedding
-  setup are usable.
-- `index` builds or refreshes local graph, search, snapshot, graph-native
-  symbol-doc, component-report, and selected dense-anchor state for one target
-  repository.
-- `ground` gives broad orientation and reports limited coverage or gaps.
-- `search` finds candidate files, symbols, routes, literals, modules, or behavior
-  terms.
-- `symbol`, `trail`, `snippet`, and `explore` inspect one selected target.
-- `context` bundles deeper evidence around that concrete target.
-- `packet` handles broad task questions and reports citations, gaps, and next
-  commands.
+**Result.** Citations point at paths in the repo. Partial or stale index state
+is reported instead of implied.
 
-The workflow is a repeatable evidence loop.
+Readiness lanes (cache-only vs sidecars): [usage.md](../usage.md#readiness-tracks).
 
-## What Gets Stored
+## What gets stored
 
-CodeStory writes per-project state under the user cache, keyed by the target
-workspace path. The cache can include:
+Per-project SQLite under your user cache, keyed by workspace path:
 
-- discovered files and refresh metadata
-- graph nodes for files, symbols, and related code elements
-- graph edges such as calls, imports, overrides, and references
-- source snippets and occurrence locations
-- search projection rows and local search indexes
-- grounding snapshots rebuilt from the graph
-- graph-native symbol docs, which are deterministic searchable summaries for
-  durable AST symbols
-- selected dense anchors, which are the only generated docs embedded as vectors
-  under the active semantic policy
+| Stored | Purpose |
+| --- | --- |
+| File inventory and refresh metadata | Incremental re-index |
+| Graph nodes and edges | Calls, imports, overrides, references |
+| Snippets and occurrences | Source-backed reads |
+| Search projections and symbol docs | Lookup without opening every file |
+| Snapshots | Cached read models rebuilt from the graph |
+| Dense anchors (when policy selects them) | Sidecar vector search only |
 
-Repository data stays local. Managed setup may fetch tool or model assets, but
-the indexed project evidence lives in the local cache.
+Repo content stays local. Managed setup may fetch tool assets; indexed evidence
+does not leave the cache unless you copy it.
 
-## Key Terms
+## Terms
 
-- Grounding is source-backed context: the files, symbols, and summaries a command
-  returns so an answer can be tied back to repository evidence.
-- A symbol doc is deterministic generated text for a symbol, stored so lexical
-  and graph retrieval can find relevant code even when the query words are not
-  exact.
-- A dense anchor is a policy-selected symbol, component report, or unstructured
-  doc that receives a vector embedding. Code symbols do not need dense vectors
-  to be product-searchable.
-- A snapshot is a cached read model rebuilt from the local graph. If a snapshot
-  is stale, the tool should say so.
-- A trail is a focused graph walk around one symbol: callers, callees,
-  references, or neighborhood context.
-- A packet is a bounded evidence bundle for a broad task. It should include
-  citations, gaps, and follow-up commands.
+| Term | Meaning |
+| --- | --- |
+| Grounding | Context tied back to indexed files and symbols |
+| Symbol doc | Generated searchable text for a symbol (lexical, not embedded by default) |
+| Dense anchor | Policy-selected symbol or report that gets a vector |
+| Snapshot | Derived read model; may be stale — commands should say so |
+| Trail | Graph walk from one symbol: callers, callees, neighbors |
+| Packet | Bounded task evidence with citations, gaps, next commands |
 
-## What Good Looks Like
+Full list: [glossary.md](../glossary.md).
 
-A good CodeStory-backed answer does three things:
+## Where to go next
 
-1. It names the files, symbols, or snippets it used.
-2. It says when evidence is stale, partial, ambiguous, or missing.
-3. It gives the next concrete command when the current evidence is not enough.
-
-The goal is not a more confident answer. The goal is confidence constrained by
-source evidence.
-
-## Where To Go Next
-
-- Use [../usage.md](../usage.md) for command flows.
-- Use [../architecture/overview.md](../architecture/overview.md) for the system
-  boundary and crate model.
-- Use [../contributors/debugging.md](../contributors/debugging.md) when output
-  looks wrong.
+- Operator flows: [usage.md](../usage.md)
+- Crates and boundaries: [architecture/overview.md](../architecture/overview.md)
+- Wrong output: [contributors/debugging.md](../contributors/debugging.md)

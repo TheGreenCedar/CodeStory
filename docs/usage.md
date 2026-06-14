@@ -1,12 +1,10 @@
 # CodeStory Usage
 
-This is the operator guide. It keeps setup, common workflows, retrieval defaults,
-and recovery notes in one place.
+Operator guide: setup, workflows, sidecars, recovery. Start with the
+[README STAR intro](../README.md) if you are new.
 
-Examples use POSIX shell syntax unless a block is labeled PowerShell. On
-Windows, use `.\target\release\codestory-cli.exe` for the release binary,
-`$env:NAME = "value"` for environment variables, and Windows paths when that is
-the workspace you are indexing.
+Examples use POSIX shell unless labeled PowerShell. Windows:
+`.\target\release\codestory-cli.exe`, `$env:NAME = "value"`.
 
 ## Install The Skill
 
@@ -42,8 +40,7 @@ TARGET_WORKSPACE="/path/to/repo"
 
 ## Readiness Tracks
 
-CodeStory has two readiness tracks. Keep them separate when deciding whether an
-agent can rely on packet/search output.
+Two lanes — do not mix them when judging `packet` or `search` output.
 
 | | Local navigation | Agent packet/search |
 | --- | --- | --- |
@@ -51,103 +48,90 @@ agent can rely on packet/search output.
 | Built by | `index` | `index` then `retrieval index` |
 | Requires | Healthy SQLite cache and graph | Sidecars healthy and `retrieval_mode=full` |
 | Commands | `ground`, `symbol`, `trail`, `snippet`, `explore`, `context`, `files`, `affected`, `report` | `packet`, `search` |
-| Does not prove | Sidecar or agent packet/search readiness | That local cache-only navigation is enough |
+| Does not prove | Sidecar readiness | That cache-only browse is enough for agent search |
 
-Architecture and sidecar topology: [architecture/overview.md](../architecture/overview.md),
-[ops/retrieval-sidecars.md](../ops/retrieval-sidecars.md).
-
-### Local navigation/cache readiness
-
-This lane is for local browsing and source navigation. It uses the project
-SQLite cache built by `index` and read by commands such as `ground`, `symbol`,
-`trail`, `snippet`, `explore`, `context`, `files`, and `affected`.
-
-`doctor` may report this lane as `local_navigation`. Local navigation readiness
-means the local cache, graph, lexical index, and DB-backed navigation commands
-are usable. It does not prove agent packet/search readiness.
-
-### Agent packet/search sidecar readiness
-
-This lane is for agent-facing `packet` and `search` evidence. It requires the
-sidecar retrieval stack to be built and healthy: Zoekt lexical shards, Qdrant
-semantic vectors, SCIP graph artifacts, the llama.cpp query embedding endpoint,
-and a current retrieval manifest.
-
-`doctor` may report this lane as `agent_packet_search`. Agent packet/search
-readiness means sidecar packet/search evidence is trustworthy only when
-retrieval status reports `retrieval_mode: "full"`. Missing, stale, stubbed,
-hash-vector, or non-product sidecar state is diagnostic only and must not be
-described as agent packet/search readiness.
+`doctor` reports lane status. Sidecar topology:
+[architecture/overview.md](architecture/overview.md),
+[ops/retrieval-sidecars.md](ops/retrieval-sidecars.md).
 
 ## Common Workflows
 
+Each block is STAR-shaped: situation → commands → what you should have after.
+
 ### I need a repo overview
+
+**Situation.** New workspace for you or the agent.
+
+**Task.** Confirm cache health and get a map before deep reads.
+
+**Action.**
 
 ```sh
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli ground --project <target-workspace> --why
 codestory-cli report --project <target-workspace> --output-file out/codestory-report.md
-codestory-cli report --project <target-workspace> --format json --output-file out/codestory-graph.json
 ```
 
-Use this when the repository is new to the agent. `doctor` tells you whether the
-cache and retrieval state are usable. `ground --why` gives broad orientation and
-reports limited coverage or gaps. `report` reads the current SQLite store
-without refreshing it and emits generated artifacts: Markdown for repo summary,
-hotspots, entry points, bridge/high-connectivity nodes, and next queries; JSON
-for automation that needs the full current graph, including nodes, edges,
-confidence/certainty, source locations, and generation metadata. `--limit`
-bounds the Markdown report sections, not the full JSON graph export. Treat both
-files as outputs to regenerate, not source-of-truth state.
+**Result.** Orientation plus optional Markdown report (hotspots, entry points).
+Report files are generated output — regenerate after index changes.
 
 ### I need evidence for a broad question
+
+**Situation.** Task spans modules ("how does routing work?", "what owns index state?").
+
+**Task.** Collect citations without opening the tree file by file.
+
+**Action.**
 
 ```sh
 codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 ```
 
-Use `packet` for questions like "how does routing work?" or "what owns indexing
-state?" It returns a `sufficient`, `partial`, or `blocked` status with
-citations, trust limits, gaps, and follow-up commands. If the packet is
-`partial` or `blocked`, follow the named source-truth commands instead of
-opening unstructured source files directly. Treat `sufficient` as evidence
-coverage, not final answer-quality proof.
+**Result.** `sufficient`, `partial`, or `blocked` with citations and follow-up
+commands. Requires `retrieval_mode=full`. `sufficient` means evidence coverage,
+not answer-quality proof.
 
 ### I need to understand one symbol or file
 
+**Situation.** You have a name or error pointing at one area of the code.
+
+**Task.** Confirm the symbol, its callers, and the source lines.
+
+**Action.**
+
 ```sh
-codestory-cli search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
-codestory-cli explore --project <target-workspace> --id <node-id> --no-tui
+codestory-cli search --project <target-workspace> --query "<symbol/file/literal>" --why
 codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative
 codestory-cli snippet --project <target-workspace> --id <node-id> --context 40
 ```
 
-Start with `search`, pick a concrete `node-id`, then inspect the relationships
-and source. Use `context` when you want a bundled handoff around that target:
-
-```sh
-codestory-cli context --project <target-workspace> --id <node-id> --bundle out/context-name
-```
-
-Target context is DB-first evidence for one concrete target. `context` is
-target-first; it is not an open chat endpoint and is not a replacement for broad
-`packet`, `search`, or `drill` questions.
+**Result.** A concrete node id, call paths, and source. Use `context` when you
+need a handoff bundle for one target.
 
 ### I changed files and need likely impact
+
+**Situation.** Local edits landed; you need test or symbol blast radius.
+
+**Task.** Map changed paths to indexed symbols and likely tests.
+
+**Action.**
 
 ```sh
 codestory-cli index --project <target-workspace> --refresh incremental
 codestory-cli affected --project <target-workspace> --format markdown
 git diff --name-only HEAD | codestory-cli affected --project <target-workspace> --stdin --format json
-git diff --name-status HEAD | codestory-cli affected --project <target-workspace> --stdin --stdin-format name-status --format json
 ```
 
-Treat `affected` as test-selection evidence, not a replacement for tests. The
-default command preserves git name-status records; path-only stdin remains
-available when another tool already chose the file list.
+**Result.** Impacted symbols and test hints — input for selection, not a substitute for running tests.
 
 ### The cache or local navigation looks stale
+
+**Situation.** Missing symbols, old paths, or `doctor` warnings.
+
+**Task.** Refresh truth before trusting search or trails.
+
+**Action.**
 
 ```sh
 codestory-cli doctor --project <target-workspace>
@@ -155,13 +139,15 @@ codestory-cli index --project <target-workspace> --refresh full
 codestory-cli doctor --project <target-workspace>
 ```
 
-If `doctor` reports stale inventory, dense-anchor contract mismatch, missing
-managed assets, or a non-`full` retrieval mode, fix that layer before
-investigating answer quality. Treat the health report as the first source of
-truth for cache and retrieval state.
+**Result.** Fresh inventory or explicit errors to fix before continuing.
 
-For agent-facing packet/search recovery, use the full sidecar repair sequence
-that `ready --goal agent` reports:
+### For agent-facing packet/search recovery
+
+**Situation.** `packet` or `search` blocked; sidecars or manifest unhealthy.
+
+**Task.** Restore `retrieval_mode=full` without guessing which layer failed.
+
+**Action.**
 
 ```sh
 codestory-cli retrieval bootstrap --project <target-workspace> --format json
@@ -170,12 +156,8 @@ codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace> --format markdown
 ```
 
-When the core index is missing, stale, unchecked, or has recorded fatal indexing
-errors, `ready` reports the necessary `codestory-cli index` repair first.
-Otherwise, sidecar recovery does not need to repeat a full core reindex.
-`retrieval bootstrap` prepares or checks the local sidecar services. The target
-workspace is not packet/search-ready until `retrieval index` writes a current
-target manifest and `doctor` or `retrieval status` reports `retrieval_mode=full`.
+**Result.** Status JSON shows mode and degraded reason. If core index is broken,
+`ready` may require `index` before sidecar repair.
 
 ## Core Commands
 

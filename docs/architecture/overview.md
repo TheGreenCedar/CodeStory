@@ -1,7 +1,16 @@
 # Architecture Overview
 
-CodeStory has one job: turn a repository into local evidence that a coding agent
-can query before relying on a small set of manually opened files.
+**Situation.** You are changing CodeStory, not just running the CLI on a repo.
+
+**Task.** Know which crate owns indexing, storage, retrieval, and CLI output so
+you do not put SQL in the wrong layer.
+
+**Action.** Follow the runtime path and dependency diagram below before editing.
+
+**Result.** Changes land in the owning crate; product behavior stays traceable
+from files and symbols back to the graph and sidecar manifest.
+
+User-facing intro: [README](../../README.md). Operator flows: [usage.md](../usage.md).
 
 The runtime path is:
 

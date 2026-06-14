@@ -1,21 +1,19 @@
 # Retrieval sidecars — Operations runbook
 
-Local Zoekt, Qdrant, and SCIP indexer processes for sidecar packet retrieval. Data directories
-live under the CodeStory user cache; ports are fixed for local dev and CI smoke.
+**Situation.** `packet` or `search` fail closed; `doctor` shows sidecars down or
+`retrieval_mode` not `full`. Local browse commands still work from SQLite alone.
 
-This runbook covers the `agent_packet_search` readiness lane. Sidecar readiness
-is required before agent-facing `packet` and `search` output can be trusted.
-Local SQLite navigation is a separate `local_navigation` lane: `codestory-cli
-index`, `ground`, `symbol`, `trail`, `snippet`, `explore`, `context`, `files`,
-and `affected` can be useful with a healthy local cache, but that cache alone
-does not prove packet/search sidecar readiness.
+**Task.** Run Zoekt, Qdrant, SCIP, and the llama.cpp embed endpoint locally; build
+a current retrieval manifest for the target workspace.
 
-**Design reference:** [`retrieval-design.md`](../architecture/retrieval-design.md)
-(mode definitions, cost envelopes, promotion guards).
+**Action.** Bootstrap services, `retrieval index`, verify with `retrieval status`
+and `doctor`. Commands and pins live in this runbook.
 
-**Operations reference:** this runbook owns setup commands, version pins, env
-vars, troubleshooting, and CI smoke sequences. Proof tiers and promotion
-checklists live in [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
+**Result.** Agent-facing retrieval serves from sidecars with `retrieval_mode=full`.
+Cache-only navigation never implied sidecar readiness.
+
+Design: [`retrieval-design.md`](../architecture/retrieval-design.md).
+Proof tiers: [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
 
 ```mermaid
 flowchart LR

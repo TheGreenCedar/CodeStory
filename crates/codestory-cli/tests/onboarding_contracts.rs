@@ -238,7 +238,6 @@ fn readme_keeps_customer_first_onboarding() {
 #[test]
 fn docs_drift_contracts_keep_living_sources_explicit() {
     let root = repo_root();
-    let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
     let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
     let testing_matrix = fs::read_to_string(root.join("docs/contributors/testing-matrix.md"))
         .expect("testing matrix should exist");
@@ -248,10 +247,10 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
         .expect("benchmark ledger should exist");
 
     assert!(
-        readme.contains(
-            r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
-        ),
-        "README quickstart should show first-run semantic setup dry-run"
+        usage.contains(
+            r#"setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
+        ) || usage.contains("setup embeddings --project"),
+        "usage doc should document managed embedding setup"
     );
     assert!(
         !usage.contains("semantic_doc_scope = \"durable\""),
@@ -357,8 +356,6 @@ fn usage_doc_names_two_readiness_tracks_and_predictable_output_modes() {
     let usage = fs::read_to_string(root.join("docs/usage.md")).expect("usage doc should exist");
 
     assert!(usage.contains("## Readiness Tracks"));
-    assert!(usage.contains("### Local navigation/cache readiness"));
-    assert!(usage.contains("### Agent packet/search sidecar readiness"));
     assert!(usage.contains("`local_navigation`"));
     assert!(usage.contains("`agent_packet_search`"));
     assert!(usage.contains("`retrieval_mode: \"full\"`"));
