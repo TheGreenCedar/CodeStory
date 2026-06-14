@@ -9,9 +9,7 @@ plans a change.
 
 ## The Loop
 
-See [README — How it works](../README.md#how-it-works) for the indexing → search → trail → answer flow.
-
-For the two-lane system map (SQLite cache vs sidecars), see [README — How it fits together](../README.md#how-it-fits-together).
+See [README — How it works](../README.md#how-it-works) for indexing, search, trails, snippets, and the optional embedding lane.
 
 - `doctor` checks whether the cache, index, retrieval mode, and local embedding
   setup are usable.

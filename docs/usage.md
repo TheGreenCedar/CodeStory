@@ -53,7 +53,7 @@ agent can rely on packet/search output.
 | Commands | `ground`, `symbol`, `trail`, `snippet`, `explore`, `context`, `files`, `affected`, `report` | `packet`, `search` |
 | Does not prove | Sidecar or agent packet/search readiness | That local cache-only navigation is enough |
 
-System map: [README — How it fits together](../README.md#how-it-fits-together).
+See [README — How it works](../README.md#how-it-works) for indexing, trails, snippets, and embeddings.
 
 ### Local navigation/cache readiness
 
