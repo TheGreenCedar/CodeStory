@@ -10,32 +10,23 @@ Local codebase grounding for coding agents.
 <a href="docs/testing/benchmark-ledger.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
-CodeStory indexes a git workspace into a local SQLite graph: files, symbols, call
-and import edges, and source snippets. You query that graph through a CLI (or
-`serve --stdio`) instead of having an agent grep the tree blind.
+**Situation.** You are in a repo with more files than anyone holds in memory. The
+agent (or you) needs to change behavior that spans packages — routing, indexing,
+auth, whatever — not rename a variable in the one file already open.
 
-Everything stays on disk under your user cache unless you opt into managed
-embedding assets. Packet and full search need local sidecars (Zoekt, Qdrant,
-SCIP, llama.cpp); browsing with `ground`, `trail`, and `snippet` does not.
+**Task.** Find the symbol that owns the behavior, see who calls it, read the
+source that actually runs, and know what to touch next. Without treating
+`grep -R` as architecture.
 
-## How it works
+**Action.** CodeStory indexes the workspace into a local SQLite graph — symbols,
+calls, imports, snippets — and exposes it through a CLI. `index` once;
+`search` or `ground` to land somewhere; `trail` and `snippet` to follow it;
+`context` or `packet` when you need a bundle. Sidecars (Zoekt, Qdrant, SCIP)
+are for full `packet`/`search`; local browsing does not require them.
 
-Run `index` once per repo. The indexer parses supported languages with
-tree-sitter, resolves what it can, and writes nodes, edges, occurrences, and
-symbol search docs into a per-project database.
-
-From there:
-
-- `ground` — repo summary and gaps
-- `search` — candidates by symbol name, path, literal, or behavior term
-- `trail` — callers, callees, references for one node id
-- `snippet` — source lines around a node
-- `context` — bundled evidence for one target
-- `packet` — wide task question with citations (requires `retrieval_mode=full`)
-
-Vectors are not built for every symbol. The graph and lexical symbol docs handle
-most lookup. Run `retrieval index` when you want sidecar-backed `packet`/`search`;
-that pass embeds a policy-selected set of anchors only.
+**Result.** Work starts at a file and line you can open, not at whichever match
+ranked first in ripgrep. Answers say what they used; gaps say when the index is
+stale or incomplete.
 
 ```mermaid
 flowchart LR
@@ -48,8 +39,26 @@ flowchart LR
     side --> out
 ```
 
-Operator detail: [docs/usage.md](docs/usage.md). Sidecar setup:
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
+## How it works
+
+The indexer uses tree-sitter on supported languages, writes nodes, edges,
+occurrences, and symbol search docs to a per-project cache under your user
+directory. Incremental refresh picks up edits without a full rebuild every time.
+
+| Command | What you get |
+| --- | --- |
+| `ground` | Repo summary and coverage gaps |
+| `search` | Ranked symbols, paths, literals |
+| `trail` | Callers, callees, references for one node id |
+| `snippet` | Source lines around a node |
+| `context` | Bundled evidence for one target |
+| `packet` | Task-sized citations (`retrieval_mode=full`) |
+
+Most lookup is graph + lexical symbol docs. `retrieval index` embeds a
+policy-selected subset of anchors when you need sidecar search — not every
+symbol gets a vector.
+
+[docs/usage.md](docs/usage.md) · [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md)
 
 ## Try it
 

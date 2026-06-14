@@ -166,6 +166,10 @@ fn readme_keeps_customer_first_onboarding() {
     let root = repo_root();
     let readme = fs::read_to_string(root.join("README.md")).expect("README should exist");
     assert!(readme.contains("How it works"));
+    assert!(readme.contains("**Situation.**"));
+    assert!(readme.contains("**Task.**"));
+    assert!(readme.contains("**Action.**"));
+    assert!(readme.contains("**Result.**"));
     assert!(readme.contains("Try it"));
     assert!(readme.contains("Local codebase grounding for coding agents"));
     assert!(readme.contains("Install as an agent skill"));
