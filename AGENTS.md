@@ -16,6 +16,7 @@
 - Backend build/test: `cargo build`, `cargo test`, `cargo check`, `cargo fmt`, `cargo clippy`.
 - CLI runtime: `cargo run --release -p codestory-cli -- index --project .`.
 - Skill-first grounding: `cargo run --release -p codestory-cli -- ground --project .`.
+- Release version checks: `python .github/scripts/check-codestory-release.py --version <version>` and `node .github/scripts/check-workflow-policy.mjs`.
 - On Windows, the Codex npm shim should be invoked as `codex.cmd` (typically under `%APPDATA%\\npm`); using the extensionless `codex` shim can fail with `os error 193`.
 - In this PowerShell environment, large parallel file reads can truncate output; when investigating a single large file, prefer one direct read command (for example `Get-Content` or `cmd /c type`) before parallelizing.
 
@@ -38,6 +39,12 @@
 ## Commit & Pull Request Guidelines
 - Commit messages are short, lowercase, imperative (e.g., `fix minimap`, `refactor graph style`).
 - PRs should include a summary, tests run, linked issues, and relevant artifacts for behavior changes.
+
+## Release Guidelines
+- `crates/codestory-cli/Cargo.toml` is the release version source.
+- Update every `codestory-*` workspace crate version and `Cargo.lock` together.
+- Do not create or push `v*` release tags manually. A synchronized version bump on `main` triggers GitHub Actions to create the tag, GitHub release, cross-platform `codestory-cli` binary assets, and `SHA256SUMS.txt`.
+- CI binary assets prove build/package smoke only. Packet/search readiness still requires the sidecar evidence tiers in `docs/contributors/testing-matrix.md`.
 
 ## Retrieval documentation
 - Canonical sidecar retrieval docs are `docs/architecture/retrieval-design.md`, `docs/testing/retrieval-architecture.md`, and `docs/ops/retrieval-sidecars.md`. Parser compatibility records live in `docs/architecture/language-support.md`.

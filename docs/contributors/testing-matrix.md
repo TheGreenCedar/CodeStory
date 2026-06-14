@@ -35,6 +35,25 @@ cargo clippy --all-targets -- -D warnings
 
 These are the default checks for any contributor change.
 
+## Release And Version Bumps
+
+`crates/codestory-cli/Cargo.toml` is the release version source. When bumping a
+release version, update every `codestory-*` workspace crate version and
+`Cargo.lock` in the same change.
+
+```sh
+node .github/scripts/check-workflow-policy.mjs
+python .github/scripts/check-codestory-release.py --version <version>
+```
+
+Do not create or push `v*` tags manually. A synchronized version bump merged to
+`main` runs the auto-release workflow, which creates the GitHub tag, release,
+cross-platform `codestory-cli` archives, and `SHA256SUMS.txt`.
+
+Binary release assets are packaging evidence only. They are not packet/search
+readiness proof; keep using the sidecar evidence tiers below before claiming
+agent-facing packet/search readiness.
+
 ## Docs-Only Fast Path
 
 If you only changed `README.md` or `docs/**`, use the smallest credible lane:

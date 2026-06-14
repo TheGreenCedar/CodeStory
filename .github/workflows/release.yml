@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  workflow-policy:
+    name: Workflow policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce third-party action pinning
+        run: node .github/scripts/check-workflow-policy.mjs
+
+  preflight:
+    name: Release preflight
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse non-main release
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            echo "::error::Run releases from main, not $GITHUB_REF_NAME."
+            exit 1
+          fi
+
+      - name: Verify release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          python .github/scripts/check-codestory-release.py --version "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse existing tag or release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists. Do not push release tags manually."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset_target }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            asset_target: linux-x64
+            exe_suffix: ""
+          - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            asset_target: windows-x64
+            exe_suffix: ".exe"
+          - os: macos-latest
+            rust_target: x86_64-apple-darwin
+            asset_target: macos-x64
+            exe_suffix: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.rust_target }}"
+
+      - name: Build codestory-cli
+        shell: pwsh
+        run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
+
+      - name: Smoke codestory-cli
+        shell: pwsh
+        run: |
+          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
+          & $bin --version
+          & $bin --help
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
+          python .github/scripts/package-codestory-release.py `
+            --version "${{ needs.preflight.outputs.version }}" `
+            --target "${{ matrix.asset_target }}" `
+            --binary $bin `
+            --out-dir target/release-dist
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: codestory-cli-${{ matrix.asset_target }}
+          path: |
+            target/release-dist/*.tar.gz
+            target/release-dist/*.zip
+            target/release-dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - preflight
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: target/release-assets
+          pattern: codestory-cli-*
+          merge-multiple: true
+
+      - name: Combine and verify checksums
+        run: |
+          set -euo pipefail
+          find target/release-assets -name '*.sha256' -print0 | sort -z | xargs -0 cat > target/release-assets/SHA256SUMS.txt
+          test -s target/release-assets/SHA256SUMS.txt
+          (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
+
+      - name: Refuse existing tag or release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists. Do not push release tags manually."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists."
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(
+            target/release-assets/codestory-cli-v${VERSION}-*.tar.gz
+            target/release-assets/codestory-cli-v${VERSION}-*.zip
+            target/release-assets/SHA256SUMS.txt
+          )
+          if [ "${#assets[@]}" -ne 4 ]; then
+            echo "::error::Expected three binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
+            printf '%s\n' "${assets[@]}"
+            exit 1
+          fi
+          gh release create "$TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "CodeStory $TAG" \
+            --generate-notes
