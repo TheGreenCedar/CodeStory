@@ -9,7 +9,9 @@ plans a change.
 
 ## The Loop
 
-See [README — How it works](../README.md#how-it-works) for indexing, search, trails, snippets, and the optional embedding lane.
+```text
+doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
+```
 
 - `doctor` checks whether the cache, index, retrieval mode, and local embedding
   setup are usable.
