@@ -24,6 +24,52 @@ papered over.
 
 Your code stays on your machine. The index lives in a local cache you control.
 
+## How it works
+
+CodeStory is a loop, not a one-shot search. You prepare a local map of the repo,
+find a starting point, follow the graph to the code that matters, then answer
+with evidence attached.
+
+```mermaid
+flowchart TB
+    doctor[doctor — is the cache ready?]
+    index[index — walk the repo and build a symbol graph]
+    orient[ground or search — find a file, symbol, or behavior]
+    inspect["trail · snippet · symbol — inspect one target"]
+    answer["context or packet — answer with citations"]
+
+    doctor --> index
+    index --> orient
+    orient --> inspect
+    inspect --> answer
+
+    index --> embedPath["retrieval index — optional sidecar pass"]
+    embedPath --> embed["embed selected anchors locally"]
+    embed -.->|"unlocks agent-grade search"| orient
+```
+
+**Index.** CodeStory discovers files, parses symbols and relationships, and
+writes a per-project graph — calls, imports, snippets, searchable symbol docs —
+into a local SQLite cache. Run `index` once per repo (then incrementally after
+changes).
+
+**Embed.** Most navigation uses the graph and lexical search alone. When you
+want broad agent `packet` and `search`, a second pass builds sidecar indexes and
+embeds a policy-selected set of anchors (entry points, public APIs, central
+nodes) — not every symbol needs a vector.
+
+**Search.** `ground` orients you on a new repo; `search` finds candidates —
+symbols, files, routes, literals. Pick a concrete target before going deeper.
+
+**Trail.** `trail` walks callers, callees, and references around one symbol so
+you can see how code flows without opening half the tree by hand.
+
+**Snippet and context.** `snippet` pulls source around a hit; `context` bundles
+trails, neighbors, and citations for one target. `packet` handles broad task
+questions when sidecars report `retrieval_mode=full`.
+
+Details: [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md).
+
 ## How it fits together
 
 ```mermaid

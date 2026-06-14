@@ -9,7 +9,7 @@ plans a change.
 
 ## The Loop
 
-`doctor` → `index` → `ground` or `search` → inspect with `symbol` / `trail` / `snippet` / `explore` → `context` or `packet`.
+See [README — How it works](../README.md#how-it-works) for the indexing → search → trail → answer flow.
 
 For the two-lane system map (SQLite cache vs sidecars), see [README — How it fits together](../README.md#how-it-fits-together).
 
