@@ -1516,68 +1516,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             manifest_input_hash: manifest_input_hash.as_deref(),
         }),
     });
-    let recommended_next_calls = if sidecar_mode == "full" {
-        serde_json::json!([
-            {
-                "method": "resources/read",
-                "uri": "codestory://agent-guide"
-            },
-            {
-                "method": "tools/call",
-                "tool": "packet",
-                "arguments": {
-                    "question": "<broad-task-question>",
-                    "budget": "compact"
-                }
-            },
-            {
-                "method": "tools/call",
-                "tool": "search",
-                "arguments": {
-                    "query": "<symbol-or-concept>",
-                    "limit": 10
-                }
-            },
-            {
-                "method": "tools/call",
-                "tool": "definition",
-                "arguments": {
-                    "id": "<node_id-from-search>"
-                }
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://trail/<node_id-from-search>"
-            }
-        ])
-    } else {
-        let commands = readiness
-            .iter()
-            .find(|verdict| crate::readiness::goal_label(verdict.goal) == "agent_packet_search")
-            .map(|verdict| verdict.full_repair.as_slice())
-            .unwrap_or_default();
-        serde_json::Value::Array(
-            commands
-                .iter()
-                .map(|command| {
-                    serde_json::json!({
-                        "method": "cli",
-                        "command": command
-                    })
-                })
-                .chain([
-                    serde_json::json!({
-                        "method": "resources/read",
-                        "uri": "codestory://status"
-                    }),
-                    serde_json::json!({
-                        "method": "resources/read",
-                        "uri": "codestory://agent-guide"
-                    }),
-                ])
-                .collect(),
-        )
-    };
+    let recommended_next_calls = stdio_status_recommended_next_calls(&readiness);
     Ok(serde_json::json!({
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
@@ -1597,6 +1536,69 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "readiness": readiness,
         "recommended_next_calls": recommended_next_calls
     }))
+}
+
+fn stdio_status_recommended_next_calls(
+    readiness: &[codestory_contracts::api::ReadinessVerdictDto],
+) -> serde_json::Value {
+    if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
+        return serde_json::Value::Array(
+            non_ready
+                .full_repair
+                .iter()
+                .map(|command| {
+                    serde_json::json!({
+                        "method": "cli",
+                        "command": command
+                    })
+                })
+                .chain([
+                    serde_json::json!({
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }),
+                    serde_json::json!({
+                        "method": "resources/read",
+                        "uri": "codestory://agent-guide"
+                    }),
+                ])
+                .collect(),
+        );
+    }
+
+    serde_json::json!([
+        {
+            "method": "resources/read",
+            "uri": "codestory://agent-guide"
+        },
+        {
+            "method": "tools/call",
+            "tool": "packet",
+            "arguments": {
+                "question": "<broad-task-question>",
+                "budget": "compact"
+            }
+        },
+        {
+            "method": "tools/call",
+            "tool": "search",
+            "arguments": {
+                "query": "<symbol-or-concept>",
+                "limit": 10
+            }
+        },
+        {
+            "method": "tools/call",
+            "tool": "definition",
+            "arguments": {
+                "id": "<node_id-from-search>"
+            }
+        },
+        {
+            "method": "resources/read",
+            "uri": "codestory://trail/<node_id-from-search>"
+        }
+    ])
 }
 
 fn read_stdio_agent_guide_resource() -> serde_json::Value {

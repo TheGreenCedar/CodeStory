@@ -7,7 +7,7 @@
   "repo": {
     "name": "flask",
     "url": "https://github.com/pallets/flask.git",
-    "ref": "3.1.1",
+    "ref": "7fff56f5172c48b6f3aedf17ee14ef5c2533dfd1",
     "workspace_root": ".",
     "languages": [
       "Python"

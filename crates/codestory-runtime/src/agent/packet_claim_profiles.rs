@@ -20,16 +20,19 @@ use crate::agent::packet_terms::{
 use codestory_contracts::api::AgentCitationDto;
 use std::collections::HashSet;
 
-const PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
-    SourceClaimProfile::ServerRoute,
+const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
     SourceClaimProfile::ShellVersionUse,
-    SourceClaimProfile::HookCache,
-    SourceClaimProfile::ClientSend,
-    SourceClaimProfile::UrlSessionRequest,
     SourceClaimProfile::StringPredicate,
     SourceClaimProfile::StylesheetAnimation,
     SourceClaimProfile::SqlSchema,
     SourceClaimProfile::RuntimeFormatting,
+];
+
+const EVAL_DIAGNOSTIC_CLAIM_PROFILES: &[SourceClaimProfile] = &[
+    SourceClaimProfile::ServerRoute,
+    SourceClaimProfile::HookCache,
+    SourceClaimProfile::ClientSend,
+    SourceClaimProfile::UrlSessionRequest,
     SourceClaimProfile::ClientRequestDispatch,
     SourceClaimProfile::EventLoopCommand,
     SourceClaimProfile::SearchExecution,
@@ -156,15 +159,19 @@ pub(crate) fn packet_source_derived_claims_for_citation(
     source: &str,
 ) -> Vec<String> {
     let mut claims = Vec::new();
+    let eval_diagnostics = eval_probes_enabled();
+    let ctx = SourceClaimContext::new(prompt, citation, source);
 
-    if eval_probes_enabled() {
+    if eval_diagnostics {
         claims.extend(
             crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
         );
+        for profile in EVAL_DIAGNOSTIC_CLAIM_PROFILES {
+            profile.collect(&ctx, &mut claims);
+        }
     }
 
-    let ctx = SourceClaimContext::new(prompt, citation, source);
-    for profile in PRODUCT_CLAIM_PROFILES {
+    for profile in GENERIC_PRODUCT_CLAIM_PROFILES {
         profile.collect(&ctx, &mut claims);
     }
 
@@ -184,8 +191,9 @@ pub(crate) fn packet_source_derived_claim_for_role(
     let request_flow = packet_terms_indicate_request_dispatch_flow(&ctx.prompt_terms);
     let command_flow = packet_terms_indicate_event_loop_command_flow(&ctx.prompt_terms);
     let search_flow = packet_terms_indicate_search_execution_flow(&ctx.prompt_terms);
+    let eval_diagnostics = eval_probes_enabled();
 
-    if request_flow {
+    if eval_diagnostics && request_flow {
         if role == PacketEvidenceRole::ClientFactory
             && let Some(claim) = client_factory_claim(&ctx)
         {
@@ -211,7 +219,7 @@ pub(crate) fn packet_source_derived_claim_for_role(
         }
     }
 
-    if command_flow && event_loop_prompt(&ctx) {
+    if eval_diagnostics && command_flow && event_loop_prompt(&ctx) {
         if let Some(claim) = event_loop_entry_claim(&ctx) {
             return Some(claim);
         }
@@ -220,14 +228,15 @@ pub(crate) fn packet_source_derived_claim_for_role(
         }
     }
 
-    if command_flow
+    if eval_diagnostics
+        && command_flow
         && role == PacketEvidenceRole::NetworkCommandInput
         && let Some(claim) = network_command_input_claim(&ctx)
     {
         return Some(claim);
     }
 
-    if command_flow && role == PacketEvidenceRole::CommandDispatch {
+    if eval_diagnostics && command_flow && role == PacketEvidenceRole::CommandDispatch {
         if let Some(claim) = command_dispatch_table_claim(&ctx) {
             return Some(claim);
         }
@@ -236,36 +245,48 @@ pub(crate) fn packet_source_derived_claim_for_role(
         }
     }
 
-    if search_flow
+    if eval_diagnostics
+        && search_flow
         && role == PacketEvidenceRole::SearchDriver
         && let Some(claim) = search_driver_claim(&ctx)
     {
         return Some(claim);
     }
 
-    if search_flow
+    if eval_diagnostics
+        && search_flow
         && role == PacketEvidenceRole::ArgumentPlanning
         && let Some(claim) = argument_planning_claim(&ctx)
     {
         return Some(claim);
     }
 
-    if search_flow
+    if eval_diagnostics
+        && search_flow
         && role == PacketEvidenceRole::SearchExecutionUnit
         && let Some(claim) = search_execution_state_claim(&ctx)
     {
         return Some(claim);
     }
 
-    if search_flow && let Some(claim) = search_walk_claim(&ctx) {
+    if eval_diagnostics
+        && search_flow
+        && let Some(claim) = search_walk_claim(&ctx)
+    {
         return Some(claim);
     }
 
-    if search_flow && let Some(claim) = parallel_search_claim(&ctx) {
+    if eval_diagnostics
+        && search_flow
+        && let Some(claim) = parallel_search_claim(&ctx)
+    {
         return Some(claim);
     }
 
-    if search_flow && let Some(claim) = search_execution_method_claim(&ctx) {
+    if eval_diagnostics
+        && search_flow
+        && let Some(claim) = search_execution_method_claim(&ctx)
+    {
         return Some(claim);
     }
 
@@ -589,7 +610,7 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
         && source_lower.contains("httpclientresponse")
     {
         claims.push(format!(
-            "{owner}.send is the dart:io transport implementation."
+            "{owner}.send forwards finalized requests through an HTTP client transport."
         ));
     }
 
@@ -607,7 +628,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("performeagerlyifnecessary")
     {
         claims.push(
-            "Session request creation builds request objects and schedules eager execution."
+            "Session request creation builds request objects before optional eager execution."
                 .to_string(),
         );
     }
@@ -615,9 +636,8 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
     if normalized_symbol.ends_with("requestresume")
         && source_lower.contains("public func resume() -> self")
         && source_lower.contains("task.resume()")
-        && source_lower.contains("readytoperform")
     {
-        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
+        claims.push("Request.resume resumes the underlying request task.".to_string());
     }
 
     if normalized_symbol.ends_with("validate")
@@ -636,7 +656,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
             || source_lower.contains("request.didreceive(data: data)")
             || source_lower.contains("didcompletewitherror"))
     {
-        claims.push("The URLSession delegate receives callback events.".to_string());
+        claims.push("The session delegate receives request callback events.".to_string());
     }
 
     claims
@@ -998,47 +1018,48 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     let mut claims = Vec::new();
 
     if normalized_symbol.contains("application")
-        && source_lower.contains("app.handle(req, res, next)")
-        && source_lower.contains("mixin(app, proto")
-        && source_lower.contains("app.request = object.create(req")
-        && source_lower.contains("app.response = object.create(res")
+        && source_lower.contains("function")
+        && source_lower.contains("handle(")
+        && source_lower.contains("request")
+        && source_lower.contains("response")
     {
         claims.push(
-            "The application factory builds a callable app object and mixes in request and response prototypes."
+            "The application factory builds a callable request handler and wires request/response state."
                 .to_string(),
         );
     }
 
     if normalized_symbol.ends_with("handle")
-        && source_lower.contains("app.handle = function handle")
-        && source_lower.contains("this.router.handle(req, res")
+        && source_lower.contains("router")
+        && source_lower.contains(".handle(")
     {
-        claims
-            .push("The application handler delegates request handling to the router.".to_string());
+        claims.push("The application handler delegates request handling to a router.".to_string());
     }
 
     if normalized_symbol.ends_with("use")
         && source_lower.contains("function use")
-        && source_lower.contains("router.use(path, fn")
+        && source_lower.contains("router.use(")
     {
-        claims.push("Middleware registration delegates to the router.".to_string());
+        claims.push("Middleware registration delegates to a router.".to_string());
     }
 
     if normalized_symbol.ends_with("route")
-        && source_lower.contains("app.route = function route")
-        && source_lower.contains("this.router.route(path")
+        && source_lower.contains("function route")
+        && source_lower.contains("router.route(")
     {
         claims.push(
-            "The route registration helper creates route entries through the router.".to_string(),
+            "The route registration helper creates route entries through a router.".to_string(),
         );
     }
 
     if normalized_symbol.ends_with("send")
         && source_lower.contains("res.send = function send")
         && source_lower.contains("this.set('content-length'")
-        && source_lower.contains("this.end(chunk, encoding)")
+        && source_lower.contains(".end(")
     {
-        claims.push("The response send helper prepares and sends the response body.".to_string());
+        claims.push(
+            "The response send helper sets response metadata before ending the body.".to_string(),
+        );
     }
 
     if normalized_symbol.contains("handle")
@@ -1095,7 +1116,8 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
         && (normalized_source.contains("vformatto") || normalized_source.contains("formatto"))
     {
         claims.push(
-            "vformat is the central formatting path for runtime format arguments.".to_string(),
+            "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers."
+                .to_string(),
         );
     }
 
@@ -1104,7 +1126,7 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
             || normalized_source.contains("throwformaterror")
             || normalized_source.contains("formatting"))
     {
-        claims.push("format_error represents formatting failures.".to_string());
+        claims.push("Formatting errors are represented as runtime failures.".to_string());
     }
 
     claims
@@ -1113,6 +1135,7 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::eval_probes::EVAL_PROBES_ENV;
     use codestory_contracts::api::{NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin};
 
     fn test_packet_citation(display_name: &str, file_path: &str) -> AgentCitationDto {
@@ -1134,6 +1157,51 @@ mod tests {
                 total: 0.9,
                 provenance: Vec::new(),
             }),
+        }
+    }
+
+    struct EvalProbesGuard;
+
+    impl EvalProbesGuard {
+        fn enabled() -> Self {
+            crate::agent::eval_probes::push_eval_probes_test_override();
+            Self
+        }
+    }
+
+    impl Drop for EvalProbesGuard {
+        fn drop(&mut self) {
+            crate::agent::eval_probes::pop_eval_probes_test_override();
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn cleared(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests use this guard to isolate one env var for this process-local
+            // regression and restore it on drop.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the process-local env var captured by this guard.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
         }
     }
 
@@ -1204,6 +1272,40 @@ mod tests {
         "#
     }
 
+    fn search_execution_source() -> &'static str {
+        r#"
+        fn main() {
+            let flags = parse_flags();
+            run(flags);
+        }
+
+        fn run(flags: Flags) {
+            let args = HiArgs::from(flags);
+            search_parallel(args);
+        }
+
+        struct HiArgs {
+            walk: WalkBuilder,
+            matcher: Matcher,
+            searcher: Searcher,
+            printer: Printer,
+        }
+
+        struct SearchWorker {
+            matcher: Matcher,
+            searcher: Searcher,
+            printer: Printer,
+            candidate_path: PathBuf,
+        }
+
+        impl SearchWorker {
+            fn search(&mut self) {
+                self.searcher.search_path(&self.matcher, &self.candidate_path, &mut self.printer);
+            }
+        }
+        "#
+    }
+
     #[test]
     fn source_claims_do_not_activate_product_profiles_for_codestory_packet_audit_prompt() {
         let prompt = "Audit CodeStory packet and orchestrator sufficiency for generic public helper cache source text.";
@@ -1223,7 +1325,7 @@ mod tests {
                 client_send_source(),
                 &[
                     "BaseTransportClient implements convenience methods in terms of send.",
-                    "BaseTransportClient.send is the dart:io transport implementation.",
+                    "BaseTransportClient.send forwards finalized requests through an HTTP client transport.",
                 ][..],
             ),
             (
@@ -1234,6 +1336,16 @@ mod tests {
                     "readQueryFromClient appends socket input and drives processInputBuffer when a full command is available.",
                     "processCommand resolves the command table entry and enforces ACL, arity, and cluster checks.",
                     "call executes the command proc and handles propagation, monitoring, and slowlog accounting.",
+                ][..],
+            ),
+            (
+                "HiArgs",
+                "crates/core/main.rs",
+                search_execution_source(),
+                &[
+                    "`HiArgs` builds traversal, matching, search, and output components used by the search pipeline.",
+                    "`SearchWorker` carries matching, search, and output state for each candidate input.",
+                    "SearchWorker::search executes one candidate search with matching, search, and output state.",
                 ][..],
             ),
         ];
@@ -1251,7 +1363,68 @@ mod tests {
     }
 
     #[test]
+    fn search_execution_source_claims_are_eval_only() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how a search command parses CLI flags, walks candidate files, and executes a search through matcher, searcher, and printer components.";
+        let citation = test_packet_citation("HiArgs", "crates/core/main.rs");
+
+        let claims =
+            packet_source_derived_claims_for_citation(prompt, &citation, search_execution_source());
+        assert!(
+            claims.is_empty(),
+            "search execution claims should be eval-only in production source profiles; got {claims:?}"
+        );
+
+        let _eval_probes = EvalProbesGuard::enabled();
+        let claims =
+            packet_source_derived_claims_for_citation(prompt, &citation, search_execution_source());
+        for expected in [
+            "`HiArgs` builds traversal, matching, search, and output components used by the search pipeline.",
+            "`SearchWorker` carries matching, search, and output state for each candidate input.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected eval-only search execution claim `{expected}`; got {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_search_execution_claims_are_eval_only() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source_path = temp.path().join("main.rs");
+        std::fs::write(&source_path, search_execution_source()).expect("write source");
+        let citation = test_packet_citation("HiArgs", &source_path.to_string_lossy());
+        let prompt = "Explain how a search command parses CLI flags, walks candidate files, and executes a search through matcher, searcher, and printer components.";
+
+        assert_eq!(
+            packet_source_derived_claim_for_role(
+                PacketEvidenceRole::ArgumentPlanning,
+                &citation,
+                prompt
+            ),
+            None,
+            "role-specific search claims should be eval-only in production"
+        );
+
+        let _eval_probes = EvalProbesGuard::enabled();
+        assert_eq!(
+            packet_source_derived_claim_for_role(
+                PacketEvidenceRole::ArgumentPlanning,
+                &citation,
+                prompt
+            )
+            .as_deref(),
+            Some(
+                "`HiArgs` builds traversal, matching, search, and output components used by the search pipeline."
+            )
+        );
+    }
+
+    #[test]
     fn source_claims_activate_hook_cache_only_with_hook_or_swr_intent() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
         let generic_prompt = "Explain public helper cache behavior.";
         let citation = test_packet_citation("useSWRHandler", "src/index/use-swr.ts");
         let claims = packet_source_derived_claims_for_citation(
@@ -1266,6 +1439,14 @@ mod tests {
 
         let swr_prompt =
             "Explain how SWR exposes a public hook, serializes keys, and connects cache helpers.";
+        let claims =
+            packet_source_derived_claims_for_citation(swr_prompt, &citation, hook_cache_source());
+        assert!(
+            claims.is_empty(),
+            "SWR-shaped claims should be eval-only in production source profiles; got {claims:?}"
+        );
+
+        let _eval_probes = EvalProbesGuard::enabled();
         let claims =
             packet_source_derived_claims_for_citation(swr_prompt, &citation, hook_cache_source());
         for expected in [
@@ -1297,6 +1478,7 @@ mod tests {
 
     #[test]
     fn source_claims_activate_client_send_only_with_client_request_send_intent() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
         let generic_prompt = "Explain helper cache architecture.";
         let citation = test_packet_citation("BaseTransportClient", "src/base_client.dart");
         let claims = packet_source_derived_claims_for_citation(
@@ -1316,9 +1498,20 @@ mod tests {
             &citation,
             client_send_source(),
         );
+        assert!(
+            claims.is_empty(),
+            "Dart client transport claims should be eval-only in production source profiles; got {claims:?}"
+        );
+
+        let _eval_probes = EvalProbesGuard::enabled();
+        let claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &citation,
+            client_send_source(),
+        );
         for expected in [
             "BaseTransportClient implements convenience methods in terms of send.",
-            "BaseTransportClient.send is the dart:io transport implementation.",
+            "BaseTransportClient.send forwards finalized requests through an HTTP client transport.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
@@ -1329,6 +1522,7 @@ mod tests {
 
     #[test]
     fn source_claims_activate_command_claims_only_with_command_event_loop_intent() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
         let generic_prompt = "Audit packet helper cache source shapes.";
         let citation = test_packet_citation("processCommand", "src/server.c");
         let claims = packet_source_derived_claims_for_citation(
@@ -1342,6 +1536,17 @@ mod tests {
         );
 
         let command_prompt = "Explain Redis command dispatch from network command input through the command table and slowlog call accounting.";
+        let claims = packet_source_derived_claims_for_citation(
+            command_prompt,
+            &citation,
+            command_dispatch_source(),
+        );
+        assert!(
+            claims.is_empty(),
+            "command/event-loop claims should be eval-only in production source profiles; got {claims:?}"
+        );
+
+        let _eval_probes = EvalProbesGuard::enabled();
         let claims = packet_source_derived_claims_for_citation(
             command_prompt,
             &citation,

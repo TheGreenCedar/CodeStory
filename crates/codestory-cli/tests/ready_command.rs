@@ -60,6 +60,16 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert!(markdown.contains("agent_packet_search"));
     assert!(markdown.contains("minimum_next:"));
     assert!(markdown.contains("full_repair:"));
+    assert!(markdown.contains("--refresh full"));
+    assert!(markdown.contains("codestory-cli retrieval bootstrap --project"));
+    assert!(markdown.contains("codestory-cli retrieval index --project"));
+    assert!(markdown.contains("codestory-cli retrieval status --project"));
+    assert!(markdown.contains("codestory-cli doctor --project"));
+    assert!(markdown.contains("--format markdown"));
+    assert!(
+        !markdown.contains("codestory-cli index --project"),
+        "fresh-index agent readiness should not recommend a full core reindex: {markdown}"
+    );
 }
 
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {

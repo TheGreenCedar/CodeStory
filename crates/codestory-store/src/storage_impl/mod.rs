@@ -463,6 +463,7 @@ pub struct StorageStats {
     pub edge_count: i64,
     pub file_count: i64,
     pub error_count: i64,
+    pub fatal_error_count: i64,
 }
 
 fn is_framework_synthetic_node(node: &Node) -> bool {
@@ -4923,6 +4924,7 @@ impl Storage {
     }
 
     pub fn get_stats(&self) -> Result<StorageStats, StorageError> {
+        let fatal_error_count = self.fatal_error_count()?;
         if self.has_ready_grounding_summary_snapshots()? {
             let mut stmt = self.conn.prepare(
                 "SELECT node_count, edge_count, file_count, error_count
@@ -4936,6 +4938,7 @@ impl Storage {
                     edge_count: row.get(1)?,
                     file_count: row.get(2)?,
                     error_count: row.get(3)?,
+                    fatal_error_count,
                 });
             }
         }
@@ -4956,7 +4959,16 @@ impl Storage {
             edge_count,
             file_count,
             error_count,
+            fatal_error_count,
         })
+    }
+
+    fn fatal_error_count(&self) -> Result<i64, StorageError> {
+        self.conn
+            .query_row("SELECT count(*) FROM error WHERE fatal = 1", [], |r| {
+                r.get(0)
+            })
+            .map_err(StorageError::from)
     }
 
     /// Delete all graph/search projection data linked to one canonical file node.

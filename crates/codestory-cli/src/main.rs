@@ -9959,6 +9959,7 @@ mod tests {
                 edge_count: 0,
                 file_count,
                 error_count: 0,
+                fatal_error_count: 0,
             },
             members: Vec::new(),
             retrieval: None,

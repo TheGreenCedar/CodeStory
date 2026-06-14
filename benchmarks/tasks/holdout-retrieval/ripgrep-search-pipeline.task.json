@@ -7,7 +7,7 @@
   "repo": {
     "name": "ripgrep",
     "url": "https://github.com/BurntSushi/ripgrep.git",
-    "ref": "14.1.0",
+    "ref": "e50df40a1967708b9781486b1c017e48040bceb0",
     "workspace_root": ".",
     "languages": [
       "Rust"

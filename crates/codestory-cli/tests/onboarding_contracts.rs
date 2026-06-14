@@ -349,7 +349,11 @@ fn usage_doc_keeps_agent_contract_terms_out_of_operator_flow() {
     assert!(usage.contains("Common Workflows"));
     assert!(usage.contains("I need a repo overview"));
     assert!(usage.contains("I need evidence for a broad question"));
-    assert!(usage.contains("The cache or retrieval looks stale"));
+    assert!(usage.contains("The cache or local navigation looks stale"));
+    assert!(usage.contains("For agent-facing packet/search recovery"));
+    assert!(usage.contains(
+        "codestory-cli retrieval index --project <target-workspace> --refresh full --format json"
+    ));
     for blocked in [
         "sufficiency.avoid_opening",
         "supported-claim wording",

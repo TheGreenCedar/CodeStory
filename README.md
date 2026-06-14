@@ -169,8 +169,8 @@ The skill package lives at
 | Build or refresh an index | `codestory-cli index --project <target-workspace> --refresh full` |
 | Broad orientation | `codestory-cli ground --project <target-workspace> --why` |
 | Repo report / graph export | `codestory-cli report --project <target-workspace> --format markdown` |
-| Broad task evidence | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
-| Candidate discovery | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
+| Broad task evidence (requires full sidecar retrieval) | `codestory-cli packet --project <target-workspace> --question "<task>" --budget compact` |
+| Candidate discovery (requires full sidecar retrieval) | `codestory-cli search --project <target-workspace> --query "<term>" --why` |
 | Exact symbol evidence | `codestory-cli symbol --project <target-workspace> --id <node-id>` |
 | Flow evidence | `codestory-cli trail --project <target-workspace> --id <node-id> --story --hide-speculative` |
 | Source excerpt | `codestory-cli snippet --project <target-workspace> --id <node-id>` |
@@ -179,9 +179,10 @@ The skill package lives at
 | Changed-file impact | `codestory-cli affected --project <target-workspace> --format markdown` |
 | Persistent read surface | `codestory-cli serve --project <target-workspace> --stdio` |
 
-Use `packet` for broad task questions. Target context is DB-first evidence for
-one concrete target; use `context` after search, trail, explore, or a bookmark
-has selected that target. Use `doctor` when output looks stale, incomplete, or
+Use `packet` for broad task questions once `ready --goal agent` reports full
+sidecar retrieval. For local cache-only inspection, start with `ground`,
+`report`, or `doctor`, then use `symbol`, `trail`, `snippet`, or `context` after
+you have a concrete target. Use `doctor` when output looks stale, incomplete, or
 inconsistent.
 
 ## What It Builds

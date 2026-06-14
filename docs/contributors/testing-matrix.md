@@ -189,6 +189,17 @@ cargo test -p codestory-cli --test runtime_backed_flows -- --ignored
 
 Run that lane only when the change crosses CLI and runtime behavior together, such as auto-refresh handling or file-filtered symbol resolution.
 
+The local real-repo agent-quality lane is ignored by default and must evaluate
+at least one sibling repository when run:
+
+```sh
+cargo test -p codestory-cli --test agent_quality_eval -- --ignored --nocapture
+```
+
+Set `CODESTORY_ALLOW_SKIP_LOCAL_REAL_AGENT_QUALITY=1` only when intentionally
+collecting skip-only local evidence because none of the sibling repositories are
+present. A zero-evaluated run is not quality proof.
+
 ## Bench Surface Checks
 
 ```sh

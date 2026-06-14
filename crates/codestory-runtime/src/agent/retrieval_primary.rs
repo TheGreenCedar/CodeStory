@@ -162,9 +162,9 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
 fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
     let project = quote_cli_arg(project);
     vec![
-        format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval bootstrap --project {project} --format json"),
         format!("codestory-cli retrieval index --project {project} --refresh full --format json"),
+        format!("codestory-cli retrieval status --project {project} --format json"),
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
@@ -1692,9 +1692,11 @@ mod tests {
         #[cfg(not(windows))]
         let expected_project = r"'C:/tmp/cost$cache`tick'\''s repo'";
 
-        assert_eq!(
-            commands[0],
-            format!("codestory-cli index --project {expected_project} --refresh full")
+        assert!(
+            commands
+                .first()
+                .is_some_and(|command| command.contains("retrieval bootstrap")),
+            "sidecar recovery should start with the sidecar bootstrap, not repeat a core index: {commands:?}"
         );
         assert!(
             commands

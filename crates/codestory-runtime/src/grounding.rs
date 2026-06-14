@@ -620,6 +620,7 @@ impl AppController {
             edge_count: clamp_i64_to_u32(stats.edge_count),
             file_count: clamp_i64_to_u32(derived_file_count),
             error_count: clamp_i64_to_u32(stats.error_count),
+            fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
 
         let mut file_coverages = Vec::with_capacity(file_summaries.len());

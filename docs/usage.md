@@ -163,7 +163,7 @@ Treat `affected` as test-selection evidence, not a replacement for tests. The
 default command preserves git name-status records; path-only stdin remains
 available when another tool already chose the file list.
 
-### The cache or retrieval looks stale
+### The cache or local navigation looks stale
 
 ```sh
 codestory-cli doctor --project <target-workspace>
@@ -175,6 +175,23 @@ If `doctor` reports stale inventory, dense-anchor contract mismatch, missing
 managed assets, or a non-`full` retrieval mode, fix that layer before
 investigating answer quality. Treat the health report as the first source of
 truth for cache and retrieval state.
+
+For agent-facing packet/search recovery, use the full sidecar repair sequence
+that `ready --goal agent` reports:
+
+```sh
+codestory-cli retrieval bootstrap --project <target-workspace> --format json
+codestory-cli retrieval index --project <target-workspace> --refresh full --format json
+codestory-cli retrieval status --project <target-workspace> --format json
+codestory-cli doctor --project <target-workspace> --format markdown
+```
+
+When the core index is missing, stale, unchecked, or has recorded fatal indexing
+errors, `ready` reports the necessary `codestory-cli index` repair first.
+Otherwise, sidecar recovery does not need to repeat a full core reindex.
+`retrieval bootstrap` prepares or checks the local sidecar services. The target
+workspace is not packet/search-ready until `retrieval index` writes a current
+target manifest and `doctor` or `retrieval status` reports `retrieval_mode=full`.
 
 ## Core Commands
 

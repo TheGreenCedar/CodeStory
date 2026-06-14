@@ -27,6 +27,8 @@ pub struct StorageStatsDto {
     pub edge_count: u32,
     pub file_count: u32,
     pub error_count: u32,
+    #[serde(default)]
+    pub fatal_error_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -253,6 +255,10 @@ pub enum ReadinessStatusDto {
 pub struct ReadinessIndexSnapshotDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<IndexFreshnessStatusDto>,
+    #[serde(default)]
+    pub error_count: u32,
+    #[serde(default)]
+    pub fatal_error_count: u32,
     pub changed_file_count: u32,
     pub new_file_count: u32,
     pub removed_file_count: u32,

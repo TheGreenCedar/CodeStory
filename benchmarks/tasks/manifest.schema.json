@@ -65,7 +65,8 @@
         },
         "ref": {
           "type": "string",
-          "minLength": 1
+          "pattern": "^[0-9a-fA-F]{40}$",
+          "description": "Full immutable Git commit SHA. Tags, branches, and short SHAs are not publishable benchmark provenance."
         },
         "workspace_root": {
           "type": "string",

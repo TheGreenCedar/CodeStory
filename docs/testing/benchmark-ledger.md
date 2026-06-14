@@ -94,8 +94,10 @@ explicit post-packet ordinary source-read budget supplied through
 `--max-source-reads-after-packet <n>`. Use `0` for packet-only promotion
 evidence; use a larger number only when the row is intentionally CodeStory-first
 but not packet-only. Publishable rows must carry clean repository provenance
-pinned to an immutable commit or tag plus CodeStory cache provenance from
-`doctor --format json`.
+pinned to a full 40-character Git commit SHA plus CodeStory cache provenance
+from `doctor --format json`. Tags are not accepted for publishable
+materialized-repo rows because they can be moved after the benchmark is
+published.
 
 Packet runtime runs compare cold CLI `packet` invocations with warm
 `serve --stdio` packet calls. They are runtime rows, not agent-token rows, and

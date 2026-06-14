@@ -7,7 +7,7 @@
   "repo": {
     "name": "axios",
     "url": "https://github.com/axios/axios.git",
-    "ref": "v1.6.8",
+    "ref": "ab3f0f9a94853c821cb00f1112788ecdd3ae7ed1",
     "workspace_root": ".",
     "languages": [
       "JavaScript",

@@ -1046,6 +1046,64 @@ function uniqueTaskRepos(tasks) {
   return repos;
 }
 
+function isTrustedPublishableRepoUrl(url) {
+  try {
+    const parsed = new URL(String(url ?? ""));
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname.toLowerCase() !== "github.com" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return false;
+    }
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    return (
+      parts.length === 2 &&
+      /^[A-Za-z0-9_.-]+$/.test(parts[0]) &&
+      /^[A-Za-z0-9_.-]+(?:\.git)?$/.test(parts[1])
+    );
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTrustedPublishableRepoUrl(url) {
+  if (!isTrustedPublishableRepoUrl(url)) {
+    return null;
+  }
+  const parsed = new URL(String(url));
+  const [owner, repo] = parsed.pathname.split("/").filter(Boolean);
+  return `${owner.toLowerCase()}/${repo.replace(/\.git$/i, "").toLowerCase()}`;
+}
+
+function manifestRepoMaterializationBlockers(tasks, opts = {}) {
+  if (!opts.publishable || !opts.materializeRepos) {
+    return [];
+  }
+  const blockers = [];
+  for (const [name, config] of uniqueTaskRepos(tasks)) {
+    if (!isTrustedPublishableRepoUrl(config.url)) {
+      blockers.push(`${name}: manifest repo URL is not an https://github.com/<owner>/<repo>[.git] URL`);
+    }
+    if (!isImmutableCommitRef(config.ref)) {
+      blockers.push(`${name}: manifest repo ref is not a full immutable commit SHA`);
+    }
+  }
+  return blockers;
+}
+
+function assertManifestRepoMaterializationAllowed(tasks, opts = {}) {
+  const blockers = manifestRepoMaterializationBlockers(tasks, opts);
+  if (blockers.length) {
+    throw new Error(
+      `Publishable repo materialization preflight failed before clone/fetch:\n- ${blockers.join("\n- ")}`,
+    );
+  }
+}
+
 async function materializeRepos(tasks, opts) {
   const repos = uniqueTaskRepos(tasks);
   if (!repos.size) {
@@ -4176,14 +4234,41 @@ function repoProvenanceBlockers(result) {
   }
   const configuredRef = provenance.configured?.ref ?? null;
   const manifestRef = provenance.manifest?.ref ?? null;
-  if (!isPinnedRepoRef(configuredRef)) {
-    reasons.push("repo ref is not pinned to an immutable commit or tag");
+  const configuredCommit = normalizeImmutableCommitRef(configuredRef);
+  const manifestCommit = manifestRef ? normalizeImmutableCommitRef(manifestRef) : null;
+  const gitHead = normalizeImmutableCommitRef(provenance.git_head);
+  if (!configuredCommit) {
+    reasons.push("repo ref is not pinned to a full immutable commit SHA");
   }
-  if (manifestRef && configuredRef && manifestRef !== configuredRef) {
+  if (manifestRef && configuredRef && manifestCommit !== configuredCommit) {
     reasons.push(`manifest ref ${manifestRef} does not match configured ref ${configuredRef}`);
   }
-  if (!provenance.git_head) {
+  if (!gitHead) {
     reasons.push("missing git head");
+  } else if (configuredCommit && gitHead !== configuredCommit) {
+    reasons.push(`git head ${provenance.git_head} does not match configured ref ${configuredRef}`);
+  }
+  const configuredUrl = provenance.configured?.url ?? null;
+  const manifestUrl = provenance.manifest?.url ?? null;
+  const gitOrigin = provenance.git_origin ?? null;
+  const configuredRepo = normalizeTrustedPublishableRepoUrl(configuredUrl);
+  const manifestRepo = manifestUrl ? normalizeTrustedPublishableRepoUrl(manifestUrl) : null;
+  const originRepo = gitOrigin ? normalizeTrustedPublishableRepoUrl(gitOrigin) : null;
+  if (!configuredRepo) {
+    reasons.push("configured repo URL is not a trusted GitHub HTTPS repo URL");
+  }
+  if (!manifestUrl) {
+    reasons.push("missing manifest repo URL");
+  } else if (!manifestRepo) {
+    reasons.push("manifest repo URL is not a trusted GitHub HTTPS repo URL");
+  }
+  if (configuredRepo && manifestUrl && manifestRepo && manifestRepo !== configuredRepo) {
+    reasons.push(`manifest repo URL ${manifestUrl} does not match configured URL ${configuredUrl}`);
+  }
+  if (!originRepo) {
+    reasons.push("git origin is missing or is not a trusted GitHub HTTPS repo URL");
+  } else if (configuredRepo && originRepo !== configuredRepo) {
+    reasons.push(`git origin ${gitOrigin} does not match configured URL ${configuredUrl}`);
   }
   if (provenance.git_dirty !== false) {
     reasons.push(provenance.git_dirty ? "repo checkout is dirty" : "repo cleanliness is unknown");
@@ -4191,21 +4276,13 @@ function repoProvenanceBlockers(result) {
   return reasons;
 }
 
-function isPinnedRepoRef(ref) {
+function isImmutableCommitRef(ref) {
+  return /^[0-9a-f]{40}$/i.test(String(ref ?? "").trim());
+}
+
+function normalizeImmutableCommitRef(ref) {
   const value = String(ref ?? "").trim();
-  if (!value || value === "local") {
-    return false;
-  }
-  if (/^[0-9a-f]{7,40}$/i.test(value)) {
-    return true;
-  }
-  if (/^refs\/tags\/[^/\s]+$/i.test(value)) {
-    return true;
-  }
-  if (/^v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9._-]+)?$/.test(value)) {
-    return true;
-  }
-  return false;
+  return isImmutableCommitRef(value) ? value.toLowerCase() : null;
 }
 
 function cacheProvenanceBlockers(result) {
@@ -5682,11 +5759,12 @@ async function main() {
     return;
   }
   const tasks = await loadTasks(opts);
-  if (opts.materializeRepos) {
-    await materializeRepos(tasks, opts);
-  }
   if (opts.publishable) {
     validatePublishableShape(opts, tasks);
+  }
+  if (opts.materializeRepos) {
+    assertManifestRepoMaterializationAllowed(tasks, opts);
+    await materializeRepos(tasks, opts);
   }
   if (opts.list) {
     if (tasks.length) {
@@ -5813,8 +5891,10 @@ export {
   commandCategory,
   extractCommandExecutions,
   isPathInside,
+  isTrustedPublishableRepoUrl,
   loadTaskForResult,
   loadTasks,
+  manifestRepoMaterializationBlockers,
   materializeRepos,
   parseArgs,
   parseJsonLines,

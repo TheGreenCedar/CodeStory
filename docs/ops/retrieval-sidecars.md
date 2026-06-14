@@ -33,6 +33,9 @@ From the CodeStory repository root (Windows, macOS, Linux):
 cargo retrieval-setup
 ```
 
+This starts or checks the local sidecar services for the CodeStory checkout; it
+does not by itself finalize the retrieval manifest for every target workspace.
+
 Plain `codestory-cli index` builds the core SQLite code index only. It can make
 the local navigation lane usable, but it does not generate sidecar artifacts or
 prove agent packet/search readiness. Use

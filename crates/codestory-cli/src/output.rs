@@ -3761,6 +3761,7 @@ mod tests {
             edge_count: 2,
             file_count: 1,
             error_count: 0,
+            fatal_error_count: 0,
         }
     }
 
@@ -4612,6 +4613,7 @@ mod tests {
                 edge_count: 0,
                 file_count: 4,
                 error_count: 2,
+                fatal_error_count: 0,
             },
             retrieval: Some(retrieval),
             coverage: GroundingCoverageDto {

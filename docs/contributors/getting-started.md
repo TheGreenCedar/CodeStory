@@ -23,14 +23,18 @@ After the basic cargo checks, verify the shipped CLI flow with the built binary 
 cargo build --release -p codestory-cli
 ./target/release/codestory-cli setup embeddings --project . --dry-run
 ./target/release/codestory-cli index --project . --refresh auto
-./target/release/codestory-cli search --project . --query WorkspaceIndexer --why
-./target/release/codestory-cli context --project . --query WorkspaceIndexer
+./target/release/codestory-cli ready --project . --goal local
+./target/release/codestory-cli ground --project . --why
+./target/release/codestory-cli files --project . --limit 20
 ./target/release/codestory-cli doctor --project .
 ```
 
 On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
 Read commands default to `--refresh none`. If a read command says the cache is empty, either run `index --refresh full` first or rerun the read command with an explicit refresh mode.
+The first loop above exercises local navigation only. Agent-facing `packet` and
+`search` evidence require full retrieval sidecars; prepare the sidecar lane
+below before treating those commands as product-quality proof.
 
 ## Hybrid Retrieval Setup
 
@@ -45,6 +49,15 @@ Use the managed full-sidecar path before debugging ranking quality:
 Hash embeddings, ONNX-only flows, and lexical-only switches are diagnostic or
 historical comparison modes only; they are not valid agent-facing retrieval
 setup.
+
+After bootstrap, run a target-repo sidecar index before using packet/search:
+
+```sh
+./target/release/codestory-cli index --project . --refresh full
+./target/release/codestory-cli retrieval index --project . --refresh full
+./target/release/codestory-cli retrieval status --project . --format json
+./target/release/codestory-cli ready --project . --goal agent
+```
 
 `index`, `ground`, `search`, `context`, and `doctor` report the active retrieval mode plus any degraded-state reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Agent-facing retrieval requires `retrieval_mode=full`.
 

@@ -11,9 +11,11 @@ import {
   benchmarkRunId,
   commandCategory,
   copyResultArtifact,
+  isTrustedPublishableRepoUrl,
   isPathInside,
   loadTaskForResult,
   loadTasks,
+  manifestRepoMaterializationBlockers,
   MAX_REUSED_ARTIFACT_BYTES,
   parseArgs as parseBenchmarkArgs,
   parseJsonLines,
@@ -442,6 +444,126 @@ test("publishable benchmark args reject diagnostic packet probes", () => {
         "--diagnostic-extra-probes-from-manifest",
       ]),
     /diagnostic-only/,
+  );
+});
+
+test("publishable repo URL trust only accepts plain GitHub HTTPS repo URLs", () => {
+  assert.equal(isTrustedPublishableRepoUrl("https://github.com/expressjs/express.git"), true);
+  assert.equal(isTrustedPublishableRepoUrl("https://github.com/expressjs/express"), true);
+  assert.equal(isTrustedPublishableRepoUrl("file:///tmp/repo.git"), false);
+  assert.equal(isTrustedPublishableRepoUrl("https://example.com/expressjs/express.git"), false);
+  assert.equal(isTrustedPublishableRepoUrl("https://github.com/expressjs/express.git?ref=main"), false);
+  assert.equal(isTrustedPublishableRepoUrl("https://token@github.com/expressjs/express.git"), false);
+});
+
+test("publishable materialization preflight rejects arbitrary URLs and moving refs", async () => {
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "file:///tmp/fixture.git",
+        ref: "main",
+        workspace_root: ".",
+      },
+    }),
+    async (manifestPath) => {
+      const opts = parseBenchmarkArgs([
+        "--task-manifest",
+        manifestPath,
+        "--publishable",
+        "--materialize-repos",
+        "--max-source-reads-after-packet",
+        "0",
+      ]);
+      const tasks = await loadTasks(opts);
+      const blockers = manifestRepoMaterializationBlockers(tasks, opts);
+      const blockerText = blockers.join("\n");
+
+      assert.match(blockerText, /https:\/\/github\.com\/<owner>\/<repo>/);
+      assert.match(blockerText, /full immutable commit SHA/);
+    },
+  );
+});
+
+test("publishable materialization preflight stays fail-closed for direct options", async () => {
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "file:///tmp/fixture.git",
+        ref: "main",
+        workspace_root: ".",
+      },
+    }),
+    async (manifestPath) => {
+      const opts = parseBenchmarkArgs([
+        "--task-manifest",
+        manifestPath,
+        "--materialize-repos",
+        "--max-source-reads-after-packet",
+        "0",
+      ]);
+      const tasks = await loadTasks(opts);
+      const blockers = manifestRepoMaterializationBlockers(tasks, {
+        ...opts,
+        publishable: true,
+      });
+
+      assert.match(blockers.join("\n"), /full immutable commit SHA/);
+    },
+  );
+});
+
+test("publishable materialization preflight rejects mutable tags before fetch", async () => {
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "https://github.com/example/fixture.git",
+        ref: "v1.2.3",
+        workspace_root: ".",
+      },
+    }),
+    async (manifestPath) => {
+      const opts = parseBenchmarkArgs([
+        "--task-manifest",
+        manifestPath,
+        "--publishable",
+        "--materialize-repos",
+        "--max-source-reads-after-packet",
+        "0",
+      ]);
+      const tasks = await loadTasks(opts);
+      const blockers = manifestRepoMaterializationBlockers(tasks, opts);
+
+      assert.match(blockers.join("\n"), /full immutable commit SHA/);
+    },
+  );
+});
+
+test("publishable materialization preflight accepts trusted pinned GitHub manifests", async () => {
+  await withManifestFile(
+    manifestFixture({
+      repo: {
+        name: "fixture-repo",
+        url: "https://github.com/example/fixture.git",
+        ref: "1234567890abcdef1234567890abcdef12345678",
+        workspace_root: ".",
+      },
+    }),
+    async (manifestPath) => {
+      const opts = parseBenchmarkArgs([
+        "--task-manifest",
+        manifestPath,
+        "--publishable",
+        "--materialize-repos",
+        "--max-source-reads-after-packet",
+        "0",
+      ]);
+      const tasks = await loadTasks(opts);
+
+      assert.deepEqual(manifestRepoMaterializationBlockers(tasks, opts), []);
+    },
   );
 });
 
@@ -1390,9 +1512,16 @@ test("forbidden claim scoring keeps polarity inside one candidate sentence", () 
 function pinnedRepoProvenance() {
   return {
     manifest_overridden_by_builtin: false,
-    configured: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
-    manifest: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
+    configured: {
+      url: "https://github.com/example/fixture.git",
+      ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+    },
+    manifest: {
+      url: "https://github.com/example/fixture.git",
+      ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+    },
     git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+    git_origin: "https://github.com/example/fixture.git",
     git_dirty: false,
   };
 }
@@ -1635,13 +1764,20 @@ test("publishable gate accepts ordinary local inspection in the without arm", ()
   assert.deepEqual(blockers, []);
 });
 
-test("publishable provenance requires pinned clean manifest checkout", () => {
+test("publishable provenance requires full-SHA clean manifest checkout", () => {
   const clean = {
     repo_provenance: {
       manifest_overridden_by_builtin: false,
-      configured: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
-      manifest: { ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7" },
-      git_head: "abc123",
+      configured: {
+        url: "https://github.com/example/fixture.git",
+        ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+      },
+      manifest: {
+        url: "https://github.com/example/fixture.git",
+        ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+      },
+      git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+      git_origin: "https://github.com/example/fixture.git",
       git_dirty: false,
     },
   };
@@ -1650,13 +1786,118 @@ test("publishable provenance requires pinned clean manifest checkout", () => {
     repoProvenanceBlockers({
       repo_provenance: {
         manifest_overridden_by_builtin: false,
-        configured: { ref: "main" },
-        manifest: { ref: "main" },
+        configured: {
+          url: "https://github.com/example/fixture.git",
+          ref: "main",
+        },
+        manifest: {
+          url: "https://github.com/example/fixture.git",
+          ref: "main",
+        },
         git_head: "abc123",
+        git_origin: "https://github.com/example/fixture.git",
         git_dirty: false,
       },
     }).join("\n"),
-    /not pinned to an immutable commit or tag/,
+    /not pinned to a full immutable commit SHA/,
+  );
+  for (const ref of ["abcdef0", "v1.2.3", "refs/tags/v1.2.3"]) {
+    assert.match(
+      repoProvenanceBlockers({
+        repo_provenance: {
+          manifest_overridden_by_builtin: false,
+          configured: {
+            url: "https://github.com/example/fixture.git",
+            ref,
+          },
+          manifest: {
+            url: "https://github.com/example/fixture.git",
+            ref,
+          },
+          git_head: "abc123",
+          git_origin: "https://github.com/example/fixture.git",
+          git_dirty: false,
+        },
+      }).join("\n"),
+      /not pinned to a full immutable commit SHA/,
+      `publishable provenance should reject ${ref}`,
+    );
+  }
+  assert.match(
+    repoProvenanceBlockers({
+      repo_provenance: {
+        manifest_overridden_by_builtin: false,
+        configured: {
+          url: "https://github.com/example/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        manifest: {
+          url: "https://github.com/example/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        git_head: "1234567890abcdef1234567890abcdef12345678",
+        git_origin: "https://github.com/example/fixture.git",
+        git_dirty: false,
+      },
+    }).join("\n"),
+    /does not match configured ref/,
+  );
+  assert.match(
+    repoProvenanceBlockers({
+      repo_provenance: {
+        manifest_overridden_by_builtin: false,
+        configured: {
+          url: "file:///tmp/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        manifest: {
+          url: "file:///tmp/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        git_origin: "file:///tmp/fixture.git",
+        git_dirty: false,
+      },
+    }).join("\n"),
+    /configured repo URL is not a trusted GitHub HTTPS repo URL/,
+  );
+  assert.match(
+    repoProvenanceBlockers({
+      repo_provenance: {
+        manifest_overridden_by_builtin: false,
+        configured: {
+          url: "https://github.com/example/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        manifest: {
+          url: "https://github.com/other/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        git_origin: "https://github.com/example/fixture.git",
+        git_dirty: false,
+      },
+    }).join("\n"),
+    /manifest repo URL .* does not match configured URL/,
+  );
+  assert.match(
+    repoProvenanceBlockers({
+      repo_provenance: {
+        manifest_overridden_by_builtin: false,
+        configured: {
+          url: "https://github.com/example/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        manifest: {
+          url: "https://github.com/example/fixture.git",
+          ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        },
+        git_head: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+        git_origin: "https://github.com/other/fixture.git",
+        git_dirty: false,
+      },
+    }).join("\n"),
+    /git origin .* does not match configured URL/,
   );
 
   const blockers = agentPublishableBlockers(
@@ -1676,9 +1917,10 @@ test("publishable provenance requires pinned clean manifest checkout", () => {
         },
         repo_provenance: {
           manifest_overridden_by_builtin: true,
-          configured: { ref: "local" },
-          manifest: { ref: "main" },
+          configured: { url: "local", ref: "local" },
+          manifest: { url: "https://github.com/example/fixture.git", ref: "main" },
           git_head: "abc123",
+          git_origin: "local",
           git_dirty: true,
         },
       },

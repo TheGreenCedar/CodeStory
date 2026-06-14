@@ -7,7 +7,7 @@
   "repo": {
     "name": "mux",
     "url": "https://github.com/gorilla/mux.git",
-    "ref": "v1.8.1",
+    "ref": "b4617d0b9670ad14039b2739167fd35a60f557c5",
     "workspace_root": ".",
     "languages": [
       "Go"

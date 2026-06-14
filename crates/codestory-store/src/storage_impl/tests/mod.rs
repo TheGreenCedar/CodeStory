@@ -1773,8 +1773,22 @@ fn test_error_storage() -> Result<(), StorageError> {
         index_step: codestory_contracts::graph::IndexStep::Indexing,
     };
     storage.insert_error(&error)?;
+    storage.insert_error(&codestory_contracts::graph::ErrorInfo {
+        message: "Recoverable parse warning".to_string(),
+        file_id: Some(NodeId(1)),
+        line: Some(20),
+        column: Some(1),
+        is_fatal: false,
+        index_step: codestory_contracts::graph::IndexStep::Indexing,
+    })?;
     let stats = storage.get_stats()?;
-    assert_eq!(stats.error_count, 1);
+    assert_eq!(stats.error_count, 2);
+    assert_eq!(stats.fatal_error_count, 1);
+    storage.refresh_grounding_summary_snapshots()?;
+    assert!(storage.has_ready_grounding_summary_snapshots()?);
+    let snapshot_stats = storage.get_stats()?;
+    assert_eq!(snapshot_stats.error_count, 2);
+    assert_eq!(snapshot_stats.fatal_error_count, 1);
     Ok(())
 }
 

@@ -1381,11 +1381,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should expose agent readiness with minimum_next/full_repair: {status}"
     );
     assert!(
-        next_call_text
-            .find("retrieval status")
-            .unwrap_or(usize::MAX)
-            < next_call_text.find("search").unwrap_or(usize::MAX),
-        "status should recommend sidecar status/index repair before search when mode is not full: {status}"
+        !next_call_text.contains("\"tool\":\"packet\"")
+            && !next_call_text.contains("\"tool\":\"search\""),
+        "status should recommend repair, not packet/search calls, when mode is not full: {status}"
+    );
+    assert!(
+        !next_call_text.contains("codestory-cli index --project")
+            && next_call_text.contains("--refresh full")
+            && next_call_text.contains("retrieval bootstrap")
+            && next_call_text.contains("retrieval index")
+            && next_call_text.contains("retrieval status")
+            && next_call_text.contains("codestory://status")
+            && next_call_text.contains("codestory://agent-guide"),
+        "status should recommend sidecar repair without repeating a fresh core index when mode is not full: {status}"
     );
     assert!(
         status
@@ -1453,6 +1461,18 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     }
 
     assert_stale_freshness_counts(&last_status, "codestory://status");
+    let status_next_call_text = last_status["recommended_next_calls"].to_string();
+    assert!(
+        !status_next_call_text.contains("\"tool\":\"packet\"")
+            && !status_next_call_text.contains("\"tool\":\"search\""),
+        "stale index readiness should recommend repair, not packet/search calls: {last_status}"
+    );
+    assert!(
+        status_next_call_text.contains("codestory-cli index --project")
+            && status_next_call_text.contains("--refresh incremental")
+            && status_next_call_text.contains("codestory://status"),
+        "stale index readiness should recommend index repair and a status recheck: {last_status}"
+    );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];
     let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
@@ -1698,18 +1718,23 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         "stdio search error should include full_repair: {response}"
     );
     assert!(
-        next_commands
-            .iter()
-            .any(|command| command.as_str().is_some_and(|text| text
-                .contains("codestory-cli index")
-                && text.contains("--refresh full"))),
-        "stdio search error should include index repair command: {response}"
+        next_commands.iter().all(|command| command
+            .as_str()
+            .is_some_and(|text| !text.contains("codestory-cli index"))),
+        "stdio search sidecar errors should not repeat core index repair commands: {response}"
     );
     assert!(
         next_commands.iter().any(|command| command
             .as_str()
             .is_some_and(|text| text.contains("codestory-cli retrieval bootstrap"))),
         "stdio search error should include sidecar bootstrap repair command: {response}"
+    );
+    assert!(
+        next_commands.iter().any(|command| command
+            .as_str()
+            .is_some_and(|text| text.contains("codestory-cli retrieval status")
+                && text.contains("--format json"))),
+        "stdio search error should include sidecar status proof command: {response}"
     );
 }
 

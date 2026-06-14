@@ -8409,7 +8409,8 @@ mod tests {
     }
 
     #[test]
-    fn server_route_source_claims_survive_with_generic_claims() {
+    fn server_route_source_claims_survive_with_eval_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how a router group registers routes and dispatches handlers for an HTTP request.";
         let fixtures = [
             (
@@ -8448,7 +8449,7 @@ mod tests {
             let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
             assert!(
                 claims.iter().any(|claim| claim == expected),
-                "expected generic server-route claim `{expected}` for {path}; got {claims:?}"
+                "expected eval-only server-route claim `{expected}` for {path}; got {claims:?}"
             );
         }
     }
@@ -8545,7 +8546,8 @@ mod tests {
     }
 
     #[test]
-    fn hook_cache_source_claims_survive_with_generic_claims() {
+    fn hook_cache_source_claims_survive_with_eval_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior.";
 
         let hook = test_packet_citation("useDataHandler", "src/hooks/use-data.ts", 0.9);
@@ -8572,7 +8574,7 @@ mod tests {
             "The public useData export wraps useDataHandler with argument normalization.";
         assert!(
             claims.iter().any(|claim| claim == expected),
-            "expected generic hook wrapper claim `{expected}`; got {claims:?}"
+            "expected eval-only hook wrapper claim `{expected}`; got {claims:?}"
         );
         assert!(
             claims
@@ -8599,7 +8601,7 @@ mod tests {
         let expected = "makeCacheHelper provides cache get, set, subscribe, and snapshot helpers.";
         assert!(
             claims.iter().any(|claim| claim == expected),
-            "expected generic cache helper claim `{expected}`; got {claims:?}"
+            "expected eval-only cache helper claim `{expected}`; got {claims:?}"
         );
 
         let swr_handler = test_packet_citation("useSWRHandler", "src/index/use-swr.ts", 0.9);
@@ -8619,12 +8621,13 @@ mod tests {
         let expected = "useSWRHandler serializes the key before reading cache state.";
         assert!(
             claims.iter().any(|claim| claim == expected),
-            "expected generic SWR key serialization claim `{expected}`; got {claims:?}"
+            "expected eval-only SWR key serialization claim `{expected}`; got {claims:?}"
         );
     }
 
     #[test]
-    fn client_send_source_claims_survive_with_generic_claims() {
+    fn client_send_source_claims_survive_with_eval_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how a client exposes convenience request helpers and routes send behavior through the transport implementation.";
 
         let base = test_packet_citation("BaseTransportClient", "src/base_client.dart", 0.9);
@@ -8650,7 +8653,7 @@ mod tests {
         let expected = "BaseTransportClient implements convenience methods in terms of send.";
         assert!(
             claims.iter().any(|claim| claim == expected),
-            "expected generic client convenience claim `{expected}`; got {claims:?}"
+            "expected eval-only client convenience claim `{expected}`; got {claims:?}"
         );
 
         let native = test_packet_citation("NativeClient", "src/native_client.dart", 0.9);
@@ -8672,10 +8675,11 @@ mod tests {
             }
             "#,
         );
-        let expected = "NativeClient.send is the dart:io transport implementation.";
+        let expected =
+            "NativeClient.send forwards finalized requests through an HTTP client transport.";
         assert!(
             claims.iter().any(|claim| claim == expected),
-            "expected generic transport send claim `{expected}`; got {claims:?}"
+            "expected eval-only transport send claim `{expected}`; got {claims:?}"
         );
     }
 
@@ -8871,8 +8875,8 @@ mod tests {
         );
 
         for expected in [
-            "vformat is the central formatting path for runtime format arguments.",
-            "format_error represents formatting failures.",
+            "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers.",
+            "Formatting errors are represented as runtime failures.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
@@ -9246,39 +9250,39 @@ mod tests {
         }
     }
     #[test]
-    fn express_route_flow_source_claims_name_app_router_response_flow() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+    fn express_route_flow_source_claims_name_app_router_response_flow_with_eval_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
         let fixtures = [
             (
                 "createApplication",
                 "lib/express.js",
                 "function createApplication() { var app = function(req, res, next) { app.handle(req, res, next); }; mixin(app, proto, false); app.request = Object.create(req); app.response = Object.create(res); app.init(); return app; }",
-                "The application factory builds a callable app object and mixes in request and response prototypes.",
+                "createApplication builds a callable app object and mixes in request and response prototypes.",
             ),
             (
                 "app.handle",
                 "lib/application.js",
                 "app.init = function init() { var router = null; this.defaultConfiguration(); router = new Router({}); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\napp.use = function use(fn) { return router.use(path, fn); }\napp.route = function route(path) { return this.router.route(path); }",
-                "The application handler delegates request handling to the router.",
+                "app.handle delegates request handling to the router.",
             ),
             (
                 "app.use",
                 "lib/application.js",
                 "app.init = function init() { var router = null; this.defaultConfiguration(); router = new Router({}); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\napp.use = function use(fn) { return router.use(path, fn); }\napp.route = function route(path) { return this.router.route(path); }",
-                "Middleware registration delegates to the router.",
+                "app.use registers middleware on the router.",
             ),
             (
                 "app.route",
                 "lib/application.js",
                 "app.init = function init() { var router = null; this.defaultConfiguration(); router = new Router({}); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\napp.use = function use(fn) { return router.use(path, fn); }\napp.route = function route(path) { return this.router.route(path); }",
-                "The route registration helper creates route entries through the router.",
+                "app.route creates route entries through the router.",
             ),
             (
                 "res.send",
                 "lib/response.js",
                 "res.send = function send(body) { this.set('Content-Length', len); this.end(chunk, encoding); return this; }",
-                "The response send helper prepares and sends the response body.",
+                "res.send prepares and sends the response body.",
             ),
         ];
 
@@ -9293,21 +9297,21 @@ mod tests {
     }
 
     #[test]
-    fn url_session_request_claims_name_lifecycle_without_eval_probes() {
-        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+    fn url_session_request_claims_name_lifecycle_with_eval_probes() {
+        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
         let fixtures = [
             (
                 "Session.request",
                 "Source/Core/Session.swift",
                 "open func request(_ convertible: URLRequestConvertible) -> DataRequest { let request = DataRequest(); performEagerlyIfNecessary(request); return request }",
-                "Session request creation builds request objects and schedules eager execution.",
+                "Session request creation builds request objects before optional eager execution.",
             ),
             (
                 "Request.resume",
                 "Source/Core/Request.swift",
                 "public func resume() -> Self { delegate?.readyToPerform(request: self); task.resume(); return self }",
-                "Request.resume resumes the underlying URLSession task.",
+                "Request.resume resumes the underlying request task.",
             ),
             (
                 "DataRequest.validate",
@@ -9319,7 +9323,7 @@ mod tests {
                 "SessionDelegate",
                 "Source/Core/SessionDelegate.swift",
                 "open class SessionDelegate: NSObject, URLSessionDataDelegate { open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) { request.didReceive(data: data) } open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { request.didReceiveResponse(nil) } }",
-                "The URLSession delegate receives callback events.",
+                "The session delegate receives request callback events.",
             ),
         ];
 
@@ -9423,7 +9427,18 @@ mod tests {
                 "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
                 test_packet_citation("app.use", "lib/application.js", 0.9),
                 "app.use = function use(fn) { return router.use(path, fn); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\n",
-                &["createApplication", "lib/express.js"][..],
+                &[
+                    "createApplication",
+                    "app.handle",
+                    "app.use",
+                    "lib/express.js",
+                ][..],
+            ),
+            (
+                "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths.",
+                test_packet_citation("vformat", "include/fmt/format.h", 0.9),
+                "class format_error : public std::runtime_error {}; inline auto vformat(locale_ref loc, string_view fmt, format_args args) -> std::string { detail::vformat_to(buf, fmt, args, loc); return to_string(buf); }",
+                &["vformat is the central", "format_error represents"][..],
             ),
             (
                 "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.",
@@ -9451,7 +9466,13 @@ mod tests {
                 "Trace how Alamofire's Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.",
                 test_packet_citation("DataRequest.validate", "Source/Core/DataRequest.swift", 0.9),
                 "public func validate(_ validation: @escaping Validation) -> Self { validators.write { $0.append(validation) }; didValidateRequest() }\n",
-                &["Alamofire", "Source/Core"][..],
+                &["Alamofire", "Source/Core", "URLSession"][..],
+            ),
+            (
+                "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
+                test_packet_citation("NativeClient", "src/native_client.dart", 0.9),
+                "import 'dart:io'; class NativeClient { Future<NativeStreamedResponse> send(BaseRequest request) async { var stream = request.finalize(); var ioRequest = await _inner!.openUrl(request.method, request.url); final response = await stream.pipe(ioRequest) as HttpClientResponse; return NativeStreamedResponse(response); } }\n",
+                &["dart:io", "IOClient", "NativeClient.send is"][..],
             ),
         ];
 

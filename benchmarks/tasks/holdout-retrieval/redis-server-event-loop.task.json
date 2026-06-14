@@ -7,7 +7,7 @@
   "repo": {
     "name": "redis",
     "url": "https://github.com/redis/redis.git",
-    "ref": "7.2.4",
+    "ref": "d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7",
     "workspace_root": ".",
     "languages": [
       "C"

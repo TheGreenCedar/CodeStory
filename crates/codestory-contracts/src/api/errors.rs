@@ -111,8 +111,11 @@ mod tests {
             "sidecar retrieval primary is unavailable or degraded",
             "C:/repo/example",
             vec![
-                "codestory-cli index --project \"C:/repo/example\" --refresh full".to_string(),
                 "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
+                    .to_string(),
+                "codestory-cli retrieval index --project \"C:/repo/example\" --refresh full --format json"
+                    .to_string(),
+                "codestory-cli retrieval status --project \"C:/repo/example\" --format json"
                     .to_string(),
             ],
         );
@@ -124,15 +127,15 @@ mod tests {
         assert_eq!(value["details"]["project"], "C:/repo/example");
         assert_eq!(
             value["details"]["next_commands"][0],
-            "codestory-cli index --project \"C:/repo/example\" --refresh full"
+            "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
         );
         assert_eq!(
             value["details"]["minimum_next"][0],
-            "codestory-cli index --project \"C:/repo/example\" --refresh full"
+            "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
         );
         assert_eq!(
             value["details"]["full_repair"][1],
-            "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
+            "codestory-cli retrieval index --project \"C:/repo/example\" --refresh full --format json"
         );
     }
 }
