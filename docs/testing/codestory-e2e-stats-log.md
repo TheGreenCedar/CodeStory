@@ -1,15 +1,5 @@
 # Codestory E2E Stats Log
 
-Timing history lives in append-only rows below. Do not chart hard-coded timings
-in prose or Mermaid blocks; cite the latest row instead.
-
-```mermaid
-flowchart LR
-    change[Behavior change to index or reads] --> build["cargo build --release -p codestory-cli"]
-    build --> test["codestory_repo_e2e_stats --ignored"]
-    test --> append[Append headline row here]
-```
-
 Append one entry before each commit after running:
 
 ```sh

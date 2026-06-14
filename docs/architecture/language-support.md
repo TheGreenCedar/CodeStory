@@ -12,19 +12,6 @@ The shared registry owns public support claims. Workspace discovery also carries
 compatibility-only filters for file types that can be scanned or grouped without
 being claimed as parser-backed language support.
 
-## Claim Ladder
-
-```mermaid
-flowchart TD
-    ext[File extension] --> route[Parser or structural route]
-    route --> parserGraph[Parser-backed graph]
-    route --> structural[Structural collector]
-    parserGraph --> fidelity[Fidelity-gated regression]
-    fidelity --> navClaim[Graph navigation claim]
-    parserGraph --> pktClaim[Separate packet/search quality claim]
-    structural --> structClaim[Structural extraction claim]
-```
-
 ## Claim Terms
 
 - `parser-backed graph`: the file extension routes to a tree-sitter parser and
@@ -52,16 +39,6 @@ Agent-facing packet/search quality is a separate claim from parser-backed graph
 support. The current language-expansion A/B report records a mixed full
 18-language result and a stronger packet-eligible slice; do not use that report
 as blanket promotion proof for every parser-backed language.
-
-```mermaid
-flowchart LR
-    subgraph parserBacked [Parser-backed graph languages]
-        py[Python, Java, Rust, JS, TS, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash]
-    end
-    subgraph structural [Structural collectors]
-        hcs[HTML, CSS, SQL]
-    end
-```
 
 The parser-backed graph claim is not a promise that every language has identical
 dispatch or semantic-resolution semantics. Typed receiver-call support is

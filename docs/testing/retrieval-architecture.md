@@ -39,20 +39,6 @@ Do not describe a branch as generalized or useful for agents until the matching
 proof tier has run cleanly on the current branch. Docs and PRs must state only
 the highest tier actually reached:
 
-```mermaid
-flowchart TB
-    t1[Tier 1: CodeStory self-e2e] --> t2[Tier 2: Local-real drill suite]
-    t2 --> t3[Tier 3: Holdout-retrieval drill suite]
-    t3 --> t4[Tier 4: Promotion-grade paired benchmark]
-```
-
-```mermaid
-flowchart LR
-    code[Code and lint gates] --> drill[drill / drill-suite]
-    drill --> holdout[Holdout-retrieval rows]
-    holdout --> ab[Paired with/without agent A/B]
-```
-
 | Tier | Proof | Claim allowed |
 |------|-------|---------------|
 | 1. CodeStory self-e2e | Generalization lint, targeted runtime/indexer tests, release CLI build, `doctor`, and repo-scale e2e stats | CodeStory still works on itself and production code has no banned holdout literals |

@@ -45,23 +45,6 @@ TARGET_WORKSPACE="/path/to/repo"
 CodeStory has two readiness tracks. Keep them separate when deciding whether an
 agent can rely on packet/search output.
 
-```mermaid
-flowchart TB
-    subgraph localLane [local_navigation]
-        direction LR
-        cache[SQLite cache from index]
-        navCmds["ground, symbol, trail, snippet, explore, context, files, affected"]
-        cache --> navCmds
-    end
-    subgraph sidecarLane [agent_packet_search]
-        direction LR
-        sidecars[Zoekt, Qdrant, SCIP, llama.cpp]
-        pktCmds["packet and search when retrieval_mode=full"]
-        sidecars --> pktCmds
-    end
-    localLane -.->|"does not prove"| sidecarLane
-```
-
 ### Local navigation/cache readiness
 
 This lane is for local browsing and source navigation. It uses the project
@@ -89,13 +72,6 @@ described as agent packet/search readiness.
 
 ### I need a repo overview
 
-```mermaid
-flowchart LR
-    d[doctor] --> i["index --refresh full"]
-    i --> g["ground --why"]
-    g --> r[report]
-```
-
 ```sh
 codestory-cli doctor --project <target-workspace>
 codestory-cli index --project <target-workspace> --refresh full
@@ -116,13 +92,6 @@ files as outputs to regenerate, not source-of-truth state.
 
 ### I need evidence for a broad question
 
-```mermaid
-flowchart LR
-    pkt["packet --question"] --> status{sufficient?}
-    status -->|partial or blocked| follow[Follow named source-truth commands]
-    status -->|sufficient| answer[Answer from citations]
-```
-
 ```sh
 codestory-cli packet --project <target-workspace> --question "<broad task question>" --budget compact
 ```
@@ -135,13 +104,6 @@ opening unstructured source files directly. Treat `sufficient` as evidence
 coverage, not final answer-quality proof.
 
 ### I need to understand one symbol or file
-
-```mermaid
-flowchart LR
-    search[search --why] --> pick[Pick node-id]
-    pick --> inspect["explore / trail / snippet"]
-    inspect --> ctx[context optional]
-```
 
 ```sh
 codestory-cli search --project <target-workspace> --query "<symbol/file/literal/API path>" --why
@@ -163,12 +125,6 @@ target-first; it is not an open chat endpoint and is not a replacement for broad
 
 ### I changed files and need likely impact
 
-```mermaid
-flowchart LR
-    inc["index --refresh incremental"] --> aff[affected]
-    diff[git diff stdin] --> aff
-```
-
 ```sh
 codestory-cli index --project <target-workspace> --refresh incremental
 codestory-cli affected --project <target-workspace> --format markdown
@@ -181,12 +137,6 @@ default command preserves git name-status records; path-only stdin remains
 available when another tool already chose the file list.
 
 ### The cache or local navigation looks stale
-
-```mermaid
-flowchart LR
-    d1[doctor] --> full["index --refresh full"]
-    full --> d2[doctor again]
-```
 
 ```sh
 codestory-cli doctor --project <target-workspace>
@@ -201,13 +151,6 @@ truth for cache and retrieval state.
 
 For agent-facing packet/search recovery, use the full sidecar repair sequence
 that `ready --goal agent` reports:
-
-```mermaid
-flowchart LR
-    boot[retrieval bootstrap] --> ridx["retrieval index --refresh full"]
-    ridx --> status[retrieval status]
-    status --> doc[doctor]
-```
 
 ```sh
 codestory-cli retrieval bootstrap --project <target-workspace> --format json
@@ -224,17 +167,6 @@ workspace is not packet/search-ready until `retrieval index` writes a current
 target manifest and `doctor` or `retrieval status` reports `retrieval_mode=full`.
 
 ## Core Commands
-
-```mermaid
-flowchart TB
-    health[Health: doctor] --> build[Build: index]
-    build --> discover[Discover: ground, search, files]
-    discover --> inspect[Inspect: symbol, trail, snippet, explore]
-    inspect --> bundle[Bundle: context, packet, affected]
-```
-
-See the [evidence loop in how-codestory-works](concepts/how-codestory-works.md#the-loop)
-for the canonical command sequence.
 
 - `doctor`: read-only health check for project, cache, index, retrieval, and
   environment readiness.

@@ -25,57 +25,6 @@ assets are installed. Setup can fetch the CodeStory source artifact or managed
 embedding assets; the indexed project data stays in the user cache and commands
 stay explicit about which workspace they read.
 
-### Evidence loop
-
-```mermaid
-flowchart TB
-    subgraph problem [Agent without grounding]
-        A1[Open random files] --> A2[Miss key symbols]
-    end
-    subgraph solution [CodeStory evidence loop]
-        B1[doctor] --> B2[index]
-        B2 --> B3[search or ground]
-        B3 --> B4["symbol / trail / snippet"]
-        B4 --> B5[context or packet]
-    end
-    problem -.-> solution
-```
-
-See [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md)
-for the full loop and storage model.
-
-### Two readiness tracks
-
-```mermaid
-flowchart LR
-    subgraph localNav [local_navigation]
-        L1[SQLite cache from index]
-        L2["ground, symbol, trail, snippet, explore, context, files, affected"]
-        L1 --> L2
-    end
-    subgraph agentPkt [agent_packet_search]
-        S1[Zoekt + Qdrant + SCIP + llama.cpp]
-        S2["packet and search when retrieval_mode=full"]
-        S1 --> S2
-    end
-    localNav -.->|"does not prove"| agentPkt
-```
-
-### Which command first?
-
-```mermaid
-flowchart TD
-    start[What do you need?] --> health{Cache or sidecar health?}
-    health -->|yes| doctor[doctor]
-    health -->|no| task{Task shape?}
-    task -->|broad question| packet["packet (needs full sidecars)"]
-    task -->|repo orientation| orient["ground or report"]
-    task -->|one symbol or file| search[search]
-    search --> inspect["trail / snippet / context"]
-    doctor --> index[index if needed]
-    index --> task
-```
-
 ## Public Promise
 
 CodeStory is a local evidence layer for repositories, not an automatic
@@ -212,23 +161,12 @@ flowchart LR
 CodeStory builds a local evidence layer so agents can request grounded context
 instead of relying on ad hoc file reads.
 
-Full crate and layer model:
-[docs/architecture/overview.md](docs/architecture/overview.md).
-
 ## Language Support Claims
 
 CodeStory separates parser-backed graph indexing, regression-tested accuracy,
 structural extraction, framework route coverage, and agent packet/search
 readiness. The current contract is documented in
 [docs/architecture/language-support.md](docs/architecture/language-support.md).
-
-```mermaid
-flowchart TD
-    ext[File extension] --> parser[Parser-backed graph]
-    parser --> fidelity[Fidelity-gated regression]
-    fidelity --> nav[Daily graph navigation claim]
-    parser --> packetClaim[Separate packet/search quality claim]
-```
 
 In short: Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby,
 PHP, C#, Kotlin, Swift, Dart, and Bash are fidelity-gated parser-backed graph

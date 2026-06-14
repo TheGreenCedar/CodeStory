@@ -1,14 +1,5 @@
 # Glossary
 
-```mermaid
-flowchart TB
-    grounding[grounding] --> snapshot[snapshot]
-    snapshot --> trail[trail]
-    trail --> packet[packet]
-    retrievalMode["retrieval_mode=full"] --> agentReady[agent packet/search readiness]
-    localReady[local navigation readiness] -.->|"separate lane"| agentReady
-```
-
 - grounding: the process of turning indexed code state into concise, relevant context for a question or tool action
 - snapshot: a derived SQLite-backed grounding view that can be rebuilt from the primary graph tables
 - projection: derived persisted data such as callable projection state or ranked grounding summaries

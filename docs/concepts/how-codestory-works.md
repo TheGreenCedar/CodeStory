@@ -9,14 +9,8 @@ plans a change.
 
 ## The Loop
 
-```mermaid
-flowchart LR
-    doctor[doctor] --> index[index]
-    index --> ground[ground]
-    ground --> search[search]
-    search --> inspect["symbol / trail / snippet / explore"]
-    inspect --> context[context]
-    search --> packet[packet]
+```text
+doctor -> index -> ground -> search -> symbol/trail/snippet/explore -> context
 ```
 
 - `doctor` checks whether the cache, index, retrieval mode, and local embedding
@@ -35,14 +29,6 @@ flowchart LR
 The workflow is a repeatable evidence loop.
 
 ## What Gets Stored
-
-```mermaid
-flowchart LR
-    repo[Repository] --> workspace[Workspace discovery]
-    workspace --> graph["Graph nodes and edges"]
-    graph --> readModels["Snapshots, symbol docs, dense anchors"]
-    readModels --> cliReads[CLI and agent reads]
-```
 
 CodeStory writes per-project state under the user cache, keyed by the target
 workspace path. The cache can include:
@@ -79,12 +65,6 @@ the indexed project evidence lives in the local cache.
   citations, gaps, and follow-up commands.
 
 ## What Good Looks Like
-
-```mermaid
-flowchart LR
-    cite[Cite source files and symbols] --> gaps[State stale or partial evidence]
-    gaps --> nextCmd[Give the next concrete command]
-```
 
 A good CodeStory-backed answer does three things:
 
