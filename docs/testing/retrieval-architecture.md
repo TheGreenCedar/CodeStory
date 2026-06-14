@@ -6,8 +6,9 @@ generic symbol/path roles; benchmark-only probe catalogs remain behind test-only
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
 configuration error, not a diagnostic route.
 
-**Related:** [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) (operator runbook),
-[`../architecture/retrieval-design.md`](../architecture/retrieval-design.md) (module contracts).
+**Related:** [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) (setup,
+env vars, CI smoke), [`../architecture/retrieval-design.md`](../architecture/retrieval-design.md)
+(mode definitions, cost envelopes, promotion guards).
 
 ---
 
@@ -23,11 +24,9 @@ configuration error, not a diagnostic route.
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
 | Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts and `codestory-runtime/src/agent/eval_probes.rs` may name holdout repos only inside their manifest/eval boundary |
 
-**Modes:** `full`, `no_scip`, `no_semantic`, `lexical_only`, `unavailable` — only
-`full` may serve primary packet/search results. All non-`full` modes fail closed. With
-`graph_first_v1`, `full` can be graph/lexical-only only when the manifest dense-anchor count is
-explicitly zero; otherwise Qdrant remains mandatory. See
-[`retrieval-design.md`](../architecture/retrieval-design.md#mandatory-sidecar-mode-matrix).
+**Modes:** See the canonical
+[mode matrix](../architecture/retrieval-design.md#mode-matrix). Only `full` may
+serve primary packet/search results.
 
 **Benchmark manifests:** `benchmarks/tasks/local-real/` is the realistic local
 product corpus; `benchmarks/tasks/holdout-retrieval/` is the public
@@ -53,96 +52,20 @@ quality. Packet-first runs count as agent-useful only when packets marked
 `sufficient` avoid post-packet source reads, or when those reads are explicitly
 classified as source-truth follow-up rather than hidden grounding.
 
-## Environment flags
+## Environment and setup
 
-### Runtime variables
+Version pins, env vars, bootstrap commands, troubleshooting, and CI smoke
+sequences are owned by
+[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md). AST-first policy gates
+and dense-anchor promotion fields are summarized there and in
+[`retrieval-design.md`](../architecture/retrieval-design.md#ast-first-semantic-contract).
 
-`CODESTORY_RETRIEVAL_V2` and `CODESTORY_RETRIEVAL_V2_SHADOW` are no longer migration aliases.
-If either legacy variable is present, packet retrieval fails closed instead of silently mapping it
-to the sidecar-primary contract.
-
-| Variable | Default (production) | Purpose |
-|----------|----------------------|---------|
-| `CODESTORY_RETRIEVAL` | unset → sidecar primary when manifest + `full` mode (else fail closed) | `1` force sidecar primary attempt; `0` is unsupported and fails closed |
-| `CODESTORY_RETRIEVAL_SHADOW` | unsupported for product benchmarks | Historical diagnostic switch; benchmark contract rejects it |
-| `CODESTORY_ZOEKT_ENABLED` | on | `0` is unsupported for product retrieval |
-| `CODESTORY_QDRANT_ENABLED` | on | `0` is unsupported for product retrieval |
-| `CODESTORY_RETRIEVAL_REAL_EMBEDDINGS` | `1` | `0` is unsupported for product retrieval |
-| `CODESTORY_RETRIEVAL_COMPOSE_PROFILE` | `real` | every other profile is unsupported for product bootstrap |
-| `CODESTORY_EMBED_BACKEND` | `llamacpp` | product manifests require llama.cpp bge-base embeddings |
-| `CODESTORY_EMBED_LLAMACPP_URL` | `http://127.0.0.1:8080/v1/embeddings` | local embedding sidecar endpoint |
-| `CODESTORY_ZOEKT_PORT` | `6070` | Zoekt HTTP |
-| `CODESTORY_QDRANT_HTTP_PORT` | `6333` | Qdrant HTTP |
-| `CODESTORY_QDRANT_GRPC_PORT` | `6334` | Qdrant gRPC |
-
-### AST-first policy gates
-
-`graph_first_v1` is the active semantic policy. Product code recall must come from exact
-symbol/AST lookup, lexical source and `symbol_search_doc` virtual docs, component reports, and graph
-expansion before dense anchors are used. Dense anchors are limited to deterministic reasons:
-`public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `component_report`, and
-`unstructured_doc`.
-
-Promotion evidence for this lane must report:
-
-- `symbol_doc_count`
-- `dense_projection_count`
-- `semantic_policy_version`
-- `graph_artifact_hash`
-- dense reason counts
-- search-result provenance labels such as `exact`, `lexical_source`, `symbol_doc`,
-  `graph_neighbor`, `component_report`, and `dense_anchor`
-
-Zero dense anchors are valid only when the policy actually emits zero anchors and graph/lexical
-artifacts are complete. Partial dense anchors, stale policy versions, count mismatches, wrong vector
-dimensions, or stale dense reason counts are fail-closed.
-
-### Benchmark-only flags
-
-Use these when running promotion harnesses. Do not enable in normal production packet runs.
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `CODESTORY_EVAL_PROBES` | ignored in production runtime | Benchmark-shaped probe catalog (`eval_probes.rs`) is test-only; promotion bundles do not inject it. |
-
-**Sidecar promotion candidate (typical):**
-
-```sh
-unset CODESTORY_RETRIEVAL
-unset CODESTORY_EVAL_PROBES
-./target/release/codestory-cli retrieval up
-./target/release/codestory-cli retrieval index --project . --refresh auto
-```
+Benchmark-only flag: `CODESTORY_EVAL_PROBES` is ignored in production runtime
+and must stay test-only.
 
 ---
 
-## Local workflows
-
-### One-command environment setup
-
-From the CodeStory repository root:
-
-```sh
-cargo retrieval-setup
-cargo retrieval-status
-```
-
-Optional Node wrapper (prerequisite report, optional holdout clone):
-`node scripts/setup-retrieval-env.mjs`.
-See [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md#quick-start-one-command).
-
-### Sidecars and index
-
-```sh
-cargo retrieval-setup
-cargo run -p codestory-cli -- retrieval index --project <repo-root> --refresh auto
-cargo run -p codestory-cli -- retrieval query "main" --project <repo-root>
-```
-
-`retrieval bootstrap` (alias `cargo retrieval-setup`) starts Docker Compose when Docker is installed.
-`retrieval up` alone only prepares cache dirs and state (see runbook).
-
-### local-real packet suite (in-scope tuning)
+## Local test workflows
 
 Repos: `codex`, `rootandruntime`, `sourcetrail`, `vscode` — manifests under
 `benchmarks/tasks/local-real/`.
@@ -226,7 +149,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
 | holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
 | `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
-| Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecar-smoke-ci.md`](../contributors/retrieval-sidecar-smoke-ci.md) |
+| Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract) |
 | Ragas/Phoenix nightly eval | optional | Not configured |
 
 ### North-star SLOs (targets — measure before claiming pass)

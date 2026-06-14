@@ -147,3 +147,8 @@ Promotion requires at least:
 - local-real quality that beats the prior accepted baseline,
 - no diagnostic/stub/hash product evidence,
 - docs and runbooks aligned with the current mandatory sidecar contract.
+
+Proof tiers, promotion checklist, and north-star SLOs:
+[`retrieval-architecture.md`](../testing/retrieval-architecture.md). Setup,
+version pins, env vars, and CI smoke:
+[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md).

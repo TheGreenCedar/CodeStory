@@ -44,18 +44,10 @@ Incremental work also does more cleanup:
 
 ## Pipeline
 
-The core path inside `WorkspaceIndexer::run` is:
-
-1. Seed symbol state for incremental runs from existing stored node kinds.
-2. Walk `files_to_index` in chunks using the configured batch sizes.
-3. For each file, normalize the path, load compilation metadata if available, and skip unsupported files before parsing.
-4. Try the artifact cache first. A cache hit can reuse stored nodes, edges, occurrences, component access, and callable projection state without reparsing the file.
-5. Parse cache misses in parallel and turn each file into `IntermediateStorage`.
-6. Merge per-file results into a batched in-memory projection and flush once file, node, edge, or occurrence thresholds are reached.
-7. Flush any remaining batched data.
-8. Run `ResolutionPass` after all projection writes are visible in the store.
-9. Flush collected indexing errors.
-10. For incremental runs, delete removed files from the store.
+The core path inside `WorkspaceIndexer::run` is documented in the
+[indexing pipeline](../indexing-pipeline.md). At a high level: discover files,
+parse or reuse cached artifacts, flush projection batches, run `ResolutionPass`,
+and clean up removed files on incremental runs.
 
 ## What Gets Flushed
 

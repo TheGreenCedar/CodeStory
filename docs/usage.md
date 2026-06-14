@@ -11,35 +11,8 @@ the workspace you are indexing.
 ## Install The Skill
 
 Install the grounding skill once, then point it at explicit target workspaces.
-
-```sh
-SkillHome="<agent-global-skill-directory>"
-mkdir -p "$SkillHome"
-cp -R ./.agents/skills/codestory-grounding "$SkillHome/codestory-grounding"
-bash "$SkillHome/codestory-grounding/scripts/setup.sh"
-```
-
-PowerShell:
-
-```powershell
-$SkillHome = "<agent-global-skill-directory>"
-New-Item -ItemType Directory -Force -Path $SkillHome | Out-Null
-Copy-Item -Recurse -Force .\.agents\skills\codestory-grounding "$SkillHome\codestory-grounding"
-& "$SkillHome\codestory-grounding\scripts\setup.ps1"
-```
-
-The setup script prints the resolved `CODESTORY_CLI` path. Persist it if your
-agent environment does not already preserve the variable between sessions.
-
-```sh
-export CODESTORY_CLI="$HOME/.local/bin/codestory-cli"
-```
-
-PowerShell:
-
-```powershell
-setx CODESTORY_CLI "C:\Users\you\AppData\Local\CodeStory\bin\codestory-cli.exe"
-```
+See [README — Install As An Agent Skill](../README.md#install-as-an-agent-skill)
+for the full copy/setup commands and Windows PowerShell variant.
 
 The source skill package lives at
 [../.agents/skills/codestory-grounding/SKILL.md](../.agents/skills/codestory-grounding/SKILL.md).
@@ -257,32 +230,13 @@ reset, schema change, or suspected stale-state incident.
 
 ## Predictable Output Modes
 
-Most commands default to Markdown because the normal operator path is human
-review. Use `--format markdown` when the output will be read directly in a
-terminal, pasted into a report, or inspected during recovery.
+Most commands default to Markdown for human review. Use `--format json` when automation needs the complete structured result, including exact field comparisons such as `retrieval_mode` or cache paths. Use `--output-file <PATH>` when the artifact should live outside terminal logs. The parent directory must already exist.
 
-Agent-facing Markdown starts with an operator header when the command has enough
-status evidence to do so: `Status`, `Trust`, `Next Action`, and `Proof Tier`
-come before dense citations, diagnostics, or graph details. This is the default
-shape for `doctor`, `ground --why`, `search --why`, `packet`, and `context`.
+`explore` opens the terminal UI by default when a TUI is available. Use `--no-tui`, `--plain`, or `CODESTORY_NO_TUI=1` for predictable command output in agent runs, tests, non-interactive terminals, and CI logs.
 
-`search --why` keeps provenance compact by default. Use
-`search --why --plan-details` only when you need the full broad-query search
-plan, including subqueries, candidate windows, bridge evidence, rejected
-candidates, and source-truth checks.
-
-Use `--format json` when automation needs the complete structured result,
-including fields that Markdown may summarize. JSON is the safer choice for
-tests, scripts, status gates, and any workflow that must compare exact values
-such as `retrieval_mode`, cache paths, or timing fields.
-
-Use `--output-file <PATH>` when a command produces an artifact that should be
-kept separate from terminal logs. The parent directory must already exist.
-Treat the file as the durable result and stdout/stderr as command status.
-
-`explore` opens the terminal UI by default when a TUI is available. Use `--no-tui`,
-`--plain`, or `CODESTORY_NO_TUI=1` for predictable command output in agent runs,
-tests, non-interactive terminals, and CI logs.
+Agent-facing Markdown may start with `Status`, `Trust`, `Next Action`, and
+`Proof Tier` before dense citations. Use `search --why --plan-details` only when
+you need the full broad-query search plan.
 
 ## Retrieval Defaults
 
@@ -507,5 +461,5 @@ changes.
 - [architecture/runtime-execution-path.md](architecture/runtime-execution-path.md)
 - [contributors/debugging.md](contributors/debugging.md)
 - [contributors/testing-matrix.md](contributors/testing-matrix.md)
-- [testing/benchmark-results.md](testing/benchmark-results.md)
+- [testing/benchmark-ledger.md](testing/benchmark-ledger.md)
 - [testing/codestory-stdio-warm-loop-stats.md](testing/codestory-stdio-warm-loop-stats.md)

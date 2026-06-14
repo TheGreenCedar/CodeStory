@@ -91,9 +91,6 @@ cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
-For the CLI navigation branch baseline, see
-[cli-navigation-next-wave-performance-review.md](cli-navigation-next-wave-performance-review.md).
-
 ## Parallelization Candidate Gate
 
 Parallel or async work is allowed only after the baseline shows the exact path

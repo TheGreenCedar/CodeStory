@@ -32,17 +32,15 @@ semantic indexing behavior and cache reuse.
 
 ### Product Direction
 
-Read [project-delight-roadmap.md](project-delight-roadmap.md) for current product
-direction around target context packets, explainable retrieval, navigation UX,
-serving, and setup help. Treat it as direction, not benchmark proof or a
-changelog.
+Read [usage.md](usage.md) and [architecture overview](architecture/overview.md)
+for current operator workflows and navigation surfaces. Treat roadmap notes as
+direction, not benchmark proof or a changelog.
 
 ### Architecture And Documentation Research
 
-Read [decision-log.md](decision-log.md), [architecture overview](architecture/overview.md),
-and [indexing pipeline](architecture/indexing-pipeline.md) for the current
-architecture state. Historical ADR-style notes were collapsed into current
-architecture docs because clear live-system explanations are more useful here.
+Read [architecture overview](architecture/overview.md) and
+[indexing pipeline](architecture/indexing-pipeline.md) for the current
+architecture state.
 
 ## How To Continue Research
 

@@ -7,7 +7,7 @@ Local codebase grounding for coding agents.
 <p align="center">
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 <a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
-<a href="docs/testing/benchmark-results.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
+<a href="docs/testing/benchmark-ledger.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
 CodeStory builds a local evidence layer for a repository. It indexes files,
@@ -67,34 +67,11 @@ Markdown report and full JSON graph export are not source-of-truth state. The ma
 embedding dry-run is a local semantic setup check; it does not prove agent
 packet/search readiness.
 
-Agent packet/search readiness has one extra contract: sidecar packet/search
-evidence is trustworthy only when retrieval status reports `retrieval_mode=full`.
-That full mode depends on local Zoekt, Qdrant, SCIP, and llama.cpp embedding
-sidecars.
-
-```sh
-node scripts/setup-retrieval-env.mjs --fetch-embed-model
-export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
-export CODESTORY_EMBED_BACKEND="llamacpp"
-export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
-
-cargo retrieval-setup
-"$CODESTORY_CLI" index --project "$TARGET_WORKSPACE" --refresh full
-"$CODESTORY_CLI" retrieval index --project "$TARGET_WORKSPACE" --refresh full
-"$CODESTORY_CLI" retrieval status --project "$TARGET_WORKSPACE" --format json
-"$CODESTORY_CLI" doctor --project "$TARGET_WORKSPACE"
-```
-
-The setup wrapper accepts either configured GGUF mirror, but every download is
-written to a temporary file and accepted only when the size is `117974304` bytes
-and the SHA-256 is
-`ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`.
-If an existing model fails that check, remove it and rerun
-`--fetch-embed-model`.
-
-Missing sidecars, stale manifests, disabled sidecars, mixed stored-doc vector
-contracts, or diagnostic embedding modes are setup failures to fix before
-trusting agent-facing packet/search evidence.
+Agent packet/search readiness requires `retrieval_mode=full` from local Zoekt,
+Qdrant, SCIP, and llama.cpp sidecars. See [docs/usage.md](docs/usage.md) for the
+full local-navigation versus sidecar-readiness split and
+[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for sidecar
+setup.
 
 After that first index, use narrower commands instead of asking the agent to
 start over:
@@ -113,26 +90,10 @@ For task-shaped flows, use [docs/usage.md](docs/usage.md).
 
 ## Retrieval sidecars
 
-For Zoekt/Qdrant/SCIP packet retrieval, run once from this repository root
-(Windows, macOS, or Linux):
-
-```sh
-cargo retrieval-setup
-```
-
-`cargo retrieval-setup` builds `codestory-cli` if needed, starts Docker Compose sidecars when
-Docker is available, writes local sidecar state, and waits for health probes. Check status with
-`cargo retrieval-status`.
-
-Bootstrap modifiers (pass through `cargo run`):
-
-```sh
-cargo run -p codestory-cli -- retrieval bootstrap --project . --skip-compose
-cargo run -p codestory-cli -- retrieval bootstrap --project . --wait-secs 120
-```
-
-Thin wrapper (same bootstrap, optional holdout clone): `node scripts/setup-retrieval-env.mjs`.
-Details: [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
+For Zoekt/Qdrant/SCIP packet retrieval, run `cargo retrieval-setup` once from
+this repository root, then follow
+[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for bootstrap
+flags, version pins, and troubleshooting.
 
 ## Install As An Agent Skill
 
@@ -231,7 +192,7 @@ benchmark history from the state of your local cache, which can drift and should
 be checked with `doctor`.
 
 - Public evidence summary and caveats:
-  [docs/testing/benchmark-results.md](docs/testing/benchmark-results.md)
+  [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
 - Repo-scale timing history:
   [docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md)
 - Warm stdio loop evidence:
@@ -257,7 +218,6 @@ workspace shares build locks.
 - [docs/architecture/subsystems/store.md](docs/architecture/subsystems/store.md)
 - [docs/architecture/subsystems/runtime.md](docs/architecture/subsystems/runtime.md)
 - [docs/architecture/subsystems/cli.md](docs/architecture/subsystems/cli.md)
-- [docs/decision-log.md](docs/decision-log.md)
 
 ## License
 

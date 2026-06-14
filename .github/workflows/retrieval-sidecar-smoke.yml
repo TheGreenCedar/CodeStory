@@ -1,5 +1,5 @@
 # Windows retrieval manifest-missing shape smoke.
-# Contract: docs/contributors/retrieval-sidecar-smoke-ci.md
+# Contract: docs/ops/retrieval-sidecars.md#preflight-smoke-contract
 
 name: retrieval-sidecar-smoke
 
@@ -25,7 +25,6 @@ on:
       - scripts/lint-retrieval-generalization.mjs
       - scripts/**retrieval**
       - docs/ops/retrieval-sidecars.md
-      - docs/contributors/retrieval-sidecar-smoke-ci.md
       - docs/architecture/retrieval-*.md
       - docs/testing/retrieval-architecture.md
       - docker/retrieval-compose.yml

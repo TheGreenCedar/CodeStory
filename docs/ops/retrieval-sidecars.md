@@ -11,7 +11,11 @@ and `affected` can be useful with a healthy local cache, but that cache alone
 does not prove packet/search sidecar readiness.
 
 **Design reference:** [`retrieval-design.md`](../architecture/retrieval-design.md)
-(sidecar pins, degraded modes, preflight).
+(mode definitions, cost envelopes, promotion guards).
+
+**Operations reference:** this runbook owns setup commands, version pins, env
+vars, troubleshooting, and CI smoke sequences. Proof tiers and promotion
+checklists live in [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
 
 ---
 
@@ -371,6 +375,39 @@ and the ignored `retrieval_eval_*` tests with `CODESTORY_RETRIEVAL_EVAL_FULL_TES
 
 **Failure policy:** PRs touching `codestory-retrieval` or sidecar wiring fail CI if smoke fails.
 
+**CI trigger paths:** match
+[`.github/workflows/retrieval-sidecar-smoke.yml`](../../.github/workflows/retrieval-sidecar-smoke.yml)
+`paths:` filters — `crates/codestory-retrieval/**`, `crates/codestory-contracts/**`,
+`crates/codestory-store/Cargo.toml`, `crates/codestory-store/src/**`, `crates/codestory-cli`
+retrieval/stdio sources (`retrieval.rs`, `main.rs`, `args.rs`, `runtime.rs`, `stdio_*.rs`),
+`crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs`,
+`search_json_output.rs`, `stdio_protocol_contracts.rs`, `crates/codestory-runtime/src/**`,
+`crates/codestory-runtime/tests/retrieval_generalization_guard.rs`,
+`crates/codestory-indexer/Cargo.toml`, `crates/codestory-indexer/src/lib.rs`,
+`scripts/lint-retrieval-generalization.mjs`, `scripts/**retrieval**`,
+`docs/ops/retrieval-sidecars.md`, `docs/architecture/retrieval-*.md`,
+`docs/testing/retrieval-architecture.md`, `docker/retrieval-compose.yml`, and the workflow file itself.
+
+**CI pass criteria (Windows `retrieval-sidecar-smoke`):**
+
+1. Generalization lint exits 0.
+2. Rust cache restore/save completes or gracefully misses without masking later failures.
+3. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and non-`full` mode on a clean temp project before indexing.
+4. `cargo test -p codestory-runtime --lib` exits 0.
+5. `cargo test -p codestory-runtime --test retrieval_generalization_guard` exits 0.
+6. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
+7. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
+8. `cargo test -p codestory-retrieval` exits 0.
+
+The workflow restores a Rust build cache before the Cargo steps; a new cache key may
+still pay one cold compile, but later pushes should reuse the warmed target and Cargo
+dependency state. The manifest-missing smoke lives in `retrieval_bootstrap_contracts`
+so Cargo builds the CLI through the integration-test path instead of paying for a
+standalone build step before the tests. The Rust cache is configured to save even on
+failure, which keeps failed follow-up pushes from repeatedly paying the full Windows
+cold-compile cost. `retrieval_generalization_guard` invokes the same lint from Rust for
+cross-platform CI parity.
+
 **Holdout prefetch (benchmark harness, not sidecar CLI):**
 
 ```sh
@@ -395,9 +432,9 @@ Clones land in `target/agent-benchmark/repos/` (gitignored).
 
 ## Mandatory sidecar modes (operator view)
 
-When a sidecar is down, the sidecar executor selects a non-`full` mode per design matrix — see
-[`retrieval-design.md`](../architecture/retrieval-design.md#mandatory-sidecar-mode-matrix).
-Non-`full` modes are diagnostic only and fail closed for product packet/search paths.
+When a sidecar is down, the sidecar executor selects a non-`full` mode per the
+[mode matrix](../architecture/retrieval-design.md#mode-matrix). Non-`full` modes
+are diagnostic only and fail closed for product packet/search paths.
 
 | Condition | User-visible mode | Action |
 |-----------|-------------------|--------|
@@ -443,6 +480,5 @@ project file to provide network endpoints for that run.
 
 ## Related docs
 
-- [`retrieval-architecture.md`](../testing/retrieval-architecture.md) — promotion guide and checklist
-- [`retrieval-design.md`](../architecture/retrieval-design.md) — mandatory sidecar mode matrix and module contracts
-- [`retrieval-sidecar-smoke-ci.md`](../contributors/retrieval-sidecar-smoke-ci.md) — CI job stub
+- [`retrieval-architecture.md`](../testing/retrieval-architecture.md) — proof tiers, promotion checklist, and north-star SLOs
+- [`retrieval-design.md`](../architecture/retrieval-design.md) — mode definitions, cost envelopes, and promotion guards

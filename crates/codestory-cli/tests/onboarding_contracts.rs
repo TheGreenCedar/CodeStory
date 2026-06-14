@@ -187,7 +187,7 @@ fn readme_keeps_customer_first_onboarding() {
     assert!(readme.contains("docs/usage.md"));
     assert!(readme.contains("docs/concepts/how-codestory-works.md"));
     assert!(readme.contains("docs/architecture/language-support.md"));
-    assert!(readme.contains("docs/testing/benchmark-results.md"));
+    assert!(readme.contains("docs/testing/benchmark-ledger.md"));
     assert!(readme.contains(
         r#""$CODESTORY_CLI" setup embeddings --project "$TARGET_WORKSPACE" --dry-run --format json"#
     ));
@@ -216,7 +216,6 @@ fn readme_keeps_customer_first_onboarding() {
         "docs/contributors/getting-started.md",
         "docs/contributors/debugging.md",
         "docs/contributors/testing-matrix.md",
-        "docs/decision-log.md",
         ".agents/skills/codestory-grounding/scripts/setup.ps1",
         ".agents/skills/codestory-grounding/scripts/setup.sh",
         "scripts/codestory-agent-ab-benchmark.mjs",
@@ -256,8 +255,8 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
         .expect("testing matrix should exist");
     let language_support = fs::read_to_string(root.join("docs/architecture/language-support.md"))
         .expect("language support doc should exist");
-    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
-        .expect("benchmark scorecard should exist");
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-ledger.md"))
+        .expect("benchmark ledger should exist");
 
     assert!(
         readme.contains(
@@ -287,9 +286,9 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
         "testing matrix should not present an old hard-coded baseline as current"
     );
     assert!(
-        benchmark_scorecard.contains("[benchmark ledger](benchmark-ledger.md)")
+        benchmark_scorecard.contains("## Current Scorecard")
             && benchmark_scorecard.contains("codestory-e2e-stats-log.md"),
-        "benchmark scorecard should link detailed history and living timing logs"
+        "benchmark ledger should keep the scorecard and living timing log references"
     );
     for required in [
         "parser-backed graph",
@@ -322,10 +321,6 @@ fn docs_drift_contracts_keep_living_sources_explicit() {
     assert!(
         root.join("docs/testing/benchmark-ledger.md").exists(),
         "benchmark ledger should preserve detailed historical rows"
-    );
-    assert!(
-        root.join("docs/review-action-plan.md").exists(),
-        "review action plan should preserve the external review remediation trail"
     );
 }
 
@@ -401,8 +396,8 @@ fn usage_doc_names_two_readiness_tracks_and_predictable_output_modes() {
 #[test]
 fn benchmark_docs_show_proof_tier_ladder() {
     let root = repo_root();
-    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-results.md"))
-        .expect("benchmark scorecard should exist");
+    let benchmark_scorecard = fs::read_to_string(root.join("docs/testing/benchmark-ledger.md"))
+        .expect("benchmark ledger should exist");
 
     assert!(benchmark_scorecard.contains("## Proof Tier Ladder"));
     for tier in [
@@ -413,7 +408,7 @@ fn benchmark_docs_show_proof_tier_ladder() {
     ] {
         assert!(
             benchmark_scorecard.contains(tier),
-            "benchmark scorecard should explain proof tier {tier}"
+            "benchmark ledger should explain proof tier {tier}"
         );
     }
     assert!(benchmark_scorecard.contains("Full sidecar readiness, agent packet/search readiness"));

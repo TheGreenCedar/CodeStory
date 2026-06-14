@@ -6,34 +6,13 @@ This page describes the current command path for the core CLI workflows:
 
 ## Index Command
 
-```mermaid
-sequenceDiagram
-    participant CLI as codestory-cli
-    participant Runtime as codestory-runtime
-    participant Workspace as codestory-workspace
-    participant Indexer as codestory-indexer
-    participant Store as codestory-store
-    participant Search as runtime search
+See [indexing pipeline](indexing-pipeline.md) for the full indexing lifecycle,
+refresh modes, and staged snapshot publish path.
 
-    CLI->>Runtime: parse args and build context
-    Runtime->>Workspace: open project and compute refresh inputs
-    Workspace-->>Runtime: refresh plan
-    Runtime->>Store: open staged or live store
-    Runtime->>Indexer: run WorkspaceIndexer
-    Indexer->>Store: flush graph, projections, search docs
-    Runtime->>Store: publish staged snapshot when a full refresh completes
-    Runtime->>Search: sync lexical projection, symbol docs, component reports, and dense anchors
-    Search->>Store: reuse, embed, upsert, reload, and prune selected dense anchors
-```
-
-1. `codestory-cli` parses the request and builds a runtime context.
-2. `codestory-runtime` opens the project root, store path, and workspace manifest.
-3. `codestory-workspace` computes the refresh plan from discovery plus stored file inventory.
-4. `codestory-runtime` opens a staged or live store depending on refresh mode.
-5. `codestory-indexer::WorkspaceIndexer` parses files, extracts graph artifacts, flushes projection batches, and runs resolution.
-6. `codestory-store` updates graph rows, occurrence rows, callable projection state, search-doc rows, and snapshot invalidation state.
-7. Runtime finalizes staged builds through `SnapshotStore` and publishes the finished snapshot when a full refresh completes.
-8. Runtime refreshes the search-symbol projection, writes graph-native `symbol_search_doc` rows, writes component reports, and synchronizes selected dense anchors before returning the index summary.
+At runtime, `codestory-cli` delegates to `codestory-runtime`, which opens the
+workspace refresh plan, runs `codestory-indexer::WorkspaceIndexer`, flushes graph
+and search projections through `codestory-store`, and synchronizes symbol docs,
+component reports, and selected dense anchors before returning the index summary.
 
 Default index runs do not defer symbol docs. When embedding assets are available, the returned retrieval state reports the selected dense-anchor corpus for `graph_first_v1`; that corpus may be zero for graph-only projects. If embedding assets are missing, runtime still completes graph, lexical, symbol-doc, and component-report state and reports the degraded-state reason instead of pretending dense retrieval is ready.
 
@@ -121,7 +100,7 @@ stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
 reports cache/index/retrieval health without mutating state.
 
 `explore` remains the browser surface until the
-[browser surface gate](browser-surface-gate.md) is satisfied. Do not add a
+[browser surface gate](overview.md#browser-surface-gate) is satisfied. Do not add a
 separate `browse` command, web UI route, or browser-specific UI without
 current manifest, warm-loop, stress-lane, explore, and screenshot-review
 evidence.
