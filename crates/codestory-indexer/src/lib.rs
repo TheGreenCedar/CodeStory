@@ -34,6 +34,21 @@ pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
 
+pub(crate) const PYTHON_ATTRIBUTE_CALLSITE_MARKER: &str = "syntax:python-attribute-call";
+pub(crate) const CPP_MEMBER_CALLSITE_MARKER: &str = "syntax:cpp-member-call";
+pub(crate) const GO_SELECTOR_CALLSITE_MARKER: &str = "syntax:go-selector-call";
+pub(crate) const JAVA_MEMBER_CALLSITE_MARKER: &str = "syntax:java-member-call";
+pub(crate) const CSHARP_MEMBER_CALLSITE_MARKER: &str = "syntax:csharp-member-call";
+pub(crate) const RUBY_MEMBER_CALLSITE_MARKER: &str = "syntax:ruby-member-call";
+pub(crate) const PHP_MEMBER_CALLSITE_MARKER: &str = "syntax:php-member-call";
+pub(crate) const JS_MEMBER_CALLSITE_MARKER: &str = "syntax:js-member-call";
+pub(crate) const TS_MEMBER_CALLSITE_MARKER: &str = "syntax:ts-member-call";
+pub(crate) const KOTLIN_MEMBER_CALLSITE_MARKER: &str = "syntax:kotlin-member-call";
+pub(crate) const DART_MEMBER_CALLSITE_MARKER: &str = "syntax:dart-member-call";
+pub(crate) const SWIFT_MEMBER_CALLSITE_MARKER: &str = "syntax:swift-member-call";
+pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
+pub(crate) const RECEIVER_MODULE_CALLSITE_PREFIX: &str = "receiver-module:";
+
 #[derive(Debug, Clone, Copy)]
 struct IndexFeatureFlags {
     legacy_edge_identity: bool,
@@ -1852,10 +1867,59 @@ struct ManualMemberEdgeSpec {
 struct ManualReceiverCallSpec {
     source_name: String,
     source_span: GraphNodeSpan,
+    receiver_name: String,
     owner_name: String,
+    owner_module: Option<String>,
+    method_name: String,
+    method_col: Option<u32>,
+    line: Option<u32>,
+    allow_global_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReceiverCallSiteKey {
+    receiver_name: String,
     method_name: String,
     line: Option<u32>,
+    method_col: Option<u32>,
 }
+
+struct ManualReceiverSource<'a> {
+    name: &'a str,
+    span: GraphNodeSpan,
+}
+
+struct ReceiverPlaceholderAnnotation<'a> {
+    line: Option<u32>,
+    method_col: Option<u32>,
+    method_name: &'a str,
+    owner_name: &'a str,
+    owner_module: Option<&'a str>,
+}
+
+struct CallPlaceholderMarkerAnnotation<'a> {
+    line: Option<u32>,
+    method_col: Option<u32>,
+    method_name: &'a str,
+    marker: &'static str,
+}
+
+fn receiver_annotation_required_callsite_marker(language_name: &str) -> Option<&'static str> {
+    match language_name {
+        "python" => Some(PYTHON_ATTRIBUTE_CALLSITE_MARKER),
+        "php" => Some(PHP_MEMBER_CALLSITE_MARKER),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportedTypeBinding {
+    module_name: String,
+    owner_name: String,
+}
+
+type ReceiverOwnerBinding = (String, Option<String>);
+type OptionalReceiverOwnerBinding = Option<ReceiverOwnerBinding>;
 
 #[derive(Debug, Clone)]
 struct ManualPreciseCallSpec {
@@ -2271,6 +2335,8 @@ struct RuntimeImportSpec {
     binding_node_id: Option<NodeId>,
     module_node_id: NodeId,
     line: u32,
+    suppress_line: u32,
+    suppress_start_col: u32,
     suppress_callee_name: String,
 }
 
@@ -3624,6 +3690,410 @@ fn collect_javascript_static_call_edges(tree: &Tree, source: &str) -> Vec<Manual
     edges
 }
 
+fn collect_javascript_receiver_call_edges(
+    tree: &Tree,
+    source: &str,
+) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    let imported_type_bindings =
+        collect_typescript_imported_type_bindings(tree.root_node(), source);
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if !matches!(
+            callable.kind(),
+            "method_definition" | "function_declaration" | "arrow_function"
+        ) {
+            return;
+        }
+        let Some(source_name) = js_like_callable_source_name(callable, source) else {
+            return;
+        };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut local_receiver_callsites = HashSet::new();
+        collect_javascript_constructor_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &imported_type_bindings,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
+        let mut receiver_types = HashMap::new();
+        if let Some(owner_name) = enclosing_node_with_kind(callable, &["class_declaration"])
+            .and_then(|owner| declaration_name(owner, source))
+            && callable.kind() == "method_definition"
+        {
+            receiver_types.insert("this".to_string(), owner_name);
+        }
+        let property_receiver_types = collect_javascript_class_property_receiver_types(
+            callable,
+            source,
+            &imported_type_bindings,
+        );
+        receiver_types.extend(
+            property_receiver_types
+                .iter()
+                .map(|(receiver_name, (owner_name, _))| {
+                    (receiver_name.clone(), owner_name.clone())
+                }),
+        );
+        if receiver_types.is_empty() {
+            return;
+        }
+        let mut receiver_modules = HashMap::new();
+        for (receiver_name, (_, owner_module)) in &property_receiver_types {
+            if let Some(module_name) = owner_module {
+                receiver_modules.insert(receiver_name.clone(), module_name.clone());
+            }
+        }
+        let start = edges.len();
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &receiver_types,
+            javascript_member_call,
+            false,
+            &mut edges,
+        );
+        let mut fallback_specs = edges.split_off(start);
+        fallback_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut fallback_specs {
+            if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
+                spec.owner_module = Some(module_name.clone());
+            }
+        }
+        edges.extend(fallback_specs);
+    });
+    edges
+}
+
+fn js_like_callable_source_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "function_declaration" | "method_definition" => declaration_name(node, source),
+        "arrow_function" => node
+            .parent()
+            .and_then(|parent| tsx_callable_binding_name(parent, source)),
+        _ => None,
+    }
+}
+
+fn collect_javascript_constructor_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = javascript_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some(owner) = javascript_visible_local_constructor_receiver_owner(
+            callable,
+            node,
+            &receiver_name,
+            source,
+            imported_type_bindings,
+        ) else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn javascript_visible_local_constructor_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "variable_declarator"
+            || !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+            || !js_ts_local_binding_visible_at_call(node, call_node)
+        {
+            return;
+        }
+        let Some(binding_name) = node
+            .child_by_field_name("name")
+            .and_then(|name_node| trimmed_node_text(name_node, source))
+            .as_deref()
+            .and_then(normalize_parameter_name)
+        else {
+            return;
+        };
+        if binding_name != receiver_name {
+            return;
+        }
+        visible_bindings.push((
+            node.end_byte(),
+            javascript_constructor_receiver_owner(node, callable, source, imported_type_bindings),
+        ));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn javascript_constructor_receiver_owner(
+    node: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let value_node = node.child_by_field_name("value")?;
+    javascript_new_expression_receiver_owner(
+        value_node,
+        callable,
+        node,
+        source,
+        imported_type_bindings,
+    )
+}
+
+fn javascript_new_expression_receiver_owner(
+    value_node: TsNode<'_>,
+    scope_node: TsNode<'_>,
+    before_node: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    if value_node.kind() != "new_expression" {
+        return None;
+    }
+    let owner_name = value_node
+        .child_by_field_name("constructor")
+        .filter(|constructor| constructor.kind() == "identifier")
+        .and_then(|constructor| trimmed_node_text(constructor, source))
+        .as_deref()
+        .and_then(normalize_parameter_name)?;
+    if js_ts_visible_local_type_name(scope_node, before_node, &owner_name, source) {
+        return Some((owner_name, None));
+    }
+    imported_type_bindings
+        .get(&owner_name)
+        .map(|binding| {
+            (
+                binding.owner_name.clone(),
+                Some(binding.module_name.clone()),
+            )
+        })
+        .or(Some((owner_name, None)))
+}
+
+fn js_ts_visible_local_type_name(
+    callable: TsNode<'_>,
+    before_node: TsNode<'_>,
+    owner_name: &str,
+    source: &str,
+) -> bool {
+    let mut found = false;
+    walk_tree_nodes(callable, &mut |node| {
+        if found
+            || !matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "enum_declaration"
+            )
+            || !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > before_node.start_byte()
+            || !js_ts_local_binding_visible_at_call(node, before_node)
+        {
+            return;
+        }
+        if declaration_name(node, source).as_deref() == Some(owner_name) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn js_ts_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = js_ts_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = js_ts_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn js_ts_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["statement_block", "block", "program"])
+}
+
+fn collect_javascript_class_property_receiver_types(
+    callable: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> HashMap<String, ReceiverOwnerBinding> {
+    let mut receiver_types = HashMap::new();
+    if callable.kind() != "method_definition" || javascript_method_is_static(callable, source) {
+        return receiver_types;
+    }
+    let Some(class_node) = enclosing_node_with_kind(callable, &["class_declaration"]) else {
+        return receiver_types;
+    };
+    let mut candidates: HashMap<String, Vec<OptionalReceiverOwnerBinding>> = HashMap::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        let Some((receiver_name, scope_node, value_node)) =
+            javascript_property_receiver_candidate(node, class_node, source)
+        else {
+            return;
+        };
+        let owner_name = javascript_new_expression_receiver_owner(
+            value_node,
+            scope_node,
+            node,
+            source,
+            imported_type_bindings,
+        );
+        candidates
+            .entry(receiver_name)
+            .or_default()
+            .push(owner_name);
+    });
+    for (receiver_name, owners) in candidates {
+        let Some(mut concrete_owners) = owners.into_iter().collect::<Option<Vec<_>>>() else {
+            continue;
+        };
+        concrete_owners.sort();
+        concrete_owners.dedup();
+        if concrete_owners.len() == 1 {
+            receiver_types.insert(receiver_name, concrete_owners.remove(0));
+        }
+    }
+    receiver_types
+}
+
+fn javascript_property_receiver_candidate<'tree>(
+    node: TsNode<'tree>,
+    class_node: TsNode<'tree>,
+    source: &str,
+) -> Option<(String, TsNode<'tree>, TsNode<'tree>)> {
+    if node.kind() == "assignment_expression"
+        && javascript_assignment_matches_instance_property_domain(node, class_node, source)
+    {
+        let receiver_name = node
+            .child_by_field_name("left")
+            .and_then(|left| javascript_this_property_receiver_name(left, source))?;
+        let scope_node =
+            enclosing_node_with_kind(node, &["method_definition"]).unwrap_or(class_node);
+        return Some((
+            receiver_name,
+            scope_node,
+            node.child_by_field_name("right")?,
+        ));
+    }
+    if matches!(node.kind(), "field_definition" | "public_field_definition")
+        && typescript_property_belongs_to_owner(node, class_node)
+        && !javascript_surface_starts_with_static(node, source)
+    {
+        let field_name = javascript_class_field_name(node, source)?;
+        return Some((
+            format!("this.{field_name}"),
+            class_node,
+            node.child_by_field_name("value")?,
+        ));
+    }
+    None
+}
+
+fn javascript_class_field_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|name| trimmed_node_text(name, source))
+        .or_else(|| {
+            trimmed_node_text(node, source).map(|surface| {
+                surface
+                    .split('=')
+                    .next()
+                    .unwrap_or(surface.as_str())
+                    .trim()
+                    .to_string()
+            })
+        })
+        .as_deref()
+        .and_then(normalize_parameter_name)
+}
+
+fn javascript_assignment_matches_instance_property_domain(
+    assignment: TsNode<'_>,
+    class_node: TsNode<'_>,
+    source: &str,
+) -> bool {
+    if !enclosing_node_with_kind(assignment, &["class_declaration"])
+        .is_some_and(|owner| same_ts_span(owner, class_node))
+    {
+        return false;
+    }
+    let Some(method) = enclosing_node_with_kind(assignment, &["method_definition"]) else {
+        return false;
+    };
+    if javascript_method_is_static(method, source)
+        || !enclosing_node_with_kind(method, &["class_declaration"])
+            .is_some_and(|owner| same_ts_span(owner, class_node))
+    {
+        return false;
+    }
+    receiver_call_belongs_to_callable(assignment, method)
+}
+
+fn javascript_method_is_static(method: TsNode<'_>, source: &str) -> bool {
+    javascript_surface_starts_with_static(method, source)
+}
+
+fn javascript_surface_starts_with_static(node: TsNode<'_>, source: &str) -> bool {
+    trimmed_node_text(node, source).is_some_and(|surface| {
+        surface
+            .trim_start()
+            .strip_prefix("static")
+            .is_some_and(|rest| rest.chars().next().is_none_or(|ch| ch.is_whitespace()))
+    })
+}
+
+fn javascript_this_property_receiver_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    let receiver_name = normalized_receiver_variable(node, source)?;
+    let field_name = receiver_name.strip_prefix("this.")?;
+    Some(format!("this.{}", normalize_parameter_name(field_name)?))
+}
+
 fn rust_macro_owner_name(mut node: TsNode<'_>, source: &str) -> Option<String> {
     while let Some(parent) = node.parent() {
         if parent.kind() == "function_item" {
@@ -3955,10 +4425,35 @@ fn collect_runtime_import_specs(
             symbol_table,
         );
     }
-    if !matches!(language_name, "javascript" | "typescript" | "tsx") {
-        return Vec::new();
+    if matches!(language_name, "javascript" | "typescript" | "tsx") {
+        return collect_javascript_runtime_import_specs(
+            file_name,
+            tree,
+            source,
+            unique_nodes,
+            symbol_table,
+        );
+    }
+    if language_name == "ruby" {
+        return collect_ruby_runtime_import_specs(
+            file_name,
+            tree,
+            source,
+            unique_nodes,
+            symbol_table,
+        );
     }
 
+    Vec::new()
+}
+
+fn collect_javascript_runtime_import_specs(
+    file_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    symbol_table: Option<&Arc<SymbolTable>>,
+) -> Vec<RuntimeImportSpec> {
     let mut specs = Vec::new();
     walk_tree_nodes(tree.root_node(), &mut |node| {
         if node.kind() != "call_expression" {
@@ -4004,6 +4499,8 @@ fn collect_runtime_import_specs(
         let start = module_node.start_position();
         let end = module_node.end_position();
         let line = start.row as u32 + 1;
+        let suppress_line = node.start_position().row as u32 + 1;
+        let suppress_start_col = function_node.start_position().column as u32 + 1;
         let canonical_seed = format!("{file_name}:{module_name}:{line}");
         let module_node_id = NodeId(generate_id(&canonical_seed));
         unique_nodes.entry(module_node_id).or_insert_with(|| Node {
@@ -4029,6 +4526,85 @@ fn collect_runtime_import_specs(
             ),
             module_node_id,
             line,
+            suppress_line,
+            suppress_start_col,
+            suppress_callee_name: callee_name,
+        });
+    });
+    specs
+}
+
+fn collect_ruby_runtime_import_specs(
+    file_name: &str,
+    tree: &Tree,
+    source: &str,
+    unique_nodes: &mut HashMap<NodeId, Node>,
+    symbol_table: Option<&Arc<SymbolTable>>,
+) -> Vec<RuntimeImportSpec> {
+    let mut specs = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        if node.kind() != "call" {
+            return;
+        }
+        if node.child_by_field_name("receiver").is_some() {
+            return;
+        }
+        let Some(method_node) = node.child_by_field_name("method") else {
+            return;
+        };
+        let Some(callee_name) =
+            node_source_text(method_node, source).map(|name| name.trim().to_string())
+        else {
+            return;
+        };
+        if callee_name != "require" && callee_name != "require_relative" {
+            return;
+        }
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let mut cursor = arguments.walk();
+        let argument_nodes = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+        let [module_node] = argument_nodes.as_slice() else {
+            return;
+        };
+        if module_node.kind() != "string" {
+            return;
+        }
+        let Some(module_name) = node_source_text(*module_node, source)
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .filter(|name| quoted_literal_surface(name).is_some())
+            .filter(|name| !name.contains("#{"))
+        else {
+            return;
+        };
+        let start = module_node.start_position();
+        let end = module_node.end_position();
+        let line = start.row as u32 + 1;
+        let suppress_line = node.start_position().row as u32 + 1;
+        let suppress_start_col = method_node.start_position().column as u32 + 1;
+        let canonical_seed = format!("{file_name}:{module_name}:{line}");
+        let module_node_id = NodeId(generate_id(&canonical_seed));
+        unique_nodes.entry(module_node_id).or_insert_with(|| Node {
+            id: module_node_id,
+            kind: NodeKind::MODULE,
+            serialized_name: module_name,
+            start_line: Some(line),
+            start_col: Some(start.column as u32 + 1),
+            end_line: Some(end.row as u32 + 1),
+            end_col: Some(end.column as u32 + 1),
+            ..Default::default()
+        });
+        if let Some(table) = symbol_table {
+            table.insert(module_node_id.0, NodeKind::MODULE);
+        }
+        specs.push(RuntimeImportSpec {
+            binding_node_id: None,
+            module_node_id,
+            line,
+            suppress_line,
+            suppress_start_col,
             suppress_callee_name: callee_name,
         });
     });
@@ -4078,6 +4654,8 @@ fn collect_bash_source_import_specs(
         let start = module_node.start_position();
         let end = module_node.end_position();
         let line = start.row as u32 + 1;
+        let suppress_line = node.start_position().row as u32 + 1;
+        let suppress_start_col = name_node.start_position().column as u32 + 1;
         let canonical_seed = format!("{file_name}:{module_name}:{line}");
         let module_node_id = NodeId(generate_id(&canonical_seed));
         unique_nodes.entry(module_node_id).or_insert_with(|| Node {
@@ -4097,6 +4675,8 @@ fn collect_bash_source_import_specs(
             binding_node_id: None,
             module_node_id,
             line,
+            suppress_line,
+            suppress_start_col,
             suppress_callee_name: callee_name,
         });
     });
@@ -4395,6 +4975,7 @@ fn append_manual_precise_call_edges(
             edge_keys,
             flags,
             spec.line,
+            None,
             &spec.target_name,
         );
 
@@ -4461,16 +5042,7 @@ fn language_member_specs(
             &["class", "module"],
             &["method", "singleton_method"],
         ),
-        "php" => collect_enclosing_type_member_edges(
-            tree,
-            source,
-            &[
-                "class_declaration",
-                "interface_declaration",
-                "trait_declaration",
-            ],
-            &["method_declaration"],
-        ),
+        "php" => collect_php_member_edges(tree, source),
         "csharp" => collect_enclosing_type_member_edges(
             tree,
             source,
@@ -4504,7 +5076,7 @@ fn append_manual_member_edges(
             context.unique_nodes,
             &spec.source_name,
             spec.source_span,
-            is_type_like_kind,
+            manual_member_source_kind,
         ) else {
             continue;
         };
@@ -4512,7 +5084,7 @@ fn append_manual_member_edges(
             context.unique_nodes,
             &spec.target_name,
             spec.target_span,
-            |kind| kind == NodeKind::METHOD,
+            manual_member_target_kind,
         ) else {
             continue;
         };
@@ -4535,17 +5107,30 @@ fn append_manual_member_edges(
     }
 }
 
+fn manual_member_source_kind(kind: NodeKind) -> bool {
+    is_type_like_kind(kind) || matches!(kind, NodeKind::MODULE | NodeKind::NAMESPACE)
+}
+
+fn manual_member_target_kind(kind: NodeKind) -> bool {
+    kind == NodeKind::METHOD || is_type_like_kind(kind)
+}
+
 fn language_receiver_call_specs(
     language_name: &str,
     tree: &Tree,
     source: &str,
 ) -> Vec<ManualReceiverCallSpec> {
     match language_name {
+        "javascript" => collect_javascript_receiver_call_edges(tree, source),
+        "python" => collect_python_receiver_call_edges(tree, source),
+        "typescript" | "tsx" => collect_typescript_receiver_call_edges(tree, source),
+        "java" => collect_java_receiver_call_edges(tree, source),
         "go" => collect_go_receiver_call_edges(tree, source),
         "ruby" => collect_ruby_receiver_call_edges(tree, source),
         "php" => collect_php_receiver_call_edges(tree, source),
         "csharp" => collect_csharp_receiver_call_edges(tree, source),
         "kotlin" => collect_kotlin_receiver_call_edges(tree, source),
+        "cpp" => collect_cpp_receiver_call_edges(tree, source),
         "swift" => collect_swift_receiver_call_edges(tree, source),
         "dart" => collect_dart_receiver_call_edges(tree, source),
         _ => Vec::new(),
@@ -4564,6 +5149,17 @@ fn append_manual_receiver_call_edges(
     flags: IndexFeatureFlags,
     callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
 ) {
+    if language_name == "ruby" {
+        annotate_ruby_member_call_placeholders(
+            tree,
+            source,
+            unique_nodes,
+            result_edges,
+            edge_keys,
+            flags,
+        );
+    }
+
     for spec in language_receiver_call_specs(language_name, tree, source) {
         let Some(source_id) =
             node_id_by_name_and_span(unique_nodes, &spec.source_name, spec.source_span, |kind| {
@@ -4572,12 +5168,77 @@ fn append_manual_receiver_call_edges(
         else {
             continue;
         };
+        if let Some(owner_module) = spec.owner_module.as_deref() {
+            let annotated_index = annotate_receiver_call_placeholder_owner(
+                unique_nodes,
+                result_edges,
+                edge_keys,
+                flags,
+                ReceiverPlaceholderAnnotation {
+                    line: spec.line,
+                    method_col: spec.method_col,
+                    method_name: &spec.method_name,
+                    owner_name: &spec.owner_name,
+                    owner_module: Some(owner_module),
+                },
+                receiver_annotation_required_callsite_marker(language_name),
+            );
+            let should_append_manual = if language_name == "dart" {
+                if let Some(index) = annotated_index {
+                    if let Some(edge) = result_edges.get(index) {
+                        edge_keys.remove(&edge_dedup_key(edge, flags));
+                    }
+                    result_edges.remove(index);
+                }
+                true
+            } else {
+                annotated_index.is_none()
+            };
+            if should_append_manual {
+                append_manual_receiver_call_placeholder_edge(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    ManualReceiverCallPlaceholder {
+                        source_id,
+                        file_id,
+                        line: spec.line,
+                        method_col: spec.method_col,
+                        method_name: &spec.method_name,
+                        owner_name: &spec.owner_name,
+                        owner_module,
+                    },
+                    callsite_ordinals,
+                );
+            }
+            continue;
+        }
+
         let Some(target_id) = member_target_id_by_owner_and_method(
             unique_nodes,
             result_edges,
             &spec.owner_name,
             &spec.method_name,
+            file_id,
+            spec.allow_global_fallback,
         ) else {
+            if language_name == "python" && !is_python_implicit_receiver(&spec.receiver_name) {
+                annotate_receiver_call_placeholder_owner(
+                    unique_nodes,
+                    result_edges,
+                    edge_keys,
+                    flags,
+                    ReceiverPlaceholderAnnotation {
+                        line: spec.line,
+                        method_col: spec.method_col,
+                        method_name: &spec.method_name,
+                        owner_name: &spec.owner_name,
+                        owner_module: spec.owner_module.as_deref(),
+                    },
+                    Some(PYTHON_ATTRIBUTE_CALLSITE_MARKER),
+                );
+            }
             continue;
         };
 
@@ -4587,6 +5248,7 @@ fn append_manual_receiver_call_edges(
             edge_keys,
             flags,
             spec.line,
+            spec.method_col,
             &spec.method_name,
         );
 
@@ -4616,11 +5278,249 @@ fn append_manual_receiver_call_edges(
     }
 }
 
+fn annotate_ruby_member_call_placeholders(
+    tree: &Tree,
+    source: &str,
+    nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+) {
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        let Some((_, method_name)) = ruby_receiver_call(node, source) else {
+            return;
+        };
+        annotate_call_placeholder_marker(
+            nodes,
+            edges,
+            edge_keys,
+            flags,
+            CallPlaceholderMarkerAnnotation {
+                line: Some(node.start_position().row as u32 + 1),
+                method_col: member_call_method_col(node, source, &method_name),
+                method_name: &method_name,
+                marker: RUBY_MEMBER_CALLSITE_MARKER,
+            },
+        );
+    });
+}
+
+fn annotate_call_placeholder_marker(
+    nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    annotation: CallPlaceholderMarkerAnnotation<'_>,
+) -> Option<usize> {
+    let mut fallback_index = None;
+    let mut exact_index = None;
+    for (index, edge) in edges.iter().enumerate() {
+        if edge.kind != EdgeKind::CALL
+            || edge.line != annotation.line
+            || edge.resolved_target.is_some()
+            || !nodes
+                .get(&edge.target)
+                .map(|target| {
+                    call_placeholder_matches_method(edge, target, annotation.method_name, None)
+                })
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        fallback_index.get_or_insert(index);
+        if annotation.method_col.is_none_or(|col| {
+            edge_callsite_col(edge) == Some(col)
+                || nodes.get(&edge.target).and_then(|target| target.start_col) == Some(col)
+        }) {
+            exact_index = Some(index);
+            break;
+        }
+    }
+
+    let index = exact_index.or(fallback_index)?;
+    let edge = edges.get_mut(index)?;
+    let old_key = edge_dedup_key(edge, flags);
+    edge_keys.remove(&old_key);
+    append_callsite_marker(edge, annotation.marker);
+    edge_keys.insert(edge_dedup_key(edge, flags));
+    Some(index)
+}
+
+fn annotate_receiver_call_placeholder_owner(
+    nodes: &HashMap<NodeId, Node>,
+    edges: &mut [Edge],
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    annotation: ReceiverPlaceholderAnnotation<'_>,
+    required_callsite_marker: Option<&str>,
+) -> Option<usize> {
+    if annotation.owner_name.contains('|') || annotation.owner_name.trim().is_empty() {
+        return None;
+    }
+    let owner_marker = format!("{RECEIVER_OWNER_CALLSITE_PREFIX}{}", annotation.owner_name);
+    let module_marker = annotation
+        .owner_module
+        .filter(|module| !module.contains('|') && !module.trim().is_empty())
+        .map(|module| format!("{RECEIVER_MODULE_CALLSITE_PREFIX}{module}"));
+    let mut fallback_index = None;
+    let mut exact_index = None;
+    for (index, edge) in edges.iter().enumerate() {
+        if edge.kind != EdgeKind::CALL
+            || edge.line != annotation.line
+            || edge.resolved_target.is_some()
+            || callsite_has_receiver_annotation(edge.callsite_identity.as_deref())
+            || !callsite_has_marker(edge.callsite_identity.as_deref(), required_callsite_marker)
+            || !nodes
+                .get(&edge.target)
+                .map(|target| {
+                    call_placeholder_matches_method(edge, target, annotation.method_name, None)
+                })
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        fallback_index.get_or_insert(index);
+        if annotation.method_col.is_none_or(|col| {
+            edge_callsite_col(edge) == Some(col)
+                || nodes.get(&edge.target).and_then(|target| target.start_col) == Some(col)
+        }) {
+            exact_index = Some(index);
+            break;
+        }
+    }
+
+    let index = exact_index.or(fallback_index)?;
+    let edge = edges.get_mut(index)?;
+    let old_key = edge_dedup_key(edge, flags);
+    edge_keys.remove(&old_key);
+    append_callsite_part(edge, &owner_marker);
+    if let Some(marker) = module_marker.as_deref() {
+        append_callsite_part(edge, marker);
+    }
+    edge_keys.insert(edge_dedup_key(edge, flags));
+    Some(index)
+}
+
+struct ManualReceiverCallPlaceholder<'a> {
+    source_id: NodeId,
+    file_id: NodeId,
+    line: Option<u32>,
+    method_col: Option<u32>,
+    method_name: &'a str,
+    owner_name: &'a str,
+    owner_module: &'a str,
+}
+
+fn append_manual_receiver_call_placeholder_edge(
+    nodes: &HashMap<NodeId, Node>,
+    edges: &mut Vec<Edge>,
+    edge_keys: &mut HashSet<EdgeDedupKey>,
+    flags: IndexFeatureFlags,
+    placeholder: ManualReceiverCallPlaceholder<'_>,
+    callsite_ordinals: &mut HashMap<(NodeId, Option<u32>), u32>,
+) {
+    if placeholder.owner_name.contains('|')
+        || placeholder.owner_module.contains('|')
+        || placeholder.owner_name.trim().is_empty()
+        || placeholder.owner_module.trim().is_empty()
+    {
+        return;
+    }
+    let Some(target_id) = receiver_call_placeholder_target_id(
+        nodes,
+        placeholder.method_name,
+        placeholder.line,
+        placeholder.method_col,
+    ) else {
+        return;
+    };
+    let mut edge = Edge {
+        id: EdgeId(0),
+        source: placeholder.source_id,
+        target: target_id,
+        kind: EdgeKind::CALL,
+        file_node_id: Some(placeholder.file_id),
+        line: placeholder.line,
+        ..Default::default()
+    };
+    if !flags.legacy_edge_identity {
+        let col = placeholder.method_col.or_else(|| {
+            let key = (edge.target, edge.line);
+            let next = callsite_ordinals.entry(key).or_insert(0);
+            *next = next.saturating_add(1);
+            Some(*next)
+        });
+        ensure_callsite_identity(&mut edge, col);
+    }
+    append_callsite_part(
+        &mut edge,
+        &format!("{RECEIVER_OWNER_CALLSITE_PREFIX}{}", placeholder.owner_name),
+    );
+    append_callsite_part(
+        &mut edge,
+        &format!(
+            "{RECEIVER_MODULE_CALLSITE_PREFIX}{}",
+            placeholder.owner_module
+        ),
+    );
+    if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
+        return;
+    }
+    edge.id = EdgeId(generate_edge_id_for_edge(&edge, flags));
+    edges.push(edge);
+}
+
+fn receiver_call_placeholder_target_id(
+    nodes: &HashMap<NodeId, Node>,
+    method_name: &str,
+    line: Option<u32>,
+    method_col: Option<u32>,
+) -> Option<NodeId> {
+    let mut matches = nodes
+        .values()
+        .filter(|node| {
+            node.kind == NodeKind::UNKNOWN
+                && node_matches_name(node, method_name)
+                && line.is_none_or(|line| node.start_line == Some(line))
+                && method_col.is_none_or(|col| node.start_col == Some(col))
+        })
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
+fn callsite_has_marker(callsite_identity: Option<&str>, required_marker: Option<&str>) -> bool {
+    let Some(required_marker) = required_marker else {
+        return true;
+    };
+    callsite_identity
+        .is_some_and(|identity| identity.split('|').any(|part| part == required_marker))
+}
+
+fn callsite_has_receiver_annotation(callsite_identity: Option<&str>) -> bool {
+    callsite_identity.is_some_and(|identity| {
+        identity.split('|').any(|part| {
+            part.starts_with(RECEIVER_OWNER_CALLSITE_PREFIX)
+                || part.starts_with(RECEIVER_MODULE_CALLSITE_PREFIX)
+        })
+    })
+}
+
 fn member_target_id_by_owner_and_method(
     nodes: &HashMap<NodeId, Node>,
     edges: &[Edge],
     owner_name: &str,
     method_name: &str,
+    file_id: NodeId,
+    allow_global_fallback: bool,
 ) -> Option<NodeId> {
     let mut owners = nodes
         .values()
@@ -4635,6 +5535,7 @@ fn member_target_id_by_owner_and_method(
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    let mut candidates = Vec::new();
     for owner in owners {
         let mut targets = edges
             .iter()
@@ -4651,12 +5552,44 @@ fn member_target_id_by_owner_and_method(
                 .cmp(&right.start_line.unwrap_or(u32::MAX))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        if let Some(target) = targets.first() {
-            return Some(target.id);
+        for target in targets {
+            candidates.push((owner.file_node_id, target.file_node_id, target.id));
         }
     }
 
-    None
+    let mut same_file_matches = candidates
+        .iter()
+        .filter_map(|(owner_file_id, target_file_id, target_id)| {
+            (owner_file_id.is_none()
+                || target_file_id.is_none()
+                || *owner_file_id == Some(file_id)
+                || *target_file_id == Some(file_id))
+            .then_some(*target_id)
+        })
+        .collect::<Vec<_>>();
+    same_file_matches.sort_unstable();
+    same_file_matches.dedup();
+    if same_file_matches.len() == 1 {
+        return Some(same_file_matches[0]);
+    }
+    if same_file_matches.len() > 1 {
+        return None;
+    }
+    if !allow_global_fallback {
+        return None;
+    }
+
+    let mut global_matches = candidates
+        .into_iter()
+        .map(|(_, _, target_id)| target_id)
+        .collect::<Vec<_>>();
+    global_matches.sort_unstable();
+    global_matches.dedup();
+    if global_matches.len() == 1 {
+        Some(global_matches[0])
+    } else {
+        None
+    }
 }
 
 fn remove_generic_call_placeholders(
@@ -4665,6 +5598,7 @@ fn remove_generic_call_placeholders(
     edge_keys: &mut HashSet<EdgeDedupKey>,
     flags: IndexFeatureFlags,
     line: Option<u32>,
+    method_col: Option<u32>,
     method_name: &str,
 ) {
     let mut removed = Vec::new();
@@ -4675,7 +5609,7 @@ fn remove_generic_call_placeholders(
             && nodes
                 .get(&edge.target)
                 .map(|target| {
-                    target.kind == NodeKind::UNKNOWN && node_matches_name(target, method_name)
+                    call_placeholder_matches_method(edge, target, method_name, method_col)
                 })
                 .unwrap_or(false);
         if remove {
@@ -4686,6 +5620,29 @@ fn remove_generic_call_placeholders(
     for key in removed {
         edge_keys.remove(&key);
     }
+}
+
+fn call_placeholder_matches_method(
+    edge: &Edge,
+    target: &Node,
+    method_name: &str,
+    method_col: Option<u32>,
+) -> bool {
+    target.kind == NodeKind::UNKNOWN
+        && node_matches_name(target, method_name)
+        && method_col
+            .is_none_or(|col| edge_callsite_col(edge) == Some(col) || target.start_col == Some(col))
+}
+
+fn edge_callsite_col(edge: &Edge) -> Option<u32> {
+    edge.callsite_identity
+        .as_deref()?
+        .split('|')
+        .next()?
+        .split(':')
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 fn collect_go_member_edges(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
@@ -4826,8 +5783,1358 @@ fn normalize_go_type_surface(raw: &str) -> Option<String> {
     (!terminal.is_empty()).then(|| terminal.to_string())
 }
 
+fn collect_python_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    let imported_type_bindings = collect_python_imported_type_bindings(tree.root_node(), source);
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if callable.kind() != "function_definition" {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut local_receiver_callsites = HashSet::new();
+        collect_python_constructor_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &imported_type_bindings,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
+        collect_python_instance_property_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &imported_type_bindings,
+            &mut edges,
+        );
+        let receiver_types = collect_python_receiver_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        let start = edges.len();
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &receiver_types,
+            python_member_call,
+            true,
+            &mut edges,
+        );
+        let mut fallback_specs = edges.split_off(start);
+        fallback_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut fallback_specs {
+            if !is_python_implicit_receiver(&spec.receiver_name)
+                && let Some(binding) = imported_type_bindings.get(&spec.owner_name)
+            {
+                spec.owner_name = binding.owner_name.clone();
+                spec.owner_module = Some(binding.module_name.clone());
+            }
+        }
+        edges.extend(fallback_specs);
+    });
+    edges
+}
+
+fn is_python_implicit_receiver(receiver_name: &str) -> bool {
+    matches!(receiver_name, "self" | "cls")
+}
+
+fn collect_python_instance_property_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    let Some(class_node) = enclosing_node_with_kind(callable, &["class_definition"]) else {
+        return;
+    };
+    let Some(self_name) = python_instance_self_parameter(callable, source) else {
+        return;
+    };
+    if python_function_has_static_or_classmethod_decorator(callable, source) {
+        return;
+    }
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = python_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable)
+            || !python_receiver_is_self_property(&receiver_name, &self_name)
+        {
+            return;
+        }
+        let Some(owner) = python_visible_instance_property_receiver_owner(
+            class_node,
+            callable,
+            node,
+            &receiver_name,
+            source,
+            imported_type_bindings,
+        ) else {
+            return;
+        };
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name: method_name.clone(),
+                method_col: member_call_method_col(node, source, &method_name),
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn python_visible_instance_property_receiver_owner(
+    class_node: TsNode<'_>,
+    call_method: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut candidates = Vec::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        let Some((assignment_receiver, assignment_method, owner)) =
+            python_instance_property_assignment_owner(
+                node,
+                class_node,
+                source,
+                imported_type_bindings,
+            )
+        else {
+            return;
+        };
+        if assignment_receiver != receiver_name
+            || !python_property_assignment_visible_at_call(
+                node,
+                assignment_method,
+                call_method,
+                call_node,
+            )
+        {
+            return;
+        }
+        candidates.push(owner);
+    });
+    if candidates.is_empty() {
+        return None;
+    }
+    let Some(mut concrete_owners) = candidates.into_iter().collect::<Option<Vec<_>>>() else {
+        return Some(None);
+    };
+    concrete_owners.sort();
+    concrete_owners.dedup();
+    if concrete_owners.len() == 1 {
+        Some(Some(concrete_owners.remove(0)))
+    } else {
+        Some(None)
+    }
+}
+
+fn python_instance_property_assignment_owner<'tree>(
+    node: TsNode<'tree>,
+    class_node: TsNode<'tree>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<(String, TsNode<'tree>, OptionalReceiverOwnerBinding)> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+    let method = enclosing_node_with_kind(node, &["function_definition"])?;
+    if !python_method_belongs_to_class(method, class_node)
+        || !receiver_call_belongs_to_callable(node, method)
+        || python_function_has_static_or_classmethod_decorator(method, source)
+    {
+        return None;
+    }
+    let self_name = python_instance_self_parameter(method, source)?;
+    let receiver_name = node
+        .child_by_field_name("left")
+        .and_then(|left| python_self_property_receiver_name(left, source, &self_name))?;
+    let owner =
+        python_property_constructor_receiver_owner(node, method, source, imported_type_bindings);
+    Some((receiver_name, method, owner))
+}
+
+fn python_property_assignment_visible_at_call(
+    assignment: TsNode<'_>,
+    assignment_method: TsNode<'_>,
+    call_method: TsNode<'_>,
+    call_node: TsNode<'_>,
+) -> bool {
+    !same_ts_span(assignment_method, call_method) || assignment.end_byte() <= call_node.start_byte()
+}
+
+fn python_instance_self_parameter(method: TsNode<'_>, source: &str) -> Option<String> {
+    let self_name = first_python_self_parameter(method, source)?;
+    (self_name == "self").then_some(self_name)
+}
+
+fn python_method_belongs_to_class(method: TsNode<'_>, class_node: TsNode<'_>) -> bool {
+    let mut current = method.parent();
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, class_node) {
+            return true;
+        }
+        if matches!(candidate.kind(), "function_definition" | "class_definition") {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn python_receiver_is_self_property(receiver_name: &str, self_name: &str) -> bool {
+    receiver_name
+        .strip_prefix(self_name)
+        .is_some_and(|suffix| suffix.starts_with('.') && suffix.len() > 1)
+}
+
+fn python_function_has_static_or_classmethod_decorator(function: TsNode<'_>, source: &str) -> bool {
+    let Some(parent) = function.parent() else {
+        return false;
+    };
+    if parent.kind() != "decorated_definition" {
+        return false;
+    }
+    let mut cursor = parent.walk();
+    parent.named_children(&mut cursor).any(|child| {
+        child.kind() == "decorator"
+            && trimmed_node_text(child, source)
+                .as_deref()
+                .and_then(python_decorator_terminal_name)
+                .is_some_and(|name| matches!(name.as_str(), "staticmethod" | "classmethod"))
+    })
+}
+
+fn python_decorator_terminal_name(surface: &str) -> Option<String> {
+    let head = surface
+        .trim()
+        .trim_start_matches('@')
+        .split('(')
+        .next()
+        .unwrap_or(surface)
+        .trim();
+    let terminal = head.rsplit('.').next().unwrap_or(head);
+    normalize_parameter_name(terminal)
+}
+
+fn python_self_property_receiver_name(
+    node: TsNode<'_>,
+    source: &str,
+    self_name: &str,
+) -> Option<String> {
+    if node.kind() != "attribute" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    if trimmed_node_text(object, source).as_deref() != Some(self_name) {
+        return None;
+    }
+    let field_name = node
+        .child_by_field_name("attribute")
+        .and_then(|field| trimmed_node_text(field, source))
+        .and_then(|name| normalize_parameter_name(&name))?;
+    Some(format!("{self_name}.{field_name}"))
+}
+
+fn python_property_constructor_receiver_owner(
+    node: TsNode<'_>,
+    method: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = node
+        .child_by_field_name("right")
+        .and_then(|right_node| python_direct_constructor_call_type(right_node, source))?;
+    if python_visible_local_type_name(method, node, &owner_name, source) {
+        return Some((owner_name, None));
+    }
+    if python_callable_has_local_binding_name(method, &owner_name, source) {
+        return None;
+    }
+    if let Some(binding) = imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    if python_constructor_name_looks_like_type(&owner_name) {
+        Some((owner_name, None))
+    } else {
+        None
+    }
+}
+
+fn collect_python_constructor_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = python_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some(owner) = python_visible_local_constructor_receiver_owner(
+            callable,
+            node,
+            &receiver_name,
+            source,
+            imported_type_bindings,
+        ) else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn python_visible_local_constructor_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "assignment"
+            || !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        if !python_assignment_target_binds_name(left, receiver_name, source) {
+            return;
+        }
+        let owner = if python_plain_identifier_name(left, source).as_deref() == Some(receiver_name)
+        {
+            python_constructor_receiver_owner(node, callable, source, imported_type_bindings)
+        } else {
+            None
+        };
+        visible_bindings.push((node.end_byte(), owner));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn python_assignment_target_binds_name(
+    node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> bool {
+    let mut bindings = HashSet::new();
+    collect_python_assignment_target_bindings(node, source, &mut bindings);
+    bindings.contains(receiver_name)
+}
+
+fn python_constructor_receiver_owner(
+    node: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = node
+        .child_by_field_name("right")
+        .and_then(|right_node| python_direct_constructor_call_type(right_node, source))?;
+    if python_visible_local_type_name(callable, node, &owner_name, source) {
+        return Some((owner_name, None));
+    }
+    if python_callable_has_local_binding_name(callable, &owner_name, source) {
+        return None;
+    }
+    if let Some(binding) = imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    if python_constructor_name_looks_like_type(&owner_name) {
+        Some((owner_name, None))
+    } else {
+        None
+    }
+}
+
+fn python_direct_constructor_call_type(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
+        return None;
+    }
+    trimmed_node_text(function, source).and_then(|name| normalize_parameter_name(&name))
+}
+
+fn python_visible_local_type_name(
+    callable: TsNode<'_>,
+    before_node: TsNode<'_>,
+    owner_name: &str,
+    source: &str,
+) -> bool {
+    let mut found = false;
+    walk_tree_nodes(callable, &mut |node| {
+        if found
+            || node.kind() != "class_definition"
+            || !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > before_node.start_byte()
+        {
+            return;
+        }
+        if declaration_name(node, source).as_deref() == Some(owner_name) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn python_callable_has_local_binding_name(
+    callable: TsNode<'_>,
+    binding_name: &str,
+    source: &str,
+) -> bool {
+    let mut found = false;
+    walk_tree_nodes(callable, &mut |node| {
+        if found || !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let candidate_names = python_local_binding_names(node, source);
+        if candidate_names.iter().any(|name| name == binding_name) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn python_local_binding_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    match node.kind() {
+        "class_definition" | "function_definition" => declaration_name(node, source)
+            .and_then(|name| normalize_parameter_name(&name))
+            .into_iter()
+            .collect(),
+        "assignment" => {
+            let mut bindings = HashSet::new();
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_python_assignment_target_bindings(left, source, &mut bindings);
+            }
+            bindings.into_iter().collect()
+        }
+        "import_from_statement" => python_from_import_local_binding_names(node, source),
+        "import_statement" => python_import_local_binding_names(node, source),
+        _ => Vec::new(),
+    }
+}
+
+fn python_from_import_local_binding_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    let Some(surface) = trimmed_node_text(node, source) else {
+        return Vec::new();
+    };
+    let Some(rest) = surface.strip_prefix("from ") else {
+        return Vec::new();
+    };
+    let Some((_, imports)) = rest.split_once(" import ") else {
+        return Vec::new();
+    };
+    let imports = python_import_list_surface(imports);
+    split_top_level_parameters(imports)
+        .into_iter()
+        .filter_map(|imported| python_import_binding_names(&imported).map(|(_, local)| local))
+        .collect()
+}
+
+fn python_import_local_binding_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    let Some(surface) = trimmed_node_text(node, source) else {
+        return Vec::new();
+    };
+    let Some(imports) = surface.strip_prefix("import ") else {
+        return Vec::new();
+    };
+    split_top_level_parameters(imports)
+        .into_iter()
+        .filter_map(|imported| python_import_local_binding_name(&imported))
+        .collect()
+}
+
+fn python_import_local_binding_name(imported: &str) -> Option<String> {
+    let imported = imported.trim();
+    if imported.is_empty() {
+        return None;
+    }
+    let tokens = imported.split_whitespace().collect::<Vec<_>>();
+    let local_name = match tokens.as_slice() {
+        [module] => module.split('.').next()?,
+        [_, "as", local] => local,
+        _ => return None,
+    };
+    normalize_parameter_name(local_name)
+}
+
+fn python_plain_identifier_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+    trimmed_node_text(node, source).and_then(|name| normalize_parameter_name(&name))
+}
+
+fn python_constructor_name_looks_like_type(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_uppercase())
+}
+
+fn collect_python_imported_type_bindings(
+    root: TsNode<'_>,
+    source: &str,
+) -> HashMap<String, ImportedTypeBinding> {
+    let top_level_bindings = collect_python_top_level_binding_names(root, source);
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    for statement in python_top_level_from_import_statements(source) {
+        let Some(rest) = statement.strip_prefix("from ") else {
+            continue;
+        };
+        let Some((module_name, imports)) = rest.split_once(" import ") else {
+            continue;
+        };
+        let module_name = module_name.trim();
+        if module_name.is_empty() {
+            continue;
+        }
+        let imports = python_import_list_surface(imports);
+        for imported in split_top_level_parameters(imports) {
+            let Some((owner_name, local_name)) = python_import_binding_names(&imported) else {
+                continue;
+            };
+            if top_level_bindings.contains(&local_name) {
+                continue;
+            }
+            if duplicates.contains(&local_name) {
+                continue;
+            }
+            if bindings.contains_key(&local_name) {
+                bindings.remove(&local_name);
+                duplicates.insert(local_name);
+                continue;
+            }
+            bindings.insert(
+                local_name,
+                ImportedTypeBinding {
+                    module_name: module_name.to_string(),
+                    owner_name,
+                },
+            );
+        }
+    }
+    bindings
+}
+
+fn collect_typescript_receiver_call_edges(
+    tree: &Tree,
+    source: &str,
+) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    let imported_type_bindings =
+        collect_typescript_imported_type_bindings(tree.root_node(), source);
+    let namespace_import_bindings =
+        collect_typescript_namespace_import_bindings(tree.root_node(), source);
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if !matches!(
+            callable.kind(),
+            "function_declaration" | "method_definition" | "arrow_function"
+        ) {
+            return;
+        }
+        let Some(source_name) = js_like_callable_source_name(callable, source) else {
+            return;
+        };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut local_receiver_callsites = HashSet::new();
+        collect_typescript_constructor_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &imported_type_bindings,
+            &namespace_import_bindings,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
+        let parameter_receiver_types = collect_colon_parameter_types(callable, source);
+        let mut receiver_types = parameter_receiver_types.clone();
+        if let Some(owner_name) = enclosing_node_with_kind(callable, &["class_declaration"])
+            .and_then(|owner| declaration_name(owner, source))
+            && callable.kind() == "method_definition"
+        {
+            receiver_types.insert("this".to_string(), owner_name);
+        }
+        let property_receiver_types = collect_typescript_class_property_receiver_bindings(
+            callable,
+            source,
+            &imported_type_bindings,
+            &namespace_import_bindings,
+        );
+        receiver_types.extend(
+            property_receiver_types
+                .iter()
+                .map(|(receiver_name, (owner_name, _))| {
+                    (receiver_name.clone(), owner_name.clone())
+                }),
+        );
+        if receiver_types.is_empty() {
+            return;
+        }
+        let mut receiver_modules =
+            collect_typescript_parameter_type_modules(callable, source, &namespace_import_bindings);
+        for (receiver_name, (_, owner_module)) in &property_receiver_types {
+            if let Some(module_name) = owner_module {
+                receiver_modules.insert(receiver_name.clone(), module_name.clone());
+            }
+        }
+        let start = edges.len();
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &receiver_types,
+            typescript_member_call,
+            false,
+            &mut edges,
+        );
+        let mut fallback_specs = edges.split_off(start);
+        fallback_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut fallback_specs {
+            if parameter_receiver_types.contains_key(&spec.receiver_name)
+                && let Some(binding) = imported_type_bindings.get(&spec.owner_name)
+            {
+                spec.owner_name = binding.owner_name.clone();
+                spec.owner_module = Some(binding.module_name.clone());
+            } else if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
+                spec.owner_module = Some(module_name.clone());
+            }
+        }
+        edges.extend(fallback_specs);
+    });
+    edges
+}
+
+fn collect_typescript_constructor_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_import_bindings: &HashMap<String, String>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = typescript_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some(owner) = typescript_visible_local_constructor_receiver_owner(
+            callable,
+            node,
+            &receiver_name,
+            source,
+            imported_type_bindings,
+            namespace_import_bindings,
+        ) else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn typescript_visible_local_constructor_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_import_bindings: &HashMap<String, String>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "variable_declarator"
+            || !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+            || !js_ts_local_binding_visible_at_call(node, call_node)
+        {
+            return;
+        }
+        let Some(binding_name) = node
+            .child_by_field_name("name")
+            .and_then(|name_node| trimmed_node_text(name_node, source))
+            .as_deref()
+            .and_then(normalize_parameter_name)
+        else {
+            return;
+        };
+        if binding_name != receiver_name {
+            return;
+        }
+        visible_bindings.push((
+            node.end_byte(),
+            typescript_constructor_receiver_owner(
+                node,
+                callable,
+                source,
+                imported_type_bindings,
+                namespace_import_bindings,
+            ),
+        ));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn typescript_constructor_receiver_owner(
+    node: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    let constructor_type = node
+        .child_by_field_name("value")
+        .and_then(|value_node| typescript_new_expression_constructor_type(value_node, source))?;
+    let owner_name = normalize_type_surface(&constructor_type)?;
+    if typescript_type_import_qualifier(&constructor_type).is_none()
+        && js_ts_visible_local_type_name(callable, node, &owner_name, source)
+    {
+        return Some((owner_name, None));
+    }
+    typescript_receiver_owner_from_type(
+        &constructor_type,
+        imported_type_bindings,
+        namespace_import_bindings,
+    )
+}
+
+fn typescript_new_expression_constructor_type(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    node.child_by_field_name("constructor")
+        .and_then(|constructor| trimmed_node_text(constructor, source))
+        .map(|constructor| constructor.trim().to_string())
+        .filter(|constructor| !constructor.is_empty())
+}
+
+fn collect_typescript_class_property_receiver_bindings(
+    callable: TsNode<'_>,
+    source: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_import_bindings: &HashMap<String, String>,
+) -> HashMap<String, ReceiverOwnerBinding> {
+    let mut receiver_bindings = HashMap::new();
+    if callable.kind() != "method_definition" {
+        return receiver_bindings;
+    }
+    let Some(class_node) = enclosing_node_with_kind(callable, &["class_declaration"]) else {
+        return receiver_bindings;
+    };
+    let mut candidates: HashMap<String, Vec<ReceiverOwnerBinding>> = HashMap::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        if node.kind() != "public_field_definition"
+            || !typescript_property_belongs_to_owner(node, class_node)
+        {
+            return;
+        }
+        let Some((field_name, raw_type)) = typescript_property_receiver_binding(node, source)
+        else {
+            return;
+        };
+        let Some(owner) = typescript_receiver_owner_from_type(
+            &raw_type,
+            imported_type_bindings,
+            namespace_import_bindings,
+        ) else {
+            return;
+        };
+        candidates
+            .entry(format!("this.{field_name}"))
+            .or_default()
+            .push(owner);
+    });
+    for (receiver_name, mut owners) in candidates {
+        owners.sort();
+        owners.dedup();
+        if owners.len() == 1 {
+            receiver_bindings.insert(receiver_name, owners.remove(0));
+        }
+    }
+    receiver_bindings
+}
+
+fn typescript_property_belongs_to_owner(property: TsNode<'_>, class_node: TsNode<'_>) -> bool {
+    let mut current = property.parent();
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, class_node) {
+            return true;
+        }
+        if matches!(candidate.kind(), "method_definition" | "class_declaration") {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn typescript_property_receiver_binding(
+    node: TsNode<'_>,
+    source: &str,
+) -> Option<(String, String)> {
+    let field_name = node
+        .child_by_field_name("name")
+        .and_then(|name| trimmed_node_text(name, source))
+        .as_deref()
+        .and_then(normalize_parameter_name)?;
+    let surface = trimmed_node_text(node, source)?;
+    let head = surface
+        .split('=')
+        .next()
+        .unwrap_or(surface.as_str())
+        .trim_end_matches(';')
+        .trim();
+    let (_, type_side) = head.split_once(':')?;
+    Some((field_name, parameter_type_after_colon(type_side)))
+}
+
+fn typescript_receiver_owner_from_type(
+    raw_type: &str,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(raw_type)?;
+    if let Some(qualifier) = typescript_type_import_qualifier(raw_type) {
+        let module_name = namespace_import_bindings.get(&qualifier)?;
+        return Some((owner_name, Some(module_name.clone())));
+    }
+    if let Some(binding) = imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    Some((owner_name, None))
+}
+
+fn collect_typescript_imported_type_bindings(
+    root: TsNode<'_>,
+    source: &str,
+) -> HashMap<String, ImportedTypeBinding> {
+    let top_level_bindings = collect_typescript_top_level_type_binding_names(root, source);
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        let Some(module_name) = statement
+            .child_by_field_name("source")
+            .and_then(|module| trimmed_node_text(module, source))
+        else {
+            continue;
+        };
+        for (owner_name, local_name) in typescript_import_binding_names(statement, source) {
+            if top_level_bindings.contains(&local_name) {
+                continue;
+            }
+            if duplicates.contains(&local_name) {
+                continue;
+            }
+            if bindings.contains_key(&local_name) {
+                bindings.remove(&local_name);
+                duplicates.insert(local_name);
+                continue;
+            }
+            bindings.insert(
+                local_name,
+                ImportedTypeBinding {
+                    module_name: module_name.clone(),
+                    owner_name,
+                },
+            );
+        }
+    }
+    bindings
+}
+
+fn typescript_import_binding_names(statement: TsNode<'_>, source: &str) -> Vec<(String, String)> {
+    let mut bindings = Vec::new();
+    let mut cursor = statement.walk();
+    for child in statement.named_children(&mut cursor) {
+        if child.kind() != "import_clause" {
+            continue;
+        }
+        let mut import_clause_cursor = child.walk();
+        for clause_child in child.named_children(&mut import_clause_cursor) {
+            match clause_child.kind() {
+                "identifier" => {
+                    if let Some(local_name) = trimmed_node_text(clause_child, source)
+                        .and_then(|name| normalize_parameter_name(&name))
+                    {
+                        bindings.push((local_name.clone(), local_name));
+                    }
+                }
+                "named_imports" => {
+                    let mut named_cursor = clause_child.walk();
+                    for import_specifier in clause_child.named_children(&mut named_cursor) {
+                        if import_specifier.kind() == "import_specifier"
+                            && let Some(binding) =
+                                typescript_import_specifier_binding_names(import_specifier, source)
+                        {
+                            bindings.push(binding);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    bindings
+}
+
+fn collect_typescript_namespace_import_bindings(
+    root: TsNode<'_>,
+    source: &str,
+) -> HashMap<String, String> {
+    let top_level_bindings = collect_typescript_top_level_type_binding_names(root, source);
+    let import_local_bindings = collect_typescript_import_local_binding_names(root, source);
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        let Some(module_name) = statement
+            .child_by_field_name("source")
+            .and_then(|module| trimmed_node_text(module, source))
+        else {
+            continue;
+        };
+        for local_name in typescript_namespace_import_names(statement, source) {
+            if top_level_bindings.contains(&local_name)
+                || import_local_bindings.contains(&local_name)
+            {
+                continue;
+            }
+            if duplicates.contains(&local_name) {
+                continue;
+            }
+            if bindings.contains_key(&local_name) {
+                bindings.remove(&local_name);
+                duplicates.insert(local_name);
+                continue;
+            }
+            bindings.insert(local_name, module_name.clone());
+        }
+    }
+    bindings
+}
+
+fn collect_typescript_import_local_binding_names(
+    root: TsNode<'_>,
+    source: &str,
+) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        for (_, local_name) in typescript_import_binding_names(statement, source) {
+            bindings.insert(local_name);
+        }
+    }
+    bindings
+}
+
+fn typescript_namespace_import_names(statement: TsNode<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = statement.walk();
+    for child in statement.named_children(&mut cursor) {
+        if child.kind() != "import_clause" {
+            continue;
+        }
+        let mut import_clause_cursor = child.walk();
+        for clause_child in child.named_children(&mut import_clause_cursor) {
+            if clause_child.kind() != "namespace_import" {
+                continue;
+            }
+            let mut namespace_cursor = clause_child.walk();
+            for namespace_child in clause_child.named_children(&mut namespace_cursor) {
+                if namespace_child.kind() == "identifier"
+                    && let Some(local_name) = trimmed_node_text(namespace_child, source)
+                        .and_then(|name| normalize_parameter_name(&name))
+                {
+                    names.push(local_name);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn typescript_import_specifier_binding_names(
+    import_specifier: TsNode<'_>,
+    source: &str,
+) -> Option<(String, String)> {
+    let name_node = import_specifier.child_by_field_name("name")?;
+    let owner_name =
+        trimmed_node_text(name_node, source).and_then(|name| normalize_parameter_name(&name))?;
+    let local_node = import_specifier
+        .child_by_field_name("alias")
+        .unwrap_or(name_node);
+    let local_name =
+        trimmed_node_text(local_node, source).and_then(|name| normalize_parameter_name(&name))?;
+    Some((owner_name, local_name))
+}
+
+fn collect_typescript_top_level_type_binding_names(
+    root: TsNode<'_>,
+    source: &str,
+) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        collect_typescript_top_level_type_binding_name(child, source, &mut bindings);
+    }
+    bindings
+}
+
+fn collect_typescript_top_level_type_binding_name(
+    node: TsNode<'_>,
+    source: &str,
+    bindings: &mut HashSet<String>,
+) {
+    match node.kind() {
+        "class_declaration"
+        | "interface_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration" => {
+            if let Some(name) =
+                declaration_name(node, source).and_then(|name| normalize_parameter_name(&name))
+            {
+                bindings.insert(name);
+            }
+        }
+        "export_statement" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_typescript_top_level_type_binding_name(child, source, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_typescript_parameter_type_modules(
+    callable: TsNode<'_>,
+    source: &str,
+    namespace_import_bindings: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut receiver_modules = HashMap::new();
+    let Some(parameters) = signature_parameter_surface(callable, source) else {
+        return receiver_modules;
+    };
+    for parameter in split_top_level_parameters(&parameters) {
+        let Some((name_side, type_side)) = parameter.split_once(':') else {
+            continue;
+        };
+        let Some(receiver_name) = parameter_name_before_colon(name_side) else {
+            continue;
+        };
+        let Some(qualifier) =
+            typescript_type_import_qualifier(&parameter_type_after_colon(type_side))
+        else {
+            continue;
+        };
+        let Some(module_name) = namespace_import_bindings.get(&qualifier) else {
+            continue;
+        };
+        receiver_modules.insert(receiver_name, module_name.clone());
+    }
+    receiver_modules
+}
+
+fn typescript_type_import_qualifier(raw_type: &str) -> Option<String> {
+    if raw_type.contains('|') || raw_type.contains('&') {
+        return None;
+    }
+    let mut surface = raw_type.trim().trim_end_matches('?').trim();
+    while let Some(stripped) = surface.strip_prefix("readonly") {
+        surface = stripped.trim_start();
+    }
+    let base = surface
+        .split(['<', '[', '('])
+        .next()
+        .unwrap_or(surface)
+        .trim();
+    let (qualifier, _) = base.rsplit_once('.')?;
+    normalize_parameter_name(qualifier)
+}
+
+fn collect_python_top_level_binding_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        collect_python_top_level_binding_name(child, source, &mut bindings);
+    }
+    bindings
+}
+
+fn collect_python_top_level_binding_name(
+    node: TsNode<'_>,
+    source: &str,
+    bindings: &mut HashSet<String>,
+) {
+    match node.kind() {
+        "class_definition" | "function_definition" => {
+            if let Some(name) =
+                declaration_name(node, source).and_then(|name| normalize_parameter_name(&name))
+            {
+                bindings.insert(name);
+            }
+        }
+        "decorated_definition" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if matches!(child.kind(), "class_definition" | "function_definition") {
+                    collect_python_top_level_binding_name(child, source, bindings);
+                    break;
+                }
+            }
+        }
+        "assignment" | "type_alias_statement" => {
+            collect_python_top_level_assignment_bindings(node, source, bindings);
+        }
+        "expression_statement" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if matches!(child.kind(), "assignment" | "type_alias_statement") {
+                    collect_python_top_level_assignment_bindings(child, source, bindings);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_python_top_level_assignment_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    bindings: &mut HashSet<String>,
+) {
+    let Some(target) = node
+        .child_by_field_name("left")
+        .or_else(|| node.child_by_field_name("name"))
+    else {
+        return;
+    };
+    collect_python_assignment_target_bindings(target, source, bindings);
+}
+
+fn collect_python_assignment_target_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    bindings: &mut HashSet<String>,
+) {
+    match node.kind() {
+        "identifier" => {
+            if let Some(name) =
+                trimmed_node_text(node, source).and_then(|name| normalize_parameter_name(&name))
+            {
+                bindings.insert(name);
+            }
+        }
+        "list"
+        | "list_pattern"
+        | "parenthesized_expression"
+        | "pattern_list"
+        | "tuple"
+        | "tuple_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_python_assignment_target_bindings(child, source, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn python_top_level_from_import_statements(source: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0usize;
+    let mut collecting = false;
+
+    for raw_line in source.lines() {
+        if !collecting {
+            if raw_line.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let line = python_strip_comment(raw_line).trim();
+            if !line.starts_with("from ") {
+                continue;
+            }
+            current.clear();
+            current.push_str(line);
+            paren_depth = python_paren_depth_delta(0, line);
+            if paren_depth == 0 {
+                statements.push(current.clone());
+            } else {
+                collecting = true;
+            }
+            continue;
+        }
+
+        let line = python_strip_comment(raw_line).trim();
+        if !line.is_empty() {
+            current.push('\n');
+            current.push_str(line);
+            paren_depth = python_paren_depth_delta(paren_depth, line);
+        }
+        if paren_depth == 0 {
+            statements.push(current.clone());
+            current.clear();
+            collecting = false;
+        }
+    }
+
+    statements
+}
+
+fn python_strip_comment(line: &str) -> &str {
+    line.split('#').next().unwrap_or(line)
+}
+
+fn python_paren_depth_delta(mut depth: usize, line: &str) -> usize {
+    for ch in line.chars() {
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn python_import_list_surface(imports: &str) -> &str {
+    let imports = imports.trim();
+    imports
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .map(str::trim)
+        .unwrap_or(imports)
+}
+
+fn python_import_binding_names(imported: &str) -> Option<(String, String)> {
+    let imported = imported.trim();
+    if imported.is_empty() || imported == "*" {
+        return None;
+    }
+
+    let tokens = imported.split_whitespace().collect::<Vec<_>>();
+    let (owner_name, local_name) = match tokens.as_slice() {
+        [owner] => (*owner, *owner),
+        [owner, "as", local] => (*owner, *local),
+        _ => return None,
+    };
+    Some((
+        normalize_parameter_name(owner_name)?,
+        normalize_parameter_name(local_name)?,
+    ))
+}
+
 fn collect_go_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let import_bindings = collect_go_import_bindings(source);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if !matches!(
             callable.kind(),
@@ -4838,25 +7145,1179 @@ fn collect_go_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiv
         let Some(source_name) = declaration_name(callable, source) else {
             return;
         };
-        let receiver_types = collect_go_parameter_types(callable, source);
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut local_binding_callsites = HashSet::new();
+        collect_go_local_composite_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &import_bindings,
+            &mut local_binding_callsites,
+            &mut edges,
+        );
+        let method_receiver_bindings = collect_go_method_receiver_bindings(
+            callable,
+            tree.root_node(),
+            source,
+            &import_bindings,
+        );
+        let mut receiver_types = method_receiver_bindings
+            .iter()
+            .map(|(receiver_name, (owner_name, _))| (receiver_name.clone(), owner_name.clone()))
+            .collect::<HashMap<_, _>>();
+        receiver_types.extend(collect_go_parameter_types(callable, source));
         if receiver_types.is_empty() {
             return;
         }
+        let mut receiver_modules =
+            collect_go_parameter_type_modules(callable, source, &import_bindings);
+        for (receiver_name, (_, owner_module)) in &method_receiver_bindings {
+            if let Some(module_name) = owner_module {
+                receiver_modules.insert(receiver_name.clone(), module_name.clone());
+            }
+        }
+        let start = edges.len();
         collect_receiver_call_specs_in_callable(
             callable,
             source,
-            &source_name,
-            ts_node_graph_span(callable),
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
             &receiver_types,
             go_selector_call,
+            false,
             &mut edges,
         );
+        let mut parameter_specs = edges.split_off(start);
+        parameter_specs
+            .retain(|spec| !local_binding_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut parameter_specs {
+            if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
+                spec.owner_module = Some(module_name.clone());
+            }
+        }
+        edges.extend(parameter_specs);
     });
     edges
 }
 
+fn collect_go_local_composite_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    import_bindings: &HashMap<String, String>,
+    local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = go_selector_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some(owner_name) = go_visible_local_composite_owner(
+            callable,
+            node,
+            &receiver_name,
+            source,
+            import_bindings,
+        ) else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_binding_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner_name {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn go_visible_local_composite_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if !matches!(
+            node.kind(),
+            "short_var_declaration" | "assignment_statement"
+        ) {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        if !go_local_binding_visible_at_call(node, call_node) {
+            return;
+        }
+        let Some(owner_name) =
+            go_receiver_write_owner(node, receiver_name, source, import_bindings)
+        else {
+            return;
+        };
+        visible_bindings.push((node.end_byte(), owner_name));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner_name)| owner_name)
+}
+
+fn go_receiver_write_owner(
+    node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    if !matches!(
+        node.kind(),
+        "short_var_declaration" | "assignment_statement"
+    ) {
+        return None;
+    }
+    let left_items = node
+        .child_by_field_name("left")
+        .map(go_expression_list_items)
+        .unwrap_or_default();
+    let receiver_index = left_items.iter().position(|left| {
+        normalized_receiver_variable(*left, source).as_deref() == Some(receiver_name)
+    })?;
+    let owner_name = node
+        .child_by_field_name("right")
+        .map(go_expression_list_items)
+        .and_then(|right_items| {
+            right_items.get(receiver_index).and_then(|right| {
+                go_direct_composite_literal_owner(*right, source, import_bindings)
+            })
+        });
+    Some(owner_name)
+}
+
+fn go_expression_list_items(node: TsNode<'_>) -> Vec<TsNode<'_>> {
+    if node.kind() != "expression_list" {
+        return vec![node];
+    }
+    let mut items = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        items.push(child);
+    }
+    items
+}
+
+fn go_direct_composite_literal_owner(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    if node.kind() == "composite_literal" {
+        return node
+            .child_by_field_name("type")
+            .and_then(|type_node| trimmed_node_text(type_node, source))
+            .as_deref()
+            .and_then(|type_surface| {
+                go_composite_literal_owner_binding_from_type(type_surface, import_bindings)
+            });
+    }
+    trimmed_node_text(node, source)
+        .as_deref()
+        .and_then(|surface| go_direct_composite_literal_owner_surface(surface, import_bindings))
+}
+
+fn go_direct_composite_literal_owner_surface(
+    surface: &str,
+    import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    let surface = surface.trim().trim_start_matches('&').trim();
+    if !surface.contains('{') {
+        return None;
+    }
+    let type_surface = surface
+        .split_once('{')
+        .map(|(type_surface, _)| type_surface)
+        .unwrap_or(surface)
+        .trim();
+    go_composite_literal_owner_binding_from_type(type_surface, import_bindings)
+}
+
+fn go_composite_literal_owner_binding_from_type(
+    type_surface: &str,
+    import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    let type_surface = type_surface.trim().trim_start_matches('&').trim();
+    if type_surface.contains('(')
+        || type_surface.contains(')')
+        || type_surface.starts_with("[]")
+        || type_surface.starts_with("map[")
+    {
+        return None;
+    }
+    let owner_name = normalize_go_type_surface(type_surface)?;
+    if !owner_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+    {
+        return None;
+    }
+    if let Some(qualifier) = go_type_import_qualifier(type_surface) {
+        let module_name = import_bindings.get(&qualifier)?;
+        return Some((owner_name, Some(module_name.clone())));
+    }
+    if type_surface.contains('.') {
+        return None;
+    }
+    Some((owner_name, None))
+}
+
+fn go_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = go_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = go_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn go_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["block"])
+}
+
+fn collect_go_method_receiver_bindings(
+    callable: TsNode<'_>,
+    root: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> HashMap<String, ReceiverOwnerBinding> {
+    let mut receiver_types = HashMap::new();
+    if callable.kind() != "method_declaration" {
+        return receiver_types;
+    }
+    let Some(receiver_node) = callable.child_by_field_name("receiver") else {
+        return receiver_types;
+    };
+    let Some(receiver_name) = go_receiver_variable_name(receiver_node, source) else {
+        return receiver_types;
+    };
+    let Some(owner_name) = go_receiver_owner_name(receiver_node, source) else {
+        return receiver_types;
+    };
+    receiver_types.insert(receiver_name.clone(), (owner_name.clone(), None));
+    let Some(owner_node) = find_go_type_declaration_by_name(root, source, &owner_name) else {
+        return receiver_types;
+    };
+    for (field_name, field_owner) in
+        collect_go_struct_field_types(owner_node, source, import_bindings)
+    {
+        receiver_types.insert(format!("{receiver_name}.{field_name}"), field_owner);
+    }
+    receiver_types
+}
+
+fn go_receiver_variable_name(receiver_node: TsNode<'_>, source: &str) -> Option<String> {
+    let text = trimmed_node_text(receiver_node, source)?;
+    let inner = text
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let tokens = inner.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return None;
+    }
+    normalize_parameter_name(tokens[0])
+}
+
+fn collect_go_struct_field_types(
+    owner_node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> HashMap<String, ReceiverOwnerBinding> {
+    let mut field_types = HashMap::new();
+    walk_tree_nodes(owner_node, &mut |node| {
+        if node.kind() != "field_declaration" {
+            return;
+        }
+        for (field_name, owner_name) in go_field_declaration_bindings(node, source, import_bindings)
+        {
+            field_types.insert(field_name, owner_name);
+        }
+    });
+    field_types
+}
+
+fn go_field_declaration_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> Vec<(String, ReceiverOwnerBinding)> {
+    if let Some(type_node) = node.child_by_field_name("type")
+        && let Some(raw_type) = trimmed_node_text(type_node, source)
+        && let Some(owner_binding) = go_receiver_owner_from_type(&raw_type, import_bindings)
+    {
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.end_byte() > type_node.start_byte() {
+                continue;
+            }
+            if matches!(child.kind(), "field_identifier" | "identifier")
+                && let Some(name) = normalized_receiver_variable(child, source)
+            {
+                names.push(name);
+            }
+        }
+        if !names.is_empty() {
+            return names
+                .into_iter()
+                .map(|name| (name, owner_binding.clone()))
+                .collect();
+        }
+    }
+
+    trimmed_node_text(node, source)
+        .as_deref()
+        .map(|surface| go_field_declaration_bindings_surface(surface, import_bindings))
+        .unwrap_or_default()
+}
+
+fn go_field_declaration_bindings_surface(
+    surface: &str,
+    import_bindings: &HashMap<String, String>,
+) -> Vec<(String, ReceiverOwnerBinding)> {
+    let surface = surface.split('`').next().unwrap_or(surface).trim();
+    let tokens = surface.split_whitespace().collect::<Vec<_>>();
+    let Some(raw_type) = tokens.last() else {
+        return Vec::new();
+    };
+    if tokens.len() < 2 {
+        return Vec::new();
+    }
+    let Some(owner_binding) = go_receiver_owner_from_type(raw_type, import_bindings) else {
+        return Vec::new();
+    };
+    let names_surface = tokens[..tokens.len() - 1].join(" ");
+    names_surface
+        .split(',')
+        .filter_map(normalize_parameter_name)
+        .map(|name| (name, owner_binding.clone()))
+        .collect()
+}
+
+fn go_receiver_owner_from_type(
+    raw_type: &str,
+    import_bindings: &HashMap<String, String>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_go_type_surface(raw_type)?;
+    if let Some(qualifier) = go_type_import_qualifier(raw_type) {
+        let module_name = import_bindings.get(&qualifier)?;
+        return Some((owner_name, Some(module_name.clone())));
+    }
+    Some((owner_name, None))
+}
+
+fn collect_java_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    let import_bindings = collect_java_import_type_bindings(tree.root_node(), source);
+    let local_type_names = collect_java_top_level_type_names(tree.root_node(), source);
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if callable.kind() != "method_declaration" {
+            return;
+        }
+        let Some(source_name) = declaration_name(callable, source) else {
+            return;
+        };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut local_receiver_callsites = HashSet::new();
+        collect_java_local_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &import_bindings,
+            &local_type_names,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
+        let receiver_types = collect_prefix_parameter_types(callable, source);
+        if receiver_types.is_empty() {
+            return;
+        }
+        let start = edges.len();
+        collect_receiver_call_specs_in_callable(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &receiver_types,
+            java_member_call,
+            false,
+            &mut edges,
+        );
+        let mut parameter_specs = edges.split_off(start);
+        parameter_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut parameter_specs {
+            if let Some(module_name) = import_bindings.get(&spec.owner_name) {
+                spec.owner_module = Some(module_name.clone());
+            }
+        }
+        edges.extend(parameter_specs);
+    });
+    edges
+}
+
+fn collect_java_local_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = java_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let owner = if let Some(owner) = java_visible_receiver_owner(
+            callable,
+            node,
+            &receiver_name,
+            source,
+            import_bindings,
+            local_type_names,
+        ) {
+            owner
+        } else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn java_visible_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    if let Some(owner) =
+        java_direct_new_receiver_owner(call_node, source, import_bindings, local_type_names)
+    {
+        return Some(Some(owner));
+    }
+    if let Some(owner) = java_self_receiver_owner(callable, receiver_name, source) {
+        return Some(Some(owner));
+    }
+    if let Some(owner) = java_visible_local_receiver_owner(
+        callable,
+        call_node,
+        receiver_name,
+        source,
+        import_bindings,
+        local_type_names,
+    ) {
+        return Some(owner);
+    }
+    if let Some(owner) = java_field_receiver_owner(
+        callable,
+        receiver_name,
+        source,
+        import_bindings,
+        local_type_names,
+    ) {
+        return Some(Some(owner));
+    }
+    java_static_receiver_owner(receiver_name, import_bindings, local_type_names).map(Some)
+}
+
+fn java_self_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> OptionalReceiverOwnerBinding {
+    if receiver_name != "this" {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(
+        callable,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "record_declaration",
+            "enum_declaration",
+            "annotation_type_declaration",
+        ],
+    )?;
+    let owner_name = declaration_name(owner_node, source)?;
+    Some((owner_name, None))
+}
+
+fn java_direct_new_receiver_owner(
+    call_node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> OptionalReceiverOwnerBinding {
+    let receiver_node = call_node.child_by_field_name("object")?;
+    java_direct_new_owner(receiver_node, source, import_bindings, local_type_names)
+}
+
+fn java_visible_local_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| match node.kind() {
+        "local_variable_declaration" => {
+            if !receiver_call_belongs_to_callable(node, callable)
+                || node.end_byte() > call_node.start_byte()
+                || !java_local_binding_visible_at_call(node, call_node)
+            {
+                return;
+            }
+            for (binding_name, owner) in java_local_variable_receiver_bindings(
+                node,
+                source,
+                import_bindings,
+                local_type_names,
+            ) {
+                if binding_name == receiver_name {
+                    visible_bindings.push((node.end_byte(), owner));
+                }
+            }
+        }
+        "enhanced_for_statement"
+        | "catch_clause"
+        | "try_statement"
+        | "try_with_resources_statement" => {
+            if !receiver_call_belongs_to_callable(node, callable)
+                || !java_scoped_binding_visible_at_call(node, call_node)
+            {
+                return;
+            }
+            if let Some((binding_name, owner)) =
+                java_scoped_receiver_binding(node, source, import_bindings, local_type_names)
+                && binding_name == receiver_name
+            {
+                visible_bindings.push((node.start_byte(), owner));
+            }
+        }
+        _ => {}
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn java_field_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> OptionalReceiverOwnerBinding {
+    let field_name = receiver_name
+        .strip_prefix("this.")
+        .unwrap_or(receiver_name)
+        .trim();
+    if field_name == "this" || field_name.contains('.') {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(
+        callable,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "record_declaration",
+            "enum_declaration",
+            "annotation_type_declaration",
+        ],
+    )?;
+    let mut field_bindings = Vec::new();
+    walk_tree_nodes(owner_node, &mut |node| {
+        if node.kind() != "field_declaration" {
+            return;
+        }
+        if !enclosing_node_with_kind(
+            node,
+            &[
+                "class_declaration",
+                "interface_declaration",
+                "record_declaration",
+                "enum_declaration",
+                "annotation_type_declaration",
+            ],
+        )
+        .is_some_and(|owner| same_ts_span(owner, owner_node))
+        {
+            return;
+        }
+        for (binding_name, owner) in java_field_declaration_receiver_bindings(
+            node,
+            source,
+            import_bindings,
+            local_type_names,
+        ) {
+            if binding_name == field_name
+                && let Some(owner) = owner
+            {
+                field_bindings.push(owner);
+            }
+        }
+    });
+    field_bindings.sort();
+    field_bindings.dedup();
+    if field_bindings.len() == 1 {
+        Some(field_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn java_field_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    java_variable_declaration_receiver_bindings(node, source, import_bindings, local_type_names)
+}
+
+fn java_local_variable_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    java_variable_declaration_receiver_bindings(node, source, import_bindings, local_type_names)
+}
+
+fn java_scoped_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    if matches!(
+        binding.kind(),
+        "try_statement" | "try_with_resources_statement"
+    ) {
+        let mut cursor = binding.walk();
+        return binding
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "block")
+            .is_some_and(|body| node_is_same_or_ancestor(body, call_node));
+    }
+    node_is_same_or_ancestor(binding, call_node)
+}
+
+fn java_scoped_receiver_binding(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Option<(String, OptionalReceiverOwnerBinding)> {
+    let surface = trimmed_node_text(node, source)?;
+    let header = match node.kind() {
+        "enhanced_for_statement" => surface
+            .split_once('(')?
+            .1
+            .split_once(':')?
+            .0
+            .trim()
+            .to_string(),
+        "catch_clause" => surface
+            .split_once('(')?
+            .1
+            .split_once(')')?
+            .0
+            .trim()
+            .to_string(),
+        "try_statement" | "try_with_resources_statement" => {
+            let rest = surface.trim_start().strip_prefix("try")?.trim_start();
+            let rest = rest.strip_prefix('(')?;
+            rest.split_once('{')?
+                .0
+                .trim()
+                .trim_end_matches(')')
+                .trim()
+                .to_string()
+        }
+        _ => return None,
+    };
+    java_typed_binding_header_owner(&header, import_bindings, local_type_names)
+}
+
+fn java_typed_binding_header_owner(
+    header: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Option<(String, OptionalReceiverOwnerBinding)> {
+    for segment in header.split(';') {
+        let head = segment
+            .split('=')
+            .next()
+            .unwrap_or(segment)
+            .trim()
+            .trim_end_matches(')')
+            .trim();
+        let tokens = head
+            .split_whitespace()
+            .filter(|token| *token != "final" && !token.starts_with('@'))
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let Some(binding_name) =
+            normalize_parameter_name(tokens.last().copied().unwrap_or_default())
+        else {
+            continue;
+        };
+        let raw_type = tokens[..tokens.len() - 1].join(" ");
+        return Some((
+            binding_name,
+            java_receiver_owner_from_type(&raw_type, import_bindings, local_type_names),
+        ));
+    }
+    None
+}
+
+fn java_variable_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    let declared_owner = node
+        .child_by_field_name("type")
+        .and_then(|type_node| trimmed_node_text(type_node, source))
+        .and_then(|raw_type| {
+            java_receiver_owner_from_type(&raw_type, import_bindings, local_type_names)
+        });
+    let declared_is_var = node
+        .child_by_field_name("type")
+        .and_then(|type_node| trimmed_node_text(type_node, source))
+        .is_some_and(|raw_type| raw_type.trim() == "var");
+    let mut bindings = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name) = child
+            .child_by_field_name("name")
+            .and_then(|name_node| trimmed_node_text(name_node, source))
+            .as_deref()
+            .and_then(normalize_parameter_name)
+        else {
+            continue;
+        };
+        let owner = if declared_is_var {
+            child.child_by_field_name("value").and_then(|value| {
+                java_direct_new_owner(value, source, import_bindings, local_type_names)
+            })
+        } else {
+            declared_owner.clone()
+        };
+        bindings.push((name, owner));
+    }
+    bindings
+}
+
+fn java_receiver_owner_from_type(
+    raw_type: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(raw_type)?;
+    if owner_name == "var" {
+        return None;
+    }
+    let owner_module = if local_type_names.contains(&owner_name) {
+        None
+    } else if let Some(module_name) = java_qualified_type_module_name(raw_type) {
+        Some(module_name)
+    } else {
+        import_bindings.get(&owner_name).cloned()
+    };
+    Some((owner_name, owner_module))
+}
+
+fn java_static_receiver_owner(
+    receiver_name: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(receiver_name)?;
+    if local_type_names.contains(&owner_name) {
+        return Some((owner_name, None));
+    }
+    if let Some(module_name) = import_bindings.get(&owner_name) {
+        return Some((owner_name, Some(module_name.clone())));
+    }
+    if let Some(module_name) = java_qualified_type_module_name(receiver_name)
+        && owner_name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return Some((owner_name, Some(module_name)));
+    }
+    None
+}
+
+fn java_direct_new_owner(
+    value: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+    local_type_names: &HashSet<String>,
+) -> OptionalReceiverOwnerBinding {
+    if value.kind() != "object_creation_expression" {
+        return None;
+    }
+    value
+        .child_by_field_name("type")
+        .and_then(|type_node| trimmed_node_text(type_node, source))
+        .and_then(|raw_type| {
+            java_receiver_owner_from_type(&raw_type, import_bindings, local_type_names)
+        })
+}
+
+fn java_qualified_type_module_name(raw_type: &str) -> Option<String> {
+    let base = raw_type
+        .trim()
+        .split(['<', '['])
+        .next()
+        .unwrap_or(raw_type)
+        .trim();
+    if !base.contains('.') || base.contains('*') || base.split_whitespace().count() != 1 {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+fn java_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = java_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = java_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn java_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["block"])
+}
+
+fn collect_java_import_type_bindings(root: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let local_type_names = collect_java_top_level_type_names(root, source);
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut cursor = root.walk();
+
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "import_declaration" {
+            continue;
+        }
+        let Some(module_name) = java_import_type_module_name(child, source) else {
+            continue;
+        };
+        let Some(local_name) = module_name
+            .rsplit('.')
+            .next()
+            .and_then(normalize_parameter_name)
+        else {
+            continue;
+        };
+        if local_type_names.contains(&local_name) || duplicates.contains(&local_name) {
+            continue;
+        }
+        if bindings.contains_key(&local_name) {
+            bindings.remove(&local_name);
+            duplicates.insert(local_name);
+            continue;
+        }
+        bindings.insert(local_name, module_name);
+    }
+
+    bindings
+}
+
+fn collect_java_top_level_type_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if java_type_declaration_kind(child.kind())
+            && let Some(name) = declaration_name(child, source)
+        {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn java_type_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "record_declaration"
+            | "enum_declaration"
+            | "annotation_type_declaration"
+    )
+}
+
+fn java_import_type_module_name(import_node: TsNode<'_>, source: &str) -> Option<String> {
+    let statement = trimmed_node_text(import_node, source)?;
+    let rest = statement.strip_prefix("import")?.trim();
+    let module_name = rest.trim_end_matches(';').trim();
+    if module_name.starts_with("static ") || module_name.ends_with(".*") {
+        return None;
+    }
+    if !module_name.contains('.')
+        || module_name.contains('*')
+        || module_name.contains('|')
+        || module_name.split_whitespace().count() != 1
+    {
+        return None;
+    }
+    Some(module_name.to_string())
+}
+
+fn collect_go_import_bindings(source: &str) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut in_import_list = false;
+    for raw_line in source.lines() {
+        let line = go_strip_line_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_import_list {
+            if line.starts_with(')') {
+                in_import_list = false;
+                continue;
+            }
+            if let Some((local_name, module_name)) = go_import_binding_from_spec(line) {
+                insert_unique_import_binding(
+                    &mut bindings,
+                    &mut duplicates,
+                    local_name,
+                    module_name,
+                );
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("import") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.starts_with('(') {
+            in_import_list = true;
+            continue;
+        }
+        if let Some((local_name, module_name)) = go_import_binding_from_spec(rest) {
+            insert_unique_import_binding(&mut bindings, &mut duplicates, local_name, module_name);
+        }
+    }
+    bindings
+}
+
+fn insert_unique_import_binding(
+    bindings: &mut HashMap<String, String>,
+    duplicates: &mut HashSet<String>,
+    local_name: String,
+    module_name: String,
+) {
+    if duplicates.contains(&local_name) {
+        return;
+    }
+    if bindings.contains_key(&local_name) {
+        bindings.remove(&local_name);
+        duplicates.insert(local_name);
+        return;
+    }
+    bindings.insert(local_name, module_name);
+}
+
+fn go_strip_line_comment(line: &str) -> &str {
+    line.split("//").next().unwrap_or(line)
+}
+
+fn go_import_binding_from_spec(spec: &str) -> Option<(String, String)> {
+    let spec = spec.trim().trim_end_matches(';').trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let tokens = spec.split_whitespace().collect::<Vec<_>>();
+    let (local_name, module_name) = match tokens.as_slice() {
+        [module] => {
+            let module_name = go_import_module_name(module)?;
+            (go_default_import_local_name(&module_name)?, module_name)
+        }
+        [alias, module] if *alias != "." && *alias != "_" => {
+            let module_name = go_import_module_name(module)?;
+            (normalize_parameter_name(alias)?, module_name)
+        }
+        _ => return None,
+    };
+    Some((local_name, module_name))
+}
+
+fn go_import_module_name(raw: &str) -> Option<String> {
+    let module = raw.trim().trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    (!module.is_empty()).then(|| module.to_string())
+}
+
+fn go_default_import_local_name(module_name: &str) -> Option<String> {
+    module_name
+        .rsplit('/')
+        .next()
+        .and_then(normalize_parameter_name)
+}
+
+fn collect_php_member_edges(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
+    let mut edges = collect_enclosing_type_member_edges(
+        tree,
+        source,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "trait_declaration",
+        ],
+        &["method_declaration"],
+    );
+    edges.extend(collect_php_namespace_member_edges(tree, source));
+    edges
+}
+
+fn collect_php_namespace_member_edges(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
+    let mut edges = Vec::new();
+    let root = tree.root_node();
+    walk_tree_nodes(root, &mut |namespace| {
+        if namespace.kind() != "namespace_definition" {
+            return;
+        }
+        let Some(body) = namespace.child_by_field_name("body") else {
+            return;
+        };
+        collect_php_namespace_member_edges_in_scope(namespace, body, source, &mut edges);
+    });
+
+    let mut current_namespace = None;
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "namespace_definition" {
+            current_namespace = child.child_by_field_name("body").is_none().then_some(child);
+            continue;
+        }
+        let Some(namespace) = current_namespace else {
+            continue;
+        };
+        collect_php_namespace_member_edge(namespace, child, source, &mut edges);
+    }
+
+    edges
+}
+
+fn collect_php_namespace_member_edges_in_scope(
+    namespace: TsNode<'_>,
+    scope: TsNode<'_>,
+    source: &str,
+    edges: &mut Vec<ManualMemberEdgeSpec>,
+) {
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        collect_php_namespace_member_edge(namespace, child, source, edges);
+    }
+}
+
+fn collect_php_namespace_member_edge(
+    namespace: TsNode<'_>,
+    child: TsNode<'_>,
+    source: &str,
+    edges: &mut Vec<ManualMemberEdgeSpec>,
+) {
+    if !matches!(child.kind(), "class_declaration" | "interface_declaration") {
+        return;
+    }
+    let Some(source_name) = declaration_name(namespace, source) else {
+        return;
+    };
+    let Some(target_name) = declaration_name(child, source) else {
+        return;
+    };
+    edges.push(ManualMemberEdgeSpec {
+        source_name,
+        target_name,
+        source_span: ts_node_graph_span(namespace),
+        target_span: ts_node_graph_span(child),
+        line: Some(child.start_position().row as u32 + 1),
+    });
+}
+
 fn collect_php_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let root = tree.root_node();
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if !matches!(
             callable.kind(),
@@ -4867,25 +8328,586 @@ fn collect_php_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRecei
         let Some(source_name) = declaration_name(callable, source) else {
             return;
         };
+        let visible_type_names = collect_php_visible_type_binding_names(root, callable, source);
+        let imported_type_bindings =
+            collect_php_visible_imported_type_bindings(root, callable, source, &visible_type_names);
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut local_receiver_callsites = HashSet::new();
+        collect_php_local_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &visible_type_names,
+            &imported_type_bindings,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
         let receiver_types = collect_php_parameter_types(callable, source);
         if receiver_types.is_empty() {
             return;
         }
+        let start = edges.len();
         collect_receiver_call_specs_in_callable(
             callable,
             source,
-            &source_name,
-            ts_node_graph_span(callable),
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
             &receiver_types,
             php_member_call,
+            false,
             &mut edges,
         );
+        let mut parameter_specs = edges.split_off(start);
+        parameter_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut parameter_specs {
+            if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
+                spec.owner_name = binding.owner_name.clone();
+                spec.owner_module = Some(binding.module_name.clone());
+            }
+        }
+        edges.extend(parameter_specs);
     });
     edges
 }
 
+fn collect_php_local_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = php_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let owner = php_self_receiver_owner(callable, &receiver_name, source)
+            .map(Some)
+            .or_else(|| {
+                php_field_receiver_owner(
+                    callable,
+                    &receiver_name,
+                    source,
+                    visible_type_names,
+                    imported_type_bindings,
+                )
+                .map(Some)
+            })
+            .or_else(|| {
+                php_direct_new_owner_surface(
+                    &receiver_name,
+                    visible_type_names,
+                    imported_type_bindings,
+                )
+                .map(Some)
+            })
+            .or_else(|| {
+                php_visible_local_receiver_owner(
+                    callable,
+                    node,
+                    &receiver_name,
+                    source,
+                    visible_type_names,
+                    imported_type_bindings,
+                )
+            });
+        let Some(owner) = owner else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        local_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn php_self_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> OptionalReceiverOwnerBinding {
+    if receiver_name != "this" {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(
+        callable,
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "trait_declaration",
+        ],
+    )?;
+    let owner_name = declaration_name(owner_node, source)?;
+    Some((owner_name, None))
+}
+
+fn php_field_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let field_name = receiver_name.strip_prefix("this->")?.trim();
+    let class_node = enclosing_node_with_kind(callable, &["class_declaration"])?;
+    let mut field_bindings = Vec::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        if !matches!(
+            node.kind(),
+            "property_declaration" | "property_promotion_parameter"
+        ) {
+            return;
+        }
+        if !enclosing_node_with_kind(node, &["class_declaration"])
+            .is_some_and(|owner| same_ts_span(owner, class_node))
+        {
+            return;
+        }
+        let Some(surface) = trimmed_node_text(node, source) else {
+            return;
+        };
+        for (binding_name, owner) in
+            php_typed_member_bindings_surface(&surface, visible_type_names, imported_type_bindings)
+        {
+            if binding_name == field_name {
+                field_bindings.push(owner);
+            }
+        }
+    });
+    field_bindings.sort();
+    field_bindings.dedup();
+    if field_bindings.len() == 1 {
+        Some(field_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn php_typed_member_bindings_surface(
+    surface: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Vec<(String, ReceiverOwnerBinding)> {
+    let surface = surface
+        .split('=')
+        .next()
+        .unwrap_or(surface)
+        .trim()
+        .trim_end_matches([';', ','])
+        .trim();
+    let Some((type_side, _)) = surface.split_once('$') else {
+        return Vec::new();
+    };
+    let Some(raw_type) = type_side
+        .split_whitespace()
+        .last()
+        .filter(|token| !php_member_modifier_token(token))
+    else {
+        return Vec::new();
+    };
+    let Some(owner) =
+        php_receiver_owner_from_type(raw_type, visible_type_names, imported_type_bindings)
+    else {
+        return Vec::new();
+    };
+
+    surface
+        .split('$')
+        .skip(1)
+        .filter_map(|part| {
+            let name = part
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect::<String>();
+            normalize_parameter_name(&name).map(|name| (name, owner.clone()))
+        })
+        .collect()
+}
+
+fn php_member_modifier_token(token: &str) -> bool {
+    matches!(
+        token,
+        "public" | "protected" | "private" | "readonly" | "static" | "var" | "final" | "abstract"
+    )
+}
+
+fn php_visible_local_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "assignment_expression" {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        let Some(left_node) = node.child_by_field_name("left") else {
+            return;
+        };
+        if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
+            return;
+        }
+        let owner = node.child_by_field_name("right").and_then(|right_node| {
+            php_direct_new_owner(
+                right_node,
+                source,
+                visible_type_names,
+                imported_type_bindings,
+            )
+        });
+        visible_bindings.push((node.end_byte(), owner));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn php_direct_new_owner(
+    node: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    trimmed_node_text(node, source)
+        .as_deref()
+        .and_then(|surface| {
+            php_direct_new_owner_surface(surface, visible_type_names, imported_type_bindings)
+        })
+}
+
+fn php_direct_new_owner_surface(
+    surface: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let surface = surface
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let rest = surface.strip_prefix("new ")?;
+    let type_surface = rest.split(['(', '{']).next().unwrap_or(rest).trim();
+    if type_surface.contains('\\') {
+        return None;
+    }
+    php_receiver_owner_from_type(type_surface, visible_type_names, imported_type_bindings)
+}
+
+fn php_receiver_owner_from_type(
+    raw_type: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let raw_type = raw_type.trim().trim_start_matches('?').trim();
+    if raw_type.contains('\\') || raw_type.contains('|') || raw_type.contains('&') {
+        return None;
+    }
+    let owner_name = normalize_type_surface(raw_type)?;
+    if visible_type_names.contains(&owner_name) {
+        return Some((owner_name, None));
+    }
+    if let Some(binding) = imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    None
+}
+
+fn collect_php_visible_imported_type_bindings(
+    root: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+) -> HashMap<String, ImportedTypeBinding> {
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+
+    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_definition"])
+        && let Some(body) = namespace.child_by_field_name("body")
+    {
+        collect_php_imported_type_bindings_in_scope(
+            body,
+            source,
+            visible_type_names,
+            &mut bindings,
+            &mut duplicates,
+        );
+    } else {
+        let (start_byte, end_byte) = php_unbracketed_namespace_segment(root, callable);
+        collect_php_imported_type_bindings_in_root_segment(
+            root,
+            source,
+            visible_type_names,
+            &mut bindings,
+            &mut duplicates,
+            start_byte,
+            end_byte,
+        );
+    }
+
+    bindings
+}
+
+fn collect_php_imported_type_bindings_in_scope(
+    scope: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    bindings: &mut HashMap<String, ImportedTypeBinding>,
+    duplicates: &mut HashSet<String>,
+) {
+    let mut cursor = scope.walk();
+    for statement in scope.named_children(&mut cursor) {
+        if statement.kind() != "namespace_use_declaration" {
+            continue;
+        }
+        let Some(statement_surface) = trimmed_node_text(statement, source) else {
+            continue;
+        };
+        for (owner_name, local_name, module_name) in
+            php_import_type_binding_names(&statement_surface)
+        {
+            if visible_type_names.contains(&local_name) || duplicates.contains(&local_name) {
+                continue;
+            }
+            if bindings.contains_key(&local_name) {
+                bindings.remove(&local_name);
+                duplicates.insert(local_name);
+                continue;
+            }
+            bindings.insert(
+                local_name,
+                ImportedTypeBinding {
+                    module_name,
+                    owner_name,
+                },
+            );
+        }
+    }
+}
+
+fn collect_php_imported_type_bindings_in_root_segment(
+    root: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    bindings: &mut HashMap<String, ImportedTypeBinding>,
+    duplicates: &mut HashSet<String>,
+    start_byte: usize,
+    end_byte: usize,
+) {
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.start_byte() < start_byte || statement.start_byte() >= end_byte {
+            continue;
+        }
+        if statement.kind() != "namespace_use_declaration" {
+            continue;
+        }
+        let Some(statement_surface) = trimmed_node_text(statement, source) else {
+            continue;
+        };
+        for (owner_name, local_name, module_name) in
+            php_import_type_binding_names(&statement_surface)
+        {
+            if visible_type_names.contains(&local_name) || duplicates.contains(&local_name) {
+                continue;
+            }
+            if bindings.contains_key(&local_name) {
+                bindings.remove(&local_name);
+                duplicates.insert(local_name);
+                continue;
+            }
+            bindings.insert(
+                local_name,
+                ImportedTypeBinding {
+                    module_name,
+                    owner_name,
+                },
+            );
+        }
+    }
+}
+
+fn collect_php_visible_type_binding_names(
+    root: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_definition"])
+        && let Some(body) = namespace.child_by_field_name("body")
+    {
+        collect_php_type_binding_names_in_scope(body, source, &mut names);
+    } else {
+        let (start_byte, end_byte) = php_unbracketed_namespace_segment(root, callable);
+        collect_php_type_binding_names_in_root_segment(
+            root, source, &mut names, start_byte, end_byte,
+        );
+    }
+    names
+}
+
+fn collect_php_type_binding_names_in_scope(
+    scope: TsNode<'_>,
+    source: &str,
+    names: &mut HashSet<String>,
+) {
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        if matches!(child.kind(), "class_declaration" | "interface_declaration")
+            && let Some(name) = declaration_name(child, source)
+        {
+            names.insert(name);
+        }
+    }
+}
+
+fn collect_php_type_binding_names_in_root_segment(
+    root: TsNode<'_>,
+    source: &str,
+    names: &mut HashSet<String>,
+    start_byte: usize,
+    end_byte: usize,
+) {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.start_byte() < start_byte || child.start_byte() >= end_byte {
+            continue;
+        }
+        if matches!(child.kind(), "class_declaration" | "interface_declaration")
+            && let Some(name) = declaration_name(child, source)
+        {
+            names.insert(name);
+        }
+    }
+}
+
+fn php_unbracketed_namespace_segment(root: TsNode<'_>, node: TsNode<'_>) -> (usize, usize) {
+    let mut start_byte = root.start_byte();
+    let mut end_byte = root.end_byte();
+    let node_start = node.start_byte();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "namespace_definition" || child.child_by_field_name("body").is_some() {
+            continue;
+        }
+        if node_start < child.start_byte() {
+            end_byte = child.start_byte();
+            break;
+        }
+        start_byte = child.end_byte();
+        end_byte = root.end_byte();
+    }
+    (start_byte, end_byte)
+}
+
+fn php_import_type_binding_names(statement: &str) -> Vec<(String, String, String)> {
+    let Some(rest) = statement.strip_prefix("use") else {
+        return Vec::new();
+    };
+    let rest = rest.trim().trim_end_matches(';').trim();
+    if starts_with_case_insensitive_keyword(rest, "function")
+        || starts_with_case_insensitive_keyword(rest, "const")
+        || rest.contains('{')
+    {
+        return Vec::new();
+    }
+
+    split_top_level_parameters(rest)
+        .into_iter()
+        .filter_map(|part| php_import_type_binding_name(&part))
+        .collect()
+}
+
+fn php_import_type_binding_name(import_surface: &str) -> Option<(String, String, String)> {
+    let import_surface = import_surface.trim();
+    if starts_with_case_insensitive_keyword(import_surface, "function")
+        || starts_with_case_insensitive_keyword(import_surface, "const")
+    {
+        return None;
+    }
+    let (module_surface, alias_surface) = split_case_insensitive_alias(import_surface, "as")?;
+    let (owner_name, module_name) = php_imported_owner_module_name(module_surface)?;
+    let local_name = normalize_parameter_name(alias_surface)?;
+    Some((owner_name, local_name, module_name))
+}
+
+fn split_case_insensitive_alias<'a>(surface: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
+    let mut tokens = surface.split_whitespace();
+    let module_surface = tokens.next()?;
+    let separator = tokens.next()?;
+    let alias_surface = tokens.next()?;
+    if tokens.next().is_some() || !separator.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    Some((module_surface, alias_surface))
+}
+
+fn starts_with_case_insensitive_keyword(surface: &str, keyword: &str) -> bool {
+    let mut parts = surface.split_whitespace();
+    parts
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case(keyword))
+}
+
+fn php_imported_owner_module_name(raw_module: &str) -> Option<(String, String)> {
+    let module = raw_module.trim().trim_start_matches('\\').trim();
+    if module.is_empty()
+        || module.contains('*')
+        || module.contains('|')
+        || module.split_whitespace().count() != 1
+    {
+        return None;
+    }
+    let (namespace, owner_name) = module.rsplit_once('\\')?;
+    let owner_name = normalize_parameter_name(owner_name)?;
+    if namespace.trim().is_empty() {
+        return None;
+    }
+    Some((owner_name.clone(), format!("{namespace}.{owner_name}")))
+}
+
 fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let root = tree.root_node();
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if callable.kind() != "method_declaration" {
             return;
@@ -4893,25 +8915,569 @@ fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRe
         let Some(source_name) = declaration_name(callable, source) else {
             return;
         };
+        let visible_type_names = collect_csharp_visible_type_binding_names(root, callable, source);
+        let imported_type_bindings = collect_csharp_visible_alias_imported_type_bindings(
+            root,
+            callable,
+            source,
+            &visible_type_names,
+        );
         let receiver_types = collect_csharp_parameter_types(callable, source);
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let mut precise_receiver_callsites = HashSet::new();
+        let receiver_context = CsharpReceiverContext {
+            visible_type_names: &visible_type_names,
+            imported_type_bindings: &imported_type_bindings,
+            parameter_receiver_types: &receiver_types,
+        };
+        collect_csharp_precise_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            receiver_context,
+            &mut precise_receiver_callsites,
+            &mut edges,
+        );
         if receiver_types.is_empty() {
             return;
         }
+        let start = edges.len();
         collect_receiver_call_specs_in_callable(
             callable,
             source,
-            &source_name,
-            ts_node_graph_span(callable),
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
             &receiver_types,
             csharp_member_call,
+            false,
             &mut edges,
         );
+        let mut parameter_specs = edges.split_off(start);
+        parameter_specs
+            .retain(|spec| !precise_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut parameter_specs {
+            if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
+                spec.owner_name = binding.owner_name.clone();
+                spec.owner_module = Some(binding.module_name.clone());
+            }
+        }
+        edges.extend(parameter_specs);
     });
     edges
+}
+
+struct CsharpReceiverContext<'a> {
+    visible_type_names: &'a HashSet<String>,
+    imported_type_bindings: &'a HashMap<String, ImportedTypeBinding>,
+    parameter_receiver_types: &'a HashMap<String, String>,
+}
+
+fn collect_csharp_precise_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    context: CsharpReceiverContext<'_>,
+    precise_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = csharp_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let Some(owner) =
+            csharp_visible_receiver_owner(callable, node, &receiver_name, source, &context)
+        else {
+            return;
+        };
+        let method_col = member_call_method_col(node, source, &method_name);
+        precise_receiver_callsites.insert(ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        });
+        if let Some((owner_name, owner_module)) = owner {
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn csharp_visible_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &CsharpReceiverContext<'_>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    if let Some(owner) = csharp_self_receiver_owner(callable, receiver_name, source) {
+        return Some(Some(owner));
+    }
+    if let Some(owner) = csharp_direct_new_owner_surface(
+        receiver_name,
+        context.visible_type_names,
+        context.imported_type_bindings,
+    ) {
+        return Some(Some(owner));
+    }
+    if let Some(owner) = csharp_visible_local_receiver_owner(
+        callable,
+        call_node,
+        receiver_name,
+        source,
+        context.visible_type_names,
+        context.imported_type_bindings,
+    ) {
+        return Some(owner);
+    }
+    if !receiver_name.contains('.') && context.parameter_receiver_types.contains_key(receiver_name)
+    {
+        return None;
+    }
+    if let Some(owner) = csharp_field_receiver_owner(
+        callable,
+        receiver_name,
+        source,
+        context.visible_type_names,
+        context.imported_type_bindings,
+    ) {
+        return Some(Some(owner));
+    }
+    csharp_static_receiver_owner(
+        receiver_name,
+        context.visible_type_names,
+        context.imported_type_bindings,
+    )
+    .map(Some)
+}
+
+fn csharp_self_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> OptionalReceiverOwnerBinding {
+    if receiver_name != "this" {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(
+        callable,
+        &[
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "record_declaration",
+        ],
+    )?;
+    let owner_name = declaration_name(owner_node, source)?;
+    Some((owner_name, None))
+}
+
+fn csharp_visible_local_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "local_declaration_statement" {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+            || !csharp_local_binding_visible_at_call(node, call_node)
+        {
+            return;
+        }
+        for (binding_name, owner) in csharp_local_declaration_receiver_bindings(
+            node,
+            source,
+            visible_type_names,
+            imported_type_bindings,
+        ) {
+            if binding_name == receiver_name {
+                visible_bindings.push((node.end_byte(), owner));
+            }
+        }
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn csharp_field_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let field_name = receiver_name
+        .strip_prefix("this.")
+        .unwrap_or(receiver_name)
+        .trim();
+    let class_node = enclosing_node_with_kind(callable, &["class_declaration"])?;
+    let mut field_bindings = Vec::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        if node.kind() != "field_declaration" {
+            return;
+        }
+        if !enclosing_node_with_kind(node, &["class_declaration"])
+            .is_some_and(|owner| same_ts_span(owner, class_node))
+        {
+            return;
+        }
+        for (binding_name, owner) in csharp_field_declaration_receiver_bindings(
+            node,
+            source,
+            visible_type_names,
+            imported_type_bindings,
+        ) {
+            if binding_name == field_name
+                && let Some(owner) = owner
+            {
+                field_bindings.push(owner);
+            }
+        }
+    });
+    field_bindings.sort();
+    field_bindings.dedup();
+    if field_bindings.len() == 1 {
+        Some(field_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn csharp_field_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    let Some(variable_declaration) = first_descendant_with_kind(node, "variable_declaration")
+    else {
+        return Vec::new();
+    };
+    csharp_variable_declaration_receiver_bindings(
+        variable_declaration,
+        source,
+        visible_type_names,
+        imported_type_bindings,
+    )
+}
+
+fn csharp_local_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    let Some(variable_declaration) = first_descendant_with_kind(node, "variable_declaration")
+    else {
+        return Vec::new();
+    };
+    csharp_variable_declaration_receiver_bindings(
+        variable_declaration,
+        source,
+        visible_type_names,
+        imported_type_bindings,
+    )
+}
+
+fn csharp_variable_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    let declared_type = node
+        .child_by_field_name("type")
+        .and_then(|type_node| trimmed_node_text(type_node, source));
+    let declared_owner = declared_type.as_deref().and_then(|raw_type| {
+        csharp_receiver_owner_from_type(raw_type, visible_type_names, imported_type_bindings)
+    });
+    let declared_is_var = declared_type
+        .as_deref()
+        .is_some_and(|raw_type| raw_type.trim() == "var");
+    let mut bindings = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name) = child
+            .child_by_field_name("name")
+            .and_then(|name_node| trimmed_node_text(name_node, source))
+            .as_deref()
+            .and_then(normalize_parameter_name)
+        else {
+            continue;
+        };
+        let owner = if declared_is_var {
+            trimmed_node_text(child, source)
+                .as_deref()
+                .and_then(|surface| surface.split_once('='))
+                .and_then(|(_, value)| {
+                    csharp_direct_new_owner_surface(
+                        value,
+                        visible_type_names,
+                        imported_type_bindings,
+                    )
+                })
+        } else {
+            declared_owner.clone()
+        };
+        bindings.push((name, owner));
+    }
+    bindings
+}
+
+fn csharp_receiver_owner_from_type(
+    raw_type: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(raw_type)?;
+    if owner_name == "var" {
+        return None;
+    }
+    if let Some(module_name) = csharp_qualified_type_module_name(raw_type) {
+        return Some((owner_name, Some(module_name)));
+    }
+    if visible_type_names.contains(&owner_name) {
+        return Some((owner_name, None));
+    }
+    if let Some(binding) = imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    Some((owner_name, None))
+}
+
+fn csharp_direct_new_owner_surface(
+    surface: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let surface = surface.trim();
+    let rest = surface.strip_prefix("new ")?;
+    let type_surface = rest.split(['(', '{']).next().unwrap_or(rest).trim();
+    csharp_receiver_owner_from_type(type_surface, visible_type_names, imported_type_bindings)
+}
+
+fn csharp_static_receiver_owner(
+    receiver_name: &str,
+    visible_type_names: &HashSet<String>,
+    imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(receiver_name)?;
+    if let Some(module_name) = csharp_qualified_type_module_name(receiver_name)
+        && owner_name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return Some((owner_name, Some(module_name)));
+    }
+    if visible_type_names.contains(&owner_name) {
+        return Some((owner_name, None));
+    }
+    if let Some(binding) = imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    None
+}
+
+fn csharp_qualified_type_module_name(raw_type: &str) -> Option<String> {
+    let base = raw_type
+        .trim()
+        .split(['<', '['])
+        .next()
+        .unwrap_or(raw_type)
+        .trim();
+    if !base.contains('.') || base.contains('*') || base.split_whitespace().count() != 1 {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+fn csharp_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = csharp_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = csharp_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn csharp_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["block"])
+}
+
+fn collect_csharp_visible_alias_imported_type_bindings(
+    root: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+) -> HashMap<String, ImportedTypeBinding> {
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+
+    collect_csharp_alias_imported_type_bindings_in_scope(
+        root,
+        source,
+        visible_type_names,
+        &mut bindings,
+        &mut duplicates,
+    );
+    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_declaration"])
+        && let Some(body) = namespace.child_by_field_name("body")
+    {
+        collect_csharp_alias_imported_type_bindings_in_scope(
+            body,
+            source,
+            visible_type_names,
+            &mut bindings,
+            &mut duplicates,
+        );
+    }
+
+    bindings
+}
+
+fn collect_csharp_alias_imported_type_bindings_in_scope(
+    scope: TsNode<'_>,
+    source: &str,
+    visible_type_names: &HashSet<String>,
+    bindings: &mut HashMap<String, ImportedTypeBinding>,
+    duplicates: &mut HashSet<String>,
+) {
+    let mut cursor = scope.walk();
+    for statement in scope.named_children(&mut cursor) {
+        if statement.kind() != "using_directive" {
+            continue;
+        }
+        let Some((owner_name, local_name, module_name)) =
+            csharp_alias_import_type_binding_names(statement, source)
+        else {
+            continue;
+        };
+        if visible_type_names.contains(&local_name) || duplicates.contains(&local_name) {
+            continue;
+        }
+        if bindings.contains_key(&local_name) {
+            bindings.remove(&local_name);
+            duplicates.insert(local_name);
+            continue;
+        }
+        bindings.insert(
+            local_name,
+            ImportedTypeBinding {
+                module_name,
+                owner_name,
+            },
+        );
+    }
+}
+
+fn collect_csharp_visible_type_binding_names(
+    root: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_csharp_type_binding_names_in_scope(root, source, &mut names);
+    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_declaration"])
+        && let Some(body) = namespace.child_by_field_name("body")
+    {
+        collect_csharp_type_binding_names_in_scope(body, source, &mut names);
+    }
+    names
+}
+
+fn collect_csharp_type_binding_names_in_scope(
+    scope: TsNode<'_>,
+    source: &str,
+    names: &mut HashSet<String>,
+) {
+    let mut cursor = scope.walk();
+    for child in scope.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "class_declaration" | "interface_declaration" | "struct_declaration"
+        ) && let Some(name) = declaration_name(child, source)
+        {
+            names.insert(name);
+        }
+    }
+}
+
+fn csharp_alias_import_type_binding_names(
+    statement: TsNode<'_>,
+    source: &str,
+) -> Option<(String, String, String)> {
+    let surface = trimmed_node_text(statement, source)?;
+    let rest = surface
+        .strip_prefix("global ")
+        .unwrap_or(surface.as_str())
+        .strip_prefix("using")?
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if rest.starts_with("static ") {
+        return None;
+    }
+    let (alias_surface, module_surface) = rest.split_once('=')?;
+    let local_name = normalize_parameter_name(alias_surface.trim())?;
+    let module_name = module_surface.trim();
+    if !module_name.contains('.') || module_name.contains('*') || module_name.contains('|') {
+        return None;
+    }
+    if module_name.split_whitespace().count() != 1 {
+        return None;
+    }
+    let owner_name = module_name
+        .rsplit('.')
+        .next()
+        .and_then(normalize_parameter_name)?;
+    Some((owner_name, local_name, module_name.to_string()))
 }
 
 fn collect_kotlin_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let root = tree.root_node();
+    let top_level_type_names = collect_kotlin_top_level_type_binding_names(root, source);
+    let has_wildcard_import = has_kotlin_wildcard_import(root, source);
+    let imported_type_bindings =
+        collect_kotlin_imported_type_bindings(root, source, &top_level_type_names);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if callable.kind() != "function_declaration" {
             return;
@@ -4919,25 +9485,968 @@ fn collect_kotlin_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRe
         let Some(source_name) = declaration_name(callable, source) else {
             return;
         };
-        let receiver_types = collect_colon_parameter_types(callable, source);
+        let source_span = ts_node_graph_span(callable);
+        let parameter_receiver_types = collect_colon_parameter_types(callable, source);
+        let mut local_receiver_callsites = HashSet::new();
+        collect_kotlin_precise_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: &source_name,
+                span: source_span,
+            },
+            KotlinReceiverContext {
+                parameter_receiver_types: &parameter_receiver_types,
+                imported_type_bindings: &imported_type_bindings,
+                top_level_type_names: &top_level_type_names,
+                has_wildcard_import,
+            },
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
+        if !parameter_receiver_types.is_empty() {
+            let start = edges.len();
+            collect_receiver_call_specs_in_callable(
+                callable,
+                source,
+                ManualReceiverSource {
+                    name: &source_name,
+                    span: source_span,
+                },
+                &parameter_receiver_types,
+                kotlin_member_call,
+                false,
+                &mut edges,
+            );
+            let mut parameter_specs = edges.split_off(start);
+            parameter_specs
+                .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+            for spec in &mut parameter_specs {
+                if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
+                    spec.owner_name = binding.owner_name.clone();
+                    spec.owner_module = Some(binding.module_name.clone());
+                } else if has_wildcard_import && !top_level_type_names.contains(&spec.owner_name) {
+                    spec.owner_module = Some("*".to_string());
+                }
+            }
+            edges.extend(parameter_specs);
+        }
+    });
+    edges
+}
+
+struct KotlinReceiverContext<'a> {
+    parameter_receiver_types: &'a HashMap<String, String>,
+    imported_type_bindings: &'a HashMap<String, ImportedTypeBinding>,
+    top_level_type_names: &'a HashSet<String>,
+    has_wildcard_import: bool,
+}
+
+fn collect_kotlin_precise_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    context: KotlinReceiverContext<'_>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = kotlin_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let method_col = member_call_method_col(node, source, &method_name);
+        let callsite_key = ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        };
+
+        if let Some(owner) =
+            kotlin_visible_local_receiver_owner(callable, node, &receiver_name, source, &context)
+        {
+            local_receiver_callsites.insert(callsite_key);
+            if let Some((owner_name, owner_module)) = owner {
+                edges.push(ManualReceiverCallSpec {
+                    source_name: call_source.name.to_string(),
+                    source_span: call_source.span,
+                    receiver_name,
+                    owner_name,
+                    owner_module,
+                    method_name,
+                    method_col,
+                    line: Some(node.start_position().row as u32 + 1),
+                    allow_global_fallback: false,
+                });
+            }
+            return;
+        }
+
+        let owner =
+            if let Some(owner) = kotlin_self_receiver_owner(callable, &receiver_name, source) {
+                Some(owner)
+            } else if !context
+                .parameter_receiver_types
+                .contains_key(&receiver_name)
+            {
+                kotlin_property_receiver_owner(callable, &receiver_name, source, &context)
+            } else {
+                None
+            };
+        let Some((owner_name, owner_module)) = owner else {
+            return;
+        };
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
+            owner_name,
+            owner_module,
+            method_name,
+            method_col,
+            line: Some(node.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+        });
+    });
+}
+
+fn kotlin_self_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> OptionalReceiverOwnerBinding {
+    if receiver_name != "this" {
+        return None;
+    }
+    let owner_node =
+        enclosing_node_with_kind(callable, &["class_declaration", "object_declaration"])?;
+    let owner_name = declaration_name(owner_node, source)?;
+    Some((owner_name, None))
+}
+
+fn kotlin_visible_local_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if !kotlin_local_declaration_candidate(node) {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        let Some(surface) = trimmed_node_text(node, source) else {
+            return;
+        };
+        let Some((binding_name, owner)) = kotlin_local_receiver_binding(&surface, context) else {
+            return;
+        };
+        if binding_name != receiver_name || !kotlin_local_binding_visible_at_call(node, call_node) {
+            return;
+        }
+        visible_bindings.push((node.end_byte(), owner));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn kotlin_property_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let field_name = receiver_name
+        .strip_prefix("this.")
+        .unwrap_or(receiver_name)
+        .trim();
+    if field_name == "this" || field_name.contains('.') {
+        return None;
+    }
+    let owner_node =
+        enclosing_node_with_kind(callable, &["class_declaration", "object_declaration"])?;
+    let mut property_bindings = Vec::new();
+    for (binding_name, owner) in
+        kotlin_primary_constructor_property_bindings(owner_node, source, context)
+    {
+        if binding_name == field_name
+            && let Some(owner) = owner
+        {
+            property_bindings.push(owner);
+        }
+    }
+    walk_tree_nodes(owner_node, &mut |node| {
+        if node.kind() != "property_declaration"
+            || !kotlin_property_belongs_to_owner(node, owner_node)
+        {
+            return;
+        }
+        for (binding_name, owner) in
+            kotlin_property_declaration_receiver_bindings(node, source, context)
+        {
+            if binding_name == field_name
+                && let Some(owner) = owner
+            {
+                property_bindings.push(owner);
+            }
+        }
+    });
+    property_bindings.sort();
+    property_bindings.dedup();
+    if property_bindings.len() == 1 {
+        Some(property_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn kotlin_property_belongs_to_owner(property: TsNode<'_>, owner_node: TsNode<'_>) -> bool {
+    let mut current = property.parent();
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, owner_node) {
+            return true;
+        }
+        if candidate.kind() == "function_declaration"
+            || matches!(candidate.kind(), "class_declaration" | "object_declaration")
+        {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn kotlin_primary_constructor_property_bindings(
+    owner_node: TsNode<'_>,
+    source: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    let Some(owner_surface) = trimmed_node_text(owner_node, source) else {
+        return Vec::new();
+    };
+    let head = owner_surface
+        .split('{')
+        .next()
+        .unwrap_or(owner_surface.as_str());
+    let Some(parameters) = signature_parameter_surface_text(head) else {
+        return Vec::new();
+    };
+    split_top_level_parameters(&parameters)
+        .into_iter()
+        .filter_map(|parameter| {
+            let (name_side, type_side) = parameter.split_once(':')?;
+            if !kotlin_property_parameter_name_side(name_side) {
+                return None;
+            }
+            let binding_name = parameter_name_before_colon(name_side)?;
+            let owner =
+                kotlin_receiver_owner_from_type(&parameter_type_after_colon(type_side), context);
+            Some((binding_name, owner))
+        })
+        .collect()
+}
+
+fn signature_parameter_surface_text(text: &str) -> Option<String> {
+    let start = text.find('(')?;
+    let mut depth = 0usize;
+    let mut parameter_start = None;
+    for (index, ch) in text.char_indices().skip_while(|(index, _)| *index < start) {
+        match ch {
+            '(' => {
+                depth = depth.saturating_add(1);
+                if depth == 1 {
+                    parameter_start = Some(index + ch.len_utf8());
+                }
+            }
+            ')' => {
+                if depth == 1 {
+                    let parameter_start = parameter_start?;
+                    return Some(text[parameter_start..index].to_string());
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn kotlin_property_parameter_name_side(name_side: &str) -> bool {
+    name_side
+        .split_whitespace()
+        .any(|token| matches!(token, "val" | "var"))
+}
+
+fn kotlin_property_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> Vec<(String, OptionalReceiverOwnerBinding)> {
+    trimmed_node_text(node, source)
+        .as_deref()
+        .and_then(|surface| kotlin_typed_property_binding(surface, context))
+        .into_iter()
+        .collect()
+}
+
+fn kotlin_local_declaration_candidate(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "property_declaration" | "variable_declaration" | "local_declaration"
+    )
+}
+
+fn kotlin_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = kotlin_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = kotlin_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn kotlin_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["block", "function_body"])
+}
+
+fn node_is_same_or_ancestor(ancestor: TsNode<'_>, node: TsNode<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, ancestor) {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn kotlin_local_receiver_binding(
+    surface: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> Option<(String, OptionalReceiverOwnerBinding)> {
+    let surface = surface.trim().trim_end_matches(';').trim();
+    let rest = surface
+        .strip_prefix("val ")
+        .or_else(|| surface.strip_prefix("var "))?
+        .trim();
+    let (binding_surface, value_surface) = rest.split_once('=')?;
+    let binding_name = binding_surface
+        .split(':')
+        .next()
+        .unwrap_or(binding_surface)
+        .split_whitespace()
+        .next()
+        .and_then(normalize_parameter_name)?;
+    let constructor_surface = value_surface.trim();
+    let Some((constructor_name, _)) = constructor_surface.split_once('(') else {
+        return Some((binding_name, None));
+    };
+    let constructor_name = constructor_name.trim();
+    if constructor_name.contains('.') || constructor_name.contains("::") {
+        return Some((binding_name, None));
+    }
+    let Some(owner_name) = normalize_type_surface(constructor_name) else {
+        return Some((binding_name, None));
+    };
+    if !owner_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return Some((binding_name, None));
+    }
+    let owner = kotlin_receiver_owner_from_constructor_name(&owner_name, context);
+    Some((binding_name, owner))
+}
+
+fn kotlin_receiver_owner_from_constructor_name(
+    constructor_name: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    if context.top_level_type_names.contains(constructor_name) {
+        return Some((constructor_name.to_string(), None));
+    }
+    if let Some(binding) = context.imported_type_bindings.get(constructor_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    Some((constructor_name.to_string(), None))
+}
+
+fn kotlin_typed_property_binding(
+    surface: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> Option<(String, OptionalReceiverOwnerBinding)> {
+    let surface = surface
+        .split('=')
+        .next()
+        .unwrap_or(surface)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let rest = surface
+        .rsplit_once(" val ")
+        .map(|(_, rest)| rest)
+        .or_else(|| surface.rsplit_once(" var ").map(|(_, rest)| rest))
+        .or_else(|| surface.strip_prefix("val "))
+        .or_else(|| surface.strip_prefix("var "))?
+        .trim();
+    let (name_side, type_side) = rest.split_once(':')?;
+    let binding_name = parameter_name_before_colon(name_side)?;
+    let owner = kotlin_receiver_owner_from_type(&parameter_type_after_colon(type_side), context);
+    Some((binding_name, owner))
+}
+
+fn kotlin_receiver_owner_from_type(
+    raw_type: &str,
+    context: &KotlinReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(raw_type)?;
+    if context.top_level_type_names.contains(&owner_name) {
+        return Some((owner_name, None));
+    }
+    if let Some(binding) = context.imported_type_bindings.get(&owner_name) {
+        return Some((
+            binding.owner_name.clone(),
+            Some(binding.module_name.clone()),
+        ));
+    }
+    if context.has_wildcard_import {
+        return Some((owner_name, Some("*".to_string())));
+    }
+    Some((owner_name, None))
+}
+
+fn collect_kotlin_imported_type_bindings(
+    root: TsNode<'_>,
+    source: &str,
+    top_level_bindings: &HashSet<String>,
+) -> HashMap<String, ImportedTypeBinding> {
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut cursor = root.walk();
+
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "import" {
+            continue;
+        }
+        let Some((owner_name, local_name, module_name)) =
+            kotlin_import_type_binding_names(statement, source)
+        else {
+            continue;
+        };
+        if top_level_bindings.contains(&local_name) || duplicates.contains(&local_name) {
+            continue;
+        }
+        if bindings.contains_key(&local_name) {
+            bindings.remove(&local_name);
+            duplicates.insert(local_name);
+            continue;
+        }
+        bindings.insert(
+            local_name,
+            ImportedTypeBinding {
+                module_name,
+                owner_name,
+            },
+        );
+    }
+
+    bindings
+}
+
+fn has_kotlin_wildcard_import(root: TsNode<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|statement| statement.kind() == "import")
+        .filter_map(|statement| trimmed_node_text(statement, source))
+        .any(|surface| {
+            surface
+                .strip_prefix("import")
+                .map(|rest| rest.trim().trim_end_matches(';').trim().ends_with(".*"))
+                .unwrap_or(false)
+        })
+}
+
+fn collect_kotlin_top_level_type_binding_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "class_declaration" | "object_declaration" | "type_alias"
+        ) && let Some(name) = declaration_name(child, source)
+        {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn kotlin_import_type_binding_names(
+    statement: TsNode<'_>,
+    source: &str,
+) -> Option<(String, String, String)> {
+    let surface = trimmed_node_text(statement, source)?;
+    let rest = surface
+        .strip_prefix("import")?
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if rest.is_empty() || rest.ends_with(".*") || rest.contains('*') {
+        return None;
+    }
+
+    let (module_surface, alias_surface) = rest
+        .rsplit_once(" as ")
+        .map(|(module, alias)| (module.trim(), Some(alias.trim())))
+        .unwrap_or((rest, None));
+    if !module_surface.contains('.') || module_surface.split_whitespace().count() != 1 {
+        return None;
+    }
+    let owner_name = module_surface
+        .rsplit('.')
+        .next()
+        .and_then(normalize_parameter_name)?;
+    let local_name = alias_surface
+        .and_then(normalize_parameter_name)
+        .unwrap_or_else(|| owner_name.clone());
+    Some((owner_name, local_name, module_surface.to_string()))
+}
+
+fn collect_cpp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
+    let mut edges = Vec::new();
+    walk_tree_nodes(tree.root_node(), &mut |callable| {
+        if callable.kind() != "function_definition" {
+            return;
+        }
+        let Some(source_name) = cpp_callable_name(callable, source) else {
+            return;
+        };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
+        let receiver_types = collect_cpp_parameter_types(callable, source);
+        let mut local_receiver_callsites = HashSet::new();
+        collect_cpp_precise_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            &receiver_types,
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
         if receiver_types.is_empty() {
             return;
         }
+        let start = edges.len();
         collect_receiver_call_specs_in_callable(
             callable,
             source,
-            &source_name,
-            ts_node_graph_span(callable),
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
             &receiver_types,
-            kotlin_member_call,
+            cpp_member_call,
+            false,
             &mut edges,
         );
+        let mut parameter_specs = edges.split_off(start);
+        parameter_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        edges.extend(parameter_specs);
     });
     edges
+}
+
+fn collect_cpp_precise_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    parameter_receiver_types: &HashMap<String, String>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = cpp_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let method_col = member_call_method_col(node, source, &method_name);
+        let callsite_key = ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        };
+
+        if let Some(owner_name) =
+            cpp_visible_local_receiver_owner(callable, node, &receiver_name, source)
+        {
+            local_receiver_callsites.insert(callsite_key);
+            if let Some(owner_name) = owner_name {
+                edges.push(ManualReceiverCallSpec {
+                    source_name: call_source.name.to_string(),
+                    source_span: call_source.span,
+                    receiver_name,
+                    owner_name,
+                    owner_module: None,
+                    method_name,
+                    method_col,
+                    line: Some(node.start_position().row as u32 + 1),
+                    allow_global_fallback: false,
+                });
+            }
+            return;
+        }
+
+        let owner_name =
+            if let Some(owner_name) = cpp_self_receiver_owner(callable, &receiver_name, source) {
+                Some(owner_name)
+            } else if !parameter_receiver_types.contains_key(&receiver_name) {
+                cpp_field_receiver_owner(callable, &receiver_name, source)
+            } else {
+                None
+            };
+        if let Some(owner_name) = owner_name {
+            local_receiver_callsites.insert(callsite_key);
+            edges.push(ManualReceiverCallSpec {
+                source_name: call_source.name.to_string(),
+                source_span: call_source.span,
+                receiver_name,
+                owner_name,
+                owner_module: None,
+                method_name,
+                method_col,
+                line: Some(node.start_position().row as u32 + 1),
+                allow_global_fallback: false,
+            });
+        }
+    });
+}
+
+fn cpp_self_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> Option<String> {
+    if receiver_name != "this" {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(callable, &["class_specifier", "struct_specifier"])?;
+    declaration_name(owner_node, source)
+}
+
+fn cpp_field_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> Option<String> {
+    let field_name = receiver_name
+        .strip_prefix("this->")
+        .unwrap_or(receiver_name)
+        .trim();
+    if field_name == "this" || field_name.contains('.') || field_name.contains("->") {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(callable, &["class_specifier", "struct_specifier"])?;
+    let mut field_bindings = Vec::new();
+    walk_tree_nodes(owner_node, &mut |node| {
+        if node.kind() != "field_declaration" || !cpp_field_belongs_to_owner(node, owner_node) {
+            return;
+        }
+        for (binding_name, owner_name) in cpp_local_declaration_receiver_bindings(node, source) {
+            if binding_name == field_name
+                && let Some(owner_name) = owner_name
+            {
+                field_bindings.push(owner_name);
+            }
+        }
+    });
+    field_bindings.sort();
+    field_bindings.dedup();
+    if field_bindings.len() == 1 {
+        Some(field_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn cpp_field_belongs_to_owner(field: TsNode<'_>, owner_node: TsNode<'_>) -> bool {
+    let mut current = field.parent();
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, owner_node) {
+            return true;
+        }
+        if matches!(
+            candidate.kind(),
+            "function_definition" | "class_specifier" | "struct_specifier"
+        ) {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn cpp_visible_local_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> Option<Option<String>> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "declaration" {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+            || !cpp_local_binding_visible_at_call(node, call_node)
+        {
+            return;
+        }
+        for (binding_name, owner_name) in cpp_local_declaration_receiver_bindings(node, source) {
+            if binding_name == receiver_name {
+                visible_bindings.push((node.end_byte(), owner_name));
+            }
+        }
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner_name)| owner_name)
+}
+
+fn cpp_local_declaration_receiver_bindings(
+    node: TsNode<'_>,
+    source: &str,
+) -> Vec<(String, Option<String>)> {
+    let Some(surface) = trimmed_node_text(node, source) else {
+        return Vec::new();
+    };
+    let surface = surface.trim().trim_end_matches(';').trim();
+    if surface.is_empty() || surface.starts_with("using ") || surface.starts_with("typedef ") {
+        return Vec::new();
+    }
+    if surface.contains(',') {
+        return surface
+            .split(',')
+            .filter_map(cpp_declarator_binding_name)
+            .map(|name| (name, None))
+            .collect();
+    }
+    let declarator_head = surface
+        .split('=')
+        .next()
+        .unwrap_or(surface)
+        .split('{')
+        .next()
+        .unwrap_or(surface)
+        .trim();
+    if declarator_head.contains('(') {
+        return Vec::new();
+    }
+    let Some((receiver_name, name_start)) = cpp_trailing_parameter_name(declarator_head) else {
+        return Vec::new();
+    };
+    let raw_type = declarator_head[..name_start].trim();
+    let owner_name = normalize_cpp_type_surface(raw_type)
+        .or_else(|| cpp_auto_local_initializer_owner(raw_type, surface));
+    vec![(receiver_name, owner_name)]
+}
+
+fn cpp_auto_local_initializer_owner(raw_type: &str, surface: &str) -> Option<String> {
+    if !cpp_type_surface_is_auto(raw_type) {
+        return None;
+    }
+    let (_, initializer) = surface.split_once('=')?;
+    cpp_direct_constructor_owner_surface(initializer)
+}
+
+fn cpp_type_surface_is_auto(raw_type: &str) -> bool {
+    let normalized = raw_type.replace(['*', '&'], " ");
+    let mut has_auto = false;
+    for token in normalized.split_whitespace() {
+        match token {
+            "auto" => has_auto = true,
+            "const" | "volatile" | "mutable" | "constexpr" => {}
+            _ => return false,
+        }
+    }
+    has_auto
+}
+
+fn cpp_direct_constructor_owner_surface(surface: &str) -> Option<String> {
+    let surface = surface.trim().trim_end_matches(';').trim();
+    let surface = surface.strip_prefix("new ").unwrap_or(surface).trim();
+    let delimiter = surface.find(['{', '('])?;
+    let owner_surface = surface[..delimiter].trim();
+    if owner_surface.contains("::")
+        || owner_surface.contains('.')
+        || owner_surface.split_whitespace().count() != 1
+    {
+        return None;
+    }
+    cpp_initializer_suffix_consumes_surface(&surface[delimiter..])?;
+    normalize_parameter_name(owner_surface)
+}
+
+fn cpp_initializer_suffix_consumes_surface(surface: &str) -> Option<()> {
+    let mut chars = surface.char_indices();
+    let (_, opener) = chars.next()?;
+    let closer = match opener {
+        '{' => '}',
+        '(' => ')',
+        _ => return None,
+    };
+    let mut stack = vec![closer];
+    for (index, ch) in chars {
+        match ch {
+            '{' => stack.push('}'),
+            '(' => stack.push(')'),
+            '}' | ')' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return surface[index + ch.len_utf8()..]
+                        .trim()
+                        .is_empty()
+                        .then_some(());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn cpp_declarator_binding_name(declarator: &str) -> Option<String> {
+    let declarator_head = declarator
+        .split('=')
+        .next()
+        .unwrap_or(declarator)
+        .split('{')
+        .next()
+        .unwrap_or(declarator)
+        .trim();
+    if declarator_head.contains('(') {
+        return None;
+    }
+    cpp_trailing_parameter_name(declarator_head).map(|(name, _)| name)
+}
+
+fn cpp_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = cpp_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = cpp_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn cpp_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["compound_statement"])
+}
+
+fn cpp_callable_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("declarator")
+        .and_then(c_like_declarator_name_node)
+        .and_then(|name_node| trimmed_node_text(name_node, source))
+}
+
+fn collect_cpp_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = HashMap::new();
+    let Some(parameters) = signature_parameter_surface(callable, source) else {
+        return receiver_types;
+    };
+    for parameter in split_top_level_parameters(&parameters) {
+        let parameter = parameter
+            .split('=')
+            .next()
+            .unwrap_or(parameter.as_str())
+            .trim();
+        if parameter.is_empty() || parameter == "void" {
+            continue;
+        }
+        let Some((receiver_name, name_start)) = cpp_trailing_parameter_name(parameter) else {
+            continue;
+        };
+        let raw_type = parameter[..name_start].trim();
+        let Some(owner_name) = normalize_cpp_type_surface(raw_type) else {
+            continue;
+        };
+        receiver_types.insert(receiver_name, owner_name);
+    }
+    receiver_types
+}
+
+fn cpp_trailing_parameter_name(parameter: &str) -> Option<(String, usize)> {
+    let mut end = None;
+    for (index, ch) in parameter.char_indices().rev() {
+        if end.is_none() {
+            if ch == '_' || ch.is_ascii_alphanumeric() {
+                end = Some(index + ch.len_utf8());
+            }
+            continue;
+        }
+        if !(ch == '_' || ch.is_ascii_alphanumeric()) {
+            let start = index + ch.len_utf8();
+            let name = &parameter[start..end?];
+            return normalize_parameter_name(name).map(|name| (name, start));
+        }
+    }
+    let end = end?;
+    let name = &parameter[..end];
+    normalize_parameter_name(name).map(|name| (name, 0))
+}
+
+fn normalize_cpp_type_surface(raw_type: &str) -> Option<String> {
+    let without_pointers = raw_type.replace(['*', '&'], " ");
+    let base = without_pointers
+        .split('<')
+        .next()
+        .unwrap_or(without_pointers.as_str());
+    let owner = base.split_whitespace().rfind(|token| {
+        !matches!(
+            *token,
+            "const"
+                | "volatile"
+                | "mutable"
+                | "constexpr"
+                | "typename"
+                | "class"
+                | "struct"
+                | "enum"
+                | "auto"
+        )
+    })?;
+    normalize_type_surface(owner)
 }
 
 fn collect_swift_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let imports = collect_swift_imports(source);
+    let local_type_names = collect_swift_type_binding_names(tree.root_node(), source);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if callable.kind() != "function_declaration" {
             return;
@@ -4945,25 +10454,533 @@ fn collect_swift_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRec
         let Some(source_name) = declaration_name(callable, source) else {
             return;
         };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(callable),
+        };
         let receiver_types = collect_colon_parameter_types(callable, source);
+        let mut local_receiver_callsites = HashSet::new();
+        collect_swift_precise_receiver_call_specs(
+            callable,
+            source,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            SwiftReceiverContext {
+                parameter_receiver_types: &receiver_types,
+                imports: &imports,
+                local_type_names: &local_type_names,
+            },
+            &mut local_receiver_callsites,
+            &mut edges,
+        );
         if receiver_types.is_empty() {
             return;
         }
+        let receiver_modules =
+            collect_swift_parameter_type_modules(callable, source, &imports, &local_type_names);
+        let start = edges.len();
         collect_receiver_call_specs_in_callable(
             callable,
             source,
-            &source_name,
-            ts_node_graph_span(callable),
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
             &receiver_types,
             swift_member_call,
+            false,
             &mut edges,
         );
+        let mut parameter_specs = edges.split_off(start);
+        parameter_specs
+            .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+        for spec in &mut parameter_specs {
+            if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
+                spec.owner_module = Some(module_name.clone());
+            }
+        }
+        edges.extend(parameter_specs);
     });
     edges
 }
 
+struct SwiftReceiverContext<'a> {
+    parameter_receiver_types: &'a HashMap<String, String>,
+    imports: &'a SwiftImportContext,
+    local_type_names: &'a HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct SwiftImportContext {
+    whole_modules: HashSet<String>,
+    scoped_types: HashSet<(String, String)>,
+}
+
+impl SwiftImportContext {
+    fn type_is_imported(&self, module_name: &str, owner_name: &str) -> bool {
+        self.whole_modules.contains(module_name)
+            || self
+                .scoped_types
+                .iter()
+                .any(|(module, owner)| module == module_name && owner == owner_name)
+    }
+
+    fn unqualified_owner_module(&self, owner_name: &str) -> Option<String> {
+        let mut candidates = self
+            .scoped_types
+            .iter()
+            .filter_map(|(module_name, imported_owner)| {
+                (imported_owner == owner_name).then_some(module_name.clone())
+            })
+            .collect::<HashSet<_>>();
+        if self.whole_modules.len() == 1
+            && let Some(module_name) = self.whole_modules.iter().next()
+        {
+            candidates.insert(module_name.clone());
+        }
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
+    }
+}
+
+fn collect_swift_precise_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    context: SwiftReceiverContext<'_>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = swift_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let method_col = member_call_method_col(node, source, &method_name);
+        let callsite_key = ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        };
+
+        if let Some(owner) =
+            swift_visible_local_receiver_owner(callable, node, &receiver_name, source, &context)
+        {
+            local_receiver_callsites.insert(callsite_key);
+            if let Some((owner_name, owner_module)) = owner {
+                edges.push(ManualReceiverCallSpec {
+                    source_name: call_source.name.to_string(),
+                    source_span: call_source.span,
+                    receiver_name,
+                    owner_name,
+                    owner_module,
+                    method_name,
+                    method_col,
+                    line: Some(node.start_position().row as u32 + 1),
+                    allow_global_fallback: false,
+                });
+            }
+            return;
+        }
+
+        let owner = if let Some(owner) = swift_self_receiver_owner(callable, &receiver_name, source)
+        {
+            Some(owner)
+        } else if !context
+            .parameter_receiver_types
+            .contains_key(&receiver_name)
+        {
+            swift_property_receiver_owner(callable, &receiver_name, source, &context)
+        } else {
+            None
+        };
+        let Some((owner_name, owner_module)) = owner else {
+            return;
+        };
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
+            owner_name,
+            owner_module,
+            method_name,
+            method_col,
+            line: Some(node.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+        });
+    });
+}
+
+fn swift_self_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> OptionalReceiverOwnerBinding {
+    if receiver_name != "self" {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(callable, &["class_declaration"])?;
+    let owner_name = declaration_name(owner_node, source)?;
+    Some((owner_name, None))
+}
+
+fn swift_visible_local_receiver_owner(
+    callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(callable, &mut |node| {
+        if node.kind() != "property_declaration" {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        let Some(binding_name) = swift_property_binding_name(node, source) else {
+            return;
+        };
+        if binding_name != receiver_name || !swift_local_binding_visible_at_call(node, call_node) {
+            return;
+        }
+        visible_bindings.push((
+            node.end_byte(),
+            swift_initialized_constructor_owner(node, source, context),
+        ));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner_name)| owner_name)
+}
+
+fn swift_property_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let field_name = receiver_name
+        .strip_prefix("self.")
+        .unwrap_or(receiver_name)
+        .trim();
+    if field_name == "self" || field_name.contains('.') {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(callable, &["class_declaration"])?;
+    let mut property_bindings = Vec::new();
+    walk_tree_nodes(owner_node, &mut |node| {
+        if node.kind() != "property_declaration"
+            || !swift_property_belongs_to_owner(node, owner_node)
+        {
+            return;
+        }
+        let Some(binding_name) = swift_property_binding_name(node, source) else {
+            return;
+        };
+        if binding_name != field_name {
+            return;
+        }
+        if let Some(owner) = swift_typed_property_owner(node, source, context) {
+            property_bindings.push(owner);
+        }
+    });
+    property_bindings.sort();
+    property_bindings.dedup();
+    if property_bindings.len() == 1 {
+        Some(property_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn swift_property_belongs_to_owner(property: TsNode<'_>, owner_node: TsNode<'_>) -> bool {
+    let mut current = property.parent();
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, owner_node) {
+            return true;
+        }
+        if candidate.kind() == "function_declaration" || candidate.kind() == "class_declaration" {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn swift_property_binding_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|name| trimmed_node_text(name, source))
+        .as_deref()
+        .and_then(|surface| {
+            surface
+                .split_whitespace()
+                .filter(|token| !matches!(*token, "let" | "var"))
+                .filter_map(normalize_parameter_name)
+                .next_back()
+        })
+}
+
+fn swift_initialized_constructor_owner(
+    node: TsNode<'_>,
+    source: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    if let Some(owner_name) = node
+        .child_by_field_name("value")
+        .and_then(|value| swift_constructor_owner(value, source, context))
+    {
+        return Some(owner_name);
+    }
+    let surface = trimmed_node_text(node, source)?;
+    let (_, value_surface) = surface.split_once('=')?;
+    swift_constructor_owner_surface(value_surface, context)
+}
+
+fn swift_typed_property_owner(
+    node: TsNode<'_>,
+    source: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let surface = trimmed_node_text(node, source)?;
+    let head = surface.split('=').next().unwrap_or(surface.as_str()).trim();
+    let rest = head
+        .rsplit_once(" let ")
+        .map(|(_, rest)| rest)
+        .or_else(|| head.rsplit_once(" var ").map(|(_, rest)| rest))
+        .or_else(|| head.strip_prefix("let "))
+        .or_else(|| head.strip_prefix("var "))?
+        .trim();
+    let (_, type_side) = rest.split_once(':')?;
+    swift_receiver_owner_from_type(&parameter_type_after_colon(type_side), context)
+}
+
+fn swift_receiver_owner_from_type(
+    raw_type: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(raw_type)?;
+    if let Some(module_name) = swift_type_import_qualifier(raw_type) {
+        if context.imports.type_is_imported(&module_name, &owner_name) {
+            return Some((owner_name, Some(module_name)));
+        }
+        return None;
+    }
+    if context.local_type_names.contains(&owner_name) {
+        return Some((owner_name, None));
+    }
+    if let Some(module_name) = context.imports.unqualified_owner_module(&owner_name) {
+        return Some((owner_name, Some(module_name)));
+    }
+    Some((owner_name, None))
+}
+
+fn swift_constructor_owner(
+    value: TsNode<'_>,
+    source: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    trimmed_node_text(value, source)
+        .as_deref()
+        .and_then(|surface| swift_constructor_owner_surface(surface, context))
+}
+
+fn swift_constructor_owner_surface(
+    surface: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let surface = surface.trim().trim_end_matches(';').trim();
+    let (constructor_name, _) = surface.split_once('(')?;
+    swift_constructor_owner_from_type_surface(constructor_name, context)
+}
+
+fn swift_constructor_owner_from_type_surface(
+    type_surface: &str,
+    context: &SwiftReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let type_surface = type_surface.trim();
+    if type_surface.contains("::") {
+        return None;
+    }
+    let owner_name = normalize_type_surface(type_surface)?;
+    if !owner_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    swift_receiver_owner_from_type(type_surface, context)
+}
+
+fn swift_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = swift_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = swift_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn swift_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["statements", "function_body"])
+}
+
+fn collect_swift_parameter_type_modules(
+    callable: TsNode<'_>,
+    source: &str,
+    imports: &SwiftImportContext,
+    local_type_names: &HashSet<String>,
+) -> HashMap<String, String> {
+    let mut receiver_modules = HashMap::new();
+    let Some(parameters) = signature_parameter_surface(callable, source) else {
+        return receiver_modules;
+    };
+    for parameter in split_top_level_parameters(&parameters) {
+        let Some((name_side, type_side)) = parameter.split_once(':') else {
+            continue;
+        };
+        let Some(receiver_name) = parameter_name_before_colon(name_side) else {
+            continue;
+        };
+        let raw_type = parameter_type_after_colon(type_side);
+        let Some(owner_name) = normalize_type_surface(&raw_type) else {
+            continue;
+        };
+        if let Some(module_name) = swift_type_import_qualifier(&raw_type) {
+            if imports.type_is_imported(&module_name, &owner_name) {
+                receiver_modules.insert(receiver_name, module_name);
+            }
+            continue;
+        }
+        if local_type_names.contains(&owner_name) {
+            continue;
+        }
+        if let Some(module_name) = imports.unqualified_owner_module(&owner_name) {
+            receiver_modules.insert(receiver_name, module_name);
+        }
+    }
+    receiver_modules
+}
+
+fn collect_swift_imports(source: &str) -> SwiftImportContext {
+    let mut imports = SwiftImportContext::default();
+    for swift_import in source.lines().filter_map(swift_import_from_line) {
+        match swift_import {
+            SwiftImport::WholeModule(module_name) => {
+                imports.whole_modules.insert(module_name);
+            }
+            SwiftImport::ScopedType {
+                module_name,
+                owner_name,
+            } => {
+                imports.scoped_types.insert((module_name, owner_name));
+            }
+        }
+    }
+    imports
+}
+
+enum SwiftImport {
+    WholeModule(String),
+    ScopedType {
+        module_name: String,
+        owner_name: String,
+    },
+}
+
+fn swift_import_from_line(raw_line: &str) -> Option<SwiftImport> {
+    let line = raw_line
+        .split("//")
+        .next()
+        .unwrap_or(raw_line)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if line.is_empty() {
+        return None;
+    }
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    let import_index = tokens.iter().position(|token| *token == "import")?;
+    let first_import_token = tokens.get(import_index + 1)?;
+    if matches!(
+        *first_import_token,
+        "class" | "struct" | "enum" | "protocol" | "typealias"
+    ) {
+        let scoped_surface = tokens.get(import_index + 2)?.trim();
+        let module_name = swift_import_module_name(scoped_surface)?;
+        let owner_name = swift_import_scoped_owner_name(scoped_surface)?;
+        return Some(SwiftImport::ScopedType {
+            module_name,
+            owner_name,
+        });
+    }
+    if matches!(*first_import_token, "func" | "var") {
+        return None;
+    }
+    let module_surface = first_import_token.trim();
+    swift_import_module_name(module_surface).map(SwiftImport::WholeModule)
+}
+
+fn swift_import_module_name(module_surface: &str) -> Option<String> {
+    let module_name = module_surface
+        .split('.')
+        .next()
+        .unwrap_or(module_surface)
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
+    (!module_name.is_empty()).then(|| module_name.to_string())
+}
+
+fn swift_import_scoped_owner_name(module_surface: &str) -> Option<String> {
+    let (_, owner_surface) = module_surface.rsplit_once('.')?;
+    normalize_parameter_name(owner_surface)
+}
+
+fn collect_swift_type_binding_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    walk_tree_nodes(root, &mut |node| {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "protocol_declaration"
+                | "struct_declaration"
+                | "enum_declaration"
+                | "typealias_declaration"
+        ) && let Some(name) =
+            declaration_name(node, source).and_then(|name| normalize_parameter_name(&name))
+        {
+            names.insert(name);
+        }
+    });
+    names
+}
+
+fn swift_type_import_qualifier(raw_type: &str) -> Option<String> {
+    if raw_type.contains('|') || raw_type.contains('&') {
+        return None;
+    }
+    let surface = raw_type.trim().trim_end_matches('?').trim();
+    let base = surface
+        .split(['<', '[', '('])
+        .next()
+        .unwrap_or(surface)
+        .trim();
+    let (qualifier, _) = base.rsplit_once('.')?;
+    normalize_parameter_name(qualifier)
+}
+
 fn collect_dart_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let import_alias_bindings = collect_dart_import_alias_bindings(source);
     walk_tree_nodes(tree.root_node(), &mut |body| {
         if body.kind() != "function_body" {
             return;
@@ -4974,21 +10991,385 @@ fn collect_dart_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRece
         let Some(source_name) = dart_callable_name(signature, source) else {
             return;
         };
+        let call_source = ManualReceiverSource {
+            name: &source_name,
+            span: ts_node_graph_span(signature),
+        };
         let receiver_types = collect_prefix_parameter_types(signature, source);
-        if receiver_types.is_empty() {
-            return;
-        }
-        collect_receiver_call_specs_in_callable(
+        let mut local_receiver_callsites = HashSet::new();
+        collect_dart_precise_receiver_call_specs(
             body,
             source,
-            &source_name,
-            ts_node_graph_span(signature),
-            &receiver_types,
-            dart_member_call,
+            ManualReceiverSource {
+                name: call_source.name,
+                span: call_source.span,
+            },
+            DartReceiverContext {
+                parameter_receiver_types: &receiver_types,
+                import_alias_bindings: &import_alias_bindings,
+            },
+            &mut local_receiver_callsites,
             &mut edges,
         );
+        if !receiver_types.is_empty() {
+            let receiver_modules =
+                collect_dart_parameter_type_modules(signature, source, &import_alias_bindings);
+            let start = edges.len();
+            collect_receiver_call_specs_in_callable(
+                body,
+                source,
+                ManualReceiverSource {
+                    name: call_source.name,
+                    span: call_source.span,
+                },
+                &receiver_types,
+                dart_member_call,
+                false,
+                &mut edges,
+            );
+            let mut parameter_specs = edges.split_off(start);
+            parameter_specs
+                .retain(|spec| !local_receiver_callsites.contains(&receiver_callsite_key(spec)));
+            for spec in &mut parameter_specs {
+                if let Some(module_name) = receiver_modules.get(&spec.receiver_name) {
+                    spec.owner_module = Some(module_name.clone());
+                }
+            }
+            edges.extend(parameter_specs);
+        }
     });
     edges
+}
+
+struct DartReceiverContext<'a> {
+    parameter_receiver_types: &'a HashMap<String, String>,
+    import_alias_bindings: &'a HashMap<String, String>,
+}
+
+fn receiver_callsite_key(spec: &ManualReceiverCallSpec) -> ReceiverCallSiteKey {
+    ReceiverCallSiteKey {
+        receiver_name: spec.receiver_name.clone(),
+        method_name: spec.method_name.clone(),
+        line: spec.line,
+        method_col: spec.method_col,
+    }
+}
+
+fn collect_dart_precise_receiver_call_specs(
+    body: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    context: DartReceiverContext<'_>,
+    local_receiver_callsites: &mut HashSet<ReceiverCallSiteKey>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(body, &mut |node| {
+        let Some((receiver_name, method_name)) = dart_member_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, body) {
+            return;
+        }
+        let method_col = member_call_method_col(node, source, &method_name);
+        let callsite_key = ReceiverCallSiteKey {
+            receiver_name: receiver_name.clone(),
+            method_name: method_name.clone(),
+            line: Some(node.start_position().row as u32 + 1),
+            method_col,
+        };
+
+        if let Some(owner) =
+            dart_visible_local_receiver_owner(body, node, &receiver_name, source, &context)
+        {
+            local_receiver_callsites.insert(callsite_key);
+            if let Some((owner_name, owner_module)) = owner {
+                edges.push(ManualReceiverCallSpec {
+                    source_name: call_source.name.to_string(),
+                    source_span: call_source.span,
+                    receiver_name,
+                    owner_name,
+                    owner_module,
+                    method_name,
+                    method_col,
+                    line: Some(node.start_position().row as u32 + 1),
+                    allow_global_fallback: false,
+                });
+            }
+            return;
+        }
+
+        let owner = if let Some(owner) = dart_self_receiver_owner(body, &receiver_name, source) {
+            Some(owner)
+        } else if !context
+            .parameter_receiver_types
+            .contains_key(&receiver_name)
+        {
+            dart_property_receiver_owner(body, &receiver_name, source, &context)
+        } else {
+            None
+        };
+        let Some((owner_name, owner_module)) = owner else {
+            return;
+        };
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
+            owner_name,
+            owner_module,
+            method_name,
+            method_col,
+            line: Some(node.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+        });
+    });
+}
+
+fn dart_self_receiver_owner(
+    body: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> OptionalReceiverOwnerBinding {
+    if receiver_name != "this" {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(body, &["class_definition"])?;
+    let owner_name = declaration_name(owner_node, source)?;
+    Some((owner_name, None))
+}
+
+fn dart_visible_local_receiver_owner(
+    body: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &DartReceiverContext<'_>,
+) -> Option<OptionalReceiverOwnerBinding> {
+    let mut visible_bindings = Vec::new();
+    walk_tree_nodes(body, &mut |node| {
+        if node.kind() != "initialized_variable_definition" {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, body)
+            || node.end_byte() > call_node.start_byte()
+        {
+            return;
+        }
+        let Some(binding_name) = dart_variable_binding_name(node, source) else {
+            return;
+        };
+        if binding_name != receiver_name || !dart_local_binding_visible_at_call(node, call_node) {
+            return;
+        }
+        visible_bindings.push((
+            node.end_byte(),
+            dart_initialized_constructor_owner(node, source, context),
+        ));
+    });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner_name)| owner_name)
+}
+
+fn dart_property_receiver_owner(
+    body: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+    context: &DartReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let field_name = receiver_name
+        .strip_prefix("this.")
+        .unwrap_or(receiver_name)
+        .trim();
+    if field_name == "this" || field_name.contains('.') {
+        return None;
+    }
+    let owner_node = enclosing_node_with_kind(body, &["class_definition"])?;
+    let mut property_bindings = Vec::new();
+    walk_tree_nodes(owner_node, &mut |node| {
+        if !matches!(
+            node.kind(),
+            "initialized_variable_definition" | "field_signature" | "declaration"
+        ) || !dart_property_belongs_to_owner(node, owner_node)
+        {
+            return;
+        }
+        let Some((binding_name, raw_type)) = dart_typed_variable_binding(node, source) else {
+            return;
+        };
+        if binding_name != field_name {
+            return;
+        }
+        if let Some(owner) = dart_receiver_owner_from_type(&raw_type, context) {
+            property_bindings.push(owner);
+        }
+    });
+    property_bindings.sort();
+    property_bindings.dedup();
+    if property_bindings.len() == 1 {
+        Some(property_bindings.remove(0))
+    } else {
+        None
+    }
+}
+
+fn dart_property_belongs_to_owner(property: TsNode<'_>, owner_node: TsNode<'_>) -> bool {
+    let mut current = property.parent();
+    while let Some(candidate) = current {
+        if same_ts_span(candidate, owner_node) {
+            return true;
+        }
+        if candidate.kind() == "function_body" || candidate.kind() == "class_definition" {
+            return false;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn dart_variable_binding_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    if let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|name| trimmed_node_text(name, source))
+        .as_deref()
+        .and_then(normalize_parameter_name)
+    {
+        return Some(name);
+    }
+    let surface = trimmed_node_text(node, source)?;
+    let head = surface
+        .split('=')
+        .next()
+        .unwrap_or(surface.as_str())
+        .trim_end_matches(';')
+        .trim();
+    head.split_whitespace()
+        .last()
+        .and_then(normalize_parameter_name)
+}
+
+fn dart_typed_variable_binding(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    let binding_name = dart_variable_binding_name(node, source)?;
+    let surface = trimmed_node_text(node, source)?;
+    let head = surface
+        .split('=')
+        .next()
+        .unwrap_or(surface.as_str())
+        .trim_end_matches(';')
+        .trim();
+    let tokens = head
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "abstract"
+                    | "covariant"
+                    | "external"
+                    | "final"
+                    | "late"
+                    | "static"
+                    | "const"
+                    | "var"
+                    | "required"
+            )
+        })
+        .collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let raw_type = tokens[..tokens.len() - 1].join(" ");
+    Some((binding_name, raw_type))
+}
+
+fn dart_receiver_owner_from_type(
+    raw_type: &str,
+    context: &DartReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let owner_name = normalize_type_surface(raw_type)?;
+    if let Some(qualifier) = dart_type_import_qualifier(raw_type) {
+        let module_name = context.import_alias_bindings.get(&qualifier)?;
+        return Some((owner_name, Some(module_name.clone())));
+    }
+    Some((owner_name, None))
+}
+
+fn dart_initialized_constructor_owner(
+    node: TsNode<'_>,
+    source: &str,
+    context: &DartReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    if let Some(owner_name) = node
+        .child_by_field_name("value")
+        .and_then(|value| dart_constructor_owner(value, source, context))
+    {
+        return Some(owner_name);
+    }
+    let surface = trimmed_node_text(node, source)?;
+    let (_, value_surface) = surface.split_once('=')?;
+    dart_constructor_owner_surface(value_surface, context)
+}
+
+fn dart_constructor_owner(
+    value: TsNode<'_>,
+    source: &str,
+    context: &DartReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    trimmed_node_text(value, source)
+        .as_deref()
+        .and_then(|surface| dart_constructor_owner_surface(surface, context))
+}
+
+fn dart_constructor_owner_surface(
+    surface: &str,
+    context: &DartReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let surface = surface.trim().trim_end_matches(';').trim();
+    let surface = surface
+        .strip_prefix("const ")
+        .or_else(|| surface.strip_prefix("new "))
+        .unwrap_or(surface)
+        .trim();
+    let (constructor_name, _) = surface.split_once('(')?;
+    dart_constructor_owner_from_type_surface(constructor_name, context)
+}
+
+fn dart_constructor_owner_from_type_surface(
+    type_surface: &str,
+    context: &DartReceiverContext<'_>,
+) -> OptionalReceiverOwnerBinding {
+    let type_surface = type_surface.trim();
+    if type_surface.contains("::") {
+        return None;
+    }
+    let owner_name = normalize_type_surface(type_surface)?;
+    if !owner_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    if let Some(qualifier) = dart_type_import_qualifier(type_surface) {
+        let module_name = context.import_alias_bindings.get(&qualifier)?;
+        return Some((owner_name, Some(module_name.clone())));
+    }
+    if type_surface.contains('.') {
+        return None;
+    }
+    Some((owner_name, None))
+}
+
+fn dart_local_binding_visible_at_call(binding: TsNode<'_>, call_node: TsNode<'_>) -> bool {
+    let Some(binding_scope) = dart_lexical_scope(binding) else {
+        return false;
+    };
+    let Some(call_scope) = dart_lexical_scope(call_node) else {
+        return false;
+    };
+    node_is_same_or_ancestor(binding_scope, call_scope)
+}
+
+fn dart_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    enclosing_node_with_kind(node, &["block", "function_body"])
 }
 
 fn collect_dart_direct_call_edges(tree: &Tree, source: &str) -> Vec<ManualPreciseCallSpec> {
@@ -5025,6 +11406,8 @@ fn dart_signature_for_body<'tree>(body: TsNode<'tree>) -> Option<TsNode<'tree>> 
 
 fn collect_ruby_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
+    let require_relative_module = ruby_single_require_relative_module(source);
+    let local_type_names = collect_ruby_file_type_names(tree.root_node(), source);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         if !matches!(callable.kind(), "method" | "singleton_method") {
             return;
@@ -5032,47 +11415,304 @@ fn collect_ruby_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRece
         let Some(source_name) = declaration_name(callable, source) else {
             return;
         };
-        let receiver_types = collect_ruby_local_constructor_types(callable, source);
-        if receiver_types.is_empty() {
-            return;
-        }
-        collect_receiver_call_specs_in_callable(
+        collect_ruby_precise_receiver_call_specs(
             callable,
             source,
-            &source_name,
-            ts_node_graph_span(callable),
-            &receiver_types,
-            ruby_receiver_call,
+            ManualReceiverSource {
+                name: &source_name,
+                span: ts_node_graph_span(callable),
+            },
+            require_relative_module.as_deref(),
+            &local_type_names,
             &mut edges,
         );
     });
     edges
 }
 
+fn collect_ruby_precise_receiver_call_specs(
+    callable: TsNode<'_>,
+    source: &str,
+    call_source: ManualReceiverSource<'_>,
+    require_relative_module: Option<&str>,
+    local_type_names: &HashSet<String>,
+    edges: &mut Vec<ManualReceiverCallSpec>,
+) {
+    walk_tree_nodes(callable, &mut |node| {
+        let Some((receiver_name, method_name)) = ruby_receiver_call(node, source) else {
+            return;
+        };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
+        let owner_name = if let Some(owner_name) = ruby_constructor_owner_surface(&receiver_name) {
+            owner_name
+        } else if let Some(owner) =
+            ruby_visible_local_receiver_owner(callable, node, &receiver_name, source)
+        {
+            let Some(owner_name) = owner else {
+                return;
+            };
+            owner_name
+        } else if receiver_name.starts_with('@') {
+            let Some(owner_name) =
+                ruby_instance_variable_receiver_owner(callable, &receiver_name, source)
+            else {
+                return;
+            };
+            owner_name
+        } else {
+            return;
+        };
+        let owner_module =
+            ruby_receiver_owner_module(&owner_name, require_relative_module, local_type_names);
+        let method_col = member_call_method_col(node, source, &method_name);
+        edges.push(ManualReceiverCallSpec {
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
+            owner_name,
+            owner_module,
+            method_name,
+            method_col,
+            line: Some(node.start_position().row as u32 + 1),
+            allow_global_fallback: false,
+        });
+    });
+}
+
+fn ruby_receiver_owner_module(
+    owner_name: &str,
+    require_relative_module: Option<&str>,
+    local_type_names: &HashSet<String>,
+) -> Option<String> {
+    if local_type_names.contains(owner_name) {
+        return None;
+    }
+    require_relative_module.map(str::to_string)
+}
+
+fn collect_ruby_file_type_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    walk_tree_nodes(root, &mut |node| match node.kind() {
+        "class" | "module" => {
+            if let Some(name) = declaration_name(node, source) {
+                names.insert(name);
+            }
+        }
+        "assignment" => {
+            if ruby_assignment_is_top_level(node)
+                && let Some(name) = node
+                    .child_by_field_name("left")
+                    .and_then(|left| trimmed_node_text(left, source))
+                    .and_then(|name| ruby_constant_name(&name))
+            {
+                names.insert(name);
+            }
+        }
+        _ => {}
+    });
+    names
+}
+
+fn ruby_assignment_is_top_level(node: TsNode<'_>) -> bool {
+    enclosing_node_with_kind(node, &["method", "singleton_method", "class", "module"]).is_none()
+}
+
+fn ruby_constant_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.contains("::") || name.contains('.') || name.starts_with('@') || name.starts_with('$') {
+        return None;
+    }
+    let first = name.chars().next()?;
+    first.is_uppercase().then(|| name.to_string())
+}
+
+fn ruby_single_require_relative_module(source: &str) -> Option<String> {
+    let mut modules = source
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter_map(ruby_require_relative_module_from_line)
+        .collect::<Vec<_>>();
+    modules.sort();
+    modules.dedup();
+    if modules.len() == 1 {
+        modules.pop()
+    } else {
+        None
+    }
+}
+
+fn ruby_require_relative_module_from_line(line: &str) -> Option<String> {
+    let line = code_before_hash_comment(line).trim();
+    let rest = line
+        .strip_prefix("require_relative")
+        .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '(']))?
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let module_name = quoted_literal_surface(rest)?;
+    if module_name.starts_with("./") || module_name.starts_with("../") {
+        Some(module_name.to_string())
+    } else {
+        Some(format!("./{module_name}"))
+    }
+}
+
+fn quoted_literal_surface(surface: &str) -> Option<&str> {
+    let mut chars = surface.chars();
+    let quote = chars.next()?;
+    if !matches!(quote, '"' | '\'') {
+        return None;
+    }
+    let end = surface[quote.len_utf8()..].find(quote)? + quote.len_utf8();
+    Some(&surface[quote.len_utf8()..end])
+}
+
+fn ruby_instance_variable_receiver_owner(
+    callable: TsNode<'_>,
+    receiver_name: &str,
+    source: &str,
+) -> Option<String> {
+    let class_node = enclosing_node_with_kind(callable, &["class"])?;
+    let mut owner_names: Vec<Option<String>> = Vec::new();
+    walk_tree_nodes(class_node, &mut |node| {
+        if !ruby_assignment_like_kind(node.kind()) {
+            return;
+        }
+        if !enclosing_node_with_kind(node, &["class"])
+            .is_some_and(|owner| same_ts_span(owner, class_node))
+        {
+            return;
+        }
+        if !ruby_assignment_matches_receiver_domain(node, callable, class_node) {
+            return;
+        }
+        let Some(left_node) = node.child_by_field_name("left") else {
+            return;
+        };
+        if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
+            return;
+        }
+        let owner_name = if node.kind() == "operator_assignment" {
+            None
+        } else {
+            node.child_by_field_name("right")
+                .and_then(|right_node| ruby_constructor_owner(right_node, source))
+        };
+        owner_names.push(owner_name);
+    });
+    let mut concrete_owners = owner_names.into_iter().collect::<Option<Vec<_>>>()?;
+    concrete_owners.sort();
+    concrete_owners.dedup();
+    if concrete_owners.len() == 1 {
+        concrete_owners.pop()
+    } else {
+        None
+    }
+}
+
+fn ruby_assignment_like_kind(kind: &str) -> bool {
+    matches!(kind, "assignment" | "operator_assignment")
+}
+
+fn ruby_assignment_matches_receiver_domain(
+    assignment: TsNode<'_>,
+    callable: TsNode<'_>,
+    class_node: TsNode<'_>,
+) -> bool {
+    let enclosing_method = enclosing_node_with_kind(assignment, &["method", "singleton_method"]);
+    match callable.kind() {
+        "method" => enclosing_method.is_some_and(|method| {
+            method.kind() == "method"
+                && enclosing_node_with_kind(method, &["class"])
+                    .is_some_and(|owner| same_ts_span(owner, class_node))
+        }),
+        "singleton_method" => enclosing_method.is_none_or(|method| {
+            method.kind() == "singleton_method"
+                && enclosing_node_with_kind(method, &["class"])
+                    .is_some_and(|owner| same_ts_span(owner, class_node))
+        }),
+        _ => false,
+    }
+}
+
 fn collect_receiver_call_specs_in_callable(
     callable: TsNode<'_>,
     source: &str,
-    source_name: &str,
-    source_span: GraphNodeSpan,
+    call_source: ManualReceiverSource<'_>,
     receiver_types: &HashMap<String, String>,
     call_parts: fn(TsNode<'_>, &str) -> Option<(String, String)>,
+    allow_global_fallback: bool,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
     walk_tree_nodes(callable, &mut |node| {
         let Some((receiver_name, method_name)) = call_parts(node, source) else {
             return;
         };
+        if !receiver_call_belongs_to_callable(node, callable) {
+            return;
+        }
         let Some(owner_name) = receiver_types.get(&receiver_name) else {
             return;
         };
+        let method_col = member_call_method_col(node, source, &method_name);
         edges.push(ManualReceiverCallSpec {
-            source_name: source_name.to_string(),
-            source_span,
+            source_name: call_source.name.to_string(),
+            source_span: call_source.span,
+            receiver_name,
             owner_name: owner_name.clone(),
+            owner_module: None,
             method_name,
+            method_col,
             line: Some(node.start_position().row as u32 + 1),
+            allow_global_fallback,
         });
     });
+}
+
+fn member_call_method_col(node: TsNode<'_>, source: &str, method_name: &str) -> Option<u32> {
+    if let Some(col) = python_attribute_method_col(node, source, method_name) {
+        return Some(col);
+    }
+
+    let text = node_source_text(node, source)?;
+    let callable = text.split('(').next().unwrap_or(text.as_str());
+    let marker = format!(".{method_name}");
+    let method_offset = callable
+        .rfind(&marker)
+        .map(|offset| offset + 1)
+        .or_else(|| callable.rfind(method_name))?;
+    Some(node.start_position().column as u32 + method_offset as u32 + 1)
+}
+
+fn receiver_call_belongs_to_callable(node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+    const DECLARATION_BOUNDARY_KINDS: &[&str] = &[
+        "function_definition",
+        "function_declaration",
+        "method_declaration",
+        "method_definition",
+        "method",
+        "singleton_method",
+        "lambda",
+        "lambda_expression",
+        "arrow_function",
+        "anonymous_function",
+        "closure_expression",
+        "class_definition",
+        "class_declaration",
+    ];
+    const BODY_BOUNDARY_KINDS: &[&str] = &["function_body"];
+
+    let boundary_kinds = if callable.kind() == "function_body" {
+        BODY_BOUNDARY_KINDS
+    } else {
+        DECLARATION_BOUNDARY_KINDS
+    };
+
+    enclosing_node_with_kind(node, boundary_kinds)
+        .is_some_and(|nearest| nearest.kind() == callable.kind() && same_ts_span(nearest, callable))
 }
 
 fn collect_go_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
@@ -5107,6 +11747,60 @@ fn collect_go_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<Str
         }
     });
     receiver_types
+}
+
+fn collect_go_parameter_type_modules(
+    callable: TsNode<'_>,
+    source: &str,
+    import_bindings: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut receiver_modules = HashMap::new();
+    let Some(parameters) = callable.child_by_field_name("parameters") else {
+        return receiver_modules;
+    };
+    walk_tree_nodes(parameters, &mut |node| {
+        if !matches!(
+            node.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            return;
+        }
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        let Some(raw_type) = trimmed_node_text(type_node, source) else {
+            return;
+        };
+        let Some(qualifier) = go_type_import_qualifier(&raw_type) else {
+            return;
+        };
+        let Some(module_name) = import_bindings.get(&qualifier) else {
+            return;
+        };
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "identifier"
+                && child.end_byte() <= type_node.start_byte()
+                && let Some(name) = normalized_receiver_variable(child, source)
+            {
+                receiver_modules.insert(name, module_name.clone());
+            }
+        }
+    });
+    receiver_modules
+}
+
+fn go_type_import_qualifier(raw_type: &str) -> Option<String> {
+    let mut surface = raw_type.trim();
+    while let Some(stripped) = surface.strip_prefix('*') {
+        surface = stripped.trim_start();
+    }
+    while let Some(stripped) = surface.strip_prefix("[]") {
+        surface = stripped.trim_start();
+    }
+    let base = surface.split('[').next().unwrap_or(surface).trim();
+    let (qualifier, _) = base.rsplit_once('.')?;
+    normalize_parameter_name(qualifier)
 }
 
 fn collect_php_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
@@ -5168,30 +11862,60 @@ fn collect_csharp_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap
     receiver_types
 }
 
-fn collect_ruby_local_constructor_types(
+fn ruby_visible_local_receiver_owner(
     callable: TsNode<'_>,
+    call_node: TsNode<'_>,
+    receiver_name: &str,
     source: &str,
-) -> HashMap<String, String> {
-    let mut receiver_types = HashMap::new();
+) -> Option<Option<String>> {
+    let mut visible_bindings = Vec::new();
     walk_tree_nodes(callable, &mut |node| {
-        if node.kind() != "assignment" {
+        if !ruby_assignment_like_kind(node.kind()) {
+            return;
+        }
+        if !receiver_call_belongs_to_callable(node, callable)
+            || node.end_byte() > call_node.start_byte()
+        {
             return;
         }
         let Some(left_node) = node.child_by_field_name("left") else {
             return;
         };
-        let Some(receiver_name) = normalized_receiver_variable(left_node, source) else {
+        if normalized_receiver_variable(left_node, source).as_deref() != Some(receiver_name) {
             return;
+        }
+        let owner_name = if node.kind() == "operator_assignment" {
+            None
+        } else {
+            node.child_by_field_name("right")
+                .and_then(|right_node| ruby_constructor_owner(right_node, source))
         };
-        let Some(right_node) = node.child_by_field_name("right") else {
-            return;
-        };
-        let Some(owner_name) = ruby_constructor_owner(right_node, source) else {
-            return;
-        };
-        receiver_types.insert(receiver_name, owner_name);
+        visible_bindings.push((node.end_byte(), owner_name));
     });
+    visible_bindings.sort_by_key(|(end_byte, _)| *end_byte);
+    visible_bindings.pop().map(|(_, owner)| owner)
+}
+
+fn collect_python_receiver_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
+    let mut receiver_types = collect_colon_parameter_types(callable, source);
+    if let Some(owner_name) = enclosing_node_with_kind(callable, &["class_definition"])
+        .and_then(|owner| declaration_name(owner, source))
+        && let Some(self_name) = first_python_self_parameter(callable, source)
+    {
+        receiver_types.insert(self_name, owner_name);
+    }
     receiver_types
+}
+
+fn first_python_self_parameter(callable: TsNode<'_>, source: &str) -> Option<String> {
+    let parameters = signature_parameter_surface(callable, source)?;
+    let first = split_top_level_parameters(&parameters).into_iter().next()?;
+    let name_side = first
+        .split_once(':')
+        .map(|(name_side, _)| name_side)
+        .unwrap_or(first.as_str());
+    let name = parameter_name_before_colon(name_side)?;
+    matches!(name.as_str(), "self" | "cls").then_some(name)
 }
 
 fn collect_colon_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap<String, String> {
@@ -5247,6 +11971,143 @@ fn collect_prefix_parameter_types(callable: TsNode<'_>, source: &str) -> HashMap
         receiver_types.insert(receiver_name, owner_name);
     }
     receiver_types
+}
+
+fn collect_dart_parameter_type_modules(
+    callable: TsNode<'_>,
+    source: &str,
+    import_alias_bindings: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut receiver_modules = HashMap::new();
+    let Some(parameters) = signature_parameter_surface(callable, source) else {
+        return receiver_modules;
+    };
+    for parameter in split_top_level_parameters(&parameters) {
+        let parameter = parameter
+            .split('=')
+            .next()
+            .unwrap_or(parameter.as_str())
+            .trim();
+        let tokens = parameter
+            .split_whitespace()
+            .filter(|token| !matches!(*token, "final" | "const" | "var" | "required"))
+            .collect::<Vec<_>>();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let Some(receiver_name) =
+            normalize_parameter_name(tokens.last().copied().unwrap_or_default())
+        else {
+            continue;
+        };
+        let raw_type = tokens[..tokens.len() - 1].join(" ");
+        let Some(qualifier) = dart_type_import_qualifier(&raw_type) else {
+            continue;
+        };
+        let Some(module_name) = import_alias_bindings.get(&qualifier) else {
+            continue;
+        };
+        receiver_modules.insert(receiver_name, module_name.clone());
+    }
+    receiver_modules
+}
+
+fn dart_type_import_qualifier(raw_type: &str) -> Option<String> {
+    if raw_type.contains('|') || raw_type.contains('&') {
+        return None;
+    }
+    let surface = raw_type.trim().trim_end_matches('?').trim();
+    let base = surface
+        .split(['<', '[', '('])
+        .next()
+        .unwrap_or(surface)
+        .trim();
+    let (qualifier, _) = base.rsplit_once('.')?;
+    normalize_parameter_name(qualifier)
+}
+
+fn collect_dart_import_alias_bindings(source: &str) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    let mut duplicates = HashSet::new();
+    for statement in dart_import_statements(source) {
+        let Some(module_name) = dart_import_module_name(&statement) else {
+            continue;
+        };
+        let Some(alias) = dart_import_alias_name(&statement) else {
+            continue;
+        };
+        if duplicates.contains(&alias) {
+            continue;
+        }
+        if bindings.contains_key(&alias) {
+            bindings.remove(&alias);
+            duplicates.insert(alias);
+            continue;
+        }
+        bindings.insert(alias, module_name);
+    }
+    bindings
+}
+
+fn dart_import_statements(source: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut collecting = false;
+
+    for raw_line in source.lines() {
+        let line = raw_line.split("//").next().unwrap_or(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !collecting {
+            if !line.starts_with("import ") {
+                continue;
+            }
+            current.clear();
+            current.push_str(line);
+            if line.contains(';') {
+                statements.push(current.clone());
+            } else {
+                collecting = true;
+            }
+            continue;
+        }
+
+        current.push(' ');
+        current.push_str(line);
+        if line.contains(';') {
+            statements.push(current.clone());
+            current.clear();
+            collecting = false;
+        }
+    }
+
+    statements
+}
+
+fn dart_import_module_name(statement: &str) -> Option<String> {
+    let rest = statement.strip_prefix("import")?.trim();
+    let quote = rest.chars().find(|ch| matches!(*ch, '"' | '\''))?;
+    let start = rest.find(quote)? + quote.len_utf8();
+    let end = rest[start..].find(quote)? + start;
+    let module_name = rest[start..end].trim();
+    (!module_name.is_empty()).then(|| module_name.to_string())
+}
+
+fn dart_import_alias_name(statement: &str) -> Option<String> {
+    let mut tokens = statement
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    while let Some(token) = tokens.pop() {
+        if token == "as" {
+            return None;
+        }
+        if tokens.last().copied() == Some("as") {
+            return normalize_parameter_name(token);
+        }
+    }
+    None
 }
 
 fn signature_parameter_surface(callable: TsNode<'_>, source: &str) -> Option<String> {
@@ -5372,6 +12233,45 @@ fn go_selector_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> 
     ))
 }
 
+fn python_attribute_call_nodes<'tree>(
+    node: TsNode<'tree>,
+) -> Option<(TsNode<'tree>, TsNode<'tree>)> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    let attribute = if function.kind() == "attribute" {
+        function
+    } else {
+        first_descendant_with_kind(function, "attribute")?
+    };
+    Some((
+        attribute.child_by_field_name("object")?,
+        attribute.child_by_field_name("attribute")?,
+    ))
+}
+
+fn python_attribute_method_col(node: TsNode<'_>, source: &str, method_name: &str) -> Option<u32> {
+    let (_, method) = python_attribute_call_nodes(node)?;
+    if trimmed_node_text(method, source).as_deref() != Some(method_name) {
+        return None;
+    }
+    Some(method.start_position().column as u32 + 1)
+}
+
+fn python_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call" {
+        return None;
+    }
+    if let Some((receiver, method)) = python_attribute_call_nodes(node) {
+        return Some((
+            normalized_receiver_variable(receiver, source)?,
+            trimmed_node_text(method, source)?,
+        ));
+    }
+    surface_member_call(node, source)
+}
+
 fn php_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if !matches!(
         node.kind(),
@@ -5403,6 +12303,18 @@ fn csharp_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)
     ))
 }
 
+fn java_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "method_invocation" {
+        return None;
+    }
+    let receiver = node.child_by_field_name("object")?;
+    let method = node.child_by_field_name("name")?;
+    Some((
+        normalized_receiver_variable(receiver, source)?,
+        trimmed_node_text(method, source)?,
+    ))
+}
+
 fn ruby_receiver_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if node.kind() != "call" {
         return None;
@@ -5416,25 +12328,198 @@ fn ruby_receiver_call(node: TsNode<'_>, source: &str) -> Option<(String, String)
     Some((normalized_receiver_variable(receiver, source)?, method_name))
 }
 
+fn typescript_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "member_expression" {
+        return None;
+    }
+    let receiver = function.child_by_field_name("object")?;
+    let method = function.child_by_field_name("property")?;
+    Some((
+        normalize_js_ts_private_receiver_surface(&normalized_receiver_variable(receiver, source)?),
+        trimmed_node_text(method, source)?,
+    ))
+}
+
+fn javascript_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "member_expression" {
+        return None;
+    }
+    let receiver = function.child_by_field_name("object")?;
+    let method = function.child_by_field_name("property")?;
+    Some((
+        normalize_js_ts_private_receiver_surface(&normalized_receiver_variable(receiver, source)?),
+        trimmed_node_text(method, source)?,
+    ))
+}
+
+fn normalize_js_ts_private_receiver_surface(receiver: &str) -> String {
+    receiver
+        .split('.')
+        .map(|segment| segment.strip_prefix('#').unwrap_or(segment))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn kotlin_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if node.kind() != "call_expression" {
         return None;
     }
-    surface_member_call(node, source)
+    let text = trimmed_node_text(node, source)?;
+    let callable = text
+        .split('(')
+        .next()
+        .unwrap_or(text.as_str())
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let separator = callable.rfind('.')?;
+    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
+    let method = callable[separator + 1..]
+        .trim()
+        .trim_start_matches('?')
+        .trim();
+    Some((
+        normalized_kotlin_receiver_surface(receiver)?,
+        normalize_parameter_name(method)?,
+    ))
+}
+
+fn normalized_kotlin_receiver_surface(raw: &str) -> Option<String> {
+    let receiver = raw.trim().trim_end_matches('?').trim();
+    if receiver.contains('.') {
+        let cleaned = receiver
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
+            .trim();
+        let valid = cleaned
+            .split('.')
+            .all(|part| normalize_parameter_name(part).is_some());
+        return (valid && !cleaned.is_empty()).then(|| cleaned.to_string());
+    }
+    normalize_parameter_name(receiver)
+}
+
+fn cpp_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let text = trimmed_node_text(node, source)?;
+    let callable = text
+        .split('(')
+        .next()
+        .unwrap_or(text.as_str())
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let dot = callable.rfind('.').map(|index| (index, 1usize));
+    let arrow = callable.rfind("->").map(|index| (index, 2usize));
+    let (separator, width) = match (dot, arrow) {
+        (Some(dot), Some(arrow)) => {
+            if dot.0 > arrow.0 {
+                dot
+            } else {
+                arrow
+            }
+        }
+        (Some(dot), None) => dot,
+        (None, Some(arrow)) => arrow,
+        (None, None) => return None,
+    };
+    let receiver = callable[..separator].trim();
+    let method = callable[separator + width..].trim();
+    Some((
+        normalized_receiver_surface(receiver)?,
+        normalize_parameter_name(method)?,
+    ))
 }
 
 fn swift_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if node.kind() != "call_expression" {
         return None;
     }
-    surface_member_call(node, source)
+    let text = trimmed_node_text(node, source)?;
+    let callable = text
+        .split('(')
+        .next()
+        .unwrap_or(text.as_str())
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let separator = callable.rfind('.')?;
+    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
+    let method = callable[separator + 1..]
+        .trim()
+        .trim_start_matches('?')
+        .trim();
+    Some((
+        normalized_swift_receiver_surface(receiver)?,
+        normalize_parameter_name(method)?,
+    ))
+}
+
+fn normalized_swift_receiver_surface(raw: &str) -> Option<String> {
+    let receiver = raw.trim().trim_end_matches('?').trim();
+    if receiver.contains('.') {
+        let cleaned = receiver
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
+            .trim();
+        let valid = cleaned
+            .split('.')
+            .all(|part| normalize_parameter_name(part).is_some());
+        return (valid && !cleaned.is_empty()).then(|| cleaned.to_string());
+    }
+    normalize_parameter_name(receiver)
 }
 
 fn dart_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
     if !matches!(node.kind(), "expression_statement" | "return_statement") {
         return None;
     }
-    surface_member_call(node, source)
+    let text = trimmed_node_text(node, source)?;
+    let callable = text
+        .split('(')
+        .next()
+        .unwrap_or(text.as_str())
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let separator = callable.rfind('.')?;
+    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
+    let method = callable[separator + 1..]
+        .trim()
+        .trim_start_matches('?')
+        .trim();
+    Some((
+        normalized_dart_receiver_surface(receiver)?,
+        normalize_parameter_name(method)?,
+    ))
+}
+
+fn normalized_dart_receiver_surface(raw: &str) -> Option<String> {
+    let receiver = raw
+        .rsplit([' ', '\t', '\n', '\r', '(', '[', '{'])
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or(raw)
+        .trim()
+        .trim_end_matches('?')
+        .trim();
+    if receiver.contains('.') {
+        let cleaned = receiver
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
+            .trim();
+        let valid = cleaned
+            .split('.')
+            .all(|part| normalize_parameter_name(part).is_some());
+        return (valid && !cleaned.is_empty()).then(|| cleaned.to_string());
+    }
+    normalize_parameter_name(receiver)
 }
 
 fn dart_direct_call(node: TsNode<'_>, source: &str) -> Option<String> {
@@ -5511,6 +12596,16 @@ fn ruby_constructor_owner(node: TsNode<'_>, source: &str) -> Option<String> {
     let receiver = node.child_by_field_name("receiver")?;
     let raw_owner = trimmed_node_text(receiver, source)?;
     normalize_type_surface(&raw_owner)
+}
+
+fn ruby_constructor_owner_surface(surface: &str) -> Option<String> {
+    let surface = surface.trim();
+    let (raw_owner, suffix) = surface.split_once(".new")?;
+    if !(suffix.is_empty() || suffix.starts_with('(') && suffix.ends_with(')')) {
+        return None;
+    }
+    let raw_owner = raw_owner.trim();
+    normalize_type_surface(raw_owner)
 }
 
 fn normalized_receiver_variable(node: TsNode<'_>, source: &str) -> Option<String> {
@@ -5749,7 +12844,13 @@ fn suppress_runtime_import_call_edges(
 
     let suppressed = runtime_import_specs
         .iter()
-        .map(|spec| (spec.line, spec.suppress_callee_name.as_str()))
+        .map(|spec| {
+            (
+                spec.suppress_line,
+                spec.suppress_start_col,
+                spec.suppress_callee_name.as_str(),
+            )
+        })
         .collect::<HashSet<_>>();
     let node_by_id = nodes
         .iter()
@@ -5763,14 +12864,28 @@ fn suppress_runtime_import_call_edges(
         let Some(line) = edge.line else {
             return true;
         };
-        let Some(target_name) = node_by_id
-            .get(&edge.target)
-            .map(|node| short_member_name(&node.serialized_name))
+        let Some(target_node) = node_by_id.get(&edge.target) else {
+            return true;
+        };
+        let Some(start_col) = edge
+            .callsite_identity
+            .as_deref()
+            .and_then(callsite_identity_start_col)
+            .or(target_node.start_col)
         else {
             return true;
         };
-        !suppressed.contains(&(line, target_name))
+        let target_name = short_member_name(&target_node.serialized_name);
+        !suppressed.contains(&(line, start_col, target_name))
     });
+}
+
+fn callsite_identity_start_col(identity: &str) -> Option<u32> {
+    let canonical = identity.split('|').next()?;
+    let mut parts = canonical.split(':');
+    let _file = parts.next()?;
+    let _line = parts.next()?;
+    parts.next()?.parse().ok()
 }
 
 fn infer_access_from_source(
@@ -10643,6 +17758,7 @@ pub fn index_file(
             let mut line: Option<u32> = None;
             let mut col: Option<u32> = None;
             let mut callsite_identity: Option<String> = None;
+            let mut callsite_marker: Option<&'static str> = None;
 
             for (attr, val) in edge.attributes.iter() {
                 match attr.as_str() {
@@ -10667,6 +17783,24 @@ pub fn index_file(
                             if !raw.is_empty() {
                                 callsite_identity = Some(raw.to_string());
                             }
+                        }
+                    }
+                    "call_syntax" => {
+                        if let Ok(raw) = val.as_str() {
+                            callsite_marker = match raw.trim() {
+                                "python_attribute" => Some(PYTHON_ATTRIBUTE_CALLSITE_MARKER),
+                                "cpp_member" => Some(CPP_MEMBER_CALLSITE_MARKER),
+                                "go_selector" => Some(GO_SELECTOR_CALLSITE_MARKER),
+                                "java_member" => Some(JAVA_MEMBER_CALLSITE_MARKER),
+                                "csharp_member" => Some(CSHARP_MEMBER_CALLSITE_MARKER),
+                                "php_member" => Some(PHP_MEMBER_CALLSITE_MARKER),
+                                "js_member" => Some(JS_MEMBER_CALLSITE_MARKER),
+                                "ts_member" => Some(TS_MEMBER_CALLSITE_MARKER),
+                                "kotlin_member" => Some(KOTLIN_MEMBER_CALLSITE_MARKER),
+                                "dart_member" => Some(DART_MEMBER_CALLSITE_MARKER),
+                                "swift_member" => Some(SWIFT_MEMBER_CALLSITE_MARKER),
+                                _ => callsite_marker,
+                            };
                         }
                     }
                     _ => {}
@@ -10699,6 +17833,9 @@ pub fn index_file(
                     Some(*next)
                 });
                 ensure_callsite_identity(&mut edge, resolved_col);
+            }
+            if let Some(marker) = callsite_marker {
+                append_callsite_marker(&mut edge, marker);
             }
             if !edge_keys.insert(edge_dedup_key(&edge, flags)) {
                 continue;
@@ -10969,6 +18106,26 @@ fn ensure_callsite_identity(edge: &mut Edge, col: Option<u32>) {
     }
     edge.callsite_identity =
         canonical_callsite_identity(edge.file_node_id, edge.line, col, edge.target);
+}
+
+fn append_callsite_marker(edge: &mut Edge, marker: &'static str) {
+    append_callsite_part(edge, marker);
+}
+
+fn append_callsite_part(edge: &mut Edge, marker: &str) {
+    if edge.kind != EdgeKind::CALL {
+        return;
+    }
+
+    match edge.callsite_identity.as_mut() {
+        Some(identity) => {
+            if !identity.split('|').any(|part| part == marker) {
+                identity.push('|');
+                identity.push_str(marker);
+            }
+        }
+        None => edge.callsite_identity = Some(marker.to_string()),
+    }
 }
 
 fn edge_dedup_key(edge: &Edge, flags: IndexFeatureFlags) -> EdgeDedupKey {
@@ -12701,6 +19858,84 @@ class Test {
         );
         let edge_ids = deduped.iter().map(|edge| edge.id).collect::<HashSet<_>>();
         assert_eq!(edge_ids.len(), 2, "callsites should have unique edge ids");
+    }
+
+    #[test]
+    fn test_runtime_import_call_suppression_uses_callsite_column() {
+        let file_id = NodeId(1);
+        let require_id = NodeId(20);
+        let module_id = NodeId(30);
+        let nodes = vec![
+            Node {
+                id: require_id,
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "require".to_string(),
+                start_line: Some(42),
+                start_col: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: module_id,
+                kind: NodeKind::MODULE,
+                serialized_name: "\"./workflow\"".to_string(),
+                start_line: Some(42),
+                start_col: Some(9),
+                ..Default::default()
+            },
+        ];
+        let mut edges = vec![
+            Edge {
+                id: EdgeId(1),
+                source: NodeId(10),
+                target: require_id,
+                kind: EdgeKind::CALL,
+                file_node_id: Some(file_id),
+                line: Some(42),
+                callsite_identity: canonical_callsite_identity(
+                    Some(file_id),
+                    Some(42),
+                    Some(1),
+                    require_id,
+                ),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(2),
+                source: NodeId(11),
+                target: require_id,
+                kind: EdgeKind::CALL,
+                file_node_id: Some(file_id),
+                line: Some(42),
+                callsite_identity: canonical_callsite_identity(
+                    Some(file_id),
+                    Some(42),
+                    Some(23),
+                    require_id,
+                ),
+                ..Default::default()
+            },
+        ];
+        let specs = vec![RuntimeImportSpec {
+            binding_node_id: None,
+            module_node_id: module_id,
+            line: 42,
+            suppress_line: 42,
+            suppress_start_col: 1,
+            suppress_callee_name: "require".to_string(),
+        }];
+
+        suppress_runtime_import_call_edges(&nodes, &mut edges, &specs);
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "only the exact import call should be suppressed"
+        );
+        assert_eq!(
+            edges[0].callsite_identity,
+            canonical_callsite_identity(Some(file_id), Some(42), Some(23), require_id),
+            "same-line non-import callsite should remain"
+        );
     }
 
     #[test]

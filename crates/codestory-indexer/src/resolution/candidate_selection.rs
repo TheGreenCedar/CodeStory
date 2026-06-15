@@ -13,15 +13,141 @@ pub(super) fn compute_call_resolution(
         _source_name,
         target_name,
         target_node_id,
-        _caller_file_path,
+        caller_file_path,
         callsite_identity,
     ) = row;
-    let prepared_name = PreparedName::new(target_name.clone());
-    let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
-    let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
+    let receiver_owner = receiver_owner_from_callsite(callsite_identity.as_deref());
+    let receiver_module = receiver_module_from_callsite(callsite_identity.as_deref());
     let mut selected: Option<(i64, f32, ResolutionStrategy)> = None;
     let mut semantic_fallback = UnambiguousBestCandidate::default();
     let mut candidate_ids = OrderedCandidateIds::with_capacity(8);
+
+    if is_python_dotted_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_cpp_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_js_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_ts_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_kotlin_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_dart_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_swift_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_go_selector_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_java_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_csharp_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_ruby_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    if is_php_member_call_placeholder(EdgeKind::CALL, callsite_identity.as_deref())
+        && receiver_owner.is_none()
+    {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
+    }
+
+    let lookup_target_name = receiver_owner
+        .map(|owner| format!("{owner}.{target_name}"))
+        .unwrap_or_else(|| target_name.clone());
+    let prepared_name = PreparedName::new(lookup_target_name);
+    let is_common_unqualified = is_common_unqualified_call_name(&prepared_name.original);
+    let is_owner_qualified = is_owner_qualified_call_name(&prepared_name.original);
 
     for candidate in semantic_candidates {
         if pass.flags.store_candidates {
@@ -36,6 +162,30 @@ pub(super) fn compute_call_resolution(
         {
             semantic_fallback.consider(candidate.target_node_id, candidate.confidence);
         }
+    }
+
+    if let (Some(owner_name), Some(module_name)) = (receiver_owner, receiver_module) {
+        let selected_imported_owner = candidate_index.find_imported_owner_member_readonly(
+            caller_file_path.as_deref(),
+            module_name,
+            owner_name,
+            target_name,
+        );
+        let Some(candidate) = selected_imported_owner else {
+            let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+            return Ok(ComputedResolution {
+                update,
+                strategy: None,
+            });
+        };
+        if pass.flags.store_candidates {
+            candidate_ids.push(candidate);
+        }
+        selected = Some((
+            candidate,
+            pass.policy.call_same_file,
+            ResolutionStrategy::CallGlobalUnique,
+        ));
     }
 
     if selected.is_none()
@@ -90,6 +240,14 @@ pub(super) fn compute_call_resolution(
                 ResolutionStrategy::CallSameModule,
             ));
         }
+    }
+
+    if selected.is_none() && receiver_owner.is_some() && receiver_module.is_none() {
+        let update = build_resolved_edge_update(*edge_id, None, candidate_ids.as_slice())?;
+        return Ok(ComputedResolution {
+            update,
+            strategy: None,
+        });
     }
 
     if selected.is_none()

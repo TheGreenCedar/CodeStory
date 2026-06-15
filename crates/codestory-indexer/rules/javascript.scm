@@ -113,6 +113,7 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+  attr (@call_any.node -> @call_any.node) call_syntax = "js_member"
 }
 
 ;; JSX component and prop usage from render paths
