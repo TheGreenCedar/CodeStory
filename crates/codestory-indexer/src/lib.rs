@@ -8864,9 +8864,14 @@ fn php_import_type_binding_name(import_surface: &str) -> Option<(String, String,
     {
         return None;
     }
-    let (module_surface, alias_surface) = split_case_insensitive_alias(import_surface, "as")?;
+    let (module_surface, alias_surface) =
+        split_case_insensitive_alias(import_surface, "as").unwrap_or((import_surface, ""));
     let (owner_name, module_name) = php_imported_owner_module_name(module_surface)?;
-    let local_name = normalize_parameter_name(alias_surface)?;
+    let local_name = if alias_surface.trim().is_empty() {
+        owner_name.clone()
+    } else {
+        normalize_parameter_name(alias_surface)?
+    };
     Some((owner_name, local_name, module_name))
 }
 
@@ -8916,12 +8921,13 @@ fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRe
             return;
         };
         let visible_type_names = collect_csharp_visible_type_binding_names(root, callable, source);
-        let imported_type_bindings = collect_csharp_visible_alias_imported_type_bindings(
+        let imported_type_bindings = collect_csharp_visible_imported_type_bindings(
             root,
             callable,
             source,
             &visible_type_names,
         );
+        let namespace_imports = collect_csharp_visible_namespace_imports(root, callable, source);
         let receiver_types = collect_csharp_parameter_types(callable, source);
         let call_source = ManualReceiverSource {
             name: &source_name,
@@ -8931,6 +8937,7 @@ fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRe
         let receiver_context = CsharpReceiverContext {
             visible_type_names: &visible_type_names,
             imported_type_bindings: &imported_type_bindings,
+            namespace_imports: &namespace_imports,
             parameter_receiver_types: &receiver_types,
         };
         collect_csharp_precise_receiver_call_specs(
@@ -8967,6 +8974,11 @@ fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRe
             if let Some(binding) = imported_type_bindings.get(&spec.owner_name) {
                 spec.owner_name = binding.owner_name.clone();
                 spec.owner_module = Some(binding.module_name.clone());
+            } else if !visible_type_names.contains(&spec.owner_name)
+                && let Some(module_name) =
+                    csharp_plain_namespace_import_type_module(&spec.owner_name, &namespace_imports)
+            {
+                spec.owner_module = Some(module_name);
             }
         }
         edges.extend(parameter_specs);
@@ -8977,6 +8989,7 @@ fn collect_csharp_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualRe
 struct CsharpReceiverContext<'a> {
     visible_type_names: &'a HashSet<String>,
     imported_type_bindings: &'a HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &'a CsharpNamespaceImports,
     parameter_receiver_types: &'a HashMap<String, String>,
 }
 
@@ -9037,6 +9050,7 @@ fn csharp_visible_receiver_owner(
         receiver_name,
         context.visible_type_names,
         context.imported_type_bindings,
+        context.namespace_imports,
     ) {
         return Some(Some(owner));
     }
@@ -9047,6 +9061,7 @@ fn csharp_visible_receiver_owner(
         source,
         context.visible_type_names,
         context.imported_type_bindings,
+        context.namespace_imports,
     ) {
         return Some(owner);
     }
@@ -9060,6 +9075,7 @@ fn csharp_visible_receiver_owner(
         source,
         context.visible_type_names,
         context.imported_type_bindings,
+        context.namespace_imports,
     ) {
         return Some(Some(owner));
     }
@@ -9099,6 +9115,7 @@ fn csharp_visible_local_receiver_owner(
     source: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
 ) -> Option<OptionalReceiverOwnerBinding> {
     let mut visible_bindings = Vec::new();
     walk_tree_nodes(callable, &mut |node| {
@@ -9116,6 +9133,7 @@ fn csharp_visible_local_receiver_owner(
             source,
             visible_type_names,
             imported_type_bindings,
+            namespace_imports,
         ) {
             if binding_name == receiver_name {
                 visible_bindings.push((node.end_byte(), owner));
@@ -9132,6 +9150,7 @@ fn csharp_field_receiver_owner(
     source: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
 ) -> OptionalReceiverOwnerBinding {
     let field_name = receiver_name
         .strip_prefix("this.")
@@ -9153,6 +9172,7 @@ fn csharp_field_receiver_owner(
             source,
             visible_type_names,
             imported_type_bindings,
+            namespace_imports,
         ) {
             if binding_name == field_name
                 && let Some(owner) = owner
@@ -9175,6 +9195,7 @@ fn csharp_field_declaration_receiver_bindings(
     source: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
 ) -> Vec<(String, OptionalReceiverOwnerBinding)> {
     let Some(variable_declaration) = first_descendant_with_kind(node, "variable_declaration")
     else {
@@ -9185,6 +9206,7 @@ fn csharp_field_declaration_receiver_bindings(
         source,
         visible_type_names,
         imported_type_bindings,
+        namespace_imports,
     )
 }
 
@@ -9193,6 +9215,7 @@ fn csharp_local_declaration_receiver_bindings(
     source: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
 ) -> Vec<(String, OptionalReceiverOwnerBinding)> {
     let Some(variable_declaration) = first_descendant_with_kind(node, "variable_declaration")
     else {
@@ -9203,6 +9226,7 @@ fn csharp_local_declaration_receiver_bindings(
         source,
         visible_type_names,
         imported_type_bindings,
+        namespace_imports,
     )
 }
 
@@ -9211,12 +9235,19 @@ fn csharp_variable_declaration_receiver_bindings(
     source: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
 ) -> Vec<(String, OptionalReceiverOwnerBinding)> {
     let declared_type = node
         .child_by_field_name("type")
         .and_then(|type_node| trimmed_node_text(type_node, source));
     let declared_owner = declared_type.as_deref().and_then(|raw_type| {
-        csharp_receiver_owner_from_type(raw_type, visible_type_names, imported_type_bindings)
+        csharp_receiver_owner_from_type(
+            raw_type,
+            visible_type_names,
+            imported_type_bindings,
+            namespace_imports,
+            true,
+        )
     });
     let declared_is_var = declared_type
         .as_deref()
@@ -9244,6 +9275,7 @@ fn csharp_variable_declaration_receiver_bindings(
                         value,
                         visible_type_names,
                         imported_type_bindings,
+                        namespace_imports,
                     )
                 })
         } else {
@@ -9258,6 +9290,8 @@ fn csharp_receiver_owner_from_type(
     raw_type: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
+    allow_plain_namespace_import: bool,
 ) -> OptionalReceiverOwnerBinding {
     let owner_name = normalize_type_surface(raw_type)?;
     if owner_name == "var" {
@@ -9275,6 +9309,12 @@ fn csharp_receiver_owner_from_type(
             Some(binding.module_name.clone()),
         ));
     }
+    if allow_plain_namespace_import
+        && let Some(module_name) =
+            csharp_plain_namespace_import_type_module(&owner_name, namespace_imports)
+    {
+        return Some((owner_name, Some(module_name)));
+    }
     Some((owner_name, None))
 }
 
@@ -9282,11 +9322,18 @@ fn csharp_direct_new_owner_surface(
     surface: &str,
     visible_type_names: &HashSet<String>,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
+    namespace_imports: &CsharpNamespaceImports,
 ) -> OptionalReceiverOwnerBinding {
     let surface = surface.trim();
     let rest = surface.strip_prefix("new ")?;
     let type_surface = rest.split(['(', '{']).next().unwrap_or(rest).trim();
-    csharp_receiver_owner_from_type(type_surface, visible_type_names, imported_type_bindings)
+    csharp_receiver_owner_from_type(
+        type_surface,
+        visible_type_names,
+        imported_type_bindings,
+        namespace_imports,
+        false,
+    )
 }
 
 fn csharp_static_receiver_owner(
@@ -9342,7 +9389,7 @@ fn csharp_lexical_scope(node: TsNode<'_>) -> Option<TsNode<'_>> {
     enclosing_node_with_kind(node, &["block"])
 }
 
-fn collect_csharp_visible_alias_imported_type_bindings(
+fn collect_csharp_visible_imported_type_bindings(
     root: TsNode<'_>,
     callable: TsNode<'_>,
     source: &str,
@@ -9351,7 +9398,7 @@ fn collect_csharp_visible_alias_imported_type_bindings(
     let mut bindings = HashMap::new();
     let mut duplicates = HashSet::new();
 
-    collect_csharp_alias_imported_type_bindings_in_scope(
+    collect_csharp_imported_type_bindings_in_scope(
         root,
         source,
         visible_type_names,
@@ -9361,7 +9408,7 @@ fn collect_csharp_visible_alias_imported_type_bindings(
     if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_declaration"])
         && let Some(body) = namespace.child_by_field_name("body")
     {
-        collect_csharp_alias_imported_type_bindings_in_scope(
+        collect_csharp_imported_type_bindings_in_scope(
             body,
             source,
             visible_type_names,
@@ -9373,7 +9420,7 @@ fn collect_csharp_visible_alias_imported_type_bindings(
     bindings
 }
 
-fn collect_csharp_alias_imported_type_bindings_in_scope(
+fn collect_csharp_imported_type_bindings_in_scope(
     scope: TsNode<'_>,
     source: &str,
     visible_type_names: &HashSet<String>,
@@ -9386,7 +9433,7 @@ fn collect_csharp_alias_imported_type_bindings_in_scope(
             continue;
         }
         let Some((owner_name, local_name, module_name)) =
-            csharp_alias_import_type_binding_names(statement, source)
+            csharp_import_type_binding_names(statement, source)
         else {
             continue;
         };
@@ -9405,6 +9452,46 @@ fn collect_csharp_alias_imported_type_bindings_in_scope(
                 owner_name,
             },
         );
+    }
+}
+
+fn collect_csharp_visible_namespace_imports(
+    root: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+) -> CsharpNamespaceImports {
+    let mut imports = CsharpNamespaceImports::default();
+    collect_csharp_namespace_imports_in_scope(root, source, &mut imports);
+    if let Some(namespace) = enclosing_node_with_kind(callable, &["namespace_declaration"])
+        && let Some(body) = namespace.child_by_field_name("body")
+    {
+        collect_csharp_namespace_imports_in_scope(body, source, &mut imports);
+    }
+    imports
+}
+
+#[derive(Default)]
+struct CsharpNamespaceImports {
+    plain_import_count: usize,
+    module_candidates: HashSet<String>,
+}
+
+fn collect_csharp_namespace_imports_in_scope(
+    scope: TsNode<'_>,
+    source: &str,
+    imports: &mut CsharpNamespaceImports,
+) {
+    let mut cursor = scope.walk();
+    for statement in scope.named_children(&mut cursor) {
+        if statement.kind() != "using_directive" {
+            continue;
+        }
+        if let Some(namespace_name) = csharp_namespace_import_name(statement, source) {
+            imports.plain_import_count = imports.plain_import_count.saturating_add(1);
+            if namespace_name.contains('.') {
+                imports.module_candidates.insert(namespace_name);
+            }
+        }
     }
 }
 
@@ -9440,7 +9527,7 @@ fn collect_csharp_type_binding_names_in_scope(
     }
 }
 
-fn csharp_alias_import_type_binding_names(
+fn csharp_import_type_binding_names(
     statement: TsNode<'_>,
     source: &str,
 ) -> Option<(String, String, String)> {
@@ -9469,6 +9556,43 @@ fn csharp_alias_import_type_binding_names(
         .next()
         .and_then(normalize_parameter_name)?;
     Some((owner_name, local_name, module_name.to_string()))
+}
+
+fn csharp_namespace_import_name(statement: TsNode<'_>, source: &str) -> Option<String> {
+    let surface = trimmed_node_text(statement, source)?;
+    let rest = surface
+        .strip_prefix("global ")
+        .unwrap_or(surface.as_str())
+        .strip_prefix("using")?
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if rest.starts_with("static ") || rest.contains('=') {
+        return None;
+    }
+    if rest.contains('*') || rest.contains('|') {
+        return None;
+    }
+    if rest.split_whitespace().count() != 1 {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn csharp_plain_namespace_import_type_module(
+    owner_name: &str,
+    namespace_imports: &CsharpNamespaceImports,
+) -> Option<String> {
+    if namespace_imports.plain_import_count != 1
+        || namespace_imports.module_candidates.len() != 1
+        || owner_name.contains('.')
+        || owner_name.contains('|')
+        || owner_name.trim().is_empty()
+    {
+        return None;
+    }
+    let namespace_name = namespace_imports.module_candidates.iter().next()?;
+    Some(format!("{namespace_name}.{owner_name}"))
 }
 
 fn collect_kotlin_receiver_call_edges(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {

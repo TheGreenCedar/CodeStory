@@ -218,22 +218,27 @@ multiple module imports, duplicate same-module owners, unimported cross-file
 property owners, erased `Any` receivers, and local type or factory shadows stay
 fail-closed unless a same-file owner can be resolved. C# receiver fixtures cover
 explicit using-alias imports such as
-`using Mailer = Acme.Mail.Notifier` when the namespace-qualified owner method is
-indexed. C# visible same-file receiver coverage also includes enclosing-type
+`using Mailer = Acme.Mail.Notifier` and single dotted plain namespace imports
+such as `using Acme.Mail;` with a `Notifier` receiver, when the
+namespace-qualified owner method is indexed. C# visible same-file receiver
+coverage also includes enclosing-type
 `this.Decorate(...)` calls, class field receivers such as
 `notifier.Notify(...)`, `this.repository.Save(...)`, ordinary local declarations
 such as `Workflow workflow = makeWorkflow(); workflow.Run(...)`, direct
 constructor temporaries such as `new Workflow(...).Run(...)`,
 `var workflow = new Workflow(...)` direct-constructor bindings, and visible
-type/static receivers such as `Program.MakeWorkflow()`. Plain namespace `using`
-directives, missing alias targets, duplicate alias local names, local type
-shadows, parameter-name shadows, `var` factory-returned receivers,
-erased/dynamic receivers, base-class dispatch, and cross-file local owner lookup
-stay fail-closed unless a same-file owner can be resolved. C# using-alias
-receiver fixtures also cover alias-typed class fields and alias-typed local
-declarations. PHP receiver fixtures cover non-grouped explicit use-alias imports
-such as `use Acme\Mail\Notifier as Mailer` when the namespace-qualified owner
-method is indexed. PHP visible same-file receiver coverage also includes
+type/static receivers such as `Program.MakeWorkflow()`. Multiple plain
+namespace imports, single-segment plain namespace imports, static or constructor
+receivers through plain namespace imports, missing alias targets, duplicate
+alias local names, local type shadows, parameter-name shadows, `var`
+factory-returned receivers, erased/dynamic receivers, base-class dispatch, and
+cross-file local owner lookup stay fail-closed unless a same-file owner can be
+resolved. C# using-alias receiver fixtures also cover alias-typed class fields
+and alias-typed local declarations. PHP receiver fixtures cover non-grouped
+explicit use imports with
+or without aliases, such as `use Acme\Mail\Notifier` and
+`use Acme\Mail\Notifier as Mailer`, when the namespace-qualified owner method is
+indexed. PHP visible same-file receiver coverage also includes
 enclosing-type `$this->decorate(...)` calls, direct constructor temporaries such
 as `(new Workflow())->run(...)`, and local constructor assignments such as
 `$workflow = new Workflow(); $workflow->run(...)`. Typed same-file property
@@ -242,9 +247,9 @@ type comes from an explicit property declaration or constructor property
 promotion, and use-alias property receiver fixtures resolve through the same
 namespace-qualified exact-owner rule as use-alias parameter annotations.
 Use-alias constructor receivers such as `$workflow = new RemoteWorkflow()` and
-`(new RemoteWorkflow())->run(...)` resolve through the same alias rule. Plain
-`use` imports, missing alias targets, duplicate alias local names, local type
-shadows, grouped use-alias imports, factory-returned receivers, untyped property
+`(new RemoteWorkflow())->run(...)` resolve through the same alias rule. Missing
+alias targets, duplicate plain or aliased local names, local type shadows,
+grouped use-alias imports, factory-returned receivers, untyped property
 receivers, and cross-file local owner lookup stay fail-closed unless a same-file
 owner can be resolved.
 
@@ -264,11 +269,11 @@ receiver ownership and relative imported receiver annotations plus TypeScript/TS
 Java explicit imported receiver parameters, Kotlin explicit imported receiver
 parameters plus exact imported constructor locals, Swift SwiftPM module imported receiver
 parameters plus imported constructor locals, C++ same-file typed receiver
-parameters, C# using-alias imported receiver parameters plus same-file
+parameters, C# using-alias and single plain-namespace imported receiver parameters plus same-file
 field/local/constructor receiver ownership, Go qualified imported receiver
 parameters plus qualified imported composite locals, Ruby same-file constructor
-receiver ownership plus exact single-file `require_relative` constructor owners, PHP use-alias
-imported receiver parameters and property receivers plus same-file
+receiver ownership plus exact single-file `require_relative` constructor owners, PHP plain and
+aliased use imported receiver parameters and property receivers plus same-file
 self/property/constructor receiver ownership plus use-alias constructor
 receivers, and Dart prefixed relative imported receiver parameters plus
 prefixed imported constructor locals. Header

@@ -4854,6 +4854,65 @@ class Workflow
     }
 }
 "#;
+    let duplicate_plain_using_source = r#"
+using Acme.Mail;
+using Acme.Other;
+
+namespace Acme.Workflow;
+
+class Workflow
+{
+    void Run(Notifier notifier)
+    {
+        notifier.Notify("ready");
+    }
+}
+"#;
+    let system_plain_using_source = r#"
+using System;
+using Acme.Mail;
+
+namespace Acme.Workflow;
+
+class Workflow
+{
+    void Run(Notifier notifier)
+    {
+        notifier.Notify("ready");
+    }
+}
+"#;
+    let local_plain_shadow_source = r#"
+using Acme.Mail;
+
+namespace Acme.Workflow;
+
+interface Notifier
+{
+    void Notify(string value);
+}
+
+class Workflow
+{
+    void Run(Notifier notifier)
+    {
+        notifier.Notify("ready");
+    }
+}
+"#;
+    let static_plain_using_source = r#"
+using Acme.Mail;
+
+namespace Acme.Workflow;
+
+class Workflow
+{
+    void Run()
+    {
+        Notifier.Notify("ready");
+    }
+}
+"#;
 
     let (nodes, edges) = index_files(&[
         ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
@@ -5010,8 +5069,8 @@ class Workflow
         ("src/Acme/Other/Notifier.cs", other_notifier_source),
         ("src/Acme/Workflow/Workflow.cs", plain_using_source),
     ])?;
-    assert_no_resolved_call_to_method_owner_in_file(
-        "csharp plain namespace using stays unresolved",
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp plain namespace using resolves exact imported owner",
         &plain_nodes,
         &plain_edges,
         "Run",
@@ -5020,13 +5079,101 @@ class Workflow
         "src/Acme/Mail/Notifier.cs",
     );
     assert_no_resolved_call_to_method_owner_in_file(
-        "csharp plain namespace using stays unresolved",
+        "csharp plain namespace using avoids other namespace",
         &plain_nodes,
         &plain_edges,
         "Run",
         "Notifier",
         "Notify",
         "src/Acme/Other/Notifier.cs",
+    );
+
+    let (duplicate_plain_nodes, duplicate_plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
+        ("src/Acme/Other/Notifier.cs", other_notifier_source),
+        (
+            "src/Acme/Workflow/Workflow.cs",
+            duplicate_plain_using_source,
+        ),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp duplicate plain namespace using stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Mail/Notifier.cs",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp duplicate plain namespace using stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Other/Notifier.cs",
+    );
+
+    let (system_plain_nodes, system_plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
+        ("src/Acme/Other/Notifier.cs", other_notifier_source),
+        ("src/Acme/Workflow/Workflow.cs", system_plain_using_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp system plus plain namespace using stays unresolved",
+        &system_plain_nodes,
+        &system_plain_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Mail/Notifier.cs",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp system plus plain namespace using stays unresolved",
+        &system_plain_nodes,
+        &system_plain_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Other/Notifier.cs",
+    );
+
+    let (local_plain_shadow_nodes, local_plain_shadow_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
+        ("src/Acme/Workflow/Workflow.cs", local_plain_shadow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "csharp local receiver shadows plain namespace using",
+        &local_plain_shadow_nodes,
+        &local_plain_shadow_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Workflow/Workflow.cs",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp local receiver shadows plain namespace using",
+        &local_plain_shadow_nodes,
+        &local_plain_shadow_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Mail/Notifier.cs",
+    );
+
+    let (static_plain_nodes, static_plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.cs", mail_notifier_source),
+        ("src/Acme/Workflow/Workflow.cs", static_plain_using_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "csharp plain namespace using does not resolve static receiver",
+        &static_plain_nodes,
+        &static_plain_edges,
+        "Run",
+        "Notifier",
+        "Notify",
+        "src/Acme/Mail/Notifier.cs",
     );
 
     Ok(())
@@ -6287,6 +6434,43 @@ function run(Notifier $notifier): void
     $notifier->notifyEvent('ready');
 }
 "#;
+    let duplicate_plain_use_source = r#"
+<?php
+
+namespace Acme\Workflow;
+
+use Acme\Mail\Notifier;
+use Acme\Other\Notifier;
+
+function run(Notifier $notifier): void
+{
+    $notifier->notifyEvent('ready');
+}
+"#;
+    let const_plain_use_source = r#"
+<?php
+
+namespace Acme\Workflow;
+
+use const Acme\Mail\Notifier;
+
+function run(Notifier $notifier): void
+{
+    $notifier->notifyEvent('ready');
+}
+"#;
+    let grouped_plain_use_source = r#"
+<?php
+
+namespace Acme\Workflow;
+
+use Acme\Mail\{Notifier};
+
+function run(Notifier $notifier): void
+{
+    $notifier->notifyEvent('ready');
+}
+"#;
     let uppercase_alias_source = r#"
 <?php
 
@@ -6471,8 +6655,8 @@ function run(Mailer $notifier): void
         ("src/Acme/Other/Notifier.php", other_notifier_source),
         ("src/Acme/Workflow/workflow.php", plain_use_source),
     ])?;
-    assert_no_resolved_call_to_method_owner_in_file(
-        "php plain use stays unresolved",
+    assert_resolved_call_to_method_owner_in_file(
+        "php plain use resolves exact imported owner",
         &plain_nodes,
         &plain_edges,
         "run",
@@ -6481,13 +6665,65 @@ function run(Mailer $notifier): void
         "src/Acme/Mail/Notifier.php",
     );
     assert_no_resolved_call_to_method_owner_in_file(
-        "php plain use stays unresolved",
+        "php plain use avoids other namespace",
         &plain_nodes,
         &plain_edges,
         "run",
         "Notifier",
         "notifyEvent",
         "src/Acme/Other/Notifier.php",
+    );
+
+    let (duplicate_plain_nodes, duplicate_plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.php", mail_notifier_source),
+        ("src/Acme/Other/Notifier.php", other_notifier_source),
+        ("src/Acme/Workflow/workflow.php", duplicate_plain_use_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "php duplicate plain use stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "src/Acme/Mail/Notifier.php",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "php duplicate plain use stays unresolved",
+        &duplicate_plain_nodes,
+        &duplicate_plain_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "src/Acme/Other/Notifier.php",
+    );
+
+    let (const_plain_nodes, const_plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.php", mail_notifier_source),
+        ("src/Acme/Workflow/workflow.php", const_plain_use_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "php const plain use is not treated as a type import",
+        &const_plain_nodes,
+        &const_plain_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "src/Acme/Mail/Notifier.php",
+    );
+
+    let (grouped_plain_nodes, grouped_plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.php", mail_notifier_source),
+        ("src/Acme/Workflow/workflow.php", grouped_plain_use_source),
+    ])?;
+    assert_no_resolved_call_to_method_owner_in_file(
+        "php grouped plain use stays unresolved",
+        &grouped_plain_nodes,
+        &grouped_plain_edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "src/Acme/Mail/Notifier.php",
     );
 
     let (uppercase_nodes, uppercase_edges) = index_files(&[
