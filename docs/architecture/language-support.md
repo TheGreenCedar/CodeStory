@@ -28,6 +28,28 @@ profiles to parser and rule construction in `get_language_for_ext`.
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
 
+## Latest Agent-Facing Evidence
+
+The latest full language-expansion paired A/B run was completed on 2026-06-16:
+`target/agent-benchmark/language-expansion-holdout-20260616-0.8.0-retry/reanalyzed-summary.md`.
+
+That run is useful operational evidence, not a broad answer-quality promotion:
+
+| Measure | With CodeStory | Without CodeStory | Read |
+| --- | ---: | ---: | --- |
+| Runs attempted | `54` | `54` | Three repeats across 18 language tasks. |
+| Run success | `54/54` | `51/54` | All baseline failures were the Ruby/Jekyll row. |
+| Quality pass | `16/54` | `19/51` successful rows | Answer quality remains uneven. |
+| All-in wall time | `6,411,835 ms` | `7,523,716 ms` | CodeStory ratio `0.852`. |
+| Total tokens | `7,859,161` | `9,087,330` | CodeStory ratio `0.865`. |
+| Commands | `54` | `471` | CodeStory kept exploration bounded. |
+| Source reads | `0` | `417` | The CodeStory arm stayed packet-first. |
+
+Safe wording: CodeStory completed the full 18-language A/B arm with lower
+overall wall time, token use, command count, and direct source reads. Do not say
+the run proves first-class agent-facing quality across every language; the
+quality score is mixed and several rows still need better handoff semantics.
+
 ## Resolution Claims
 
 Receiver and import resolution are fixture-backed. If a behavior is not covered

@@ -3,9 +3,10 @@
 This page is the current benchmark scorecard. It should answer a reader's first
 question quickly: did CodeStory help, hurt, or still need proof?
 
-Short answer: the June 13-14, 2026 evidence is promising, especially for
-TypeScript/React routing-style work, but it is not broad enough yet for a
-general public savings claim.
+Short answer: the June 16, 2026 full language A/B run is operationally
+positive, but it is still not a general public answer-quality claim. CodeStory
+completed every with-CodeStory row and reduced wall time, tokens, commands, and
+direct source reads. The quality score stayed mixed.
 
 ## Plain English
 
@@ -22,31 +23,61 @@ general public savings claim.
 
 | Question | Answer |
 | --- | --- |
-| Is there benchmark data from this week? | Yes: one TypeScript/React comparison run and one 18-language answer-bundle run. |
-| Does the fresh data show CodeStory can be useful? | Yes. The TypeScript/React row shows a large win, and the 18-language run shows broad file-finding coverage. |
-| Can we claim general agent savings yet? | No. The strongest comparison row is one repeat, non-publishable, and reused one baseline run. |
+| Is there benchmark data from this week? | Yes: a full 18-language paired A/B run with three repeats per language task, plus the earlier packet-runtime diagnostic. |
+| Does the fresh data show CodeStory can be useful? | Yes. In the full paired run, CodeStory succeeded on `54/54` rows, used `0.852x` all-in wall time, `0.865x` tokens, `54` commands instead of `471`, and `0` source reads instead of `417`. |
+| Can we claim general answer-quality superiority yet? | No. CodeStory quality passed `16/54` rows; the baseline passed `19/51` successful rows and failed all three Ruby/Jekyll repeats. |
 
 ## Current Evidence At A Glance
 
 ```mermaid
 flowchart LR
-    run["June 14 language run<br/>18 repo tasks"]
-    pass["12 quality pass"]
-    miss["6 quality miss"]
-    files["17/18 found all expected files"]
-    claims["11/18 found all expected explanation points"]
-    run --> pass
-    run --> miss
-    run --> files
-    run --> claims
+    run["June 16 full paired A/B<br/>18 tasks x 3 repeats"]
+    cs["with CodeStory<br/>54/54 success"]
+    base["without CodeStory<br/>51/54 success"]
+    ops["lower wall, tokens,<br/>commands, source reads"]
+    quality["quality still mixed<br/>16/54 vs 19/51"]
+    run --> cs
+    run --> base
+    cs --> ops
+    cs --> quality
 ```
 
 | Lane | Fresh result | What it means | Claim status |
 | --- | --- | --- | --- |
-| TypeScript React library comparison | With CodeStory: `32,168` tokens, `42.67s` elapsed including setup check, `1` command, `0` source files opened, quality `1/1`. Without CodeStory: `535,632` tokens, `201.38s`, `35` commands, `30` source files opened, quality `0/1`. | CodeStory was clearly useful on this task. | Strong single-task evidence, not a general savings claim. |
-| 18-language answer-bundle run | `18/18` answer bundles completed; `12/18` passed full quality; `17/18` found all expected files; median elapsed time was `11.14s`. | CodeStory usually found the right files, but explanation quality is still uneven. | Broad runtime and coverage evidence, not a comparison-run savings claim. |
+| Full 18-language paired A/B | With CodeStory: `54/54` success, `16/54` quality, `6,411,835 ms` all-in wall, `7,859,161` tokens, `54` commands, `0` source reads. Without CodeStory: `51/54` success, `19/51` quality over successful rows, `7,523,716 ms`, `9,087,330` tokens, `471` commands, `417` source reads. | CodeStory materially reduced operating cost and kept runs packet-first, but did not win broad quality. | Current full-suite evidence; operationally positive, quality-mixed. |
+| 18-language packet-runtime diagnostic | `18/18` answer bundles completed; `12/18` passed full quality; `17/18` found all expected files; median elapsed time was `11.14s`. | CodeStory usually found the right files, but explanation quality was uneven even before the paired run. | Runtime and coverage evidence, not a comparison-run savings claim. |
+| TypeScript React library comparison | With CodeStory: `32,168` tokens, `42.67s` elapsed including setup check, `1` command, `0` source files opened, quality `1/1`. Without CodeStory: `535,632` tokens, `201.38s`, `35` commands, `30` source files opened, quality `0/1`. | CodeStory was clearly useful on this task. | Strong historical single-task evidence, not a general savings claim. |
 
-## Performance By Language
+## Current Full A/B By Language
+
+Source: `target/agent-benchmark/language-expansion-holdout-20260616-0.8.0-retry/reanalyzed-summary.md`
+
+| Language | Example project | With CodeStory quality | Baseline quality | Read |
+| --- | --- | ---: | ---: | --- |
+| Python | requests | `1/3` | `3/3` | Anchor recall was high, explanation quality lagged. |
+| Java | Commons Lang | `0/3` | `0/3` | Both arms missed quality. |
+| Rust | ripgrep | `1/3` | `0/3` | Slight CodeStory quality lift, still incomplete. |
+| JavaScript | Express | `3/3` | `2/3` | Strong current row. |
+| TypeScript | SWR | `0/3` | `2/3` | Current paired run regressed versus older focused SWR evidence. |
+| C++ | fmt | `1/3` | `2/3` | Operationally cheaper, weaker quality. |
+| C | Redis | `0/3` | `1/3` | File anchors surfaced, handoff explanation missed. |
+| Go | Gin | `0/3` | `3/3` | Route explanation remains weak. |
+| Ruby | Jekyll | `0/3` | failed | Baseline failed all repeats. |
+| PHP | Monolog | `0/3` | `1/3` | Weak current row. |
+| C# | AutoMapper | `0/3` | `0/3` | Both arms missed quality. |
+| Kotlin | Okio | `0/3` | `1/3` | Weak current row. |
+| Swift | Alamofire | `1/3` | `1/3` | Strong recall, mixed explanation. |
+| Dart | http | `1/3` | `1/3` | Mixed quality. |
+| Bash | nvm | `3/3` | `2/3` | Strong current row. |
+| HTML | MDN forms | `0/3` | `0/3` | Structural row still weak. |
+| CSS | animate.css | `2/3` | `0/3` | Clear CodeStory lift, still mixed. |
+| SQL | Chinook | `3/3` | `0/3` | Strong current row. |
+
+## Packet Runtime Performance By Language
+
+This older packet-runtime diagnostic remains useful for packet composition and
+claim-quality work, but the June 16 full paired A/B is the current comparison
+source.
 
 Source: `target/agent-benchmark/language-expansion-packet-runtime-current-after-claim-fixes/packet-runtime-summary.json`
 
@@ -124,33 +155,36 @@ Why this matters:
 
 ## What Is Solid
 
-- CodeStory produced a much better agent run on one current holdout-language
-  task: the TypeScript React data-fetching row.
-- The current answer-bundle path runs through real sidecars, not stubbed or
-  disabled retrieval.
-- The 18-language run completed for every task.
-- File-level recall is strong in the fresh language run: `17/18` tasks found all
-  expected files.
+- The full 18-language with-CodeStory arm completed `54/54` attempted rows.
+- The current paired run lowered all-in wall time, total tokens, commands, and
+  direct source reads overall.
+- The current with-CodeStory arm stayed packet-first: `54` commands and `0`
+  direct source reads across the full suite.
+- JavaScript/Express, Bash/nvm, and SQL/Chinook are strong current quality rows;
+  CSS/animate.css is a positive but still mixed row.
 
 ## What Is Not Claimed
 
-- No general "CodeStory saves tokens" claim yet.
-- No universal language-support claim yet.
-- No publishable paired benchmark claim from the June 13 TypeScript React row.
+- No general public savings claim beyond the measured June 16 full-suite run.
+- No universal language-support or answer-quality claim yet.
+- No publishable public benchmark claim yet: the June 16 full suite is
+  quality-mixed, and the June 13 TypeScript row is a non-publishable single
+  task.
 - No claim that a complete-looking answer bundle always means answer quality
-  passes; the June 14 run has `4` sufficiency/quality gaps.
+  passes; the June 16 full A/B run has `16/54` CodeStory quality passes.
 
 ## Next Runs Needed
 
 Run these before promoting the current story beyond "promising current
 evidence":
 
-1. Repeat the TypeScript React comparison row with `--publishable`, no reused
-   baseline, and at least `3` repeats.
-2. Rerun the 18-language answer-bundle check after fixing the six
-   claim-quality misses.
-3. Add at least two more comparison rows from the language-expansion holdout
-   set.
+1. Improve answer semantics on the current `0/3` CodeStory quality rows:
+   Java, TypeScript/SWR, C/Redis, Go/Gin, Ruby/Jekyll, PHP, C#, Kotlin, and
+   HTML.
+2. Isolate the Ruby/Jekyll baseline failure so future paired runs keep both
+   arms comparable.
+3. Rerun the full 18-language paired A/B suite with `--publishable` once the
+   quality rows improve enough for a public claim.
 
 ## How To Rerun
 
@@ -165,6 +199,19 @@ Language answer-bundle run:
 
 ```sh
 node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite language-expansion-holdout --repeats 1 --packet-runtime-mode cold-cli --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/language-expansion-packet-runtime-current --timeout-ms 120000
+```
+
+Full paired language A/B run:
+
+```sh
+node ./scripts/codestory-agent-ab-benchmark.mjs \
+  --task-suite language-expansion-holdout \
+  --arms without_codestory,with_codestory \
+  --repeats 3 \
+  --materialize-repos \
+  --prepare-codestory-cache \
+  --out-dir target/agent-benchmark/language-expansion-holdout \
+  --timeout-ms 600000
 ```
 
 Publishable TypeScript React comparison target:
