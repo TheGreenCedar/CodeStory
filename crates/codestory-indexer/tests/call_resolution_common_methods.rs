@@ -8501,9 +8501,19 @@ export function Widget(): JSX.Element {
 #[test]
 fn test_typescript_tsx_imported_class_property_receiver_call_resolves_to_imported_owner_method()
 -> anyhow::Result<()> {
+    let notifier_source = r#"
+export interface Notifier {
+    notifyEvent(value: string): void;
+}
+"#;
     let repository_source = r#"
 export interface Repository {
     save(value: string): string;
+}
+"#;
+    let other_notifier_source = r#"
+export interface Notifier {
+    notifyEvent(value: string): void;
 }
 "#;
     let other_repository_source = r#"
@@ -8512,12 +8522,15 @@ export interface Repository {
 }
 "#;
     let widget_source = r#"
+import type { Notifier as WidgetNotifier } from "./notifier";
 import type { Repository } from "./repository";
 
 class WidgetWorkflow {
+    #privateNotifier: WidgetNotifier;
     private repository: Repository;
 
     run(value: string): string {
+        this.#privateNotifier.notifyEvent(value);
         return this.repository.save(value);
     }
 }
@@ -8543,10 +8556,30 @@ export function Widget(): JSX.Element {
 "#;
 
     let (nodes, edges) = index_files(&[
+        ("notifier.ts", notifier_source),
         ("repository.ts", repository_source),
+        ("other/notifier.ts", other_notifier_source),
         ("other/repository.ts", other_repository_source),
         ("widget.tsx", widget_source),
     ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "tsx imported private class property receiver",
+        &nodes,
+        &edges,
+        "WidgetWorkflow.run",
+        "Notifier",
+        "notifyEvent",
+        "notifier.ts",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "tsx imported private class property receiver avoids same-name owner",
+        &nodes,
+        &edges,
+        "WidgetWorkflow.run",
+        "Notifier",
+        "notifyEvent",
+        "other/notifier.ts",
+    );
     assert_resolved_call_to_method_owner_in_file(
         "tsx imported class property receiver",
         &nodes,

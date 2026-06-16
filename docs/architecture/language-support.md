@@ -76,6 +76,8 @@ imports, inline `type` imports, namespace imports, imported private-field
 receivers, missing imported files, duplicate imported local names, local
 type/interface shadows, `any`/unknown property owners, missing namespace
 aliases, namespace alias collisions, and unimported cross-file property owners.
+TSX property receiver fixtures also cover imported ordinary and private-field
+receivers through relative type imports with same-name wrong-file guards.
 TypeScript and
 TSX receiver fixtures also cover visible-before-call constructor bindings such
 as `const workflow = new Workflow<T>(); workflow.run()`, and TypeScript/TSX
