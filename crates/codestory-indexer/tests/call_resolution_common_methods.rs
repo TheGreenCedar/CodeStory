@@ -8428,6 +8428,22 @@ export class WidgetWorkflow {
     }
 }
 "#;
+    let aliased_widget_source = r#"
+import { WidgetWorkflow as RemoteWidgetWorkflow } from "./workflow";
+
+export function Widget(): JSX.Element {
+    const workflow = new RemoteWidgetWorkflow();
+    return <div>{workflow.run("ready")}</div>;
+}
+"#;
+    let namespace_widget_source = r#"
+import * as remote from "./workflow";
+
+export function Widget(): JSX.Element {
+    const workflow = new remote.WidgetWorkflow();
+    return <div>{workflow.run("ready")}</div>;
+}
+"#;
 
     let (nodes, edges) = index_files(&[
         ("widget.tsx", widget_source),
@@ -8437,6 +8453,34 @@ export class WidgetWorkflow {
         "tsx imported constructor receiver",
         &nodes,
         &edges,
+        "Widget",
+        "WidgetWorkflow",
+        "run",
+        "workflow.ts",
+    );
+
+    let (aliased_nodes, aliased_edges) = index_files(&[
+        ("widget.tsx", aliased_widget_source),
+        ("workflow.ts", workflow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "tsx aliased imported constructor receiver",
+        &aliased_nodes,
+        &aliased_edges,
+        "Widget",
+        "WidgetWorkflow",
+        "run",
+        "workflow.ts",
+    );
+
+    let (namespace_nodes, namespace_edges) = index_files(&[
+        ("widget.tsx", namespace_widget_source),
+        ("workflow.ts", workflow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "tsx namespace imported constructor receiver",
+        &namespace_nodes,
+        &namespace_edges,
         "Widget",
         "WidgetWorkflow",
         "run",
