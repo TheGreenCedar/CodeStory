@@ -3,18 +3,17 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAnswerDto,
-    AgentAskRequest, AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto,
-    AgentResponseModeDto, AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto,
-    AnswerReadinessReportDto, AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
+    AgentAskRequest, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto,
     EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto,
     IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, PacketBudgetModeDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
     RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto,
-    RetrievalShadowDto, SearchHit, SearchHybridLimitsDto, SearchMatchQualityDto,
-    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
-    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
-    TrailMode,
+    RetrievalShadowDto, SearchHit, SearchMatchQualityDto, SearchQueryAssessmentDto,
+    SearchRepoTextMode, SearchRequest, SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope,
+    TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -158,22 +157,6 @@ fn with_drill_command_duration(
 ) -> DrillCommandStatusOutput {
     status.duration_ms = elapsed_ms(start);
     status
-}
-
-fn hybrid_weights(
-    lexical: Option<f32>,
-    semantic: Option<f32>,
-    graph: Option<f32>,
-) -> Option<AgentHybridWeightsDto> {
-    (lexical.is_some() || semantic.is_some() || graph.is_some()).then_some(AgentHybridWeightsDto {
-        lexical,
-        semantic,
-        graph,
-    })
-}
-
-fn hybrid_limits(lexical: Option<u32>, semantic: Option<u32>) -> Option<SearchHybridLimitsDto> {
-    (lexical.is_some() || semantic.is_some()).then_some(SearchHybridLimitsDto { lexical, semantic })
 }
 
 fn main() -> Result<()> {
@@ -518,7 +501,6 @@ struct ResolvedContextTarget {
 fn run_context(cmd: ContextCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    ensure_no_context_hybrid_overrides(&cmd)?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "context")?;
@@ -1116,7 +1098,6 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    ensure_no_search_hybrid_overrides(&cmd)?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
@@ -1129,41 +1110,14 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn ensure_no_search_hybrid_overrides(cmd: &SearchCommand) -> Result<()> {
-    let mut flags = Vec::new();
-    if cmd.hybrid_lexical.is_some() {
-        flags.push("--hybrid-lexical");
-    }
-    if cmd.hybrid_semantic.is_some() {
-        flags.push("--hybrid-semantic");
-    }
-    if cmd.hybrid_graph.is_some() {
-        flags.push("--hybrid-graph");
-    }
-    if cmd.hybrid_lexical_limit.is_some() {
-        flags.push("--hybrid-lexical-limit");
-    }
-    if cmd.hybrid_semantic_limit.is_some() {
-        flags.push("--hybrid-semantic-limit");
-    }
-    if flags.is_empty() {
-        return Ok(());
-    }
-
-    bail!(
-        "search --hybrid-* flags are unsupported under mandatory sidecar search; ignored tuning flags would be misleading ({})",
-        flags.join(", ")
-    )
-}
-
 fn search_request_from_command(cmd: &SearchCommand) -> SearchRequest {
     SearchRequest {
         query: cmd.query.clone(),
         repo_text: to_api_repo_text_mode(cmd.repo_text),
         limit_per_source: cmd.limit.clamp(1, 50),
         expand_search_plan: cmd.why && cmd.plan_details,
-        hybrid_weights: hybrid_weights(cmd.hybrid_lexical, cmd.hybrid_semantic, cmd.hybrid_graph),
-        hybrid_limits: hybrid_limits(cmd.hybrid_lexical_limit, cmd.hybrid_semantic_limit),
+        hybrid_weights: None,
+        hybrid_limits: None,
     }
 }
 
@@ -1172,26 +1126,6 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
     let output = execute_drill(&cmd)?;
     let contents = write_drill_outputs(cmd.format, &cmd.output_dir, &output)?;
     print!("{}", contents.selected);
-    Ok(())
-}
-
-fn ensure_no_context_hybrid_overrides(cmd: &ContextCommand) -> Result<()> {
-    let mut flags = Vec::new();
-    if cmd.hybrid_lexical.is_some() {
-        flags.push("--hybrid-lexical");
-    }
-    if cmd.hybrid_semantic.is_some() {
-        flags.push("--hybrid-semantic");
-    }
-    if cmd.hybrid_graph.is_some() {
-        flags.push("--hybrid-graph");
-    }
-    if !flags.is_empty() {
-        bail!(
-            "context --hybrid-* flags are unsupported under mandatory sidecar retrieval; ignored tuning flags would be misleading ({})",
-            flags.join(", ")
-        );
-    }
     Ok(())
 }
 

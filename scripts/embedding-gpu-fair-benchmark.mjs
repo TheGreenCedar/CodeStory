@@ -650,7 +650,7 @@ const queries = [
   {
     id: "holdout-search-doc-delete",
     query: "remove persisted semantic search documents for one changed source file",
-    expect: ["SearchDocStore::delete_for_file", "delete_for_file"],
+    expect: ["Storage::delete_llm_symbol_docs_for_file", "delete_llm_symbol_docs_for_file"],
     bucket: "holdout-adversarial",
   },
   {
@@ -2533,6 +2533,26 @@ function allCases() {
   });
 }
 
+function usesRemovedSearchCliTuning(config) {
+  return Boolean(config.hybridWeights || config.hybridLimits);
+}
+
+function isSelectedCase(config) {
+  return (
+    selectedCaseIds.has(config.case_id) ||
+    selectedCaseIds.has(config.id) ||
+    (config.variant && selectedCaseIds.has(config.variant))
+  );
+}
+
+function isSelectedSpecificCase(config) {
+  return selectedCaseIds.has(config.case_id) || (config.variant && selectedCaseIds.has(config.variant));
+}
+
+function selectedCaseIdsFor(configs) {
+  return [...new Set(configs.map((config) => config.case_id))].sort();
+}
+
 function selectedCases() {
   const cases = allCases();
   const stageScopedCases = requestedStages.has("all")
@@ -2541,11 +2561,10 @@ function selectedCases() {
   // ONNX case definitions are kept only so old case IDs in historical reports remain readable.
   // Active runs are restricted to the supported llama.cpp backend.
   if (selectedCaseIds.size > 0) {
-    const unsupportedSelections = stageScopedCases
-      .filter((config) => config.kind !== "llama")
-      .filter((config) => selectedCaseIds.has(config.case_id) || selectedCaseIds.has(config.id))
-      .map((config) => config.case_id)
-      .sort();
+    const unsupportedSelections = selectedCaseIdsFor([
+      ...stageScopedCases.filter((config) => config.kind !== "llama").filter(isSelectedCase),
+      ...cases.filter((config) => config.kind !== "llama").filter(isSelectedSpecificCase),
+    ]);
     if (unsupportedSelections.length > 0) {
       throw new Error(
         `Removed benchmark backend selected: ${unsupportedSelections.join(
@@ -2553,13 +2572,24 @@ function selectedCases() {
         )}. Active benchmark runs support llama.cpp cases only.`,
       );
     }
+    const removedHybridSelections = selectedCaseIdsFor([
+      ...stageScopedCases.filter(usesRemovedSearchCliTuning).filter(isSelectedCase),
+      ...cases.filter(usesRemovedSearchCliTuning).filter(isSelectedSpecificCase),
+    ]);
+    if (removedHybridSelections.length > 0) {
+      throw new Error(
+        `Removed public CLI hybrid tuning selected: ${removedHybridSelections.join(
+          ", ",
+        )}. Active benchmark runs use the runtime-default search CLI; use historical reports or an internal runtime harness for hybrid-weight experiments.`,
+      );
+    }
   }
-  const supportedCases = stageScopedCases.filter((config) => config.kind === "llama");
+  const supportedCases = stageScopedCases.filter(
+    (config) => config.kind === "llama" && !usesRemovedSearchCliTuning(config),
+  );
   const selected =
     selectedCaseIds.size > 0
-      ? supportedCases.filter(
-          (config) => selectedCaseIds.has(config.case_id) || selectedCaseIds.has(config.id),
-        )
+      ? supportedCases.filter(isSelectedCase)
       : supportedCases;
   const seen = new Set();
   const unique = [];
@@ -2846,34 +2876,6 @@ function requiredFiles(config) {
   return files;
 }
 
-function hybridWeightArgs(config) {
-  if (!config.hybridWeights) {
-    return [];
-  }
-  return [
-    "--hybrid-lexical",
-    String(config.hybridWeights.lexical),
-    "--hybrid-semantic",
-    String(config.hybridWeights.semantic),
-    "--hybrid-graph",
-    String(config.hybridWeights.graph),
-  ];
-}
-
-function hybridLimitArgs(config) {
-  if (!config.hybridLimits) {
-    return [];
-  }
-  const args = [];
-  if (config.hybridLimits.lexical !== undefined) {
-    args.push("--hybrid-lexical-limit", String(config.hybridLimits.lexical));
-  }
-  if (config.hybridLimits.semantic !== undefined) {
-    args.push("--hybrid-semantic-limit", String(config.hybridLimits.semantic));
-  }
-  return args;
-}
-
 function fileSizeMb(filePath) {
   if (!filePath || !fs.existsSync(filePath)) {
     return null;
@@ -3112,8 +3114,6 @@ async function runCase(config) {
           "none",
           "--format",
           "json",
-          ...hybridWeightArgs(config),
-          ...hybridLimitArgs(config),
         ],
         env,
         path.join(logsDir, `${q.id}.log`),
@@ -3396,7 +3396,7 @@ function writeManifest(cases) {
       dimension:
         "Source-backed Matryoshka/dimension rows for Nomic v1.5, Nomic v2 MoE, Qwen3 0.6B, and EmbeddingGemma; BGE-small is a negative control.",
       retrieval:
-        "Hybrid weight, semantic scope, and alias-mode sweeps using the CLI search weight flags.",
+        "Runtime-default CLI search rows for semantic scope and alias-mode sweeps; use historical reports or an internal runtime harness for hybrid-weight experiments.",
       "bge-small-candidate":
         "Three-repeat current-default versus crossed BGE-small scope=all + no_alias + b256 candidate.",
       finalists2:

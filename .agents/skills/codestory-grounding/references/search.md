@@ -25,7 +25,6 @@ fail-closed states.
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
 | `--why` | boolean | `false` | Include compact ranking, uncertainty, and next-action evidence |
 | `--plan-details` | boolean | `false` | With `--why`, include the full Search Plan in Markdown and JSON |
-| `--hybrid-*` | n/a | unsupported | Hybrid tuning overrides are rejected under mandatory sidecar search because ignored weights would be misleading |
 
 ## Query Behavior
 
@@ -50,7 +49,7 @@ fail-closed states.
   as clues to inspect, not as sidecar success.
 - For architecture questions, broad natural-language `search` is discovery only. If `query_assessment` says `weak_top_hit=true` or there is no exact anchor, move to `drill` with concrete anchors from `ground`/`search`; do not answer from broad search hits alone.
 - `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
-- **Hybrid weight overrides** are unsupported. `search --hybrid-*` flags are rejected under mandatory sidecar search; use sidecar configuration and fixture-backed tests for ranking experiments instead.
+- **Hybrid weight overrides** are not public CLI options. `search --hybrid-*` flags are unknown arguments; use sidecar configuration and fixture-backed tests for ranking experiments instead.
 
 ## Output
 

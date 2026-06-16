@@ -296,7 +296,7 @@ fn search_json_fails_closed_without_full_sidecars() {
 }
 
 #[test]
-fn search_json_rejects_stale_hybrid_tuning_flags() {
+fn search_json_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
     let workspace = tempdir().expect("workspace dir");
 
     let search = run_cli(
@@ -313,18 +313,18 @@ fn search_json_rejects_stale_hybrid_tuning_flags() {
     );
     assert!(
         !search.status.success(),
-        "stale hybrid tuning flags should be rejected before product search: {}",
+        "removed hybrid tuning flags should be rejected by CLI parsing: {}",
         String::from_utf8_lossy(&search.stdout)
     );
     let stderr = String::from_utf8_lossy(&search.stderr);
     assert!(
-        stderr.contains("search --hybrid-* flags are unsupported under mandatory sidecar search"),
-        "search should explain unsupported hybrid tuning flags: {stderr}"
+        stderr.contains("unexpected argument '--hybrid-lexical'"),
+        "search should reject removed hybrid tuning flags as unknown args: {stderr}"
     );
 }
 
 #[test]
-fn context_rejects_stale_hybrid_tuning_flags() {
+fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
     let workspace = tempdir().expect("workspace dir");
 
     let context = run_cli(
@@ -341,14 +341,13 @@ fn context_rejects_stale_hybrid_tuning_flags() {
     );
     assert!(
         !context.status.success(),
-        "stale context hybrid tuning flags should be rejected before runtime open: {}",
+        "removed context hybrid tuning flags should be rejected by CLI parsing: {}",
         String::from_utf8_lossy(&context.stdout)
     );
     let stderr = String::from_utf8_lossy(&context.stderr);
     assert!(
-        stderr
-            .contains("context --hybrid-* flags are unsupported under mandatory sidecar retrieval"),
-        "context should explain unsupported hybrid tuning flags: {stderr}"
+        stderr.contains("unexpected argument '--hybrid-semantic'"),
+        "context should reject removed hybrid tuning flags as unknown args: {stderr}"
     );
 }
 

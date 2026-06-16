@@ -15,14 +15,18 @@
 
 - `crates/codestory-store/src/lib.rs`
 - `crates/codestory-store/src/storage_impl/mod.rs`
+- `crates/codestory-store/src/storage_impl/trail.rs`
 - `crates/codestory-store/src/snapshot_store.rs`
 - `crates/codestory-store/src/file_store.rs`
-- `crates/codestory-store/src/graph_store.rs`
-- `crates/codestory-store/src/trail_store.rs`
+
+`GraphStore`, `TrailStore`, and `SearchDocStore` wrapper facades were removed;
+callers should use the direct `Store` methods or the surviving focused stores
+listed above.
 
 ## Extension Points
 
-- add new read/write surfaces as focused sub-stores
+- add new read/write surfaces as focused sub-stores only when they own behavior
+  beyond forwarding to `Store`
 - keep snapshot lifecycle changes inside `snapshot_store.rs`
 - keep SQL-heavy persistence logic inside `storage_impl/`
 

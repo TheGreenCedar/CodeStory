@@ -92,9 +92,9 @@ rather than the general CLI architecture page.
 ## Search And Context Research Boundary
 
 `codestory-cli search` and `codestory-cli context` keep production behavior on
-runtime defaults unless a caller explicitly passes hybrid research weights. The
-runtime owns clamping, normalization, scoring, and Search Plan construction; the
-CLI only forwards parsed values and renders the response.
+runtime defaults; public hybrid tuning flags have been removed. Internal
+packet and retrieval planning may still use hybrid weights, but the CLI does
+not expose ranking knobs for product search/context calls.
 
 ## Serving And Integration Surface
 
