@@ -376,27 +376,6 @@ pub(crate) struct ContextCommand {
         help = "Omit citation edge ids and score breakdowns from the structured context packet."
     )]
     pub(crate) no_evidence: bool,
-    #[arg(
-        long = "hybrid-lexical",
-        value_name = "WEIGHT",
-        hide = true,
-        help = "Override the lexical component weight for hybrid context research runs."
-    )]
-    pub(crate) hybrid_lexical: Option<f32>,
-    #[arg(
-        long = "hybrid-semantic",
-        value_name = "WEIGHT",
-        hide = true,
-        help = "Override the semantic component weight for hybrid context research runs."
-    )]
-    pub(crate) hybrid_semantic: Option<f32>,
-    #[arg(
-        long = "hybrid-graph",
-        value_name = "WEIGHT",
-        hide = true,
-        help = "Override the graph component weight for hybrid context research runs."
-    )]
-    pub(crate) hybrid_graph: Option<f32>,
 }
 
 #[derive(Args, Debug)]
@@ -681,41 +660,6 @@ pub(crate) struct SearchCommand {
         help = "Include the full search plan in --why output. By default --why keeps provenance compact."
     )]
     pub(crate) plan_details: bool,
-    #[arg(
-        long = "hybrid-lexical",
-        value_name = "WEIGHT",
-        hide = true,
-        help = "Unsupported for product search under mandatory sidecar retrieval."
-    )]
-    pub(crate) hybrid_lexical: Option<f32>,
-    #[arg(
-        long = "hybrid-semantic",
-        value_name = "WEIGHT",
-        hide = true,
-        help = "Unsupported for product search under mandatory sidecar retrieval."
-    )]
-    pub(crate) hybrid_semantic: Option<f32>,
-    #[arg(
-        long = "hybrid-graph",
-        value_name = "WEIGHT",
-        hide = true,
-        help = "Unsupported for product search under mandatory sidecar retrieval."
-    )]
-    pub(crate) hybrid_graph: Option<f32>,
-    #[arg(
-        long = "hybrid-lexical-limit",
-        value_name = "N",
-        hide = true,
-        help = "Unsupported for product search under mandatory sidecar retrieval."
-    )]
-    pub(crate) hybrid_lexical_limit: Option<u32>,
-    #[arg(
-        long = "hybrid-semantic-limit",
-        value_name = "N",
-        hide = true,
-        help = "Unsupported for product search under mandatory sidecar retrieval."
-    )]
-    pub(crate) hybrid_semantic_limit: Option<u32>,
 }
 
 #[derive(Args, Debug)]
