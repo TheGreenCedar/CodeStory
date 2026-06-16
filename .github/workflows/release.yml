@@ -106,10 +106,8 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
             asset_target: windows-arm64
             exe_suffix: ".exe"
-          - os: macos-15-intel
-            rust_target: x86_64-apple-darwin
-            asset_target: macos-x64
-            exe_suffix: ""
+          # ponytail: ort-sys has no x86_64-apple-darwin prebuilt; add macos-x64
+          # when the release path links a custom ONNX Runtime build.
           - os: macos-15
             rust_target: aarch64-apple-darwin
             asset_target: macos-arm64
@@ -230,8 +228,8 @@ jobs:
             target/release-assets/codestory-cli-v${VERSION}-*.zip
             target/release-assets/SHA256SUMS.txt
           )
-          if [ "${#assets[@]}" -ne 7 ]; then
-            echo "::error::Expected six binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
+          if [ "${#assets[@]}" -ne 6 ]; then
+            echo "::error::Expected five binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
