@@ -94,30 +94,48 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             asset_target: linux-x64
             exe_suffix: ""
+          - os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            asset_target: linux-arm64
+            exe_suffix: ""
           - os: windows-latest
             rust_target: x86_64-pc-windows-msvc
             asset_target: windows-x64
             exe_suffix: ".exe"
-          - os: macos-latest
+          - os: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            asset_target: windows-arm64
+            exe_suffix: ".exe"
+          - os: macos-15-intel
             rust_target: x86_64-apple-darwin
             asset_target: macos-x64
+            exe_suffix: ""
+          - os: macos-15
+            rust_target: aarch64-apple-darwin
+            asset_target: macos-arm64
             exe_suffix: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust stable
-        shell: pwsh
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add "${{ matrix.rust_target }}"
 
       - name: Build codestory-cli
-        shell: pwsh
         run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
 
       - name: Smoke codestory-cli
+        if: runner.os != 'Windows'
+        run: |
+          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
+          "$bin" --version
+          "$bin" --help
+
+      - name: Smoke codestory-cli on Windows
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
@@ -125,6 +143,17 @@ jobs:
           & $bin --help
 
       - name: Package release asset
+        if: runner.os != 'Windows'
+        run: |
+          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
+          python .github/scripts/package-codestory-release.py \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --target "${{ matrix.asset_target }}" \
+            --binary "$bin" \
+            --out-dir target/release-dist
+
+      - name: Package release asset on Windows
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
@@ -201,8 +230,8 @@ jobs:
             target/release-assets/codestory-cli-v${VERSION}-*.zip
             target/release-assets/SHA256SUMS.txt
           )
-          if [ "${#assets[@]}" -ne 4 ]; then
-            echo "::error::Expected three binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
+          if [ "${#assets[@]}" -ne 7 ]; then
+            echo "::error::Expected six binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
