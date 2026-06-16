@@ -1,0 +1,121 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - crates/**/Cargo.toml
+      - Cargo.lock
+      - CHANGELOG.md
+      - AGENTS.md
+      - docs/contributors/testing-matrix.md
+      - .github/workflows/auto-release.yml
+      - .github/workflows/release.yml
+      - .github/scripts/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  workflow-policy:
+    name: Workflow policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce third-party action pinning
+        run: node .github/scripts/check-workflow-policy.mjs
+
+  detect-version:
+    name: Detect codestory-cli version change
+    needs: workflow-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare codestory-cli versions
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          semver = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          package_path = "crates/codestory-cli/Cargo.toml"
+
+          def read_version_bytes(data: bytes) -> str:
+              package = tomllib.loads(data.decode("utf-8")).get("package", {})
+              return str(package.get("version", ""))
+
+          new_version = read_version_bytes(Path(package_path).read_bytes())
+          before = os.environ.get("BEFORE_SHA", "")
+          old_version = ""
+          if before and not re.fullmatch(r"0+", before):
+              result = subprocess.run(
+                  ["git", "show", f"{before}:{package_path}"],
+                  check=False,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+              )
+              if result.returncode == 0:
+                  old_version = read_version_bytes(result.stdout)
+
+          print(f"Previous codestory-cli version: {old_version or '<missing>'}")
+          print(f"Current codestory-cli version: {new_version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={new_version}\n")
+              if old_version == new_version:
+                  print("codestory-cli version did not change; skipping release.")
+                  output.write("should_release=false\n")
+                  sys.exit(0)
+
+              if not semver.fullmatch(new_version):
+                  print(
+                      f"::error::codestory-cli version must be strict semver, got {new_version!r}.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              output.write("should_release=true\n")
+          PY
+
+      - name: Validate synchronized release version
+        if: steps.version.outputs.should_release == 'true'
+        run: python .github/scripts/check-codestory-release.py --version "${{ steps.version.outputs.version }}"
+
+  release:
+    name: Release
+    needs: detect-version
+    if: needs.detect-version.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.detect-version.outputs.version }}
