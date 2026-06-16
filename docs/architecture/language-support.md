@@ -245,11 +245,12 @@ as `(new Workflow())->run(...)`, and local constructor assignments such as
 receivers such as `$this->notifier->notify(...)` also resolve when the property
 type comes from an explicit property declaration or constructor property
 promotion, and use-alias property receiver fixtures resolve through the same
-namespace-qualified exact-owner rule as use-alias parameter annotations.
-Use-alias constructor receivers such as `$workflow = new RemoteWorkflow()` and
-`(new RemoteWorkflow())->run(...)` resolve through the same alias rule. Missing
+namespace-qualified exact-owner rule as use parameter annotations with or
+without aliases. Constructor receivers from plain or aliased use imports such
+as `$workflow = new RemoteWorkflow()` and `(new RemoteWorkflow())->run(...)`
+resolve through the same exact-owner rule. Missing
 alias targets, duplicate plain or aliased local names, local type shadows,
-grouped use-alias imports, factory-returned receivers, untyped property
+grouped use imports, factory-returned receivers, untyped property
 receivers, and cross-file local owner lookup stay fail-closed unless a same-file
 owner can be resolved.
 
@@ -274,7 +275,7 @@ field/local/constructor receiver ownership, Go qualified imported receiver
 parameters plus qualified imported composite locals, Ruby same-file constructor
 receiver ownership plus exact single-file `require_relative` constructor owners, PHP plain and
 aliased use imported receiver parameters and property receivers plus same-file
-self/property/constructor receiver ownership plus use-alias constructor
+self/property/constructor receiver ownership plus plain and aliased use constructor
 receivers, and Dart prefixed relative imported receiver parameters plus
 prefixed imported constructor locals. Header
 files keep the shared registry default of

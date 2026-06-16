@@ -10983,6 +10983,28 @@ class Workflow
     }
 }
 "#;
+    let plain_use_source = r#"
+<?php
+
+namespace Acme\Workflow;
+
+use Acme\Mail\Notifier;
+
+class Workflow
+{
+    private Notifier $notifier;
+
+    public function __construct(private Notifier $promoted)
+    {
+    }
+
+    public function run(string $value): void
+    {
+        $this->notifier->notifyEvent($value);
+        $this->promoted->notifyEvent($value);
+    }
+}
+"#;
     let missing_import_source = r#"
 <?php
 
@@ -11058,6 +11080,24 @@ function direct_alias(): void
     (new RemoteWorkflow())->run('ready');
 }
 "#;
+    let plain_constructor_source = r#"
+<?php
+
+namespace Acme\Workflow;
+
+use Acme\Remote\Workflow;
+
+function construct_plain(): void
+{
+    $workflow = new Workflow();
+    $workflow->run('ready');
+}
+
+function direct_plain(): void
+{
+    (new Workflow())->run('ready');
+}
+"#;
     let remote_workflow_source = r#"
 <?php
 
@@ -11090,6 +11130,33 @@ class Workflow
         "php use alias imported property receiver avoids other namespace",
         &nodes,
         &edges,
+        "run",
+        "Notifier",
+        "notifyEvent",
+        "src/Acme/Other/Notifier.php",
+    );
+
+    let (plain_nodes, plain_edges) = index_files(&[
+        ("src/Acme/Mail/Notifier.php", mail_notifier_source),
+        ("src/Acme/Other/Notifier.php", other_notifier_source),
+        ("src/Acme/Workflow/workflow.php", plain_use_source),
+    ])?;
+    assert_resolved_call_count_to_method_owner_in_file(
+        "php plain use imported property receiver exact namespace",
+        &plain_nodes,
+        &plain_edges,
+        ResolvedCallCountInFile {
+            caller_name: "run",
+            owner_name: "Notifier",
+            method_name: "notifyEvent",
+            file_suffix: "src/Acme/Mail/Notifier.php",
+            expected_count: 2,
+        },
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "php plain use imported property receiver avoids other namespace",
+        &plain_nodes,
+        &plain_edges,
         "run",
         "Notifier",
         "notifyEvent",
@@ -11175,6 +11242,29 @@ class Workflow
         &alias_constructor_nodes,
         &alias_constructor_edges,
         "direct_alias",
+        "Workflow",
+        "run",
+        "src/Acme/Remote/Workflow.php",
+    );
+
+    let (plain_constructor_nodes, plain_constructor_edges) = index_files(&[
+        ("src/Acme/Remote/Workflow.php", remote_workflow_source),
+        ("src/Acme/Workflow/workflow.php", plain_constructor_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "php plain use local constructor receiver resolves imported owner",
+        &plain_constructor_nodes,
+        &plain_constructor_edges,
+        "construct_plain",
+        "Workflow",
+        "run",
+        "src/Acme/Remote/Workflow.php",
+    );
+    assert_resolved_call_to_method_owner_in_file(
+        "php plain use direct constructor receiver resolves imported owner",
+        &plain_constructor_nodes,
+        &plain_constructor_edges,
+        "direct_plain",
         "Workflow",
         "run",
         "src/Acme/Remote/Workflow.php",
