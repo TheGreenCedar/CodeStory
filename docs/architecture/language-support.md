@@ -72,10 +72,11 @@ explicit `this.<field>` calls through typed class properties such as
 private-field receivers such as
 `#privateRepository: PrivateRepository; this.#privateRepository.persist()`.
 TypeScript property receiver fixtures cover same-file owners, aliased named
-imports, inline `type` imports, namespace imports, missing imported files,
-duplicate imported local names, local type/interface shadows, `any`/unknown
-property owners, missing namespace aliases, namespace alias collisions, and
-unimported cross-file property owners. TypeScript and
+imports, inline `type` imports, namespace imports, imported private-field
+receivers, missing imported files, duplicate imported local names, local
+type/interface shadows, `any`/unknown property owners, missing namespace
+aliases, namespace alias collisions, and unimported cross-file property owners.
+TypeScript and
 TSX receiver fixtures also cover visible-before-call constructor bindings such
 as `const workflow = new Workflow<T>(); workflow.run()`, and TypeScript/TSX
 imported constructor bindings through named, aliased, and namespace imports.
@@ -96,8 +97,9 @@ instance assignments such as
 `this.workflow = new Workflow(); this.workflow.run()`, ECMAScript private
 instance assignments such as
 `this.#workflow = new Workflow(); this.#workflow.run()`, private field
-initializers such as `#workflow = new Workflow()`, plus imported default, named,
-and aliased constructor owners assigned to `this.<field>`. Factory-returned
+initializers such as `#workflow = new Workflow()`, including imported
+constructor owners, plus imported default, named, and aliased constructor owners
+assigned to `this.<field>`. Factory-returned
 receivers, parameter receivers, static-only property setup, mixed property
 owners, qualified constructors/namespace imports, missing or duplicate imported
 constructor aliases, and duplicate ambiguous owners stay fail-closed unless a

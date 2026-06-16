@@ -7126,6 +7126,17 @@ class Entry {
     }
 }
 "#;
+    let private_initializer_source = r#"
+import { Workflow } from "./workflow.js";
+
+class Entry {
+    #workflow = new Workflow();
+
+    run(value) {
+        this.#workflow.run(value);
+    }
+}
+"#;
     let missing_source = r#"
 import { Workflow } from "./missing.js";
 
@@ -7247,6 +7258,20 @@ export class Workflow {
         "javascript aliased imported property receiver resolves imported owner",
         &aliased_nodes,
         &aliased_edges,
+        "Entry.run",
+        "Workflow",
+        "run",
+        "workflow.js",
+    );
+
+    let (private_initializer_nodes, private_initializer_edges) = index_files(&[
+        ("main.js", private_initializer_source),
+        ("workflow.js", workflow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "javascript imported private initializer property receiver resolves imported owner",
+        &private_initializer_nodes,
+        &private_initializer_edges,
         "Entry.run",
         "Workflow",
         "run",
@@ -9855,11 +9880,13 @@ import type * as archive from "./archive";
 
 class Workflow {
     private mailer: Mailer;
+    #privateMailer: Mailer;
     private repository: Repository;
     private archive: archive.Archive;
 
     run(value: string): void {
         this.mailer.notifyEvent(value);
+        this.#privateMailer.notifyEvent(value);
         this.repository.save(value);
         this.archive.save(value);
     }
@@ -9955,6 +9982,18 @@ class Workflow {
         "Notifier",
         "notifyEvent",
         "notifier.ts",
+    );
+    assert_resolved_call_count_to_method_owner_in_file(
+        "typescript imported private class property receiver adds second notifier call",
+        &nodes,
+        &edges,
+        ResolvedCallCountInFile {
+            caller_name: "Workflow.run",
+            owner_name: "Notifier",
+            method_name: "notifyEvent",
+            file_suffix: "notifier.ts",
+            expected_count: 2,
+        },
     );
     assert_resolved_call_to_method_owner_in_file(
         "typescript imported class property receiver",
