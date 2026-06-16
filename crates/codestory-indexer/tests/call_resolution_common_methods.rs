@@ -8598,6 +8598,25 @@ export function Widget(): JSX.Element {
     return <div>ready</div>;
 }
 "#;
+    let local_shadow_source = r#"
+import type { Repository as RemoteRepository } from "./repository";
+
+interface Repository {
+    save(value: string): string;
+}
+
+class WidgetWorkflow {
+    private repository: Repository;
+
+    run(value: string): string {
+        return this.repository.save(value);
+    }
+}
+
+export function Widget(): JSX.Element {
+    return <div>ready</div>;
+}
+"#;
 
     let (nodes, edges) = index_files(&[
         ("notifier.ts", notifier_source),
@@ -8641,6 +8660,29 @@ export function Widget(): JSX.Element {
         "Repository",
         "save",
         "other/repository.ts",
+    );
+
+    let (shadow_nodes, shadow_edges) = index_files(&[
+        ("repository.ts", repository_source),
+        ("widget.tsx", local_shadow_source),
+    ])?;
+    assert_resolved_call_to_method_owner_in_file(
+        "tsx local shadowed class property receiver",
+        &shadow_nodes,
+        &shadow_edges,
+        "WidgetWorkflow.run",
+        "Repository",
+        "save",
+        "widget.tsx",
+    );
+    assert_no_resolved_call_to_method_owner_in_file(
+        "tsx local shadowed class property receiver avoids imported owner",
+        &shadow_nodes,
+        &shadow_edges,
+        "WidgetWorkflow.run",
+        "Repository",
+        "save",
+        "repository.ts",
     );
 
     let (missing_nodes, missing_edges) = index_files(&[
