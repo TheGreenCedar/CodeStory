@@ -89,6 +89,7 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+  attr (@call_any.node -> @call_any.node) col = (start-column @callee_any)
 }
 
 ;; Calls (global fallback attribute)
@@ -107,6 +108,8 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+  attr (@call_any.node -> @call_any.node) col = (start-column @callee_any)
+  attr (@call_any.node -> @call_any.node) call_syntax = "python_attribute"
 }
 
 ;; Decorator usage (class)

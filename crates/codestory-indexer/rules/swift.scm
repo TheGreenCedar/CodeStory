@@ -133,7 +133,8 @@
 
 (call_expression
   (navigation_expression
-    target: (_) @callee_any)) @call_any
+    suffix: (navigation_suffix
+      suffix: (simple_identifier) @callee_any))) @call_any
 {
   node @call_any.node
   attr (@call_any.node) kind = "UNKNOWN"
@@ -146,6 +147,7 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+  attr (@call_any.node -> @call_any.node) call_syntax = "swift_member"
 }
 
 ;; Imports

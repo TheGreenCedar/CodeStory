@@ -72,6 +72,23 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+;; Package membership
+(source_file
+  (package_header (qualified_identifier) @package_name)
+  (class_declaration name: (identifier) @class_name))
+{
+  edge @package_name.node -> @class_name.node
+  attr (@package_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(source_file
+  (package_header (qualified_identifier) @package_name)
+  (object_declaration name: (identifier) @class_name))
+{
+  edge @package_name.node -> @class_name.node
+  attr (@package_name.node -> @class_name.node) kind = "MEMBER"
+}
+
 ;; Membership
 (class_declaration
   name: (identifier) @class_name
@@ -185,6 +202,7 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+  attr (@call_any.node -> @call_any.node) call_syntax = "kotlin_member"
 }
 
 ;; Imports

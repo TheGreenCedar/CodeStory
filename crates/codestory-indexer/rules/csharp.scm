@@ -47,7 +47,7 @@
 }
 
 (namespace_declaration
-  name: (identifier) @name) @def
+  name: [(identifier) (qualified_name)] @name) @def
 {
   node @name.node
   attr (@name.node) kind = "NAMESPACE"
@@ -56,6 +56,70 @@
   attr (@name.node) start_col = (start-column @def)
   attr (@name.node) end_row = (end-row @def)
   attr (@name.node) end_col = (end-column @def)
+}
+
+(file_scoped_namespace_declaration
+  name: [(identifier) (qualified_name)] @name) @def
+{
+  node @name.node
+  attr (@name.node) kind = "NAMESPACE"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+;; Namespace membership
+(compilation_unit
+  (file_scoped_namespace_declaration name: [(identifier) (qualified_name)] @namespace_name)
+  (class_declaration name: (identifier) @class_name))
+{
+  edge @namespace_name.node -> @class_name.node
+  attr (@namespace_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(compilation_unit
+  (file_scoped_namespace_declaration name: [(identifier) (qualified_name)] @namespace_name)
+  (interface_declaration name: (identifier) @class_name))
+{
+  edge @namespace_name.node -> @class_name.node
+  attr (@namespace_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(compilation_unit
+  (file_scoped_namespace_declaration name: [(identifier) (qualified_name)] @namespace_name)
+  (struct_declaration name: (identifier) @class_name))
+{
+  edge @namespace_name.node -> @class_name.node
+  attr (@namespace_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(namespace_declaration
+  name: [(identifier) (qualified_name)] @namespace_name
+  body: (declaration_list
+    (class_declaration name: (identifier) @class_name)))
+{
+  edge @namespace_name.node -> @class_name.node
+  attr (@namespace_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(namespace_declaration
+  name: [(identifier) (qualified_name)] @namespace_name
+  body: (declaration_list
+    (interface_declaration name: (identifier) @class_name)))
+{
+  edge @namespace_name.node -> @class_name.node
+  attr (@namespace_name.node -> @class_name.node) kind = "MEMBER"
+}
+
+(namespace_declaration
+  name: [(identifier) (qualified_name)] @namespace_name
+  body: (declaration_list
+    (struct_declaration name: (identifier) @class_name)))
+{
+  edge @namespace_name.node -> @class_name.node
+  attr (@namespace_name.node -> @class_name.node) kind = "MEMBER"
 }
 
 ;; Inheritance
@@ -107,6 +171,7 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
+  attr (@call_any.node -> @call_any.node) call_syntax = "csharp_member"
 }
 
 ;; Using directives

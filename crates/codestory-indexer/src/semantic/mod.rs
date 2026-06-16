@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 mod c;
 mod cpp;
 mod csharp;
+mod generic;
 mod go;
 mod java;
 mod javascript;
@@ -19,6 +20,7 @@ mod typescript;
 use c::CSemanticResolver;
 use cpp::CppSemanticResolver;
 use csharp::CSharpSemanticResolver;
+use generic::GenericSemanticResolver;
 use go::GoSemanticResolver;
 use java::JavaSemanticResolver;
 use javascript::JavaScriptSemanticResolver;
@@ -297,6 +299,10 @@ pub struct SemanticResolverRegistry {
     ruby: RubySemanticResolver,
     php: PhpSemanticResolver,
     csharp: CSharpSemanticResolver,
+    kotlin: GenericSemanticResolver,
+    swift: GenericSemanticResolver,
+    dart: GenericSemanticResolver,
+    bash: GenericSemanticResolver,
 }
 
 impl SemanticResolverRegistry {
@@ -314,6 +320,10 @@ impl SemanticResolverRegistry {
             ruby: RubySemanticResolver,
             php: PhpSemanticResolver,
             csharp: CSharpSemanticResolver,
+            kotlin: GenericSemanticResolver::new("kotlin"),
+            swift: GenericSemanticResolver::new("swift"),
+            dart: GenericSemanticResolver::new("dart"),
+            bash: GenericSemanticResolver::new("bash"),
         }
     }
 
@@ -326,7 +336,7 @@ impl SemanticResolverRegistry {
             return Ok(Vec::new());
         }
 
-        match detect_language(request.file_path.as_deref()) {
+        match detect_resolver_language(request.file_path.as_deref()) {
             Some("c") => self.c.resolve(index, request),
             Some("cpp") => self.cpp.resolve(index, request),
             Some("javascript") | Some("vue") | Some("svelte") | Some("astro") => {
@@ -340,6 +350,10 @@ impl SemanticResolverRegistry {
             Some("ruby") => self.ruby.resolve(index, request),
             Some("php") => self.php.resolve(index, request),
             Some("csharp") => self.csharp.resolve(index, request),
+            Some("kotlin") => self.kotlin.resolve(index, request),
+            Some("swift") => self.swift.resolve(index, request),
+            Some("dart") => self.dart.resolve(index, request),
+            Some("bash") => self.bash.resolve(index, request),
             _ => Ok(Vec::new()),
         }
     }
@@ -354,7 +368,8 @@ pub(crate) fn detect_language(path: Option<&str>) -> Option<&'static str> {
         .to_ascii_lowercase();
     match ext.as_str() {
         "c" => Some("c"),
-        "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => Some("cpp"),
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some("cpp"),
+        "h" => Some("c"),
         "java" => Some("java"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
         "py" | "pyi" => Some("python"),
@@ -367,7 +382,21 @@ pub(crate) fn detect_language(path: Option<&str>) -> Option<&'static str> {
         "rb" => Some("ruby"),
         "php" => Some("php"),
         "cs" => Some("csharp"),
+        "kt" | "kts" => Some("kotlin"),
+        "swift" => Some("swift"),
+        "dart" => Some("dart"),
+        "sh" | "bash" => Some("bash"),
+        "html" | "htm" => Some("html"),
+        "css" => Some("css"),
+        "sql" => Some("sql"),
         _ => None,
+    }
+}
+
+pub(crate) fn detect_resolver_language(path: Option<&str>) -> Option<&'static str> {
+    match detect_language(path)? {
+        "html" | "css" | "sql" => None,
+        language => Some(language),
     }
 }
 
@@ -381,7 +410,7 @@ pub(super) fn request_target(request: &SemanticResolutionRequest) -> Option<&str
 }
 
 pub(super) fn request_language(request: &SemanticResolutionRequest) -> Option<&'static str> {
-    detect_language(request.file_path.as_deref())
+    detect_resolver_language(request.file_path.as_deref())
 }
 
 pub(super) fn alias_target(target: &str) -> &str {
@@ -545,6 +574,10 @@ fn language_family_bucket(language: &'static str) -> &'static str {
         "ruby" => "ruby",
         "php" => "php",
         "csharp" => "csharp",
+        "kotlin" => "kotlin",
+        "swift" => "swift",
+        "dart" => "dart",
+        "bash" => "bash",
         "html" | "css" | "sql" => "structural",
         _ => language,
     }
@@ -563,11 +596,15 @@ fn compatible_language_families(
 #[cfg(test)]
 mod tests {
     use super::{
-        SemanticCandidateIndex, alias_target, call_target_name, detect_language, namespace_tail,
-        resolve_call_candidates, resolve_import_candidates, tail_segment,
+        SemanticCandidateIndex, SemanticResolutionRequest, SemanticResolverRegistry, alias_target,
+        call_target_name, detect_language, detect_resolver_language, language_family_bucket,
+        namespace_tail, resolve_call_candidates, resolve_import_candidates, tail_segment,
     };
     use anyhow::Result;
-    use codestory_contracts::graph::NodeKind;
+    use codestory_contracts::{
+        graph::{EdgeKind, NodeKind},
+        language_support::{LANGUAGE_SUPPORT_PROFILES, LanguageSupportMode},
+    };
     use rusqlite::{Connection, params};
 
     fn create_node_table(conn: &Connection) -> Result<()> {
@@ -599,7 +636,7 @@ mod tests {
             ("a.c", Some("c")),
             ("a.cpp", Some("cpp")),
             ("a.hxx", Some("cpp")),
-            ("a.h", Some("cpp")),
+            ("a.h", Some("c")),
             ("a.java", Some("java")),
             ("a.js", Some("javascript")),
             ("a.jsx", Some("javascript")),
@@ -615,10 +652,63 @@ mod tests {
             ("a.vue", Some("vue")),
             ("a.svelte", Some("svelte")),
             ("a.astro", Some("astro")),
+            ("a.kt", Some("kotlin")),
+            ("a.kts", Some("kotlin")),
+            ("a.swift", Some("swift")),
+            ("a.dart", Some("dart")),
+            ("a.sh", Some("bash")),
+            ("a.bash", Some("bash")),
+            ("a.html", Some("html")),
+            ("a.css", Some("css")),
+            ("a.sql", Some("sql")),
             ("a.unknown", None),
         ];
         for (path, language) in expected {
             assert_eq!(detect_language(Some(path)), language, "path={path}");
+        }
+    }
+
+    #[test]
+    fn test_semantic_detection_matches_public_language_profiles() {
+        for profile in LANGUAGE_SUPPORT_PROFILES {
+            for extension in profile.extensions {
+                let path = format!("sample.{extension}");
+                assert_eq!(
+                    detect_language(Some(&path)),
+                    Some(profile.language_name),
+                    "semantic detection drifted from public language profile for .{extension}"
+                );
+            }
+
+            if profile.support_mode == LanguageSupportMode::StructuralCollector {
+                assert_eq!(
+                    language_family_bucket(profile.language_name),
+                    "structural",
+                    "structural collectors should not share code-language semantic families"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolver_detection_skips_structural_collectors() {
+        for profile in LANGUAGE_SUPPORT_PROFILES {
+            for extension in profile.extensions {
+                let path = format!("sample.{extension}");
+                if profile.support_mode == LanguageSupportMode::StructuralCollector {
+                    assert_eq!(
+                        detect_resolver_language(Some(&path)),
+                        None,
+                        "structural collector .{extension} should not create semantic work"
+                    );
+                } else {
+                    assert_eq!(
+                        detect_resolver_language(Some(&path)),
+                        Some(profile.language_name),
+                        "parser-backed .{extension} should remain eligible for semantic dispatch"
+                    );
+                }
+            }
         }
     }
 
@@ -771,6 +861,60 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].target_node_id, 40);
+        Ok(())
+    }
+
+    #[test]
+    fn test_semantic_registry_resolves_parser_backed_language_calls() -> Result<()> {
+        for profile in LANGUAGE_SUPPORT_PROFILES
+            .iter()
+            .filter(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
+        {
+            let extension = profile
+                .extensions
+                .first()
+                .expect("parser-backed language profiles should define at least one extension");
+            let path = format!("main.{extension}");
+            let conn = Connection::open_in_memory()?;
+            create_node_table(&conn)?;
+            insert_file_node(&conn, 1, &path)?;
+            for (offset, kind) in [NodeKind::FUNCTION, NodeKind::METHOD].iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        10_i64 + offset as i64,
+                        *kind as i32,
+                        "target",
+                        format!("Fixture.target.{offset}"),
+                        1_i64,
+                        2_i64 + offset as i64
+                    ],
+                )?;
+            }
+
+            let index = SemanticCandidateIndex::load(
+                &conn,
+                &[NodeKind::FUNCTION as i32, NodeKind::METHOD as i32],
+            )?;
+            let registry = SemanticResolverRegistry::new(true);
+            let request = SemanticResolutionRequest {
+                edge_kind: EdgeKind::CALL,
+                file_id: Some(1),
+                file_path: Some(path),
+                caller_qualified: Some("Fixture.caller".to_string()),
+                target_name: "target".to_string(),
+            };
+
+            let out = registry.resolve(&index, &request)?;
+            assert!(
+                out.iter()
+                    .any(|candidate| matches!(candidate.target_node_id, 10 | 11)),
+                "{} semantic resolver did not return a same-file call candidate: {out:?}",
+                profile.language_name
+            );
+        }
+
         Ok(())
     }
 }

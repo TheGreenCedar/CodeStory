@@ -66,6 +66,10 @@ impl PythonSemanticResolver {
             return Ok(Vec::new());
         };
 
+        if target.contains('.') {
+            return Ok(Vec::new());
+        }
+
         let Some(call_name) = call_target_name(target) else {
             return Ok(Vec::new());
         };

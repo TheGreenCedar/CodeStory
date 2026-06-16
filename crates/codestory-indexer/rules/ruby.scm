@@ -84,19 +84,5 @@
   edge @call_any.node -> @call_any.node
   attr (@call_any.node -> @call_any.node) kind = "CALL"
   attr (@call_any.node -> @call_any.node) line = (start-row @call_any)
-}
-
-(call
-  arguments: (argument_list (string) @module))
-{
-  node @module.node
-  attr (@module.node) kind = "MODULE"
-  attr (@module.node) name = (source-text @module)
-  attr (@module.node) start_row = (start-row @module)
-  attr (@module.node) start_col = (start-column @module)
-  attr (@module.node) end_row = (end-row @module)
-  attr (@module.node) end_col = (end-column @module)
-
-  edge @module.node -> @module.node
-  attr (@module.node -> @module.node) kind = "IMPORT"
+  attr (@call_any.node -> @call_any.node) col = (start-column @callee_any)
 }

@@ -244,6 +244,12 @@ use std::collections::HashMap;
 fn main() {}
 "#,
         ),
+        (
+            "main.rb",
+            r#"
+require_relative "./helper"
+"#,
+        ),
     ];
 
     for (filename, code) in cases {
@@ -293,6 +299,110 @@ pub fn make_widget() -> Widget {
 
     assert_import_resolved_to(&nodes, &edges, "src/main.ts", "src/foo.ts", "Foo");
     assert_import_resolved_to(&nodes, &edges, "src/lib.rs", "src/widget.rs", "Widget");
+    Ok(())
+}
+
+#[test]
+fn test_generic_parser_backed_imports_resolve_to_indexed_targets() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[
+        (
+            "src/app/shared/SharedHelper.kt",
+            r#"
+package app.shared
+
+class SharedHelper
+"#,
+        ),
+        (
+            "src/app/Main.kt",
+            r#"
+package app
+
+import app.shared.SharedHelper
+
+fun main() {
+    SharedHelper()
+}
+"#,
+        ),
+        (
+            "Sources/SharedKit.swift",
+            r#"
+class SharedKit {
+    func value() -> Int { return 1 }
+}
+"#,
+        ),
+        (
+            "Sources/App.swift",
+            r#"
+import SharedKit
+
+func main() -> Int {
+    return 1
+}
+"#,
+        ),
+        (
+            "lib/helper.dart",
+            r#"
+String helper() {
+  return 'ready';
+}
+"#,
+        ),
+        (
+            "lib/main.dart",
+            r#"
+import './helper.dart';
+
+void main() {
+  helper();
+}
+"#,
+        ),
+        (
+            "scripts/logger.sh",
+            r#"
+logger() {
+  printf "%s\n" "$1"
+}
+"#,
+        ),
+        (
+            "scripts/main.sh",
+            r#"
+source ./logger.sh
+
+main() {
+  logger "ready"
+}
+"#,
+        ),
+    ])?;
+
+    assert_import_resolved_to(
+        &nodes,
+        &edges,
+        "src/app/Main.kt",
+        "src/app/shared/SharedHelper.kt",
+        "SharedHelper",
+    );
+    assert_import_resolved_to(
+        &nodes,
+        &edges,
+        "Sources/App.swift",
+        "Sources/SharedKit.swift",
+        "SharedKit",
+    );
+    assert_import_resolved_to(&nodes, &edges, "lib/main.dart", "lib/helper.dart", "helper");
+    assert_import_resolved_to(
+        &nodes,
+        &edges,
+        "scripts/main.sh",
+        "scripts/logger.sh",
+        "logger",
+    );
     Ok(())
 }
 
@@ -353,6 +463,192 @@ async function load() {
     assert!(
         generic_runtime_calls.is_empty(),
         "expected runtime module loading to avoid generic CALL placeholders, found {generic_runtime_calls:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_ruby_require_runtime_imports_avoid_string_call_false_positives() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[
+        (
+            "main.rb",
+            r#"
+require_relative "./workflow"
+require_relative(
+  "./multiline"
+)
+require "json"
+
+puts "not an import"
+log("also not import")
+"#,
+        ),
+        (
+            "workflow.rb",
+            r#"
+class Workflow
+end
+"#,
+        ),
+        ("multiline.rb", "class Multiline\nend\n"),
+    ])?;
+
+    assert!(has_node_kind(&nodes, "\"./workflow\"", NodeKind::MODULE));
+    assert!(has_node_kind(&nodes, "\"./multiline\"", NodeKind::MODULE));
+    assert!(has_node_kind(&nodes, "\"json\"", NodeKind::MODULE));
+
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let import_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .map(|node| node.serialized_name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"./workflow\"")),
+        "expected require_relative \"./workflow\" to surface as IMPORT"
+    );
+    assert!(
+        import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"./multiline\"")),
+        "expected multiline require_relative \"./multiline\" to surface as IMPORT"
+    );
+    assert!(
+        import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"json\"")),
+        "expected require \"json\" to surface as IMPORT"
+    );
+    assert!(
+        !import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"not an import\"")),
+        "puts string arguments must not surface as IMPORT"
+    );
+    assert!(
+        !import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"also not import\"")),
+        "ordinary string call arguments must not surface as IMPORT"
+    );
+
+    let generic_runtime_calls = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .map(|node| node.serialized_name.as_str())
+        .filter(|name| matches_name(name, "require") || matches_name(name, "require_relative"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        generic_runtime_calls.is_empty(),
+        "expected Ruby runtime module loading to avoid generic CALL placeholders, found {generic_runtime_calls:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_ruby_receiver_qualified_require_calls_do_not_surface_as_imports() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[(
+        "main.rb",
+        r#"
+loader.require "not_receiver_import"
+loader.require_relative("not_receiver_relative_import")
+"#,
+    )])?;
+
+    assert!(!has_node_kind(
+        &nodes,
+        "\"not_receiver_import\"",
+        NodeKind::MODULE
+    ));
+    assert!(!has_node_kind(
+        &nodes,
+        "\"not_receiver_relative_import\"",
+        NodeKind::MODULE
+    ));
+
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let import_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .map(|node| node.serialized_name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"not_receiver_import\"")),
+        "receiver-qualified require calls must not surface as IMPORT"
+    );
+    assert!(
+        !import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"not_receiver_relative_import\"")),
+        "receiver-qualified require_relative calls must not surface as IMPORT"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_ruby_same_line_dynamic_require_does_not_surface_as_import() -> anyhow::Result<()> {
+    let (nodes, edges) = index_workspace(&[
+        (
+            "main.rb",
+            r#"
+path = "./dynamic"
+require "./workflow"; require(path)
+"#,
+        ),
+        (
+            "workflow.rb",
+            r#"
+class Workflow
+end
+"#,
+        ),
+    ])?;
+
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let import_targets = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::IMPORT)
+        .filter_map(|edge| node_by_id.get(&edge.target).copied())
+        .map(|node| node.serialized_name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"./workflow\"")),
+        "expected static require \"./workflow\" to surface as IMPORT"
+    );
+    assert!(!has_node_kind(&nodes, "\"./dynamic\"", NodeKind::MODULE));
+    assert!(
+        !import_targets
+            .iter()
+            .any(|name| matches_name(name, "\"./dynamic\"")),
+        "same-line dynamic require(path) must not surface the variable value as IMPORT"
     );
 
     Ok(())

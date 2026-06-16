@@ -21,12 +21,12 @@ class Workflow(abc.ABC):
     def persist(self, value):
         raise NotImplementedError
 
-    def run(self, notifier, value):
+    def run(self, notifier: Notifier, value):
         notifier.notify_event(value)
         self.persist(value)
         self.audit(value)
 
-    async def run_async(self, notifier, value):
+    async def run_async(self, notifier: Notifier, value):
         self.run(notifier, value)
         await asyncio.sleep(0)
 

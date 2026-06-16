@@ -1,126 +1,105 @@
 # Language Support Contract
 
-CodeStory uses the word "support" only with a qualifier. Parser routing,
-regression evidence, framework route coverage, and agent packet/search quality
-are separate claims.
+CodeStory uses "support" only with a qualifier. Parser routing, graph fidelity,
+semantic resolution, framework routes, and agent packet quality are different
+claims.
 
-The source of truth for extension ownership, stored-language names, support
-modes, evidence tiers, and claim labels is
+The source of truth for public language labels is
 `crates/codestory-contracts/src/language_support.rs`. The indexer maps those
-shared support profiles to parser/rule construction in `get_language_for_ext`.
-The shared registry owns public support claims. Workspace discovery also carries
-compatibility-only filters for file types that can be scanned or grouped without
-being claimed as parser-backed language support.
+profiles to parser and rule construction in `get_language_for_ext`.
 
 ## Claim Terms
 
-- `parser-backed graph`: the file extension routes to a tree-sitter parser and
-  rule asset, and the indexer can emit graph nodes and edges for that language.
-- `fidelity-gated`: parser-backed graph support has overlapping regression
-  evidence for symbols, imports, calls, member ownership, representable
-  inheritance, and resolved-call behavior covered by the fixture suites.
-- `semantic-resolution-backed`: the language has explicit semantic resolver
-  dispatch and tests for the resolution behavior being claimed. This is a
-  narrower claim than parser-backed graph support.
-- `structural collector`: the language is indexed by dedicated structural
-  collectors, not full tree-sitter graph rules.
-- `candidate parser compatibility record`: a parser crate/version was checked
-  for possible future use, but that record is not a runtime support claim until
-  the language has dependency wiring, rule assets, routing, and fidelity tests.
+| Term | Means | Does not mean |
+| --- | --- | --- |
+| Parser-backed graph | Extension routes to a parser and graph rules. | Full semantic navigation. |
+| Fidelity-gated | Core symbol/import/call/member shapes pass fixture suites. | Every language feature is covered. |
+| Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
+| Structural collector | Dedicated extractor emits structural entities. | Parser-backed code navigation. |
+| Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
 
-## Current Matrix
+## Current Runtime Claims
 
-| Runtime claim | Languages | Runtime path | Evidence floor | Safe claim |
-| --- | --- | --- | --- | --- |
-| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | tree-sitter parser plus graph rules | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, and the opt-in OSS language corpus; agent-facing A/B evidence is separate and currently mixed | daily graph navigation on typical code, with language-specific caveats |
-| Structural collector | HTML, CSS, SQL | dedicated structural collectors | structural collector tests | structural entity extraction, not semantic code navigation |
+| Runtime claim | Languages | Evidence floor | Safe claim |
+| --- | --- | --- | --- |
+| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
+| Structural collector | HTML, CSS, SQL | structural collector tests | structural entity extraction |
 
-Agent-facing packet/search quality is a separate claim from parser-backed graph
-support. The current language-expansion A/B report records a mixed full
-18-language result and a stronger packet-eligible slice; do not use that report
-as blanket promotion proof for every parser-backed language.
+Agent-facing packet/search quality is separate. The language-expansion A/B
+report is not blanket promotion proof for every parser-backed language.
 
-The parser-backed graph claim is not a promise that every language has identical
-dispatch or semantic-resolution semantics. Typed receiver-call support is
-claimed only for the fixture-backed cases named in the indexer regression
-suites. Current support covers simple local owner qualified calls where tests
-prove the behavior. Cross-package receiver lookup, polymorphic dispatch,
-inheritance-heavy target selection, framework-handler resolution, and
-declarative parameter extraction require separate fixtures and cannot be used
-as product claims until those fixtures pass.
+## Resolution Claims
 
-## Parser Compatibility Matrix
+Receiver and import resolution are fixture-backed. If a behavior is not covered
+by `crates/codestory-indexer/tests/call_resolution_common_methods.rs` or another
+targeted regression suite, do not claim it.
 
-This table is a parser-version compatibility record, not a runtime support
-claim. Candidate parser crates are judged against the workspace parser-version
-policy before they become durable language-support evidence:
+Use the tests for specifics. This page should state the contract, not repeat the
+fixture catalogue.
+
+Current boundaries:
+
+- Typed receiver behavior is proven only for the languages and shapes covered by
+  targeted tests.
+- Framework handlers, broad scoped-import shadowing, inheritance-heavy target
+  selection, polymorphic dispatch, declarative parameter extraction, and untyped
+  factory-returned receivers need separate fixtures before they become claims.
+- Header files keep the shared registry default of `.h` as C for path-only
+  semantic detection. Any C++ header upgrade from compile/source signals is a
+  parser-routing detail until semantic requests carry that resolved identity.
+
+## Parser Compatibility Records
+
+This table records parser-version compatibility only. A parser becomes runtime
+support only after dependency wiring, rule assets, extension routing, and
+fidelity coverage land.
+
+Workspace parser policy:
 
 - `tree-sitter = "0.24"`
 - `tree-sitter-graph = "0.12"`
 
-Validation method: checked candidate parser crates in an isolated temporary probe
-crate (outside workspace members) with `tree-sitter = "0.24"`,
-`tree-sitter-graph = "0.12"`, and exactly one pinned `<language-parser-crate>`
-dependency, then ran `cargo check` for each language.
+Validation: each listed candidate passed an isolated `cargo check` probe with
+the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, and SQL
+remain structural runtime paths, not parser-backed runtime claims.
 
-| Language | Candidate crate | Version checked | `cargo check` with 0.24/0.12 | Decision | Notes |
-|---|---|---:|---|---|---|
-| Go | `tree-sitter-go` | `0.23.4` | pass (`cargo check` + parse smoke) | crates.io pin | `0.25.0` compiles but fails at runtime with `LanguageError { version: 15 }` on tree-sitter `0.24`. |
-| Ruby | `tree-sitter-ruby` | `0.23.1` | pass (`cargo check` + parse smoke) | crates.io pin | Wired in indexer with `rules/ruby.scm`. |
-| PHP | `tree-sitter-php` | `0.23.11` | pass (`cargo check` + parse smoke) | crates.io pin | `0.24.2` compiles but fails at runtime with `LanguageError { version: 15 }` on tree-sitter `0.24`. |
-| C# | `tree-sitter-c-sharp` | `=0.23.0` | pass (`cargo check` + parse smoke) | crates.io pin | `0.23.5` compiles but fails at runtime with `LanguageError { version: 15 }` on tree-sitter `0.24`. |
-| Kotlin | `tree-sitter-kotlin-ng` | `1.1.0` | pass (`cargo check` + parse smoke) | crates.io pin | Wired in indexer with `rules/kotlin.scm`. |
-| Swift | `tree-sitter-swift` | `0.7.0` | pass (`cargo check` + parse smoke) | crates.io pin | `0.7.1` and newer tested candidates use ABI 15 and fail at runtime on tree-sitter `0.24`. |
-| Dart | `tree-sitter-dart-orchard` | `0.3.2` | pass (`cargo check` + parse smoke) | crates.io pin | Replaces `tree-sitter-dart = 0.2.0`, whose language export uses ABI 15 with tree-sitter `0.24`. |
-| HTML | `tree-sitter-html` | `0.23.2` | pass | crates.io pin | Parser is available if structural extraction chooses parser-backed route. |
-| CSS | `tree-sitter-css` | `0.25.0` | pass | crates.io pin | Parser is available if structural extraction chooses parser-backed route. |
-| SQL | `tree-sitter-sequel` | `0.3.11` | pass | crates.io pin | SQL parser candidate compiles with policy pins. |
-| Bash | `tree-sitter-bash` | `0.23.3` | pass (`cargo check` + parse smoke) | crates.io pin | `0.25.x` uses ABI 15 and fails at runtime on tree-sitter `0.24`. |
+| Language | Candidate crate | Version checked | Decision |
+| --- | --- | ---: | --- |
+| Go | `tree-sitter-go` | `0.23.4` | wired |
+| Ruby | `tree-sitter-ruby` | `0.23.1` | wired |
+| PHP | `tree-sitter-php` | `0.23.11` | wired |
+| C# | `tree-sitter-c-sharp` | `=0.23.0` | wired |
+| Kotlin | `tree-sitter-kotlin-ng` | `1.1.0` | wired |
+| Swift | `tree-sitter-swift` | `0.7.0` | wired |
+| Dart | `tree-sitter-dart-orchard` | `0.3.2` | wired |
+| Bash | `tree-sitter-bash` | `0.23.3` | wired |
+| HTML | `tree-sitter-html` | `0.23.2` | candidate only |
+| CSS | `tree-sitter-css` | `0.25.0` | candidate only |
+| SQL | `tree-sitter-sequel` | `0.3.11` | candidate only |
 
-Current outcome:
-
-- No language in this matrix currently requires a git pin, custom fork, or forced
-  text-only fallback for parser-policy compatibility.
-- Go, Ruby, PHP, C#, Kotlin, Swift, Dart, and Bash have parser dependencies,
-  rule assets, and extension routing wired in the current branch.
-- HTML, CSS, and SQL have structural extraction paths, but they are not
-  parser-backed rule assets from this matrix.
-- New parser candidates should stay on this page as compatibility records until
-  they also have dependency wiring, rule assets, language routing, and fidelity
-  coverage.
+Older or newer parser candidates that use an incompatible tree-sitter ABI are
+not support claims. Re-check the candidate before upgrading.
 
 ## Route Coverage Is Separate
 
 Framework route extraction has its own confidence labels in
 [framework-route-coverage.md](../testing/framework-route-coverage.md). A
-language can have parser-backed graph support while a framework remains
-partial or heuristic. A route claim needs fixture or real-repo route evidence,
-not just a language parser.
+language can have parser-backed graph support while a framework remains partial
+or heuristic. A route claim needs fixture or real-repo route evidence, not just a
+language parser.
 
 ## Expansion Checklist
 
-Before adding a new parser-backed language or broader framework claim:
+Before adding a parser-backed language or widening a public claim:
 
-1. Add or update the parser/rule path and extension mapping.
-2. Add tictactoe coverage for symbol, import, call, member, and inheritance
-   shapes that the language can reasonably represent.
-3. Add or update fidelity-lab fixtures for symbols, imports, call edges, and
-   any resolution behavior being claimed.
-4. Add targeted resolution tests before claiming local receiver-aware,
-   polymorphic, cross-package, framework-handler, or owner-qualified call trails.
-5. Update `crates/codestory-contracts/src/language_support.rs`, including
-   `language_support_profile_for_ext` and
-   `language_support_profile_for_language_name`, parser construction such as
-   `get_language_for_ext`, and this page in the same change.
-6. Add or update the
-   [OSS language corpus](../testing/oss-language-corpus.md) entry so the new
-   public language-support profile has a pinned medium-sized open source project and
-   a raw-without-CodeStory indexing comparison lane.
-7. Add or update the `language-expansion-holdout` task manifest so the language
-   also has a strict `without_codestory` versus `with_codestory` agent A/B task
-   that measures elapsed time, tokens, tool calls, command counts, source reads,
-   post-packet source reads, and answer quality.
-8. Run the full test binaries, not filtered test names:
+1. Update registry, parser construction, extension mapping, rules, and docs in
+   one change.
+2. Add tictactoe and fidelity-lab coverage for the represented language shapes.
+3. Add targeted resolution tests for any receiver, import, framework, or
+   polymorphic behavior being claimed.
+4. Add or update the OSS corpus and A/B task manifest before making
+   agent-facing savings or answer-quality claims.
+5. Run the full binaries, not filtered test names:
 
    ```sh
    cargo test -p codestory-indexer --test fidelity_regression
@@ -131,29 +110,22 @@ Before adding a new parser-backed language or broader framework claim:
    cargo test -p codestory-indexer --test trait_interface_resolution
    ```
 
-9. For broader real-project smoke evidence, run either the OSS corpus dry-run
-   manifest check or the relevant full corpus language subset:
+6. For broader real-project smoke evidence, run either the OSS corpus dry-run
+   manifest check or the relevant language subset:
 
    ```sh
    CODESTORY_OSS_CORPUS_DRY_RUN=1 cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapture
    CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1 CODESTORY_OSS_CORPUS_LANGUAGES=python cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapture
    ```
 
-10. For agent-facing evidence, run at least the targeted language task from the
-    A/B suite, and run the full suite before making language-wide savings or
-    answer-quality claims:
+7. For agent-facing evidence, run at least the targeted language task from the
+   A/B suite, and run the full suite before making language-wide claims:
 
-    ```sh
-    node scripts/codestory-agent-ab-benchmark.mjs \
-      --task-suite language-expansion-holdout \
-      --arms without_codestory,with_codestory \
-      --repeats 3 --materialize-repos --prepare-codestory-cache \
-      --out-dir target/agent-benchmark/language-expansion-holdout \
-      --timeout-ms 600000
-    ```
-
-11. Before widening typed receiver-call claims, add same-file and cross-file
-    fixtures for the target language. If implementation still uses signature
-    string slicing, document that as a transitional boundary; prefer a
-    tree-sitter-query or global-resolution-backed implementation for new
-    claims.
+   ```sh
+   node scripts/codestory-agent-ab-benchmark.mjs \
+     --task-suite language-expansion-holdout \
+     --arms without_codestory,with_codestory \
+     --repeats 3 --materialize-repos --prepare-codestory-cache \
+     --out-dir target/agent-benchmark/language-expansion-holdout \
+     --timeout-ms 600000
+   ```

@@ -1,7 +1,7 @@
 use crate::semantic::{
     SemanticCandidateIndex, SemanticCandidateNodeSnapshot, SemanticResolutionCandidate,
     SemanticResolutionRequest, SemanticResolverRegistry,
-    detect_language as semantic_detect_language,
+    detect_resolver_language as semantic_detect_resolver_language,
 };
 use anyhow::Result;
 use codestory_contracts::graph::{EdgeKind, NodeKind, ResolutionCertainty};
@@ -37,7 +37,6 @@ struct SemanticEdgeLookup<'a> {
     edge_kind: EdgeKind,
     file_id: Option<i64>,
     file_path: Option<&'a str>,
-    caller_qualified: Option<&'a str>,
     source_name: &'a str,
     target_name: &'a str,
     callsite_identity: Option<&'a str>,
@@ -56,7 +55,6 @@ struct SemanticResolutionRequestKey {
     edge_kind: i32,
     file_id: Option<i64>,
     file_path: Option<String>,
-    caller_qualified: Option<String>,
     target_name: String,
 }
 
@@ -856,7 +854,7 @@ impl ResolutionPass {
             edge_kind: EdgeKind::try_from(request_key.edge_kind)?,
             file_id: request_key.file_id,
             file_path: request_key.file_path.clone(),
-            caller_qualified: request_key.caller_qualified.clone(),
+            caller_qualified: None,
             target_name: request_key.target_name.clone(),
         };
         self.semantic_resolvers.resolve(index, &request)
@@ -1042,7 +1040,7 @@ fn owner_token_store_alias(left: &str, right: &str) -> bool {
 }
 
 fn semantic_language_bucket(file_path: Option<&str>) -> Option<&'static str> {
-    semantic_detect_language(file_path)
+    semantic_detect_resolver_language(file_path)
 }
 
 fn semantic_lookup_from_row<'a>(
@@ -1052,7 +1050,7 @@ fn semantic_lookup_from_row<'a>(
     let (
         _,
         file_id,
-        caller_qualified,
+        _caller_qualified,
         source_name,
         target_name,
         _target_node_id,
@@ -1063,7 +1061,6 @@ fn semantic_lookup_from_row<'a>(
         edge_kind,
         file_id: *file_id,
         file_path: caller_file_path.as_deref(),
-        caller_qualified: caller_qualified.as_deref(),
         source_name,
         target_name,
         callsite_identity: callsite_identity.as_deref(),
@@ -1072,6 +1069,19 @@ fn semantic_lookup_from_row<'a>(
 
 fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResolutionRequestKey> {
     if semantic_language_bucket(lookup.file_path).is_none()
+        || is_python_dotted_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_cpp_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_js_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_ts_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_kotlin_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_dart_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_swift_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_go_selector_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_java_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_csharp_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_ruby_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_php_member_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
+        || is_imported_receiver_call_placeholder(lookup.edge_kind, lookup.callsite_identity)
         || should_skip_semantic_candidates(lookup)
     {
         return None;
@@ -1081,7 +1091,6 @@ fn semantic_request_key(lookup: &SemanticEdgeLookup<'_>) -> Option<SemanticResol
         edge_kind: lookup.edge_kind as i32,
         file_id: lookup.file_id,
         file_path: lookup.file_path.map(str::to_string),
-        caller_qualified: lookup.caller_qualified.map(str::to_string),
         target_name: semantic_request_target_name(lookup),
     })
 }
@@ -1103,6 +1112,179 @@ fn should_skip_semantic_candidates(lookup: &SemanticEdgeLookup<'_>) -> bool {
             ResolutionCertainty::CERTAIN_MIN,
             lookup.callsite_identity,
         )
+}
+
+fn is_python_dotted_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER)
+    })
+}
+
+fn is_cpp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::CPP_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_js_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::JS_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_ts_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::TS_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_kotlin_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::KOTLIN_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_dart_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::DART_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_swift_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::SWIFT_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_go_selector_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::GO_SELECTOR_CALLSITE_MARKER)
+    })
+}
+
+fn is_java_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::JAVA_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_csharp_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::CSHARP_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_ruby_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::RUBY_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_php_member_call_placeholder(edge_kind: EdgeKind, callsite_identity: Option<&str>) -> bool {
+    if edge_kind != EdgeKind::CALL {
+        return false;
+    }
+
+    callsite_identity.is_some_and(|identity| {
+        identity
+            .split('|')
+            .any(|part| part == crate::PHP_MEMBER_CALLSITE_MARKER)
+    })
+}
+
+fn is_imported_receiver_call_placeholder(
+    edge_kind: EdgeKind,
+    callsite_identity: Option<&str>,
+) -> bool {
+    edge_kind == EdgeKind::CALL
+        && receiver_owner_from_callsite(callsite_identity).is_some()
+        && receiver_module_from_callsite(callsite_identity).is_some()
+}
+
+fn receiver_owner_from_callsite(callsite_identity: Option<&str>) -> Option<&str> {
+    callsite_identity
+        .into_iter()
+        .flat_map(|identity| identity.split('|'))
+        .find_map(|part| {
+            part.strip_prefix(crate::RECEIVER_OWNER_CALLSITE_PREFIX)
+                .filter(|owner| !owner.is_empty())
+        })
+}
+
+fn receiver_module_from_callsite(callsite_identity: Option<&str>) -> Option<&str> {
+    callsite_identity
+        .into_iter()
+        .flat_map(|identity| identity.split('|'))
+        .find_map(|part| {
+            part.strip_prefix(crate::RECEIVER_MODULE_CALLSITE_PREFIX)
+                .filter(|module| !module.is_empty())
+        })
 }
 
 pub(super) fn semantic_candidate_kinds(edge_kind: EdgeKind) -> &'static [i32] {
@@ -1568,6 +1750,382 @@ impl CandidateIndex {
         })
     }
 
+    fn find_imported_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        match semantic_language_bucket(caller_file_path) {
+            Some("python") => self.find_python_imported_owner_member_readonly(
+                caller_file_path,
+                module_name,
+                owner_name,
+                method_name,
+            ),
+            Some("go") => {
+                self.find_go_imported_owner_member_readonly(module_name, owner_name, method_name)
+            }
+            Some("javascript" | "typescript") => self
+                .find_typescript_imported_owner_member_readonly(
+                    caller_file_path,
+                    module_name,
+                    owner_name,
+                    method_name,
+                ),
+            Some("csharp" | "java" | "kotlin" | "php") => self
+                .find_qualified_imported_owner_member_readonly(
+                    module_name,
+                    owner_name,
+                    method_name,
+                ),
+            Some("swift") => self.find_swift_imported_owner_member_readonly(
+                caller_file_path,
+                module_name,
+                owner_name,
+                method_name,
+            ),
+            Some("ruby") => self.find_ruby_imported_owner_member_readonly(
+                caller_file_path,
+                module_name,
+                owner_name,
+                method_name,
+            ),
+            Some("dart") => self.find_dart_imported_owner_member_readonly(
+                caller_file_path,
+                module_name,
+                owner_name,
+                method_name,
+            ),
+            _ => None,
+        }
+    }
+
+    fn find_python_imported_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let path_candidates = python_import_path_candidates(caller_file_path?, module_name);
+        if path_candidates.is_empty() {
+            return None;
+        }
+        self.find_path_imported_owner_member_readonly(&path_candidates, owner_name, method_name)
+    }
+
+    fn find_typescript_imported_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let path_candidates =
+            typescript_relative_import_path_candidates(caller_file_path?, module_name);
+        if path_candidates.is_empty() {
+            return None;
+        }
+        self.find_path_imported_owner_member_readonly(&path_candidates, owner_name, method_name)
+    }
+
+    fn find_ruby_imported_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let path_candidates = ruby_require_relative_path_candidates(caller_file_path?, module_name);
+        if path_candidates.is_empty() {
+            return None;
+        }
+        self.find_path_imported_owner_member_strict_readonly(
+            &path_candidates,
+            owner_name,
+            method_name,
+        )
+    }
+
+    fn find_qualified_imported_owner_member_readonly(
+        &self,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let imported_owner_qualified_name = module_name.trim();
+        if imported_owner_qualified_name.is_empty()
+            || imported_owner_qualified_name.contains('*')
+            || imported_owner_qualified_name.contains('|')
+        {
+            return None;
+        }
+        let imported_member_qualified_name =
+            format!("{imported_owner_qualified_name}.{method_name}");
+        let imported_member_qualified_name_ascii_lower =
+            imported_member_qualified_name.to_ascii_lowercase();
+        let method_name_ascii_lower = method_name.to_ascii_lowercase();
+        let owner_qualified_name = format!("{owner_name}.{method_name}");
+        let owner_qualified_name_ascii_lower = owner_qualified_name.to_ascii_lowercase();
+        let mut offsets = Vec::new();
+        if let Some(exact) = self.exact_map.get(&owner_qualified_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(exact) = self.exact_map.get(&imported_member_qualified_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&method_name_ascii_lower) {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self
+            .suffix_map_ascii_lower
+            .get(&owner_qualified_name_ascii_lower)
+        {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self
+            .suffix_map_ascii_lower
+            .get(&imported_member_qualified_name_ascii_lower)
+        {
+            offsets.extend(suffix.iter().copied());
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        let mut matches = offsets
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| node.qualified_name.as_deref() == Some(&imported_member_qualified_name))
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
+    }
+
+    fn find_dart_imported_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let path_candidates = relative_import_path_candidates(caller_file_path?, module_name);
+        if path_candidates.is_empty() {
+            return None;
+        }
+        self.find_path_imported_owner_member_readonly(&path_candidates, owner_name, method_name)
+    }
+
+    fn find_swift_imported_owner_member_readonly(
+        &self,
+        caller_file_path: Option<&str>,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let caller_file_path = caller_file_path?;
+        let module_name = normalize_import_module_name(module_name)?;
+        let method_name_ascii_lower = method_name.to_ascii_lowercase();
+        let owner_qualified_name = format!("{owner_name}.{method_name}");
+        let owner_qualified_name_ascii_lower = owner_qualified_name.to_ascii_lowercase();
+        let mut offsets = Vec::new();
+        if let Some(exact) = self.exact_map.get(&owner_qualified_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&method_name_ascii_lower) {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self
+            .suffix_map_ascii_lower
+            .get(&owner_qualified_name_ascii_lower)
+        {
+            offsets.extend(suffix.iter().copied());
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        let mut matches = offsets
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.normalized_file_path.as_deref().is_some_and(|path| {
+                    swift_imported_module_path_matches(path, caller_file_path, &module_name)
+                })
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
+    }
+
+    fn find_path_imported_owner_member_readonly(
+        &self,
+        path_candidates: &[String],
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        self.find_path_imported_owner_member_exact_readonly(
+            path_candidates,
+            owner_name,
+            method_name,
+        )
+        .or_else(|| self.find_unique_imported_member_by_path(path_candidates, method_name))
+    }
+
+    fn find_path_imported_owner_member_strict_readonly(
+        &self,
+        path_candidates: &[String],
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        self.find_path_imported_owner_member_exact_readonly(
+            path_candidates,
+            owner_name,
+            method_name,
+        )
+    }
+
+    fn find_path_imported_owner_member_exact_readonly(
+        &self,
+        path_candidates: &[String],
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let method_name_ascii_lower = method_name.to_ascii_lowercase();
+        let owner_qualified_name = format!("{owner_name}.{method_name}");
+        let owner_qualified_name_ascii_lower = owner_qualified_name.to_ascii_lowercase();
+        let mut offsets = Vec::new();
+        if let Some(exact) = self.exact_map.get(&owner_qualified_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&method_name_ascii_lower) {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self
+            .suffix_map_ascii_lower
+            .get(&owner_qualified_name_ascii_lower)
+        {
+            offsets.extend(suffix.iter().copied());
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        let mut matches = offsets
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter(|node| {
+                node.normalized_file_path.as_deref().is_some_and(|path| {
+                    path_candidates.iter().any(|candidate| {
+                        path == candidate || path.ends_with(&format!("/{candidate}"))
+                    })
+                })
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
+    }
+
+    fn find_unique_imported_member_by_path(
+        &self,
+        path_candidates: &[String],
+        method_name: &str,
+    ) -> Option<i64> {
+        let method_name_ascii_lower = method_name.to_ascii_lowercase();
+        let mut matches = self
+            .suffix_map_ascii_lower
+            .get(&method_name_ascii_lower)
+            .into_iter()
+            .flatten()
+            .filter_map(|offset| self.nodes.get(*offset))
+            .filter(|node| member_candidate_matches(node, method_name))
+            .filter(|node| {
+                node.normalized_file_path.as_deref().is_some_and(|path| {
+                    path_candidates.iter().any(|candidate| {
+                        path == candidate || path.ends_with(&format!("/{candidate}"))
+                    })
+                })
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
+    }
+
+    fn find_go_imported_owner_member_readonly(
+        &self,
+        module_name: &str,
+        owner_name: &str,
+        method_name: &str,
+    ) -> Option<i64> {
+        let method_name_ascii_lower = method_name.to_ascii_lowercase();
+        let owner_qualified_name = format!("{owner_name}.{method_name}");
+        let owner_qualified_name_ascii_lower = owner_qualified_name.to_ascii_lowercase();
+        let mut offsets = Vec::new();
+        if let Some(exact) = self.exact_map.get(&owner_qualified_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&method_name_ascii_lower) {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self
+            .suffix_map_ascii_lower
+            .get(&owner_qualified_name_ascii_lower)
+        {
+            offsets.extend(suffix.iter().copied());
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        let matches = offsets
+            .into_iter()
+            .filter_map(|offset| self.nodes.get(offset))
+            .filter(|node| owner_member_candidate_matches(node, owner_name, method_name))
+            .filter_map(|node| {
+                let score =
+                    go_import_path_match_score(node.normalized_file_path.as_deref()?, module_name)?;
+                Some((node.id, score))
+            })
+            .collect::<Vec<_>>();
+        let max_score = matches.iter().map(|(_, score)| *score).max()?;
+        let mut matches = matches
+            .into_iter()
+            .filter_map(|(id, score)| (score == max_score).then_some(id))
+            .collect::<Vec<_>>();
+        matches.sort_unstable();
+        matches.dedup();
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     fn find_global_unique(&self, name: &str) -> Option<i64> {
         let name_ascii_lower = name.to_ascii_lowercase();
@@ -1877,6 +2435,215 @@ fn relative_import_path_candidates(caller_file_path: &str, module_name: &str) ->
         }
     }
     candidates
+}
+
+fn typescript_relative_import_path_candidates(
+    caller_file_path: &str,
+    module_name: &str,
+) -> Vec<String> {
+    let mut candidates = relative_import_path_candidates(caller_file_path, module_name);
+    let Some(module_name) = normalize_import_module_name(module_name) else {
+        return candidates;
+    };
+    let Some((specifier_stem, specifier_extension)) = module_name.rsplit_once('.') else {
+        return candidates;
+    };
+    let source_extensions = match specifier_extension {
+        "js" => &["ts", "tsx"][..],
+        "jsx" => &["tsx"][..],
+        "mjs" => &["mts"][..],
+        "cjs" => &["cts"][..],
+        _ => return candidates,
+    };
+    let Some(caller_path) = normalize_resolution_path(caller_file_path) else {
+        return candidates;
+    };
+    let Some(parent) = caller_path.rsplit_once('/').map(|(parent, _)| parent) else {
+        return candidates;
+    };
+    for source_extension in source_extensions {
+        if let Some(candidate) =
+            normalize_resolution_path(&format!("{parent}/{specifier_stem}.{source_extension}"))
+        {
+            push_unique(&mut candidates, candidate);
+        }
+    }
+    candidates
+}
+
+fn ruby_require_relative_path_candidates(caller_file_path: &str, module_name: &str) -> Vec<String> {
+    let Some(mut module_name) = normalize_import_module_name(module_name) else {
+        return Vec::new();
+    };
+    if !(module_name.starts_with("./") || module_name.starts_with("../")) {
+        module_name = format!("./{module_name}");
+    }
+    let Some(caller_path) = normalize_resolution_path(caller_file_path) else {
+        return Vec::new();
+    };
+    let Some(parent) = caller_path.rsplit_once('/').map(|(parent, _)| parent) else {
+        return Vec::new();
+    };
+    let Some(base) = normalize_resolution_path(&format!("{parent}/{module_name}")) else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    push_unique(&mut candidates, base.clone());
+    if !path_has_extension(&base) {
+        push_unique(&mut candidates, format!("{base}.rb"));
+    }
+    candidates
+}
+
+fn python_import_path_candidates(caller_file_path: &str, module_name: &str) -> Vec<String> {
+    let Some(module_name) = normalize_import_module_name(module_name) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+
+    if module_name.starts_with('.') {
+        let Some(caller_path) = normalize_resolution_path(caller_file_path) else {
+            return candidates;
+        };
+        let Some(parent) = caller_path.rsplit_once('/').map(|(parent, _)| parent) else {
+            return candidates;
+        };
+        let leading_dots = module_name.chars().take_while(|ch| *ch == '.').count();
+        let rest = module_name[leading_dots..].trim_matches('.');
+        let mut relative = String::new();
+        if leading_dots == 1 {
+            relative.push_str("./");
+        } else {
+            for _ in 1..leading_dots {
+                relative.push_str("../");
+            }
+        }
+        relative.push_str(&rest.replace('.', "/"));
+        if let Some(base) = normalize_resolution_path(&format!("{parent}/{relative}")) {
+            push_python_module_file_candidates(&mut candidates, &base);
+        }
+        return candidates;
+    }
+
+    let module_path = module_name.replace('.', "/");
+    if !module_path.contains('/') {
+        if let Some(caller_path) = normalize_resolution_path(caller_file_path)
+            && let Some(parent) = caller_path.rsplit_once('/').map(|(parent, _)| parent)
+        {
+            push_python_module_file_candidates(&mut candidates, &format!("{parent}/{module_path}"));
+        }
+        return candidates;
+    }
+
+    push_python_module_file_candidates(&mut candidates, &module_path);
+    candidates
+}
+
+fn push_python_module_file_candidates(candidates: &mut Vec<String>, base: &str) {
+    let base = base.trim_matches('/');
+    if base.is_empty() {
+        return;
+    }
+    if path_has_extension(base) {
+        push_unique(candidates, base.to_string());
+    } else {
+        push_unique(candidates, format!("{base}.py"));
+        push_unique(candidates, format!("{base}/__init__.py"));
+    }
+}
+
+fn go_import_path_match_score(path: &str, module_name: &str) -> Option<usize> {
+    let module_name = normalize_import_module_name(module_name)?;
+    let import_segments = module_name
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if import_segments.is_empty() {
+        return None;
+    }
+    let normalized_path = normalize_resolution_path(path)?;
+    let package_dir = normalized_path.rsplit_once('/').map(|(dir, _)| dir)?;
+    let path_segments = package_dir
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let max_len = import_segments.len().min(path_segments.len());
+    let min_len = if import_segments.len() > 1 { 2 } else { 1 };
+    (min_len..=max_len).rev().find(|len| {
+        import_segments[import_segments.len() - len..] == path_segments[path_segments.len() - len..]
+    })
+}
+
+fn swift_imported_module_path_matches(
+    path: &str,
+    caller_file_path: &str,
+    module_name: &str,
+) -> bool {
+    let Some(normalized_path) = normalize_resolution_path(path) else {
+        return false;
+    };
+    let Some(caller_path) = normalize_resolution_path(caller_file_path) else {
+        return false;
+    };
+    if normalized_path == caller_path {
+        return false;
+    }
+    let Some((target_root, target_module)) = swift_sources_root_and_module(&normalized_path) else {
+        return false;
+    };
+    let Some((caller_root, _)) = swift_sources_root_and_module(&caller_path) else {
+        return false;
+    };
+    target_root == caller_root && target_module == module_name
+}
+
+fn swift_sources_root_and_module(path: &str) -> Option<(&str, &str)> {
+    let (root, rest) = if let Some(rest) = path.strip_prefix("sources/") {
+        ("", rest)
+    } else {
+        let marker = "/sources/";
+        let index = path.find(marker)?;
+        (&path[..index], &path[index + marker.len()..])
+    };
+    let module = rest.split('/').next()?.trim();
+    (!module.is_empty()).then_some((root, module))
+}
+
+fn owner_member_candidate_matches(
+    node: &CandidateNode,
+    owner_name: &str,
+    method_name: &str,
+) -> bool {
+    [
+        Some(node.serialized_name.as_str()),
+        node.qualified_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|name| {
+        split_owner_member_name(name).is_some_and(|(owner, member)| {
+            member == method_name
+                && owner
+                    .rsplit(['.', ':'])
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(owner)
+                    == owner_name
+        })
+    })
+}
+
+fn member_candidate_matches(node: &CandidateNode, method_name: &str) -> bool {
+    [
+        Some(node.serialized_name.as_str()),
+        node.qualified_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|name| {
+        split_owner_member_name(name).is_some_and(|(_, member)| member == method_name)
+            || name == method_name
+    })
 }
 
 fn path_has_extension(path: &str) -> bool {
@@ -2572,12 +3339,12 @@ mod tests {
             (
                 2_i64,
                 Some(100_i64),
-                Some("pkg::core::caller".to_string()),
-                "caller".to_string(),
+                Some("pkg::other::caller".to_string()),
+                "other_caller".to_string(),
                 "target".to_string(),
                 0,
                 Some("/repo/lib.rs".to_string()),
-                Some("1:2:3:4".to_string()),
+                Some("2:2:3:4".to_string()),
             ),
         ];
 
@@ -2730,7 +3497,7 @@ mod tests {
         let expected = [
             ("a.c", Some("c")),
             ("a.cpp", Some("cpp")),
-            ("a.h", Some("cpp")),
+            ("a.h", Some("c")),
             ("a.hh", Some("cpp")),
             ("a.java", Some("java")),
             ("a.js", Some("javascript")),
@@ -2740,6 +3507,16 @@ mod tests {
             ("a.ts", Some("typescript")),
             ("a.tsx", Some("typescript")),
             ("a.mts", Some("typescript")),
+            ("a.vue", Some("vue")),
+            ("a.svelte", Some("svelte")),
+            ("a.astro", Some("astro")),
+            ("a.kt", Some("kotlin")),
+            ("a.swift", Some("swift")),
+            ("a.dart", Some("dart")),
+            ("a.sh", Some("bash")),
+            ("a.html", None),
+            ("a.css", None),
+            ("a.sql", None),
             ("a.unknown", None),
         ];
         for (path, language) in expected {
@@ -2749,6 +3526,74 @@ mod tests {
                 "path={path}"
             );
         }
+    }
+
+    #[test]
+    fn test_structural_collectors_do_not_create_semantic_request_keys() {
+        let lookup = SemanticEdgeLookup {
+            edge_kind: EdgeKind::IMPORT,
+            file_id: Some(1),
+            file_path: Some("index.html"),
+            source_name: "script",
+            target_name: "app.js",
+            callsite_identity: None,
+        };
+        assert!(semantic_request_key(&lookup).is_none());
+
+        let parser_backed_lookup = SemanticEdgeLookup {
+            file_path: Some("main.kt"),
+            ..lookup
+        };
+        assert!(semantic_request_key(&parser_backed_lookup).is_some());
+    }
+
+    #[test]
+    fn test_python_dotted_placeholders_do_not_create_semantic_request_keys() {
+        let dotted_identity = format!("2:10:2:14|{}", crate::PYTHON_ATTRIBUTE_CALLSITE_MARKER);
+        let dotted_lookup = SemanticEdgeLookup {
+            edge_kind: EdgeKind::CALL,
+            file_id: Some(1),
+            file_path: Some("workflow.py"),
+            source_name: "run",
+            target_name: "save",
+            callsite_identity: Some(&dotted_identity),
+        };
+        assert!(semantic_request_key(&dotted_lookup).is_none());
+
+        let direct_lookup = SemanticEdgeLookup {
+            target_name: "build_index",
+            callsite_identity: Some("3:5:3:16"),
+            ..dotted_lookup
+        };
+        assert!(semantic_request_key(&direct_lookup).is_some());
+    }
+
+    #[test]
+    fn test_imported_receiver_placeholders_do_not_create_semantic_request_keys() {
+        let receiver_identity = format!(
+            "2:10:2:14|{}Notifier|{}example.com/project/notifier",
+            crate::RECEIVER_OWNER_CALLSITE_PREFIX,
+            crate::RECEIVER_MODULE_CALLSITE_PREFIX
+        );
+        let receiver_lookup = SemanticEdgeLookup {
+            edge_kind: EdgeKind::CALL,
+            file_id: Some(1),
+            file_path: Some("workflow.go"),
+            source_name: "Run",
+            target_name: "Notify",
+            callsite_identity: Some(&receiver_identity),
+        };
+        assert!(semantic_request_key(&receiver_lookup).is_none());
+
+        let owner_only_identity = format!(
+            "2:10:2:14|{}Notifier",
+            crate::RECEIVER_OWNER_CALLSITE_PREFIX
+        );
+        let owner_only_lookup = SemanticEdgeLookup {
+            callsite_identity: Some(&owner_only_identity),
+            ..receiver_lookup
+        };
+        assert!(semantic_request_key(&owner_only_lookup).is_some());
     }
 
     #[test]
@@ -2762,7 +3607,8 @@ mod tests {
                 qualified_name TEXT,
                 canonical_id TEXT,
                 file_node_id INTEGER,
-                start_line INTEGER NOT NULL DEFAULT 0
+                start_line INTEGER NOT NULL DEFAULT 0,
+                start_col INTEGER
             );
             CREATE TABLE edge (
                 id INTEGER PRIMARY KEY,
@@ -2863,7 +3709,8 @@ mod tests {
                 qualified_name TEXT,
                 canonical_id TEXT,
                 file_node_id INTEGER,
-                start_line INTEGER NOT NULL DEFAULT 0
+                start_line INTEGER NOT NULL DEFAULT 0,
+                start_col INTEGER
             );
             CREATE TABLE edge (
                 id INTEGER PRIMARY KEY,
