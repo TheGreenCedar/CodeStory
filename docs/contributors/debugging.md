@@ -50,7 +50,7 @@ Start with:
 - `crates/codestory-store/src/lib.rs`
 - `crates/codestory-store/src/storage_impl/mod.rs`
 - `crates/codestory-store/src/snapshot_store.rs`
-- `crates/codestory-store/src/trail_store.rs`
+- `crates/codestory-store/src/storage_impl/trail.rs`
 
 Check:
 
@@ -76,7 +76,7 @@ Start with:
 
 - `crates/codestory-runtime/src/search/`
 - `crates/codestory-runtime/src/lib.rs`
-- `crates/codestory-store/src/search_doc_store.rs`
+- `crates/codestory-store/src/storage_impl/mod.rs`
 
 Check:
 
@@ -115,7 +115,7 @@ Start with:
 
 - `crates/codestory-runtime/src/lib.rs`
 - `crates/codestory-runtime/src/search/engine.rs`
-- `crates/codestory-store/src/search_doc_store.rs`
+- `crates/codestory-store/src/storage_impl/mod.rs`
 - `docs/testing/codestory-e2e-stats-log.md`
 - `docs/testing/embedding-backend-benchmarks.md`
 
@@ -160,7 +160,7 @@ If `ground --budget max` is the only failing path, check detail-snapshot readine
 
 Start with:
 
-- `crates/codestory-store/src/trail_store.rs`
+- `crates/codestory-store/src/storage_impl/trail.rs`
 - trail DTO mapping in `crates/codestory-runtime/src/lib.rs`
 
 Check:
