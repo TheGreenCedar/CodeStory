@@ -3352,6 +3352,28 @@ function cachePolicyForRun(observations = {}) {
   return observations.cache_prepared ? "prepared-sidecar-cache-read-only" : "unprepared-cache-blocked";
 }
 
+function cachePreparationForRepo(opts, repoName) {
+  const preparation = opts.cachePreparationByRepo;
+  if (preparation instanceof Map) {
+    return preparation.get(repoName) ?? null;
+  }
+  if (Array.isArray(preparation)) {
+    return preparation.find((row) => row?.repo === repoName) ?? null;
+  }
+  return null;
+}
+
+function packetRuntimeCacheObservations(opts, repoName, transportMode) {
+  const cachePreparation = cachePreparationForRepo(opts, repoName);
+  return {
+    codestory_index_commands_observed: 0,
+    indexing_in_timed_run: false,
+    cache_prepared: Boolean(cachePreparation),
+    cache_preparation: cachePreparation,
+    transport_mode: transportMode,
+  };
+}
+
 async function codestoryCacheProvenance(opts, config, observations = {}) {
   let codestoryCli;
   try {
@@ -3954,11 +3976,11 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(opts, repoConfig, {
-    codestory_index_commands_observed: 0,
-    indexing_in_timed_run: false,
-    transport_mode: "cold_cli_packet",
-  });
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    packetRuntimeCacheObservations(opts, task.repo, "cold_cli_packet"),
+  );
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -4102,11 +4124,11 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(opts, repoConfig, {
-    codestory_index_commands_observed: 0,
-    indexing_in_timed_run: false,
-    transport_mode: "warm_stdio_packet",
-  });
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    packetRuntimeCacheObservations(opts, repoName, "warm_stdio_packet"),
+  );
   const client = createStdioClient(
     codestoryCli,
     ["serve", "--project", repoConfig.path, "--stdio", "--refresh", "none"],
@@ -4563,48 +4585,52 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
   const enforcePacketRuntimeTelemetry = Boolean(opts.publishable || opts.enforcePacketRuntimeTelemetry);
   return results
-    .map((row) => {
-      const reasons = [];
+    .flatMap((row) => {
+      const productReasons = [];
+      const harnessReasons = [];
       if (row.status !== "pass") {
-        reasons.push(`status=${row.status}`);
+        productReasons.push(`status=${row.status}`);
       }
       if (!row.quality) {
-        reasons.push("missing manifest quality score");
+        productReasons.push("missing manifest quality score");
       } else if (!row.quality.pass) {
-        reasons.push("manifest quality failed");
+        productReasons.push("manifest quality failed");
       }
       if (row.sufficiency?.sufficient_quality_mismatch) {
-        reasons.push("packet sufficiency says sufficient but manifest quality failed");
+        productReasons.push("packet sufficiency says sufficient but manifest quality failed");
       }
       if (enforcePacketRuntimeTelemetry) {
         if (row.packet_extra_probe_strategy) {
-          reasons.push(`diagnostic packet extra probes used: ${row.packet_extra_probe_strategy}`);
+          harnessReasons.push(`diagnostic packet extra probes used: ${row.packet_extra_probe_strategy}`);
         }
         if (!row.sufficiency) {
-          reasons.push("missing packet sufficiency telemetry");
+          harnessReasons.push("missing packet sufficiency telemetry");
         } else if (row.sufficiency.status !== "sufficient") {
-          reasons.push(`packet sufficiency status=${row.sufficiency.status ?? "unknown"}; expected sufficient`);
+          productReasons.push(`packet sufficiency status=${row.sufficiency.status ?? "unknown"}; expected sufficient`);
         }
         const latency = row.packet_latency;
         if (!latency) {
-          reasons.push("missing packet latency telemetry");
+          harnessReasons.push("missing packet latency telemetry");
         } else {
           if (latency.sla_missed !== false) {
-            reasons.push(`packet retrieval SLA missed=${latency.sla_missed ?? "unknown"}; expected false`);
+            productReasons.push(`packet retrieval SLA missed=${latency.sla_missed ?? "unknown"}; expected false`);
           }
           const shadow = latency.retrieval_shadow;
           if (!shadow) {
-            reasons.push("missing retrieval shadow telemetry");
+            harnessReasons.push("missing retrieval shadow telemetry");
           } else if (shadow.retrieval_mode !== "full") {
-            reasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
+            productReasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
           }
         }
       }
       if (enforceRepoProvenance) {
-        reasons.push(...repoProvenanceBlockers(row));
-        reasons.push(...cacheProvenanceBlockers(row));
+        harnessReasons.push(...repoProvenanceBlockers(row));
+        harnessReasons.push(...cacheProvenanceBlockers(row));
       }
-      return reasons.length ? { result: row, reasons } : null;
+      return [
+        productReasons.length ? { result: row, category: "product", reasons: productReasons } : null,
+        harnessReasons.length ? { result: row, category: "harness-contract", reasons: harnessReasons } : null,
+      ];
     })
     .filter(Boolean);
 }
@@ -4619,7 +4645,8 @@ function packetRuntimeQualityGateRequired(opts = {}) {
 
 function formatPacketRuntimeBlocker(blocker) {
   const row = blocker.result;
-  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`;
+  const category = blocker.category ? `${blocker.category}: ` : "";
+  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${category}${blocker.reasons.join("; ")}`;
 }
 
 function groupTasksByRepo(tasks) {
@@ -5641,6 +5668,21 @@ function runSelfTest() {
     }),
     "already-ready",
   );
+  const packetRuntimePreparation = [
+    {
+      repo: "codestory",
+      retrieval_status: { retrieval_mode: "full" },
+    },
+  ];
+  for (const transportMode of ["cold_cli_packet", "warm_stdio_packet"]) {
+    const observations = packetRuntimeCacheObservations(
+      { cachePreparationByRepo: packetRuntimePreparation },
+      "codestory",
+      transportMode,
+    );
+    assert.equal(cachePolicyForRun(observations), "prepared-sidecar-cache-read-only");
+    assert.equal(observations.cache_preparation, packetRuntimePreparation[0]);
+  }
 
   const plannedAgentRuns = planAgentRuns(
     { arms: ["without_codestory", "with_codestory"], repeats: 1, repos: null },
@@ -6050,6 +6092,7 @@ export {
   materializeRepos,
   parseArgs,
   parseJsonLines,
+  cachePolicyForRun,
   packetComposition,
   packetCommandArgs,
   packetForAgentPrompt,
@@ -6057,6 +6100,7 @@ export {
   packetManifestQualitySummary,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
+  packetRuntimeCacheObservations,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   PACKET_COMPOSITION_WEIGHTS,

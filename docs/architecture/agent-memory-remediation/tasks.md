@@ -2,11 +2,11 @@
 
 ## Phase 1: Fix Promotion Telemetry First
 
-- [ ] 1. Repair packet-runtime cache provenance
-  - [ ] 1.1 Pass `cache_prepared` and `cache_preparation` into `runColdPacketRuntime`.
-  - [ ] 1.2 Pass `cache_prepared` and `cache_preparation` into `runWarmPacketRuntimeGroup`.
-  - [ ] 1.3 Add a script self-test where cache preparation is an array but packet-runtime rows still report `prepared-sidecar-cache-read-only`.
-  - [ ] 1.4 Split publishable blockers into product and harness categories.
+- [x] 1. Repair packet-runtime cache provenance
+  - [x] 1.1 Pass `cache_prepared` and `cache_preparation` into `runColdPacketRuntime`.
+  - [x] 1.2 Pass `cache_prepared` and `cache_preparation` into `runWarmPacketRuntimeGroup`.
+  - [x] 1.3 Add a script self-test where cache preparation is an array but packet-runtime rows still report `prepared-sidecar-cache-read-only`.
+  - [x] 1.4 Split publishable blockers into product and harness categories.
   - _Requirements: 5.1, 5.2, 5.3_
 
 ## Phase 2: Make Sufficiency Consume Flow Requirements

@@ -22,6 +22,7 @@ import {
   parseJsonLines,
   packetComposition,
   packetCommandArgs,
+  packetRuntimeCacheObservations,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
@@ -40,6 +41,7 @@ import {
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
+  cachePolicyForRun,
 } from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
@@ -89,6 +91,26 @@ test("parses packet-runtime benchmark run id", () => {
       ]),
     /--prepare-codestory-jobs must be a positive integer/,
   );
+});
+
+test("packet-runtime cache observations preserve prepared cache provenance", () => {
+  const cachePreparation = [
+    {
+      repo: "codestory",
+      retrieval_status: { retrieval_mode: "full" },
+    },
+  ];
+  const opts = {
+    cachePreparationByRepo: new Map(cachePreparation.map((row) => [row.repo, row])),
+  };
+
+  for (const transportMode of ["cold_cli_packet", "warm_stdio_packet"]) {
+    const observations = packetRuntimeCacheObservations(opts, "codestory", transportMode);
+
+    assert.equal(observations.cache_prepared, true);
+    assert.equal(observations.cache_preparation, cachePreparation[0]);
+    assert.equal(cachePolicyForRun(observations), "prepared-sidecar-cache-read-only");
+  }
 });
 
 test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
@@ -2181,6 +2203,26 @@ test("packet runtime publishable gate rejects diagnostic packet probes", () => {
 
   assert.equal(blockers.length, 1);
   assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
+});
+
+test("packet runtime publishable gate separates product and harness blockers", () => {
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        quality: { pass: false },
+        codestory_cache_provenance: localCacheProvenance({
+          cache_policy: "unprepared-cache-blocked",
+          retrieval_mode: "full",
+        }),
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 2);
+  assert.deepEqual(blockers.map((blocker) => blocker.category), ["product", "harness-contract"]);
+  assert.match(blockers[0].reasons.join("\n"), /manifest quality failed/);
+  assert.match(blockers[1].reasons.join("\n"), /CodeStory sidecar cache was not prepared/);
 });
 
 test("holdout packet runtime requires quality gate unless failures are allowed", () => {
