@@ -811,14 +811,25 @@ fn packet_ineligible_claim_report_entry(claim: &PacketClaimDto, reason: &str) ->
     format!(
         "claim=\"{}\" role=\"{}\" tier=\"{}\" reason=\"{}\"",
         packet_escape_coverage_report_value(&claim.claim),
-        packet_escape_coverage_report_value(
-            packet_claim_coverage_label(claim)
-                .unwrap_or_else(|| "unknown".to_string())
-                .as_str()
-        ),
+        packet_escape_coverage_report_value(packet_claim_ineligible_role_label(claim).as_str()),
         packet_escape_coverage_report_value(packet_claim_tier_label(claim).as_str()),
         packet_escape_coverage_report_value(reason)
     )
+}
+
+fn packet_claim_ineligible_role_label(claim: &PacketClaimDto) -> String {
+    claim
+        .coverage_role
+        .clone()
+        .or_else(|| {
+            claim
+                .citations
+                .iter()
+                .find_map(|citation| packet_evidence_role(citation).map(|role| role.as_str()))
+                .map(str::to_string)
+        })
+        .or_else(|| packet_claim_family(claim).map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn packet_claim_tier_label(claim: &PacketClaimDto) -> String {
@@ -1717,6 +1728,13 @@ mod tests {
                 .contains(&"transform_or_validate".to_string())
         );
         assert_eq!(report.ineligible.len(), 3);
+        assert!(
+            report
+                .ineligible
+                .iter()
+                .all(|entry| entry.contains("role=\"source evidence\"")),
+            "generic HTML diagnostics should preserve source-evidence role labels: {report:?}"
+        );
         assert!(
             report.ineligible.iter().all(|entry| entry.contains(
                 "reason=\"generic navigation/source-evidence claim lacks required coverage role\""
