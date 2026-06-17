@@ -63,7 +63,7 @@ pub(crate) enum CoverageMode {
     DiagnosticOnly,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct FlowRequirement {
     pub id: &'static str,
     pub role: FlowRole,
@@ -110,10 +110,11 @@ pub(crate) fn packet_flow_requirements_for_terms(
     if packet_terms_indicate_sql_schema_flow(terms) {
         requirements.extend_from_slice(SQL_SCHEMA_FLOW);
     }
-    if packet_terms_indicate_html_css_template_structure_flow(terms)
-        || packet_terms_indicate_stylesheet_animation_flow(terms)
-    {
+    if packet_terms_indicate_html_css_template_structure_flow(terms) {
         requirements.extend_from_slice(HTML_CSS_FLOW);
+    }
+    if packet_terms_indicate_stylesheet_animation_flow(terms) {
+        requirements.extend_from_slice(CSS_ANIMATION_FLOW);
     }
     if packet_terms_indicate_form_validation_flow(terms) {
         requirements.extend_from_slice(FORM_VALIDATION_FLOW);
@@ -277,9 +278,28 @@ const HTML_CSS_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+const CSS_ANIMATION_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "css_animation_entrypoint",
+        role: FlowRole::Entrypoint,
+        query_seeds: &["animation stylesheet entrypoint", "css animation imports"],
+        coverage_mode: CoverageMode::AllowsLexicalSource,
+    },
+    FlowRequirement {
+        id: "css_animation_structure",
+        role: FlowRole::Configuration,
+        query_seeds: &[
+            "css animation variables",
+            "css animation base class",
+            "css animation keyframes",
+        ],
+        coverage_mode: CoverageMode::AllowsLexicalSource,
+    },
+];
+
 const FORM_VALIDATION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
-        id: "form_constraints",
+        id: "form_native_constraints",
         role: FlowRole::TransformOrValidate,
         query_seeds: &[
             "native form constraints",
@@ -289,9 +309,15 @@ const FORM_VALIDATION_FLOW: &[FlowRequirement] = &[
         coverage_mode: CoverageMode::AllowsLexicalSource,
     },
     FlowRequirement {
-        id: "form_submit",
+        id: "form_custom_validation",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["custom validation", "custom error rendering"],
+        coverage_mode: CoverageMode::AllowsLexicalSource,
+    },
+    FlowRequirement {
+        id: "form_submit_guard",
         role: FlowRole::TerminalBoundary,
-        query_seeds: &["submit prevent default", "custom error rendering"],
+        query_seeds: &["submit prevent default", "submit invalid guard"],
         coverage_mode: CoverageMode::AllowsLexicalSource,
     },
 ];

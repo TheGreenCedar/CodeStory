@@ -19,9 +19,10 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_url_session_request_flow,
 };
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto, GraphArtifactDto,
-    PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto,
-    PacketEvidenceTierDto, PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto,
+    GraphArtifactDto, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto,
+    PacketCoverageReportDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -116,14 +117,14 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
     let has_minimum_claim_families =
         packet_has_minimum_claim_family_coverage(task_class, &sufficiency_claims);
-    let missing_required_flow_roles =
-        packet_missing_required_flow_roles(question, task_class, &sufficiency_claims);
-    let has_required_flow_roles = missing_required_flow_roles.is_empty();
+    let missing_required_flow_requirements =
+        packet_missing_required_flow_requirements(question, task_class, &sufficiency_claims);
+    let has_required_flow_roles = missing_required_flow_requirements.is_empty();
     let blocking_missing_probe_queries = packet_blocking_missing_probe_queries(
         question,
         task_class,
         &missing_required_probe_queries,
-        &missing_required_flow_roles,
+        &missing_required_flow_requirements,
     );
     let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
         answer,
@@ -162,7 +163,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_required_flow_roles,
         has_sufficiency_blocking_budget_omission,
         &blocking_missing_probe_queries,
-        &missing_required_flow_roles,
+        &missing_required_flow_requirements,
         &unresolved_sidecar_queries,
     );
     let follow_up_probe_queries = if blocking_missing_probe_queries.is_empty() {
@@ -182,7 +183,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         &supported_claims,
         &sufficiency_claims,
         &flow_context,
-        &missing_required_flow_roles,
+        &missing_required_flow_requirements,
         &unresolved_sidecar_queries,
         budget,
         has_sufficiency_blocking_budget_omission,
@@ -290,7 +291,7 @@ fn packet_sufficiency_gaps(
     has_required_flow_roles: bool,
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &[String],
-    missing_required_flow_roles: &[FlowRole],
+    missing_required_flow_requirements: &[FlowRequirement],
     unresolved_sidecar_queries: &[String],
 ) -> Vec<String> {
     let mut gaps = Vec::new();
@@ -325,13 +326,13 @@ fn packet_sufficiency_gaps(
         ));
     }
     if !answer.citations.is_empty() && !has_required_flow_roles {
-        let missing_labels = missing_required_flow_roles
+        let missing_labels = missing_required_flow_requirements
             .iter()
-            .map(|role| role.label())
+            .map(flow_requirement_missing_label)
             .collect::<Vec<_>>()
             .join(", ");
         gaps.push(format!(
-            "{:?} packet missed required flow-role coverage: {}.",
+            "{:?} packet missed required structural coverage: {}.",
             task_class, missing_labels
         ));
     }
@@ -694,7 +695,7 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
 }
 
 pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
-    packet_claim_ineligibility_reason(claim, false).is_none()
+    packet_claim_ineligibility_reason(claim, false, false).is_none()
 }
 
 fn packet_claim_can_satisfy_sufficiency_in_context(
@@ -704,18 +705,24 @@ fn packet_claim_can_satisfy_sufficiency_in_context(
     let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
     let carries_required_role =
         flow_context.claim_carries_required_role(claim, !generic_navigation);
-    packet_claim_ineligibility_reason(claim, carries_required_role).is_none()
+    let structural_policy_admitted = flow_context.claim_has_structural_policy_admission(claim);
+    packet_claim_ineligibility_reason(claim, carries_required_role, structural_policy_admitted)
+        .is_none()
 }
 
 fn packet_claim_ineligibility_reason(
     claim: &PacketClaimDto,
     carries_required_role: bool,
+    structural_policy_admitted: bool,
 ) -> Option<&'static str> {
     let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
-    if claim.eligible_for_sufficiency == Some(false) {
+    if claim.eligible_for_sufficiency == Some(false) && !structural_policy_admitted {
         return Some("claim marked diagnostic");
     }
-    if !claim.citations.is_empty() && !claim.citations.iter().any(citation_sufficiency_eligible) {
+    if !claim.citations.is_empty()
+        && !claim.citations.iter().any(citation_sufficiency_eligible)
+        && !structural_policy_admitted
+    {
         return Some("citation evidence is diagnostic-only");
     }
     if generic_navigation && !carries_required_role {
@@ -751,7 +758,7 @@ fn packet_coverage_report(
     supported_claims: &[PacketClaimDto],
     sufficiency_claims: &[PacketClaimDto],
     flow_context: &PacketFlowContext,
-    missing_required_flow_roles: &[FlowRole],
+    missing_required_flow_requirements: &[FlowRequirement],
     unresolved_sidecar_queries: &[String],
     budget: &PacketBudgetDto,
     has_sufficiency_blocking_budget_omission: bool,
@@ -768,15 +775,21 @@ fn packet_coverage_report(
             let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
             let carries_required_role =
                 flow_context.claim_carries_required_role(claim, !generic_navigation);
-            packet_claim_ineligibility_reason(claim, carries_required_role)
-                .map(|reason| packet_ineligible_claim_report_entry(claim, reason))
+            let structural_policy_admitted =
+                flow_context.claim_has_structural_policy_admission(claim);
+            packet_claim_ineligibility_reason(
+                claim,
+                carries_required_role,
+                structural_policy_admitted,
+            )
+            .map(|reason| packet_ineligible_claim_report_entry(claim, reason))
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let missing = missing_required_flow_roles
+    let missing = missing_required_flow_requirements
         .iter()
-        .map(|role| role.role_id().to_string())
+        .map(|requirement| requirement.id.to_string())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -862,6 +875,7 @@ fn packet_escape_coverage_report_value(value: &str) -> String {
 }
 
 struct PacketFlowContext {
+    requirements: Vec<FlowRequirement>,
     required_roles: Vec<FlowRole>,
     site_build_flow: bool,
     mapper_flow: bool,
@@ -881,6 +895,7 @@ impl PacketFlowContext {
         let question_terms = packet_probe_terms(question);
         let requirements = packet_flow_requirements_for_terms(&question_terms, task_class);
         Self {
+            requirements: requirements.clone(),
             required_roles: packet_required_flow_roles(&requirements),
             site_build_flow: packet_terms_indicate_site_build_phase_flow(&question_terms),
             mapper_flow: packet_terms_indicate_mapper_configuration_plan_flow(&question_terms),
@@ -913,7 +928,24 @@ impl PacketFlowContext {
         if self.required_roles.is_empty() {
             return false;
         }
-        if self.claim_declares_required_role(claim) {
+        self.requirements.iter().any(|requirement| {
+            self.claim_satisfies_requirement(claim, requirement, include_generic_fallback_roles)
+        })
+    }
+
+    fn claim_satisfies_requirement(
+        &self,
+        claim: &PacketClaimDto,
+        requirement: &FlowRequirement,
+        include_generic_fallback_roles: bool,
+    ) -> bool {
+        if StructuralLanguagePolicy::claim_satisfies_requirement(requirement, claim) {
+            return true;
+        }
+        if StructuralLanguagePolicy::requires_specific_proof(requirement) {
+            return false;
+        }
+        if self.claim_declares_requirement_role(claim, requirement) {
             return true;
         }
         let claim_roles = packet_flow_roles_for_claim(
@@ -931,20 +963,151 @@ impl PacketFlowContext {
             self.string_predicate_flow,
             include_generic_fallback_roles,
         );
-        claim_roles
-            .iter()
-            .any(|claim_role| self.required_roles.contains(claim_role))
+        claim_roles.contains(&requirement.role)
     }
 
-    fn claim_declares_required_role(&self, claim: &PacketClaimDto) -> bool {
+    fn claim_has_structural_policy_admission(&self, claim: &PacketClaimDto) -> bool {
+        self.requirements.iter().any(|requirement| {
+            StructuralLanguagePolicy::admits_diagnostic_evidence(requirement, claim)
+        })
+    }
+
+    fn claim_declares_requirement_role(
+        &self,
+        claim: &PacketClaimDto,
+        requirement: &FlowRequirement,
+    ) -> bool {
         let Some(role_label) = claim.coverage_role.as_deref() else {
             return false;
         };
         let normalized = normalize_identifier(role_label);
-        self.required_roles.iter().any(|role| {
-            normalized == normalize_identifier(role.role_id())
-                || normalized == normalize_identifier(role.label())
-        })
+        normalized == normalize_identifier(requirement.role_id())
+            || normalized == normalize_identifier(requirement.role.label())
+    }
+}
+
+struct StructuralLanguagePolicy;
+
+impl StructuralLanguagePolicy {
+    fn requires_specific_proof(requirement: &FlowRequirement) -> bool {
+        matches!(
+            requirement.id,
+            "sql_tables"
+                | "sql_relationships"
+                | "form_native_constraints"
+                | "form_custom_validation"
+                | "form_submit_guard"
+                | "css_animation_entrypoint"
+                | "css_animation_structure"
+        )
+    }
+
+    fn claim_satisfies_requirement(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
+        let normalized = normalize_identifier(&claim.claim);
+        match requirement.id {
+            "sql_tables" => {
+                Self::claim_text_names_sql_tables(&normalized)
+                    || claim.citations.iter().any(Self::citation_is_sql_table)
+            }
+            "sql_relationships" => {
+                Self::claim_text_names_sql_relationships(&normalized)
+                    || claim
+                        .citations
+                        .iter()
+                        .any(Self::citation_is_sql_relationship)
+            }
+            "form_native_constraints" => Self::claim_text_names_native_constraints(&normalized),
+            "form_custom_validation" => Self::claim_text_names_custom_validation(&normalized),
+            "form_submit_guard" => Self::claim_text_names_submit_guard(&normalized),
+            "css_animation_entrypoint" => {
+                normalized.contains("animationstylesheetentrypoint")
+                    || (normalized.contains("imports") && normalized.contains("animationfiles"))
+            }
+            "css_animation_structure" => {
+                normalized.contains("baseclass")
+                    || normalized.contains("animationname")
+                    || normalized.contains("matchingkeyframes")
+                    || normalized.contains("customproperties")
+                    || normalized.contains("duration")
+                    || normalized.contains("delay")
+                    || normalized.contains("repeat")
+                    || normalized.contains("keyframes")
+            }
+            _ => false,
+        }
+    }
+
+    fn admits_diagnostic_evidence(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
+        matches!(requirement.id, "sql_tables" | "sql_relationships")
+            && claim.citations.iter().any(|citation| {
+                Self::citation_is_sql_source_scan(citation)
+                    && match requirement.id {
+                        "sql_tables" => Self::citation_is_sql_table(citation),
+                        "sql_relationships" => Self::citation_is_sql_relationship(citation),
+                        _ => false,
+                    }
+            })
+    }
+
+    fn citation_is_sql_source_scan(citation: &AgentCitationDto) -> bool {
+        citation.evidence_tier == Some(PacketEvidenceTierDto::SyntheticSourceScan)
+            && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+    }
+
+    fn citation_is_sql_table(citation: &AgentCitationDto) -> bool {
+        packet_evidence_role(citation) == Some(PacketEvidenceRole::SqlTableDefinition)
+    }
+
+    fn citation_is_sql_relationship(citation: &AgentCitationDto) -> bool {
+        packet_evidence_role(citation) == Some(PacketEvidenceRole::SqlRelationshipConstraint)
+    }
+
+    fn claim_text_names_sql_tables(normalized: &str) -> bool {
+        normalized.contains("sqlschema")
+            && (normalized.contains("definestables")
+                || normalized.contains("tables")
+                || normalized.contains("createtable"))
+    }
+
+    fn claim_text_names_sql_relationships(normalized: &str) -> bool {
+        normalized.contains("rowsreference")
+            || normalized.contains("foreignkey")
+            || (normalized.contains("reference") && normalized.contains("rows"))
+    }
+
+    fn claim_text_names_native_constraints(normalized: &str) -> bool {
+        (normalized.contains("native")
+            || normalized.contains("constraint")
+            || normalized.contains("constraints")
+            || normalized.contains("formvalidationexamples"))
+            && contains_any(normalized, &["required", "pattern", "min", "max"])
+    }
+
+    fn claim_text_names_custom_validation(normalized: &str) -> bool {
+        normalized.contains("custom")
+            && contains_any(
+                normalized,
+                &[
+                    "validation",
+                    "validity",
+                    "validitystate",
+                    "error",
+                    "errors",
+                    "message",
+                    "messages",
+                    "browser",
+                    "defaultui",
+                    "ui",
+                ],
+            )
+    }
+
+    fn claim_text_names_submit_guard(normalized: &str) -> bool {
+        normalized.contains("submit")
+            && contains_any(
+                normalized,
+                &["prevent", "prevents", "submission", "invalid"],
+            )
     }
 }
 
@@ -953,36 +1116,44 @@ fn packet_missing_required_flow_roles(
     task_class: PacketTaskClassDto,
     supported_claims: &[PacketClaimDto],
 ) -> Vec<FlowRole> {
+    let missing = packet_missing_required_flow_requirements(question, task_class, supported_claims);
+    packet_missing_requirement_roles(&missing)
+}
+
+fn packet_missing_required_flow_requirements(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    supported_claims: &[PacketClaimDto],
+) -> Vec<FlowRequirement> {
     let flow_context = PacketFlowContext::new(question, task_class);
-    if flow_context.required_roles.is_empty() {
-        return Vec::new();
-    }
-    let mut covered = HashSet::new();
-    for claim in supported_claims {
-        for role in packet_flow_roles_for_claim(
-            claim,
-            flow_context.site_build_flow,
-            flow_context.mapper_flow,
-            flow_context.shell_install_dispatch_flow,
-            flow_context.url_session_request_flow,
-            flow_context.form_validation_flow,
-            flow_context.server_request_dispatch_flow,
-            flow_context.html_css_template_structure_flow,
-            flow_context.stylesheet_animation_flow,
-            flow_context.sql_schema_flow,
-            flow_context.runtime_formatting_flow,
-            flow_context.string_predicate_flow,
-            true,
-        ) {
-            covered.insert(role);
-        }
-    }
     flow_context
-        .required_roles
+        .requirements
         .iter()
         .copied()
-        .filter(|role| !covered.contains(role))
+        .filter(|requirement| flow_requirement_blocks_sufficiency(requirement))
+        .filter(|requirement| {
+            !supported_claims
+                .iter()
+                .any(|claim| flow_context.claim_satisfies_requirement(claim, requirement, true))
+        })
         .collect()
+}
+
+fn packet_missing_requirement_roles(requirements: &[FlowRequirement]) -> Vec<FlowRole> {
+    let mut roles = Vec::new();
+    for requirement in requirements {
+        if !roles
+            .iter()
+            .any(|role: &FlowRole| role.role_id() == requirement.role_id())
+        {
+            roles.push(requirement.role);
+        }
+    }
+    roles
+}
+
+fn flow_requirement_missing_label(requirement: &FlowRequirement) -> String {
+    format!("{} ({})", requirement.id, requirement.role.label())
 }
 
 fn packet_required_flow_roles(requirements: &[FlowRequirement]) -> Vec<FlowRole> {
@@ -1009,22 +1180,22 @@ fn packet_blocking_missing_probe_queries(
     question: &str,
     task_class: PacketTaskClassDto,
     missing_required_probe_queries: &[String],
-    missing_required_flow_roles: &[FlowRole],
+    missing_required_flow_requirements: &[FlowRequirement],
 ) -> Vec<String> {
-    if missing_required_probe_queries.is_empty() || missing_required_flow_roles.is_empty() {
+    if missing_required_probe_queries.is_empty() || missing_required_flow_requirements.is_empty() {
         return Vec::new();
     }
 
-    let missing_role_ids = missing_required_flow_roles
+    let missing_requirement_ids = missing_required_flow_requirements
         .iter()
-        .map(|role| role.role_id())
+        .map(|requirement| requirement.id)
         .collect::<HashSet<_>>();
     let question_terms = packet_probe_terms(question);
     let blocking_query_seeds = packet_flow_requirements_for_terms(&question_terms, task_class)
         .into_iter()
         .filter(|requirement| {
             flow_requirement_blocks_sufficiency(requirement)
-                && missing_role_ids.contains(requirement.role_id())
+                && missing_requirement_ids.contains(requirement.id)
         })
         .flat_map(|requirement| requirement.query_seeds.iter().copied())
         .collect::<HashSet<_>>();
@@ -1583,6 +1754,11 @@ mod tests {
         let mut citation = cited_anchor(name);
         citation.file_path = Some(file_path.to_string());
         citation.evidence_tier = Some(tier);
+        citation.resolution_status = Some(if tier == PacketEvidenceTierDto::SyntheticSourceScan {
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        } else {
+            PacketEvidenceResolutionDto::Resolved
+        });
         citation.eligible_for_sufficiency = eligible_for_sufficiency;
         citation
     }
@@ -1723,8 +1899,14 @@ mod tests {
         assert!(
             report
                 .missing
-                .contains(&"transform_or_validate".to_string())
+                .contains(&"form_native_constraints".to_string())
         );
+        assert!(
+            report
+                .missing
+                .contains(&"form_custom_validation".to_string())
+        );
+        assert!(report.missing.contains(&"form_submit_guard".to_string()));
         assert_eq!(report.ineligible.len(), 3);
         assert!(
             report
@@ -1835,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_structural_claims_can_cover_roles_while_generic_source_scan_stays_diagnostic() {
+    fn sql_synthetic_source_scan_table_and_foreign_key_cover_schema_requirements() {
         let question = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
         let answer = answer_fixture(question);
         let budget = budget_fixture();
@@ -1844,23 +2026,23 @@ mod tests {
                 "SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine.",
                 Some("source evidence"),
                 cited_anchor_with_tier(
-                    "CreateTableArtist",
+                    "CREATE TABLE Artist",
                     "schema.sql",
-                    PacketEvidenceTierDto::ResolvedGraph,
-                    Some(true),
+                    PacketEvidenceTierDto::SyntheticSourceScan,
+                    Some(false),
                 ),
-                Some(true),
+                Some(false),
             ),
             cited_claim(
                 "Track rows reference Album, Genre, and MediaType rows.",
                 Some("source evidence"),
                 cited_anchor_with_tier(
-                    "ForeignKeyTrackAlbum",
+                    "FOREIGN KEY",
                     "schema.sql",
-                    PacketEvidenceTierDto::ResolvedGraph,
-                    Some(true),
+                    PacketEvidenceTierDto::SyntheticSourceScan,
+                    Some(false),
                 ),
-                Some(true),
+                Some(false),
             ),
             cited_claim(
                 "`schema.sql` in `schema.sql` ties sql schema in this flow to cited definitions and adjacent ownership.",
@@ -1892,11 +2074,11 @@ mod tests {
             report
                 .covered
                 .contains(&"sql table definitions".to_string()),
-            "source-evidence-labelled SQL table text should report the concrete role: {report:?}"
+            "source-scan SQL table text should report the concrete role: {report:?}"
         );
         assert!(
             report.covered.contains(&"sql relationships".to_string()),
-            "source-evidence-labelled SQL relationship text should report the concrete role: {report:?}"
+            "source-scan SQL relationship text should report the concrete role: {report:?}"
         );
         assert!(
             !report.covered.contains(&"source evidence".to_string()),
@@ -1907,7 +2089,51 @@ mod tests {
         assert!(report.ineligible[0].contains("tier=\"synthetic_source_scan\""));
         assert!(
             report.ineligible[0].contains("reason=\"claim marked diagnostic\""),
-            "synthetic SQL source-scan evidence should remain diagnostic until Task 4 structural policy: {report:?}"
+            "plain SQL source-scan file evidence should remain diagnostic: {report:?}"
+        );
+    }
+
+    #[test]
+    fn synthetic_source_scan_stays_nonproof_for_non_structural_requirements() {
+        let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+            ),
+            claim("Runtime formatting writes formatted output through output iterator helpers."),
+            cited_claim(
+                "SQL schema defines tables Artist and Album.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "CREATE TABLE Artist",
+                    "schema.sql",
+                    PacketEvidenceTierDto::SyntheticSourceScan,
+                    Some(false),
+                ),
+                Some(false),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert_eq!(report.ineligible.len(), 1);
+        assert!(report.ineligible[0].contains("tier=\"synthetic_source_scan\""));
+        assert!(
+            report.ineligible[0].contains("reason=\"claim marked diagnostic\""),
+            "synthetic source-scan evidence should not become proof outside SQL structural requirements: {report:?}"
         );
     }
 
@@ -1951,6 +2177,108 @@ mod tests {
     }
 
     #[test]
+    fn form_validation_native_and_submit_without_custom_is_partial() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "The form validation examples use native required, pattern, min, and max constraints.",
+            ),
+            claim("Submit handlers prevent submission when the form is invalid."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report
+                .missing
+                .contains(&"form_custom_validation".to_string()),
+            "native constraints plus submit guard should still require custom validation: {report:?}"
+        );
+    }
+
+    #[test]
+    fn form_validation_custom_and_submit_without_native_is_partial() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "A custom validation example applies script-driven validity checks before rendering messages.",
+            ),
+            claim("Submit handlers prevent submission when the form is invalid."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report
+                .missing
+                .contains(&"form_native_constraints".to_string()),
+            "custom validation plus submit guard should still require native constraints: {report:?}"
+        );
+    }
+
+    #[test]
+    fn form_validation_native_custom_and_submit_is_sufficient() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "The form validation examples use native required, pattern, min, and max constraints.",
+            ),
+            claim(
+                "A custom validation example applies script-driven validity checks before rendering messages.",
+            ),
+            claim("Submit handlers prevent submission when the form is invalid."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report.missing.is_empty()),
+            "all three form proof slots should satisfy the form-validation flow: {sufficiency:?}"
+        );
+    }
+
+    #[test]
     fn missing_flow_role_keeps_matching_probe_query_blocking() {
         let question = "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.";
         let answer = answer_fixture(question);
@@ -1976,7 +2304,7 @@ mod tests {
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         let report = sufficiency.coverage_report.as_ref().unwrap();
-        assert!(report.missing.iter().any(|gap| gap == "registration"));
+        assert!(report.missing.iter().any(|gap| gap == "request_entrypoint"));
         assert!(!report.missing.iter().any(|gap| gap == "route registration"));
         assert!(
             sufficiency
@@ -2018,7 +2346,7 @@ mod tests {
 
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         let report = sufficiency.coverage_report.as_ref().unwrap();
-        assert!(report.missing.iter().any(|gap| gap == "error_or_fallback"));
+        assert!(report.missing.iter().any(|gap| gap == "format_errors"));
         assert!(!report.missing.iter().any(|gap| gap == "format error"));
         assert!(
             sufficiency
@@ -2116,6 +2444,78 @@ mod tests {
         assert!(
             missing.is_empty(),
             "HTML/CSS template prompts should use structural app-shell/style roles: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn css_animation_prompt_with_animation_evidence_does_not_require_html_app_shell() {
+        let question = "Explain how a stylesheet defines shared animation variables, base classes, and connects named animation classes to keyframes.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "The animation stylesheet entrypoint imports variable, base, and animation files.",
+            ),
+            claim(
+                "Shared CSS custom properties define animation duration, delay, and repeat defaults.",
+            ),
+            claim(
+                "The base class applies animation duration and fill mode, while named classes set animation-name to matching keyframes.",
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            !report.missing.contains(&"html_app_shell".to_string()),
+            "CSS animation prompts should not inherit HTML app-shell requirements: {report:?}"
+        );
+    }
+
+    #[test]
+    fn generic_html_css_template_prompt_still_requires_app_shell_plus_css_structure() {
+        let question = "Explain how the HTML app shell and CSS structure split template selectors, theme defaults, and interactive element styling.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "main.css owns :root typography, color-scheme, smoothing, and body layout defaults.",
+            ),
+            claim("CSS app container rules constrain mounted content and center it with padding."),
+            claim("CSS interaction selectors define hover, focus, and transition behavior."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.contains(&"html_app_shell".to_string()),
+            "generic HTML/CSS prompts should still require app-shell evidence: {report:?}"
+        );
+        assert!(
+            !report.missing.contains(&"css_structure".to_string()),
+            "CSS structure evidence should cover the stylesheet side of the template prompt: {report:?}"
         );
     }
 

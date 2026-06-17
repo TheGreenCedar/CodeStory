@@ -26,11 +26,11 @@
 
 ## Phase 3: Add Structural Language Policy
 
-- [ ] 4. Add structural proof rules
-  - [ ] 4.1 Add a narrow `StructuralLanguagePolicy` helper.
-  - [ ] 4.2 Allow SQL source-scan table and foreign-key roles to satisfy schema coverage.
-  - [ ] 4.3 Require HTML native constraint, custom validation, and submit guard roles for form-validation prompts.
-  - [ ] 4.4 Split CSS animation roles from HTML app-shell roles.
+- [x] 4. Add structural proof rules
+  - [x] 4.1 Add a narrow `StructuralLanguagePolicy` helper.
+  - [x] 4.2 Allow SQL source-scan table and foreign-key roles to satisfy schema coverage.
+  - [x] 4.3 Require HTML native constraint, custom validation, and submit guard roles for form-validation prompts.
+  - [x] 4.4 Split CSS animation roles from HTML app-shell roles.
   - _Requirements: 2.1, 2.2, 2.3_
 
 ## Phase 4: Improve Source-Backed Claims Without Fixture Text
