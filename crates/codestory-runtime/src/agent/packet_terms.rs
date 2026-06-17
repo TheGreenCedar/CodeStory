@@ -123,10 +123,12 @@ fn packet_terms_have_specific_flow_anchor(terms: &[String]) -> bool {
         || ((has("indexing") || has("indexer")) && (has("storage") || has("persistent")))
         || ((has("json") || has("jsonl")) && (has("exec") || has("thread") || has("turn")))
         || packet_terms_indicate_request_dispatch_flow(terms)
+        || packet_terms_indicate_server_request_dispatch_flow(terms)
         || packet_terms_indicate_server_route_dispatch_flow(terms)
         || packet_terms_indicate_buffered_io_flow(terms)
         || packet_terms_indicate_site_build_phase_flow(terms)
         || packet_terms_indicate_form_validation_flow(terms)
+        || packet_terms_indicate_html_css_template_structure_flow(terms)
         || packet_terms_indicate_shell_install_dispatch_flow(terms)
         || (has("event") && has("loop"))
         || (has_any(&["command", "commands"]) && has_any(&["dispatch", "dispatches"]))
@@ -230,7 +232,10 @@ pub(crate) fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> b
         "interceptors",
         "transport",
     ]);
-    if packet_terms_indicate_server_route_dispatch_flow(terms) && !explicit_client_transport {
+    if (packet_terms_indicate_server_route_dispatch_flow(terms)
+        || packet_terms_indicate_server_request_dispatch_flow(terms))
+        && !explicit_client_transport
+    {
         return false;
     }
     let has_compound_request_dispatch = terms.iter().any(|term| {
@@ -241,6 +246,25 @@ pub(crate) fn packet_terms_indicate_request_dispatch_flow(terms: &[String]) -> b
         || has_compound_request_dispatch
         || ((has("request") || has("http"))
             && has_any(&["adapter", "adapters", "dispatch", "dispatches", "transport"]))
+}
+
+pub(crate) fn packet_terms_indicate_server_request_dispatch_flow(terms: &[String]) -> bool {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    let server_or_protocol = has_any(&["wsgi", "asgi", "server", "servers"]);
+    let request_flow = has_any(&["request", "requests"]) && has_any(&["dispatch", "dispatches"]);
+    let handler_or_view = has_any(&[
+        "handler",
+        "handlers",
+        "handling",
+        "view",
+        "views",
+        "context",
+        "response",
+        "responses",
+    ]);
+
+    (server_or_protocol && has_any(&["request", "requests"]) && handler_or_view)
+        || (request_flow && has_any(&["server", "view", "views", "context", "response"]))
 }
 
 pub(crate) fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
@@ -257,6 +281,43 @@ pub(crate) fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String])
         && (has("request")
             || has_any(&["server", "incoming", "http"])
             || has_any(&["engine", "method", "methods"]))
+}
+
+pub(crate) fn packet_terms_indicate_javascript_route_source_flow(terms: &[String]) -> bool {
+    packet_terms_indicate_server_route_dispatch_flow(terms)
+        && packet_terms_have_any(
+            terms,
+            &[
+                "application",
+                "applications",
+                "express",
+                "javascript",
+                "js",
+                "middleware",
+                "response",
+                "responses",
+                "helper",
+                "helpers",
+            ],
+        )
+}
+
+pub(crate) fn packet_terms_indicate_route_tree_dispatch_flow(terms: &[String]) -> bool {
+    packet_terms_indicate_server_route_dispatch_flow(terms)
+        && packet_terms_have_any(
+            terms,
+            &[
+                "engine",
+                "engines",
+                "group",
+                "groups",
+                "method",
+                "methods",
+                "tree",
+                "trees",
+                "routergroup",
+            ],
+        )
 }
 
 pub(crate) fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
@@ -296,7 +357,11 @@ pub(crate) fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> b
 pub(crate) fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let logger_or_log_call = has_any(&["log", "logger", "logging", "message", "messages"]);
-    let record_intent = has_any(&["record", "records", "logrecord", "logrecords"]);
+    let compound_log_record_intent = terms.iter().any(|term| {
+        let lower = term.to_ascii_lowercase();
+        lower.contains("log") && lower.contains("record")
+    });
+    let record_intent = has_any(&["record", "records"]) || compound_log_record_intent;
     let handler_intent = has_any(&[
         "handler",
         "handlers",
@@ -413,6 +478,30 @@ pub(crate) fn packet_terms_indicate_stylesheet_animation_flow(terms: &[String]) 
     css_signal && animation_signal && source_shape_signal
 }
 
+pub(crate) fn packet_terms_indicate_html_css_template_structure_flow(terms: &[String]) -> bool {
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    let html_signal = has("html") || has_any(&["markup", "document", "shell"]);
+    let css_signal =
+        has("css") || has_any(&["style", "styles", "styling", "stylesheet", "stylesheets"]);
+    let structure_signal = has_any(&[
+        "app",
+        "element",
+        "elements",
+        "interactive",
+        "layout",
+        "selector",
+        "selectors",
+        "shared",
+        "structure",
+        "template",
+        "templates",
+        "theme",
+    ]);
+
+    html_signal && css_signal && structure_signal
+}
+
 pub(crate) fn packet_terms_indicate_sql_schema_flow(terms: &[String]) -> bool {
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     has_any(&["sql", "schema", "schemas", "table", "tables"])
@@ -481,7 +570,7 @@ pub(crate) fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bo
         && (has_any(&["constraint", "constraints", "native"])
             || has_any(&["custom", "javascript", "script", "scripts", "js"])
             || has("pattern")
-            || has_any(&["required", "min", "max", "novalidate"]))
+            || has_any(&["required", "min", "max"]))
 }
 
 pub(crate) fn packet_terms_indicate_event_loop_command_flow(terms: &[String]) -> bool {
@@ -513,7 +602,21 @@ pub(crate) fn packet_terms_indicate_event_loop_command_flow(terms: &[String]) ->
 }
 
 pub(crate) fn packet_terms_indicate_url_session_request_flow(terms: &[String]) -> bool {
-    packet_terms_have_any(terms, &["session", "urlsession", "callback", "callbacks"])
+    let explicit_url_session_lifecycle = packet_terms_have_any(
+        terms,
+        &[
+            "callback",
+            "callbacks",
+            "resume",
+            "resumes",
+            "swift",
+            "task",
+            "tasks",
+            "urlsession",
+        ],
+    );
+    explicit_url_session_lifecycle
+        && packet_terms_have_any(terms, &["session", "urlsession"])
         && packet_terms_have_any(
             terms,
             &[
@@ -644,6 +747,64 @@ mod tests {
             "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
         );
         assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+    }
+
+    #[test]
+    fn url_session_prompts_require_explicit_lifecycle_terms() {
+        let swift_terms = packet_probe_terms(
+            "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.",
+        );
+        assert!(packet_terms_indicate_url_session_request_flow(&swift_terms));
+
+        let python_terms = packet_probe_terms(
+            "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.",
+        );
+        assert!(!packet_terms_indicate_url_session_request_flow(
+            &python_terms
+        ));
+    }
+
+    #[test]
+    fn route_tree_prompts_are_distinct_from_javascript_route_sources() {
+        let express_terms = packet_probe_terms(
+            "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
+        );
+        assert!(packet_terms_indicate_server_route_dispatch_flow(
+            &express_terms
+        ));
+        assert!(packet_terms_indicate_javascript_route_source_flow(
+            &express_terms
+        ));
+        assert!(!packet_terms_indicate_route_tree_dispatch_flow(
+            &express_terms
+        ));
+
+        let gin_terms = packet_probe_terms(
+            "Trace how Gin creates an engine, registers routes through router groups, stores them in method trees, and dispatches handlers for a request.",
+        );
+        assert!(packet_terms_indicate_server_route_dispatch_flow(&gin_terms));
+        assert!(packet_terms_indicate_route_tree_dispatch_flow(&gin_terms));
+    }
+
+    #[test]
+    fn server_request_dispatch_prompts_do_not_activate_client_transport() {
+        let terms = packet_probe_terms(
+            "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.",
+        );
+
+        assert!(packet_terms_indicate_server_request_dispatch_flow(&terms));
+        assert!(!packet_terms_indicate_request_dispatch_flow(&terms));
+    }
+
+    #[test]
+    fn html_css_template_structure_prompts_are_detected() {
+        let terms = packet_probe_terms(
+            "Explain how an HTML app shell and CSS structure split template selectors, theme defaults, and interactive element styling.",
+        );
+
+        assert!(packet_terms_indicate_html_css_template_structure_flow(
+            &terms
+        ));
     }
 
     #[test]

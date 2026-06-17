@@ -42,7 +42,8 @@ use crate::agent::packet_plan::{
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
 use crate::agent::packet_required_probes::{
     PacketFileScopedSymbolProbe, packet_file_scoped_symbol_probe_parts,
-    packet_probe_query_is_cited, packet_sufficiency_required_probe_queries_with_extra,
+    packet_probe_file_name_matches, packet_probe_query_is_cited,
+    packet_sufficiency_required_probe_queries_with_extra,
 };
 #[cfg(test)]
 use crate::agent::packet_scoring::packet_citation_key;
@@ -532,6 +533,7 @@ fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
             | "pattern"
             | "javascriptvalidation"
             | "customvalidation"
+            | "customvalidationflow"
             | "formvalidationbypass"
             | "validitystate"
             | "mapperconfiguration"
@@ -1271,7 +1273,7 @@ fn packet_required_probe_source_path(
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if file_name == parts.file_name {
+        if packet_probe_file_name_matches(&parts.file_name, &file_name) {
             return Some(std::path::PathBuf::from(path));
         }
     }
@@ -1309,7 +1311,7 @@ fn packet_find_unique_source_file_by_name(
                 }
                 continue;
             }
-            if entry_name.eq_ignore_ascii_case(file_name) {
+            if packet_probe_file_name_matches(file_name, &entry_name) {
                 if found.is_some() {
                     return None;
                 }
@@ -3902,7 +3904,7 @@ mod tests {
             &[],
         );
         let extra_probes = packet_plan_sufficiency_extra_probes(&plan, &[]);
-        for expected in ["pattern", "form validation bypass", "validity state"] {
+        for expected in ["pattern", "custom validation flow", "validity state"] {
             assert!(
                 extra_probes.iter().any(|query| query == expected),
                 "expected selected plan probe {expected:?} in {extra_probes:?}"
@@ -3960,7 +3962,7 @@ mod tests {
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("pattern") && gap.contains("form validation bypass")),
+                .any(|gap| gap.contains("pattern") && gap.contains("submit prevent default")),
             "selected planned role probes should become sufficiency gaps: {sufficiency:?}"
         );
     }
@@ -8781,9 +8783,9 @@ mod tests {
             "Logger.php pushHandler",
             "Logger.php addRecord",
             "Logger.php log",
-            "LogRecord.php LogRecord",
+            "record.php record",
             "HandlerInterface.php handle",
-            "AbstractProcessingHandler.php handle",
+            "processing_handler.php handle",
             "handler processing",
         ] {
             assert!(
@@ -9057,7 +9059,8 @@ mod tests {
             "Mapper.cs Mapper.Map",
             "MapperConfiguration.cs MapperConfiguration",
             "TypeMap.cs CreateMapperLambda",
-            "TypeMapPlanBuilder.cs CreateMapperLambda",
+            "plan_builder.cs plan builder",
+            "plan_builder.cs CreateMapperLambda",
             "type map plan",
             "mapping execution plan",
         ] {
@@ -9130,14 +9133,15 @@ mod tests {
         );
 
         for expected in [
-            "full-example.html required",
-            "full-example.html pattern",
-            "detailed-custom-validation.html input#mail",
-            "detailed-custom-validation.html novalidate",
-            "detailed-custom-validation.html showError",
-            "fruit-pattern.html pattern",
-            "min-max.html min",
+            "html form required constraint",
+            "html form pattern constraint",
+            "html form min max constraints",
+            "custom form validation input",
+            "custom validation validity state",
+            "custom validation error rendering",
             "native form constraints",
+            "custom validation flow",
+            "validity state",
             "submit prevent default",
         ] {
             assert!(
@@ -9171,9 +9175,9 @@ mod tests {
             "Session.swift Session",
             "Session.swift Session.request",
             "Request.swift Request.resume",
-            "DataRequest.swift DataRequest.validate",
-            "SessionDelegate.swift SessionDelegate",
-            "SessionDelegate.swift urlSession",
+            "request_object.swift validate",
+            "delegate_callbacks.swift delegate",
+            "delegate_callbacks.swift urlSession",
             "session request creation",
             "request task resume",
             "data request validation",
@@ -9193,6 +9197,140 @@ mod tests {
             assert!(
                 !queries.contains(&http_seed),
                 "URLSession route-tracing prompt should not include HTTP route seed `{http_seed}` in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_does_not_apply_urlsession_probes_to_python_session_adapters() {
+        let question = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required = packet_sufficiency_required_probe_queries(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for forbidden in [
+            "Session.swift Session",
+            "Session.swift Session.request",
+            "Request.swift Request",
+            "Request.swift Request.resume",
+            "request_object.swift request",
+            "request_object.swift validate",
+            "delegate_callbacks.swift delegate",
+            "delegate_callbacks.swift urlSession",
+        ] {
+            assert!(
+                !queries.contains(&forbidden),
+                "Python session-adapter prompt should not include Swift URLSession probe `{forbidden}` in {queries:?}"
+            );
+            assert!(
+                !required.iter().any(|query| query == forbidden),
+                "Python session-adapter prompt should not require Swift URLSession probe `{forbidden}` in {required:?}"
+            );
+        }
+
+        for expected in [
+            "request preparation",
+            "session request",
+            "session send",
+            "adapter send",
+            "adapter selection",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "Python session-adapter prompt should keep request/adapter probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "Python session-adapter prompt should require request/adapter probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_keeps_javascript_route_probes_separate_from_route_tree_probes() {
+        let express_question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
+        let express_plan = build_packet_plan(
+            express_question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let express_queries = express_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let express_required = packet_sufficiency_required_probe_queries(
+            express_question,
+            PacketTaskClassDto::RouteTracing,
+        );
+
+        for expected in [
+            "application.js use",
+            "application.js route",
+            "application.js handle",
+            "response.js send",
+            "route registration",
+            "request handler",
+        ] {
+            assert!(
+                express_queries.contains(&expected),
+                "Express route prompt should include JS/source probe `{expected}` in {express_queries:?}"
+            );
+        }
+        for forbidden in [
+            "router group",
+            "route tree",
+            "route tree add route",
+            "router group handle route",
+            "engine request handler",
+            "context next handler chain",
+            "engine creation",
+            "engine creation new router",
+        ] {
+            assert!(
+                !express_queries.contains(&forbidden),
+                "Express route prompt should not inherit route-tree probe `{forbidden}` in {express_queries:?}"
+            );
+            assert!(
+                !express_required.iter().any(|query| query == forbidden),
+                "Express route prompt should not require route-tree probe `{forbidden}` in {express_required:?}"
+            );
+        }
+
+        let gin_question = "Trace how Gin creates an engine, registers routes through router groups, stores them in method trees, and dispatches handlers for a request.";
+        let gin_plan = build_packet_plan(
+            gin_question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let gin_queries = gin_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "router group",
+            "route tree",
+            "route tree add route",
+            "engine request handler",
+            "context next handler chain",
+            "engine creation new router",
+        ] {
+            assert!(
+                gin_queries.contains(&expected),
+                "Gin engine/tree prompt should keep route-tree probe `{expected}` in {gin_queries:?}"
             );
         }
     }
@@ -9386,7 +9524,7 @@ mod tests {
                   return app;
                 }
                 "#,
-                "createApplication builds a callable app object and mixes in request and response prototypes.",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
             ),
             (
                 "application",
@@ -9946,7 +10084,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Build.process constructs or processes a Jekyll site.",
+                "Build.process constructs or processes a site.",
             ),
             (
                 "Site#process",
@@ -10518,7 +10656,7 @@ mod tests {
                     return Lambda(mapperFunc, GetParameters(second: _initialDestination));
                 }
                 "#,
-                "TypeMapPlanBuilder participates in building expression plans for mappings.",
+                "The mapping plan builder participates in building expression plans for mappings.",
             ),
         ];
 
@@ -10540,7 +10678,7 @@ mod tests {
                 "createApplication",
                 "lib/express.js",
                 "function createApplication() { var app = function(req, res, next) { app.handle(req, res, next); }; mixin(app, proto, false); app.request = Object.create(req); app.response = Object.create(res); app.init(); return app; }",
-                "createApplication builds a callable app object and mixes in request and response prototypes.",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
             ),
             (
                 "app.handle",
@@ -10587,7 +10725,7 @@ mod tests {
                 "Session.request",
                 "Source/Core/Session.swift",
                 "open func request(_ convertible: URLRequestConvertible) -> DataRequest { let request = DataRequest(); performEagerlyIfNecessary(request); return request }",
-                "Session.request creates request objects such as DataRequest before optional eager execution.",
+                "Session.request creates request objects before optional eager execution.",
             ),
             (
                 "Request.resume",
@@ -10599,13 +10737,13 @@ mod tests {
                 "DataRequest.validate",
                 "Source/Core/DataRequest.swift",
                 "public func validate(_ validation: @escaping Validation) -> Self { validators.write { $0.append(validation) }; didValidateRequest(); return self }",
-                "DataRequest.validate attaches validation behavior.",
+                "Request validation methods attach validation behavior.",
             ),
             (
                 "SessionDelegate",
                 "Source/Core/SessionDelegate.swift",
                 "open class SessionDelegate: NSObject, URLSessionDataDelegate { open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) { request.didReceive(data: data) } open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { request.didReceiveResponse(nil) } }",
-                "SessionDelegate receives URLSession callback events.",
+                "Session delegate callbacks receive URLSession task events.",
             ),
         ];
 

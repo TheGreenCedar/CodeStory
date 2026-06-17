@@ -4,8 +4,11 @@ use crate::agent::packet_plan::packet_symbol_probe_queries;
 use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_probe_terms, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_html_css_template_structure_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_server_request_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
     packet_terms_indicate_stylesheet_animation_flow,
@@ -486,6 +489,55 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         {
             return Some("css imports");
         }
+        if normalized_claim.contains("appshell") && normalized_claim.contains("divapp") {
+            return Some("html app shell");
+        }
+        if normalized_claim.contains("roottypography")
+            || normalized_claim.contains("colorscheme")
+            || normalized_claim.contains("bodylayout")
+        {
+            return Some("css template defaults");
+        }
+        if normalized_claim.contains("appconstrains")
+            || (normalized_claim.contains("mountedapplication")
+                && normalized_claim.contains("padding"))
+        {
+            return Some("css app layout");
+        }
+        if normalized_claim.contains("logo")
+            && normalized_claim.contains("button")
+            && contains_any(&normalized_claim, &["hover", "focus", "transition"])
+        {
+            return Some("css interaction styles");
+        }
+        if normalized_claim.contains("preferscolorschemelight")
+            || normalized_claim.contains("mediaquery")
+        {
+            return Some("css light theme");
+        }
+        if contains_all(&normalized_claim, &["wsgi", "app"])
+            && normalized_claim.contains("entrypoint")
+        {
+            return Some("server request entrypoint");
+        }
+        if contains_all(&normalized_claim, &["full", "dispatch", "request"])
+            && contains_any(&normalized_claim, &["finalization", "finalize"])
+            && contains_any(&normalized_claim, &["preprocess", "exception", "wrap"])
+        {
+            return Some("server request dispatch wrapper");
+        }
+        if contains_all(
+            &normalized_claim,
+            &["dispatch", "request", "view", "function"],
+        ) && !normalized_claim.contains("full")
+        {
+            return Some("server view dispatch");
+        }
+        if normalized_claim.contains("routedecorator")
+            && normalized_claim.contains("registersviewfunctions")
+        {
+            return Some("server route registration");
+        }
         if normalized_claim.contains("sqlschema")
             && (normalized_claim.contains("definestables")
                 || normalized_claim.contains("tables")
@@ -530,6 +582,43 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
             && normalized_claim.contains("formattedoutput")
         {
             return Some("runtime format buffer");
+        }
+        if (normalized_claim.contains("native")
+            || normalized_claim.contains("constraint")
+            || normalized_claim.contains("constraints")
+            || normalized_claim.contains("formvalidationexamples"))
+            && contains_any(&normalized_claim, &["required", "pattern", "min", "max"])
+        {
+            return Some("form native constraints");
+        }
+        if normalized_claim.contains("custom")
+            && normalized_claim.contains("validation")
+            && contains_any(&normalized_claim, &["browser", "defaultui", "ui"])
+        {
+            return Some("form custom validation ui");
+        }
+        if normalized_claim.contains("submit")
+            && contains_any(
+                &normalized_claim,
+                &["prevent", "prevents", "submission", "invalid"],
+            )
+        {
+            return Some("form submit guard");
+        }
+        if normalized_claim.contains("validitystate")
+            || (normalized_claim.contains("validity")
+                && contains_any(
+                    &normalized_claim,
+                    &[
+                        "valuemissing",
+                        "typemismatch",
+                        "tooshort",
+                        "message",
+                        "messages",
+                    ],
+                ))
+        {
+            return Some("form validity messages");
         }
         if normalized_claim.contains("public")
             && contains_any(
@@ -602,6 +691,11 @@ fn packet_missing_required_flow_roles(
     let shell_install_dispatch_flow =
         packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
     let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
+    let form_validation_flow = packet_terms_indicate_form_validation_flow(&question_terms);
+    let server_request_dispatch_flow =
+        packet_terms_indicate_server_request_dispatch_flow(&question_terms);
+    let html_css_template_structure_flow =
+        packet_terms_indicate_html_css_template_structure_flow(&question_terms);
     let stylesheet_animation_flow =
         packet_terms_indicate_stylesheet_animation_flow(&question_terms);
     let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
@@ -612,6 +706,9 @@ fn packet_missing_required_flow_roles(
         site_build_flow,
         shell_install_dispatch_flow,
         url_session_request_flow,
+        form_validation_flow,
+        server_request_dispatch_flow,
+        html_css_template_structure_flow,
         stylesheet_animation_flow,
         sql_schema_flow,
         runtime_formatting_flow,
@@ -629,6 +726,9 @@ fn packet_missing_required_flow_roles(
             mapper_flow,
             shell_install_dispatch_flow,
             url_session_request_flow,
+            form_validation_flow,
+            server_request_dispatch_flow,
+            html_css_template_structure_flow,
             stylesheet_animation_flow,
             sql_schema_flow,
             runtime_formatting_flow,
@@ -650,6 +750,9 @@ fn packet_required_flow_roles(
     site_build_flow: bool,
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
+    form_validation_flow: bool,
+    server_request_dispatch_flow: bool,
+    html_css_template_structure_flow: bool,
     stylesheet_animation_flow: bool,
     sql_schema_flow: bool,
     runtime_formatting_flow: bool,
@@ -681,6 +784,52 @@ fn packet_required_flow_roles(
                 PacketFlowRole::BoundaryOrState,
             ],
             PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if form_validation_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if server_request_dispatch_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation
+            | PacketTaskClassDto::DataFlow
+            | PacketTaskClassDto::RouteTracing => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if html_css_template_structure_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::BugLocalization
             | PacketTaskClassDto::ChangeImpact
             | PacketTaskClassDto::SymbolOwnership
             | PacketTaskClassDto::EditPlanning => &[],
@@ -783,6 +932,9 @@ fn packet_flow_roles_for_claim(
     mapper_flow: bool,
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
+    form_validation_flow: bool,
+    server_request_dispatch_flow: bool,
+    html_css_template_structure_flow: bool,
     stylesheet_animation_flow: bool,
     sql_schema_flow: bool,
     runtime_formatting_flow: bool,
@@ -822,7 +974,8 @@ fn packet_flow_roles_for_claim(
             roles.insert(PacketFlowRole::BoundaryOrState);
         }
         if (normalized.contains("typemap") && normalized.contains("plan"))
-            || normalized.contains("typemapplanbuilder")
+            || normalized.contains("mappingplanbuilder")
+            || normalized.contains("planbuilder")
             || normalized.contains("executionpipeline")
         {
             roles.insert(PacketFlowRole::Handoff);
@@ -868,24 +1021,124 @@ fn packet_flow_roles_for_claim(
         {
             roles.insert(PacketFlowRole::Handoff);
         }
-        if normalized.contains("datarequestvalidate")
-            || normalized.contains("validation")
-            || normalized.contains("sessiondelegate")
+        if normalized.contains("validation")
+            || normalized.contains("requestvalidation")
+            || (normalized.contains("request") && normalized.contains("validate"))
+            || normalized.contains("delegatecallback")
+            || normalized.contains("delegatecallbacks")
             || normalized.contains("callback")
             || normalized.contains("callbacks")
         {
             roles.insert(PacketFlowRole::BoundaryOrState);
         }
-        if normalized.contains("sessiondelegate")
+        if normalized.contains("delegatecallback")
+            || normalized.contains("delegatecallbacks")
             || normalized.contains("urlsessioncallback")
             || normalized.contains("urlsessioncallbacks")
+            || (normalized.contains("delegate") && normalized.contains("callback"))
         {
             roles.insert(PacketFlowRole::Handoff);
         }
     }
 
+    if form_validation_flow {
+        if (normalized.contains("native")
+            || normalized.contains("constraint")
+            || normalized.contains("constraints")
+            || normalized.contains("formvalidationexamples"))
+            && contains_any(&normalized, &["required", "pattern", "min", "max"])
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("custom")
+            && normalized.contains("validation")
+            && contains_any(&normalized, &["browser", "defaultui", "ui"])
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("submit")
+            && contains_any(
+                &normalized,
+                &["prevent", "prevents", "submission", "invalid"],
+            )
+        {
+            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("validitystate")
+            || (normalized.contains("validity")
+                && contains_any(
+                    &normalized,
+                    &[
+                        "valid",
+                        "valuemissing",
+                        "typemismatch",
+                        "tooshort",
+                        "message",
+                        "messages",
+                    ],
+                ))
+        {
+            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if server_request_dispatch_flow {
+        if contains_all(&normalized, &["wsgi", "app"]) && normalized.contains("entrypoint") {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if contains_all(&normalized, &["full", "dispatch", "request"])
+            && contains_any(&normalized, &["finalization", "finalize"])
+            && contains_any(&normalized, &["preprocess", "exception", "wrap"])
+        {
+            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if contains_all(&normalized, &["dispatch", "request", "view", "function"])
+            && !normalized.contains("full")
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("routedecorator") && normalized.contains("registersviewfunctions") {
+            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if html_css_template_structure_flow {
+        if normalized.contains("appshell")
+            && (normalized.contains("divapp") || normalized.contains("modulescript"))
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("roottypography")
+            || normalized.contains("colorscheme")
+            || normalized.contains("bodylayout")
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("appconstrains")
+            || (normalized.contains("mountedapplication") && normalized.contains("padding"))
+        {
+            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("logo")
+            && normalized.contains("button")
+            && contains_any(&normalized, &["hover", "focus", "transition"])
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("preferscolorschemelight") || normalized.contains("mediaquery") {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
     if stylesheet_animation_flow {
-        if normalized.contains("sourceanimatecss")
+        if normalized.contains("animationstylesheetentrypoint")
             || (normalized.contains("imports") && normalized.contains("animationfiles"))
             || normalized.contains("baseclass")
         {
@@ -960,9 +1213,9 @@ fn packet_flow_roles_for_claim(
     }
 
     if string_predicate_flow {
-        if normalized.contains("stringutils")
+        if (normalized.contains("string") && normalized.contains("utils"))
             || normalized.contains("strings")
-            || normalized.contains("charsequenceutils")
+            || (normalized.contains("charsequence") && normalized.contains("utils"))
         {
             roles.insert(PacketFlowRole::EntryPoint);
         }
@@ -1162,7 +1415,7 @@ mod tests {
     #[test]
     fn route_tracing_site_build_prompts_use_lifecycle_flow_roles() {
         let claims = vec![
-            claim("Build.process constructs or processes a Jekyll site."),
+            claim("Build.process constructs or processes a site."),
             claim("Site.process runs reset, read, generate, render, cleanup, and write phases."),
             claim("Reader is responsible for reading site content."),
             claim("Renderer renders pages and documents."),
@@ -1190,12 +1443,69 @@ mod tests {
     }
 
     #[test]
+    fn route_tracing_server_request_prompts_use_wsgi_flow_roles() {
+        let claims = vec![
+            claim(
+                "wsgi_app is the WSGI entry point and creates or uses request context before dispatch.",
+            ),
+            claim(
+                "full_dispatch_request wraps preprocessing, dispatch, exception handling, and response finalization.",
+            ),
+            claim("dispatch_request invokes the view function selected by URL matching."),
+            claim(
+                "The route decorator registers view functions through the scaffold URL rule path rather than performing request dispatch itself.",
+            ),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.",
+            PacketTaskClassDto::RouteTracing,
+            &claims,
+        );
+
+        assert!(
+            missing.is_empty(),
+            "server request dispatch prompts should use WSGI/request/view roles: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_html_css_template_prompts_use_structural_roles() {
+        let claims = vec![
+            claim(
+                "home.html provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry.",
+            ),
+            claim(
+                "main.css owns :root typography, color-scheme, smoothing, and body layout defaults.",
+            ),
+            claim("#app constrains the mounted application content and centers it with padding."),
+            claim("Logo and button selectors define hover, focus, and transition behavior in CSS."),
+            claim(
+                "The @media (prefers-color-scheme: light) media query overrides root, link-hover, and button colors.",
+            ),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how the HTML app shell and CSS structure split template selectors, theme defaults, and interactive element styling.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+
+        assert!(
+            missing.is_empty(),
+            "HTML/CSS template prompts should use structural app-shell/style roles: {missing:?}"
+        );
+    }
+
+    #[test]
     fn data_flow_mapper_plan_prompts_use_mapping_flow_roles() {
         let claims = vec![
             claim("Mapper.Map is the public runtime entry point for object mapping."),
             claim("MapperConfiguration builds and owns mapping configuration used at runtime."),
             claim("TypeMap contributes mapper lambda plans used by the execution pipeline."),
-            claim("TypeMapPlanBuilder participates in building expression plans for mappings."),
+            claim(
+                "The mapping plan builder participates in building expression plans for mappings.",
+            ),
         ];
 
         let missing = packet_missing_required_flow_roles(
@@ -1252,6 +1562,34 @@ mod tests {
         assert!(
             packet_supported_claim_family_count(&claims) >= 3,
             "runtime formatting claims should cover distinct sufficiency families"
+        );
+    }
+
+    #[test]
+    fn architecture_form_validation_prompts_use_constraint_submit_and_validity_roles() {
+        let claims = vec![
+            claim(
+                "The form validation examples use native required, pattern, min, and max constraints.",
+            ),
+            claim(
+                "A custom validation example applies script-driven validity checks before rendering messages.",
+            ),
+            claim("Submit handlers prevent submission when the form is invalid."),
+            claim("Custom error rendering branches on ValidityState fields to choose messages."),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "form validation prompts should use constraint, submit, and validity-state roles: {missing:?}"
+        );
+        assert!(
+            packet_supported_claim_family_count(&claims) >= 3,
+            "form validation claims should cover distinct sufficiency families"
         );
     }
 
@@ -1405,6 +1743,10 @@ pub(crate) fn quote_packet_command_value(value: &str) -> String {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn contains_all(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().all(|needle| haystack.contains(needle))
 }
 
 fn push_unique_term(terms: &mut Vec<String>, value: &str) {

@@ -18,12 +18,16 @@ use crate::agent::packet_scoring::{
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_form_validation_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_javascript_route_source_flow,
     packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_prepared_session_adapter_flow,
-    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
     packet_terms_indicate_stylesheet_animation_flow,
@@ -282,6 +286,18 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             ],
         );
     }
+    if packet_terms_indicate_server_request_dispatch_flow(terms) {
+        push_server_request_dispatch_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "server request dispatch",
+                "request context",
+                "view function dispatch",
+                "response finalization",
+            ],
+        );
+    }
     if packet_terms_indicate_client_send_flow(terms) {
         push_client_send_source_probe_queries(queries);
         push_unique_terms(
@@ -313,10 +329,10 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             queries,
             &[
                 "native form constraints",
-                "custom validation messages",
+                "custom validation flow",
+                "custom error rendering",
                 "validity state",
                 "submit prevent default",
-                "form validation bypass",
             ],
         );
     }
@@ -329,6 +345,19 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
                 "css animation base class",
                 "css keyframes",
                 "css animation imports",
+            ],
+        );
+    }
+    if packet_terms_indicate_html_css_template_structure_flow(terms) {
+        push_html_css_template_structure_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "html app shell",
+                "module script entry",
+                "css theme defaults",
+                "css layout selectors",
+                "interactive element styles",
             ],
         );
     }
@@ -356,20 +385,25 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             ],
         );
     }
-    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+    if packet_terms_indicate_javascript_route_source_flow(terms) {
         push_javascript_route_source_probe_queries(queries);
+    }
+    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+        push_unique_terms(
+            queries,
+            &["route registration", "request handler", "handler chain"],
+        );
+    }
+    if packet_terms_indicate_route_tree_dispatch_flow(terms) {
         push_unique_terms(
             queries,
             &[
-                "route registration",
                 "router group",
                 "route tree",
                 "route tree add route",
                 "router group handle route",
-                "request handler",
                 "engine request handler",
                 "context next handler chain",
-                "handler chain",
                 "engine creation",
                 "engine creation new router",
             ],
@@ -394,7 +428,7 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
         push_unique_terms(
             queries,
             &[
-                "log record",
+                "logger record",
                 "record creation",
                 "handler registration",
                 "handler processing",
@@ -512,6 +546,18 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             ],
         );
     }
+    if packet_terms_indicate_server_request_dispatch_flow(terms) {
+        push_server_request_dispatch_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "server request dispatch",
+                "request context",
+                "view function dispatch",
+                "response finalization",
+            ],
+        );
+    }
     if packet_terms_indicate_url_session_request_flow(terms) {
         push_url_session_request_source_probe_queries(queries);
         push_unique_terms(
@@ -524,20 +570,25 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             ],
         );
     }
-    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+    if packet_terms_indicate_javascript_route_source_flow(terms) {
         push_javascript_route_source_probe_queries(queries);
+    }
+    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+        push_unique_terms(
+            queries,
+            &["route registration", "request handler", "handler chain"],
+        );
+    }
+    if packet_terms_indicate_route_tree_dispatch_flow(terms) {
         push_unique_terms(
             queries,
             &[
-                "route registration",
                 "router group",
                 "route tree",
                 "route tree add route",
                 "router group handle route",
-                "request handler",
                 "engine request handler",
                 "context next handler chain",
-                "handler chain",
                 "engine creation",
                 "engine creation new router",
             ],
@@ -564,7 +615,7 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             queries,
             &[
                 "log call",
-                "log record",
+                "logger record",
                 "record creation",
                 "handler stack",
                 "handler registration",
@@ -611,10 +662,10 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             queries,
             &[
                 "native form constraints",
-                "custom validation messages",
+                "custom validation flow",
+                "custom error rendering",
                 "validity state",
                 "submit prevent default",
-                "form validation bypass",
             ],
         );
     }
@@ -627,6 +678,19 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
                 "css animation base class",
                 "css keyframes",
                 "css animation imports",
+            ],
+        );
+    }
+    if packet_terms_indicate_html_css_template_structure_flow(terms) {
+        push_html_css_template_structure_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "html app shell",
+                "module script entry",
+                "css theme defaults",
+                "css layout selectors",
+                "interactive element styles",
             ],
         );
     }
@@ -716,8 +780,24 @@ fn push_javascript_route_source_probe_queries(queries: &mut Vec<String>) {
         &[
             "application.js init",
             "application.js use",
+            "application.js route",
             "application.js handle",
             "response.js send",
+        ],
+    );
+}
+
+fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "wsgi app",
+            "request dispatch wrapper",
+            "dispatch request view function",
+            "request context",
+            "route decorator",
+            "route add url rule",
+            "response finalization",
         ],
     );
 }
@@ -750,10 +830,10 @@ fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
             "Session.swift Session.request",
             "Request.swift Request",
             "Request.swift Request.resume",
-            "DataRequest.swift DataRequest",
-            "DataRequest.swift DataRequest.validate",
-            "SessionDelegate.swift SessionDelegate",
-            "SessionDelegate.swift urlSession",
+            "request_object.swift request",
+            "request_object.swift validate",
+            "delegate_callbacks.swift delegate",
+            "delegate_callbacks.swift urlSession",
         ],
     );
 }
@@ -762,16 +842,13 @@ fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "full-example.html required",
-            "full-example.html pattern",
-            "full-example.html min",
-            "full-example.html max",
-            "detailed-custom-validation.html input#mail",
-            "detailed-custom-validation.html novalidate",
-            "detailed-custom-validation.html showError",
-            "fruit-pattern.html pattern",
-            "min-max.html min",
-            "min-max.html max",
+            "html form required constraint",
+            "html form pattern constraint",
+            "html form min max constraints",
+            "custom form validation input",
+            "custom validation validity state",
+            "custom validation error rendering",
+            "submit prevent default",
         ],
     );
 }
@@ -789,6 +866,23 @@ fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
             "bounce.css @keyframes bounce",
             "flash.css flash",
             "flash.css @keyframes flash",
+        ],
+    );
+}
+
+fn push_html_css_template_structure_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "html app root element",
+            "html module script entry",
+            "css root selector",
+            "css body layout selector",
+            "css app container selector",
+            "css color scheme theme",
+            "css button hover focus",
+            "css light color scheme media query",
+            "css logo hover transition",
         ],
     );
 }
@@ -838,9 +932,9 @@ fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
             "Logger.php pushHandler",
             "Logger.php addRecord",
             "Logger.php log",
-            "LogRecord.php LogRecord",
+            "record.php record",
             "HandlerInterface.php handle",
-            "AbstractProcessingHandler.php handle",
+            "processing_handler.php handle",
         ],
     );
 }
@@ -876,8 +970,8 @@ fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>
             "MapperConfiguration.cs MapperConfiguration",
             "TypeMap.cs TypeMap",
             "TypeMap.cs CreateMapperLambda",
-            "TypeMapPlanBuilder.cs TypeMapPlanBuilder",
-            "TypeMapPlanBuilder.cs CreateMapperLambda",
+            "plan_builder.cs plan builder",
+            "plan_builder.cs CreateMapperLambda",
         ],
     );
 }

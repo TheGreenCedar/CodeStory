@@ -662,7 +662,7 @@ test("public-core corpus keeps publishable coverage locked", async () => {
   });
   const audit = publicCoreCorpusAudit(tasks);
 
-  assert.equal(tasks.length, 18);
+  assert.equal(tasks.length, 19);
   assert.equal(audit.repo_count, 5);
   assert.deepEqual(Object.keys(audit.class_counts), [
     "architecture_explanation",
@@ -672,7 +672,7 @@ test("public-core corpus keeps publishable coverage locked", async () => {
     "route_tracing",
     "symbol_ownership",
   ]);
-  assert.deepEqual(Object.values(audit.class_counts), [3, 3, 3, 3, 3, 3]);
+  assert.deepEqual(Object.values(audit.class_counts), [4, 3, 3, 3, 3, 3]);
   assert.deepEqual(audit.missing_classes, []);
   assert.deepEqual(audit.underfilled_classes, []);
 });

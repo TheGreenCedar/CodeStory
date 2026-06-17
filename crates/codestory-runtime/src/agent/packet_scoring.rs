@@ -3,9 +3,12 @@
 use super::eval_probes::eval_citation_rank_adjustment;
 use crate::agent::packet_terms::{
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_form_validation_flow, packet_terms_indicate_log_record_handler_flow,
+    packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_html_css_template_structure_flow,
+    packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_server_request_dispatch_flow,
     packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
@@ -124,6 +127,9 @@ pub(crate) fn packet_citation_rank(
     if packet_terms_indicate_server_route_dispatch_flow(terms) {
         score += packet_route_dispatch_rank_bonus(&normalized_display, &path, terms);
     }
+    if packet_terms_indicate_server_request_dispatch_flow(terms) {
+        score += packet_server_request_dispatch_rank_bonus(&normalized_display, &path, terms);
+    }
     if packet_terms_indicate_buffered_io_flow(terms) {
         score += packet_buffered_io_rank_bonus(&normalized_display, &path);
     }
@@ -147,6 +153,9 @@ pub(crate) fn packet_citation_rank(
     }
     if packet_terms_indicate_stylesheet_animation_flow(terms) {
         score += packet_stylesheet_animation_rank_bonus(&normalized_display, &path);
+    }
+    if packet_terms_indicate_html_css_template_structure_flow(terms) {
+        score += packet_html_css_template_structure_rank_bonus(&normalized_display, &path);
     }
     if packet_terms_indicate_sql_schema_flow(terms) {
         score += packet_sql_schema_rank_bonus(&normalized_display, &path, terms);
@@ -309,6 +318,82 @@ fn packet_route_dispatch_rank_bonus(normalized_display: &str, path: &str, terms:
     bonus
 }
 
+fn packet_server_request_dispatch_rank_bonus(
+    normalized_display: &str,
+    path: &str,
+    terms: &[String],
+) -> f32 {
+    let mut bonus = 0.0;
+    if normalized_display_matches_prompt_owner(normalized_display, terms) {
+        bonus += 6.0;
+    }
+    if normalized_display_contains_all_parts(normalized_display, &["wsgi", "app"]) {
+        bonus += 10.0;
+    }
+    if normalized_display_contains_all_parts(normalized_display, &["full", "dispatch", "request"]) {
+        bonus += 9.0;
+    }
+    if normalized_display_contains_all_parts(normalized_display, &["dispatch", "request"]) {
+        bonus += 8.0;
+    }
+    if normalized_display_contains_all_parts(normalized_display, &["request", "context"])
+        || path.contains("/ctx.")
+        || path.ends_with("ctx.py")
+    {
+        bonus += 5.0;
+    }
+    if normalized_display.ends_with("route")
+        || normalized_display_contains_all_parts(normalized_display, &["add", "url", "rule"])
+    {
+        bonus += 5.0;
+    }
+    if normalized_display.ends_with("route") {
+        bonus += 6.0;
+    }
+    if path.ends_with("app.py") {
+        bonus += 3.0;
+    }
+    if path.contains("/sansio/scaffold.py") || path.ends_with("sansio/scaffold.py") {
+        bonus += 3.0;
+    }
+    bonus
+}
+
+fn normalized_display_contains_all_parts(value: &str, parts: &[&str]) -> bool {
+    parts.iter().all(|part| value.contains(part))
+}
+
+fn normalized_display_matches_prompt_owner(normalized_display: &str, terms: &[String]) -> bool {
+    terms
+        .iter()
+        .filter(|term| term.len() >= 4 && packet_prompt_owner_term(term))
+        .map(|term| normalize_identifier(term))
+        .any(|term| !term.is_empty() && normalized_display.starts_with(&term))
+}
+
+fn packet_prompt_owner_term(term: &str) -> bool {
+    !matches!(
+        term,
+        "control"
+            | "dispatch"
+            | "dispatches"
+            | "finalizes"
+            | "handling"
+            | "opens"
+            | "receives"
+            | "request"
+            | "requests"
+            | "response"
+            | "responses"
+            | "returns"
+            | "route"
+            | "server"
+            | "trace"
+            | "view"
+            | "wsgi"
+    )
+}
+
 fn packet_buffered_io_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
@@ -335,7 +420,7 @@ fn packet_buffered_io_rank_bonus(normalized_display: &str, path: &str) -> f32 {
 
 fn packet_log_record_handler_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
-    let display_or_path = format!("{normalized_display}{path}");
+    let path_stem = packet_path_file_stem(path);
     if path.ends_with("logger.php") {
         bonus += 5.0;
     }
@@ -346,17 +431,18 @@ fn packet_log_record_handler_rank_bonus(normalized_display: &str, path: &str) ->
     {
         bonus += 5.0;
     }
-    if path.ends_with("logrecord.php") || normalized_display.contains("logrecord") {
+    if path_stem.ends_with("record")
+        || (normalized_display.contains("log") && normalized_display.contains("record"))
+    {
         bonus += 4.0;
     }
-    if display_or_path.contains("abstractprocessinghandler") {
+    if (path_stem.contains("processing") && path_stem.ends_with("handler"))
+        || (normalized_display.contains("processing") && normalized_display.contains("handler"))
+    {
         bonus += 6.0;
     }
     if normalized_display.contains("gethandlers") {
         bonus += 1.0;
-    }
-    if normalized_display == "monolog" {
-        bonus -= 6.0;
     }
     bonus
 }
@@ -364,17 +450,17 @@ fn packet_log_record_handler_rank_bonus(normalized_display: &str, path: &str) ->
 fn packet_site_build_phase_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
-    if path.ends_with("lib/jekyll/commands/build.rb") || path.ends_with("jekyll/commands/build.rb")
-    {
+    let path_stem = packet_path_file_stem(path);
+    if path_stem == "build" && path.contains("/commands/") {
         bonus += 5.0;
     }
-    if path.ends_with("lib/jekyll/site.rb") || path.ends_with("jekyll/site.rb") {
+    if path_stem == "site" {
         bonus += 5.0;
     }
-    if path.ends_with("lib/jekyll/reader.rb") || path.ends_with("jekyll/reader.rb") {
+    if path_stem == "reader" {
         bonus += 4.0;
     }
-    if path.ends_with("lib/jekyll/renderer.rb") || path.ends_with("jekyll/renderer.rb") {
+    if path_stem == "renderer" {
         bonus += 4.0;
     }
     if normalized_display.contains("process")
@@ -405,6 +491,7 @@ fn packet_site_build_phase_rank_bonus(normalized_display: &str, path: &str) -> f
 fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
+    let path_stem = packet_path_file_stem(path);
     if path.ends_with("mapper.cs") {
         bonus += 5.0;
     }
@@ -419,7 +506,9 @@ fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &
     if path.ends_with("typemap.cs") || normalized_display.contains("typemap") {
         bonus += 6.0;
     }
-    if display_or_path.contains("typemapplanbuilder") {
+    if (path_stem.contains("plan") && path_stem.ends_with("builder"))
+        || normalized_display.contains("planbuilder")
+    {
         bonus += 8.0;
     }
     if normalized_display.contains("createmapperlambda")
@@ -486,19 +575,20 @@ fn packet_path_has_prompt_package_segment(path: &str, terms: &[String]) -> bool 
 fn packet_url_session_request_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
+    let path_stem = packet_path_file_stem(path);
+    let is_request_object_file = path_stem.ends_with("request") && path_stem != "request";
+    let is_delegate_callback_file = path_stem.ends_with("delegate") && path_stem != "delegate";
 
-    if path.ends_with("source/core/session.swift") || path.ends_with("session.swift") {
+    if path_stem == "session" {
         bonus += 4.0;
     }
-    if path.ends_with("source/core/request.swift") || path.ends_with("request.swift") {
+    if path_stem == "request" {
         bonus += 4.0;
     }
-    if path.ends_with("source/core/datarequest.swift") || path.ends_with("datarequest.swift") {
+    if is_request_object_file {
         bonus += 5.0;
     }
-    if path.ends_with("source/core/sessiondelegate.swift")
-        || path.ends_with("sessiondelegate.swift")
-    {
+    if is_delegate_callback_file {
         bonus += 5.0;
     }
 
@@ -511,13 +601,11 @@ fn packet_url_session_request_rank_bonus(normalized_display: &str, path: &str) -
     if normalized_display.ends_with("requestresume") {
         bonus += 9.0;
     }
-    if normalized_display.ends_with("datarequestvalidate")
-        || normalized_display.ends_with("requestvalidate")
-    {
+    if normalized_display.ends_with("requestvalidate") {
         bonus += 9.0;
     }
-    if normalized_display.contains("sessiondelegate")
-        || (normalized_display.contains("urlsession") && path.ends_with("sessiondelegate.swift"))
+    if normalized_display.contains("delegate")
+        || (normalized_display.contains("urlsession") && is_delegate_callback_file)
     {
         bonus += 7.0;
     }
@@ -533,24 +621,40 @@ fn packet_url_session_request_rank_bonus(normalized_display: &str, path: &str) -
     bonus
 }
 
+fn packet_path_file_stem(path: &str) -> String {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    normalize_identifier(stem)
+}
+
 fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
-    if path.contains("/form-validation/") || path.contains("\\form-validation\\") {
+    let normalized_path = normalize_identifier(path);
+    let is_html = path.ends_with(".html");
+    if normalized_path.contains("form") && normalized_path.contains("validation") {
         bonus += 8.0;
     }
-    if path.ends_with("full-example.html") {
+    if is_html && normalized_path.contains("form") && normalized_path.contains("example") {
         bonus += 6.0;
     }
-    if path.ends_with("detailed-custom-validation.html") {
+    if is_html && normalized_path.contains("custom") && normalized_path.contains("validation") {
         bonus += 7.0;
     }
-    if path.ends_with("fruit-pattern.html") || path.ends_with("min-max.html") {
+    if is_html
+        && (normalized_path.contains("pattern")
+            || normalized_path.contains("constraint")
+            || (normalized_path.contains("min") && normalized_path.contains("max")))
+    {
         bonus += 5.0;
     }
-    if normalized_display.contains("showerror")
-        || normalized_display.contains("novalidate")
-        || normalized_display.contains("inputmail")
+    if normalized_display.contains("error")
+        || normalized_display.contains("validity")
+        || normalized_display.contains("validate")
+        || normalized_display.contains("input")
         || normalized_display == "pattern"
         || normalized_display == "required"
         || normalized_display == "min"
@@ -572,6 +676,7 @@ fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f3
 fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
+    let path_stem = packet_path_file_stem(path);
 
     if path.contains("/source/") || path.starts_with("source/") {
         bonus += 5.0;
@@ -582,7 +687,7 @@ fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) 
     if path.ends_with("_base.css") {
         bonus += 8.0;
     }
-    if path.ends_with("source/animate.css") || path == "source/animate.css" {
+    if path_stem == "animate" && path.ends_with(".css") {
         bonus += 7.0;
     }
     if path.ends_with("attention_seekers/bounce.css") {
@@ -620,6 +725,61 @@ fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) 
     }
     if path.contains("/back_exits/") || path.contains("/rotating_entrances/") {
         bonus -= 4.0;
+    }
+
+    bonus
+}
+
+fn packet_html_css_template_structure_rank_bonus(normalized_display: &str, path: &str) -> f32 {
+    let mut bonus = 0.0;
+    let display_or_path = format!("{normalized_display}{path}");
+
+    if path.ends_with(".html")
+        && (normalized_display == "app"
+            || normalized_display.contains("script")
+            || normalized_display.contains("module")
+            || path.contains("template"))
+    {
+        bonus += 8.0;
+    }
+    if path.ends_with(".css")
+        && (normalized_display == "root"
+            || normalized_display == "body"
+            || normalized_display == "app"
+            || normalized_display.contains("button")
+            || normalized_display.contains("logo")
+            || normalized_display.contains("color"))
+    {
+        bonus += 8.0;
+    }
+    if normalized_display == "app" || normalized_display.contains("divapp") {
+        bonus += 5.0;
+    }
+    if normalized_display == "root"
+        || normalized_display == "body"
+        || normalized_display == "color"
+        || normalized_display.contains("colorscheme")
+    {
+        bonus += 4.0;
+    }
+    if normalized_display.contains("button")
+        || normalized_display.contains("hover")
+        || normalized_display.contains("focus")
+        || normalized_display.contains("logo")
+    {
+        bonus += 4.0;
+    }
+    if normalized_display.contains("preferscolorscheme")
+        || display_or_path.contains("prefers-color-scheme")
+    {
+        bonus += 4.0;
+    }
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains("/fixtures/")
+        || path.ends_with(".min.css")
+    {
+        bonus -= 12.0;
     }
 
     bonus
@@ -726,17 +886,19 @@ fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) ->
 fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
+    let path_stem = packet_path_file_stem(path);
 
-    if path.ends_with("stringutils.java") {
+    if path_stem.starts_with("string") && path_stem.ends_with("utils") {
         bonus += 7.0;
     }
     if path.ends_with("strings.java") {
         bonus += 8.0;
     }
-    if path.ends_with("charsequenceutils.java") {
+    if path_stem.contains("charsequence") && path_stem.ends_with("utils") {
         bonus += 7.0;
     }
-    if normalized_display.contains("stringutils")
+    if normalized_display.contains("string")
+        && normalized_display.contains("utils")
         && (normalized_display.contains("isblank") || normalized_display.contains("isempty"))
     {
         bonus += 8.0;
@@ -751,9 +913,9 @@ fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f
         bonus += 8.0;
     }
     if display_or_path.contains("arrayutils")
-        || display_or_path.contains("randomstringutils")
         || display_or_path.contains("annotationutils")
         || display_or_path.contains("circuitbreaker")
+        || (display_or_path.contains("random") && display_or_path.contains("string"))
     {
         bonus -= 10.0;
     }

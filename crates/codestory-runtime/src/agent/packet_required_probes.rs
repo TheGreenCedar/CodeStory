@@ -9,12 +9,15 @@ use crate::agent::packet_scoring::{
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_form_validation_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
     packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_prepared_session_adapter_flow,
-    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
@@ -94,7 +97,7 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
             normalized_claim.contains("handlerinterface")
                 || (normalized_claim.contains("handler") && normalized_claim.contains("boundar"))
         }
-        "logrecord" => normalized_claim.contains("logrecord"),
+        "loggerrecord" => normalized_claim.contains("log") && normalized_claim.contains("record"),
         "logcall" => normalized_claim.contains("log") && normalized_claim.contains("addrecord"),
         "handlerstack" => {
             normalized_claim.contains("handler") && normalized_claim.contains("stack")
@@ -106,11 +109,18 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
                 && normalized_claim.contains("min")
                 && normalized_claim.contains("max")
         }
-        "customvalidationmessages" => {
-            (normalized_claim.contains("validation") || normalized_claim.contains("showerror"))
-                && (normalized_claim.contains("message")
-                    || normalized_claim.contains("messages")
-                    || normalized_claim.contains("showerror"))
+        "customvalidationflow" => {
+            normalized_claim.contains("custom")
+                && normalized_claim.contains("validation")
+                && (normalized_claim.contains("scriptdriven")
+                    || normalized_claim.contains("validity")
+                    || normalized_claim.contains("message"))
+        }
+        "customerrorrendering" => {
+            normalized_claim.contains("error")
+                && (normalized_claim.contains("render") || normalized_claim.contains("message"))
+                && (normalized_claim.contains("validitystate")
+                    || normalized_claim.contains("validity"))
         }
         "validitystate" => {
             normalized_claim.contains("validitystate")
@@ -127,9 +137,14 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
                 && (normalized_claim.contains("invalid") || normalized_claim.contains("form"))
         }
         "formvalidationbypass" => {
-            normalized_claim.contains("novalidate")
+            normalized_claim.contains("suppress")
+                && normalized_claim.contains("browser")
+                && normalized_claim.contains("defaultui")
                 && (normalized_claim.contains("suppress") || normalized_claim.contains("disable"))
-                && (normalized_claim.contains("browser") || normalized_claim.contains("defaultui"))
+                && (normalized_claim.contains("validation")
+                    || normalized_claim.contains("validity")
+                    || normalized_claim.contains("form")
+                    || normalized_claim.contains("scriptdriven"))
         }
         "shellinstallerbootstrap" => {
             normalized_claim.contains("install")
@@ -293,11 +308,12 @@ fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
             | "handlerregistration"
             | "handlerprocessing"
             | "handlerinterface"
-            | "logrecord"
+            | "loggerrecord"
             | "logcall"
             | "handlerstack"
             | "nativeformconstraints"
-            | "customvalidationmessages"
+            | "customvalidationflow"
+            | "customerrorrendering"
             | "validitystate"
             | "submitpreventdefault"
             | "formvalidationbypass"
@@ -397,6 +413,18 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
             ],
         );
     }
+    if packet_terms_indicate_server_request_dispatch_flow(terms) {
+        push_server_request_dispatch_source_probe_queries(&mut queries);
+        push_unique_terms(
+            &mut queries,
+            &[
+                "server request dispatch",
+                "request context",
+                "view function dispatch",
+                "response finalization",
+            ],
+        );
+    }
     if packet_terms_indicate_client_send_flow(terms) {
         push_client_send_source_probe_queries(&mut queries);
         push_unique_terms(
@@ -424,6 +452,19 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
     }
     if packet_terms_indicate_sql_schema_flow(terms) {
         push_sql_schema_required_probe_queries(terms, &mut queries);
+    }
+    if packet_terms_indicate_html_css_template_structure_flow(terms) {
+        push_html_css_template_structure_probe_queries(&mut queries);
+        push_unique_terms(
+            &mut queries,
+            &[
+                "html app shell",
+                "module script entry",
+                "css theme defaults",
+                "css layout selectors",
+                "interactive element styles",
+            ],
+        );
     }
     if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_unique_terms(
@@ -500,18 +541,33 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
     if packet_terms_indicate_server_route_dispatch_flow(terms) {
         push_unique_terms(
             queries,
+            &["route registration", "request handler", "handler chain"],
+        );
+    }
+    if packet_terms_indicate_route_tree_dispatch_flow(terms) {
+        push_unique_terms(
+            queries,
             &[
-                "route registration",
                 "router group",
                 "route tree",
                 "route tree add route",
                 "router group handle route",
-                "request handler",
                 "engine request handler",
                 "context next handler chain",
-                "handler chain",
                 "engine creation",
                 "engine creation new router",
+            ],
+        );
+    }
+    if packet_terms_indicate_server_request_dispatch_flow(terms) {
+        push_server_request_dispatch_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "server request dispatch",
+                "request context",
+                "view function dispatch",
+                "response finalization",
             ],
         );
     }
@@ -539,7 +595,7 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
             push_unique_term(queries, "custom validation");
         }
         if has("custom") && has("html") && has_any(&["javascript", "script", "scripts", "js"]) {
-            push_unique_term(queries, "form validation bypass");
+            push_unique_term(queries, "custom validation flow");
             push_unique_term(queries, "validity state");
         }
         if has_any(&["validity", "state", "states"]) {
@@ -552,10 +608,9 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
             queries,
             &[
                 "native form constraints",
-                "custom validation messages",
+                "custom error rendering",
                 "validity state",
                 "submit prevent default",
-                "form validation bypass",
             ],
         );
     }
@@ -568,6 +623,19 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
                 "css animation base class",
                 "css keyframes",
                 "css animation imports",
+            ],
+        );
+    }
+    if packet_terms_indicate_html_css_template_structure_flow(terms) {
+        push_html_css_template_structure_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "html app shell",
+                "module script entry",
+                "css theme defaults",
+                "css layout selectors",
+                "interactive element styles",
             ],
         );
     }
@@ -647,7 +715,7 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
         push_unique_terms(
             queries,
             &[
-                "log record",
+                "logger record",
                 "record creation",
                 "handler registration",
                 "handler processing",
@@ -806,6 +874,9 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     {
         return matches_file_scoped_symbol;
     }
+    if packet_citation_matches_route_registration_probe(query, citation) {
+        return true;
+    }
     if packet_citation_matches_route_engine_constructor_probe(query, citation) {
         return true;
     }
@@ -907,6 +978,8 @@ pub(crate) fn packet_citation_probe_match_rank(
         } else {
             None
         }
+    } else if packet_citation_matches_route_registration_probe(query, citation) {
+        Some(6)
     } else if packet_citation_matches_route_engine_constructor_probe(query, citation) {
         Some(6)
     } else if packet_citation_matches_route_dispatch_probe(query, citation) {
@@ -968,6 +1041,62 @@ fn packet_citation_matches_sql_schema_scripts_probe(
             || normalize_identifier(&citation.display_name).contains("sqlschema"))
 }
 
+fn packet_citation_matches_route_registration_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    if normalize_identifier(query) != "routeregistration" {
+        return false;
+    }
+    if !matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::ANNOTATION
+    ) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.starts_with("test/")
+        || path.starts_with("tests/")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+        || path.starts_with("test\\")
+        || path.starts_with("tests\\")
+        || path.contains("_test.")
+        || path.contains("test.")
+    {
+        return false;
+    }
+
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let display_tail = citation
+        .display_name
+        .rsplit(['.', ':', '#'])
+        .next()
+        .map(normalize_identifier)
+        .unwrap_or_default();
+    let route_context = normalized_display.contains("route")
+        || normalized_display.contains("router")
+        || path.contains("route")
+        || path.contains("router")
+        || path.contains("application");
+    let registration_shape = normalized_display.contains("addroute")
+        || normalized_display.contains("registerroute")
+        || display_tail == "route"
+        || ((display_tail == "use" || normalized_display.ends_with("use"))
+            && path.contains("application"))
+        || ((display_tail == "handle" || normalized_display.ends_with("handle"))
+            && (normalized_display.contains("routergroup") || path.contains("routergroup")));
+
+    route_context && registration_shape
+}
+
 fn packet_citation_matches_route_engine_constructor_probe(
     query: &str,
     citation: &AgentCitationDto,
@@ -1009,7 +1138,11 @@ fn packet_citation_matches_route_dispatch_probe(query: &str, citation: &AgentCit
     let normalized_query = normalize_identifier(query);
     if !matches!(
         normalized_query.as_str(),
-        "handlerdispatch" | "requesthandler" | "enginerequesthandler"
+        "handlerchain"
+            | "handlerdispatch"
+            | "requesthandler"
+            | "contextnexthandlerchain"
+            | "enginerequesthandler"
     ) {
         return false;
     }
@@ -1037,18 +1170,47 @@ fn packet_citation_matches_route_dispatch_probe(query: &str, citation: &AgentCit
     }
 
     let normalized_display = normalize_identifier(&citation.display_name);
+    let display_tail = citation
+        .display_name
+        .rsplit(['.', ':', '#'])
+        .next()
+        .map(normalize_identifier)
+        .unwrap_or_default();
+    let route_context = normalized_display.contains("route")
+        || normalized_display.contains("router")
+        || path.contains("route")
+        || path.contains("router")
+        || path.contains("application");
     let handles_http_request = normalized_display.contains("handle")
         && (normalized_display.contains("request") || normalized_display.contains("http"));
+    let application_or_router_handle =
+        (display_tail == "handle" || normalized_display.ends_with("handle")) && route_context;
     let dispatches_handler_or_route = normalized_display.contains("dispatch")
         && (normalized_display.contains("handler")
             || normalized_display.contains("route")
             || normalized_display.contains("request"));
     let handler_request_symbol =
         normalized_display.contains("handler") && normalized_display.contains("request");
+    let handler_chain_symbol = normalized_display.contains("handler")
+        && (normalized_display.contains("chain")
+            || normalized_display.contains("stack")
+            || normalized_display.contains("next"));
+    let context_next_symbol = normalized_display.contains("next")
+        && (normalized_display.contains("context") || path.contains("context"));
+    let middleware_chain_symbol = route_context
+        && ((display_tail == "use" || normalized_display.ends_with("use"))
+            || normalized_display.contains("middleware")
+            || (normalized_display.contains("next") && normalized_display.contains("context")));
 
     match normalized_query.as_str() {
-        "handlerdispatch" => handles_http_request || dispatches_handler_or_route,
-        "requesthandler" => handles_http_request || handler_request_symbol,
+        "handlerchain" => handler_chain_symbol || middleware_chain_symbol,
+        "contextnexthandlerchain" => handler_chain_symbol || context_next_symbol,
+        "handlerdispatch" => {
+            handles_http_request || application_or_router_handle || dispatches_handler_or_route
+        }
+        "requesthandler" => {
+            handles_http_request || application_or_router_handle || handler_request_symbol
+        }
         "enginerequesthandler" => {
             (normalized_display.contains("engine") || path.contains("engine"))
                 && (handles_http_request || handler_request_symbol)
@@ -1290,7 +1452,7 @@ fn packet_file_scoped_symbol_probe_matches(
         .next()
         .unwrap_or(path.as_str())
         .to_ascii_lowercase();
-    if file_name != parts.file_name {
+    if !packet_probe_file_name_matches(&parts.file_name, &file_name) {
         return Some(false);
     }
 
@@ -1323,6 +1485,45 @@ fn packet_file_scoped_short_symbol_matches(display_name: &str, symbol: &str) -> 
         .next()
         .map(normalize_identifier)
         .is_some_and(|tail| tail == symbol)
+}
+
+pub(crate) fn packet_probe_file_name_matches(
+    query_file_name: &str,
+    candidate_file_name: &str,
+) -> bool {
+    let query_stem = packet_probe_file_stem(query_file_name);
+    let candidate_stem = packet_probe_file_stem(candidate_file_name);
+    if query_stem.is_empty() || candidate_stem.is_empty() {
+        return false;
+    }
+    query_stem == candidate_stem
+        || packet_probe_role_file_stem_matches(&query_stem, &candidate_stem)
+}
+
+fn packet_probe_file_stem(file_name: &str) -> String {
+    let file_name = file_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(file_name)
+        .trim();
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    normalize_identifier(stem)
+}
+
+fn packet_probe_role_file_stem_matches(query_stem: &str, candidate_stem: &str) -> bool {
+    match query_stem {
+        "record" => candidate_stem.ends_with("record"),
+        "processinghandler" => {
+            candidate_stem.contains("processing") && candidate_stem.ends_with("handler")
+        }
+        "planbuilder" => candidate_stem.contains("plan") && candidate_stem.ends_with("builder"),
+        "requestobject" => candidate_stem.ends_with("request") && candidate_stem != "request",
+        "delegatecallbacks" => candidate_stem.ends_with("delegate"),
+        _ => false,
+    }
 }
 
 pub(crate) struct PacketFileScopedSymbolProbe {
@@ -1461,9 +1662,9 @@ fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
             "Logger.php pushHandler",
             "Logger.php addRecord",
             "Logger.php log",
-            "LogRecord.php LogRecord",
+            "record.php record",
             "HandlerInterface.php handle",
-            "AbstractProcessingHandler.php handle",
+            "processing_handler.php handle",
         ],
     );
 }
@@ -1499,8 +1700,8 @@ fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>
             "MapperConfiguration.cs MapperConfiguration",
             "TypeMap.cs TypeMap",
             "TypeMap.cs CreateMapperLambda",
-            "TypeMapPlanBuilder.cs TypeMapPlanBuilder",
-            "TypeMapPlanBuilder.cs CreateMapperLambda",
+            "plan_builder.cs plan builder",
+            "plan_builder.cs CreateMapperLambda",
         ],
     );
 }
@@ -1525,6 +1726,21 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "wsgi app",
+            "request dispatch wrapper",
+            "dispatch request view function",
+            "request context",
+            "route decorator",
+            "route add url rule",
+            "response finalization",
+        ],
+    );
+}
+
 fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1533,10 +1749,10 @@ fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
             "Session.swift Session.request",
             "Request.swift Request",
             "Request.swift Request.resume",
-            "DataRequest.swift DataRequest",
-            "DataRequest.swift DataRequest.validate",
-            "SessionDelegate.swift SessionDelegate",
-            "SessionDelegate.swift urlSession",
+            "request_object.swift request",
+            "request_object.swift validate",
+            "delegate_callbacks.swift delegate",
+            "delegate_callbacks.swift urlSession",
         ],
     );
 }
@@ -1545,16 +1761,13 @@ fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "full-example.html required",
-            "full-example.html pattern",
-            "full-example.html min",
-            "full-example.html max",
-            "detailed-custom-validation.html input#mail",
-            "detailed-custom-validation.html novalidate",
-            "detailed-custom-validation.html showError",
-            "fruit-pattern.html pattern",
-            "min-max.html min",
-            "min-max.html max",
+            "html form required constraint",
+            "html form pattern constraint",
+            "html form min max constraints",
+            "custom form validation input",
+            "custom validation validity state",
+            "custom validation error rendering",
+            "submit prevent default",
         ],
     );
 }
@@ -1572,6 +1785,23 @@ fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
             "bounce.css @keyframes bounce",
             "flash.css flash",
             "flash.css @keyframes flash",
+        ],
+    );
+}
+
+fn push_html_css_template_structure_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "html app root element",
+            "html module script entry",
+            "css root selector",
+            "css body layout selector",
+            "css app container selector",
+            "css color scheme theme",
+            "css button hover focus",
+            "css light color scheme media query",
+            "css logo hover transition",
         ],
     );
 }
@@ -1847,7 +2077,7 @@ mod tests {
             "html constraint",
             "pattern",
             "javascript validation",
-            "form validation bypass",
+            "custom validation flow",
             "validity state",
             "handler processing",
             "mapper configuration",
@@ -1955,6 +2185,34 @@ mod tests {
         assert!(packet_citation_satisfies_required_probe(
             "route tree add route",
             &test_packet_citation("node.addRoute", "src/router/tree.go", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "route registration",
+            &test_packet_citation("node.addRoute", "src/router/tree.go", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "route registration",
+            &test_packet_citation("app.route", "lib/application.js", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "route registration",
+            &test_packet_citation("app.use", "lib/application.js", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "request handler",
+            &test_packet_citation("app.handle", "lib/application.js", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "handler dispatch",
+            &test_packet_citation("app.handle", "lib/application.js", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "handler chain",
+            &test_packet_citation("app.use", "lib/application.js", 0.9)
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "route registration",
+            &test_packet_citation("node.addRoute", "tests/router/tree_test.go", 0.9)
         ));
         assert!(packet_citation_satisfies_required_probe(
             "router group handle route",
@@ -2114,6 +2372,66 @@ mod tests {
             "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
             &create_playlist_track
         ));
+
+        let log_record = test_packet_citation("LogRecord", "src/Monolog/LogRecord.php", 0.9);
+        let processing_handler = test_packet_citation(
+            "AbstractProcessingHandler.handle",
+            "src/Monolog/Handler/AbstractProcessingHandler.php",
+            0.9,
+        );
+        let plan_builder = test_packet_citation(
+            "TypeMapPlanBuilder",
+            "src/AutoMapper/Execution/TypeMapPlanBuilder.cs",
+            0.9,
+        );
+        let create_mapper_lambda = test_packet_citation(
+            "TypeMapPlanBuilder.CreateMapperLambda",
+            "src/AutoMapper/Execution/TypeMapPlanBuilder.cs",
+            0.9,
+        );
+        let data_request =
+            test_packet_citation("DataRequest", "Source/Core/DataRequest.swift", 0.9);
+        let data_request_validate =
+            test_packet_citation("DataRequest.validate", "Source/Core/DataRequest.swift", 0.9);
+        let session_delegate =
+            test_packet_citation("SessionDelegate", "Source/Core/SessionDelegate.swift", 0.9);
+        let session_delegate_url_session = test_packet_citation(
+            "SessionDelegate.urlSession",
+            "Source/Core/SessionDelegate.swift",
+            0.9,
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "record.php record",
+            &log_record
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "processing_handler.php handle",
+            &processing_handler
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "plan_builder.cs plan builder",
+            &plan_builder
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "plan_builder.cs CreateMapperLambda",
+            &create_mapper_lambda
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "request_object.swift request",
+            &data_request
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "request_object.swift validate",
+            &data_request_validate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "delegate_callbacks.swift delegate",
+            &session_delegate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "delegate_callbacks.swift urlSession",
+            &session_delegate_url_session
+        ));
     }
 
     #[test]
@@ -2184,7 +2502,7 @@ mod tests {
                 citations: Vec::new(),
             },
             PacketClaimDto {
-                claim: "addRecord creates a LogRecord before passing it to handlers.".to_string(),
+                claim: "addRecord creates a log record before passing it to handlers.".to_string(),
                 citations: Vec::new(),
             },
             PacketClaimDto {
@@ -2198,7 +2516,7 @@ mod tests {
             "handler registration",
             "record creation",
             "handler processing",
-            "log record",
+            "logger record",
             "handler stack",
         ] {
             assert!(
@@ -2247,12 +2565,13 @@ mod tests {
                 citations: Vec::new(),
             },
             PacketClaimDto {
-                claim: "A custom validation example uses novalidate to suppress the browser default UI."
+                claim: "A custom validation example applies script-driven validity checks before rendering messages."
                     .to_string(),
                 citations: Vec::new(),
             },
             PacketClaimDto {
-                claim: "showError branches on ValidityState fields to choose messages.".to_string(),
+                claim: "Custom error rendering branches on ValidityState fields to choose messages."
+                    .to_string(),
                 citations: Vec::new(),
             },
             PacketClaimDto {
@@ -2263,10 +2582,10 @@ mod tests {
 
         for probe in [
             "native form constraints",
-            "custom validation messages",
+            "custom validation flow",
+            "custom error rendering",
             "validity state",
             "submit prevent default",
-            "form validation bypass",
         ] {
             assert!(
                 packet_probe_query_is_claimed(probe, &claims),

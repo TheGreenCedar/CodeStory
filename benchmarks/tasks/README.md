@@ -96,13 +96,14 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --list --task-suite language-expansion-holdout --materialize-repos
 ```
 
-Run a strict paired comparison:
+Run the comparison with the fixed no-CodeStory control reused:
 
 ```powershell
 node scripts/codestory-agent-ab-benchmark.mjs `
   --task-suite language-expansion-holdout `
   --arms without_codestory,with_codestory `
   --repeats 3 --materialize-repos --prepare-codestory-cache `
+  --reuse-baseline-from target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4 `
   --out-dir target/agent-benchmark/language-expansion-holdout `
   --timeout-ms 600000
 ```
@@ -110,6 +111,12 @@ node scripts/codestory-agent-ab-benchmark.mjs `
 Use `--task-ids <id>` for a cheaper targeted run. The Markdown summary table
 includes the human-readable A/B columns; `runs.jsonl` remains the source of
 truth for per-run metrics.
+
+Do not rerun the no-CodeStory arm for the current language-expansion harness
+context. Treat the fixed baseline as the control artifact and reuse it for
+comparison runs. Generate a new control artifact only if the task suite, pinned
+repo state, harness contract, or scorer boundary changes with explicit
+approval.
 
 For runtime packet fixes, prefer a packet-first gated loop before launching
 nested agents:

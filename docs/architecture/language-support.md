@@ -30,25 +30,38 @@ report is not blanket promotion proof for every parser-backed language.
 
 ## Latest Agent-Facing Evidence
 
-The latest full language-expansion paired A/B run was completed on 2026-06-16:
-`target/agent-benchmark/language-expansion-holdout-20260616-0.8.0-retry/reanalyzed-summary.md`.
+The latest language-expansion comparison artifact was built on 2026-06-17:
+`target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.md`.
 
-That run is useful operational evidence, not a broad answer-quality promotion:
+It is an offline reused-baseline composite. It combines the fixed no-CodeStory
+baseline at `target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4`
+with the CodeStory-only confirmation at
+`target/agent-benchmark/language-expansion-holdout-20260617-post-round24-codeonly-prepj1-j2`.
+No harness arm was executed to create the composite, and no no-CodeStory rows
+were rerun.
+
+That artifact is the current development-quality read, not a final public
+promotion claim:
 
 | Measure | With CodeStory | Without CodeStory | Read |
 | --- | ---: | ---: | --- |
 | Runs attempted | `54` | `54` | Three repeats across 18 language tasks. |
-| Run success | `54/54` | `51/54` | All baseline failures were the Ruby/Jekyll row. |
-| Quality pass | `16/54` | `19/51` successful rows | Answer quality remains uneven. |
-| All-in wall time | `6,411,835 ms` | `7,523,716 ms` | CodeStory ratio `0.852`. |
-| Total tokens | `7,859,161` | `9,087,330` | CodeStory ratio `0.865`. |
+| Run success | `54/54` | `54/54` | Both arms successful in their source artifacts. |
+| Quality pass | `54/54` | `24/54` | CodeStory quality is never worse per row; some rows tie a saturated baseline. |
+| All-in wall time | `3,383,687 ms` | `7,943,578 ms` | CodeStory ratio `0.426`. |
+| Total tokens | `2,141,124` | `9,692,559` | CodeStory ratio `0.221`. |
 | Commands | `54` | `471` | CodeStory kept exploration bounded. |
 | Source reads | `0` | `417` | The CodeStory arm stayed packet-first. |
 
-Safe wording: CodeStory completed the full 18-language A/B arm with lower
-overall wall time, token use, command count, and direct source reads. Do not say
-the run proves first-class agent-facing quality across every language; the
-quality score is mixed and several rows still need better handoff semantics.
+Safe wording: on the current fixed-baseline development comparison, CodeStory is
+quality-equal or better on every measured language task and materially cheaper
+overall. Do not describe this as product-grade proof for every supported
+language or framework until repeat, freshness, breadth, and promotion metadata
+are recorded. Future language-expansion loops should reuse the fixed
+no-CodeStory control or compare to it offline. Do not rerun the control for
+freshness or promotion loops; generate a new control artifact only when the task
+suite, pinned repo state, harness contract, or scorer boundary changes with
+explicit approval.
 
 ## Resolution Claims
 
@@ -141,13 +154,16 @@ Before adding a parser-backed language or widening a public claim:
    ```
 
 7. For agent-facing evidence, run at least the targeted language task from the
-   A/B suite, and run the full suite before making language-wide claims:
+   A/B suite. Reuse the fixed no-CodeStory control for current
+   language-expansion comparisons; a new control artifact is only for changed
+   task, repo-pin, harness, or scorer boundaries with explicit approval:
 
    ```sh
    node scripts/codestory-agent-ab-benchmark.mjs \
      --task-suite language-expansion-holdout \
      --arms without_codestory,with_codestory \
      --repeats 3 --materialize-repos --prepare-codestory-cache \
+     --reuse-baseline-from target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4 \
      --out-dir target/agent-benchmark/language-expansion-holdout \
      --timeout-ms 600000
    ```

@@ -12,10 +12,13 @@ use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_buffered_io_flow,
     packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
     packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
+    packet_terms_indicate_html_css_template_structure_flow,
     packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow,
     packet_terms_indicate_shell_version_use_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
@@ -27,6 +30,7 @@ use std::collections::HashSet;
 
 const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
     SourceClaimProfile::ServerRoute,
+    SourceClaimProfile::ServerRequestDispatch,
     SourceClaimProfile::ShellInstallDispatch,
     SourceClaimProfile::ShellVersionUse,
     SourceClaimProfile::HookCache,
@@ -34,9 +38,10 @@ const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
     SourceClaimProfile::UrlSessionRequest,
     SourceClaimProfile::StringPredicate,
     SourceClaimProfile::StylesheetAnimation,
+    SourceClaimProfile::HtmlCssTemplateStructure,
     SourceClaimProfile::SqlSchema,
     SourceClaimProfile::RuntimeFormatting,
-    SourceClaimProfile::LogRecordHandler,
+    SourceClaimProfile::LoggerHandlerFlow,
     SourceClaimProfile::SiteBuildPhase,
     SourceClaimProfile::MapperConfigurationPlan,
     SourceClaimProfile::FormValidation,
@@ -49,6 +54,7 @@ const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
 #[derive(Debug, Clone, Copy)]
 enum SourceClaimProfile {
     ServerRoute,
+    ServerRequestDispatch,
     ShellInstallDispatch,
     ShellVersionUse,
     HookCache,
@@ -56,9 +62,10 @@ enum SourceClaimProfile {
     UrlSessionRequest,
     StringPredicate,
     StylesheetAnimation,
+    HtmlCssTemplateStructure,
     SqlSchema,
     RuntimeFormatting,
-    LogRecordHandler,
+    LoggerHandlerFlow,
     SiteBuildPhase,
     MapperConfigurationPlan,
     FormValidation,
@@ -75,6 +82,13 @@ impl SourceClaimProfile {
                 if packet_terms_indicate_server_route_dispatch_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_server_route_flow_claims(
                         ctx.symbol, ctx.source,
+                    ));
+                }
+            }
+            Self::ServerRequestDispatch => {
+                if packet_terms_indicate_server_request_dispatch_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_server_request_dispatch_flow_claims(
+                        ctx.symbol, ctx.source, &ctx.path,
                     ));
                 }
             }
@@ -127,6 +141,14 @@ impl SourceClaimProfile {
                     claims.extend(packet_generic_css_animation_flow_claims(ctx.source));
                 }
             }
+            Self::HtmlCssTemplateStructure => {
+                if packet_terms_indicate_html_css_template_structure_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_html_css_template_structure_claims(
+                        &ctx.file_name,
+                        ctx.source,
+                    ));
+                }
+            }
             Self::SqlSchema => {
                 if packet_terms_indicate_sql_schema_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_sql_schema_flow_claims(ctx.source));
@@ -141,7 +163,7 @@ impl SourceClaimProfile {
                     ));
                 }
             }
-            Self::LogRecordHandler => {
+            Self::LoggerHandlerFlow => {
                 if packet_terms_indicate_log_record_handler_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_log_record_handler_flow_claims(
                         ctx.symbol, ctx.source,
@@ -179,6 +201,7 @@ impl SourceClaimProfile {
 struct SourceClaimContext<'a> {
     source: &'a str,
     symbol: &'a str,
+    path: String,
     file_name: String,
     normalized_prompt: String,
     prompt_terms: Vec<String>,
@@ -201,6 +224,7 @@ impl<'a> SourceClaimContext<'a> {
         Self {
             source,
             symbol,
+            path,
             file_name,
             normalized_prompt: normalize_identifier(prompt),
             prompt_terms: packet_probe_terms(prompt),
@@ -896,9 +920,8 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
     claims
 }
 
-fn packet_generic_form_validation_flow_claims(symbol: &str, source: &str) -> Vec<String> {
+fn packet_generic_form_validation_flow_claims(_symbol: &str, source: &str) -> Vec<String> {
     let source_lower = source.to_ascii_lowercase();
-    let normalized_symbol = normalize_identifier(symbol);
     let mut claims = Vec::new();
 
     let has_native_constraints = source_lower.contains("<form")
@@ -914,21 +937,25 @@ fn packet_generic_form_validation_flow_claims(symbol: &str, source: &str) -> Vec
     }
 
     if source_lower.contains("<form")
-        && source_lower.contains("novalidate")
         && source_lower.contains("validity")
+        && (source_lower.contains("addeventlistener")
+            || source_lower.contains("checkvalidity")
+            || source_lower.contains("setcustomvalidity"))
     {
         claims.push(
-            "A custom validation example uses novalidate to suppress the browser default UI."
+            "A custom validation example applies script-driven validity checks before rendering messages."
                 .to_string(),
         );
     }
 
-    if normalized_symbol.contains("showerror")
-        && source_lower.contains("validity.valuemissing")
+    if source_lower.contains("validity.valuemissing")
         && source_lower.contains("validity.typemismatch")
         && source_lower.contains("validity.tooshort")
     {
-        claims.push("showError branches on ValidityState fields to choose messages.".to_string());
+        claims.push(
+            "Custom error rendering branches on ValidityState fields to choose messages."
+                .to_string(),
+        );
     }
 
     if source_lower.contains("addeventlistener('submit'")
@@ -952,8 +979,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("performeagerlyifnecessary")
     {
         claims.push(
-            "Session.request creates request objects such as DataRequest before optional eager execution."
-                .to_string(),
+            "Session.request creates request objects before optional eager execution.".to_string(),
         );
     }
 
@@ -970,7 +996,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("didvalidate")
         && source_lower.contains("request")
     {
-        claims.push("DataRequest.validate attaches validation behavior.".to_string());
+        claims.push("Request validation methods attach validation behavior.".to_string());
     }
 
     if normalized_symbol.ends_with("delegate")
@@ -980,7 +1006,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
             || source_lower.contains("request.didreceive(data: data)")
             || source_lower.contains("didcompletewitherror"))
     {
-        claims.push("SessionDelegate receives URLSession callback events.".to_string());
+        claims.push("Session delegate callbacks receive URLSession task events.".to_string());
     }
 
     claims
@@ -1033,7 +1059,7 @@ pub(crate) fn packet_generic_string_predicate_flow_claims(
     if normalized_source_contains_region_match_delegate(source) {
         let owner = packet_display_owner(symbol).unwrap_or_else(|| "String comparison".to_string());
         claims.push(format!(
-            "{owner} delegates region matching work to CharSequenceUtils.regionMatches."
+            "{owner} delegates region matching work to a shared character-sequence helper."
         ));
     }
 
@@ -1048,7 +1074,7 @@ fn packet_predicate_claim_symbol(symbol: &str, method: &str) -> String {
 
 fn normalized_source_contains_region_match_delegate(source: &str) -> bool {
     let normalized_source = normalize_identifier(source);
-    normalized_source.contains("charsequenceutils")
+    normalized_source.contains("charsequence")
         && normalized_source.contains("regionmatches")
         && (normalized_source.contains("return")
             || normalized_source.contains("delegate")
@@ -1117,7 +1143,7 @@ pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<Stri
         && (lower.contains("bounce.css") || lower.contains("flash.css"))
     {
         claims.push(
-            "source/animate.css imports the variable, base, and individual animation files."
+            "The animation stylesheet entrypoint imports the variable, base, and individual animation files."
                 .to_string(),
         );
     }
@@ -1127,6 +1153,75 @@ pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<Stri
             claims.push(format!(
                 "Named classes such as .{keyframe} set animation-name to matching keyframes; @keyframes {keyframe} defines the matching animation."
             ));
+        }
+    }
+
+    claims
+}
+
+pub(crate) fn packet_generic_html_css_template_structure_claims(
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
+    let lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if file_name.ends_with(".html") || (lower.contains("<html") && lower.contains("<body")) {
+        if lower.contains("id=\"app\"")
+            && lower.contains("type=\"module\"")
+            && lower.contains("viewport")
+        {
+            claims.push(format!(
+                "{file_name} provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry."
+            ));
+        }
+    }
+
+    if file_name.ends_with(".css") {
+        if lower.contains(":root")
+            && lower.contains("font-family")
+            && lower.contains("color-scheme")
+            && lower.contains("font-smoothing")
+            && lower.contains("body")
+            && lower.contains("min-height")
+        {
+            claims.push(format!(
+                "{file_name} owns :root typography, color-scheme, smoothing, and body layout defaults."
+            ));
+        }
+
+        if lower.contains("#app")
+            && lower.contains("max-width")
+            && lower.contains("margin: 0 auto")
+            && lower.contains("padding")
+        {
+            claims.push(
+                "#app constrains the mounted application content and centers it with padding."
+                    .to_string(),
+            );
+        }
+
+        if lower.contains(".logo")
+            && lower.contains("transition")
+            && lower.contains("button")
+            && lower.contains(":hover")
+            && (lower.contains(":focus") || lower.contains(":focus-visible"))
+        {
+            claims.push(
+                "Logo and button selectors define hover, focus, and transition behavior in CSS."
+                    .to_string(),
+            );
+        }
+
+        if lower.contains("@media")
+            && lower.contains("prefers-color-scheme: light")
+            && lower.contains(":root")
+            && lower.contains("button")
+        {
+            claims.push(
+                "The @media (prefers-color-scheme: light) media query overrides root, link-hover, and button colors."
+                    .to_string(),
+            );
         }
     }
 
@@ -1440,15 +1535,17 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
+    let callable_factory_source =
+        source_lower.contains("mixin(app") || source_lower.contains("var app = function");
     if normalized_symbol.contains("application")
         && source_lower.contains("function")
         && source_lower.contains("handle(")
         && source_lower.contains("request")
         && source_lower.contains("response")
     {
-        if normalized_symbol.contains("createapplication") {
+        if callable_factory_source {
             claims.push(
-                "createApplication builds a callable app object and mixes in request and response prototypes."
+                "The application factory builds a callable app object and mixes in request and response prototypes."
                     .to_string(),
             );
         } else {
@@ -1563,6 +1660,67 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     claims
 }
 
+fn packet_generic_server_request_dispatch_flow_claims(
+    symbol: &str,
+    source: &str,
+    path: &str,
+) -> Vec<String> {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_source = normalize_identifier(source);
+    let symbol_has = |parts: &[&str]| parts.iter().all(|part| normalized_symbol.contains(part));
+    let source_has = |parts: &[&str]| parts.iter().all(|part| normalized_source.contains(part));
+    let mut claims = Vec::new();
+
+    if !packet_claim_primary_source_path(path) {
+        return claims;
+    }
+
+    if symbol_has(&["wsgi", "app"]) && source_has(&["request", "context"]) {
+        claims.push(format!(
+            "{symbol} is the WSGI entry point and creates or uses request context before dispatch."
+        ));
+    }
+
+    if symbol_has(&["full", "dispatch", "request"])
+        && source_has(&["preprocess", "request"])
+        && source_has(&["dispatch", "request"])
+        && source_has(&["finalize", "request"])
+    {
+        claims.push(format!(
+            "{symbol} wraps preprocessing, dispatch, exception handling, and response finalization."
+        ));
+    }
+
+    if symbol_has(&["dispatch", "request"])
+        && !symbol_has(&["full", "dispatch", "request"])
+        && source_has(&["view", "function"])
+        && source_has(&["view", "args"])
+    {
+        claims.push(format!(
+            "{symbol} invokes the view function selected by URL matching."
+        ));
+    }
+
+    if normalized_symbol.ends_with("route") && source_has(&["add", "url", "rule"]) {
+        claims.push(
+            "The route decorator registers view functions through the scaffold URL rule path rather than performing request dispatch itself."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_claim_primary_source_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    !(path.contains("/tests/")
+        || path.contains("/test/")
+        || path.starts_with("tests/")
+        || path.starts_with("test/")
+        || path.contains("/examples/")
+        || path.starts_with("examples/"))
+}
+
 fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
     let mut claims = Vec::new();
     let tables = packet_sql_create_table_names(source);
@@ -1673,6 +1831,9 @@ fn packet_generic_runtime_formatting_flow_claims(
 fn packet_generic_log_record_handler_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let normalized_symbol = normalize_identifier(symbol);
     let source_lower = source.to_ascii_lowercase();
+    let creates_record_object = source_lower.contains("new ") && source_lower.contains("record(");
+    let typed_record_handle =
+        source_lower.contains("function handle(") && source_lower.contains("$record");
     let mut claims = Vec::new();
 
     if source_lower.contains("class logger")
@@ -1691,17 +1852,17 @@ fn packet_generic_log_record_handler_flow_claims(symbol: &str, source: &str) -> 
     }
 
     if (normalized_symbol.ends_with("addrecord") || source_lower.contains("function addrecord("))
-        && source_lower.contains("new logrecord(")
+        && creates_record_object
         && (source_lower.contains("$handler->handle($record)")
             || source_lower.contains("$handler->handle(clone $record)")
             || source_lower.contains("->handle($record)")
             || source_lower.contains("->handle(clone $record)"))
     {
-        claims.push("addRecord creates a LogRecord before passing it to handlers.".to_string());
+        claims.push("addRecord creates a log record before passing it to handlers.".to_string());
     }
 
     if source_lower.contains("interface handlerinterface")
-        && source_lower.contains("function handle(logrecord $record)")
+        && typed_record_handle
         && source_lower.contains("function handlebatch(")
     {
         claims.push(
@@ -1709,12 +1870,12 @@ fn packet_generic_log_record_handler_flow_claims(symbol: &str, source: &str) -> 
         );
     }
 
-    if source_lower.contains("function handle(logrecord $record)")
+    if typed_record_handle
         && source_lower.contains("$this->processrecord($record)")
         && source_lower.contains("$this->write($record)")
     {
         claims.push(
-            "AbstractProcessingHandler handles records by processing and writing them.".to_string(),
+            "The processing handler handles records by processing and writing them.".to_string(),
         );
     }
 
@@ -1725,8 +1886,8 @@ fn packet_generic_site_build_phase_flow_claims(source: &str) -> Vec<String> {
     let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
 
-    if normalized_source.contains("defprocess") && normalized_source.contains("jekyllsitenew") {
-        claims.push("Build.process constructs or processes a Jekyll site.".to_string());
+    if normalized_source.contains("defprocess") && normalized_source.contains("sitenew") {
+        claims.push("Build.process constructs or processes a site.".to_string());
     }
 
     if normalized_source.contains("defprocess")
@@ -1785,21 +1946,21 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
 
     if file_name == "typemap.cs"
         && normalized_source.contains("createmapperlambda")
-        && normalized_source.contains("typemapplanbuilder")
+        && normalized_source.contains("planbuilder")
     {
         claims.push(
             "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
         );
     }
 
-    if file_name == "typemapplanbuilder.cs"
+    if file_name.ends_with("planbuilder.cs")
         && normalized_source.contains("createmapperlambda")
         && normalized_source.contains("createdestinationfunc")
         && normalized_source.contains("createassignmentfunc")
         && normalized_source.contains("createmapperfunc")
     {
         claims.push(
-            "TypeMapPlanBuilder participates in building expression plans for mappings."
+            "The mapping plan builder participates in building expression plans for mappings."
                 .to_string(),
         );
     }
@@ -2135,7 +2296,7 @@ mod tests {
                 "createApplication",
                 "lib/express.js",
                 "function createApplication() { var app = function(req, res, next) { app.handle(req, res, next); }; mixin(app, proto, false); app.request = Object.create(req); app.response = Object.create(res); app.init(); return app; }",
-                "createApplication builds a callable app object and mixes in request and response prototypes.",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
             ),
             (
                 "app.use",
@@ -2237,7 +2398,7 @@ mod tests {
                 "#,
                 &[
                     "Logger owns a stack of handlers registered by pushHandler.",
-                    "addRecord creates a LogRecord before passing it to handlers.",
+                    "addRecord creates a log record before passing it to handlers.",
                 ][..],
             ),
             (
@@ -2265,7 +2426,7 @@ mod tests {
                     }
                 }
                 "#,
-                &["AbstractProcessingHandler handles records by processing and writing them."][..],
+                &["The processing handler handles records by processing and writing them."][..],
             ),
         ];
 
@@ -2557,13 +2718,105 @@ mod tests {
             "#,
         );
         for expected in [
-            "A custom validation example uses novalidate to suppress the browser default UI.",
-            "showError branches on ValidityState fields to choose messages.",
+            "A custom validation example applies script-driven validity checks before rendering messages.",
+            "Custom error rendering branches on ValidityState fields to choose messages.",
             "Submit handlers prevent submission when the form is invalid.",
         ] {
             assert!(
                 custom_claims.iter().any(|claim| claim == expected),
                 "expected form validation claim `{expected}`; got {custom_claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_claims_activate_server_request_dispatch_flow_without_client_transport() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let generic_prompt = "Explain client request adapter behavior.";
+        let claims = packet_source_derived_claims_for_citation(
+            generic_prompt,
+            &test_packet_citation("wsgi_app", "src/app.py"),
+            "def wsgi_app(self, environ, start_response): ctx = self.request_context(environ); response = self.full_dispatch_request()",
+        );
+        assert!(
+            claims.is_empty(),
+            "generic client prompt must not activate server request claims; got {claims:?}"
+        );
+
+        let server_prompt = "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.";
+        let entry_claims = packet_source_derived_claims_for_citation(
+            server_prompt,
+            &test_packet_citation("wsgi_app", "src/app.py"),
+            "def wsgi_app(self, environ, start_response): ctx = self.request_context(environ); response = self.full_dispatch_request()",
+        );
+        assert!(
+            entry_claims.iter().any(|claim| {
+                claim == "wsgi_app is the WSGI entry point and creates or uses request context before dispatch."
+            }),
+            "expected WSGI entry claim; got {entry_claims:?}"
+        );
+
+        let dispatch_claims = packet_source_derived_claims_for_citation(
+            server_prompt,
+            &test_packet_citation("dispatch_request", "src/app.py"),
+            "def dispatch_request(self): return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)",
+        );
+        assert!(
+            dispatch_claims.iter().any(|claim| {
+                claim == "dispatch_request invokes the view function selected by URL matching."
+            }),
+            "expected view dispatch claim; got {dispatch_claims:?}"
+        );
+    }
+
+    #[test]
+    fn source_claims_activate_html_css_template_structure_without_fixed_filenames() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how an HTML app shell and CSS structure split template selectors, theme defaults, and interactive element styling.";
+        let html_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &test_packet_citation("app", "templates/home.html"),
+            r#"
+            <html>
+              <head>
+                <meta name="viewport" content="width=device-width">
+              </head>
+              <body>
+                <div id="app"></div>
+                <script type="module" src="/main.js"></script>
+              </body>
+            </html>
+            "#,
+        );
+        assert!(
+            html_claims.iter().any(|claim| {
+                claim == "home.html provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry."
+            }),
+            "expected generic HTML app-shell claim; got {html_claims:?}"
+        );
+
+        let css_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &test_packet_citation("app", "assets/main.css"),
+            r#"
+            :root { font-family: system-ui; color-scheme: light dark; -webkit-font-smoothing: antialiased; }
+            body { margin: 0; min-height: 100vh; }
+            #app { max-width: 64rem; margin: 0 auto; padding: 2rem; }
+            .logo:hover { transition: filter 300ms; }
+            button:hover { color: blue; }
+            button:focus-visible { outline: auto; }
+            @media (prefers-color-scheme: light) { :root { color: #111; } a:hover { color: #333; } button { background: white; } }
+            "#,
+        );
+        for expected in [
+            "main.css owns :root typography, color-scheme, smoothing, and body layout defaults.",
+            "#app constrains the mounted application content and centers it with padding.",
+            "Logo and button selectors define hover, focus, and transition behavior in CSS.",
+            "The @media (prefers-color-scheme: light) media query overrides root, link-hover, and button colors.",
+        ] {
+            assert!(
+                css_claims.iter().any(|claim| claim == expected),
+                "expected structural CSS claim `{expected}`; got {css_claims:?}"
             );
         }
     }

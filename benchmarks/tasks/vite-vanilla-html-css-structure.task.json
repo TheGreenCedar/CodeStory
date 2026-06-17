@@ -1,0 +1,115 @@
+{
+  "$schema": "./manifest.schema.json",
+  "id": "vite-vanilla-html-css-structure",
+  "version": 1,
+  "suite": "public-core",
+  "task_class": "architecture_explanation",
+  "repo": {
+    "name": "vite",
+    "url": "https://github.com/vitejs/vite.git",
+    "ref": "80a333a23103ced0442d4463d1191433d90f5e19",
+    "workspace_root": "packages/create-vite/template-vanilla",
+    "languages": [
+      "HTML",
+      "CSS",
+      "JavaScript"
+    ],
+    "setup": [
+      "No dependency setup is required for read-only benchmark inspection."
+    ]
+  },
+  "prompt": "Explain how the Vite vanilla template splits the HTML app shell from the shared CSS structure, theme defaults, and interactive element styling. Cite the source files and name the supporting elements or selectors.",
+  "expected_files": [
+    "index.html",
+    "style.css"
+  ],
+  "expected_symbols": [
+    {
+      "name": "div#app",
+      "path": "index.html",
+      "kind": "element",
+      "why": "Mount point for the client module."
+    },
+    {
+      "name": "script[type=\"module\"]",
+      "path": "index.html",
+      "kind": "element",
+      "why": "Loads the client module entry."
+    },
+    {
+      "name": ":root",
+      "path": "style.css",
+      "kind": "selector",
+      "why": "Defines shared typography, color, and rendering defaults."
+    },
+    {
+      "name": "body",
+      "path": "style.css",
+      "kind": "selector",
+      "why": "Defines the full-viewport centered page shell."
+    },
+    {
+      "name": "#app",
+      "path": "style.css",
+      "kind": "selector",
+      "why": "Constrains and centers the mounted app content."
+    },
+    {
+      "name": ".logo.vanilla:hover",
+      "path": "style.css",
+      "kind": "selector",
+      "why": "Applies the vanilla-specific logo hover effect."
+    },
+    {
+      "name": "@media (prefers-color-scheme: light)",
+      "path": "style.css",
+      "kind": "media-query",
+      "why": "Overrides theme colors for light mode."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "index.html provides the app shell with viewport metadata, div#app, and a module script entry."
+    },
+    {
+      "text": "style.css owns the shared typography, color-scheme, smoothing, and body layout defaults."
+    },
+    {
+      "text": "#app constrains the mounted application content and centers it with padding."
+    },
+    {
+      "text": "Logo and button selectors define hover, focus, and transition behavior in CSS."
+    },
+    {
+      "text": "The light color-scheme media query overrides root, link-hover, and button colors."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The vanilla template stores its shared layout and interactive styles in JavaScript instead of CSS.",
+      "severity": "major"
+    },
+    {
+      "text": "index.html renders the full visible UI without loading a module script.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 0.62,
+    "min_expected_file_recall": 0.6,
+    "min_expected_symbol_recall": 0.55,
+    "min_expected_claim_recall": 0.65,
+    "min_citation_coverage": 0.6,
+    "max_forbidden_claims": 0
+  },
+  "notes": [
+    "Out-of-sample structural collector diagnostic for packet-answer-quality promotion breadth; not part of the language-expansion-holdout comparison contract."
+  ],
+  "tags": [
+    "html",
+    "css",
+    "structural",
+    "vite",
+    "out-of-sample"
+  ]
+}
