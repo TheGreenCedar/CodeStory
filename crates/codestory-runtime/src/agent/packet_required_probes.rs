@@ -73,9 +73,21 @@ pub(crate) fn packet_probe_query_is_claimed(
     }
     supported_claims.iter().any(|claim| {
         let normalized_claim = normalize_identifier(&claim.claim);
-        normalized_claim.contains(&normalized_query)
-            || packet_claim_covers_concept_probe(&normalized_query, &normalized_claim)
+        let concept_covered =
+            packet_claim_covers_concept_probe(&normalized_query, &normalized_claim);
+        if packet_probe_query_requires_concept_match(&normalized_query) {
+            concept_covered
+        } else {
+            normalized_claim.contains(&normalized_query) || concept_covered
+        }
     })
+}
+
+fn packet_probe_query_requires_concept_match(normalized_query: &str) -> bool {
+    matches!(
+        normalized_query,
+        "references" | "foreignkeyrelationships" | "schemaconstraints"
+    )
 }
 
 fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &str) -> bool {
@@ -201,7 +213,7 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
         "references" => {
             normalized_claim.contains("rowsreference")
                 || normalized_claim.contains("foreignkey")
-                || normalized_claim.contains("references")
+                || claim_has_sql_relationship_reference(normalized_claim)
         }
         "sqltabledefinitions" => {
             normalized_claim.contains("sqlschema")
@@ -210,7 +222,14 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
                     || normalized_claim.contains("createtable"))
         }
         "foreignkeyrelationships" => {
-            normalized_claim.contains("rowsreference") || normalized_claim.contains("foreignkey")
+            normalized_claim.contains("rowsreference")
+                || normalized_claim.contains("foreignkey")
+                || claim_has_sql_relationship_reference(normalized_claim)
+        }
+        "schemaconstraints" => {
+            normalized_claim.contains("foreignkey")
+                || normalized_claim.contains("rowsreference")
+                || claim_has_sql_relationship_reference(normalized_claim)
         }
         "sqlschemascripts" | "schemadialectscripts" => {
             normalized_claim.contains("sql")
@@ -304,6 +323,15 @@ fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
             && !trimmed.chars().any(char::is_whitespace)
 }
 
+fn claim_has_sql_relationship_reference(normalized_claim: &str) -> bool {
+    normalized_claim.contains("rowsreference")
+        || (normalized_claim.contains("references")
+            && (normalized_claim.contains("foreignkey")
+                || normalized_claim.contains("relationship")
+                || normalized_claim.contains("table")
+                || normalized_claim.contains("rows")))
+}
+
 fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
     matches!(
         normalized_query,
@@ -326,6 +354,7 @@ fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
             | "references"
             | "sqltabledefinitions"
             | "foreignkeyrelationships"
+            | "schemaconstraints"
             | "sqlschemascripts"
             | "schemadialectscripts"
     )
@@ -2464,6 +2493,87 @@ mod tests {
             !queries.iter().any(|query| query == "CREATE TABLE File"),
             "documentation words should not become table probes: {queries:?}"
         );
+    }
+
+    #[test]
+    fn sql_relationship_probes_can_be_covered_by_source_claims() {
+        let claims = vec![
+            PacketClaimDto {
+                claim: "FOREIGN KEY constraints define row references between SQL tables."
+                    .to_string(),
+                citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
+            },
+            PacketClaimDto {
+                claim:
+                    "A CHECK constraint validates a column without describing table relationships."
+                        .to_string(),
+                citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
+            },
+        ];
+
+        for probe in [
+            "foreign key relationships",
+            "schema constraints",
+            "REFERENCES",
+        ] {
+            assert!(
+                packet_probe_query_is_claimed(probe, &claims),
+                "expected claim-backed coverage for {probe}: {claims:?}"
+            );
+        }
+
+        let non_relationship_claims = vec![PacketClaimDto {
+            claim: "A CHECK constraint validates a column without describing table relationships."
+                .to_string(),
+            citations: Vec::new(),
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }];
+        assert!(
+            !packet_probe_query_is_claimed("schema constraints", &non_relationship_claims),
+            "non-relationship constraints should not cover SQL relationship probes"
+        );
+
+        let column_reference_claims = vec![PacketClaimDto {
+            claim: "A CHECK constraint references the Price column while validating values."
+                .to_string(),
+            citations: Vec::new(),
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }];
+        for probe in [
+            "foreign key relationships",
+            "schema constraints",
+            "REFERENCES",
+        ] {
+            assert!(
+                !packet_probe_query_is_claimed(probe, &column_reference_claims),
+                "column-level CHECK references should not cover {probe}"
+            );
+        }
+
+        let range_reference_claims = vec![PacketClaimDto {
+            claim:
+                "A CHECK constraint references the Price column and validates values between 0 and 100."
+                    .to_string(),
+            citations: Vec::new(),
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }];
+        for probe in [
+            "foreign key relationships",
+            "schema constraints",
+            "REFERENCES",
+        ] {
+            assert!(
+                !packet_probe_query_is_claimed(probe, &range_reference_claims),
+                "column-level CHECK references with ranges should not cover {probe}"
+            );
+        }
     }
 
     #[test]

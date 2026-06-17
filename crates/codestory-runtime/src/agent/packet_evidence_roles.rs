@@ -89,7 +89,8 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
 
     if path.ends_with(".sql") && normalized_display.starts_with("createtable") {
         Some(PacketEvidenceRole::SqlTableDefinition)
-    } else if path.ends_with(".sql") && normalized_display == "foreignkey" {
+    } else if path.ends_with(".sql") && display_is_sql_relationship_constraint(&normalized_display)
+    {
         Some(PacketEvidenceRole::SqlRelationshipConstraint)
     } else if path.ends_with(".sql") {
         Some(PacketEvidenceRole::SqlSchemaFile)
@@ -272,6 +273,15 @@ fn packet_display_is_runtime_formatting_arg_store(normalized_display: &str) -> b
     normalized_display.contains("formatargstore")
 }
 
+fn display_is_sql_relationship_constraint(normalized_display: &str) -> bool {
+    normalized_display == "foreignkey"
+        || normalized_display == "references"
+        || normalized_display.contains("foreignkey")
+        || normalized_display.contains("references")
+        || (normalized_display.contains("constraint")
+            && (normalized_display.contains("foreign") || normalized_display.contains("refer")))
+}
+
 fn packet_display_or_path_is_route_dispatch(normalized_display: &str, path: &str) -> bool {
     if normalized_display.contains("add") && normalized_display.contains("route") {
         return true;
@@ -440,6 +450,27 @@ mod tests {
         assert_eq!(
             packet_evidence_role(&citation("dynamic_format_arg_store", "include/fmt/args.h")),
             Some(PacketEvidenceRole::SourceEvidence)
+        );
+    }
+
+    #[test]
+    fn sql_relationship_role_matches_reference_and_constraint_anchors() {
+        for display_name in [
+            "FOREIGN KEY",
+            "REFERENCES",
+            "CONSTRAINT fk_child_parent FOREIGN KEY",
+            "fk_order_customer references",
+        ] {
+            assert_eq!(
+                packet_evidence_role(&citation(display_name, "db/schema.sql")),
+                Some(PacketEvidenceRole::SqlRelationshipConstraint),
+                "expected SQL relationship role for {display_name}"
+            );
+        }
+
+        assert_eq!(
+            packet_evidence_role(&citation("CHECK constraint", "db/schema.sql")),
+            Some(PacketEvidenceRole::SqlSchemaFile)
         );
     }
 }
