@@ -6,6 +6,7 @@ use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use codestory_contracts::api::{
@@ -436,6 +437,28 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         ) {
             return Some("predicate behavior");
         }
+        if normalized_claim.contains("csscustomproperties")
+            || (normalized_claim.contains("animationduration")
+                && normalized_claim.contains("delay")
+                && normalized_claim.contains("repeat"))
+        {
+            return Some("css variables");
+        }
+        if normalized_claim.contains("baseclass")
+            || normalized_claim.contains("animationfillmode")
+            || normalized_claim.contains("animatedisthebase")
+        {
+            return Some("css base class");
+        }
+        if normalized_claim.contains("keyframes") || normalized_claim.contains("animationname") {
+            return Some("css keyframes");
+        }
+        if normalized_claim.contains("imports")
+            && (normalized_claim.contains("animationfiles")
+                || normalized_claim.contains("variablebase"))
+        {
+            return Some("css imports");
+        }
         if normalized_claim.contains("public")
             && contains_any(
                 &normalized_claim,
@@ -507,11 +530,14 @@ fn packet_missing_required_flow_roles(
     let shell_install_dispatch_flow =
         packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
     let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
+    let stylesheet_animation_flow =
+        packet_terms_indicate_stylesheet_animation_flow(&question_terms);
     let required = packet_required_flow_roles(
         task_class,
         site_build_flow,
         shell_install_dispatch_flow,
         url_session_request_flow,
+        stylesheet_animation_flow,
     );
     if required.is_empty() {
         return Vec::new();
@@ -525,6 +551,7 @@ fn packet_missing_required_flow_roles(
             mapper_flow,
             shell_install_dispatch_flow,
             url_session_request_flow,
+            stylesheet_animation_flow,
         ) {
             covered.insert(role);
         }
@@ -542,6 +569,7 @@ fn packet_required_flow_roles(
     site_build_flow: bool,
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
+    stylesheet_animation_flow: bool,
 ) -> &'static [PacketFlowRole] {
     if shell_install_dispatch_flow {
         return match task_class {
@@ -569,6 +597,21 @@ fn packet_required_flow_roles(
                 PacketFlowRole::BoundaryOrState,
             ],
             PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if stylesheet_animation_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::BugLocalization
             | PacketTaskClassDto::ChangeImpact
             | PacketTaskClassDto::SymbolOwnership
             | PacketTaskClassDto::EditPlanning => &[],
@@ -611,6 +654,7 @@ fn packet_flow_roles_for_claim(
     mapper_flow: bool,
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
+    stylesheet_animation_flow: bool,
 ) -> HashSet<PacketFlowRole> {
     let mut roles = HashSet::new();
     let lower = claim.claim.to_ascii_lowercase();
@@ -705,6 +749,29 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("urlsessioncallbacks")
         {
             roles.insert(PacketFlowRole::Handoff);
+        }
+    }
+
+    if stylesheet_animation_flow {
+        if normalized.contains("sourceanimatecss")
+            || (normalized.contains("imports") && normalized.contains("animationfiles"))
+            || normalized.contains("baseclass")
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if normalized.contains("imports")
+            || normalized.contains("animationname")
+            || normalized.contains("matchingkeyframes")
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("customproperties")
+            || normalized.contains("duration")
+            || normalized.contains("delay")
+            || normalized.contains("repeat")
+            || normalized.contains("keyframes")
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
         }
     }
 

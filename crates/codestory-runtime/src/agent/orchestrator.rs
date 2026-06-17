@@ -8843,6 +8843,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn packet_plan_derives_generic_css_animation_source_probes() {
+        let question = "Explain how a stylesheet defines shared animation variables, base classes, and connects named animation classes to keyframes.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required = packet_sufficiency_required_probe_queries(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for expected in [
+            "_vars.css --animate-duration",
+            "_vars.css --animate-delay",
+            "_base.css .animated",
+            "animate.css @import",
+            "bounce.css @keyframes bounce",
+            "flash.css @keyframes flash",
+            "css animation variables",
+            "css animation imports",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic CSS animation probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic CSS animation probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
     #[test]
     fn packet_plan_derives_automapper_map_flow_symbol_probes() {
         let _eval_probes = EvalProbesGuard::enabled();

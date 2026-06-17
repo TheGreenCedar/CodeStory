@@ -7,6 +7,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::retrieval_file_role_from_path;
@@ -141,6 +142,9 @@ pub(crate) fn packet_citation_rank(
     }
     if packet_terms_indicate_form_validation_flow(terms) {
         score += packet_form_validation_rank_bonus(&normalized_display, &path);
+    }
+    if packet_terms_indicate_stylesheet_animation_flow(terms) {
+        score += packet_stylesheet_animation_rank_bonus(&normalized_display, &path);
     }
     if packet_terms_indicate_shell_install_dispatch_flow(terms) {
         score += packet_shell_install_dispatch_rank_bonus(&normalized_display, &path);
@@ -551,6 +555,62 @@ fn packet_form_validation_rank_bonus(normalized_display: &str, path: &str) -> f3
     {
         bonus -= 10.0;
     }
+    bonus
+}
+
+fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) -> f32 {
+    let mut bonus = 0.0;
+    let display_or_path = format!("{normalized_display}{path}");
+
+    if path.contains("/source/") || path.starts_with("source/") {
+        bonus += 5.0;
+    }
+    if path.ends_with("_vars.css") {
+        bonus += 8.0;
+    }
+    if path.ends_with("_base.css") {
+        bonus += 8.0;
+    }
+    if path.ends_with("source/animate.css") || path == "source/animate.css" {
+        bonus += 7.0;
+    }
+    if path.ends_with("attention_seekers/bounce.css") {
+        bonus += 7.0;
+    }
+    if path.ends_with("attention_seekers/flash.css") {
+        bonus += 7.0;
+    }
+
+    if normalized_display.contains("animated")
+        || normalized_display.contains("animated")
+        || normalized_display.contains("animate_duration")
+        || normalized_display.contains("animateduration")
+        || normalized_display.contains("animate_delay")
+        || normalized_display.contains("animatedelay")
+        || normalized_display.contains("animate_repeat")
+        || normalized_display.contains("animaterepeat")
+        || normalized_display.contains("bounce")
+        || normalized_display.contains("flash")
+        || normalized_display.contains("keyframes")
+    {
+        bonus += 6.0;
+    }
+
+    if path.contains("/docs/")
+        || path.starts_with("docs/")
+        || path.contains("/docssource/")
+        || path.starts_with("docssource/")
+        || path.ends_with(".min.css")
+        || path.ends_with("animate.compat.css")
+        || display_or_path.contains("compileanimation")
+        || display_or_path.contains("startanimation")
+    {
+        bonus -= 14.0;
+    }
+    if path.contains("/back_exits/") || path.contains("/rotating_entrances/") {
+        bonus -= 4.0;
+    }
+
     bonus
 }
 

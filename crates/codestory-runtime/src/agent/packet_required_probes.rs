@@ -16,6 +16,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::exact_symbol_query_terms;
@@ -45,6 +46,7 @@ fn packet_probe_query_is_covered(
         return packet_probe_query_is_cited(query, answer);
     }
     packet_probe_query_is_cited(query, answer)
+        || packet_css_custom_property_probe_is_covered(query, answer, supported_claims)
         || packet_probe_query_is_claimed(query, supported_claims)
 }
 
@@ -207,6 +209,52 @@ fn packet_claim_covers_file_scoped_probe(
         .symbols
         .iter()
         .all(|symbol| normalized_claim.contains(symbol))
+}
+
+fn packet_css_custom_property_probe_is_covered(
+    query: &str,
+    answer: &AgentAnswerDto,
+    supported_claims: &[PacketClaimDto],
+) -> bool {
+    let Some(parts) = packet_file_scoped_symbol_probe_parts(query) else {
+        return false;
+    };
+    if !parts.file_name.eq_ignore_ascii_case("_vars.css") {
+        return false;
+    }
+    if parts.symbols.is_empty()
+        || !parts
+            .symbols
+            .iter()
+            .all(|symbol| symbol.starts_with("animate"))
+    {
+        return false;
+    }
+    let cites_variables_file = answer.citations.iter().any(|citation| {
+        citation
+            .file_path
+            .as_deref()
+            .map(packet_display_path)
+            .map(|path| {
+                path.rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(path.as_str())
+                    .eq_ignore_ascii_case("_vars.css")
+            })
+            .unwrap_or(false)
+    });
+    if !cites_variables_file {
+        return false;
+    }
+
+    supported_claims.iter().any(|claim| {
+        let normalized_claim = normalize_identifier(&claim.claim);
+        normalized_claim.contains("csscustomproperties")
+            && parts
+                .symbols
+                .iter()
+                .all(|symbol| normalized_claim.contains(symbol))
+    })
 }
 
 fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
@@ -480,6 +528,18 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
                 "validity state",
                 "submit prevent default",
                 "form validation bypass",
+            ],
+        );
+    }
+    if packet_terms_indicate_stylesheet_animation_flow(terms) {
+        push_stylesheet_animation_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "css animation variables",
+                "css animation base class",
+                "css keyframes",
+                "css animation imports",
             ],
         );
     }
@@ -1414,6 +1474,23 @@ fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
             "fruit-pattern.html pattern",
             "min-max.html min",
             "min-max.html max",
+        ],
+    );
+}
+
+fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "_vars.css --animate-duration",
+            "_vars.css --animate-delay",
+            "_vars.css --animate-repeat",
+            "_base.css .animated",
+            "animate.css @import",
+            "bounce.css bounce",
+            "bounce.css @keyframes bounce",
+            "flash.css flash",
+            "flash.css @keyframes flash",
         ],
     );
 }

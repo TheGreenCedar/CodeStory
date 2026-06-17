@@ -24,8 +24,8 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_string_predicate_flow, packet_terms_indicate_url_session_request_flow,
-    prompt_search_terms,
+    packet_terms_indicate_string_predicate_flow, packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
 use crate::agent::planning::dedupe_packet_plan_queries;
 use crate::{
@@ -316,6 +316,18 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             ],
         );
     }
+    if packet_terms_indicate_stylesheet_animation_flow(terms) {
+        push_stylesheet_animation_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "css animation variables",
+                "css animation base class",
+                "css keyframes",
+                "css animation imports",
+            ],
+        );
+    }
     if packet_terms_indicate_shell_install_dispatch_flow(terms) {
         push_shell_install_dispatch_source_probe_queries(queries);
         push_unique_terms(
@@ -591,6 +603,18 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             ],
         );
     }
+    if packet_terms_indicate_stylesheet_animation_flow(terms) {
+        push_stylesheet_animation_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "css animation variables",
+                "css animation base class",
+                "css keyframes",
+                "css animation imports",
+            ],
+        );
+    }
     if packet_terms_indicate_shell_install_dispatch_flow(terms) {
         push_shell_install_dispatch_source_probe_queries(queries);
         push_unique_terms(
@@ -722,6 +746,23 @@ fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
             "fruit-pattern.html pattern",
             "min-max.html min",
             "min-max.html max",
+        ],
+    );
+}
+
+fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "_vars.css --animate-duration",
+            "_vars.css --animate-delay",
+            "_vars.css --animate-repeat",
+            "_base.css .animated",
+            "animate.css @import",
+            "bounce.css bounce",
+            "bounce.css @keyframes bounce",
+            "flash.css flash",
+            "flash.css @keyframes flash",
         ],
     );
 }

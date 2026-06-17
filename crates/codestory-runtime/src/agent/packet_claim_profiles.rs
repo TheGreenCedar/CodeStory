@@ -1080,6 +1080,18 @@ pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<Stri
         ));
     }
 
+    let lower = source.to_ascii_lowercase();
+    if lower.contains("@import")
+        && lower.contains("_vars.css")
+        && lower.contains("_base.css")
+        && (lower.contains("bounce.css") || lower.contains("flash.css"))
+    {
+        claims.push(
+            "source/animate.css imports the variable, base, and individual animation files."
+                .to_string(),
+        );
+    }
+
     for keyframe in packet_css_keyframe_names(source).into_iter().take(4) {
         if packet_css_class_sets_animation_name(source, &keyframe) {
             claims.push(format!(
