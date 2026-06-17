@@ -1683,10 +1683,6 @@ fn packet_response_receiver_owner(owner: &str) -> bool {
 
 fn packet_response_terminal_method(method: &str) -> bool {
     matches!(method, "send" | "json" | "end" | "respond")
-        || method.ends_with("send")
-        || method.ends_with("json")
-        || method.ends_with("end")
-        || method.ends_with("respond")
 }
 
 fn packet_source_sets_response_metadata(source_lower: &str) -> bool {
@@ -1703,7 +1699,6 @@ fn packet_source_ends_or_writes_response(source_lower: &str) -> bool {
     source_lower.contains(".end(")
         || source_lower.contains(".write(")
         || source_lower.contains("writehead(")
-        || source_lower.contains("body")
 }
 
 fn packet_generic_server_request_dispatch_flow_claims(
@@ -2391,6 +2386,19 @@ mod tests {
                 "expected production Express source claim `{expected}` for {symbol}; got {claims:?}"
             );
         }
+
+        let metadata_only = test_packet_citation("reply.append", "src/http/reply.js");
+        let metadata_only_claims = packet_source_derived_claims_for_citation(
+            express_prompt,
+            &metadata_only,
+            "reply.append = function append(body) { this.setHeader('Content-Type', 'text/plain'); return body; }",
+        );
+        assert!(
+            !metadata_only_claims
+                .iter()
+                .any(|claim| claim.contains("ending the response")),
+            "metadata-only helpers must not claim terminal response writes: {metadata_only_claims:?}"
+        );
     }
 
     #[test]

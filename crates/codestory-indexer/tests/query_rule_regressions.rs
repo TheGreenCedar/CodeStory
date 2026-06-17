@@ -234,6 +234,38 @@ res.send = function send(body) {
 }
 
 #[test]
+fn test_typescript_and_tsx_receiver_function_assignments_preserve_method_aliases()
+-> anyhow::Result<()> {
+    let (nodes, _) = index_project(&[
+        (
+            "main.ts",
+            r#"
+const service = {};
+service.reply = function reply(message: string) {
+  return message;
+};
+
+const response = {};
+response.json = (body: unknown) => body;
+"#,
+        ),
+        (
+            "view.tsx",
+            r#"
+const view = {};
+view.render = () => <span>ready</span>;
+"#,
+        ),
+    ])?;
+
+    assert!(has_node_kind(&nodes, "service.reply", NodeKind::METHOD));
+    assert!(has_node_kind(&nodes, "response.json", NodeKind::METHOD));
+    assert!(has_node_kind(&nodes, "view.render", NodeKind::METHOD));
+
+    Ok(())
+}
+
+#[test]
 fn test_typescript_aliases_and_interface_inheritance_stay_well_typed() -> anyhow::Result<()> {
     let (nodes, edges) = index_project(&[(
         "main.ts",
