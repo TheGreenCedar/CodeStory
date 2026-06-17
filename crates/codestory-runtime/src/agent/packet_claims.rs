@@ -238,12 +238,79 @@ fn packet_append_source_derived_flow_claims(
             _ => continue,
         };
         for claim in packet_source_derived_claims_for_citation(prompt, citation, &source) {
-            packet_push_flow_template_claim(claims, seen, &claim, Some(citation.clone()));
+            let claim_citation =
+                packet_preferred_source_derived_claim_citation(&claim, citation, citations);
+            packet_push_flow_template_claim(claims, seen, &claim, Some(claim_citation));
             if claims.len() >= 18 {
                 return;
             }
         }
     }
+}
+
+fn packet_preferred_source_derived_claim_citation(
+    claim: &str,
+    source_citation: &AgentCitationDto,
+    citations: &[AgentCitationDto],
+) -> AgentCitationDto {
+    if packet_claim_text_indicates_sql_relationship(claim)
+        && let Some(relationship_citation) =
+            packet_matching_sql_relationship_citation(source_citation, citations)
+    {
+        return relationship_citation;
+    }
+    source_citation.clone()
+}
+
+fn packet_matching_sql_relationship_citation(
+    source_citation: &AgentCitationDto,
+    citations: &[AgentCitationDto],
+) -> Option<AgentCitationDto> {
+    let source_path = source_citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .map(|path| normalize_identifier(&path));
+    citations
+        .iter()
+        .filter(|citation| {
+            packet_evidence_role(citation) == Some(PacketEvidenceRole::SqlRelationshipConstraint)
+        })
+        .find(|citation| {
+            source_path.as_deref().is_some_and(|source_path| {
+                citation
+                    .file_path
+                    .as_deref()
+                    .map(packet_display_path)
+                    .map(|path| normalize_identifier(&path) == source_path)
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| {
+            citations.iter().find(|citation| {
+                packet_evidence_role(citation)
+                    == Some(PacketEvidenceRole::SqlRelationshipConstraint)
+            })
+        })
+        .cloned()
+}
+
+fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
+    let normalized = normalize_identifier(claim);
+    normalized.contains("rowsreference")
+        || normalized.contains("foreignkey")
+        || normalized.contains("references")
+        || ((normalized.contains("relationship")
+            || normalized.contains("relationships")
+            || normalized.contains("constraint")
+            || normalized.contains("constraints"))
+            && (normalized.contains("sql")
+                || normalized.contains("schema")
+                || normalized.contains("table")
+                || normalized.contains("rows")
+                || normalized.contains("foreign")
+                || normalized.contains("reference")
+                || normalized.contains("referential")))
 }
 
 fn packet_append_sql_schema_file_claims(
@@ -859,4 +926,175 @@ fn packet_identifier_tokens(identifier: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{
+        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
+        NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin,
+    };
+
+    fn test_answer(prompt: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "packet-claims-test".to_string(),
+            prompt: prompt.to_string(),
+            summary: "test answer".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations,
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "packet-claims-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                annotations: Vec::new(),
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        }
+    }
+
+    fn test_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(format!("test::{display_name}")),
+            display_name: display_name.to_string(),
+            kind: NodeKind::ANNOTATION,
+            file_path: Some(file_path.to_string()),
+            line: Some(1),
+            score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: score,
+                semantic: 0.0,
+                graph: 0.0,
+                total: score,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
+                provenance: Vec::new(),
+            }),
+            evidence_tier: None,
+            evidence_producer: Some("test".to_string()),
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn write_sql_fixture(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "codestory-packet-claims-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create packet claims temp dir");
+        let path = root.join("schema.sql");
+        std::fs::write(
+            &path,
+            r#"
+            CREATE TABLE Child
+            (
+                ChildId INTEGER NOT NULL,
+                ParentId INTEGER NOT NULL,
+                FOREIGN KEY (ParentId) REFERENCES Parent (ParentId)
+            );
+            CREATE TABLE Parent
+            (
+                ParentId INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("write packet claims sql fixture");
+        path
+    }
+
+    #[test]
+    fn sql_relationship_claims_attach_to_retained_foreign_key_citations() {
+        let path = write_sql_fixture("foreign-key");
+        let path_text = path.to_string_lossy().to_string();
+        let answer = test_answer(
+            "Explain SQL schema relationships between child and parent rows.",
+            vec![
+                test_citation("CREATE TABLE Child", &path_text, 0.9),
+                test_citation("FOREIGN KEY", &path_text, 0.8),
+            ],
+        );
+
+        let claims = packet_supported_claims(&answer);
+        let relationship_claim = claims
+            .iter()
+            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
+        assert!(
+            relationship_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "FOREIGN KEY"),
+            "relationship claim should cite retained FK evidence: {relationship_claim:?}"
+        );
+        assert!(
+            !relationship_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "CREATE TABLE Child"),
+            "relationship claim should not stay attached only to table evidence: {relationship_claim:?}"
+        );
+
+        let table_claim = claims
+            .iter()
+            .find(|claim| claim.claim == "SQL schema defines tables Child and Parent.")
+            .unwrap_or_else(|| panic!("expected table claim in {claims:?}"));
+        assert!(
+            table_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "CREATE TABLE Child"),
+            "table claim should keep table-definition evidence: {table_claim:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
+    }
+
+    #[test]
+    fn sql_relationship_claims_can_attach_to_retained_references_citations() {
+        let path = write_sql_fixture("references");
+        let path_text = path.to_string_lossy().to_string();
+        let answer = test_answer(
+            "Explain SQL schema relationships and references between child and parent rows.",
+            vec![
+                test_citation("CREATE TABLE Child", &path_text, 0.9),
+                test_citation("REFERENCES", &path_text, 0.8),
+            ],
+        );
+
+        let claims = packet_supported_claims(&answer);
+        let relationship_claim = claims
+            .iter()
+            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
+        assert!(
+            relationship_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "REFERENCES"),
+            "relationship claim should cite retained REFERENCES evidence: {relationship_claim:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
+    }
 }
