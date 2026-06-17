@@ -125,10 +125,20 @@ pub(crate) fn packet_citation_rank(
         score += 4.0;
     }
     if packet_terms_indicate_server_route_dispatch_flow(terms) {
-        score += packet_route_dispatch_rank_bonus(&normalized_display, &path, terms);
+        score += packet_route_dispatch_rank_bonus(
+            &citation.display_name,
+            &normalized_display,
+            &path,
+            terms,
+        );
     }
     if packet_terms_indicate_server_request_dispatch_flow(terms) {
-        score += packet_server_request_dispatch_rank_bonus(&normalized_display, &path, terms);
+        score += packet_server_request_dispatch_rank_bonus(
+            &citation.display_name,
+            &normalized_display,
+            &path,
+            terms,
+        );
     }
     if packet_terms_indicate_buffered_io_flow(terms) {
         score += packet_buffered_io_rank_bonus(&normalized_display, &path);
@@ -293,8 +303,14 @@ pub(crate) fn packet_display_name_is_test_like(display: &str) -> bool {
         || local_name.contains("_tests_")
 }
 
-fn packet_route_dispatch_rank_bonus(normalized_display: &str, path: &str, terms: &[String]) -> f32 {
+fn packet_route_dispatch_rank_bonus(
+    display: &str,
+    normalized_display: &str,
+    path: &str,
+    terms: &[String],
+) -> f32 {
     let mut bonus = 0.0;
+    bonus += packet_request_dispatch_anchor_rank_bonus(display, normalized_display, path);
     if normalized_display.contains("create") && normalized_display.contains("application") {
         bonus += 8.0;
     }
@@ -319,11 +335,13 @@ fn packet_route_dispatch_rank_bonus(normalized_display: &str, path: &str, terms:
 }
 
 fn packet_server_request_dispatch_rank_bonus(
+    display: &str,
     normalized_display: &str,
     path: &str,
     terms: &[String],
 ) -> f32 {
     let mut bonus = 0.0;
+    bonus += packet_request_dispatch_anchor_rank_bonus(display, normalized_display, path);
     if normalized_display_matches_prompt_owner(normalized_display, terms) {
         bonus += 6.0;
     }
@@ -357,6 +375,90 @@ fn packet_server_request_dispatch_rank_bonus(
         bonus += 3.0;
     }
     bonus
+}
+
+fn packet_request_dispatch_anchor_rank_bonus(
+    display: &str,
+    normalized_display: &str,
+    path: &str,
+) -> f32 {
+    let mut bonus = 0.0;
+    let role = retrieval_file_role_from_path(path);
+    if packet_request_dispatch_artifact_anchor(normalized_display, path) {
+        bonus -= 18.0;
+    } else if role.is_non_primary() {
+        bonus -= 10.0;
+    }
+    if role == crate::RetrievalFileRole::Source
+        && packet_application_router_response_source_anchor(display, normalized_display, path)
+    {
+        bonus += 8.0;
+    }
+    bonus
+}
+
+fn packet_request_dispatch_artifact_anchor(normalized_display: &str, path: &str) -> bool {
+    normalized_display.starts_with("componentreport")
+        || normalized_display.contains("schemareference")
+        || path.contains("component_report")
+        || path.contains("component-report")
+        || path.contains("schema_reference")
+        || path.contains("schema-reference")
+}
+
+fn packet_application_router_response_source_anchor(
+    display: &str,
+    normalized_display: &str,
+    path: &str,
+) -> bool {
+    if normalized_display.contains("create") && normalized_display.contains("application") {
+        return true;
+    }
+    if let Some((owner, method)) = packet_display_owner_and_method(display)
+        && packet_request_dispatch_receiver_owner(&owner)
+        && packet_request_dispatch_method_tail(&method)
+    {
+        return true;
+    }
+    let path_stem = packet_path_file_stem(path);
+    packet_request_dispatch_owner_path_stem(&path_stem)
+        && packet_request_dispatch_method_tail(normalized_display)
+}
+
+fn packet_display_owner_and_method(display: &str) -> Option<(String, String)> {
+    let trimmed = display.trim();
+    for separator in ['.', '#', ':'] {
+        if let Some(index) = trimmed.rfind(separator) {
+            let owner = normalize_identifier(&trimmed[..index]);
+            let method = normalize_identifier(&trimmed[index + separator.len_utf8()..]);
+            if !owner.is_empty() && !method.is_empty() {
+                return Some((owner, method));
+            }
+        }
+    }
+    None
+}
+
+fn packet_request_dispatch_receiver_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "app" | "application" | "router" | "route" | "res" | "response"
+    )
+}
+
+fn packet_request_dispatch_owner_path_stem(path_stem: &str) -> bool {
+    path_stem.contains("app")
+        || path_stem.contains("application")
+        || path_stem.contains("router")
+        || path_stem.contains("route")
+        || path_stem.contains("response")
+}
+
+fn packet_request_dispatch_method_tail(method: &str) -> bool {
+    matches!(
+        method,
+        "dispatch" | "handle" | "use" | "route" | "send" | "json" | "end" | "respond"
+    )
 }
 
 fn normalized_display_contains_all_parts(value: &str, parts: &[&str]) -> bool {
@@ -1138,6 +1240,7 @@ fn path_after_named_repo_root(normalized: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::NodeId;
 
     #[test]
     fn test_like_display_names_include_go_style_pascal_names() {
@@ -1159,16 +1262,82 @@ mod tests {
             "engine".to_string(),
         ];
         assert!(
-            packet_route_dispatch_rank_bonus("nodeaddroute", "src/router/tree.go", &terms) > 0.0
+            packet_route_dispatch_rank_bonus(
+                "Node.addRoute",
+                "nodeaddroute",
+                "src/router/tree.go",
+                &terms
+            ) > 0.0
         );
         assert!(
             packet_route_dispatch_rank_bonus(
+                "serverHandleHttpRequest",
                 "serverhandlehttprequest",
                 "src/http/server.go",
                 &terms
             ) > 0.0
         );
-        assert!(packet_route_dispatch_rank_bonus("new", "src/server.go", &terms) > 0.0);
+        assert!(packet_route_dispatch_rank_bonus("new", "new", "src/server.go", &terms) > 0.0);
+    }
+
+    #[test]
+    fn request_dispatch_rank_prefers_source_anchors_over_artifacts() {
+        let terms = vec![
+            "server".to_string(),
+            "request".to_string(),
+            "dispatch".to_string(),
+            "router".to_string(),
+            "response".to_string(),
+        ];
+        let source = test_rank_citation("app.handle", "lib/application.js", 1.0);
+        let example = test_rank_citation("app.handle", "examples/application.js", 1.0);
+        let schema_reference = test_rank_citation(
+            "schema_reference::request_dispatch",
+            "schema/reference.js",
+            1.0,
+        );
+        let component_report =
+            test_rank_citation("component_report:routes", "lib/application.js", 1.0);
+        let response_source = test_rank_citation("res.send", "lib/response.js", 1.0);
+
+        assert!(
+            packet_citation_rank(&source, &terms, false)
+                > packet_citation_rank(&example, &terms, false)
+        );
+        assert!(
+            packet_citation_rank(&source, &terms, false)
+                > packet_citation_rank(&schema_reference, &terms, false)
+        );
+        assert!(
+            packet_citation_rank(&source, &terms, false)
+                > packet_citation_rank(&component_report, &terms, false)
+        );
+        assert!(
+            packet_citation_rank(&response_source, &terms, false)
+                > packet_citation_rank(&component_report, &terms, false)
+        );
+    }
+
+    fn test_rank_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind: NodeKind::METHOD,
+            file_path: Some(file_path.to_string()),
+            line: Some(1),
+            score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        }
     }
 
     #[test]

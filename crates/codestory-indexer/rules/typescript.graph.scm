@@ -248,6 +248,35 @@
   attr (@name.node) end_col = (end-column @def)
 }
 
+;; Receiver method assignment
+(assignment_expression
+  left: (member_expression
+    property: (property_identifier)) @name
+  right: (function_expression) @def)
+{
+  node @name.node
+  attr (@name.node) kind = "METHOD"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
+(assignment_expression
+  left: (member_expression
+    property: (property_identifier)) @name
+  right: (arrow_function) @def)
+{
+  node @name.node
+  attr (@name.node) kind = "METHOD"
+  attr (@name.node) name = (source-text @name)
+  attr (@name.node) start_row = (start-row @def)
+  attr (@name.node) start_col = (start-column @def)
+  attr (@name.node) end_row = (end-row @def)
+  attr (@name.node) end_col = (end-column @def)
+}
+
 ;; Exported object/array configs
 (export_statement
   declaration: (lexical_declaration

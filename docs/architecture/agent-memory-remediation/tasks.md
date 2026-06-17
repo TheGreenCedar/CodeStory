@@ -35,10 +35,10 @@
 
 ## Phase 4: Improve Source-Backed Claims Without Fixture Text
 
-- [ ] 5. Improve dynamic symbol labels
-  - [ ] 5.1 Preserve JavaScript receiver-method aliases from source ranges where graph display names are weak.
-  - [ ] 5.2 Prefer application/router/response source anchors over examples and schema-reference component reports for request-dispatch roles.
-  - [ ] 5.3 Add a regression that Express names `createApplication`, `app.handle`, `app.use`, and `res.send` without embedding expected claim strings in production.
+- [x] 5. Improve dynamic symbol labels
+  - [x] 5.1 Preserve JavaScript receiver-method aliases from source ranges where graph display names are weak.
+  - [x] 5.2 Prefer application/router/response source anchors over examples and schema-reference component reports for request-dispatch roles.
+  - [x] 5.3 Add a regression that Express names `createApplication`, `app.handle`, `app.use`, and `res.send` without embedding expected claim strings in production.
   - _Requirements: 3.1, 3.2, 3.3, 6.1_
 
 ## Phase 5: Make Compact Budget Proof-Aware
