@@ -134,7 +134,11 @@ impl SourceClaimProfile {
             }
             Self::RuntimeFormatting => {
                 if packet_terms_indicate_runtime_formatting_flow(&ctx.prompt_terms) {
-                    claims.extend(packet_generic_runtime_formatting_flow_claims(ctx.source));
+                    claims.extend(packet_generic_runtime_formatting_flow_claims(
+                        ctx.symbol,
+                        &ctx.file_name,
+                        ctx.source,
+                    ));
                 }
             }
             Self::LogRecordHandler => {
@@ -1001,9 +1005,10 @@ pub(crate) fn packet_generic_string_predicate_flow_claims(
             && (method_lower.contains("null") || null_empty_whitespace_documented)
             && method_lower.contains("length")
         {
-            claims.push(
-                "isBlank treats null, empty, and whitespace-only inputs as blank.".to_string(),
-            );
+            let symbol = packet_predicate_claim_symbol(symbol, "isBlank");
+            claims.push(format!(
+                "{symbol} treats null, empty, and whitespace-only inputs as blank."
+            ));
         }
     }
 
@@ -1018,11 +1023,36 @@ pub(crate) fn packet_generic_string_predicate_flow_claims(
             && !method_lower.contains("strip(")
             && !method_lower.contains(".strip")
         {
-            claims.push("isEmpty does not trim whitespace before deciding emptiness.".to_string());
+            let symbol = packet_predicate_claim_symbol(symbol, "isEmpty");
+            claims.push(format!(
+                "{symbol} does not trim whitespace before deciding emptiness."
+            ));
         }
     }
 
+    if normalized_source_contains_region_match_delegate(source) {
+        let owner = packet_display_owner(symbol).unwrap_or_else(|| "String comparison".to_string());
+        claims.push(format!(
+            "{owner} delegates region matching work to CharSequenceUtils.regionMatches."
+        ));
+    }
+
     claims
+}
+
+fn packet_predicate_claim_symbol(symbol: &str, method: &str) -> String {
+    packet_display_owner(symbol)
+        .map(|owner| format!("{owner}.{method}"))
+        .unwrap_or_else(|| method.to_string())
+}
+
+fn normalized_source_contains_region_match_delegate(source: &str) -> bool {
+    let normalized_source = normalize_identifier(source);
+    normalized_source.contains("charsequenceutils")
+        && normalized_source.contains("regionmatches")
+        && (normalized_source.contains("return")
+            || normalized_source.contains("delegate")
+            || normalized_source.contains("ignorecase"))
 }
 
 fn packet_source_method_block(
@@ -1553,9 +1583,30 @@ fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
     claims
 }
 
-fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
+fn packet_generic_runtime_formatting_flow_claims(
+    symbol: &str,
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_file_name = normalize_identifier(file_name);
     let normalized_source = normalize_identifier(source);
+    let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
+
+    if normalized_symbol.contains("formatargstore") || normalized_source.contains("formatargstore")
+    {
+        claims.push(
+            "Runtime formatting builds type-erased format argument stores before dispatching formatting."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "vformat" || normalized_symbol.ends_with("vformat") {
+        claims.push(
+            "vformat is the central formatting path for runtime format arguments.".to_string(),
+        );
+    }
 
     if normalized_source.contains("vformat")
         && (normalized_source.contains("formatargs")
@@ -1574,8 +1625,44 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
             || normalized_source.contains("throwformaterror")
             || normalized_source.contains("formatting"))
     {
+        claims.push("format_error represents formatting failures.".to_string());
         claims.push(
             "Runtime formatting failures use format_error, which represents the failure type."
+                .to_string(),
+        );
+    }
+
+    if (normalized_symbol.contains("formatto") || normalized_source.contains("formatto"))
+        && (normalized_source.contains("outputit")
+            || normalized_source.contains("outputiterator")
+            || normalized_source.contains("appender")
+            || normalized_source.contains("vformatto"))
+    {
+        claims.push("format_to writes formatted output through an output iterator.".to_string());
+    }
+
+    if normalized_source.contains("buffer")
+        && normalized_source.contains("append")
+        && (normalized_file_name.starts_with("format")
+            || normalized_source.contains("formatted")
+            || normalized_source.contains("format"))
+    {
+        claims.push(
+            "Runtime formatting source instantiates buffer append paths for formatted output."
+                .to_string(),
+        );
+    }
+
+    if (normalized_file_name.starts_with("os")
+        || normalized_source.contains("systemerror")
+        || normalized_source.contains("formaterrorcode"))
+        && normalized_source.contains("vformat")
+        && (normalized_source.contains("formaterrorcode")
+            || normalized_source.contains("formatwindowserror")
+            || source_lower.contains("std::system_error"))
+    {
+        claims.push(
+            "Runtime formatting error-boundary code formats system errors with vformat or format_to."
                 .to_string(),
         );
     }

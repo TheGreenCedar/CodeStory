@@ -1361,13 +1361,18 @@ fn packet_required_probe_source_display_name(parts: &PacketFileScopedSymbolProbe
     if display_name.contains('.') || display_name.contains(':') || display_name.contains('#') {
         return display_name;
     }
-    let path = parts.query_path.replace('\\', "/").to_ascii_lowercase();
-    let receiver = if path.ends_with("application.js") {
+    let path = parts.query_path.replace('\\', "/");
+    let path_lower = path.to_ascii_lowercase();
+    let receiver = if path_lower.ends_with("application.js") {
         Some("app")
-    } else if path.ends_with("response.js") {
+    } else if path_lower.ends_with("response.js") {
         Some("res")
-    } else if path.ends_with("request.js") {
+    } else if path_lower.ends_with("request.js") {
         Some("req")
+    } else if path_lower.ends_with(".java") {
+        path.rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.').map(|(stem, _)| stem))
     } else {
         None
     };
@@ -1432,6 +1437,16 @@ fn packet_source_line_matches_file_scoped_probe(
         return true;
     }
 
+    if parts.symbols.len() > 1
+        && !packet_source_line_is_comment_like(line)
+        && parts
+            .symbols
+            .iter()
+            .all(|symbol| normalized_line.contains(symbol))
+    {
+        return true;
+    }
+
     let terminal = packet_required_probe_terminal_symbol(&raw_display);
     let normalized_terminal = normalize_identifier(&terminal);
     if normalized_terminal.is_empty() || !normalized_line.contains(&normalized_terminal) {
@@ -1442,9 +1457,35 @@ fn packet_source_line_matches_file_scoped_probe(
         return true;
     }
 
+    if parts.symbols.len() == 1
+        && normalized_line.contains(&parts.symbols[0])
+        && (packet_source_line_looks_like_code_call(line)
+            || packet_cpp_template_instantiation(line))
+    {
+        return true;
+    }
+
     packet_source_line_declares_named_symbol(line, &normalized_terminal)
         || normalized_line == normalized_display
         || normalized_line.ends_with(&normalized_display)
+}
+
+fn packet_source_line_looks_like_code_call(line: &str) -> bool {
+    if packet_source_line_is_comment_like(line) {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    trimmed.contains('(') && (trimmed.contains(';') || trimmed.contains('{'))
+}
+
+fn packet_source_line_is_comment_like(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
+}
+
+fn packet_cpp_template_instantiation(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("template ") && (lower.contains("api ") || lower.contains("extern "))
 }
 
 fn packet_shell_function_line_matches(line: &str, normalized_terminal: &str) -> bool {
@@ -7401,11 +7442,30 @@ mod tests {
                     0.9,
                 )],
             },
+            PacketClaimDto {
+                claim: "Strings delegates region matching work to CharSequenceUtils.regionMatches."
+                    .to_string(),
+                citations: vec![test_packet_citation(
+                    "Strings.regionMatches",
+                    "src/main/java/org/apache/commons/lang3/Strings.java",
+                    0.9,
+                )],
+            },
         ];
 
-        assert_eq!(packet_claim_family(&claims[0]), Some("predicate behavior"));
-        assert_eq!(packet_claim_family(&claims[1]), Some("predicate behavior"));
-        assert_eq!(packet_supported_claim_family_count(&claims), 1);
+        assert_eq!(
+            packet_claim_family(&claims[0]),
+            Some("predicate blank behavior")
+        );
+        assert_eq!(
+            packet_claim_family(&claims[1]),
+            Some("predicate empty behavior")
+        );
+        assert_eq!(
+            packet_claim_family(&claims[2]),
+            Some("predicate region/case flow")
+        );
+        assert_eq!(packet_supported_claim_family_count(&claims), 3);
     }
 
     #[test]
@@ -8545,6 +8605,17 @@ mod tests {
                 "production packet plan should keep literal prompt symbol `{literal_symbol}` in {queries:?}"
             );
         }
+        for source_probe in [
+            "StringUtils.java isBlank",
+            "StringUtils.java isEmpty",
+            "Strings.java regionMatches",
+            "CharSequenceUtils.java regionMatches",
+        ] {
+            assert!(
+                queries.contains(&source_probe),
+                "production packet plan should derive Java source-scoped predicate probe `{source_probe}` in {queries:?}"
+            );
+        }
         for eval_only_probe in [
             "StringUtils.isBlank",
             "StringUtils.isEmpty",
@@ -8612,8 +8683,11 @@ mod tests {
         for scoped_probe in [
             "TextChecks isBlank",
             "TextChecks isEmpty",
+            "TextChecks.java isBlank",
+            "TextChecks.java isEmpty",
             "regionMatches",
             "CharSequenceHelpers regionMatches",
+            "CharSequenceHelpers.java regionMatches",
         ] {
             assert!(
                 queries.contains(&scoped_probe),
@@ -8655,6 +8729,12 @@ mod tests {
             "dynamic_format_arg_store",
             "format.h format_error",
             "format_error",
+            "format.cc buffer append",
+            "buffer append",
+            "os.cc vformat",
+            "os.cc format_to",
+            "format_windows_error",
+            "format_error_code",
         ] {
             assert!(
                 queries.contains(&expected),
@@ -9748,14 +9828,66 @@ mod tests {
         );
 
         for expected in [
+            "vformat is the central formatting path for runtime format arguments.",
             "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers.",
+            "format_error represents formatting failures.",
             "Runtime formatting failures use format_error, which represents the failure type.",
+            "format_to writes formatted output through an output iterator.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
                 "expected runtime formatting claim `{expected}` in {claims:?}"
             );
         }
+
+        let arg_store = test_packet_citation("dynamic_format_arg_store", "include/fmt/args.h", 0.9);
+        let arg_store_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &arg_store,
+            r#"
+            template <typename Context>
+            class dynamic_format_arg_store {
+              template <typename T>
+              void push_back(const T& value) {
+                data_.push_back(detail::make_arg<Context>(value));
+              }
+            };
+            "#,
+        );
+        assert!(
+            arg_store_claims.iter().any(|claim| claim
+                == "Runtime formatting builds type-erased format argument stores before dispatching formatting."),
+            "expected runtime formatting argument-store claim in {arg_store_claims:?}"
+        );
+
+        let format_cc = test_packet_citation("buffer<char>::append", "src/format.cc", 0.9);
+        let source_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &format_cc,
+            "template FMT_API void buffer<char>::append(const char*, const char*);",
+        );
+        assert!(
+            source_claims.iter().any(|claim| claim
+                == "Runtime formatting source instantiates buffer append paths for formatted output."),
+            "expected runtime formatting source-buffer claim in {source_claims:?}"
+        );
+
+        let os_cc = test_packet_citation("format_windows_error", "src/os.cc", 0.9);
+        let os_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &os_cc,
+            r#"void format_windows_error(detail::buffer<char>& out, int error_code, const char* message) {
+              fmt::format_to(appender(out), FMT_STRING("{}: {}"), message, format_system_error(error_code));
+            }
+            std::system_error vformat_system_error(int ec, string_view format_str, format_args args) {
+              return std::system_error(ec, vformat(format_str, args));
+            }"#,
+        );
+        assert!(
+            os_claims.iter().any(|claim| claim
+                == "Runtime formatting error-boundary code formats system errors with vformat or format_to."),
+            "expected runtime formatting OS-boundary claim in {os_claims:?}"
+        );
     }
 
     #[test]
@@ -10190,6 +10322,80 @@ mod tests {
     }
 
     #[test]
+    fn required_file_scoped_source_probe_adds_cpp_template_and_call_anchors() {
+        let root = packet_temp_root("required-source-probe-cpp-calls");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/format.cc",
+            r#"
+            template FMT_API void buffer<char>::append(const char*, const char*);
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/os.cc",
+            r#"
+            // fmt::format_to appears in docs, but the call below is the source anchor.
+            fmt::format_to(appender(out), FMT_STRING("{}: {}"), message, error_code);
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let probes = [
+            "format.cc buffer append".to_string(),
+            "os.cc format_to".to_string(),
+        ];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &probes,
+            &mut answer,
+        );
+
+        let has_format_cc_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "buffer append"
+                && citation.kind == NodeKind::ANNOTATION
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("src/format.cc"))
+        });
+        let has_os_cc_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "format_to"
+                && citation.kind == NodeKind::ANNOTATION
+                && citation.line == Some(3)
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("src/os.cc"))
+        });
+        let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.contains("appended=2")
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            has_format_cc_anchor,
+            "required source probe should append C++ template instantiation anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_os_cc_anchor,
+            "required source probe should append C++ call-site anchors instead of comments: {:?}",
+            answer.citations
+        );
+        assert!(
+            used_source_probe,
+            "C++ source probes should annotate appended anchor count: {:?}",
+            answer.retrieval_trace.annotations
+        );
+    }
+
+    #[test]
     fn required_file_scoped_source_probe_adds_shell_function_anchor() {
         let root = packet_temp_root("required-source-probe-shell");
         let _ = std::fs::remove_dir_all(&root);
@@ -10491,7 +10697,7 @@ mod tests {
                     return cs == null || cs.length() == 0;
                 }
                 "#,
-                &["StringUtils."][..],
+                &[][..],
             ),
             (
                 "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths.",
@@ -10577,8 +10783,8 @@ mod tests {
         ));
 
         for expected in [
-            "isBlank treats null, empty, and whitespace-only inputs as blank.",
-            "isEmpty does not trim whitespace before deciding emptiness.",
+            "TextChecks.isBlank treats null, empty, and whitespace-only inputs as blank.",
+            "TextChecks.isEmpty does not trim whitespace before deciding emptiness.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),

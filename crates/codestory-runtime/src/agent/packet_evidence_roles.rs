@@ -208,6 +208,8 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         Some(PacketEvidenceRole::WorkspaceDiscoveryAndPlanning)
     } else if display.contains("snapshot") || display.contains("refresh") {
         Some(PacketEvidenceRole::SnapshotRefresh)
+    } else if packet_display_is_runtime_formatting_arg_store(&normalized_display) {
+        Some(PacketEvidenceRole::SourceEvidence)
     } else if display.contains("projection")
         || display.contains("persist")
         || display.contains("storage")
@@ -262,6 +264,10 @@ fn packet_path_is_route_like(path: &str) -> bool {
         || normalized_path.contains("/route.")
         || normalized_path.ends_with("/route.ts")
         || normalized_path.ends_with("/route.tsx")
+}
+
+fn packet_display_is_runtime_formatting_arg_store(normalized_display: &str) -> bool {
+    normalized_display.contains("formatargstore")
 }
 
 fn packet_display_or_path_is_route_dispatch(normalized_display: &str, path: &str) -> bool {
@@ -410,6 +416,18 @@ mod tests {
         assert_eq!(
             packet_evidence_role(&citation("RequestContext.Next", "src/context.go")),
             Some(PacketEvidenceRole::RouteHandling)
+        );
+    }
+
+    #[test]
+    fn runtime_format_arg_store_is_source_evidence_not_persistence() {
+        assert_eq!(
+            packet_evidence_role(&citation("format_arg_store", "include/fmt/base.h")),
+            Some(PacketEvidenceRole::SourceEvidence)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("dynamic_format_arg_store", "include/fmt/args.h")),
+            Some(PacketEvidenceRole::SourceEvidence)
         );
     }
 }

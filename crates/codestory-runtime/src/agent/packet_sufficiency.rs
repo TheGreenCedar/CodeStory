@@ -5,8 +5,10 @@ use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queri
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use codestory_contracts::api::{
@@ -419,6 +421,23 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         if contains_any(&normalized_claim, &["mutation", "mutate", "internalmutate"]) {
             return Some("mutation flow");
         }
+        if normalized_claim.contains("isblank")
+            || (normalized_claim.contains("blank") && normalized_claim.contains("whitespace"))
+        {
+            return Some("predicate blank behavior");
+        }
+        if normalized_claim.contains("isempty")
+            || (normalized_claim.contains("empty") && normalized_claim.contains("trim"))
+        {
+            return Some("predicate empty behavior");
+        }
+        if normalized_claim.contains("regionmatches")
+            || (normalized_claim.contains("region") && normalized_claim.contains("delegate"))
+            || normalized_claim.contains("casesensitive")
+            || normalized_claim.contains("ignorecase")
+        {
+            return Some("predicate region/case flow");
+        }
         if contains_any(
             &normalized_claim,
             &[
@@ -426,13 +445,21 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
                 "empty",
                 "casesensitive",
                 "ignorecase",
+                "region",
+                "regionmatches",
                 "whitespace",
                 "trim",
             ],
         ) && contains_any(
             &normalized_claim,
             &[
-                "treats", "tests", "doesnot", "deciding", "return", "compares",
+                "treats",
+                "tests",
+                "doesnot",
+                "deciding",
+                "return",
+                "compares",
+                "delegates",
             ],
         ) {
             return Some("predicate behavior");
@@ -477,6 +504,32 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
             || normalized_claim.contains("dialectscripts")
         {
             return Some("sql dialect scripts");
+        }
+        if normalized_claim.contains("typeerased")
+            && (normalized_claim.contains("formatargs")
+                || normalized_claim.contains("formatarguments")
+                || normalized_claim.contains("formattingarguments"))
+        {
+            return Some("runtime format arguments");
+        }
+        if normalized_claim.contains("formatto")
+            && (normalized_claim.contains("outputiterator")
+                || normalized_claim.contains("formattedoutput")
+                || normalized_claim.contains("output"))
+        {
+            return Some("runtime format output");
+        }
+        if normalized_claim.contains("formaterror")
+            || normalized_claim.contains("formattingfailures")
+            || normalized_claim.contains("systemerrors")
+        {
+            return Some("runtime format errors");
+        }
+        if normalized_claim.contains("buffer")
+            && normalized_claim.contains("append")
+            && normalized_claim.contains("formattedoutput")
+        {
+            return Some("runtime format buffer");
         }
         if normalized_claim.contains("public")
             && contains_any(
@@ -552,6 +605,8 @@ fn packet_missing_required_flow_roles(
     let stylesheet_animation_flow =
         packet_terms_indicate_stylesheet_animation_flow(&question_terms);
     let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
+    let runtime_formatting_flow = packet_terms_indicate_runtime_formatting_flow(&question_terms);
+    let string_predicate_flow = packet_terms_indicate_string_predicate_flow(&question_terms);
     let required = packet_required_flow_roles(
         task_class,
         site_build_flow,
@@ -559,6 +614,8 @@ fn packet_missing_required_flow_roles(
         url_session_request_flow,
         stylesheet_animation_flow,
         sql_schema_flow,
+        runtime_formatting_flow,
+        string_predicate_flow,
     );
     if required.is_empty() {
         return Vec::new();
@@ -574,6 +631,8 @@ fn packet_missing_required_flow_roles(
             url_session_request_flow,
             stylesheet_animation_flow,
             sql_schema_flow,
+            runtime_formatting_flow,
+            string_predicate_flow,
         ) {
             covered.insert(role);
         }
@@ -593,6 +652,8 @@ fn packet_required_flow_roles(
     url_session_request_flow: bool,
     stylesheet_animation_flow: bool,
     sql_schema_flow: bool,
+    runtime_formatting_flow: bool,
+    string_predicate_flow: bool,
 ) -> &'static [PacketFlowRole] {
     if shell_install_dispatch_flow {
         return match task_class {
@@ -656,6 +717,36 @@ fn packet_required_flow_roles(
         };
     }
 
+    if runtime_formatting_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if string_predicate_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
     if site_build_flow {
         return match task_class {
             PacketTaskClassDto::ArchitectureExplanation
@@ -694,6 +785,8 @@ fn packet_flow_roles_for_claim(
     url_session_request_flow: bool,
     stylesheet_animation_flow: bool,
     sql_schema_flow: bool,
+    runtime_formatting_flow: bool,
+    string_predicate_flow: bool,
 ) -> HashSet<PacketFlowRole> {
     let mut roles = HashSet::new();
     let lower = claim.claim.to_ascii_lowercase();
@@ -833,6 +926,62 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("schemascripts")
             || normalized.contains("dialectscripts")
         {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if runtime_formatting_flow {
+        if normalized.contains("typeerased")
+            && (normalized.contains("formatargs")
+                || normalized.contains("formatarguments")
+                || normalized.contains("formattingarguments"))
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("formatto")
+            && (normalized.contains("outputiterator")
+                || normalized.contains("formattedoutput")
+                || normalized.contains("output"))
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("buffer") && normalized.contains("append") {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("formaterror")
+            || normalized.contains("formattingfailures")
+            || normalized.contains("systemerrors")
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if string_predicate_flow {
+        if normalized.contains("stringutils")
+            || normalized.contains("strings")
+            || normalized.contains("charsequenceutils")
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if normalized.contains("delegates") || normalized.contains("regionmatches") {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if contains_any(
+            &normalized,
+            &[
+                "null",
+                "empty",
+                "blank",
+                "whitespace",
+                "trim",
+                "case",
+                "ignorecase",
+                "casesensitive",
+            ],
+        ) {
             roles.insert(PacketFlowRole::BoundaryOrState);
         }
     }
@@ -1076,6 +1225,56 @@ mod tests {
         assert!(
             missing.is_empty(),
             "SQL schema prompts should use table, relationship, and dialect roles: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_runtime_formatting_prompts_use_argument_output_error_roles() {
+        let claims = vec![
+            claim(
+                "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers.",
+            ),
+            claim("format_to writes formatted output through an output iterator."),
+            claim(
+                "Runtime formatting failures use format_error, which represents the failure type.",
+            ),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "runtime formatting prompts should use argument, output, and error roles: {missing:?}"
+        );
+        assert!(
+            packet_supported_claim_family_count(&claims) >= 3,
+            "runtime formatting claims should cover distinct sufficiency families"
+        );
+    }
+
+    #[test]
+    fn architecture_string_predicate_prompts_use_blank_empty_region_roles() {
+        let claims = vec![
+            claim("StringUtils.isBlank treats null, empty, and whitespace-only inputs as blank."),
+            claim("StringUtils.isEmpty does not trim whitespace before deciding emptiness."),
+            claim("Strings delegates region matching work to CharSequenceUtils.regionMatches."),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how string helpers implement blank, empty, and case-sensitive string checks across StringUtils, Strings, and CharSequenceUtils.",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "string predicate prompts should use public helper, behavior, and region handoff roles: {missing:?}"
+        );
+        assert!(
+            packet_supported_claim_family_count(&claims) >= 3,
+            "string predicate claims should cover distinct sufficiency families"
         );
     }
 }

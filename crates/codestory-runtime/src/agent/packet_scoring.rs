@@ -5,9 +5,11 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
     packet_terms_indicate_form_validation_flow, packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::retrieval_file_role_from_path;
@@ -148,6 +150,12 @@ pub(crate) fn packet_citation_rank(
     }
     if packet_terms_indicate_sql_schema_flow(terms) {
         score += packet_sql_schema_rank_bonus(&normalized_display, &path, terms);
+    }
+    if packet_terms_indicate_runtime_formatting_flow(terms) {
+        score += packet_runtime_formatting_rank_bonus(&normalized_display, &path);
+    }
+    if packet_terms_indicate_string_predicate_flow(terms) {
+        score += packet_string_predicate_rank_bonus(&normalized_display, &path);
     }
     if packet_terms_indicate_shell_install_dispatch_flow(terms) {
         score += packet_shell_install_dispatch_rank_bonus(&normalized_display, &path);
@@ -670,6 +678,89 @@ fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[S
     bonus
 }
 
+fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) -> f32 {
+    let mut bonus = 0.0;
+    let display_or_path = format!("{normalized_display}{path}");
+
+    if path.ends_with("format.h") || path.ends_with("format.hpp") {
+        bonus += 4.0;
+    }
+    if path.ends_with("format.cc") || path.ends_with("format.cpp") || path.ends_with("format.cxx") {
+        bonus += 8.0;
+    }
+    if path.ends_with("os.cc") || path.ends_with("os.cpp") || path.ends_with("os.cxx") {
+        bonus += 7.0;
+    }
+    if normalized_display.contains("formatargstore")
+        || normalized_display.contains("basicformatargs")
+        || normalized_display.contains("dynamicformatargstore")
+    {
+        bonus += 7.0;
+    }
+    if normalized_display.contains("vformat")
+        || normalized_display.contains("vformatto")
+        || normalized_display.contains("formatto")
+    {
+        bonus += 8.0;
+    }
+    if normalized_display.contains("formaterror")
+        || normalized_display.contains("formaterrorcode")
+        || normalized_display.contains("formatwindowserror")
+    {
+        bonus += 8.0;
+    }
+    if display_or_path.contains("buffer") && display_or_path.contains("append") {
+        bonus += 7.0;
+    }
+    if display_or_path.contains("chrono")
+        || display_or_path.contains("ranges")
+        || display_or_path.contains("compile")
+        || display_or_path.contains("support")
+    {
+        bonus -= 5.0;
+    }
+
+    bonus
+}
+
+fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f32 {
+    let mut bonus = 0.0;
+    let display_or_path = format!("{normalized_display}{path}");
+
+    if path.ends_with("stringutils.java") {
+        bonus += 7.0;
+    }
+    if path.ends_with("strings.java") {
+        bonus += 8.0;
+    }
+    if path.ends_with("charsequenceutils.java") {
+        bonus += 7.0;
+    }
+    if normalized_display.contains("stringutils")
+        && (normalized_display.contains("isblank") || normalized_display.contains("isempty"))
+    {
+        bonus += 8.0;
+    }
+    if normalized_display.contains("strings")
+        || normalized_display.ends_with("cs")
+        || normalized_display.ends_with("ci")
+    {
+        bonus += 6.0;
+    }
+    if normalized_display.contains("regionmatches") {
+        bonus += 8.0;
+    }
+    if display_or_path.contains("arrayutils")
+        || display_or_path.contains("randomstringutils")
+        || display_or_path.contains("annotationutils")
+        || display_or_path.contains("circuitbreaker")
+    {
+        bonus -= 10.0;
+    }
+
+    bonus
+}
+
 fn packet_shell_install_dispatch_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     if path.ends_with("install.sh") {
@@ -1028,6 +1119,47 @@ mod tests {
         assert!(
             packet_sql_schema_rank_bonus("createtabletrack", "db/schema.sql", &terms)
                 > packet_sql_schema_rank_bonus("createtablecustomer", "db/schema.sql", &terms)
+        );
+    }
+
+    #[test]
+    fn runtime_formatting_rank_bonus_prefers_output_and_error_source_files() {
+        assert!(
+            packet_runtime_formatting_rank_bonus("bufferappend", "src/format.cc")
+                > packet_runtime_formatting_rank_bonus("duration", "include/fmt/chrono.h")
+        );
+        assert!(
+            packet_runtime_formatting_rank_bonus("formaterrorcode", "src/os.cc")
+                > packet_runtime_formatting_rank_bonus("formaterrorcode", "include/fmt/format.h")
+        );
+        assert!(packet_runtime_formatting_rank_bonus("formatto", "include/fmt/format.h") > 0.0);
+    }
+
+    #[test]
+    fn string_predicate_rank_bonus_prefers_specific_string_sources() {
+        assert!(
+            packet_string_predicate_rank_bonus(
+                "orgapachecommonslang3stringutilsisempty",
+                "src/main/java/org/apache/commons/lang3/stringutils.java",
+            ) > packet_string_predicate_rank_bonus(
+                "orgapachecommonslang3arrayutilsisempty",
+                "src/main/java/org/apache/commons/lang3/arrayutils.java",
+            )
+        );
+        assert!(
+            packet_string_predicate_rank_bonus(
+                "orgapachecommonslang3strings",
+                "src/main/java/org/apache/commons/lang3/strings.java",
+            ) > packet_string_predicate_rank_bonus(
+                "orgapachecommonslang3randomstringutils",
+                "src/main/java/org/apache/commons/lang3/randomstringutils.java",
+            )
+        );
+        assert!(
+            packet_string_predicate_rank_bonus(
+                "orgapachecommonslang3charsequenceutilsregionmatches",
+                "src/main/java/org/apache/commons/lang3/charsequenceutils.java",
+            ) > 0.0
         );
     }
 }

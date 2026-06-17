@@ -820,6 +820,12 @@ fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
             "dynamic_format_arg_store",
             "format.h format_error",
             "format_error",
+            "format.cc buffer append",
+            "buffer append",
+            "os.cc vformat",
+            "os.cc format_to",
+            "format_windows_error",
+            "format_error_code",
         ],
     );
 }
@@ -904,6 +910,11 @@ fn push_predicate_symbol_probe_queries(terms: &[String], queries: &mut Vec<Strin
     for scope in scopes.iter().take(4) {
         for method_name in method_names.iter().take(4) {
             push_unique_term(queries, &format!("{scope} {method_name}"));
+            if packet_predicate_method_source_probe_allowed(method_name)
+                && let Some(source_file) = packet_predicate_scope_source_file(scope)
+            {
+                push_unique_term(queries, &format!("{source_file} {method_name}"));
+            }
         }
     }
 }
@@ -980,6 +991,15 @@ fn packet_predicate_probe_scopes(terms: &[String], queries: &[String]) -> Vec<St
 
 fn packet_predicate_probe_scope_term(term: &str) -> bool {
     let trimmed = term.trim();
+    let normalized = normalize_identifier(trimmed);
+    if normalized == "strings"
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+    {
+        return true;
+    }
     if trimmed.len() < 4
         || trimmed.chars().any(char::is_whitespace)
         || trimmed.contains('.')
@@ -990,7 +1010,6 @@ fn packet_predicate_probe_scope_term(term: &str) -> bool {
     {
         return false;
     }
-    let normalized = normalize_identifier(trimmed);
     if matches!(
         normalized.as_str(),
         "check"
@@ -1041,6 +1060,10 @@ fn push_string_region_matching_probe_queries(
         return;
     }
     push_unique_term(queries, "regionMatches");
+    if packet_terms_have(terms, "strings") {
+        push_unique_term(queries, "Strings regionMatches");
+        push_unique_term(queries, "Strings.java regionMatches");
+    }
     for scope in scopes
         .iter()
         .filter(|scope| normalize_identifier(scope).contains("charsequence"))
@@ -1048,6 +1071,34 @@ fn push_string_region_matching_probe_queries(
     {
         push_unique_term(queries, &format!("{scope} regionMatches"));
     }
+    for scope in scopes.iter().take(4) {
+        if let Some(source_file) = packet_predicate_scope_source_file(scope) {
+            push_unique_term(queries, &format!("{source_file} regionMatches"));
+        }
+    }
+}
+
+fn packet_predicate_scope_source_file(scope: &str) -> Option<String> {
+    let trimmed = scope.trim();
+    if !packet_predicate_probe_scope_term(trimmed)
+        || trimmed.contains('.')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return None;
+    }
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+        .then(|| format!("{trimmed}.java"))
+}
+
+fn packet_predicate_method_source_probe_allowed(method_name: &str) -> bool {
+    matches!(
+        normalize_identifier(method_name).as_str(),
+        "isblank" | "isempty"
+    )
 }
 
 fn push_predicate_identifier_variants(queries: &mut Vec<String>, terms: &[&str]) {

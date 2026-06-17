@@ -1443,6 +1443,12 @@ fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
             "dynamic_format_arg_store",
             "format.h format_error",
             "format_error",
+            "format.cc buffer append",
+            "buffer append",
+            "os.cc vformat",
+            "os.cc format_to",
+            "format_windows_error",
+            "format_error_code",
         ],
     );
 }

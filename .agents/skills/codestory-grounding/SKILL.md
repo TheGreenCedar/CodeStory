@@ -40,7 +40,11 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
   source-truth verification, or user-requested worktree proof.
 - When `packet` reports `sufficient` and `follow_up_commands` is empty, answer
   from the packet; budget truncation alone is not a gap. Preserve supported-claim
-  wording and include a compact "Support files" list from `answer.citations` and
+  wording and exact source identifiers from `sufficiency.covered_claims` and
+  citation display names. Do not merge repeated exact anchors into shorthand that
+  drops required prefixes; write each exact anchor independently when naming
+  declarations, tables, symbols, selectors, or other source-defined terms. Include
+  a compact "Support files" list from `answer.citations` and
   `sufficiency.avoid_opening_paths`. The older `sufficiency.avoid_opening` field
   is human-readable compatibility prose, not the raw path contract. Do not run
   ordinary source reads, `rg`, `grep`, or `git show` only to verify packet
