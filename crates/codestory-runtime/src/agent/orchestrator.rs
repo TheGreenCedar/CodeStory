@@ -8016,11 +8016,7 @@ mod tests {
             question,
             vec![
                 test_packet_citation("Posts", "src/collections/Posts.ts", 0.9),
-                test_packet_citation(
-                    "getApprovedCommentsForPost",
-                    "src/lib/content-data/comment-content.ts",
-                    0.9,
-                ),
+                test_packet_citation("ContentStore", "src/lib/content-data/content-store.ts", 0.9),
                 test_packet_citation("GET /feed.xml", "src/app/feed.xml/route.ts", 0.9),
             ],
         );
@@ -8124,11 +8120,7 @@ mod tests {
             question,
             vec![
                 test_packet_citation("Posts", "src/collections/Posts.ts", 0.9),
-                test_packet_citation(
-                    "getApprovedCommentsForPost",
-                    "src/lib/content-data/comment-content.ts",
-                    0.9,
-                ),
+                test_packet_citation("ContentStore", "src/lib/content-data/content-store.ts", 0.9),
                 test_packet_citation("GET /feed.xml", "src/app/feed.xml/route.ts", 0.9),
             ],
         );

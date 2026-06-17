@@ -21,7 +21,7 @@ use crate::agent::packet_terms::{
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto, GraphArtifactDto,
     PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto,
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketEvidenceTierDto, PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -98,14 +98,19 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
     let min_citations = packet_sufficiency_min_citations(task_class);
     let min_claims = packet_sufficiency_min_claims(task_class);
+    let flow_context = PacketFlowContext::new(question, task_class);
     let sufficiency_claims = supported_claims
         .iter()
-        .filter(|claim| packet_claim_can_satisfy_sufficiency(claim))
+        .filter(|claim| packet_claim_can_satisfy_sufficiency_in_context(claim, &flow_context))
         .cloned()
         .collect::<Vec<_>>();
     let generic_navigation_claim_count = supported_claims
-        .len()
-        .saturating_sub(sufficiency_claims.len());
+        .iter()
+        .filter(|claim| {
+            packet_claim_is_generic_navigation_or_source_evidence(claim)
+                && !flow_context.claim_carries_required_role(claim, false)
+        })
+        .count();
     let has_minimum_coverage = answer.citations.len() >= min_citations;
     let has_minimum_claims = sufficiency_claims.len() >= min_claims;
     let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
@@ -174,7 +179,9 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         targeted_follow_up_queries,
     );
     let coverage_report = packet_coverage_report(
+        &supported_claims,
         &sufficiency_claims,
+        &flow_context,
         &missing_required_flow_roles,
         &unresolved_sidecar_queries,
         budget,
@@ -687,29 +694,65 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
 }
 
 pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
-    if claim.eligible_for_sufficiency == Some(false) {
-        return false;
+    packet_claim_ineligibility_reason(claim, false).is_none()
+}
+
+fn packet_claim_can_satisfy_sufficiency_in_context(
+    claim: &PacketClaimDto,
+    flow_context: &PacketFlowContext,
+) -> bool {
+    let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
+    let carries_required_role =
+        flow_context.claim_carries_required_role(claim, !generic_navigation);
+    packet_claim_ineligibility_reason(claim, carries_required_role).is_none()
+}
+
+fn packet_claim_ineligibility_reason(
+    claim: &PacketClaimDto,
+    carries_required_role: bool,
+) -> Option<&'static str> {
+    let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
+    if claim.eligible_for_sufficiency == Some(false)
+        && !(generic_navigation && carries_required_role)
+    {
+        return Some("claim marked diagnostic");
     }
     if !claim.citations.is_empty() && !claim.citations.iter().any(citation_sufficiency_eligible) {
-        return false;
+        return Some("citation evidence is diagnostic-only");
     }
-    if claim.eligible_for_sufficiency == Some(true) {
+    if generic_navigation && !carries_required_role {
+        return Some("generic navigation/source-evidence claim lacks required coverage role");
+    }
+    None
+}
+
+fn packet_claim_is_generic_navigation_or_source_evidence(claim: &PacketClaimDto) -> bool {
+    if claim
+        .coverage_role
+        .as_deref()
+        .is_some_and(packet_role_label_is_generic_source_evidence)
+    {
         return true;
     }
     let lower = claim.claim.to_ascii_lowercase();
-    !(lower.contains("anchored by")
+    lower.contains("anchored by")
         || lower.contains("inspect it")
         || lower.contains("inspect the cited")
         || (lower.contains("supports ") && lower.contains("inspect"))
         || (lower.contains("ties ")
             && lower.contains(" to cited definitions")
             && lower.contains("adjacent ownership"))
-        || (lower.contains(" is defined in cited source ")
-            && lower.contains("exact source anchor")))
+        || (lower.contains(" is defined in cited source ") && lower.contains("exact source anchor"))
+}
+
+fn packet_role_label_is_generic_source_evidence(role: &str) -> bool {
+    normalize_identifier(role) == "sourceevidence"
 }
 
 fn packet_coverage_report(
+    supported_claims: &[PacketClaimDto],
     sufficiency_claims: &[PacketClaimDto],
+    flow_context: &PacketFlowContext,
     missing_required_flow_roles: &[FlowRole],
     unresolved_sidecar_queries: &[String],
     budget: &PacketBudgetDto,
@@ -717,11 +760,18 @@ fn packet_coverage_report(
 ) -> PacketCoverageReportDto {
     let covered = sufficiency_claims
         .iter()
+        .filter_map(packet_claim_coverage_label)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let ineligible = supported_claims
+        .iter()
         .filter_map(|claim| {
-            claim
-                .coverage_role
-                .clone()
-                .or_else(|| packet_claim_family(claim).map(str::to_string))
+            let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
+            let carries_required_role =
+                flow_context.claim_carries_required_role(claim, !generic_navigation);
+            packet_claim_ineligibility_reason(claim, carries_required_role)
+                .map(|reason| packet_ineligible_claim_report_entry(claim, reason))
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -738,9 +788,154 @@ fn packet_coverage_report(
     PacketCoverageReportDto {
         covered,
         missing,
-        ineligible: Vec::new(),
+        ineligible,
         unresolved: unresolved_sidecar_queries.to_vec(),
         budget_omitted,
+    }
+}
+
+fn packet_claim_coverage_label(claim: &PacketClaimDto) -> Option<String> {
+    if let Some(role) = claim
+        .coverage_role
+        .as_deref()
+        .filter(|role| !packet_role_label_is_generic_source_evidence(role))
+    {
+        return Some(role.to_string());
+    }
+    packet_claim_family(claim)
+        .filter(|role| !packet_role_label_is_generic_source_evidence(role))
+        .map(str::to_string)
+}
+
+fn packet_ineligible_claim_report_entry(claim: &PacketClaimDto, reason: &str) -> String {
+    format!(
+        "claim=\"{}\" role=\"{}\" tier=\"{}\" reason=\"{}\"",
+        packet_escape_coverage_report_value(&claim.claim),
+        packet_escape_coverage_report_value(
+            packet_claim_coverage_label(claim)
+                .unwrap_or_else(|| "unknown".to_string())
+                .as_str()
+        ),
+        packet_escape_coverage_report_value(packet_claim_tier_label(claim).as_str()),
+        packet_escape_coverage_report_value(reason)
+    )
+}
+
+fn packet_claim_tier_label(claim: &PacketClaimDto) -> String {
+    claim
+        .citations
+        .first()
+        .and_then(|citation| citation.evidence_tier)
+        .map(packet_evidence_tier_label)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn packet_evidence_tier_label(tier: PacketEvidenceTierDto) -> &'static str {
+    match tier {
+        PacketEvidenceTierDto::ExactSource => "exact_source",
+        PacketEvidenceTierDto::ResolvedGraph => "resolved_graph",
+        PacketEvidenceTierDto::LexicalSource => "lexical_source",
+        PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
+        PacketEvidenceTierDto::ComponentReport => "component_report",
+        PacketEvidenceTierDto::DenseSemantic => "dense_semantic",
+        PacketEvidenceTierDto::SyntheticSourceScan => "synthetic_source_scan",
+        PacketEvidenceTierDto::GeneratedSummary => "generated_summary",
+    }
+}
+
+fn packet_escape_coverage_report_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', " ")
+        .replace('\n', " ")
+}
+
+struct PacketFlowContext {
+    required_roles: Vec<FlowRole>,
+    site_build_flow: bool,
+    mapper_flow: bool,
+    shell_install_dispatch_flow: bool,
+    url_session_request_flow: bool,
+    form_validation_flow: bool,
+    server_request_dispatch_flow: bool,
+    html_css_template_structure_flow: bool,
+    stylesheet_animation_flow: bool,
+    sql_schema_flow: bool,
+    runtime_formatting_flow: bool,
+    string_predicate_flow: bool,
+}
+
+impl PacketFlowContext {
+    fn new(question: &str, task_class: PacketTaskClassDto) -> Self {
+        let question_terms = packet_probe_terms(question);
+        let requirements = packet_flow_requirements_for_terms(&question_terms, task_class);
+        Self {
+            required_roles: packet_required_flow_roles(&requirements),
+            site_build_flow: packet_terms_indicate_site_build_phase_flow(&question_terms),
+            mapper_flow: packet_terms_indicate_mapper_configuration_plan_flow(&question_terms),
+            shell_install_dispatch_flow: packet_terms_indicate_shell_install_dispatch_flow(
+                &question_terms,
+            ),
+            url_session_request_flow: packet_terms_indicate_url_session_request_flow(
+                &question_terms,
+            ),
+            form_validation_flow: packet_terms_indicate_form_validation_flow(&question_terms),
+            server_request_dispatch_flow: packet_terms_indicate_server_request_dispatch_flow(
+                &question_terms,
+            ),
+            html_css_template_structure_flow:
+                packet_terms_indicate_html_css_template_structure_flow(&question_terms),
+            stylesheet_animation_flow: packet_terms_indicate_stylesheet_animation_flow(
+                &question_terms,
+            ),
+            sql_schema_flow: packet_terms_indicate_sql_schema_flow(&question_terms),
+            runtime_formatting_flow: packet_terms_indicate_runtime_formatting_flow(&question_terms),
+            string_predicate_flow: packet_terms_indicate_string_predicate_flow(&question_terms),
+        }
+    }
+
+    fn claim_carries_required_role(
+        &self,
+        claim: &PacketClaimDto,
+        include_generic_fallback_roles: bool,
+    ) -> bool {
+        if self.required_roles.is_empty() {
+            return false;
+        }
+        if self.claim_declares_required_role(claim) {
+            return true;
+        }
+        let claim_roles = packet_flow_roles_for_claim(
+            claim,
+            self.site_build_flow,
+            self.mapper_flow,
+            self.shell_install_dispatch_flow,
+            self.url_session_request_flow,
+            self.form_validation_flow,
+            self.server_request_dispatch_flow,
+            self.html_css_template_structure_flow,
+            self.stylesheet_animation_flow,
+            self.sql_schema_flow,
+            self.runtime_formatting_flow,
+            self.string_predicate_flow,
+            include_generic_fallback_roles,
+        );
+        claim_roles
+            .iter()
+            .any(|claim_role| self.required_roles.contains(claim_role))
+    }
+
+    fn claim_declares_required_role(&self, claim: &PacketClaimDto) -> bool {
+        let Some(role_label) = claim.coverage_role.as_deref() else {
+            return false;
+        };
+        let normalized = normalize_identifier(role_label);
+        self.required_roles.iter().any(|role| {
+            normalized == normalize_identifier(role.role_id())
+                || normalized == normalize_identifier(role.label())
+        })
     }
 }
 
@@ -749,48 +944,32 @@ fn packet_missing_required_flow_roles(
     task_class: PacketTaskClassDto,
     supported_claims: &[PacketClaimDto],
 ) -> Vec<FlowRole> {
-    let question_terms = packet_probe_terms(question);
-    let requirements = packet_flow_requirements_for_terms(&question_terms, task_class);
-    let required = packet_required_flow_roles(&requirements);
-    if required.is_empty() {
+    let flow_context = PacketFlowContext::new(question, task_class);
+    if flow_context.required_roles.is_empty() {
         return Vec::new();
     }
-
-    let site_build_flow = packet_terms_indicate_site_build_phase_flow(&question_terms);
-    let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&question_terms);
-    let shell_install_dispatch_flow =
-        packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
-    let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
-    let form_validation_flow = packet_terms_indicate_form_validation_flow(&question_terms);
-    let server_request_dispatch_flow =
-        packet_terms_indicate_server_request_dispatch_flow(&question_terms);
-    let html_css_template_structure_flow =
-        packet_terms_indicate_html_css_template_structure_flow(&question_terms);
-    let stylesheet_animation_flow =
-        packet_terms_indicate_stylesheet_animation_flow(&question_terms);
-    let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
-    let runtime_formatting_flow = packet_terms_indicate_runtime_formatting_flow(&question_terms);
-    let string_predicate_flow = packet_terms_indicate_string_predicate_flow(&question_terms);
     let mut covered = HashSet::new();
     for claim in supported_claims {
         for role in packet_flow_roles_for_claim(
             claim,
-            site_build_flow,
-            mapper_flow,
-            shell_install_dispatch_flow,
-            url_session_request_flow,
-            form_validation_flow,
-            server_request_dispatch_flow,
-            html_css_template_structure_flow,
-            stylesheet_animation_flow,
-            sql_schema_flow,
-            runtime_formatting_flow,
-            string_predicate_flow,
+            flow_context.site_build_flow,
+            flow_context.mapper_flow,
+            flow_context.shell_install_dispatch_flow,
+            flow_context.url_session_request_flow,
+            flow_context.form_validation_flow,
+            flow_context.server_request_dispatch_flow,
+            flow_context.html_css_template_structure_flow,
+            flow_context.stylesheet_animation_flow,
+            flow_context.sql_schema_flow,
+            flow_context.runtime_formatting_flow,
+            flow_context.string_predicate_flow,
+            true,
         ) {
             covered.insert(role);
         }
     }
-    required
+    flow_context
+        .required_roles
         .iter()
         .copied()
         .filter(|role| !covered.contains(role))
@@ -861,6 +1040,7 @@ fn packet_flow_roles_for_claim(
     sql_schema_flow: bool,
     runtime_formatting_flow: bool,
     string_predicate_flow: bool,
+    include_generic_fallback_roles: bool,
 ) -> HashSet<FlowRole> {
     let mut roles = HashSet::new();
     let lower = claim.claim.to_ascii_lowercase();
@@ -1165,160 +1345,162 @@ fn packet_flow_roles_for_claim(
         }
     }
 
-    if contains_any(
-        &normalized,
-        &[
-            "entrypoint",
-            "toplevel",
-            "public",
-            "command",
-            "route",
-            "router",
-            "registration",
-            "register",
-            "helper",
-            "helpers",
-            "wrapper",
-            "wrappers",
-            "clientfactory",
-            "factory",
-            "api",
-            "apis",
-        ],
-    ) {
-        insert_generic_entrypoint_roles(&mut roles);
-    }
-    if contains_any(
-        &normalized,
-        &[
-            "delegate",
-            "delegates",
-            "handoff",
-            "dispatch",
-            "calls",
-            "calling",
-            "send",
-            "routes",
-            "handler",
-            "executes",
-            "coordinates",
-            "maps",
-            "wrap",
-            "wraps",
-            "wrapper",
-            "wrappers",
-            "read",
-            "reads",
-            "write",
-            "writes",
-            "execution",
-            "pipeline",
-            "plan",
-            "plans",
-            "lambda",
-            "mapping",
-        ],
-    ) {
-        insert_generic_dispatch_roles(&mut roles);
-    }
-    if contains_any(
-        &normalized,
-        &[
-            "boundary",
-            "transport",
-            "persist",
-            "project",
-            "store",
-            "cache",
-            "state",
-            "prepare",
-            "response",
-            "serialize",
-            "extract",
-            "refresh",
-            "output",
-            "schema",
-            "buffer",
-            "bytes",
-            "byte",
-            "record",
-            "records",
-            "format",
-            "formatted",
-            "write",
-            "writes",
-            "writing",
-            "source",
-            "sink",
-            "upstream",
-            "configuration",
-            "plan",
-            "plans",
-            "lambda",
-            "expression",
-            "destination",
-        ],
-    ) || lower.contains("side effect")
-    {
-        insert_generic_boundary_roles(&mut roles);
-    }
-
-    for citation in &claim.citations {
-        match packet_evidence_role(citation) {
-            Some(PacketEvidenceRole::CommandEntrypoint)
-            | Some(PacketEvidenceRole::ClientFactory)
-            | Some(PacketEvidenceRole::SearchDriver)
-            | Some(PacketEvidenceRole::RouteHandling)
-            | Some(PacketEvidenceRole::CollectionConfiguration)
-            | Some(PacketEvidenceRole::AppServerRequestProtocol) => {
-                insert_generic_entrypoint_roles(&mut roles);
-            }
-            Some(PacketEvidenceRole::RequestDispatch)
-            | Some(PacketEvidenceRole::CommandDispatch)
-            | Some(PacketEvidenceRole::TransportAdapter)
-            | Some(PacketEvidenceRole::SearchExecutionUnit)
-            | Some(PacketEvidenceRole::RuntimeOrchestration)
-            | Some(PacketEvidenceRole::EventLoop)
-            | Some(PacketEvidenceRole::NetworkCommandInput)
-            | Some(PacketEvidenceRole::IndexingWorkQueue)
-            | Some(PacketEvidenceRole::BufferedIo)
-            | Some(PacketEvidenceRole::InterceptorManagement) => {
-                insert_generic_dispatch_roles(&mut roles);
-            }
-            _ => {}
+    if include_generic_fallback_roles {
+        if contains_any(
+            &normalized,
+            &[
+                "entrypoint",
+                "toplevel",
+                "public",
+                "command",
+                "route",
+                "router",
+                "registration",
+                "register",
+                "helper",
+                "helpers",
+                "wrapper",
+                "wrappers",
+                "clientfactory",
+                "factory",
+                "api",
+                "apis",
+            ],
+        ) {
+            insert_generic_entrypoint_roles(&mut roles);
+        }
+        if contains_any(
+            &normalized,
+            &[
+                "delegate",
+                "delegates",
+                "handoff",
+                "dispatch",
+                "calls",
+                "calling",
+                "send",
+                "routes",
+                "handler",
+                "executes",
+                "coordinates",
+                "maps",
+                "wrap",
+                "wraps",
+                "wrapper",
+                "wrappers",
+                "read",
+                "reads",
+                "write",
+                "writes",
+                "execution",
+                "pipeline",
+                "plan",
+                "plans",
+                "lambda",
+                "mapping",
+            ],
+        ) {
+            insert_generic_dispatch_roles(&mut roles);
+        }
+        if contains_any(
+            &normalized,
+            &[
+                "boundary",
+                "transport",
+                "persist",
+                "project",
+                "store",
+                "cache",
+                "state",
+                "prepare",
+                "response",
+                "serialize",
+                "extract",
+                "refresh",
+                "output",
+                "schema",
+                "buffer",
+                "bytes",
+                "byte",
+                "record",
+                "records",
+                "format",
+                "formatted",
+                "write",
+                "writes",
+                "writing",
+                "source",
+                "sink",
+                "upstream",
+                "configuration",
+                "plan",
+                "plans",
+                "lambda",
+                "expression",
+                "destination",
+            ],
+        ) || lower.contains("side effect")
+        {
+            insert_generic_boundary_roles(&mut roles);
         }
 
-        match packet_evidence_role(citation) {
-            Some(PacketEvidenceRole::TransportAdapter)
-            | Some(PacketEvidenceRole::PersistenceAndSearchProjection)
-            | Some(PacketEvidenceRole::SnapshotRefresh)
-            | Some(PacketEvidenceRole::EventOutputProcessing)
-            | Some(PacketEvidenceRole::SymbolExtraction)
-            | Some(PacketEvidenceRole::SourceGroupConfiguration)
-            | Some(PacketEvidenceRole::WorkspaceDiscoveryAndPlanning)
-            | Some(PacketEvidenceRole::CollectionConfiguration)
-            | Some(PacketEvidenceRole::BufferedIo)
-            | Some(PacketEvidenceRole::SqlTableDefinition)
-            | Some(PacketEvidenceRole::SqlRelationshipConstraint)
-            | Some(PacketEvidenceRole::SqlSchemaFile)
-            | Some(PacketEvidenceRole::CandidateFileConstruction) => {
-                insert_generic_boundary_roles(&mut roles);
-            }
-            _ => {}
-        }
-
-        if sql_schema_flow {
+        for citation in &claim.citations {
             match packet_evidence_role(citation) {
-                Some(PacketEvidenceRole::SqlTableDefinition) => {
-                    roles.insert(FlowRole::StateOrStorage);
+                Some(PacketEvidenceRole::CommandEntrypoint)
+                | Some(PacketEvidenceRole::ClientFactory)
+                | Some(PacketEvidenceRole::SearchDriver)
+                | Some(PacketEvidenceRole::RouteHandling)
+                | Some(PacketEvidenceRole::CollectionConfiguration)
+                | Some(PacketEvidenceRole::AppServerRequestProtocol) => {
+                    insert_generic_entrypoint_roles(&mut roles);
                 }
-                Some(PacketEvidenceRole::SqlRelationshipConstraint) => {
-                    roles.insert(FlowRole::Configuration);
-                }
-                Some(PacketEvidenceRole::SqlSchemaFile) => {
-                    roles.insert(FlowRole::StateOrStorage);
+                Some(PacketEvidenceRole::RequestDispatch)
+                | Some(PacketEvidenceRole::CommandDispatch)
+                | Some(PacketEvidenceRole::TransportAdapter)
+                | Some(PacketEvidenceRole::SearchExecutionUnit)
+                | Some(PacketEvidenceRole::RuntimeOrchestration)
+                | Some(PacketEvidenceRole::EventLoop)
+                | Some(PacketEvidenceRole::NetworkCommandInput)
+                | Some(PacketEvidenceRole::IndexingWorkQueue)
+                | Some(PacketEvidenceRole::BufferedIo)
+                | Some(PacketEvidenceRole::InterceptorManagement) => {
+                    insert_generic_dispatch_roles(&mut roles);
                 }
                 _ => {}
+            }
+
+            match packet_evidence_role(citation) {
+                Some(PacketEvidenceRole::TransportAdapter)
+                | Some(PacketEvidenceRole::PersistenceAndSearchProjection)
+                | Some(PacketEvidenceRole::SnapshotRefresh)
+                | Some(PacketEvidenceRole::EventOutputProcessing)
+                | Some(PacketEvidenceRole::SymbolExtraction)
+                | Some(PacketEvidenceRole::SourceGroupConfiguration)
+                | Some(PacketEvidenceRole::WorkspaceDiscoveryAndPlanning)
+                | Some(PacketEvidenceRole::CollectionConfiguration)
+                | Some(PacketEvidenceRole::BufferedIo)
+                | Some(PacketEvidenceRole::SqlTableDefinition)
+                | Some(PacketEvidenceRole::SqlRelationshipConstraint)
+                | Some(PacketEvidenceRole::SqlSchemaFile)
+                | Some(PacketEvidenceRole::CandidateFileConstruction) => {
+                    insert_generic_boundary_roles(&mut roles);
+                }
+                _ => {}
+            }
+
+            if sql_schema_flow {
+                match packet_evidence_role(citation) {
+                    Some(PacketEvidenceRole::SqlTableDefinition) => {
+                        roles.insert(FlowRole::StateOrStorage);
+                    }
+                    Some(PacketEvidenceRole::SqlRelationshipConstraint) => {
+                        roles.insert(FlowRole::Configuration);
+                    }
+                    Some(PacketEvidenceRole::SqlSchemaFile) => {
+                        roles.insert(FlowRole::StateOrStorage);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1383,6 +1565,33 @@ mod tests {
         }
     }
 
+    fn cited_anchor_with_tier(
+        name: &str,
+        file_path: &str,
+        tier: PacketEvidenceTierDto,
+        eligible_for_sufficiency: Option<bool>,
+    ) -> AgentCitationDto {
+        let mut citation = cited_anchor(name);
+        citation.file_path = Some(file_path.to_string());
+        citation.evidence_tier = Some(tier);
+        citation.eligible_for_sufficiency = eligible_for_sufficiency;
+        citation
+    }
+
+    fn cited_claim(
+        text: &str,
+        coverage_role: Option<&str>,
+        citation: AgentCitationDto,
+        eligible_for_sufficiency: Option<bool>,
+    ) -> PacketClaimDto {
+        PacketClaimDto {
+            claim: text.to_string(),
+            citations: vec![citation],
+            coverage_role: coverage_role.map(str::to_string),
+            eligible_for_sufficiency,
+        }
+    }
+
     fn answer_fixture(question: &str) -> AgentAnswerDto {
         AgentAnswerDto {
             answer_id: "packet-sufficiency-test".to_string(),
@@ -1442,6 +1651,162 @@ mod tests {
             omitted_sections: Vec::new(),
             next_deeper_command: None,
         }
+    }
+
+    #[test]
+    fn html_form_validation_generic_source_evidence_is_diagnostic_only() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            cited_claim(
+                "`index.html` in `src/index.html` ties page markup in this flow to cited definitions and adjacent ownership.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "index.html",
+                    "src/index.html",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                Some(true),
+            ),
+            cited_claim(
+                "Page markup supports `Main`; inspect the cited source for details.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "Main",
+                    "src/main.js",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                Some(true),
+            ),
+            cited_claim(
+                "`PageState` is defined in cited source `src/main.js` and should be treated as an exact source anchor for this flow.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "PageState",
+                    "src/main.js",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                Some(true),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.covered.is_empty(),
+            "generic navigation claims should not appear as covered proof: {report:?}"
+        );
+        assert!(
+            report
+                .missing
+                .contains(&"transform_or_validate".to_string())
+        );
+        assert_eq!(report.ineligible.len(), 3);
+        assert!(
+            report.ineligible.iter().all(|entry| entry.contains(
+                "reason=\"generic navigation/source-evidence claim lacks required coverage role\""
+            )),
+            "generic HTML claims should explain diagnostic demotion: {report:?}"
+        );
+        assert!(
+            report
+                .ineligible
+                .iter()
+                .all(|entry| entry.contains("tier=\"resolved_graph\"")),
+            "ineligible diagnostics should include the citation tier: {report:?}"
+        );
+    }
+
+    #[test]
+    fn sql_structural_claims_can_cover_roles_while_generic_source_scan_stays_diagnostic() {
+        let question = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            cited_claim(
+                "SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "CreateTableArtist",
+                    "schema.sql",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                Some(true),
+            ),
+            cited_claim(
+                "Track rows reference Album, Genre, and MediaType rows.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "ForeignKeyTrackAlbum",
+                    "schema.sql",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                Some(true),
+            ),
+            cited_claim(
+                "`schema.sql` in `schema.sql` ties sql schema in this flow to cited definitions and adjacent ownership.",
+                Some("sql schema scripts"),
+                cited_anchor_with_tier(
+                    "schema.sql",
+                    "schema.sql",
+                    PacketEvidenceTierDto::SyntheticSourceScan,
+                    Some(false),
+                ),
+                Some(false),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report
+                .covered
+                .contains(&"sql table definitions".to_string()),
+            "source-evidence-labelled SQL table text should report the concrete role: {report:?}"
+        );
+        assert!(
+            report.covered.contains(&"sql relationships".to_string()),
+            "source-evidence-labelled SQL relationship text should report the concrete role: {report:?}"
+        );
+        assert!(
+            !report.covered.contains(&"source evidence".to_string()),
+            "covered roles must not imply generic source evidence is proof: {report:?}"
+        );
+        assert_eq!(report.ineligible.len(), 1);
+        assert!(report.ineligible[0].contains("role=\"sql schema scripts\""));
+        assert!(report.ineligible[0].contains("tier=\"synthetic_source_scan\""));
+        assert!(
+            report.ineligible[0].contains("reason=\"claim marked diagnostic\""),
+            "synthetic SQL source-scan evidence should remain diagnostic until Task 4 structural policy: {report:?}"
+        );
     }
 
     #[test]

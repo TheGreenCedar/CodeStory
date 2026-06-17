@@ -18,10 +18,10 @@
   - [x] 2.4 Treat missing probe queries as follow-up hints unless their required role is still missing.
   - _Requirements: 1.1, 1.3, 6.3_
 
-- [ ] 3. Demote generic navigation claims
-  - [ ] 3.1 Mark `source evidence` and adjacent-ownership claims ineligible unless they carry a required coverage role.
-  - [ ] 3.2 Populate `coverage_report.ineligible` with claim id or text, role, tier, and reason.
-  - [ ] 3.3 Add regressions for the HTML false-sufficient row and SQL false-partial row.
+- [x] 3. Demote generic navigation claims
+  - [x] 3.1 Mark `source evidence` and adjacent-ownership claims ineligible unless they carry a required coverage role.
+  - [x] 3.2 Populate `coverage_report.ineligible` with claim id or text, role, tier, and reason.
+  - [x] 3.3 Add regressions for the HTML false-sufficient row and SQL false-partial row.
   - _Requirements: 1.2, 2.1, 2.2, 3.2_
 
 ## Phase 3: Add Structural Language Policy
