@@ -7930,7 +7930,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_budget_truncates_verbose_sections_before_proof_sections() {
+    fn markdown_budget_skips_tiny_diagram_intro_and_truncates_verbose_sections_first() {
         let question = "Explain compact packet proof retention.";
         let mut answer = packet_answer_fixture(
             question,
@@ -7965,9 +7965,15 @@ mod tests {
             AgentResponseSectionDto {
                 id: "diagrams".to_string(),
                 title: "Diagrams".to_string(),
-                blocks: vec![AgentResponseBlockDto::Markdown {
-                    markdown: "verbose diagram explanation\n".repeat(1_200),
-                }],
+                blocks: vec![
+                    AgentResponseBlockDto::Markdown {
+                        markdown: "Mermaid diagrams generated from indexed graph retrieval."
+                            .to_string(),
+                    },
+                    AgentResponseBlockDto::Mermaid {
+                        graph_id: "primary".to_string(),
+                    },
+                ],
             },
         ];
 
@@ -7978,8 +7984,12 @@ mod tests {
                 AgentResponseBlockDto::Mermaid { .. } => String::new(),
             })
             .collect::<Vec<_>>();
+        let original_diagram_intro = match &answer.sections[3].blocks[0] {
+            AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
+            AgentResponseBlockDto::Mermaid { .. } => String::new(),
+        };
         let original_bytes = serde_json::to_vec(&answer).unwrap().len();
-        let truncated = truncate_answer_markdown_to_byte_cap(&mut answer, original_bytes - 12_000);
+        let truncated = truncate_answer_markdown_to_byte_cap(&mut answer, original_bytes - 6_000);
 
         assert!(truncated);
         for (section, original_markdown) in
@@ -7994,17 +8004,25 @@ mod tests {
                 section.id
             );
         }
+        let AgentResponseBlockDto::Markdown {
+            markdown: retrieval_markdown,
+        } = &answer.sections[2].blocks[0]
+        else {
+            panic!("retrieval evidence should remain markdown");
+        };
         assert!(
-            answer.sections[2..].iter().any(|section| {
-                section.blocks.iter().any(|block| {
-                    matches!(
-                        block,
-                        AgentResponseBlockDto::Markdown { markdown }
-                            if markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim())
-                    )
-                })
-            }),
-            "expected a verbose packet section to absorb markdown truncation first"
+            retrieval_markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim()),
+            "large retrieval evidence should absorb truncation before proof sections"
+        );
+        let AgentResponseBlockDto::Markdown {
+            markdown: diagram_intro,
+        } = &answer.sections[3].blocks[0]
+        else {
+            panic!("diagram intro should remain markdown");
+        };
+        assert_eq!(
+            diagram_intro, &original_diagram_intro,
+            "tiny diagram intro should be skipped instead of aborting truncation"
         );
     }
 

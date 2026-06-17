@@ -15,6 +15,8 @@ use codestory_contracts::api::{
 use std::collections::HashSet;
 use std::path::Path;
 
+const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
+
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
     match mode {
         PacketBudgetModeDto::Tiny => PacketBudgetLimitsDto {
@@ -339,7 +341,7 @@ pub(crate) fn truncate_answer_markdown_to_byte_cap(
         else {
             return truncated;
         };
-        if len <= 256 {
+        if len <= MARKDOWN_TRUNCATION_FLOOR_BYTES {
             return truncated;
         }
         if let AgentResponseBlockDto::Markdown { markdown } =
@@ -358,6 +360,9 @@ fn next_markdown_truncation_candidate(answer: &AgentAnswerDto) -> Option<(usize,
         for (block_index, block) in section.blocks.iter().enumerate() {
             if let AgentResponseBlockDto::Markdown { markdown } = block {
                 let len = markdown.len();
+                if len <= MARKDOWN_TRUNCATION_FLOOR_BYTES {
+                    continue;
+                }
                 let priority = packet_markdown_truncation_priority(section.id.as_str());
                 if candidate.is_none_or(|(_, _, existing_priority, existing_len)| {
                     priority < existing_priority
