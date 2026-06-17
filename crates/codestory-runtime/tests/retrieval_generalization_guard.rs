@@ -236,6 +236,48 @@ pub fn leaked_holdout_probe() -> &'static [&'static str] {
 }
 
 #[test]
+fn linter_catches_nested_manifest_derived_claims_in_production_only() {
+    let nested_manifest_claim =
+        "The top-level request helper opens a Session and delegates to Session.request.";
+
+    let test_only_output = run_lint_with_fixture(
+        r#"
+#[cfg(test)]
+mod tests {
+    const TEST_ONLY_EXPECTED_CLAIM: &str =
+        "The top-level request helper opens a Session and delegates to Session.request.";
+}
+
+pub fn generic_production_note() -> &'static str {
+    "generic role coverage should stay repository neutral"
+}
+"#,
+    );
+    let test_only_stderr = String::from_utf8_lossy(&test_only_output.stderr);
+    assert!(
+        test_only_output.status.success(),
+        "nested manifest-derived claims should be allowed inside cfg(test) items; stderr={test_only_stderr}"
+    );
+
+    let output = run_lint_with_fixture(
+        r#"
+pub fn leaked_nested_manifest_claim() -> &'static str {
+    "The top-level request helper opens a Session and delegates to Session.request."
+}
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "fixture with nested manifest-derived claim should fail lint; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(nested_manifest_claim),
+        "lint failure should report the nested manifest-derived claim, stderr={stderr}"
+    );
+}
+
+#[test]
 fn linter_catches_split_benchmark_family_literals_in_production() {
     let output = run_lint_with_fixture(
         r##"

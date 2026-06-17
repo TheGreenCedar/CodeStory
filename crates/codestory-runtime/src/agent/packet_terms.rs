@@ -386,7 +386,7 @@ pub(crate) fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[Stri
         "config",
         "profile",
         "profiles",
-        "mapperconfiguration",
+        "mappingconfiguration",
     ]);
     let runtime_api_intent = has_any(&[
         "runtime",

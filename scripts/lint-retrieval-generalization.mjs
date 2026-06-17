@@ -214,20 +214,72 @@ function benchmarkManifestDerivedPatterns() {
     } catch {
       continue;
     }
-    addSpecificMarker(markers, manifest.id);
-    addSpecificMarker(markers, manifest.repo?.name);
-    for (const expectedFile of manifest.expected_files ?? []) {
-      addSpecificMarker(markers, expectedFile);
-    }
-    for (const symbol of manifest.expected_symbols ?? []) {
-      addSpecificMarker(markers, symbol?.name);
-      addSpecificMarker(markers, symbol?.path);
-    }
-    for (const claim of manifest.expected_claims ?? []) {
-      addSpecificMarker(markers, claim?.text);
+    for (const task of benchmarkManifestTasks(manifest)) {
+      addSpecificMarker(markers, task.id);
+      addRepoMarkers(markers, task.repo);
+      for (const expectedFile of task.expected_files ?? []) {
+        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      }
+      for (const expectedFile of task.expected_verification_files ?? []) {
+        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      }
+      for (const symbol of task.expected_symbols ?? []) {
+        if (typeof symbol === "string") {
+          addSpecificMarker(markers, symbol);
+        } else {
+          addSpecificMarker(markers, symbol?.name);
+          addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
+          addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+        }
+      }
+      for (const claim of task.expected_claims ?? []) {
+        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
+      }
     }
   }
   return [...markers].sort().map(escapeRegExp);
+}
+
+function benchmarkManifestTasks(manifest) {
+  if (Array.isArray(manifest?.tasks)) {
+    return manifest.tasks.filter((task) => task && typeof task === "object");
+  }
+  if (manifest && typeof manifest === "object") {
+    return [manifest];
+  }
+  return [];
+}
+
+function addRepoMarkers(markers, repo) {
+  addSpecificMarker(markers, repo?.name);
+  for (const slug of repoUrlSlugs(repo?.url)) {
+    addSpecificMarker(markers, slug);
+  }
+}
+
+function repoUrlSlugs(url) {
+  if (typeof url !== "string" || url.trim().length === 0) {
+    return [];
+  }
+  const trimmed = url.trim().replace(/\.git$/i, "");
+  let pathname;
+  try {
+    pathname = new URL(trimmed).pathname;
+  } catch {
+    pathname = trimmed;
+  }
+  const parts = pathname
+    .split(/[\\/]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return [];
+  }
+  const repoName = parts[parts.length - 1];
+  const ownerName = parts.length >= 2
+    ? `${parts[parts.length - 2]}/${repoName}`
+    : null;
+  return [ownerName, repoName].filter(Boolean);
 }
 
 function walkFiles(root, predicate) {
@@ -249,25 +301,37 @@ function walkFiles(root, predicate) {
   return files;
 }
 
-function addSpecificMarker(markers, value) {
+function addSpecificMarker(markers, value, options = {}) {
   if (typeof value !== "string") {
     return;
   }
   const marker = value.trim();
-  if (marker.length < 8 || benchmarkMarkerTooGeneric(marker)) {
+  if (marker.length < 8 || benchmarkMarkerTooGeneric(marker, options)) {
     return;
   }
   markers.add(marker);
 }
 
-function benchmarkMarkerTooGeneric(marker) {
+function benchmarkMarkerTooGeneric(marker, options = {}) {
+  if (options.allowExactPhrase && marker.split(/\s+/).length >= 5) {
+    return false;
+  }
+  if (
+    options.allowSpecificComposite
+    && /[\\/.:]/.test(marker)
+    && /[a-zA-Z]/.test(marker)
+  ) {
+    return false;
+  }
   const normalized = marker.toLowerCase().replace(/[^a-z0-9]+/g, "");
   return (
     normalized.length < 8 ||
     [
       "codestory",
       "request",
+      "requests",
       "response",
+      "responses",
       "dispatch",
       "router",
       "routepath",
@@ -282,6 +346,17 @@ function benchmarkMarkerTooGeneric(marker) {
       "indexing",
       "configuration",
       "validation",
+      "serialize",
+      "serializes",
+      "serialized",
+      "serialization",
+      "foreignkey",
+      "references",
+      "formatto",
+      "formaterror",
+      "formaterrorcode",
+      "formatwindowserror",
+      "internalmutate",
     ].includes(normalized)
   );
 }

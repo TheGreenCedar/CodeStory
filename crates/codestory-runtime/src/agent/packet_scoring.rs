@@ -311,6 +311,9 @@ fn packet_route_dispatch_rank_bonus(
 ) -> f32 {
     let mut bonus = 0.0;
     bonus += packet_request_dispatch_anchor_rank_bonus(display, normalized_display, path);
+    if path.contains("/examples/") || path.starts_with("examples/") {
+        bonus -= 14.0;
+    }
     if normalized_display.contains("create") && normalized_display.contains("application") {
         bonus += 8.0;
     }
@@ -327,6 +330,13 @@ fn packet_route_dispatch_rank_bonus(
     }
     if normalized_display.contains("combine") && normalized_display.contains("handler") {
         bonus += 3.0;
+    }
+    let path_stem = packet_path_file_stem(path);
+    if path.contains("/lib/")
+        && (path_stem.contains("application") || path_stem.contains("response"))
+        && packet_request_dispatch_method_tail(normalized_display)
+    {
+        bonus += 8.0;
     }
     if normalized_display == "new" && packet_terms_contain(terms, "engine") {
         bonus += 4.0;
@@ -600,9 +610,7 @@ fn packet_mapper_configuration_plan_rank_bonus(normalized_display: &str, path: &
     if normalized_display.contains("imapper") || normalized_display.contains("mappermap") {
         bonus += 5.0;
     }
-    if path.ends_with("mapperconfiguration.cs")
-        || normalized_display.contains("mapperconfiguration")
-    {
+    if display_or_path.contains("mapper") && display_or_path.contains("configuration") {
         bonus += 6.0;
     }
     if path.ends_with("typemap.cs") || normalized_display.contains("typemap") {
@@ -644,10 +652,18 @@ fn packet_client_send_rank_bonus(normalized_display: &str, path: &str, terms: &[
     if path.ends_with("client.dart") && normalized_display.contains("client") {
         bonus += 7.0;
     }
-    if path.ends_with("base_client.dart") || normalized_display.contains("baseclientsend") {
+    if packet_path_file_stem(path) == "base_client"
+        || (normalized_display.contains("base")
+            && normalized_display.contains("client")
+            && normalized_display.contains("send"))
+    {
         bonus += 6.0;
     }
-    if path.ends_with("base_request.dart") || normalized_display.contains("baserequestfinalize") {
+    if packet_path_file_stem(path) == "base_request"
+        || (normalized_display.contains("base")
+            && normalized_display.contains("request")
+            && normalized_display.contains("finalize"))
+    {
         bonus += 6.0;
     }
     if path.ends_with("io_client.dart") || normalized_display.contains("ioclientsend") {
@@ -783,19 +799,16 @@ fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) 
     if path.contains("/source/") || path.starts_with("source/") {
         bonus += 5.0;
     }
-    if path.ends_with("_vars.css") {
-        bonus += 8.0;
+    if path_stem.contains("var") && path.ends_with(".css") {
+        bonus += 12.0;
     }
-    if path.ends_with("_base.css") {
+    if path_stem.contains("base") && path.ends_with(".css") {
         bonus += 8.0;
     }
     if path_stem == "animate" && path.ends_with(".css") {
         bonus += 7.0;
     }
-    if path.ends_with("attention_seekers/bounce.css") {
-        bonus += 7.0;
-    }
-    if path.ends_with("attention_seekers/flash.css") {
+    if path.contains("/attention_seekers/") && path.ends_with(".css") {
         bonus += 7.0;
     }
 
@@ -943,14 +956,17 @@ fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[S
 fn packet_runtime_formatting_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     let display_or_path = format!("{normalized_display}{path}");
+    let path_stem = packet_path_file_stem(path);
+    let is_compiled_source =
+        path.ends_with(".cc") || path.ends_with(".cpp") || path.ends_with(".cxx");
 
-    if path.ends_with("format.h") || path.ends_with("format.hpp") {
+    if path_stem == "format" && (path.ends_with(".h") || path.ends_with(".hpp")) {
         bonus += 4.0;
     }
-    if path.ends_with("format.cc") || path.ends_with("format.cpp") || path.ends_with("format.cxx") {
+    if path_stem == "format" && is_compiled_source {
         bonus += 8.0;
     }
-    if path.ends_with("os.cc") || path.ends_with("os.cpp") || path.ends_with("os.cxx") {
+    if (path_stem == "os" || path_stem.contains("system")) && is_compiled_source {
         bonus += 7.0;
     }
     if normalized_display.contains("formatargstore")

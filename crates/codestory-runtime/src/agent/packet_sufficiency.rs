@@ -2553,6 +2553,50 @@ mod tests {
     }
 
     #[test]
+    fn generic_request_dispatch_prompt_succeeds_without_benchmark_product_terms() {
+        let question = "Trace how a generic HTTP service receives a request, registers a route, dispatches to a handler, finalizes the response, and returns control to the server.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Public request entrypoint registers route wrappers before dispatching handler calls.",
+            ),
+            claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            ),
+            claim(
+                "Response finalization boundary writes response output and returns control to the server.",
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/synthetic-service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(sufficiency.gaps.is_empty());
+        assert!(sufficiency.follow_up_commands.is_empty());
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "generic source-shape role coverage should satisfy request dispatch without product-specific strings: {report:?}"
+        );
+        for expected in ["public api/export", "server view dispatch"] {
+            assert!(
+                report.covered.iter().any(|entry| entry == expected),
+                "expected generic coverage report to include {expected}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
     fn architecture_html_css_template_prompts_use_structural_roles() {
         let claims = vec![
             claim(

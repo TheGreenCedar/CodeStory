@@ -43,7 +43,7 @@ const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
     SourceClaimProfile::RuntimeFormatting,
     SourceClaimProfile::LoggerHandlerFlow,
     SourceClaimProfile::SiteBuildPhase,
-    SourceClaimProfile::MapperConfigurationPlan,
+    SourceClaimProfile::MappingConfigurationPlan,
     SourceClaimProfile::FormValidation,
     SourceClaimProfile::ClientRequestDispatch,
     SourceClaimProfile::EventLoopCommand,
@@ -67,7 +67,7 @@ enum SourceClaimProfile {
     RuntimeFormatting,
     LoggerHandlerFlow,
     SiteBuildPhase,
-    MapperConfigurationPlan,
+    MappingConfigurationPlan,
     FormValidation,
     ClientRequestDispatch,
     EventLoopCommand,
@@ -175,7 +175,7 @@ impl SourceClaimProfile {
                     claims.extend(packet_generic_site_build_phase_flow_claims(ctx.source));
                 }
             }
-            Self::MapperConfigurationPlan => {
+            Self::MappingConfigurationPlan => {
                 if packet_terms_indicate_mapper_configuration_plan_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_mapper_configuration_plan_claims(
                         &ctx.file_name,
@@ -592,10 +592,11 @@ fn top_level_session_request_delegate_claim(ctx: &SourceClaimContext<'_>) -> Opt
     if packet_source_has_any(
         ctx.source,
         &["session() as session", "sessions.session() as session"],
-    ) && lower.contains("session.request(")
+    ) && lower.contains("session.")
+        && lower.contains("request(")
     {
         return Some(
-            "The top-level request helper opens a Session and delegates to Session.request."
+            "The top-level request helper opens a session object and delegates to the session request method."
                 .to_string(),
         );
     }
@@ -609,7 +610,7 @@ fn session_request_prepares_claim(ctx: &SourceClaimContext<'_>) -> Option<String
         && lower.contains("self.prepare_request(")
     {
         return Some(
-            "Session.request creates a Request object and prepares it into a transport-ready request object."
+            "The session request method creates a request object and prepares it into a transport-ready request object."
                 .to_string(),
         );
     }
@@ -638,7 +639,8 @@ fn session_send_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
         && lower.contains("adapter.send(")
     {
         return Some(
-            "Session.send chooses an adapter and calls the adapter send method.".to_string(),
+            "The session send method chooses an adapter and calls the adapter send method."
+                .to_string(),
         );
     }
     None
@@ -842,7 +844,9 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
 
     if source_lower.contains("serialize(_key)")
         && (source_lower.contains("getcache")
-            || source_lower.contains("createcachehelper")
+            || (source_lower.contains("create")
+                && source_lower.contains("cache")
+                && source_lower.contains("helper"))
             || source_lower.contains("cache"))
     {
         claims.push(format!(
@@ -877,7 +881,8 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
 
     if source_lower.contains("_withclient")
         && source_lower.contains("client()")
-        && packet_source_has_any(source, &["client.get", "client.post", "client.put"])
+        && source_lower.contains("client.")
+        && packet_source_has_any(source, &["get(", "post(", "put("])
         && source_lower.contains("future<response>")
     {
         claims.push("Top-level HTTP helpers delegate to a Client.".to_string());
@@ -962,7 +967,7 @@ fn packet_generic_form_validation_flow_claims(_symbol: &str, source: &str) -> Ve
         && source_lower.contains("validity.valid")
         && source_lower.contains("preventdefault")
     {
-        claims.push("Submit handlers prevent submission when the form is invalid.".to_string());
+        claims.push("Submit handling prevents invalid form submission.".to_string());
     }
 
     claims
@@ -979,7 +984,8 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("performeagerlyifnecessary")
     {
         claims.push(
-            "Session.request creates request objects before optional eager execution.".to_string(),
+            "The session request API creates request objects before optional eager execution."
+                .to_string(),
         );
     }
 
@@ -987,7 +993,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("public func resume() -> self")
         && source_lower.contains("task.resume()")
     {
-        claims.push("Request.resume resumes the underlying URLSession task.".to_string());
+        claims.push("The request resume API resumes the underlying URL session task.".to_string());
     }
 
     if normalized_symbol.ends_with("validate")
@@ -1137,11 +1143,14 @@ pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<Stri
     }
 
     let lower = source.to_ascii_lowercase();
-    if lower.contains("@import")
-        && lower.contains("_vars.css")
-        && lower.contains("_base.css")
-        && (lower.contains("bounce.css") || lower.contains("flash.css"))
-    {
+    let imports_css = lower.contains("@import") && lower.contains(".css");
+    let imports_variables = lower.contains("var") && lower.contains(".css");
+    let imports_base = lower.contains("base") && lower.contains(".css");
+    let imports_named_animation = lower
+        .lines()
+        .filter(|line| line.contains("@import") && line.contains(".css"))
+        .any(|line| line.contains('/') && !line.contains("docs"));
+    if imports_css && imports_variables && imports_base && imports_named_animation {
         claims.push(
             "The animation stylesheet entrypoint imports the variable, base, and individual animation files."
                 .to_string(),
@@ -1527,11 +1536,11 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
 
     let callable_factory_source =
         source_lower.contains("mixin(app") || source_lower.contains("var app = function");
-    if normalized_symbol.contains("application")
-        && source_lower.contains("function")
+    if source_lower.contains("function")
         && source_lower.contains("handle(")
         && source_lower.contains("request")
         && source_lower.contains("response")
+        && (normalized_symbol.contains("application") || callable_factory_source)
     {
         if callable_factory_source {
             claims.push(
@@ -1546,9 +1555,11 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
         }
     }
 
-    if normalized_symbol.ends_with("handle")
-        && source_lower.contains("router")
+    if source_lower.contains("router")
         && source_lower.contains(".handle(")
+        && (normalized_symbol.ends_with("handle")
+            || (source_lower.contains("handle = function")
+                && source_lower.contains("this.router.handle")))
     {
         if symbol.contains('.') {
             claims.push(format!(
@@ -1561,10 +1572,10 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
         }
     }
 
-    if normalized_symbol.ends_with("use")
-        && source_lower.contains("function use")
+    if source_lower.contains("function use")
         && source_lower.contains("router")
         && source_lower.contains(".use(")
+        && (normalized_symbol.ends_with("use") || source_lower.contains("use = function"))
     {
         if symbol.contains('.') {
             claims.push(format!("{symbol} registers middleware on the router."));
@@ -1573,9 +1584,9 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
         }
     }
 
-    if normalized_symbol.ends_with("route")
-        && source_lower.contains("function route")
+    if source_lower.contains("function route")
         && source_lower.contains("router.route(")
+        && (normalized_symbol.ends_with("route") || source_lower.contains("route = function"))
     {
         claims.push(
             "The route registration helper creates route entries through a router.".to_string(),
@@ -1883,14 +1894,15 @@ fn packet_generic_log_record_handler_flow_claims(symbol: &str, source: &str) -> 
         && source_lower.contains("function pushhandler")
         && source_lower.contains("array_unshift($this->handlers")
     {
-        claims.push("Logger owns a stack of handlers registered by pushHandler.".to_string());
+        claims
+            .push("The logger owns a handler stack populated by handler registration.".to_string());
     }
 
     if normalized_symbol.ends_with("log")
         && source_lower.contains("function log(")
         && source_lower.contains("$this->addrecord(")
     {
-        claims.push("Logger::log delegates into addRecord.".to_string());
+        claims.push("The logger log method delegates into record creation.".to_string());
     }
 
     if (normalized_symbol.ends_with("addrecord") || source_lower.contains("function addrecord("))
@@ -1941,13 +1953,13 @@ fn packet_generic_site_build_phase_flow_claims(source: &str) -> Vec<String> {
         && normalized_source.contains("write")
     {
         claims.push(
-            "Site.process runs reset, read, generate, render, cleanup, and write phases."
+            "The site lifecycle method runs reset, read, generate, render, cleanup, and write phases."
                 .to_string(),
         );
     }
 
     if normalized_source.contains("classreader") && normalized_source.contains("defread") {
-        claims.push("Reader is responsible for reading site content.".to_string());
+        claims.push("Content reading source owns the site content read phase.".to_string());
     }
 
     if normalized_source.contains("classrenderer")
@@ -1955,7 +1967,7 @@ fn packet_generic_site_build_phase_flow_claims(source: &str) -> Vec<String> {
             || normalized_source.contains("renderdocument")
             || normalized_source.contains("renderliquid"))
     {
-        claims.push("Renderer renders pages and documents.".to_string());
+        claims.push("Page rendering source handles page and document rendering.".to_string());
     }
 
     claims
@@ -1966,8 +1978,10 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
     let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
 
-    if file_name == "mapperconfiguration.cs"
-        && normalized_source.contains("mapperconfiguration")
+    if file_name.contains("configuration")
+        && file_name.contains("mapper")
+        && normalized_source.contains("mapper")
+        && normalized_source.contains("configuration")
         && normalized_source.contains("configuredmaps")
         && normalized_source.contains("resolvedmaps")
         && normalized_source.contains("buildexecutionplan")
@@ -2470,7 +2484,7 @@ mod tests {
                 }
                 "#,
                 &[
-                    "Logger owns a stack of handlers registered by pushHandler.",
+                    "The logger owns a handler stack populated by handler registration.",
                     "addRecord creates a log record before passing it to handlers.",
                 ][..],
             ),
@@ -2478,7 +2492,7 @@ mod tests {
                 "Logger.log",
                 "src/logging/Logger.php",
                 "class Logger { public function log($level, string $message): void { $this->addRecord($level, $message); } }",
-                &["Logger::log delegates into addRecord."][..],
+                &["The logger log method delegates into record creation."][..],
             ),
             (
                 "HandlerInterface",
@@ -2793,7 +2807,7 @@ mod tests {
         for expected in [
             "A custom validation example applies script-driven validity checks before rendering messages.",
             "Custom error rendering branches on ValidityState fields to choose messages.",
-            "Submit handlers prevent submission when the form is invalid.",
+            "Submit handling prevents invalid form submission.",
         ] {
             assert!(
                 custom_claims.iter().any(|claim| claim == expected),

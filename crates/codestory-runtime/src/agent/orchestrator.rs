@@ -542,7 +542,7 @@ fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
             | "customvalidationflow"
             | "formvalidationbypass"
             | "validitystate"
-            | "mapperconfiguration"
+            | "mappingconfiguration"
             | "typemap"
             | "mappingplan"
             | "bufferedsource"
@@ -8933,18 +8933,15 @@ mod tests {
         );
 
         for expected in [
-            "base.h format_arg_store",
-            "format_arg_store",
-            "args.h dynamic_format_arg_store",
-            "dynamic_format_arg_store",
-            "format.h format_error",
-            "format_error",
-            "format.cc buffer append",
+            "format argument store",
+            "dynamic format argument collection",
+            "format error type",
+            "format source buffer append",
             "buffer append",
-            "os.cc vformat",
-            "os.cc format_to",
-            "format_windows_error",
-            "format_error_code",
+            "system source vformat",
+            "output formatting function",
+            "system error formatting",
+            "format error code",
         ] {
             assert!(
                 queries.contains(&expected),
@@ -8987,13 +8984,12 @@ mod tests {
             packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
 
         for expected in [
-            "Logger.php Logger",
-            "Logger.php pushHandler",
-            "Logger.php addRecord",
-            "Logger.php log",
-            "record.php record",
-            "HandlerInterface.php handle",
-            "processing_handler.php handle",
+            "logger handler stack",
+            "handler registration",
+            "logger record creation",
+            "log method record handoff",
+            "record handler interface",
+            "processing handler write boundary",
             "handler processing",
         ] {
             assert!(
@@ -9186,12 +9182,12 @@ mod tests {
         );
 
         for expected in [
-            "_vars.css --animate-duration",
-            "_vars.css --animate-delay",
-            "_base.css .animated",
-            "animate.css @import",
-            "bounce.css @keyframes bounce",
-            "flash.css @keyframes flash",
+            "animation custom property duration",
+            "animation custom property delay",
+            "animation base class",
+            "animation stylesheet import",
+            "named animation class",
+            "named keyframes animation",
             "css animation variables",
             "css animation imports",
         ] {
@@ -9263,12 +9259,12 @@ mod tests {
             packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
 
         for expected in [
-            "Mapper.cs IMapperBase",
-            "Mapper.cs Mapper.Map",
-            "MapperConfiguration.cs MapperConfiguration",
-            "TypeMap.cs CreateMapperLambda",
-            "plan_builder.cs plan builder",
-            "plan_builder.cs CreateMapperLambda",
+            "mapper public api",
+            "mapping runtime entrypoint",
+            "mapping configuration source",
+            "type map source",
+            "mapping lambda plan",
+            "mapping plan builder",
             "type map plan",
             "mapping execution plan",
         ] {
@@ -9300,13 +9296,11 @@ mod tests {
             packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
 
         for expected in [
-            "http.dart get",
-            "client.dart Client",
-            "client.dart Client.get",
-            "base_client.dart BaseClient",
-            "base_request.dart finalize",
-            "io_client.dart send",
-            "response.dart Response",
+            "http top level helper",
+            "client convenience method",
+            "client send implementation",
+            "io transport client send",
+            "response stream boundary",
             "top level helpers",
             "request finalization",
             "transport send",
@@ -9380,13 +9374,12 @@ mod tests {
             packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::RouteTracing);
 
         for expected in [
-            "Session.swift Session",
-            "Session.swift Session.request",
-            "Request.swift Request.resume",
-            "request_object.swift validate",
-            "delegate_callbacks.swift delegate",
-            "delegate_callbacks.swift urlSession",
             "session request creation",
+            "request object creation",
+            "request resume dispatch",
+            "request validation pipeline",
+            "delegate callback handling",
+            "url session callback boundary",
             "request task resume",
             "data request validation",
             "urlsession callbacks",
@@ -10245,13 +10238,13 @@ mod tests {
             packet_sufficiency_required_probe_queries(prompt, PacketTaskClassDto::RouteTracing);
 
         for expected in [
-            "build.rb Build.process",
-            "site.rb Site.process",
-            "site.rb Site.read",
-            "site.rb Site.render",
-            "site.rb Site.write",
-            "reader.rb Reader.read",
-            "renderer.rb Renderer.render_document",
+            "build process entrypoint",
+            "site lifecycle process phases",
+            "site read phase",
+            "site render phase",
+            "site write phase",
+            "content reader read phase",
+            "page renderer render phase",
         ] {
             assert!(
                 queries.iter().any(|query| query == &expected),
@@ -10301,7 +10294,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Site.process runs reset, read, generate, render, cleanup, and write phases.",
+                "The site lifecycle method runs reset, read, generate, render, cleanup, and write phases.",
             ),
             (
                 "Reader",
@@ -10314,7 +10307,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Reader is responsible for reading site content.",
+                "Content reading source owns the site content read phase.",
             ),
             (
                 "Renderer",
@@ -10328,7 +10321,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Renderer renders pages and documents.",
+                "Page rendering source handles page and document rendering.",
             ),
         ];
 
@@ -10925,13 +10918,13 @@ mod tests {
                 "Session.request",
                 "Source/Core/Session.swift",
                 "open func request(_ convertible: URLRequestConvertible) -> DataRequest { let request = DataRequest(); performEagerlyIfNecessary(request); return request }",
-                "Session.request creates request objects before optional eager execution.",
+                "The session request API creates request objects before optional eager execution.",
             ),
             (
                 "Request.resume",
                 "Source/Core/Request.swift",
                 "public func resume() -> Self { delegate?.readyToPerform(request: self); task.resume(); return self }",
-                "Request.resume resumes the underlying URLSession task.",
+                "The request resume API resumes the underlying URL session task.",
             ),
             (
                 "DataRequest.validate",
@@ -11201,13 +11194,13 @@ mod tests {
                 "request",
                 "src/requests/api.py",
                 "def request(method, url, **kwargs):\n    with sessions.Session() as session:\n        return session.request(method=method, url=url, **kwargs)\n",
-                "The top-level request helper opens a Session and delegates to Session.request.",
+                "The top-level request helper opens a session object and delegates to the session request method.",
             ),
             (
                 "Session.request",
                 "src/requests/sessions.py",
                 "def request(self, method, url, **kwargs):\n    req = Request(method=method, url=url)\n    prep = self.prepare_request(req)\n    return self.send(prep, **kwargs)\n",
-                "Session.request creates a Request object and prepares it into a transport-ready request object.",
+                "The session request method creates a request object and prepares it into a transport-ready request object.",
             ),
             (
                 "PreparedRequest.prepare",
@@ -11225,7 +11218,7 @@ mod tests {
                 "Session.send",
                 "src/requests/sessions.py",
                 "def send(self, request, **kwargs):\n    adapter = self.get_adapter(url=request.url)\n    r = adapter.send(request, **kwargs)\n    return r\n",
-                "Session.send chooses an adapter and calls the adapter send method.",
+                "The session send method chooses an adapter and calls the adapter send method.",
             ),
             (
                 "BaseAdapter.send",

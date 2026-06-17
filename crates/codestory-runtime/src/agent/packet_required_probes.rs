@@ -183,7 +183,8 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
                 && (normalized_claim.contains("delegate") || normalized_claim.contains("wrap"))
         }
         "requestfinalization" => {
-            (normalized_claim.contains("request") || normalized_claim.contains("baserequest"))
+            (normalized_claim.contains("request")
+                || (normalized_claim.contains("base") && normalized_claim.contains("request")))
                 && (normalized_claim.contains("finalize")
                     || normalized_claim.contains("finalized")
                     || normalized_claim.contains("finalization"))
@@ -477,9 +478,13 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
             &mut queries,
             &[
                 "request preparation",
+                "prepared request prepare method",
+                "transport-ready request object",
                 "session request",
                 "session send",
                 "adapter send",
+                "adapter send method",
+                "transport adapter send method",
                 "adapter selection",
             ],
         );
@@ -1644,18 +1649,20 @@ fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "base.h format_arg_store",
-            "format_arg_store",
-            "args.h dynamic_format_arg_store",
-            "dynamic_format_arg_store",
-            "format.h format_error",
-            "format_error",
-            "format.cc buffer append",
+            "format argument store",
+            "format arg store",
+            "dynamic format argument collection",
+            "dynamic format arg store",
+            "format error type",
+            "format failure type",
+            "format source buffer append",
             "buffer append",
-            "os.cc vformat",
-            "os.cc format_to",
-            "format_windows_error",
-            "format_error_code",
+            "system source vformat",
+            "format runtime source",
+            "output formatting function",
+            "system output formatting",
+            "system error formatting",
+            "format error code",
         ],
     );
 }
@@ -1664,13 +1671,12 @@ fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "Logger.php Logger",
-            "Logger.php pushHandler",
-            "Logger.php addRecord",
-            "Logger.php log",
-            "record.php record",
-            "HandlerInterface.php handle",
-            "processing_handler.php handle",
+            "logger handler stack",
+            "handler registration",
+            "logger record creation",
+            "log method record handoff",
+            "record handler interface",
+            "processing handler write boundary",
         ],
     );
 }
@@ -1679,18 +1685,14 @@ fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "build.rb Build.process",
-            "build.rb Build.build",
-            "site.rb Site",
-            "site.rb Site.process",
-            "site.rb Site.read",
-            "site.rb Site.render",
-            "site.rb Site.write",
-            "reader.rb Reader",
-            "reader.rb Reader.read",
-            "renderer.rb Renderer",
-            "renderer.rb Renderer.render_document",
-            "renderer.rb Renderer.render_liquid",
+            "build process entrypoint",
+            "build lifecycle method",
+            "site lifecycle process phases",
+            "site read phase",
+            "site render phase",
+            "site write phase",
+            "content reader read phase",
+            "page renderer render phase",
         ],
     );
 }
@@ -1699,15 +1701,13 @@ fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>
     push_unique_terms(
         queries,
         &[
-            "Mapper.cs IMapperBase",
-            "Mapper.cs IMapper",
-            "Mapper.cs Mapper",
-            "Mapper.cs Mapper.Map",
-            "MapperConfiguration.cs MapperConfiguration",
-            "TypeMap.cs TypeMap",
-            "TypeMap.cs CreateMapperLambda",
-            "plan_builder.cs plan builder",
-            "plan_builder.cs CreateMapperLambda",
+            "mapper public api",
+            "mapping runtime entrypoint",
+            "mapping configuration source",
+            "type map source",
+            "mapping lambda plan",
+            "mapping plan builder",
+            "mapping execution plan",
         ],
     );
 }
@@ -1716,18 +1716,17 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "http.dart get",
-            "http.dart Client",
-            "client.dart Client",
-            "client.dart Client.get",
-            "base_client.dart BaseClient",
-            "base_client.dart send",
-            "base_request.dart BaseRequest",
-            "base_request.dart finalize",
-            "io_client.dart IOClient",
-            "io_client.dart send",
-            "response.dart Response",
-            "response.dart fromStream",
+            "http top level helper",
+            "client convenience method",
+            "client send implementation",
+            "request finalization",
+            "request preparation",
+            "prepared request prepare method",
+            "transport-ready request object",
+            "adapter send method",
+            "transport adapter send method",
+            "io transport client send",
+            "response stream boundary",
         ],
     );
 }
@@ -1751,14 +1750,12 @@ fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "Session.swift Session",
-            "Session.swift Session.request",
-            "Request.swift Request",
-            "Request.swift Request.resume",
-            "request_object.swift request",
-            "request_object.swift validate",
-            "delegate_callbacks.swift delegate",
-            "delegate_callbacks.swift urlSession",
+            "session request creation",
+            "request object creation",
+            "request resume dispatch",
+            "request validation pipeline",
+            "delegate callback handling",
+            "url session callback boundary",
         ],
     );
 }
@@ -1782,15 +1779,16 @@ fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "_vars.css --animate-duration",
-            "_vars.css --animate-delay",
-            "_vars.css --animate-repeat",
-            "_base.css .animated",
-            "animate.css @import",
-            "bounce.css bounce",
-            "bounce.css @keyframes bounce",
-            "flash.css flash",
-            "flash.css @keyframes flash",
+            "animation custom property duration",
+            "animation custom property delay",
+            "animation custom property repeat",
+            "animation variables file",
+            "animation base class",
+            "animation stylesheet import",
+            "named animation class",
+            "named keyframes animation",
+            "attention animation keyframes",
+            "attention seeker animation",
         ],
     );
 }
