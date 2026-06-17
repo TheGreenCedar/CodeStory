@@ -712,9 +712,7 @@ fn packet_claim_ineligibility_reason(
     carries_required_role: bool,
 ) -> Option<&'static str> {
     let generic_navigation = packet_claim_is_generic_navigation_or_source_evidence(claim);
-    if claim.eligible_for_sufficiency == Some(false)
-        && !(generic_navigation && carries_required_role)
-    {
+    if claim.eligible_for_sufficiency == Some(false) {
         return Some("claim marked diagnostic");
     }
     if !claim.citations.is_empty() && !claim.citations.iter().any(citation_sufficiency_eligible) {
@@ -1748,6 +1746,92 @@ mod tests {
                 .all(|entry| entry.contains("tier=\"resolved_graph\"")),
             "ineligible diagnostics should include the citation tier: {report:?}"
         );
+    }
+
+    #[test]
+    fn claim_level_diagnostic_flag_overrides_required_role_on_generic_claim() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "The form validation examples use native required, pattern, min, and max constraints.",
+            ),
+            claim("Submit handlers prevent submission when the form is invalid."),
+            cited_claim(
+                "`validateForm` in `src/forms.js` ties form validation in this flow to cited definitions and adjacent ownership.",
+                Some("transform_or_validate"),
+                cited_anchor_with_tier(
+                    "validateForm",
+                    "src/forms.js",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                Some(false),
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert_eq!(report.ineligible.len(), 1);
+        assert!(report.ineligible[0].contains("role=\"transform_or_validate\""));
+        assert!(report.ineligible[0].contains("reason=\"claim marked diagnostic\""));
+        assert!(
+            !report
+                .covered
+                .contains(&"transform_or_validate".to_string()),
+            "claim-level diagnostic flags must keep role-backed generic claims out of covered proof: {report:?}"
+        );
+    }
+
+    #[test]
+    fn ineligible_claim_report_escapes_claim_text() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![cited_claim(
+            "Page \"markup\" uses C:\\forms\nand adjacent ownership.",
+            Some("source evidence"),
+            cited_anchor_with_tier(
+                "PageMarkup",
+                "src/forms.js",
+                PacketEvidenceTierDto::ResolvedGraph,
+                Some(true),
+            ),
+            Some(false),
+        )];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert_eq!(report.ineligible.len(), 1);
+        let entry = &report.ineligible[0];
+        assert!(
+            entry
+                .contains("claim=\"Page \\\"markup\\\" uses C:\\\\forms and adjacent ownership.\""),
+            "quoted, backslash, and newline claim text should be escaped in ineligible diagnostics: {entry}"
+        );
+        assert!(!entry.contains('\n'));
     }
 
     #[test]
