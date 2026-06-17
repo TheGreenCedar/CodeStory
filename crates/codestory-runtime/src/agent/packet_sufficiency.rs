@@ -1005,17 +1005,11 @@ impl StructuralLanguagePolicy {
     fn claim_satisfies_requirement(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
         let normalized = normalize_identifier(&claim.claim);
         match requirement.id {
-            "sql_tables" => {
-                Self::claim_text_names_sql_tables(&normalized)
-                    || claim.citations.iter().any(Self::citation_is_sql_table)
-            }
-            "sql_relationships" => {
-                Self::claim_text_names_sql_relationships(&normalized)
-                    || claim
-                        .citations
-                        .iter()
-                        .any(Self::citation_is_sql_relationship)
-            }
+            "sql_tables" => claim.citations.iter().any(Self::citation_is_sql_table),
+            "sql_relationships" => claim
+                .citations
+                .iter()
+                .any(Self::citation_is_sql_relationship),
             "form_native_constraints" => Self::claim_text_names_native_constraints(&normalized),
             "form_custom_validation" => Self::claim_text_names_custom_validation(&normalized),
             "form_submit_guard" => Self::claim_text_names_submit_guard(&normalized),
@@ -1060,19 +1054,6 @@ impl StructuralLanguagePolicy {
 
     fn citation_is_sql_relationship(citation: &AgentCitationDto) -> bool {
         packet_evidence_role(citation) == Some(PacketEvidenceRole::SqlRelationshipConstraint)
-    }
-
-    fn claim_text_names_sql_tables(normalized: &str) -> bool {
-        normalized.contains("sqlschema")
-            && (normalized.contains("definestables")
-                || normalized.contains("tables")
-                || normalized.contains("createtable"))
-    }
-
-    fn claim_text_names_sql_relationships(normalized: &str) -> bool {
-        normalized.contains("rowsreference")
-            || normalized.contains("foreignkey")
-            || (normalized.contains("reference") && normalized.contains("rows"))
     }
 
     fn claim_text_names_native_constraints(normalized: &str) -> bool {
@@ -2094,6 +2075,39 @@ mod tests {
     }
 
     #[test]
+    fn sql_looking_claim_text_without_structural_citations_stays_partial() {
+        let question = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine."),
+            claim("Track rows reference Album, Genre, and MediaType rows."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.contains(&"sql_tables".to_string()),
+            "SQL table wording without a table citation must stay missing: {report:?}"
+        );
+        assert!(
+            report.missing.contains(&"sql_relationships".to_string()),
+            "SQL relationship wording without an FK citation must stay missing: {report:?}"
+        );
+    }
+
+    #[test]
     fn synthetic_source_scan_stays_nonproof_for_non_structural_requirements() {
         let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
         let answer = answer_fixture(question);
@@ -2546,8 +2560,28 @@ mod tests {
     #[test]
     fn data_flow_sql_schema_prompts_use_schema_relationship_roles() {
         let claims = vec![
-            claim("SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine."),
-            claim("Track rows reference Album, Genre, and MediaType rows."),
+            cited_claim(
+                "SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "CREATE TABLE Artist",
+                    "schema.sql",
+                    PacketEvidenceTierDto::SyntheticSourceScan,
+                    Some(false),
+                ),
+                Some(false),
+            ),
+            cited_claim(
+                "Track rows reference Album, Genre, and MediaType rows.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "FOREIGN KEY",
+                    "schema.sql",
+                    PacketEvidenceTierDto::SyntheticSourceScan,
+                    Some(false),
+                ),
+                Some(false),
+            ),
             claim("The repository carries multiple SQL dialect scripts for the same schema."),
         ];
 
