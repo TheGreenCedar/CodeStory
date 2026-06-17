@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
+const AVOID_OPENING_OMISSION: &str = "avoid_opening";
+const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
 
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
     match mode {
@@ -140,8 +142,11 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
             .saturating_sub(over_by.saturating_add(1024))
             .max(1024);
 
-        if trim_packet_sufficiency_verbose_lists(packet) {
-            push_omitted_section(&mut packet.budget, "avoid_opening");
+        let trimmed_verbose_sections = trim_packet_sufficiency_verbose_lists(packet);
+        if !trimmed_verbose_sections.is_empty() {
+            for section in trimmed_verbose_sections {
+                push_omitted_section(&mut packet.budget, section);
+            }
             continue;
         }
 
@@ -168,12 +173,25 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
     }
 }
 
-fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> bool {
-    let had_verbose_lists = !packet.sufficiency.avoid_opening.is_empty()
-        || !packet.sufficiency.avoid_opening_paths.is_empty();
-    packet.sufficiency.avoid_opening.clear();
-    packet.sufficiency.avoid_opening_paths.clear();
-    had_verbose_lists
+fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> Vec<&'static str> {
+    let mut trimmed_sections = Vec::new();
+
+    if !packet.sufficiency.avoid_opening.is_empty()
+        || !packet.sufficiency.avoid_opening_paths.is_empty()
+    {
+        packet.sufficiency.avoid_opening.clear();
+        packet.sufficiency.avoid_opening_paths.clear();
+        trimmed_sections.push(AVOID_OPENING_OMISSION);
+    }
+
+    if let Some(report) = packet.sufficiency.coverage_report.as_mut()
+        && !report.ineligible.is_empty()
+    {
+        report.ineligible.clear();
+        trimmed_sections.push(COVERAGE_REPORT_INELIGIBLE_OMISSION);
+    }
+
+    trimmed_sections
 }
 
 fn rebuild_packet_budget_dependents(
@@ -192,13 +210,23 @@ fn rebuild_packet_budget_dependents(
         &packet.budget,
         extra_probes,
     );
-    if packet
+    let trim_avoid_opening = packet
         .budget
         .omitted_sections
         .iter()
-        .any(|section| section == "avoid_opening")
-    {
-        trim_packet_sufficiency_verbose_lists(packet);
+        .any(|section| section == AVOID_OPENING_OMISSION);
+    let trim_ineligible = packet
+        .budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == COVERAGE_REPORT_INELIGIBLE_OMISSION);
+
+    if trim_avoid_opening {
+        packet.sufficiency.avoid_opening.clear();
+        packet.sufficiency.avoid_opening_paths.clear();
+    }
+    if trim_ineligible && let Some(report) = packet.sufficiency.coverage_report.as_mut() {
+        report.ineligible.clear();
     }
 }
 
@@ -452,4 +480,240 @@ pub(crate) fn next_deeper_packet_command(
         "codestory-cli packet --project {project} --question {} --budget {next}",
         quote_packet_command_value(question)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{
+        AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
+        AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId, NodeKind, PacketClaimDto,
+        PacketCoverageReportDto, PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto,
+        PacketSufficiencyDto, PacketSufficiencyStatusDto, SearchHitOrigin,
+    };
+
+    #[test]
+    fn compact_budget_trims_ineligible_coverage_report_before_payload_omission() {
+        let question = "Explain symbol ownership for PacketBudget.";
+        let mut packet = test_packet(question, 1);
+        packet
+            .sufficiency
+            .coverage_report
+            .as_mut()
+            .expect("coverage report")
+            .ineligible = (0..48)
+            .map(|index| {
+                format!(
+                    "claim=\"diagnostic claim {index} {}\" role=\"source evidence\" tier=\"diagnostic\" reason=\"claim marked diagnostic\"",
+                    "padding ".repeat(80)
+                )
+            })
+            .collect();
+
+        let mut trimmed_probe = packet.clone();
+        let trimmed_sections = trim_packet_sufficiency_verbose_lists(&mut trimmed_probe);
+        assert_eq!(trimmed_sections, vec![COVERAGE_REPORT_INELIGIBLE_OMISSION]);
+        let trimmed_len = serialized_packet_len(&trimmed_probe);
+        let max_output_bytes = u32::try_from(trimmed_len + 4096).expect("test cap fits u32");
+        packet.budget.limits.max_output_bytes = max_output_bytes;
+        assert!(
+            serialized_packet_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the packet output cap"
+        );
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let serialized_len = serialized_packet_len(&packet);
+        assert!(
+            serialized_len <= max_output_bytes as usize,
+            "trimming verbose ineligible diagnostics should bring the packet under cap: {serialized_len} > {max_output_bytes}"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .contains(&"output_bytes".to_string())
+        );
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&COVERAGE_REPORT_INELIGIBLE_OMISSION.to_string())
+        );
+        assert!(
+            packet
+                .sufficiency
+                .coverage_report
+                .as_ref()
+                .expect("coverage report")
+                .ineligible
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sufficiency_verbose_trimming_preserves_missing_and_blocking_report_entries() {
+        let mut packet = test_packet("Explain route dispatch gaps.", 4096);
+        packet.sufficiency.coverage_report = Some(PacketCoverageReportDto {
+            covered: vec!["request dispatch".to_string()],
+            missing: vec!["route handling".to_string()],
+            ineligible: vec!["claim=\"diagnostic\" reason=\"claim marked diagnostic\"".to_string()],
+            unresolved: vec!["RouteDispatcher".to_string()],
+            budget_omitted: vec!["packet_payload".to_string(), "output_bytes".to_string()],
+        });
+
+        let trimmed_sections = trim_packet_sufficiency_verbose_lists(&mut packet);
+
+        assert_eq!(trimmed_sections, vec![COVERAGE_REPORT_INELIGIBLE_OMISSION]);
+        let report = packet
+            .sufficiency
+            .coverage_report
+            .as_ref()
+            .expect("coverage report");
+        assert_eq!(report.covered, vec!["request dispatch".to_string()]);
+        assert_eq!(report.missing, vec!["route handling".to_string()]);
+        assert!(report.ineligible.is_empty());
+        assert_eq!(report.unresolved, vec!["RouteDispatcher".to_string()]);
+        assert_eq!(
+            report.budget_omitted,
+            vec!["packet_payload".to_string(), "output_bytes".to_string()]
+        );
+    }
+
+    fn test_packet(question: &str, max_output_bytes: u32) -> AgentPacketDto {
+        let answer = AgentAnswerDto {
+            answer_id: "packet-budget-test".to_string(),
+            prompt: question.to_string(),
+            summary: "Packet budget test answer.".to_string(),
+            freshness: None,
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "Short answer with cited ownership evidence.".to_string(),
+                }],
+            }],
+            citations: vec![
+                test_citation(
+                    "PacketBudget",
+                    "crates/codestory-runtime/src/agent/packet_budget.rs",
+                ),
+                test_citation(
+                    "AgentPacketDto",
+                    "crates/codestory-contracts/src/api/dto.rs",
+                ),
+            ],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "packet-budget-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                annotations: Vec::new(),
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        };
+        let budget = PacketBudgetDto {
+            requested: PacketBudgetModeDto::Compact,
+            limits: PacketBudgetLimitsDto {
+                max_anchors: 13,
+                max_files: 13,
+                max_snippets: 12,
+                max_trail_edges: 20,
+                max_output_bytes,
+            },
+            used: PacketBudgetUsageDto {
+                anchors: 0,
+                files: 0,
+                snippets: 0,
+                trail_edges: 0,
+                output_bytes: 0,
+            },
+            truncated: false,
+            omitted_sections: Vec::new(),
+            next_deeper_command: None,
+        };
+        let sufficiency = PacketSufficiencyDto {
+            status: PacketSufficiencyStatusDto::Sufficient,
+            covered_claims: vec![PacketClaimDto {
+                claim: "Packet budget ownership is covered by cited runtime and contract anchors."
+                    .to_string(),
+                citations: answer.citations.clone(),
+                coverage_role: Some("source evidence".to_string()),
+                eligible_for_sufficiency: Some(true),
+            }],
+            open_next: Vec::new(),
+            avoid_opening: Vec::new(),
+            avoid_opening_paths: Vec::new(),
+            gaps: Vec::new(),
+            follow_up_commands: Vec::new(),
+            coverage_report: Some(PacketCoverageReportDto::default()),
+        };
+        let retrieval_trace_summary = PacketRetrievalTraceSummaryDto {
+            retrieval_trace: answer.retrieval_trace.clone(),
+            source_read_steps: 0,
+            search_steps: 0,
+            trail_steps: 0,
+        };
+
+        AgentPacketDto {
+            packet_id: answer.answer_id.clone(),
+            question: question.to_string(),
+            task_class: Some(PacketTaskClassDto::SymbolOwnership),
+            plan: PacketPlanDto {
+                task_class: PacketTaskClassDto::SymbolOwnership,
+                inferred_task_class: false,
+                queries: vec![PacketPlanQueryDto {
+                    query: question.to_string(),
+                    purpose: "fixture".to_string(),
+                }],
+                trace: Vec::new(),
+            },
+            answer,
+            budget,
+            sufficiency,
+            retrieval_trace_summary,
+        }
+    }
+
+    fn test_citation(display_name: &str, file_path: &str) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some(file_path.to_string()),
+            line: Some(10),
+            score: 0.9,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn test_project_root() -> &'static Path {
+        Path::new("C:/workspace/project root")
+    }
 }
