@@ -1582,13 +1582,14 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
         );
     }
 
-    if normalized_symbol.ends_with("send")
-        && source_lower.contains("res.send = function send")
-        && source_lower.contains("this.set('content-length'")
-        && source_lower.contains(".end(")
+    if packet_symbol_is_response_send_helper(symbol, &normalized_symbol)
+        && packet_source_sets_response_metadata(&source_lower)
+        && packet_source_ends_or_writes_response(&source_lower)
     {
         if symbol.contains('.') {
-            claims.push(format!("{symbol} prepares and sends the response body."));
+            claims.push(format!(
+                "{symbol} sets response metadata before ending the response."
+            ));
         } else {
             claims.push(
                 "The response send helper sets response metadata before ending the body."
@@ -1649,6 +1650,60 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     }
 
     claims
+}
+
+fn packet_symbol_is_response_send_helper(symbol: &str, normalized_symbol: &str) -> bool {
+    if let Some((owner, method)) = packet_receiver_method_parts(symbol)
+        && packet_response_receiver_owner(&owner)
+        && packet_response_terminal_method(&method)
+    {
+        return true;
+    }
+    (normalized_symbol.contains("response") || normalized_symbol.starts_with("res"))
+        && packet_response_terminal_method(normalized_symbol)
+}
+
+fn packet_receiver_method_parts(symbol: &str) -> Option<(String, String)> {
+    let trimmed = symbol.trim();
+    for separator in ['.', '#', ':'] {
+        if let Some(index) = trimmed.rfind(separator) {
+            let owner = normalize_identifier(&trimmed[..index]);
+            let method = normalize_identifier(&trimmed[index + separator.len_utf8()..]);
+            if !owner.is_empty() && !method.is_empty() {
+                return Some((owner, method));
+            }
+        }
+    }
+    None
+}
+
+fn packet_response_receiver_owner(owner: &str) -> bool {
+    matches!(owner, "res" | "response" | "reply")
+}
+
+fn packet_response_terminal_method(method: &str) -> bool {
+    matches!(method, "send" | "json" | "end" | "respond")
+        || method.ends_with("send")
+        || method.ends_with("json")
+        || method.ends_with("end")
+        || method.ends_with("respond")
+}
+
+fn packet_source_sets_response_metadata(source_lower: &str) -> bool {
+    source_lower.contains("content-length")
+        || source_lower.contains("contentlength")
+        || source_lower.contains("content-type")
+        || source_lower.contains("contenttype")
+        || source_lower.contains("setheader")
+        || source_lower.contains(".set(")
+        || source_lower.contains("header(")
+}
+
+fn packet_source_ends_or_writes_response(source_lower: &str) -> bool {
+    source_lower.contains(".end(")
+        || source_lower.contains(".write(")
+        || source_lower.contains("writehead(")
+        || source_lower.contains("body")
 }
 
 fn packet_generic_server_request_dispatch_flow_claims(
@@ -2318,7 +2373,13 @@ mod tests {
                 "res.send",
                 "lib/response.js",
                 "res.send = function send(body) { this.set('Content-Length', len); this.end(chunk, encoding); return this; }",
-                "res.send prepares and sends the response body.",
+                "res.send sets response metadata before ending the response.",
+            ),
+            (
+                "reply.respond",
+                "src/http/reply.js",
+                "reply.respond = function writePayload(payload) { this.setHeader('Content-Type', 'text/plain'); return this.end(payload); }",
+                "reply.respond sets response metadata before ending the response.",
             ),
         ];
         for (symbol, path, source, expected) in express_cases {
