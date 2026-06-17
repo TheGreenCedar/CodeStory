@@ -16,7 +16,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::exact_symbol_query_terms;
@@ -180,6 +180,26 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
                     || normalized_claim.contains("fromstream")
                     || normalized_claim.contains("streamed"))
         }
+        "references" => {
+            normalized_claim.contains("rowsreference")
+                || normalized_claim.contains("foreignkey")
+                || normalized_claim.contains("references")
+        }
+        "sqltabledefinitions" => {
+            normalized_claim.contains("sqlschema")
+                && (normalized_claim.contains("definestables")
+                    || normalized_claim.contains("tables")
+                    || normalized_claim.contains("createtable"))
+        }
+        "foreignkeyrelationships" => {
+            normalized_claim.contains("rowsreference") || normalized_claim.contains("foreignkey")
+        }
+        "sqlschemascripts" | "schemadialectscripts" => {
+            normalized_claim.contains("sql")
+                && normalized_claim.contains("schema")
+                && (normalized_claim.contains("dialectscripts")
+                    || normalized_claim.contains("schemascripts"))
+        }
         _ => false,
     }
 }
@@ -284,6 +304,11 @@ fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
             | "toplevelhelpers"
             | "requestfinalization"
             | "requestresponse"
+            | "references"
+            | "sqltabledefinitions"
+            | "foreignkeyrelationships"
+            | "sqlschemascripts"
+            | "schemadialectscripts"
     )
 }
 
@@ -396,6 +421,9 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
                 "urlsession callbacks",
             ],
         );
+    }
+    if packet_terms_indicate_sql_schema_flow(terms) {
+        push_sql_schema_required_probe_queries(terms, &mut queries);
     }
     if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_unique_terms(
@@ -552,6 +580,17 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
                 "request task resume",
                 "data request validation",
                 "urlsession callbacks",
+            ],
+        );
+    }
+    if packet_terms_indicate_sql_schema_flow(terms) {
+        push_sql_schema_required_probe_queries(terms, queries);
+        push_unique_terms(
+            queries,
+            &[
+                "sql table definitions",
+                "foreign key relationships",
+                "schema dialect scripts",
             ],
         );
     }
@@ -796,6 +835,9 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     if packet_citation_matches_validation_bypass_probe(query, citation) {
         return true;
     }
+    if packet_citation_matches_sql_schema_scripts_probe(query, citation) {
+        return true;
+    }
     let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
         return false;
     };
@@ -804,7 +846,10 @@ pub(crate) fn packet_citation_satisfies_required_probe(
 
 pub(crate) fn packet_required_probe_needs_exact_match(query: &str) -> bool {
     let normalized_query = normalize_identifier(query);
-    query.contains("::") || query.contains('.') || normalized_query == "formvalidationbypass"
+    query.contains("::")
+        || query.contains('.')
+        || normalized_query == "formvalidationbypass"
+        || (normalized_query.starts_with("createtable") && normalized_query != "createtable")
 }
 
 fn packet_required_probe_needs_concrete_file(query: &str) -> bool {
@@ -874,6 +919,8 @@ pub(crate) fn packet_citation_probe_match_rank(
         Some(6)
     } else if packet_citation_matches_validation_bypass_probe(query, citation) {
         Some(5)
+    } else if packet_citation_matches_sql_schema_scripts_probe(query, citation) {
+        Some(5)
     } else if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
         Some(5)
     } else if normalized_display == normalized_query
@@ -891,6 +938,34 @@ pub(crate) fn packet_citation_probe_match_rank(
     } else {
         None
     }
+}
+
+fn packet_citation_matches_sql_schema_scripts_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    if !matches!(
+        normalize_identifier(query).as_str(),
+        "sqlschemascripts" | "schemadialectscripts"
+    ) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(citation.kind, NodeKind::FILE | NodeKind::ANNOTATION)
+        && path.ends_with(".sql")
+        && (path.contains("sqlite")
+            || path.contains("mysql")
+            || path.contains("postgres")
+            || path.contains("postgresql")
+            || path.contains("sqlserver")
+            || path.contains("oracle")
+            || path.contains("db2")
+            || normalize_identifier(&citation.display_name).contains("sqlschema"))
 }
 
 fn packet_citation_matches_route_engine_constructor_probe(
@@ -1495,6 +1570,150 @@ fn push_stylesheet_animation_source_probe_queries(queries: &mut Vec<String>) {
     );
 }
 
+pub(crate) fn push_sql_schema_required_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "CREATE TABLE",
+            "FOREIGN KEY",
+            "REFERENCES",
+            "sql schema scripts",
+        ],
+    );
+    for table in packet_sql_schema_prompt_table_candidates(terms)
+        .into_iter()
+        .take(8)
+    {
+        push_unique_term(queries, &format!("CREATE TABLE {table}"));
+    }
+}
+
+fn packet_sql_schema_prompt_table_candidates(terms: &[String]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for window in terms.windows(2) {
+        let [left, right] = window else {
+            continue;
+        };
+        if !packet_sql_schema_compound_suffix(right) {
+            continue;
+        }
+        let Some(left) = packet_sql_schema_prompt_table_part(left, true) else {
+            continue;
+        };
+        let Some(right) = packet_sql_schema_prompt_table_part(right, true) else {
+            continue;
+        };
+        push_unique_term(&mut candidates, &format!("{left}{right}"));
+    }
+
+    for term in terms {
+        let Some(table) = packet_sql_schema_prompt_table_part(term, false) else {
+            continue;
+        };
+        push_unique_term(&mut candidates, &table);
+    }
+
+    candidates
+}
+
+fn packet_sql_schema_compound_suffix(term: &str) -> bool {
+    matches!(
+        normalize_identifier(term).as_str(),
+        "line" | "lines" | "item" | "items" | "detail" | "details"
+    )
+}
+
+fn packet_sql_schema_prompt_table_part(term: &str, allow_singular: bool) -> Option<String> {
+    let normalized = normalize_identifier(term);
+    if normalized.len() < 4
+        || packet_sql_schema_prompt_table_stop_term(&normalized)
+        || normalized.chars().any(|ch| !ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    if !allow_singular && packet_sql_schema_compound_suffix(&normalized) {
+        return None;
+    }
+    if !allow_singular
+        && !normalized.ends_with('s')
+        && !matches!(
+            normalized.as_str(),
+            "line" | "lines" | "item" | "items" | "detail" | "details"
+        )
+    {
+        return None;
+    }
+    let singular = packet_sql_schema_singular_table_term(&normalized);
+    if singular.len() < 4 || packet_sql_schema_prompt_table_stop_term(&singular) {
+        return None;
+    }
+    Some(packet_sql_schema_pascal_identifier(&singular))
+}
+
+fn packet_sql_schema_singular_table_term(term: &str) -> String {
+    term.strip_suffix("ies")
+        .map(|prefix| format!("{prefix}y"))
+        .or_else(|| term.strip_suffix('s').map(str::to_string))
+        .unwrap_or_else(|| term.to_string())
+}
+
+fn packet_sql_schema_pascal_identifier(term: &str) -> String {
+    let mut value = String::new();
+    let mut chars = term.chars();
+    if let Some(first) = chars.next() {
+        value.push(first.to_ascii_uppercase());
+        value.extend(chars.map(|ch| ch.to_ascii_lowercase()));
+    }
+    value
+}
+
+fn packet_sql_schema_prompt_table_stop_term(term: &str) -> bool {
+    matches!(
+        term,
+        "across"
+            | "between"
+            | "constraint"
+            | "constraints"
+            | "core"
+            | "create"
+            | "database"
+            | "databases"
+            | "definition"
+            | "definitions"
+            | "dialect"
+            | "dialects"
+            | "explain"
+            | "file"
+            | "files"
+            | "foreign"
+            | "reference"
+            | "references"
+            | "relation"
+            | "relations"
+            | "relationship"
+            | "relationships"
+            | "schema"
+            | "schemas"
+            | "script"
+            | "scripts"
+            | "seed"
+            | "seeds"
+            | "sqlite"
+            | "source"
+            | "sources"
+            | "mysql"
+            | "name"
+            | "names"
+            | "postgres"
+            | "postgresql"
+            | "sql"
+            | "support"
+            | "supporting"
+            | "table"
+            | "tables"
+    )
+}
+
 fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
@@ -1868,6 +2087,19 @@ mod tests {
             "SampleDatabase/DataSources/Sample_Sqlite.sql",
             0.9,
         );
+        let create_invoice = test_packet_citation(
+            "CREATE TABLE Invoice",
+            "SampleDatabase/DataSources/Sample_Sqlite.sql",
+            0.9,
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "CREATE TABLE Track",
+            &create_track
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "CREATE TABLE Track",
+            &create_invoice
+        ));
         assert!(packet_citation_satisfies_required_probe(
             "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
             &create_track
@@ -1876,6 +2108,41 @@ mod tests {
             "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
             &create_playlist_track
         ));
+    }
+
+    #[test]
+    fn sql_schema_required_probes_derive_prompt_table_symbols() {
+        let terms = packet_probe_terms(
+            "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across SQL seed scripts. Cite the source files.",
+        );
+        let queries = packet_sufficiency_required_probe_queries_from_terms(
+            &terms,
+            PacketTaskClassDto::DataFlow,
+        );
+
+        for expected in [
+            "CREATE TABLE",
+            "FOREIGN KEY",
+            "REFERENCES",
+            "CREATE TABLE Artist",
+            "CREATE TABLE Album",
+            "CREATE TABLE Track",
+            "CREATE TABLE Invoice",
+            "CREATE TABLE InvoiceLine",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "expected SQL schema probe `{expected}` in {queries:?}"
+            );
+        }
+        assert!(
+            !queries.iter().any(|query| query == "CREATE TABLE Line"),
+            "standalone compound suffixes should not become table probes: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|query| query == "CREATE TABLE File"),
+            "documentation words should not become table probes: {queries:?}"
+        );
     }
 
     #[test]

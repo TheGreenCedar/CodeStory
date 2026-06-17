@@ -7,7 +7,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use crate::retrieval_file_role_from_path;
@@ -145,6 +145,9 @@ pub(crate) fn packet_citation_rank(
     }
     if packet_terms_indicate_stylesheet_animation_flow(terms) {
         score += packet_stylesheet_animation_rank_bonus(&normalized_display, &path);
+    }
+    if packet_terms_indicate_sql_schema_flow(terms) {
+        score += packet_sql_schema_rank_bonus(&normalized_display, &path, terms);
     }
     if packet_terms_indicate_shell_install_dispatch_flow(terms) {
         score += packet_shell_install_dispatch_rank_bonus(&normalized_display, &path);
@@ -614,6 +617,59 @@ fn packet_stylesheet_animation_rank_bonus(normalized_display: &str, path: &str) 
     bonus
 }
 
+fn packet_sql_schema_rank_bonus(normalized_display: &str, path: &str, terms: &[String]) -> f32 {
+    let mut bonus = 0.0;
+    let display_or_path = format!("{normalized_display}{path}");
+
+    if path.ends_with(".sql") {
+        bonus += 5.0;
+    }
+    if normalized_display.contains("createtable") || normalized_display.contains("create_table") {
+        bonus += 8.0;
+    }
+    if normalized_display.contains("foreignkey")
+        || normalized_display.contains("foreign_key")
+        || normalized_display.contains("references")
+    {
+        bonus += 8.0;
+    }
+    if display_or_path.contains("sqlite")
+        || display_or_path.contains("mysql")
+        || display_or_path.contains("postgres")
+        || display_or_path.contains("postgresql")
+        || display_or_path.contains("sqlserver")
+    {
+        bonus += 3.0;
+    }
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains(".test/")
+        || path.contains("fixture")
+    {
+        bonus -= 14.0;
+    }
+    if normalized_display.contains("createtable") {
+        for term in terms {
+            let normalized_term = normalize_identifier(term);
+            if normalized_term.len() < 4 || packet_query_stop_term(&normalized_term) {
+                continue;
+            }
+            let singular = if let Some(prefix) = normalized_term.strip_suffix("ies") {
+                format!("{prefix}y")
+            } else if let Some(prefix) = normalized_term.strip_suffix('s') {
+                prefix.to_string()
+            } else {
+                normalized_term.clone()
+            };
+            if singular.len() >= 4 && normalized_display.contains(&singular) {
+                bonus += 6.0;
+            }
+        }
+    }
+
+    bonus
+}
+
 fn packet_shell_install_dispatch_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
     if path.ends_with("install.sh") {
@@ -957,6 +1013,21 @@ mod tests {
                 "beans",
                 "html/forms/native-form-widgets/advanced-examples.html"
             )
+        );
+    }
+
+    #[test]
+    fn sql_schema_rank_bonus_matches_plural_prompt_table_terms() {
+        let terms = vec![
+            "sql".to_string(),
+            "schema".to_string(),
+            "tracks".to_string(),
+            "invoices".to_string(),
+        ];
+
+        assert!(
+            packet_sql_schema_rank_bonus("createtabletrack", "db/schema.sql", &terms)
+                > packet_sql_schema_rank_bonus("createtablecustomer", "db/schema.sql", &terms)
         );
     }
 }

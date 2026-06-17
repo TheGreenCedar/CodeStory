@@ -6,7 +6,7 @@ use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
 use codestory_contracts::api::{
@@ -459,6 +459,25 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         {
             return Some("css imports");
         }
+        if normalized_claim.contains("sqlschema")
+            && (normalized_claim.contains("definestables")
+                || normalized_claim.contains("tables")
+                || normalized_claim.contains("createtable"))
+        {
+            return Some("sql table definitions");
+        }
+        if normalized_claim.contains("rowsreference")
+            || normalized_claim.contains("foreignkey")
+            || (normalized_claim.contains("reference") && normalized_claim.contains("rows"))
+        {
+            return Some("sql relationships");
+        }
+        if normalized_claim.contains("sqldialect")
+            || normalized_claim.contains("schemascripts")
+            || normalized_claim.contains("dialectscripts")
+        {
+            return Some("sql dialect scripts");
+        }
         if normalized_claim.contains("public")
             && contains_any(
                 &normalized_claim,
@@ -532,12 +551,14 @@ fn packet_missing_required_flow_roles(
     let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
     let stylesheet_animation_flow =
         packet_terms_indicate_stylesheet_animation_flow(&question_terms);
+    let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
     let required = packet_required_flow_roles(
         task_class,
         site_build_flow,
         shell_install_dispatch_flow,
         url_session_request_flow,
         stylesheet_animation_flow,
+        sql_schema_flow,
     );
     if required.is_empty() {
         return Vec::new();
@@ -552,6 +573,7 @@ fn packet_missing_required_flow_roles(
             shell_install_dispatch_flow,
             url_session_request_flow,
             stylesheet_animation_flow,
+            sql_schema_flow,
         ) {
             covered.insert(role);
         }
@@ -570,6 +592,7 @@ fn packet_required_flow_roles(
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
     stylesheet_animation_flow: bool,
+    sql_schema_flow: bool,
 ) -> &'static [PacketFlowRole] {
     if shell_install_dispatch_flow {
         return match task_class {
@@ -604,6 +627,21 @@ fn packet_required_flow_roles(
     }
 
     if stylesheet_animation_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::RouteTracing
+            | PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if sql_schema_flow {
         return match task_class {
             PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
                 PacketFlowRole::EntryPoint,
@@ -655,6 +693,7 @@ fn packet_flow_roles_for_claim(
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
     stylesheet_animation_flow: bool,
+    sql_schema_flow: bool,
 ) -> HashSet<PacketFlowRole> {
     let mut roles = HashSet::new();
     let lower = claim.claim.to_ascii_lowercase();
@@ -770,6 +809,29 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("delay")
             || normalized.contains("repeat")
             || normalized.contains("keyframes")
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if sql_schema_flow {
+        if normalized.contains("sqlschema")
+            && (normalized.contains("definestables")
+                || normalized.contains("tables")
+                || normalized.contains("createtable"))
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("rowsreference")
+            || normalized.contains("foreignkey")
+            || (normalized.contains("reference") && normalized.contains("rows"))
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("sqldialect")
+            || normalized.contains("schemascripts")
+            || normalized.contains("dialectscripts")
         {
             roles.insert(PacketFlowRole::BoundaryOrState);
         }
@@ -916,6 +978,22 @@ fn packet_flow_roles_for_claim(
             }
             _ => {}
         }
+
+        if sql_schema_flow {
+            match packet_evidence_role(citation) {
+                Some(PacketEvidenceRole::SqlTableDefinition) => {
+                    roles.insert(PacketFlowRole::EntryPoint);
+                    roles.insert(PacketFlowRole::BoundaryOrState);
+                }
+                Some(PacketEvidenceRole::SqlRelationshipConstraint) => {
+                    roles.insert(PacketFlowRole::Handoff);
+                }
+                Some(PacketEvidenceRole::SqlSchemaFile) => {
+                    roles.insert(PacketFlowRole::BoundaryOrState);
+                }
+                _ => {}
+            }
+        }
     }
 
     roles
@@ -979,6 +1057,25 @@ mod tests {
         assert!(
             missing.is_empty(),
             "mapper plan prompts should use mapping flow roles: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn data_flow_sql_schema_prompts_use_schema_relationship_roles() {
+        let claims = vec![
+            claim("SQL schema defines tables Artist, Album, Track, Invoice, and InvoiceLine."),
+            claim("Track rows reference Album, Genre, and MediaType rows."),
+            claim("The repository carries multiple SQL dialect scripts for the same schema."),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.",
+            PacketTaskClassDto::DataFlow,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "SQL schema prompts should use table, relationship, and dialect roles: {missing:?}"
         );
     }
 }

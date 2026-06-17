@@ -905,7 +905,7 @@ fn maybe_append_sql_schema_file_citations(
             }) {
                 continue;
             }
-            let score = candidate.score + (anchor.score / 1000.0);
+            let score = candidate.score + anchor.score;
             answer.citations.push(AgentCitationDto {
                 node_id: NodeId(format!(
                     "packet::sql_schema::{}::{}::{}",
@@ -3498,6 +3498,39 @@ mod tests {
         assert_eq!(
             answer.citations[0].file_path.as_deref(),
             Some("crates/acme-cli/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn packet_required_probe_promotion_keeps_multiple_sql_schema_scripts() {
+        let mut sqlite = test_packet_citation("db/schema_sqlite.sql", "db/schema_sqlite.sql", 0.7);
+        sqlite.kind = NodeKind::FILE;
+        let mut mysql = test_packet_citation("db/schema_mysql.sql", "db/schema_mysql.sql", 0.6);
+        mysql.kind = NodeKind::FILE;
+        let mut postgres =
+            test_packet_citation("db/schema_postgresql.sql", "db/schema_postgresql.sql", 0.5);
+        postgres.kind = NodeKind::FILE;
+        let distractor = test_packet_citation("SchemaBuilder", "src/schema_builder.rs", 0.95);
+        let mut answer = packet_answer_fixture(
+            "Explain SQL schema relationships across seed scripts.",
+            vec![distractor, sqlite, mysql, postgres],
+        );
+
+        promote_required_probe_citations(&mut answer, &["sql schema scripts".to_string()]);
+
+        let promoted_sql_paths = answer
+            .citations
+            .iter()
+            .take(3)
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            promoted_sql_paths,
+            vec![
+                "db/schema_sqlite.sql",
+                "db/schema_mysql.sql",
+                "db/schema_postgresql.sql"
+            ]
         );
     }
 
@@ -9605,7 +9638,7 @@ mod tests {
     }
     #[test]
     fn generic_sql_schema_claims_survive_with_generic_claims() {
-        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across SQL seed scripts. Cite the source files.";
         let citation = test_packet_citation("schema.sql", "db/schema.sql", 0.9);
         let claims = packet_source_derived_claims_for_citation(
             prompt,
@@ -9650,6 +9683,46 @@ mod tests {
                 "expected generic SQL schema claim `{expected}` in {claims:?}"
             );
         }
+    }
+
+    #[test]
+    fn generic_sql_schema_packet_plan_derives_prompt_table_probes() {
+        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let plan = build_packet_plan(
+            prompt,
+            Some(PacketTaskClassDto::DataFlow),
+            PacketBudgetModeDto::Standard,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(prompt, PacketTaskClassDto::DataFlow);
+
+        for expected in [
+            "CREATE TABLE Artist",
+            "CREATE TABLE Album",
+            "CREATE TABLE Track",
+            "CREATE TABLE Invoice",
+            "CREATE TABLE InvoiceLine",
+            "FOREIGN KEY",
+            "REFERENCES",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == &expected),
+                "expected SQL schema packet query `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "expected SQL schema required probe `{expected}` in {required:?}"
+            );
+        }
+        assert!(
+            !queries.iter().any(|query| query == &"CREATE TABLE File"),
+            "source-file wording should not become a SQL table probe: {queries:?}"
+        );
     }
 
     #[test]

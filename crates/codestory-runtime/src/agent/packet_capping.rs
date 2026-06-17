@@ -523,6 +523,16 @@ pub(crate) fn promote_required_probe_citations(
     let focus_roots = packet_command_focus_roots(&answer.citations);
     let mut promoted_indices = Vec::new();
     for query in required_probe_queries {
+        if let Some(limit) = packet_required_probe_multi_match_limit(query) {
+            promote_distinct_required_probe_matches(
+                answer,
+                query,
+                limit,
+                &mut promoted_indices,
+                &focus_roots,
+            );
+            continue;
+        }
         if promoted_indices
             .iter()
             .any(|index| packet_citation_satisfies_required_probe(query, &answer.citations[*index]))
@@ -587,6 +597,72 @@ pub(crate) fn promote_required_probe_citations(
         required_probe_queries.join("|").replace('`', "'")
     ));
     protected_citation_keys
+}
+
+fn promote_distinct_required_probe_matches(
+    answer: &AgentAnswerDto,
+    query: &str,
+    limit: usize,
+    promoted_indices: &mut Vec<usize>,
+    focus_roots: &[PacketCommandFocusRoot],
+) {
+    let mut promoted_paths = promoted_indices
+        .iter()
+        .filter(|index| packet_citation_satisfies_required_probe(query, &answer.citations[**index]))
+        .filter_map(|index| packet_citation_file_path_key(&answer.citations[*index]))
+        .collect::<HashSet<_>>();
+
+    while promoted_paths.len() < limit {
+        let mut best_match = None;
+        for (index, citation) in answer.citations.iter().enumerate() {
+            if promoted_indices.contains(&index) {
+                continue;
+            }
+            let Some(path) = packet_citation_file_path_key(citation) else {
+                continue;
+            };
+            if promoted_paths.contains(&path) {
+                continue;
+            }
+            let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
+                continue;
+            };
+            if packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
+                && !packet_citation_satisfies_required_probe(query, citation)
+            {
+                continue;
+            }
+            if best_match
+                .map(|(best_index, best_rank)| {
+                    packet_prefer_required_probe_match(
+                        query,
+                        citation,
+                        match_rank,
+                        &answer.citations[best_index],
+                        best_rank,
+                        focus_roots,
+                    )
+                })
+                .unwrap_or(true)
+            {
+                best_match = Some((index, match_rank));
+            }
+        }
+        let Some((index, _)) = best_match else {
+            break;
+        };
+        if let Some(path) = packet_citation_file_path_key(&answer.citations[index]) {
+            promoted_paths.insert(path);
+        }
+        promoted_indices.push(index);
+    }
+}
+
+fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
+    match normalize_identifier(query).as_str() {
+        "sqlschemascripts" | "schemadialectscripts" => Some(3),
+        _ => None,
+    }
 }
 
 pub(crate) fn promote_focus_neighborhood_citations(

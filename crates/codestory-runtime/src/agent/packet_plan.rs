@@ -10,6 +10,7 @@ use crate::agent::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
     packet_sufficiency_required_probe_queries_from_terms,
     push_indexing_flow_required_probe_queries, push_search_flow_probe_queries,
+    push_sql_schema_required_probe_queries,
 };
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
@@ -24,7 +25,8 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_string_predicate_flow, packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
 use crate::agent::planning::dedupe_packet_plan_queries;
@@ -55,6 +57,7 @@ pub(crate) fn build_packet_plan_with_extra(
     let shell_install_dispatch_flow =
         packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
     let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
+    let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
     let mut queries = Vec::new();
     push_packet_query(
         &mut queries,
@@ -86,6 +89,7 @@ pub(crate) fn build_packet_plan_with_extra(
         task_class,
         shell_install_dispatch_flow,
         url_session_request_flow,
+        sql_schema_flow,
     ) {
         push_packet_query(&mut queries, query, "task-class retrieval seed");
     }
@@ -325,6 +329,17 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
                 "css animation base class",
                 "css keyframes",
                 "css animation imports",
+            ],
+        );
+    }
+    if packet_terms_indicate_sql_schema_flow(terms) {
+        push_sql_schema_required_probe_queries(terms, queries);
+        push_unique_terms(
+            queries,
+            &[
+                "sql table definitions",
+                "foreign key relationships",
+                "schema dialect scripts",
             ],
         );
     }
@@ -612,6 +627,17 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
                 "css animation base class",
                 "css keyframes",
                 "css animation imports",
+            ],
+        );
+    }
+    if packet_terms_indicate_sql_schema_flow(terms) {
+        push_sql_schema_required_probe_queries(terms, queries);
+        push_unique_terms(
+            queries,
+            &[
+                "sql table definitions",
+                "foreign key relationships",
+                "schema dialect scripts",
             ],
         );
     }
@@ -1339,6 +1365,7 @@ fn task_class_seed_queries(
     task_class: PacketTaskClassDto,
     shell_install_dispatch_flow: bool,
     url_session_request_flow: bool,
+    sql_schema_flow: bool,
 ) -> &'static [&'static str] {
     match task_class {
         PacketTaskClassDto::ArchitectureExplanation => &[
@@ -1356,6 +1383,11 @@ fn task_class_seed_queries(
         }
         PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
         PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
+        PacketTaskClassDto::DataFlow if sql_schema_flow => &[
+            "table definitions",
+            "foreign key relationships",
+            "schema dialect scripts",
+        ],
         PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],
         PacketTaskClassDto::EditPlanning => &["edit candidates", "test coverage"],
     }

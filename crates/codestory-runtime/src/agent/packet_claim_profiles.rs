@@ -1539,7 +1539,7 @@ fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
     if !tables.is_empty() {
         claims.push(format!(
             "SQL schema defines tables {}.",
-            packet_human_join(&tables.iter().take(6).cloned().collect::<Vec<_>>())
+            packet_human_join(&tables.iter().take(12).cloned().collect::<Vec<_>>())
         ));
     }
     for claim in packet_sql_foreign_key_claims(source) {
