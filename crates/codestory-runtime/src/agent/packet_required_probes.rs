@@ -3,6 +3,7 @@ use crate::agent::eval_probes::{
     push_prompt_concept_derived_symbol_probes,
 };
 use crate::agent::packet_batch::packet_file_stem_matches_query;
+use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_display_path, packet_query_stop_term,
 };
@@ -150,7 +151,8 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
             normalized_claim.contains("install")
                 && normalized_claim.contains("bootstrap")
                 && (normalized_claim.contains("source")
-                    || normalized_claim.contains("nvmsh")
+                    || normalized_claim.contains("runtime")
+                    || normalized_claim.contains("shell")
                     || normalized_claim.contains("profile"))
         }
         "shellfunctiondispatch" => {
@@ -162,8 +164,8 @@ fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &
             normalized_claim.contains("install")
                 && (normalized_claim.contains("download") || normalized_claim.contains("fetch"))
                 && (normalized_claim.contains("helper")
-                    || normalized_claim.contains("nvmdownload")
-                    || normalized_claim.contains("nvminstallnode"))
+                    || normalized_claim.contains("asset")
+                    || normalized_claim.contains("runtime"))
         }
         "conditionalversionuse" => {
             normalized_claim.contains("use")
@@ -376,6 +378,10 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
     let mut queries = Vec::new();
+    push_unique_owned_terms(
+        &mut queries,
+        &packet_flow_requirement_queries_for_terms(terms, task_class),
+    );
 
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
@@ -555,7 +561,7 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
                 "engine request handler",
                 "context next handler chain",
                 "engine creation",
-                "engine creation new router",
+                "engine creation router state",
             ],
         );
     }
@@ -663,7 +669,6 @@ fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<St
         );
     }
     if packet_terms_indicate_shell_install_dispatch_flow(terms) {
-        push_shell_install_dispatch_source_probe_queries(queries);
         push_unique_terms(
             queries,
             &[
@@ -820,8 +825,8 @@ fn packet_required_probe_file_query(query: &str) -> Option<String> {
         return None;
     }
     let normalized_query = normalize_identifier(query);
-    if normalized_query == "eventprocessor" {
-        return Some("event_processor.rs".to_string());
+    if normalized_query == "eventoutputprocessor" {
+        return Some("event_output_processor.rs".to_string());
     }
     query
         .chars()
@@ -925,7 +930,7 @@ pub(crate) fn packet_required_probe_needs_exact_match(query: &str) -> bool {
 
 fn packet_required_probe_needs_concrete_file(query: &str) -> bool {
     let normalized_query = normalize_identifier(query);
-    normalized_query.contains("execevents") || normalized_query == "eventprocessor"
+    normalized_query.contains("execevents") || normalized_query == "eventoutputprocessor"
 }
 
 fn packet_required_probe_needs_full_token_coverage(query: &str) -> bool {
@@ -1101,7 +1106,7 @@ fn packet_citation_matches_route_engine_constructor_probe(
     query: &str,
     citation: &AgentCitationDto,
 ) -> bool {
-    if normalize_identifier(query) != "enginecreationnewrouter" {
+    if normalize_identifier(query) != "enginecreationrouterstate" {
         return false;
     }
     if !matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
@@ -1573,8 +1578,9 @@ pub(crate) fn packet_file_scoped_symbol_probe_parts(
 fn packet_extensionless_source_file_name(file_name: &str) -> bool {
     matches!(
         file_name,
-        "makefile" | "dockerfile" | "rakefile" | "gemfile" | "bash_completion" | "configure"
+        "makefile" | "dockerfile" | "rakefile" | "gemfile" | "configure"
     ) || file_name.ends_with("_completion")
+        || file_name.contains("completion")
 }
 
 pub(crate) fn packet_citation_probe_token_coverage(
@@ -1950,23 +1956,6 @@ fn packet_sql_schema_prompt_table_stop_term(term: &str) -> bool {
     )
 }
 
-fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "install.sh nvm_do_install",
-            "install.sh nvm_install_node",
-            "install.sh install_nvm_as_script",
-            "install.sh nvm_download",
-            "nvm.sh nvm",
-            "nvm.sh nvm_download",
-            "nvm.sh nvm_use_if_needed",
-            "bash_completion __nvm",
-            "bash_completion __nvm_commands",
-        ],
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1996,8 +1985,18 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.3,
                 total: score,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         }
     }
 
@@ -2115,7 +2114,7 @@ mod tests {
             "context next handler chain",
             "handler chain",
             "engine creation",
-            "engine creation new router",
+            "engine creation router state",
         ] {
             assert!(
                 route_queries.iter().any(|query| query == expected),
@@ -2263,11 +2262,11 @@ mod tests {
         ));
         let engine_new = test_packet_citation("New", "src/http/server.go", 0.9);
         assert!(packet_citation_satisfies_required_probe(
-            "engine creation new router",
+            "engine creation router state",
             &engine_new
         ));
         assert_eq!(
-            packet_citation_probe_match_rank("engine creation new router", &engine_new),
+            packet_citation_probe_match_rank("engine creation router state", &engine_new),
             Some(6)
         );
         assert!(!packet_citation_satisfies_required_probe(
@@ -2475,14 +2474,20 @@ mod tests {
             PacketClaimDto {
                 claim: "app.use registers middleware on the router.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "app.handle delegates request handling to the router.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "res.send prepares and sends the response body.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
@@ -2500,15 +2505,21 @@ mod tests {
             PacketClaimDto {
                 claim: "Logger owns a stack of handlers registered by pushHandler.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "addRecord creates a log record before passing it to handlers.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "AbstractProcessingHandler handles records by processing and writing them."
                     .to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
@@ -2532,14 +2543,20 @@ mod tests {
             PacketClaimDto {
                 claim: "Top-level HTTP helpers delegate to a Client.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "BaseRequest.finalize prepares the request body for sending.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Response.fromStream builds a streamed response boundary.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
@@ -2563,20 +2580,28 @@ mod tests {
                     "The form validation examples use native required, pattern, min, and max constraints."
                         .to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "A custom validation example applies script-driven validity checks before rendering messages."
                     .to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Custom error rendering branches on ValidityState fields to choose messages."
                     .to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Submit handlers prevent submission when the form is invalid.".to_string(),
                 citations: Vec::new(),
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 

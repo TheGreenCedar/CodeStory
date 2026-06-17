@@ -7366,6 +7366,14 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("route_endpoint".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         })
     }
@@ -7643,6 +7651,14 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
             match_quality: Some(SearchMatchQualityDto::RepoText),
             resolvable: false,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),
+            evidence_producer: Some("repo_text_fallback".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         }
     }
@@ -9548,6 +9564,10 @@ impl AppController {
                     semantic: scored.semantic_score,
                     graph: scored.graph_score,
                     total: scored.total_score,
+                    tier_cap: None,
+                    boosts: Vec::new(),
+                    dampening: Vec::new(),
+                    final_rank_reason: None,
                     provenance: Vec::new(),
                 });
                 out.push(HybridSearchScoredHit {
@@ -10867,6 +10887,12 @@ mod tests {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             }
         }
@@ -12541,6 +12567,12 @@ pub fn exact_symbol_anchor() {{}}
             origin,
             match_quality: None,
             resolvable,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         }
     }
@@ -14077,6 +14109,12 @@ fn build_llm_symbol_doc_text() -> String {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
         let method = SearchHit {
@@ -14089,6 +14127,12 @@ fn build_llm_symbol_doc_text() -> String {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
 
@@ -15329,6 +15373,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15341,6 +15391,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
         ];
@@ -15357,6 +15413,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             }],
         );
@@ -15379,6 +15441,12 @@ fn build_llm_symbol_doc_text() -> String {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
         let query = "exact symbol first semantic ranking search_hybrid_with_scores";
@@ -15414,6 +15482,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15426,6 +15500,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15438,6 +15518,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
         ];
@@ -15472,6 +15558,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15484,6 +15576,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
         ];

@@ -27,6 +27,7 @@ use crate::agent::packet_claim_profiles::{
 #[cfg(test)]
 use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
 use crate::agent::packet_claims::{packet_flow_claims_markdown, packet_supported_claims};
+use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
@@ -519,14 +520,18 @@ fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
         "serialize"
             | "cachehelper"
             | "middleware"
+            | "appinitialization"
+            | "middlewareregistration"
+            | "routeregistration"
             | "handlerprocessing"
             | "handlerdispatch"
             | "requesthandler"
+            | "responsesend"
             | "routetreeaddroute"
             | "routergrouphandleroute"
             | "enginerequesthandler"
             | "contextnexthandlerchain"
-            | "enginecreationnewrouter"
+            | "enginecreationrouterstate"
             | "formvalidation"
             | "constraintvalidation"
             | "htmlconstraint"
@@ -864,6 +869,7 @@ fn maybe_append_sql_schema_file_citations(
 
     let mut appended_files = 0;
     let mut appended_anchors = 0;
+    const SYNTHETIC_SQL_SCORE_CAP: f32 = 20.0;
     for candidate in candidates.into_iter().take(12) {
         let path_string = candidate.path.to_string_lossy().to_string();
         let file_already_present = answer.citations.iter().any(|existing| {
@@ -872,7 +878,8 @@ fn maybe_append_sql_schema_file_citations(
             })
         });
         if !file_already_present {
-            let score = candidate.score + 5.0;
+            let raw_score = candidate.score + 5.0;
+            let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
             answer.citations.push(AgentCitationDto {
                 node_id: NodeId(format!("packet::sql_schema::{}", candidate.display_name)),
                 display_name: candidate.display_name.clone(),
@@ -889,8 +896,24 @@ fn maybe_append_sql_schema_file_citations(
                     semantic: 0.0,
                     graph: 0.0,
                     total: score,
+                    tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                    boosts: Vec::new(),
+                    dampening: vec![format!(
+                        "synthetic SQL source scan capped from {raw_score:.3}"
+                    )],
+                    final_rank_reason: Some("synthetic SQL source scan".to_string()),
                     provenance: vec!["packet_generic_sql_schema_file_probe".to_string()],
                 }),
+                evidence_tier: Some(
+                    codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                ),
+                evidence_producer: Some("packet_generic_sql_schema_file_probe".to_string()),
+                resolution_status: Some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                ),
+                loss_reason: None,
+                coverage_role: Some("sql schema scripts".to_string()),
+                eligible_for_sufficiency: Some(false),
             });
             appended_files += 1;
         }
@@ -907,7 +930,8 @@ fn maybe_append_sql_schema_file_citations(
             }) {
                 continue;
             }
-            let score = candidate.score + anchor.score;
+            let raw_score = candidate.score + anchor.score;
+            let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
             answer.citations.push(AgentCitationDto {
                 node_id: NodeId(format!(
                     "packet::sql_schema::{}::{}::{}",
@@ -927,8 +951,24 @@ fn maybe_append_sql_schema_file_citations(
                     semantic: 0.0,
                     graph: 0.0,
                     total: score,
+                    tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                    boosts: Vec::new(),
+                    dampening: vec![format!(
+                        "synthetic SQL source scan capped from {raw_score:.3}"
+                    )],
+                    final_rank_reason: Some("synthetic SQL source scan".to_string()),
                     provenance: vec!["packet_generic_sql_schema_anchor_probe".to_string()],
                 }),
+                evidence_tier: Some(
+                    codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                ),
+                evidence_producer: Some("packet_generic_sql_schema_anchor_probe".to_string()),
+                resolution_status: Some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                ),
+                loss_reason: None,
+                coverage_role: Some("sql schema anchor".to_string()),
+                eligible_for_sufficiency: Some(false),
             });
             appended_anchors += 1;
         }
@@ -1204,8 +1244,20 @@ fn maybe_append_required_file_scoped_source_citations(
                 semantic: 0.0,
                 graph: 0.0,
                 total: 96.0,
+                tier_cap: Some(40.0),
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: Some("required source probe".to_string()),
                 provenance: vec!["packet_required_file_scoped_source_probe".to_string()],
             }),
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),
+            evidence_producer: Some("packet_required_file_scoped_source_probe".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: Some("required source probe".to_string()),
+            eligible_for_sufficiency: Some(true),
         });
         appended += 1;
     }
@@ -1364,20 +1416,16 @@ fn packet_required_probe_source_display_name(parts: &PacketFileScopedSymbolProbe
         return display_name;
     }
     let path = parts.query_path.replace('\\', "/");
-    let path_lower = path.to_ascii_lowercase();
-    let receiver = if path_lower.ends_with("application.js") {
-        Some("app")
-    } else if path_lower.ends_with("response.js") {
-        Some("res")
-    } else if path_lower.ends_with("request.js") {
-        Some("req")
-    } else if path_lower.ends_with(".java") {
-        path.rsplit('/')
-            .next()
-            .and_then(|name| name.rsplit_once('.').map(|(stem, _)| stem))
-    } else {
-        None
-    };
+    let receiver = path.rsplit('/').next().and_then(|name| {
+        let (stem, extension) = name.rsplit_once('.')?;
+        match (stem.to_ascii_lowercase().as_str(), extension) {
+            ("application", "js") => Some("app"),
+            ("response", "js") => Some("res"),
+            ("request", "js") => Some("req"),
+            (_, "java") => Some(stem),
+            _ => None,
+        }
+    });
     receiver
         .map(|receiver| format!("{receiver}.{display_name}"))
         .unwrap_or(display_name)
@@ -2234,7 +2282,7 @@ fn to_citation(
     primary_graph: Option<&GraphResponse>,
     include_evidence: bool,
 ) -> AgentCitationDto {
-    AgentCitationDto {
+    let mut citation = AgentCitationDto {
         node_id: scored.hit.node_id.clone(),
         display_name: scored.hit.display_name.clone(),
         kind: scored.hit.kind,
@@ -2254,9 +2302,21 @@ fn to_citation(
             semantic: scored.semantic_score,
             graph: scored.graph_score,
             total: scored.total_score,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
             provenance: Vec::new(),
         }),
-    }
+        evidence_tier: scored.hit.evidence_tier,
+        evidence_producer: scored.hit.evidence_producer.clone(),
+        resolution_status: scored.hit.resolution_status,
+        loss_reason: scored.hit.loss_reason.clone(),
+        coverage_role: scored.hit.coverage_role.clone(),
+        eligible_for_sufficiency: scored.hit.eligible_for_sufficiency,
+    };
+    decorate_citation_from_hit(&mut citation, &scored.hit);
+    citation
 }
 
 fn weak_initial_hits(prompt: &str, hits: &[SearchHit]) -> bool {
@@ -2424,11 +2484,21 @@ fn search_hit_from_grounding_symbol(
         origin: SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+        evidence_producer: Some("test_grounding_symbol".to_string()),
+        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        loss_reason: None,
+        coverage_role: None,
+        eligible_for_sufficiency: Some(true),
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.35,
             semantic: 0.0,
             graph: 0.20,
             total: 0.55,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
             provenance: Vec::new(),
         }),
     }
@@ -3157,6 +3227,14 @@ mod tests {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         }
     }
@@ -3168,6 +3246,10 @@ mod tests {
             semantic: score,
             graph: 0.0,
             total: score,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
             provenance: Vec::new(),
         });
         hit
@@ -3190,8 +3272,20 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.3,
                 total: score,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
         }
     }
 
@@ -6401,7 +6495,7 @@ mod tests {
             "The exec CLI defines --json as the switch that chooses JSONL stdout output."
         ));
         assert!(text.contains(
-            "run_main loads config, resolves sandbox and approval settings, and builds the in-process app-server start arguments"
+            "Runtime session entrypoint evidence loads config, resolves sandbox and approval settings, and builds app-server start arguments"
         ));
         assert!(
             text.contains("The command or public entrypoint for this flow is `codex_exec::Cli`")
@@ -6612,12 +6706,12 @@ mod tests {
             .join("\n");
 
         for expected in [
-            "The CLI index command prepares command options and delegates indexing work into the runtime layer.",
-            "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
-            "The workspace crate is responsible for source-file discovery and refresh-plan construction.",
-            "The indexer extracts nodes, edges, occurrences, and related symbol data from source files.",
-            "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data.",
-            "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state.",
+            "Indexing entrypoint evidence delegates indexing work into the runtime orchestration layer.",
+            "Runtime orchestration evidence opens workspace/store state and coordinates refresh phases.",
+            "Workspace discovery evidence plans source-file discovery and refresh work.",
+            "Symbol extraction evidence builds graph nodes, edges, occurrences, and related source data.",
+            "Persistence evidence stores graph/file data and rebuilds query/search projections.",
+            "Snapshot refresh evidence updates read models after persisted graph changes.",
         ] {
             assert!(
                 text.contains(expected),
@@ -7318,6 +7412,8 @@ mod tests {
                 "src/runtime.rs",
                 0.9,
             )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         };
         let causal = PacketClaimDto {
             claim: "`RuntimeCoordinator` coordinates runtime state transitions and downstream service calls."
@@ -7327,6 +7423,8 @@ mod tests {
                 "src/runtime.rs",
                 0.9,
             )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         };
         let adjacent = PacketClaimDto {
             claim:
@@ -7337,6 +7435,8 @@ mod tests {
                 "src/requests/sessions.py",
                 0.9,
             )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         };
         let definition = PacketClaimDto {
             claim:
@@ -7347,6 +7447,8 @@ mod tests {
                 "src/requests/models.py",
                 0.9,
             )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         };
 
         assert!(!packet_claim_can_satisfy_sufficiency(&generic));
@@ -7366,6 +7468,8 @@ mod tests {
                     "src/index/use-swr.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "useSWRHandler serializes the key before reading cache state.".to_string(),
@@ -7374,6 +7478,8 @@ mod tests {
                     "src/_internal/utils/serialize.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim:
@@ -7384,6 +7490,8 @@ mod tests {
                     "src/_internal/utils/helper.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "internalMutate routes mutate behavior through the mutation helper."
@@ -7393,6 +7501,8 @@ mod tests {
                     "src/_internal/utils/mutate.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
@@ -7434,6 +7544,8 @@ mod tests {
                     "src/main/java/org/apache/commons/lang3/StringUtils.java",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
@@ -7443,6 +7555,8 @@ mod tests {
                     "src/main/java/org/apache/commons/lang3/StringUtils.java",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Strings delegates region matching work to CharSequenceUtils.regionMatches."
@@ -7452,6 +7566,8 @@ mod tests {
                     "src/main/java/org/apache/commons/lang3/Strings.java",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
@@ -8504,10 +8620,10 @@ mod tests {
         let express_sufficiency_extra = packet_plan_sufficiency_extra_probes(&express_plan, &[]);
 
         for generic_probe in [
-            "application.js init",
-            "application.js use",
-            "application.js handle",
-            "response.js send",
+            "app initialization",
+            "middleware registration",
+            "request handler",
+            "response send",
         ] {
             assert!(
                 express_queries.contains(&generic_probe),
@@ -9276,12 +9392,10 @@ mod tests {
         );
 
         for expected in [
-            "application.js use",
-            "application.js route",
-            "application.js handle",
-            "response.js send",
+            "middleware registration",
             "route registration",
             "request handler",
+            "response send",
         ] {
             assert!(
                 express_queries.contains(&expected),
@@ -9296,7 +9410,7 @@ mod tests {
             "engine request handler",
             "context next handler chain",
             "engine creation",
-            "engine creation new router",
+            "engine creation router state",
         ] {
             assert!(
                 !express_queries.contains(&forbidden),
@@ -9326,7 +9440,7 @@ mod tests {
             "route tree add route",
             "engine request handler",
             "context next handler chain",
-            "engine creation new router",
+            "engine creation router state",
         ] {
             assert!(
                 gin_queries.contains(&expected),
@@ -9352,15 +9466,11 @@ mod tests {
             packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::RouteTracing);
 
         for expected in [
-            "install.sh nvm_do_install",
-            "install.sh nvm_install_node",
-            "nvm.sh nvm",
-            "nvm.sh nvm_download",
-            "nvm.sh nvm_use_if_needed",
-            "bash_completion __nvm",
             "shell installer bootstrap",
+            "install download helpers",
             "shell function dispatch",
             "conditional version use",
+            "shell completion",
         ] {
             assert!(
                 queries.contains(&expected),
@@ -9726,8 +9836,7 @@ mod tests {
             }
             "#,
         );
-        let expected =
-            "NativeClient.send forwards finalized requests through an HTTP client transport.";
+        let expected = "NativeClient.send is the dart:io transport implementation that forwards finalized requests through an HTTP client.";
         assert!(
             claims.iter().any(|claim| claim == expected),
             "expected eval-only transport send claim `{expected}`; got {claims:?}"
@@ -9966,11 +10075,10 @@ mod tests {
         );
 
         for expected in [
-            "vformat is the central formatting path for runtime format arguments.",
-            "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers.",
-            "format_error represents formatting failures.",
-            "Runtime formatting failures use format_error, which represents the failure type.",
-            "format_to writes formatted output through an output iterator.",
+            "Runtime formatting routes format calls through a central runtime argument path.",
+            "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+            "Runtime formatting defines an error type for formatting failures.",
+            "Runtime formatting writes formatted output through output iterator helpers.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
@@ -10023,7 +10131,7 @@ mod tests {
         );
         assert!(
             os_claims.iter().any(|claim| claim
-                == "Runtime formatting error-boundary code formats system errors with vformat or format_to."),
+                == "Runtime formatting error-boundary code formats system errors through shared formatting helpers."),
             "expected runtime formatting OS-boundary claim in {os_claims:?}"
         );
     }
@@ -10616,7 +10724,7 @@ mod tests {
                     public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) => this.Internal().BuildExecutionPlan(new(new(sourceType, destinationType)));
                 }
                 "#,
-                "MapperConfiguration builds and owns the mapping configuration used at runtime.",
+                "Mapping configuration source builds and owns runtime mapping plans.",
             ),
             (
                 "Mapper.Map",
@@ -10633,7 +10741,7 @@ mod tests {
                     }
                 }
                 "#,
-                "Mapper.Map is the public runtime entry point for object mapping.",
+                "Mapper runtime source exposes the public object-mapping entry point.",
             ),
             (
                 "TypeMap.CreateMapperLambda",
@@ -10642,7 +10750,7 @@ mod tests {
                 internal LambdaExpression CreateMapperLambda(IGlobalConfiguration configuration) =>
                     Types.ContainsGenericParameters ? null : new TypeMapPlanBuilder(configuration, this).CreateMapperLambda();
                 "#,
-                "TypeMap contributes mapper lambda plans used by the execution pipeline.",
+                "Type-map source contributes lambda plans used by the mapping execution pipeline.",
             ),
             (
                 "TypeMapPlanBuilder",
@@ -11077,6 +11185,14 @@ mod tests {
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),
             retrieval_score_breakdown: None,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
         };
 
         assert_eq!(
@@ -11190,6 +11306,14 @@ mod tests {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         }];
 
@@ -11206,6 +11330,16 @@ mod tests {
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                     match_quality: None,
                     resolvable: true,
+                    evidence_tier: Some(
+                        codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph,
+                    ),
+                    evidence_producer: Some("test".to_string()),
+                    resolution_status: Some(
+                        codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+                    ),
+                    loss_reason: None,
+                    coverage_role: None,
+                    eligible_for_sufficiency: Some(true),
                     score_breakdown: None,
                 },
                 SearchHit {
@@ -11218,6 +11352,16 @@ mod tests {
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                     match_quality: None,
                     resolvable: true,
+                    evidence_tier: Some(
+                        codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph,
+                    ),
+                    evidence_producer: Some("test".to_string()),
+                    resolution_status: Some(
+                        codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+                    ),
+                    loss_reason: None,
+                    coverage_role: None,
+                    eligible_for_sufficiency: Some(true),
                     score_breakdown: None,
                 },
             ],

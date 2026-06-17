@@ -96,7 +96,8 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --list --task-suite language-expansion-holdout --materialize-repos
 ```
 
-Run the comparison with the fixed no-CodeStory control reused:
+Run the comparison with the fixed no-CodeStory control reused only when the
+benchmark contract accepts the baseline fingerprints:
 
 ```powershell
 node scripts/codestory-agent-ab-benchmark.mjs `
@@ -113,10 +114,10 @@ includes the human-readable A/B columns; `runs.jsonl` remains the source of
 truth for per-run metrics.
 
 Do not rerun the no-CodeStory arm for the current language-expansion harness
-context. Treat the fixed baseline as the control artifact and reuse it for
-comparison runs. Generate a new control artifact only if the task suite, pinned
-repo state, harness contract, or scorer boundary changes with explicit
-approval.
+context unless the benchmark contract changed. Treat the fixed baseline as a
+control artifact only when `--reuse-baseline-from` accepts matching fingerprints.
+Missing or incompatible fingerprints make the comparison diagnostic-only until a
+new control artifact is generated with explicit approval.
 
 For runtime packet fixes, prefer a packet-first gated loop before launching
 nested agents:
@@ -136,8 +137,8 @@ independent nested A/B repo groups, and `--prepare-codestory-jobs` caps cache
 prep across repos. If a packet probe fails from transient sidecar
 unavailability, the score wrapper reruns just those task ids serially in a
 `packet-probes-retry` artifact before deciding which rows enter the A/B phase.
-Baseline reuse is valid only when the task manifest and scorer boundary are
-unchanged.
+Baseline reuse is valid only when the task manifest, scorer, harness, model,
+CLI identity, retrieval contract, and packet threshold fingerprints match.
 
 For anti-overfit language checks, run promotion-oriented packet gates with
 production defaults. Exact benchmark probes belong in benchmark manifests,

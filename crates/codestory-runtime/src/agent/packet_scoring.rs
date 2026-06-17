@@ -925,27 +925,22 @@ fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f
 
 fn packet_shell_install_dispatch_rank_bonus(normalized_display: &str, path: &str) -> f32 {
     let mut bonus = 0.0;
-    if path.ends_with("install.sh") {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    if file_name.contains("install") && path.ends_with(".sh") {
         bonus += 8.0;
     }
-    if path.ends_with("nvm.sh") {
+    if path.ends_with(".sh") && (file_name.contains("command") || file_name.contains("runtime")) {
         bonus += 8.0;
     }
-    if path.ends_with("bash_completion") {
+    if file_name.contains("completion") {
         bonus += 7.0;
     }
-    if normalized_display.contains("nvm_do_install")
-        || normalized_display.contains("nvmdoinstall")
-        || normalized_display.contains("nvm_install_node")
-        || normalized_display.contains("nvminstallnode")
-        || normalized_display.contains("installnvmasscript")
-        || normalized_display.contains("nvm_download")
-        || normalized_display.contains("nvmdownload")
-        || normalized_display == "nvm"
-        || normalized_display.contains("nvm_use_if_needed")
-        || normalized_display.contains("nvmuseifneeded")
-        || normalized_display.contains("__nvm")
-        || normalized_display.contains("nvmcommands")
+    if normalized_display.contains("install")
+        || normalized_display.contains("download")
+        || normalized_display.contains("dispatch")
+        || normalized_display.contains("completion")
+        || normalized_display.contains("ifneeded")
+        || normalized_display.contains("useif")
     {
         bonus += 7.0;
     }

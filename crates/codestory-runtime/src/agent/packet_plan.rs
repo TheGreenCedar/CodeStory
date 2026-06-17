@@ -6,6 +6,7 @@ use crate::agent::eval_probes::{
 use crate::agent::packet_command_profiles::{
     packet_command_exact_probe_queries, packet_command_role_probe_queries,
 };
+use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
 use crate::agent::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
     packet_sufficiency_required_probe_queries_from_terms,
@@ -215,6 +216,10 @@ pub(crate) fn packet_symbol_probe_queries(
         &mut queries,
         &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
     );
+    push_unique_owned_terms(
+        &mut queries,
+        &packet_flow_requirement_queries_for_terms(&terms, task_class),
+    );
     if eval_probes_enabled() {
         push_prompt_named_file_probe_queries(&terms, &mut queries);
     }
@@ -405,7 +410,7 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
                 "engine request handler",
                 "context next handler chain",
                 "engine creation",
-                "engine creation new router",
+                "engine creation router state",
             ],
         );
     }
@@ -590,7 +595,7 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
                 "engine request handler",
                 "context next handler chain",
                 "engine creation",
-                "engine creation new router",
+                "engine creation router state",
             ],
         );
     }
@@ -778,11 +783,11 @@ fn push_javascript_route_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "application.js init",
-            "application.js use",
-            "application.js route",
-            "application.js handle",
-            "response.js send",
+            "app initialization",
+            "middleware registration",
+            "route registration",
+            "request handler",
+            "response send",
         ],
     );
 }
@@ -891,15 +896,11 @@ fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
     push_unique_terms(
         queries,
         &[
-            "install.sh nvm_do_install",
-            "install.sh nvm_install_node",
-            "install.sh install_nvm_as_script",
-            "install.sh nvm_download",
-            "nvm.sh nvm",
-            "nvm.sh nvm_download",
-            "nvm.sh nvm_use_if_needed",
-            "bash_completion __nvm",
-            "bash_completion __nvm_commands",
+            "shell installer bootstrap",
+            "install download helpers",
+            "shell function dispatch",
+            "conditional version use",
+            "shell completion",
         ],
     );
 }

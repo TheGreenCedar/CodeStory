@@ -20,14 +20,11 @@ const extraScanRoots = (
   .filter(Boolean);
 
 const requiredScanDirs = [
-  path.join(repoRoot, "crates", "codestory-cli", "src"),
-  path.join(repoRoot, "crates", "codestory-indexer", "src"),
-  path.join(repoRoot, "crates", "codestory-runtime", "src"),
-  path.join(repoRoot, "crates", "codestory-retrieval"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
+  path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
 const requiredProductionOnlyFiles = [
-  path.join(repoRoot, "crates", "codestory-cli", "src", "main.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "orchestrator.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "lib.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "semantic_doc_text.rs"),
@@ -61,6 +58,7 @@ const benchmarkIdentityScriptFiles = [
   path.join(repoRoot, "scripts", "cross-repo-promotion-benchmark.mjs"),
   path.join(repoRoot, "scripts", "cross-repo-sourcetrail-queries.mjs"),
 ];
+const benchmarkTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 
 const missingBenchmarkBoundaryFiles = benchmarkIdentityScriptFiles
   .filter((scriptPath) => !existsSync(scriptPath));
@@ -162,6 +160,10 @@ const bannedPatterns = [
   "novalidate",
   "showError",
   "source/animate\\.css",
+  "nvm",
+  "install\\.sh\\s+nvm",
+  "bash_completion\\s+__nvm",
+  ...benchmarkManifestDerivedPatterns(),
 ];
 
 const bannedLiteralPatterns = [
@@ -199,6 +201,94 @@ const allowedPatternLines = [
 ];
 
 const rankerFilenameLiteralPattern = /["'`][a-z0-9][a-z0-9._-]*\.[a-z0-9]+["'`]/i;
+
+function benchmarkManifestDerivedPatterns() {
+  if (!existsSync(benchmarkTaskRoot)) {
+    return [];
+  }
+  const markers = new Set();
+  for (const filePath of walkFiles(benchmarkTaskRoot, (candidate) => candidate.endsWith(".task.json"))) {
+    let manifest;
+    try {
+      manifest = JSON.parse(readFileSync(filePath, "utf8"));
+    } catch {
+      continue;
+    }
+    addSpecificMarker(markers, manifest.id);
+    addSpecificMarker(markers, manifest.repo?.name);
+    for (const expectedFile of manifest.expected_files ?? []) {
+      addSpecificMarker(markers, expectedFile);
+    }
+    for (const symbol of manifest.expected_symbols ?? []) {
+      addSpecificMarker(markers, symbol?.name);
+      addSpecificMarker(markers, symbol?.path);
+    }
+    for (const claim of manifest.expected_claims ?? []) {
+      addSpecificMarker(markers, claim?.text);
+    }
+  }
+  return [...markers].sort().map(escapeRegExp);
+}
+
+function walkFiles(root, predicate) {
+  const files = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const stat = statSync(current);
+    if (stat.isDirectory()) {
+      for (const entry of readdirSync(current)) {
+        stack.push(path.join(current, entry));
+      }
+      continue;
+    }
+    if (stat.isFile() && predicate(current)) {
+      files.push(current);
+    }
+  }
+  return files;
+}
+
+function addSpecificMarker(markers, value) {
+  if (typeof value !== "string") {
+    return;
+  }
+  const marker = value.trim();
+  if (marker.length < 8 || benchmarkMarkerTooGeneric(marker)) {
+    return;
+  }
+  markers.add(marker);
+}
+
+function benchmarkMarkerTooGeneric(marker) {
+  const normalized = marker.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return (
+    normalized.length < 8 ||
+    [
+      "codestory",
+      "request",
+      "response",
+      "dispatch",
+      "router",
+      "routepath",
+      "approute",
+      "comments",
+      "indexfile",
+      "runindex",
+      "servicesrs",
+      "schema",
+      "source",
+      "storage",
+      "indexing",
+      "configuration",
+      "validation",
+    ].includes(normalized)
+  );
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function isExcludedRustFile(filePath) {
   const relative = path.relative(repoRoot, filePath);

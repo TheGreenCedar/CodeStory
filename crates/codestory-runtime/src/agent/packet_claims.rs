@@ -2,10 +2,7 @@ use crate::agent::eval_probes::{
     eval_citation_shaped_claim, eval_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
 };
-use crate::agent::packet_citations::{
-    packet_citation_matching_display, packet_citation_matching_display_contains,
-    packet_citation_source_text,
-};
+use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_claim_profiles::{
     packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation,
 };
@@ -126,14 +123,10 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         return;
     }
 
-    let cli_entry = packet_citation_matching_display(citations, "run_index")
-        .or_else(|| packet_citation_matching_display(citations, "Command::Index"))
-        .or_else(|| packet_citation_matching_display(citations, "IndexCommand"))
-        .or_else(|| packet_citation_matching_display(citations, "CliDirection"));
+    let cli_entry = packet_citation_matching_role(citations, PacketEvidenceRole::CommandEntrypoint);
     let runtime_entry =
-        packet_citation_matching_display_contains(citations, "IndexService::run_indexing")
-            .or_else(|| packet_citation_matching_display(citations, "Runtime::index_service"));
-    if let Some(runtime_entry) = runtime_entry {
+        packet_citation_matching_role(citations, PacketEvidenceRole::RuntimeOrchestration);
+    if let Some(runtime_entry) = &runtime_entry {
         let mut claim_citations = Vec::new();
         if let Some(cli_entry) = cli_entry {
             claim_citations.push(cli_entry.clone());
@@ -142,37 +135,38 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The CLI index command prepares command options and delegates indexing work into the runtime layer.",
+            "Indexing entrypoint evidence delegates indexing work into the runtime orchestration layer.",
             claim_citations,
         );
     }
 
     let workspace_plan =
-        packet_citation_matching_display(citations, "WorkspaceManifest::build_execution_plan");
-    if let Some(runtime_entry) = runtime_entry {
+        packet_citation_matching_role(citations, PacketEvidenceRole::WorkspaceDiscoveryAndPlanning);
+    if let Some(runtime_entry) = &runtime_entry {
         let mut claim_citations = vec![runtime_entry.clone()];
-        if let Some(workspace_plan) = workspace_plan {
+        if let Some(workspace_plan) = &workspace_plan {
             claim_citations.push(workspace_plan.clone());
         }
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
+            "Runtime orchestration evidence opens workspace/store state and coordinates refresh phases.",
             claim_citations,
         );
     }
 
-    if let Some(workspace_plan) = workspace_plan {
+    if let Some(workspace_plan) = &workspace_plan {
         packet_push_flow_template_claim(
             claims,
             seen,
-            "The workspace crate is responsible for source-file discovery and refresh-plan construction.",
+            "Workspace discovery evidence plans source-file discovery and refresh work.",
             Some(workspace_plan.clone()),
         );
     }
 
-    let workspace_indexer = packet_citation_matching_display(citations, "WorkspaceIndexer::run");
-    let index_file = packet_citation_matching_display(citations, "index_file");
+    let workspace_indexer =
+        packet_citation_matching_role(citations, PacketEvidenceRole::IndexingWorkQueue);
+    let index_file = packet_citation_matching_role(citations, PacketEvidenceRole::SymbolExtraction);
     if workspace_indexer.is_some() || index_file.is_some() {
         let mut claim_citations = Vec::new();
         if let Some(workspace_indexer) = workspace_indexer {
@@ -184,17 +178,16 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The indexer extracts nodes, edges, occurrences, and related symbol data from source files.",
+            "Symbol extraction evidence builds graph nodes, edges, occurrences, and related source data.",
             claim_citations,
         );
     }
 
-    let storage_flush =
-        packet_citation_matching_display(citations, "Storage::flush_projection_batch");
-    let search_projection = packet_citation_matching_display(
+    let storage_flush = packet_citation_matching_role(
         citations,
-        "Storage::rebuild_search_symbol_projection_from_node_table",
+        PacketEvidenceRole::PersistenceAndSearchProjection,
     );
+    let search_projection = storage_flush.clone();
     if storage_flush.is_some() || search_projection.is_some() {
         let mut claim_citations = Vec::new();
         if let Some(storage_flush) = storage_flush {
@@ -206,21 +199,31 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data.",
+            "Persistence evidence stores graph/file data and rebuilds query/search projections.",
             claim_citations,
         );
     }
 
     if let Some(snapshot_refresh) =
-        packet_citation_matching_display(citations, "SnapshotStore::refresh_all_with_stats")
+        packet_citation_matching_role(citations, PacketEvidenceRole::SnapshotRefresh)
     {
         packet_push_flow_template_claim(
             claims,
             seen,
-            "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state.",
+            "Snapshot refresh evidence updates read models after persisted graph changes.",
             Some(snapshot_refresh.clone()),
         );
     }
+}
+
+fn packet_citation_matching_role(
+    citations: &[AgentCitationDto],
+    role: PacketEvidenceRole,
+) -> Option<AgentCitationDto> {
+    citations
+        .iter()
+        .find(|citation| packet_evidence_role(citation) == Some(role))
+        .cloned()
 }
 
 fn packet_append_source_derived_flow_claims(
@@ -433,6 +436,8 @@ fn packet_push_flow_template_claim_with_citations(
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
         citations,
+        coverage_role: Some("flow template".to_string()),
+        eligible_for_sufficiency: Some(true),
     });
 }
 
@@ -461,6 +466,8 @@ pub(crate) fn append_ranked_citation_claims(
                 claims.push(PacketClaimDto {
                     claim: shaped,
                     citations: vec![citation.clone()],
+                    coverage_role: citation.coverage_role.clone(),
+                    eligible_for_sufficiency: Some(false),
                 });
             }
             continue;
@@ -488,6 +495,8 @@ pub(crate) fn append_ranked_citation_claims(
         claims.push(PacketClaimDto {
             claim: packet_claim_for_role(role, citation, prompt, rank_terms),
             citations: vec![citation.clone()],
+            coverage_role: Some(role.as_str().to_string()),
+            eligible_for_sufficiency: Some(true),
         });
         if claims.len() >= 18 {
             break;
@@ -730,6 +739,8 @@ fn packet_push_claim(
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
         citations: citation.map(|value| vec![value]).unwrap_or_default(),
+        coverage_role: Some("source definition".to_string()),
+        eligible_for_sufficiency: Some(false),
     });
 }
 

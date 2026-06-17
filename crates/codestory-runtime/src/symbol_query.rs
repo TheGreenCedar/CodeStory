@@ -1321,6 +1321,12 @@ mod tests {
             origin: SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         }
     }

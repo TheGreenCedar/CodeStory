@@ -54,7 +54,7 @@ impl PacketEvidenceRole {
             Self::NetworkCommandInput => "network command input",
             Self::CommandDispatch => "command dispatch",
             Self::ArgumentPlanning => "argument planning",
-            Self::SearchExecutionUnit => "search worker",
+            Self::SearchExecutionUnit => "search execution unit",
             Self::CandidateFileConstruction => "candidate file construction",
             Self::SearchDriver => "search driver",
             Self::CommandEntrypoint => "command entrypoint",
@@ -105,7 +105,9 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
     {
         Some(PacketEvidenceRole::SourceGroupConfiguration)
     } else if normalized_display.contains("buildindex")
-        || normalized_display.contains("taskfillindexercommandsqueue")
+        || (normalized_display.contains("task")
+            && normalized_display.contains("indexer")
+            && normalized_display.contains("queue"))
         || normalized_display.contains("indexercommand")
         || normalized_display.contains("javaindexer")
         || path.contains("/data/indexer/")
@@ -181,7 +183,7 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         Some(PacketEvidenceRole::SearchDriver)
     } else if display_is_command_entrypoint(&citation.display_name, &normalized_display, &path) {
         Some(PacketEvidenceRole::CommandEntrypoint)
-    } else if display.contains("eventprocessor")
+    } else if (display.contains("event") && display.contains("processor"))
         || display.contains("event_processor")
         || display.contains("jsonl")
         || path.contains("event_processor")
@@ -379,8 +381,18 @@ mod tests {
                 semantic: 0.0,
                 graph: 0.0,
                 total: 1.0,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         }
     }
 

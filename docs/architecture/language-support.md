@@ -57,11 +57,12 @@ Safe wording: on the current fixed-baseline development comparison, CodeStory is
 quality-equal or better on every measured language task and materially cheaper
 overall. Do not describe this as product-grade proof for every supported
 language or framework until repeat, freshness, breadth, and promotion metadata
-are recorded. Future language-expansion loops should reuse the fixed
-no-CodeStory control or compare to it offline. Do not rerun the control for
-freshness or promotion loops; generate a new control artifact only when the task
-suite, pinned repo state, harness contract, or scorer boundary changes with
-explicit approval.
+are recorded. Future language-expansion loops may reuse the fixed no-CodeStory
+control only when the benchmark contract accepts the reused rows as
+fingerprint-compatible. Missing or incompatible fingerprints are diagnostic-only;
+generate a new control artifact when the task suite, pinned repo state, harness
+contract, scorer boundary, model, CLI identity, or retrieval contract changes
+with explicit approval.
 
 ## Resolution Claims
 
@@ -154,9 +155,9 @@ Before adding a parser-backed language or widening a public claim:
    ```
 
 7. For agent-facing evidence, run at least the targeted language task from the
-   A/B suite. Reuse the fixed no-CodeStory control for current
-   language-expansion comparisons; a new control artifact is only for changed
-   task, repo-pin, harness, or scorer boundaries with explicit approval:
+   A/B suite. Reuse the fixed no-CodeStory control only when
+   `--reuse-baseline-from` accepts the baseline fingerprints; otherwise treat the
+   reused comparison as diagnostic or create a new approved control artifact:
 
    ```sh
    node scripts/codestory-agent-ab-benchmark.mjs \

@@ -105,6 +105,28 @@ pub enum SearchMatchQualityDto {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum PacketEvidenceTierDto {
+    ExactSource,
+    ResolvedGraph,
+    LexicalSource,
+    SymbolDoc,
+    ComponentReport,
+    DenseSemantic,
+    SyntheticSourceScan,
+    GeneratedSummary,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketEvidenceResolutionDto {
+    Resolved,
+    SourceRangeOnly,
+    Unresolved,
+    DiagnosticOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RetrievalModeDto {
     Hybrid,
     Symbolic,
@@ -304,6 +326,18 @@ pub struct SearchHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_quality: Option<SearchMatchQualityDto>,
     pub resolvable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_for_sufficiency: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score_breakdown: Option<RetrievalScoreBreakdownDto>,
 }
@@ -1376,6 +1410,14 @@ pub struct RetrievalScoreBreakdownDto {
     pub semantic: f32,
     pub graph: f32,
     pub total: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_cap: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dampening: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_rank_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provenance: Vec<String>,
 }
@@ -1398,6 +1440,18 @@ pub struct AgentCitationDto {
     pub evidence_edge_ids: Vec<EdgeId>,
     #[serde(default)]
     pub retrieval_score_breakdown: Option<RetrievalScoreBreakdownDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_tier: Option<PacketEvidenceTierDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<PacketEvidenceResolutionDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_for_sufficiency: Option<bool>,
 }
 
 const fn default_search_hit_origin() -> SearchHitOrigin {
@@ -1811,6 +1865,24 @@ pub struct PacketClaimDto {
     pub claim: String,
     #[serde(default)]
     pub citations: Vec<AgentCitationDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_for_sufficiency: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+pub struct PacketCoverageReportDto {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covered: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ineligible: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_omitted: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1828,6 +1900,8 @@ pub struct PacketSufficiencyDto {
     pub gaps: Vec<String>,
     #[serde(default)]
     pub follow_up_commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_report: Option<PacketCoverageReportDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

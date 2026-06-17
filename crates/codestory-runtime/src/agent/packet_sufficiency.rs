@@ -1,4 +1,5 @@
 use crate::agent::packet_claims::packet_supported_claims;
+use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use crate::agent::packet_plan::packet_symbol_probe_queries;
 use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
@@ -16,8 +17,8 @@ use crate::agent::packet_terms::{
 };
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto, GraphArtifactDto,
-    PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketSufficiencyDto,
-    PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -158,6 +159,14 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         &missing_required_probe_queries,
         targeted_follow_up_queries,
     );
+    let coverage_report = packet_coverage_report(
+        &sufficiency_claims,
+        &missing_required_flow_roles,
+        &missing_required_probe_queries,
+        &unresolved_sidecar_queries,
+        budget,
+        has_sufficiency_blocking_budget_omission,
+    );
     let open_next = follow_up_commands.clone();
     let avoid_opening_paths = answer
         .citations
@@ -186,6 +195,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         avoid_opening_paths,
         gaps,
         follow_up_commands,
+        coverage_report: Some(coverage_report),
     }
 }
 
@@ -499,13 +509,15 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
             return Some("css template defaults");
         }
         if normalized_claim.contains("appconstrains")
+            || normalized_claim.contains("appcontainer")
             || (normalized_claim.contains("mountedapplication")
                 && normalized_claim.contains("padding"))
+            || (normalized_claim.contains("mountedcontent") && normalized_claim.contains("padding"))
         {
             return Some("css app layout");
         }
-        if normalized_claim.contains("logo")
-            && normalized_claim.contains("button")
+        if (normalized_claim.contains("logo") && normalized_claim.contains("button")
+            || normalized_claim.contains("interactionselectors"))
             && contains_any(&normalized_claim, &["hover", "focus", "transition"])
         {
             return Some("css interaction styles");
@@ -533,8 +545,10 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         {
             return Some("server view dispatch");
         }
-        if normalized_claim.contains("routedecorator")
-            && normalized_claim.contains("registersviewfunctions")
+        if (normalized_claim.contains("routedecorator")
+            && normalized_claim.contains("registersviewfunctions"))
+            || (normalized_claim.contains("routeregistrationdecorator")
+                && normalized_claim.contains("urlrules"))
         {
             return Some("server route registration");
         }
@@ -557,14 +571,19 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         {
             return Some("sql dialect scripts");
         }
-        if normalized_claim.contains("typeerased")
+        if (normalized_claim.contains("typeerased")
             && (normalized_claim.contains("formatargs")
                 || normalized_claim.contains("formatarguments")
-                || normalized_claim.contains("formattingarguments"))
+                || normalized_claim.contains("formattingarguments")
+                || normalized_claim.contains("arguments")))
+            || (normalized_claim.contains("runtimeformatting")
+                && normalized_claim.contains("centralruntimeargumentpath"))
         {
             return Some("runtime format arguments");
         }
-        if normalized_claim.contains("formatto")
+        if (normalized_claim.contains("formatto")
+            || normalized_claim.contains("outputiterator")
+            || normalized_claim.contains("formattedoutputhelpers"))
             && (normalized_claim.contains("outputiterator")
                 || normalized_claim.contains("formattedoutput")
                 || normalized_claim.contains("output"))
@@ -651,6 +670,15 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
 }
 
 pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
+    if claim.eligible_for_sufficiency == Some(false) {
+        return false;
+    }
+    if !claim.citations.is_empty() && !claim.citations.iter().any(citation_sufficiency_eligible) {
+        return false;
+    }
+    if claim.eligible_for_sufficiency == Some(true) {
+        return true;
+    }
     let lower = claim.claim.to_ascii_lowercase();
     !(lower.contains("anchored by")
         || lower.contains("inspect it")
@@ -661,6 +689,44 @@ pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bo
             && lower.contains("adjacent ownership"))
         || (lower.contains(" is defined in cited source ")
             && lower.contains("exact source anchor")))
+}
+
+fn packet_coverage_report(
+    sufficiency_claims: &[PacketClaimDto],
+    missing_required_flow_roles: &[&'static str],
+    missing_required_probe_queries: &[String],
+    unresolved_sidecar_queries: &[String],
+    budget: &PacketBudgetDto,
+    has_sufficiency_blocking_budget_omission: bool,
+) -> PacketCoverageReportDto {
+    let covered = sufficiency_claims
+        .iter()
+        .filter_map(|claim| {
+            claim
+                .coverage_role
+                .clone()
+                .or_else(|| packet_claim_family(claim).map(str::to_string))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let missing = missing_required_flow_roles
+        .iter()
+        .map(|role| (*role).to_string())
+        .chain(missing_required_probe_queries.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let budget_omitted = has_sufficiency_blocking_budget_omission
+        .then(|| budget.omitted_sections.clone())
+        .unwrap_or_default();
+    PacketCoverageReportDto {
+        covered,
+        missing,
+        ineligible: Vec::new(),
+        unresolved: unresolved_sidecar_queries.to_vec(),
+        budget_omitted,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -965,15 +1031,20 @@ fn packet_flow_roles_for_claim(
     }
 
     if mapper_flow {
-        if normalized.contains("mappermap") && normalized.contains("entrypoint") {
+        if (normalized.contains("mapper") || normalized.contains("objectmapping"))
+            && normalized.contains("entrypoint")
+        {
             roles.insert(PacketFlowRole::EntryPoint);
         }
-        if normalized.contains("mapperconfiguration")
-            && (normalized.contains("configuration") || normalized.contains("runtime"))
+        if normalized.contains("mappingconfiguration")
+            && (normalized.contains("configuration")
+                || normalized.contains("runtime")
+                || normalized.contains("plans"))
         {
             roles.insert(PacketFlowRole::BoundaryOrState);
         }
         if (normalized.contains("typemap") && normalized.contains("plan"))
+            || normalized.contains("typemapsource")
             || normalized.contains("mappingplanbuilder")
             || normalized.contains("planbuilder")
             || normalized.contains("executionpipeline")
@@ -993,8 +1064,9 @@ fn packet_flow_roles_for_claim(
         }
         if normalized.contains("dispatcher")
             || normalized.contains("dispatch")
-            || normalized.contains("nvminstallnode")
-            || normalized.contains("nvmdownload")
+            || normalized.contains("installhelper")
+            || normalized.contains("downloadhelper")
+            || normalized.contains("downloadassets")
         {
             roles.insert(PacketFlowRole::Handoff);
         }
@@ -1101,7 +1173,10 @@ fn packet_flow_roles_for_claim(
         {
             roles.insert(PacketFlowRole::Handoff);
         }
-        if normalized.contains("routedecorator") && normalized.contains("registersviewfunctions") {
+        if (normalized.contains("routedecorator") && normalized.contains("registersviewfunctions"))
+            || (normalized.contains("routeregistrationdecorator")
+                && normalized.contains("urlrules"))
+        {
             roles.insert(PacketFlowRole::EntryPoint);
             roles.insert(PacketFlowRole::BoundaryOrState);
         }
@@ -1184,15 +1259,20 @@ fn packet_flow_roles_for_claim(
     }
 
     if runtime_formatting_flow {
-        if normalized.contains("typeerased")
+        if (normalized.contains("typeerased")
             && (normalized.contains("formatargs")
                 || normalized.contains("formatarguments")
-                || normalized.contains("formattingarguments"))
+                || normalized.contains("formattingarguments")
+                || normalized.contains("arguments")))
+            || (normalized.contains("runtimeformatting")
+                && normalized.contains("centralruntimeargumentpath"))
         {
             roles.insert(PacketFlowRole::EntryPoint);
             roles.insert(PacketFlowRole::Handoff);
         }
-        if normalized.contains("formatto")
+        if (normalized.contains("formatto")
+            || normalized.contains("outputiterator")
+            || normalized.contains("formattedoutputhelpers"))
             && (normalized.contains("outputiterator")
                 || normalized.contains("formattedoutput")
                 || normalized.contains("output"))
@@ -1409,6 +1489,8 @@ mod tests {
         PacketClaimDto {
             claim: text.to_string(),
             citations: Vec::new(),
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         }
     }
 
@@ -1453,7 +1535,7 @@ mod tests {
             ),
             claim("dispatch_request invokes the view function selected by URL matching."),
             claim(
-                "The route decorator registers view functions through the scaffold URL rule path rather than performing request dispatch itself.",
+                "Route registration decorator adds URL rules without performing request dispatch itself.",
             ),
         ];
 
@@ -1478,10 +1560,10 @@ mod tests {
             claim(
                 "main.css owns :root typography, color-scheme, smoothing, and body layout defaults.",
             ),
-            claim("#app constrains the mounted application content and centers it with padding."),
-            claim("Logo and button selectors define hover, focus, and transition behavior in CSS."),
+            claim("CSS app container rules constrain mounted content and center it with padding."),
+            claim("CSS interaction selectors define hover, focus, and transition behavior."),
             claim(
-                "The @media (prefers-color-scheme: light) media query overrides root, link-hover, and button colors.",
+                "Light color-scheme media query rules override root, link-hover, and button colors.",
             ),
         ];
 
@@ -1500,9 +1582,11 @@ mod tests {
     #[test]
     fn data_flow_mapper_plan_prompts_use_mapping_flow_roles() {
         let claims = vec![
-            claim("Mapper.Map is the public runtime entry point for object mapping."),
-            claim("MapperConfiguration builds and owns mapping configuration used at runtime."),
-            claim("TypeMap contributes mapper lambda plans used by the execution pipeline."),
+            claim("Mapper runtime source exposes the public object-mapping entry point."),
+            claim("Mapping configuration source builds and owns runtime mapping plans."),
+            claim(
+                "Type-map source contributes lambda plans used by the mapping execution pipeline.",
+            ),
             claim(
                 "The mapping plan builder participates in building expression plans for mappings.",
             ),
@@ -1542,12 +1626,10 @@ mod tests {
     fn architecture_runtime_formatting_prompts_use_argument_output_error_roles() {
         let claims = vec![
             claim(
-                "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers.",
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
             ),
-            claim("format_to writes formatted output through an output iterator."),
-            claim(
-                "Runtime formatting failures use format_error, which represents the failure type.",
-            ),
+            claim("Runtime formatting writes formatted output through output iterator helpers."),
+            claim("Runtime formatting defines an error type for formatting failures."),
         ];
 
         let missing = packet_missing_required_flow_roles(

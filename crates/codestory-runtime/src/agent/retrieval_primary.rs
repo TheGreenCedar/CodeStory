@@ -1,13 +1,14 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::agent::retrieval_rollback::{RollbackCheckInput, check_and_log_rollback_warnings};
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::{
-    ApiError, NodeId, PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
+    ApiError, PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
     RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
+    RetrievalStageTimingDto, SearchHit,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
@@ -1287,23 +1288,7 @@ fn resolve_sidecar_candidates_with_stats(
         let Some(node_id) =
             resolve_candidate_node_id(&storage, &node_names, &project_root, &rel_path, candidate)
         else {
-            if let Some(hit) =
-                unresolved_source_candidate_search_hit(&project_root, &rel_path, candidate)
-            {
-                let dedupe_key = format!(
-                    "unresolved:{}:{}:{}",
-                    rel_path,
-                    hit.display_name,
-                    hit.line.unwrap_or_default()
-                );
-                if seen.contains_key(&dedupe_key) {
-                    continue;
-                }
-                seen.insert(dedupe_key, ());
-                hits.push(hit);
-            } else {
-                unresolved_candidate_count += 1;
-            }
+            unresolved_candidate_count += 1;
             continue;
         };
         let dedupe_key = node_id.0.to_string();
@@ -1318,6 +1303,7 @@ fn resolve_sidecar_candidates_with_stats(
             continue;
         };
         hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
+        decorate_search_hit_evidence(&mut hit);
         hits.push(hit);
     }
 
@@ -1326,92 +1312,6 @@ fn resolve_sidecar_candidates_with_stats(
         attempted_candidate_count,
         unresolved_candidate_count,
     })
-}
-
-fn unresolved_source_candidate_search_hit(
-    project_root: &Path,
-    rel_path: &str,
-    candidate: &CandidateHit,
-) -> Option<SearchHit> {
-    let symbol = candidate.symbol_name.as_deref()?.trim();
-    let line = candidate.start_line?;
-    if !unresolved_source_candidate_allowed(project_root, rel_path, symbol, candidate) {
-        return None;
-    }
-    let display_name = unresolved_source_candidate_display_name(rel_path, symbol);
-    Some(SearchHit {
-        node_id: NodeId(format!(
-            "unresolved-sidecar:{rel_path}:{line}:{}",
-            display_name.replace([' ', '\t'], "_")
-        )),
-        display_name,
-        kind: NodeKind::FUNCTION.into(),
-        file_path: Some(rel_path.to_string()),
-        line: Some(line),
-        score: candidate.score,
-        origin: SearchHitOrigin::IndexedSymbol,
-        match_quality: Some(SearchMatchQualityDto::Fuzzy),
-        resolvable: false,
-        score_breakdown: Some(score_breakdown_for_candidate(candidate)),
-    })
-}
-
-fn unresolved_source_candidate_allowed(
-    project_root: &Path,
-    rel_path: &str,
-    symbol: &str,
-    candidate: &CandidateHit,
-) -> bool {
-    if !candidate_path_resolvable(project_root, &candidate.file_path)
-        || !matches!(
-            candidate.source,
-            CandidateSource::Scip | CandidateSource::Zoekt
-        )
-    {
-        return false;
-    }
-    let normalized_path = rel_path.replace('\\', "/").to_ascii_lowercase();
-    if normalized_path.contains("/test/")
-        || normalized_path.starts_with("test/")
-        || normalized_path.contains("/tests/")
-        || normalized_path.starts_with("tests/")
-        || normalized_path.contains("/example")
-        || normalized_path.starts_with("examples/")
-    {
-        return false;
-    }
-    unresolved_source_symbol_allowed(symbol)
-}
-
-fn unresolved_source_symbol_allowed(symbol: &str) -> bool {
-    let trimmed = symbol.trim();
-    if trimmed.len() < 2
-        || trimmed.starts_with('"')
-        || trimmed.starts_with('\'')
-        || trimmed.starts_with('.')
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains(':')
-    {
-        return false;
-    }
-    trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
-}
-
-fn unresolved_source_candidate_display_name(rel_path: &str, symbol: &str) -> String {
-    let normalized_path = rel_path.replace('\\', "/").to_ascii_lowercase();
-    if normalized_path.ends_with("/application.js") || normalized_path == "application.js" {
-        return format!("app.{symbol}");
-    }
-    if normalized_path.ends_with("/response.js") || normalized_path == "response.js" {
-        return format!("res.{symbol}");
-    }
-    if normalized_path.ends_with("/request.js") || normalized_path == "request.js" {
-        return format!("req.{symbol}");
-    }
-    symbol.to_string()
 }
 
 fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
@@ -1427,6 +1327,10 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         semantic,
         graph,
         total: candidate.score,
+        tier_cap: None,
+        boosts: Vec::new(),
+        dampening: Vec::new(),
+        final_rank_reason: None,
         provenance,
     }
 }
@@ -1572,57 +1476,38 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_source_candidate_search_hit_packages_primary_js_assignments() {
-        let root = std::env::temp_dir().join(format!(
-            "codestory-unresolved-source-hit-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("lib")).expect("create lib");
-        std::fs::create_dir_all(root.join("test")).expect("create test");
-        std::fs::write(
-            root.join("lib").join("application.js"),
-            "app.use = function use() {}",
-        )
-        .expect("write application");
-        std::fs::write(root.join("test").join("app.use.js"), "app.use(fn)").expect("write test");
+    fn unresolved_sidecar_candidates_are_diagnostic_only() {
+        let result = QueryResult {
+            query: "application use".into(),
+            features: classify_query("application use"),
+            hits: vec![CandidateHit::with_source(
+                "lib/application.js",
+                Some("use".to_string()),
+                0.7,
+                CandidateSource::Scip,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 100,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let resolution = SidecarCandidateResolutionOutcome {
+            resolved_hits: Vec::new(),
+            attempted_candidate_count: 1,
+            unresolved_candidate_count: 1,
+        };
 
-        let mut candidate = CandidateHit::with_source(
-            root.join("lib")
-                .join("application.js")
-                .to_string_lossy()
-                .to_string(),
-            Some("use".to_string()),
-            0.7,
-            CandidateSource::Scip,
-        );
-        candidate.start_line = Some(222);
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution);
 
-        let hit = unresolved_source_candidate_search_hit(&root, "lib/application.js", &candidate)
-            .expect("primary unresolved candidate should become a source hit");
-        assert_eq!(hit.display_name, "app.use");
-        assert_eq!(hit.file_path.as_deref(), Some("lib/application.js"));
-        assert_eq!(hit.line, Some(222));
-        assert_eq!(hit.origin, SearchHitOrigin::IndexedSymbol);
-        assert!(!hit.resolvable);
-
-        let mut test_candidate = CandidateHit::with_source(
-            root.join("test")
-                .join("app.use.js")
-                .to_string_lossy()
-                .to_string(),
-            Some("use".to_string()),
-            0.7,
-            CandidateSource::Scip,
-        );
-        test_candidate.start_line = Some(1);
-        assert!(
-            unresolved_source_candidate_search_hit(&root, "test/app.use.js", &test_candidate)
-                .is_none(),
-            "test-path unresolved candidates should not become packet source evidence"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(diagnostic.candidate_count, 1);
+        assert_eq!(diagnostic.resolved_hit_count, 0);
+        assert_eq!(diagnostic.unresolved_candidate_count, 1);
+        assert!(diagnostic.diagnostic.is_some());
     }
 
     #[test]

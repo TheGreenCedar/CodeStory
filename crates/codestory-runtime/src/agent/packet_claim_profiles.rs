@@ -1196,7 +1196,7 @@ pub(crate) fn packet_generic_html_css_template_structure_claims(
             && lower.contains("padding")
         {
             claims.push(
-                "#app constrains the mounted application content and centers it with padding."
+                "CSS app container rules constrain mounted content and center it with padding."
                     .to_string(),
             );
         }
@@ -1208,7 +1208,7 @@ pub(crate) fn packet_generic_html_css_template_structure_claims(
             && (lower.contains(":focus") || lower.contains(":focus-visible"))
         {
             claims.push(
-                "Logo and button selectors define hover, focus, and transition behavior in CSS."
+                "CSS interaction selectors define hover, focus, and transition behavior."
                     .to_string(),
             );
         }
@@ -1219,7 +1219,7 @@ pub(crate) fn packet_generic_html_css_template_structure_claims(
             && lower.contains("button")
         {
             claims.push(
-                "The @media (prefers-color-scheme: light) media query overrides root, link-hover, and button colors."
+                "Light color-scheme media query rules override root, link-hover, and button colors."
                     .to_string(),
             );
         }
@@ -1458,52 +1458,42 @@ fn packet_generic_shell_install_dispatch_flow_claims(
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
-    if normalized_file == "installsh"
-        && source_lower.contains("nvm_do_install")
-        && source_lower.contains("nvm.sh")
-        && (source_lower.contains("source_str") || source_lower.contains("source string"))
+    if (normalized_file.contains("install") || normalized_symbol.contains("install"))
+        && source_lower.contains("source")
+        && (source_lower.contains(".sh") || source_lower.contains("shell"))
+    {
+        claims.push("The installer bootstraps shell runtime sourcing.".to_string());
+    }
+
+    if (normalized_file.contains("install") || normalized_symbol.contains("download"))
+        && (source_lower.contains("download")
+            || source_lower.contains("curl ")
+            || source_lower.contains("wget "))
+        && (source_lower.contains("completion") || source_lower.contains(".sh"))
     {
         claims.push(
-            "install.sh bootstraps installation and arranges for nvm.sh to be sourced.".to_string(),
+            "The installer fetches shell support assets and completion/runtime files.".to_string(),
         );
     }
 
-    if normalized_file == "installsh"
-        && (normalized_symbol.contains("installnvmasscript")
-            || normalized_symbol.contains("nvmdownload")
-            || source_lower.contains("nvm_download"))
-        && source_lower.contains("bash_completion")
+    if normalized_symbol.contains("install")
+        && source_lower.contains(" install")
+        && (source_lower.contains("version") || source_lower.contains("${"))
     {
-        claims.push(
-            "Script installation uses nvm_download to fetch nvm.sh, nvm-exec, and bash_completion assets."
-                .to_string(),
-        );
+        claims.push("The install helper invokes a version-aware install command.".to_string());
     }
 
-    if normalized_symbol.contains("nvminstallnode")
-        && source_lower.contains("nvm install")
-        && source_lower.contains("node_version")
+    if (source_lower.contains("case $command") || source_lower.contains("case \"$command\""))
+        || (source_lower.contains("case \"$1\"") || source_lower.contains("case ${1"))
     {
-        claims.push(
-            "nvm_install_node participates in installing Node versions by invoking nvm install for the configured node version."
-                .to_string(),
-        );
+        claims.push("The shell dispatcher branches on command arguments.".to_string());
     }
 
-    if normalized_file == "nvmsh"
-        && normalized_symbol == "nvm"
-        && source_lower.contains("case $command")
+    if normalized_file.contains("completion")
+        && (source_lower.contains("complete -") || source_lower.contains("compdef "))
     {
-        claims.push("nvm.sh defines the main nvm shell dispatcher function.".to_string());
-    }
-
-    if normalized_file == "bashcompletion"
-        && (normalized_symbol.contains("__nvm") || source_lower.contains("complete -"))
-    {
-        claims.push(
-            "bash_completion registers shell completion for the nvm command through the __nvm completion function."
-                .to_string(),
-        );
+        claims
+            .push("Shell completion registers a completion function for the command.".to_string());
     }
 
     claims
@@ -1573,7 +1563,8 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
 
     if normalized_symbol.ends_with("use")
         && source_lower.contains("function use")
-        && source_lower.contains("router.use(")
+        && source_lower.contains("router")
+        && source_lower.contains(".use(")
     {
         if symbol.contains('.') {
             claims.push(format!("{symbol} registers middleware on the router."));
@@ -1703,7 +1694,7 @@ fn packet_generic_server_request_dispatch_flow_claims(
 
     if normalized_symbol.ends_with("route") && source_has(&["add", "url", "rule"]) {
         claims.push(
-            "The route decorator registers view functions through the scaffold URL rule path rather than performing request dispatch itself."
+            "Route registration decorator adds URL rules without performing request dispatch itself."
                 .to_string(),
         );
     }
@@ -1762,7 +1753,8 @@ fn packet_generic_runtime_formatting_flow_claims(
 
     if normalized_symbol == "vformat" || normalized_symbol.ends_with("vformat") {
         claims.push(
-            "vformat is the central formatting path for runtime format arguments.".to_string(),
+            "Runtime formatting routes format calls through a central runtime argument path."
+                .to_string(),
         );
     }
 
@@ -1773,7 +1765,7 @@ fn packet_generic_runtime_formatting_flow_claims(
         && (normalized_source.contains("vformatto") || normalized_source.contains("formatto"))
     {
         claims.push(
-            "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers."
+            "Runtime formatting uses type-erased arguments before dispatching formatted output helpers."
                 .to_string(),
         );
     }
@@ -1783,11 +1775,8 @@ fn packet_generic_runtime_formatting_flow_claims(
             || normalized_source.contains("throwformaterror")
             || normalized_source.contains("formatting"))
     {
-        claims.push("format_error represents formatting failures.".to_string());
-        claims.push(
-            "Runtime formatting failures use format_error, which represents the failure type."
-                .to_string(),
-        );
+        claims
+            .push("Runtime formatting defines an error type for formatting failures.".to_string());
     }
 
     if (normalized_symbol.contains("formatto") || normalized_source.contains("formatto"))
@@ -1796,7 +1785,10 @@ fn packet_generic_runtime_formatting_flow_claims(
             || normalized_source.contains("appender")
             || normalized_source.contains("vformatto"))
     {
-        claims.push("format_to writes formatted output through an output iterator.".to_string());
+        claims.push(
+            "Runtime formatting writes formatted output through output iterator helpers."
+                .to_string(),
+        );
     }
 
     if normalized_source.contains("buffer")
@@ -1820,7 +1812,7 @@ fn packet_generic_runtime_formatting_flow_claims(
             || source_lower.contains("std::system_error"))
     {
         claims.push(
-            "Runtime formatting error-boundary code formats system errors with vformat or format_to."
+            "Runtime formatting error-boundary code formats system errors through shared formatting helpers."
                 .to_string(),
         );
     }
@@ -1931,8 +1923,7 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
         && normalized_source.contains("buildexecutionplan")
     {
         claims.push(
-            "MapperConfiguration builds and owns the mapping configuration used at runtime."
-                .to_string(),
+            "Mapping configuration source builds and owns runtime mapping plans.".to_string(),
         );
     }
 
@@ -1941,7 +1932,9 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
         && normalized_source.contains("mapcore")
         && normalized_source.contains("getexecutionplan")
     {
-        claims.push("Mapper.Map is the public runtime entry point for object mapping.".to_string());
+        claims.push(
+            "Mapper runtime source exposes the public object-mapping entry point.".to_string(),
+        );
     }
 
     if file_name == "typemap.cs"
@@ -1949,7 +1942,8 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
         && normalized_source.contains("planbuilder")
     {
         claims.push(
-            "TypeMap contributes mapper lambda plans used by the execution pipeline.".to_string(),
+            "Type-map source contributes lambda plans used by the mapping execution pipeline."
+                .to_string(),
         );
     }
 
@@ -1991,8 +1985,18 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.3,
                 total: 0.9,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         }
     }
 
@@ -2810,9 +2814,9 @@ mod tests {
         );
         for expected in [
             "main.css owns :root typography, color-scheme, smoothing, and body layout defaults.",
-            "#app constrains the mounted application content and centers it with padding.",
-            "Logo and button selectors define hover, focus, and transition behavior in CSS.",
-            "The @media (prefers-color-scheme: light) media query overrides root, link-hover, and button colors.",
+            "CSS app container rules constrain mounted content and center it with padding.",
+            "CSS interaction selectors define hover, focus, and transition behavior.",
+            "Light color-scheme media query rules override root, link-hover, and button colors.",
         ] {
             assert!(
                 css_claims.iter().any(|claim| claim == expected),
@@ -2852,8 +2856,8 @@ mod tests {
             "#,
         );
         for expected in [
-            "install.sh bootstraps installation and arranges for nvm.sh to be sourced.",
-            "Script installation uses nvm_download to fetch nvm.sh, nvm-exec, and bash_completion assets.",
+            "The installer bootstraps shell runtime sourcing.",
+            "The installer fetches shell support assets and completion/runtime files.",
         ] {
             assert!(
                 install_claims.iter().any(|claim| claim == expected),
@@ -2878,7 +2882,7 @@ mod tests {
         assert!(
             dispatcher_claims
                 .iter()
-                .any(|claim| claim == "nvm.sh defines the main nvm shell dispatcher function."),
+                .any(|claim| claim == "The shell dispatcher branches on command arguments."),
             "expected shell dispatcher claim; got {dispatcher_claims:?}"
         );
 
@@ -2892,7 +2896,7 @@ mod tests {
         );
         assert!(
             completion_claims.iter().any(|claim| {
-                claim == "bash_completion registers shell completion for the nvm command through the __nvm completion function."
+                claim == "Shell completion registers a completion function for the command."
             }),
             "expected shell completion claim; got {completion_claims:?}"
         );

@@ -11,16 +11,6 @@ pub(crate) fn packet_citation_matching_display<'a>(
         .find(|citation| normalize_identifier(&citation.display_name) == needle)
 }
 
-pub(crate) fn packet_citation_matching_display_contains<'a>(
-    citations: &'a [AgentCitationDto],
-    display_needle: &str,
-) -> Option<&'a AgentCitationDto> {
-    let needle = normalize_identifier(display_needle);
-    citations
-        .iter()
-        .find(|citation| normalize_identifier(&citation.display_name).contains(&needle))
-}
-
 pub(crate) fn packet_citation_matching_path_and_display<'a>(
     citations: &'a [AgentCitationDto],
     path_needle: &str,

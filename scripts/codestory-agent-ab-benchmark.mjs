@@ -13,7 +13,9 @@ import {
   discoverPreviousPacketSummary,
 } from "./codestory-agent-value-score.mjs";
 import {
+  benchmarkContractCompatibility,
   benchmarkChildEnv,
+  benchmarkRunContract,
   retrievalContractSummary,
   retrievalEnv as benchmarkRetrievalEnv,
   shouldPrepareRetrievalIndex,
@@ -21,6 +23,8 @@ import {
 } from "./codestory-benchmark-contract.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const benchmarkHarnessPath = fileURLToPath(import.meta.url);
+const benchmarkScorerPath = path.join(scriptDir, "codestory-agent-value-score.mjs");
 const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
 const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
@@ -2942,8 +2946,10 @@ async function runOne(opts, run, outDir) {
         transport_mode: "agent_runner",
       })
     : null;
+  const benchmarkContract = benchmarkContractForRun(opts, run, env);
 
   const output = {
+    benchmark_run_id: runId,
     repo: run.repo,
     task_id: run.task?.id ?? null,
     task_name: run.task?.name ?? null,
@@ -2962,6 +2968,8 @@ async function runOne(opts, run, outDir) {
     repo_path: repoConfig.path,
     repo_provenance: provenance,
     codestory_cache_provenance: cacheProvenance,
+    benchmark_contract: benchmarkContract,
+    promotion_eligible: benchmarkContract.promotion_eligible,
     status: result.timedOut ? "timeout" : result.exitCode === 0 ? "pass" : "fail",
     exit_code: result.exitCode,
     signal: result.signal,
@@ -4776,6 +4784,14 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
     output_dir: outDir,
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
+    benchmark_contract: benchmarkRunContract({
+      opts,
+      task: null,
+      env: process.env,
+      harnessPath: benchmarkHarnessPath,
+      scorerPath: benchmarkScorerPath,
+      cliIdentity: opts.codestoryCli ?? process.env.CODESTORY_CLI ?? null,
+    }),
     summary,
   };
   const packetRuntimeSummaryPath = path.join(outDir, "packet-runtime-summary.json");
@@ -5701,6 +5717,17 @@ function taskSnapshotMatches(currentTask, candidate) {
   return JSON.stringify(current ?? null) === JSON.stringify(previous ?? null);
 }
 
+function benchmarkContractForRun(opts, run, env = process.env) {
+  return benchmarkRunContract({
+    opts,
+    task: run.task ?? null,
+    env,
+    harnessPath: benchmarkHarnessPath,
+    scorerPath: benchmarkScorerPath,
+    cliIdentity: run.arm === "with_codestory" ? opts.codestoryCli ?? env.CODESTORY_CLI ?? null : null,
+  });
+}
+
 function resolveRunArtifactPath(runDir, artifactPath) {
   if (!artifactPath) {
     return null;
@@ -5799,6 +5826,19 @@ async function loadReusableBaselines(opts, plannedRuns, outDir) {
       continue;
     }
     const reanalyzed = await recomputeRunAnalysis(row, opts, sourceRunDir, taskCache);
+    const currentContract = benchmarkContractForRun(opts, planned);
+    const compatibility = benchmarkContractCompatibility(
+      currentContract,
+      reanalyzed.benchmark_contract,
+    );
+    if (!compatibility.compatible) {
+      throw new Error(
+        [
+          `Refusing to reuse incompatible baseline row for ${planned.repo} ${planned.task?.id ?? ""} repeat ${planned.repeat}.`,
+          ...compatibility.mismatches,
+        ].join(" "),
+      );
+    }
     const runId = benchmarkRunId([
       planned.repo,
       ...(planned.task ? [planned.task.id] : []),
@@ -5809,7 +5849,15 @@ async function loadReusableBaselines(opts, plannedRuns, outDir) {
     reusable.set(key, {
       ...copied,
       reused_from: sourceRunDir,
+      reused_from_run_id: row.benchmark_run_id ?? null,
       reused_at: new Date().toISOString(),
+      benchmark_contract: {
+        ...currentContract,
+        reused_from: sourceRunDir,
+        reused_from_run_id: row.benchmark_run_id ?? null,
+        promotion_eligible: true,
+      },
+      promotion_eligible: true,
       resource_accounting: resourceAccountingForResult(copied),
     });
   }

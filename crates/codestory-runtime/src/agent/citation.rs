@@ -1,5 +1,6 @@
 //! Citation construction from search hits for agent retrieval.
 
+use crate::agent::packet_evidence::decorate_citation_from_hit;
 use codestory_contracts::api::{AgentCitationDto, EdgeId, GraphResponse, NodeId, SearchHit};
 
 pub(crate) fn to_citation_from_hit(
@@ -8,7 +9,7 @@ pub(crate) fn to_citation_from_hit(
     primary_graph: Option<&GraphResponse>,
     include_evidence: bool,
 ) -> AgentCitationDto {
-    AgentCitationDto {
+    let mut citation = AgentCitationDto {
         node_id: hit.node_id.clone(),
         display_name: hit.display_name.clone(),
         kind: hit.kind,
@@ -26,7 +27,15 @@ pub(crate) fn to_citation_from_hit(
         retrieval_score_breakdown: include_evidence
             .then(|| hit.score_breakdown.clone())
             .flatten(),
-    }
+        evidence_tier: None,
+        evidence_producer: None,
+        resolution_status: None,
+        loss_reason: None,
+        coverage_role: None,
+        eligible_for_sufficiency: None,
+    };
+    decorate_citation_from_hit(&mut citation, hit);
+    citation
 }
 
 pub(crate) fn evidence_edge_ids_for_node(

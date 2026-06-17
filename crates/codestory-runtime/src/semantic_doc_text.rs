@@ -473,23 +473,23 @@ pub(crate) fn runtime_concept_phrases(
             "build config" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "Payload buildConfig root config registers collections content blocks dashboard widgets"
+                "root build configuration registers collections blocks dashboard widgets"
                     .to_string(),
             ),
             "content blocks" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "Payload content block registry array of reusable rich text blocks".to_string(),
+                "content block registry array of reusable rich text blocks".to_string(),
             ),
             "hero field" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "Payload shared hero field group builder reusable field configuration".to_string(),
+                "shared hero field group builder reusable field configuration".to_string(),
             ),
             "content field" => push_unique_alias(
                 &mut phrases,
                 &mut seen,
-                "Payload shared content richText field builder reusable field configuration"
+                "shared content rich text field builder reusable field configuration"
                     .to_string(),
             ),
             "ast visitor" => {
@@ -732,13 +732,11 @@ pub(crate) fn runtime_concept_phrases(
                         .to_string(),
                 );
             }
-            "build index"
-                if qualified_name.is_some_and(|name| name.contains("Project::buildIndex")) =>
-            {
+            "build index" => {
                 push_unique_alias(
                     &mut phrases,
                     &mut seen,
-                    "project buildIndex builds the source graph index after load and refresh"
+                    "project build index step builds the source graph index after load and refresh"
                         .to_string(),
                 );
                 push_unique_alias(
@@ -1424,21 +1422,19 @@ mod tests {
         );
         assert_eq!(
             runtime_concept_phrases("buildConfig", Some("buildConfig")),
-            vec![
-                "Payload buildConfig root config registers collections content blocks dashboard widgets"
-            ]
+            vec!["root build configuration registers collections blocks dashboard widgets"]
         );
         assert_eq!(
             runtime_concept_phrases("contentBlocks", Some("contentBlocks")),
-            vec!["Payload content block registry array of reusable rich text blocks"]
+            vec!["content block registry array of reusable rich text blocks"]
         );
         assert_eq!(
             runtime_concept_phrases("heroField", Some("heroField")),
-            vec!["Payload shared hero field group builder reusable field configuration"]
+            vec!["shared hero field group builder reusable field configuration"]
         );
         assert_eq!(
             runtime_concept_phrases("contentField", Some("contentField")),
-            vec!["Payload shared content richText field builder reusable field configuration"]
+            vec!["shared content rich text field builder reusable field configuration"]
         );
         assert_eq!(
             runtime_concept_phrases("AstVisitor", Some("com.sourcetrail.AstVisitor")),
@@ -1591,7 +1587,7 @@ mod tests {
         assert_eq!(
             runtime_concept_phrases("buildIndex", Some("Project::buildIndex")),
             vec![
-                "project buildIndex builds the source graph index after load and refresh",
+                "project build index step builds the source graph index after load and refresh",
                 "project loads settings refreshes source groups computes refresh info and builds an index"
             ]
         );
