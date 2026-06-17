@@ -4870,7 +4870,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_treats_unresolved_sidecar_candidates_as_gap() {
+    fn packet_sufficiency_keeps_nonblocking_unresolved_sidecar_candidates_diagnostic() {
         let question = "Explain how packet retrieval flows through sidecar diagnostics.";
         let (mut answer, initial_sufficiency) = build_sufficient_packet_fixture(
             question,
@@ -4934,24 +4934,22 @@ mod tests {
             &budget,
         );
 
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(
-            sufficiency
+            !sufficiency
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("sidecar candidates")),
-            "expected sidecar candidate gap, got {:?}",
+            "nonblocking sidecar diagnostics should not become sufficiency gaps: {:?}",
             sufficiency.gaps
         );
-        let sidecar_gap = sufficiency
-            .gaps
-            .iter()
-            .find(|gap| gap.contains("sidecar candidates"))
-            .expect("sidecar gap");
         assert_eq!(
-            sidecar_gap.matches("sidecar batch").count(),
-            1,
-            "duplicate diagnostics should not duplicate query names in sufficiency gaps: {sidecar_gap}"
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .map(|report| report.unresolved.as_slice()),
+            Some(&["sidecar batch".to_string()][..]),
+            "duplicate diagnostics should remain visible once in coverage_report.unresolved: {sufficiency:?}"
         );
     }
 

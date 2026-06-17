@@ -130,6 +130,14 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         &missing_required_flow_requirements,
     );
     let unresolved_sidecar_queries = unresolved_sidecar_queries(answer);
+    let blocking_unresolved_sidecar_queries = packet_blocking_unresolved_sidecar_queries(
+        question,
+        task_class,
+        &unresolved_sidecar_queries,
+        &missing_required_probe_queries,
+        &blocking_missing_probe_queries,
+        &missing_required_flow_requirements,
+    );
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
         answer,
         budget,
@@ -140,7 +148,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_required_flow_roles,
         has_sufficiency_blocking_budget_omission,
         missing_required_probe_queries: &blocking_missing_probe_queries,
-        unresolved_sidecar_queries: &unresolved_sidecar_queries,
+        unresolved_sidecar_queries: &blocking_unresolved_sidecar_queries,
     });
 
     let gaps = packet_sufficiency_gaps(
@@ -160,12 +168,16 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_sufficiency_blocking_budget_omission,
         &blocking_missing_probe_queries,
         &missing_required_flow_requirements,
-        &unresolved_sidecar_queries,
+        &blocking_unresolved_sidecar_queries,
     );
-    let follow_up_probe_queries = if blocking_missing_probe_queries.is_empty() {
+    let blocking_follow_up_probe_queries = packet_blocking_follow_up_probe_queries(
+        &blocking_missing_probe_queries,
+        &blocking_unresolved_sidecar_queries,
+    );
+    let follow_up_probe_queries = if blocking_follow_up_probe_queries.is_empty() {
         &missing_required_probe_queries
     } else {
-        &blocking_missing_probe_queries
+        &blocking_follow_up_probe_queries
     };
     let follow_up_commands = packet_follow_up_commands(
         project_root,
@@ -1184,6 +1196,71 @@ fn packet_blocking_missing_probe_queries(
         .collect()
 }
 
+fn packet_blocking_unresolved_sidecar_queries(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    unresolved_sidecar_queries: &[String],
+    missing_required_probe_queries: &[String],
+    blocking_missing_probe_queries: &[String],
+    missing_required_flow_requirements: &[FlowRequirement],
+) -> Vec<String> {
+    if unresolved_sidecar_queries.is_empty()
+        || (missing_required_probe_queries.is_empty()
+            && missing_required_flow_requirements.is_empty())
+    {
+        return Vec::new();
+    }
+
+    let missing_requirement_ids = missing_required_flow_requirements
+        .iter()
+        .map(|requirement| requirement.id)
+        .collect::<HashSet<_>>();
+    let question_terms = packet_probe_terms(question);
+    let blocking_query_seeds = packet_flow_requirements_for_terms(&question_terms, task_class)
+        .into_iter()
+        .filter(|requirement| {
+            flow_requirement_blocks_sufficiency(requirement)
+                && missing_requirement_ids.contains(requirement.id)
+        })
+        .flat_map(|requirement| requirement.query_seeds.iter().copied())
+        .collect::<HashSet<_>>();
+    let blocking_probe_queries = blocking_missing_probe_queries
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let missing_probe_queries = missing_required_probe_queries
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    unresolved_sidecar_queries
+        .iter()
+        .filter(|query| {
+            blocking_query_seeds.contains(query.as_str())
+                || blocking_probe_queries.contains(query.as_str())
+                || missing_probe_queries.contains(query.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+fn packet_blocking_follow_up_probe_queries(
+    blocking_missing_probe_queries: &[String],
+    blocking_unresolved_sidecar_queries: &[String],
+) -> Vec<String> {
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+    for query in blocking_missing_probe_queries
+        .iter()
+        .chain(blocking_unresolved_sidecar_queries)
+    {
+        if seen.insert(query.as_str()) {
+            queries.push(query.clone());
+        }
+    }
+    queries
+}
+
 fn packet_flow_roles_for_claim(
     claim: &PacketClaimDto,
     site_build_flow: bool,
@@ -1687,7 +1764,8 @@ mod tests {
         AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
         NodeKind, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
-        PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto,
+        SearchHitOrigin,
     };
     use std::path::Path;
 
@@ -1789,6 +1867,17 @@ mod tests {
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
+        }
+    }
+
+    fn unresolved_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
+        PacketSidecarQueryDiagnosticDto {
+            query: query.to_string(),
+            retrieval_mode: "full".to_string(),
+            candidate_count: 1,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 1,
+            diagnostic: Some("unresolved test candidate".to_string()),
         }
     }
 
@@ -2594,6 +2683,207 @@ mod tests {
                 "expected generic coverage report to include {expected}: {report:?}"
             );
         }
+    }
+
+    #[test]
+    fn unresolved_sidecar_diagnostics_do_not_block_when_required_roles_are_covered() {
+        let question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
+        let mut answer = answer_fixture(question);
+        answer.retrieval_trace.packet_sidecar_diagnostics = vec![
+            unresolved_sidecar_diagnostic("response send helper"),
+            unresolved_sidecar_diagnostic("helpers"),
+        ];
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Public request entrypoint registers route wrappers before dispatching handler calls.",
+            ),
+            claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            ),
+            claim(
+                "Response finalization boundary writes response output and returns control to the server.",
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/express"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(sufficiency.gaps.is_empty());
+        assert!(sufficiency.follow_up_commands.is_empty());
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.is_empty());
+        assert_eq!(
+            report.unresolved,
+            vec!["response send helper".to_string(), "helpers".to_string()]
+        );
+    }
+
+    #[test]
+    fn unresolved_selected_probe_blocks_when_express_response_coverage_is_missing() {
+        let question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
+        let mut answer = answer_fixture(question);
+        answer.retrieval_trace.packet_sidecar_diagnostics =
+            vec![unresolved_sidecar_diagnostic("response send")];
+        let budget = budget_fixture();
+        let claims = vec![
+            PacketClaimDto {
+                claim: "Selected callback invocation happens.".to_string(),
+                citations: Vec::new(),
+                coverage_role: Some("dispatch".to_string()),
+                eligible_for_sufficiency: None,
+            },
+            PacketClaimDto {
+                claim: "Selected handler invocation happens.".to_string(),
+                citations: Vec::new(),
+                coverage_role: Some("dispatch".to_string()),
+                eligible_for_sufficiency: None,
+            },
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/express"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec!["response send".to_string()],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "Express route probes may be selected even without canonical flow requirements: {report:?}"
+        );
+        assert_eq!(report.unresolved, vec!["response send".to_string()]);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("response send"))
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .first()
+                .is_some_and(|command| command.contains("--query 'response send'")),
+            "unresolved selected probe should become the follow-up when no missing flow seed exists: {:?}",
+            sufficiency.follow_up_commands
+        );
+    }
+
+    #[test]
+    fn missing_flow_seed_follow_up_precedes_unresolved_selected_probe() {
+        let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
+        let mut answer = answer_fixture(question);
+        answer.retrieval_trace.packet_sidecar_diagnostics =
+            vec![unresolved_sidecar_diagnostic("response send")];
+        let budget = budget_fixture();
+        let claims = vec![
+            PacketClaimDto {
+                claim: "Selected callback invocation happens.".to_string(),
+                citations: Vec::new(),
+                coverage_role: Some("dispatch".to_string()),
+                eligible_for_sufficiency: None,
+            },
+            PacketClaimDto {
+                claim: "Selected handler invocation happens.".to_string(),
+                citations: Vec::new(),
+                coverage_role: Some("dispatch".to_string()),
+                eligible_for_sufficiency: None,
+            },
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec![
+                "route registration".to_string(),
+                "response send".to_string(),
+            ],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "request_entrypoint"));
+        assert!(report.missing.iter().any(|gap| gap == "request_terminal"));
+        assert_eq!(report.unresolved, vec!["response send".to_string()]);
+        assert!(
+            sufficiency.follow_up_commands.len() >= 2,
+            "expected both missing flow seed and unresolved selected probe follow-ups: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency.follow_up_commands[0].contains("--query 'route registration'"),
+            "missing flow seed should remain first follow-up: {:?}",
+            sufficiency.follow_up_commands
+        );
+        assert!(
+            sufficiency.follow_up_commands[1].contains("--query 'response send'"),
+            "unresolved selected probe should follow missing flow seed: {:?}",
+            sufficiency.follow_up_commands
+        );
+    }
+
+    #[test]
+    fn unresolved_sidecar_diagnostics_block_when_required_coverage_is_missing() {
+        let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
+        let mut answer = answer_fixture(question);
+        answer.retrieval_trace.packet_sidecar_diagnostics =
+            vec![unresolved_sidecar_diagnostic("response finalization")];
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Public request entrypoint registers route wrappers before dispatching handler calls.",
+            ),
+            claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "request_terminal"));
+        assert_eq!(report.unresolved, vec!["response finalization".to_string()]);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("response finalization"))
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'response finalization'"))
+        );
     }
 
     #[test]
