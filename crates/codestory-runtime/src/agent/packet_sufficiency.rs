@@ -176,7 +176,6 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
     let coverage_report = packet_coverage_report(
         &sufficiency_claims,
         &missing_required_flow_roles,
-        &blocking_missing_probe_queries,
         &unresolved_sidecar_queries,
         budget,
         has_sufficiency_blocking_budget_omission,
@@ -712,7 +711,6 @@ pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bo
 fn packet_coverage_report(
     sufficiency_claims: &[PacketClaimDto],
     missing_required_flow_roles: &[FlowRole],
-    missing_required_probe_queries: &[String],
     unresolved_sidecar_queries: &[String],
     budget: &PacketBudgetDto,
     has_sufficiency_blocking_budget_omission: bool,
@@ -731,7 +729,6 @@ fn packet_coverage_report(
     let missing = missing_required_flow_roles
         .iter()
         .map(|role| role.role_id().to_string())
-        .chain(missing_required_probe_queries.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -1342,7 +1339,6 @@ fn insert_generic_boundary_roles(roles: &mut HashSet<FlowRole>) {
     roles.insert(FlowRole::Configuration);
     roles.insert(FlowRole::StateOrStorage);
     roles.insert(FlowRole::TerminalBoundary);
-    roles.insert(FlowRole::ErrorOrFallback);
 }
 
 #[cfg(test)]
@@ -1514,7 +1510,61 @@ mod tests {
         assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
         let report = sufficiency.coverage_report.as_ref().unwrap();
         assert!(report.missing.iter().any(|gap| gap == "registration"));
-        assert!(report.missing.iter().any(|gap| gap == "route registration"));
+        assert!(!report.missing.iter().any(|gap| gap == "route registration"));
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("route registration"))
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'route registration'"))
+        );
+    }
+
+    #[test]
+    fn runtime_formatting_output_claims_do_not_cover_error_fallback_role() {
+        let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+            ),
+            claim("Runtime formatting writes formatted output through output iterator helpers."),
+            claim("Runtime formatting appends formatted output to a buffer."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec!["format error".to_string()],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "error_or_fallback"));
+        assert!(!report.missing.iter().any(|gap| gap == "format error"));
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("format error"))
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'format error'"))
+        );
     }
 
     #[test]
