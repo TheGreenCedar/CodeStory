@@ -19,10 +19,9 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_url_session_request_flow,
 };
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto,
-    GraphArtifactDto, PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto,
-    PacketCoverageReportDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, PacketBudgetDto,
+    PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -127,11 +126,8 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         &missing_required_flow_requirements,
     );
     let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
-        answer,
         budget,
-        min_citations,
-        min_claims,
-        sufficiency_claims.len(),
+        &missing_required_flow_requirements,
     );
     let unresolved_sidecar_queries = unresolved_sidecar_queries(answer);
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
@@ -1819,6 +1815,18 @@ mod tests {
         }
     }
 
+    fn compact_truncated_budget(question: &str, omitted_sections: Vec<&str>) -> PacketBudgetDto {
+        let mut budget = budget_fixture();
+        budget.requested = PacketBudgetModeDto::Compact;
+        budget.truncated = true;
+        budget.omitted_sections = omitted_sections.into_iter().map(str::to_string).collect();
+        budget.next_deeper_command = Some(format!(
+            "codestory-cli packet --project 'C:/workspace/project' --question '{}' --budget standard",
+            question.replace('\'', "''")
+        ));
+        budget
+    }
+
     #[test]
     fn html_form_validation_generic_source_evidence_is_diagnostic_only() {
         let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
@@ -2377,6 +2385,117 @@ mod tests {
     }
 
     #[test]
+    fn runtime_formatting_compact_verbose_truncation_keeps_complete_roles_sufficient() {
+        let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
+        let answer = answer_fixture(question);
+        let budget = compact_truncated_budget(
+            question,
+            vec!["citations", "markdown_blocks", "trail_edges"],
+        );
+        let claims = vec![
+            claim(
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+            ),
+            claim("Runtime formatting writes formatted output through output iterator helpers."),
+            claim("Runtime formatting defines format_error for formatting failures."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(sufficiency.gaps.is_empty());
+        assert!(sufficiency.follow_up_commands.is_empty());
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.is_empty());
+        assert!(
+            report.budget_omitted.is_empty(),
+            "verbose compact truncation should not be reported as proof omission when roles are complete: {report:?}"
+        );
+    }
+
+    #[test]
+    fn url_session_compact_verbose_truncation_keeps_complete_roles_sufficient() {
+        let question = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
+        let answer = answer_fixture(question);
+        let budget = compact_truncated_budget(question, vec!["markdown_blocks", "trail_edges"]);
+        let claims = vec![
+            claim("Session.request creates request objects before optional eager execution."),
+            claim("Request.resume resumes the underlying URLSession task."),
+            claim("Request validation methods attach validation behavior."),
+            claim("Session delegate callbacks receive URLSession task events."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(sufficiency.gaps.is_empty());
+        assert!(sufficiency.follow_up_commands.is_empty());
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.is_empty());
+        assert!(report.budget_omitted.is_empty());
+    }
+
+    #[test]
+    fn compact_proof_omission_reports_missing_role_and_standard_budget_follow_up() {
+        let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
+        let answer = answer_fixture(question);
+        let budget = compact_truncated_budget(question, vec!["citations", "markdown_blocks"]);
+        let claims = vec![
+            claim(
+                "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+            ),
+            claim("Runtime formatting writes formatted output through output iterator helpers."),
+            claim("Runtime formatting appends formatted output to a buffer."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec!["format error".to_string()],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "format_errors"));
+        assert!(
+            report
+                .budget_omitted
+                .iter()
+                .any(|section| section == "citations")
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--budget standard")),
+            "proof omission under compact budget should recommend the standard packet: {sufficiency:?}"
+        );
+    }
+
+    #[test]
     fn route_tracing_site_build_prompts_use_lifecycle_flow_roles() {
         let claims = vec![
             claim("Build.process constructs or processes a site."),
@@ -2674,63 +2793,32 @@ mod tests {
 }
 
 fn packet_has_sufficiency_blocking_budget_omission(
-    answer: &AgentAnswerDto,
     budget: &PacketBudgetDto,
-    min_citations: usize,
-    min_claims: usize,
-    supported_claim_count: usize,
+    missing_required_flow_requirements: &[FlowRequirement],
 ) -> bool {
     if !budget.truncated {
         return false;
     }
 
-    let has_claim_stop_signal =
-        answer.citations.len() >= min_citations && supported_claim_count >= min_claims;
-    let has_retained_graph = packet_has_retained_graph(answer);
+    if budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == "packet_payload")
+    {
+        return true;
+    }
+
+    if missing_required_flow_requirements.is_empty() {
+        return false;
+    }
 
     budget
         .omitted_sections
         .iter()
         .any(|section| match section.as_str() {
-            "packet_payload" => true,
-            "markdown_blocks" => {
-                !has_claim_stop_signal || packet_markdown_truncation_blocks_sufficiency(answer)
-            }
-            "trail_edges" => !has_claim_stop_signal || !has_retained_graph,
+            "citations" | "markdown_blocks" | "trail_edges" | "output_bytes" => true,
             _ => false,
         })
-}
-
-fn packet_has_retained_graph(answer: &AgentAnswerDto) -> bool {
-    answer.graphs.iter().any(|artifact| match artifact {
-        GraphArtifactDto::Uml { graph, .. } => !graph.edges.is_empty(),
-        GraphArtifactDto::Mermaid { .. } => false,
-    })
-}
-
-fn packet_markdown_truncation_blocks_sufficiency(answer: &AgentAnswerDto) -> bool {
-    let mut saw_truncated_markdown = false;
-    for section in &answer.sections {
-        for block in &section.blocks {
-            let AgentResponseBlockDto::Markdown { markdown } = block else {
-                continue;
-            };
-            if !markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim()) {
-                continue;
-            }
-            saw_truncated_markdown = true;
-            if !packet_section_allows_nonblocking_truncation(section.id.as_str()) {
-                return true;
-            }
-        }
-    }
-    !saw_truncated_markdown
-}
-
-fn packet_section_allows_nonblocking_truncation(section_id: &str) -> bool {
-    section_id == "retrieval-evidence"
-        || section_id == "diagrams"
-        || section_id.starts_with("packet-subquery-")
 }
 
 pub(crate) fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {

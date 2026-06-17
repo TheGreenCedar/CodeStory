@@ -43,10 +43,10 @@
 
 ## Phase 5: Make Compact Budget Proof-Aware
 
-- [ ] 6. Retain required proof before verbose packet sections
-  - [ ] 6.1 Change budget omission blocking to check missing required roles, not section names alone.
-  - [ ] 6.2 Prefer dropping diagrams, repeated snippets, or avoid-opening lists before proof citations and covered claims.
-  - [ ] 6.3 Add fmt and Swift compact regressions where quality-equivalent role coverage is sufficient despite truncation.
+- [x] 6. Retain required proof before verbose packet sections
+  - [x] 6.1 Change budget omission blocking to check missing required roles, not section names alone.
+  - [x] 6.2 Prefer dropping diagrams, repeated snippets, or avoid-opening lists before proof citations and covered claims.
+  - [x] 6.3 Add fmt and Swift compact regressions where quality-equivalent role coverage is sufficient despite truncation.
   - _Requirements: 4.1, 4.2, 4.3_
 
 ## Phase 6: Anti-Overfit And Promotion Gates

@@ -10,6 +10,7 @@ use crate::agent::packet_batch::{
 #[cfg(test)]
 use crate::agent::packet_budget::{
     apply_packet_budget, next_deeper_packet_command, packet_budget_usage,
+    truncate_answer_markdown_to_byte_cap,
 };
 use crate::agent::packet_budget::{
     apply_packet_budget_with_extra, enforce_packet_output_budget, packet_budget_limits,
@@ -7929,7 +7930,86 @@ mod tests {
     }
 
     #[test]
-    fn answer_critical_budget_truncation_requires_deeper_packet() {
+    fn markdown_budget_truncates_verbose_sections_before_proof_sections() {
+        let question = "Explain compact packet proof retention.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
+                test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
+                test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
+            ],
+        );
+        answer.sections = vec![
+            AgentResponseSectionDto {
+                id: "packet-evidence-ledger".to_string(),
+                title: "Packet Evidence Ledger".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "proof citation ledger\n".repeat(250),
+                }],
+            },
+            AgentResponseSectionDto {
+                id: "packet-flow-claims".to_string(),
+                title: "Packet Claims".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "covered proof claim\n".repeat(250),
+                }],
+            },
+            AgentResponseSectionDto {
+                id: "retrieval-evidence".to_string(),
+                title: "Retrieval Evidence".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "repeated snippet and retrieval appendix\n".repeat(1_200),
+                }],
+            },
+            AgentResponseSectionDto {
+                id: "diagrams".to_string(),
+                title: "Diagrams".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "verbose diagram explanation\n".repeat(1_200),
+                }],
+            },
+        ];
+
+        let original_proof_sections = answer.sections[0..2]
+            .iter()
+            .map(|section| match &section.blocks[0] {
+                AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
+                AgentResponseBlockDto::Mermaid { .. } => String::new(),
+            })
+            .collect::<Vec<_>>();
+        let original_bytes = serde_json::to_vec(&answer).unwrap().len();
+        let truncated = truncate_answer_markdown_to_byte_cap(&mut answer, original_bytes - 12_000);
+
+        assert!(truncated);
+        for (section, original_markdown) in
+            answer.sections[0..2].iter().zip(original_proof_sections)
+        {
+            let AgentResponseBlockDto::Markdown { markdown } = &section.blocks[0] else {
+                panic!("proof section should remain markdown");
+            };
+            assert_eq!(
+                markdown, &original_markdown,
+                "proof-bearing section `{}` should not be truncated before verbose sections",
+                section.id
+            );
+        }
+        assert!(
+            answer.sections[2..].iter().any(|section| {
+                section.blocks.iter().any(|block| {
+                    matches!(
+                        block,
+                        AgentResponseBlockDto::Markdown { markdown }
+                            if markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim())
+                    )
+                })
+            }),
+            "expected a verbose packet section to absorb markdown truncation first"
+        );
+    }
+
+    #[test]
+    fn hard_payload_budget_truncation_requires_deeper_packet() {
         let question = "Explain the packet stop rule when evidence is clipped.";
         let mut answer = packet_answer_fixture(
             question,
@@ -7948,7 +8028,7 @@ mod tests {
             &mut answer,
         );
         budget.truncated = true;
-        budget.omitted_sections = vec!["markdown_blocks".to_string(), "trail_edges".to_string()];
+        budget.omitted_sections = vec!["packet_payload".to_string()];
         budget.next_deeper_command = next_deeper_packet_command(
             packet_fixture_project_root(),
             question,
@@ -7969,7 +8049,7 @@ mod tests {
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("answer-critical evidence")),
-            "answer-critical truncation should be named as a sufficiency gap: {sufficiency:?}"
+            "hard payload truncation should be named as a sufficiency gap: {sufficiency:?}"
         );
         assert!(
             sufficiency

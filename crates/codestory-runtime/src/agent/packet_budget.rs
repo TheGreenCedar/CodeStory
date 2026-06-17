@@ -138,6 +138,11 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
             .saturating_sub(over_by.saturating_add(1024))
             .max(1024);
 
+        if trim_packet_sufficiency_verbose_lists(packet) {
+            push_omitted_section(&mut packet.budget, "avoid_opening");
+            continue;
+        }
+
         if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
             push_omitted_section(&mut packet.budget, "markdown_blocks");
             packet.budget.used = packet_budget_usage(&packet.answer);
@@ -161,6 +166,14 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
     }
 }
 
+fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> bool {
+    let had_verbose_lists = !packet.sufficiency.avoid_opening.is_empty()
+        || !packet.sufficiency.avoid_opening_paths.is_empty();
+    packet.sufficiency.avoid_opening.clear();
+    packet.sufficiency.avoid_opening_paths.clear();
+    had_verbose_lists
+}
+
 fn rebuild_packet_budget_dependents(
     project_root: &Path,
     packet: &mut AgentPacketDto,
@@ -177,6 +190,14 @@ fn rebuild_packet_budget_dependents(
         &packet.budget,
         extra_probes,
     );
+    if packet
+        .budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == "avoid_opening")
+    {
+        trim_packet_sufficiency_verbose_lists(packet);
+    }
 }
 
 fn refresh_packet_output_bytes(packet: &mut AgentPacketDto) -> usize {
@@ -314,7 +335,8 @@ pub(crate) fn truncate_answer_markdown_to_byte_cap(
         if bytes.len() <= byte_cap {
             return truncated;
         }
-        let Some((section_index, block_index, len)) = largest_markdown_block(answer) else {
+        let Some((section_index, block_index, len)) = next_markdown_truncation_candidate(answer)
+        else {
             return truncated;
         };
         if len <= 256 {
@@ -330,19 +352,36 @@ pub(crate) fn truncate_answer_markdown_to_byte_cap(
     truncated
 }
 
-fn largest_markdown_block(answer: &AgentAnswerDto) -> Option<(usize, usize, usize)> {
-    let mut largest = None;
+fn next_markdown_truncation_candidate(answer: &AgentAnswerDto) -> Option<(usize, usize, usize)> {
+    let mut candidate = None;
     for (section_index, section) in answer.sections.iter().enumerate() {
         for (block_index, block) in section.blocks.iter().enumerate() {
             if let AgentResponseBlockDto::Markdown { markdown } = block {
                 let len = markdown.len();
-                if largest.is_none_or(|(_, _, existing)| len > existing) {
-                    largest = Some((section_index, block_index, len));
+                let priority = packet_markdown_truncation_priority(section.id.as_str());
+                if candidate.is_none_or(|(_, _, existing_priority, existing_len)| {
+                    priority < existing_priority
+                        || (priority == existing_priority && len > existing_len)
+                }) {
+                    candidate = Some((section_index, block_index, priority, len));
                 }
             }
         }
     }
-    largest
+    candidate.map(|(section_index, block_index, _, len)| (section_index, block_index, len))
+}
+
+fn packet_markdown_truncation_priority(section_id: &str) -> u8 {
+    if section_id == "diagrams" {
+        return 0;
+    }
+    if section_id == "retrieval-evidence" || section_id.starts_with("packet-subquery-") {
+        return 1;
+    }
+    if section_id == "packet-evidence-ledger" || section_id == "packet-flow-claims" {
+        return 10;
+    }
+    5
 }
 
 fn truncate_markdown_block(markdown: &mut String) {
