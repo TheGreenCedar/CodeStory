@@ -65,7 +65,11 @@ use crate::agent::packet_sufficiency::{
     packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_sql_schema_flow, prompt_search_terms,
+    packet_probe_terms, packet_terms_have_any,
+    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
+    packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
 };
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -427,6 +431,7 @@ pub(crate) fn agent_packet(
         &mut answer,
     )?;
     maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
+    maybe_append_generic_source_shape_citations(&project_root, &question, &mut answer);
     let file_scoped_source_probes =
         packet_file_scoped_source_probe_inputs_from_plan(&plan, &extra_probes);
     maybe_append_required_file_scoped_source_citations(
@@ -980,6 +985,806 @@ fn maybe_append_sql_schema_file_citations(
             "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
         ));
     }
+}
+
+struct PacketGenericSourceShapeCandidate {
+    path: std::path::PathBuf,
+    display_name: String,
+    kind: NodeKind,
+    line: u32,
+    score: f32,
+    coverage_role: String,
+    producer: String,
+    eligible_for_sufficiency: bool,
+}
+
+fn maybe_append_generic_source_shape_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
+    let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
+    let formatting_flow = packet_terms_indicate_runtime_formatting_flow(&terms);
+    let css_animation_flow = packet_terms_indicate_stylesheet_animation_flow(&terms)
+        || (packet_terms_have_any(&terms, &["animation", "animations", "animate"])
+            && packet_terms_have_any(&terms, &["variable", "variables", "keyframe", "keyframes"]));
+    if !route_flow && !mapper_flow && !formatting_flow && !css_animation_flow {
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    collect_generic_source_shape_candidates(
+        project_root,
+        project_root,
+        route_flow,
+        mapper_flow,
+        formatting_flow,
+        css_animation_flow,
+        &mut candidates,
+    );
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+
+    let mut appended = 0usize;
+    let mut skipped_existing = 0usize;
+    for candidate in candidates.into_iter().take(24) {
+        if appended >= 16 {
+            break;
+        }
+        let path_string = candidate.path.to_string_lossy().to_string();
+        let score = candidate.score.min(40.0);
+        if let Some(existing) = answer.citations.iter_mut().find(|existing| {
+            existing.display_name == candidate.display_name
+                && existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&path_string)
+                })
+        }) {
+            skipped_existing = skipped_existing.saturating_add(1);
+            if existing.score < score {
+                existing.score = score;
+            }
+            if existing.coverage_role.is_none() {
+                existing.coverage_role = Some(candidate.coverage_role);
+            }
+            if let Some(breakdown) = existing.retrieval_score_breakdown.as_mut()
+                && !breakdown
+                    .boosts
+                    .iter()
+                    .any(|boost| boost == "generic source-shape duplicate boost")
+            {
+                breakdown
+                    .boosts
+                    .push("generic source-shape duplicate boost".to_string());
+            }
+            continue;
+        }
+        answer.citations.push(AgentCitationDto {
+            node_id: NodeId(format!(
+                "packet::generic_source_shape::{}::{}::{}",
+                candidate.producer, candidate.display_name, candidate.line
+            )),
+            display_name: candidate.display_name,
+            kind: candidate.kind,
+            file_path: Some(path_string),
+            line: Some(candidate.line),
+            score,
+            origin: SearchHitOrigin::TextMatch,
+            resolvable: false,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: score,
+                semantic: 0.0,
+                graph: 0.0,
+                total: score,
+                tier_cap: Some(40.0),
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: Some("generic source-shape scan".to_string()),
+                provenance: vec![candidate.producer.clone()],
+            }),
+            evidence_tier: Some(
+                codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+            ),
+            evidence_producer: Some(candidate.producer),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: Some(candidate.coverage_role),
+            eligible_for_sufficiency: Some(candidate.eligible_for_sufficiency),
+        });
+        appended = appended.saturating_add(1);
+    }
+
+    if appended > 0 || skipped_existing > 0 {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_generic_source_shape_citations appended={appended} skipped_existing={skipped_existing}"
+        ));
+    }
+}
+
+fn collect_generic_source_shape_candidates(
+    project_root: &Path,
+    dir: &Path,
+    route_flow: bool,
+    mapper_flow: bool,
+    formatting_flow: bool,
+    css_animation_flow: bool,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    if candidates.len() >= 96 {
+        return;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = read_dir.flatten().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        let left_is_dir = left.path().is_dir();
+        let right_is_dir = right.path().is_dir();
+        left_is_dir
+            .cmp(&right_is_dir)
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if !packet_source_probe_skip_dir(&name) {
+                collect_generic_source_shape_candidates(
+                    project_root,
+                    &path,
+                    route_flow,
+                    mapper_flow,
+                    formatting_flow,
+                    css_animation_flow,
+                    candidates,
+                );
+            }
+            continue;
+        }
+        if !packet_generic_source_shape_candidate_path(project_root, &path) {
+            continue;
+        }
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        if metadata.len() > 1_500_000 {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if route_flow {
+            collect_route_receiver_assignment_candidates(&path, &source, candidates);
+        }
+        if mapper_flow {
+            collect_csharp_mapper_shape_candidates(&path, &source, candidates);
+        }
+        if formatting_flow {
+            collect_runtime_formatting_shape_candidates(&path, &source, candidates);
+        }
+        if css_animation_flow {
+            collect_css_animation_variable_candidates(&path, &source, candidates);
+        }
+    }
+}
+
+fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) -> bool {
+    let relative = path
+        .strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if relative.contains("/test/")
+        || relative.contains("/tests/")
+        || relative.starts_with("test/")
+        || relative.starts_with("tests/")
+        || relative.contains("/example")
+        || relative.starts_with("example")
+        || relative.contains("/docs/")
+        || relative.starts_with("docs/")
+        || relative.contains("docssource/")
+    {
+        return false;
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "js" | "mjs"
+                    | "cjs"
+                    | "ts"
+                    | "css"
+                    | "h"
+                    | "hpp"
+                    | "hh"
+                    | "cc"
+                    | "cpp"
+                    | "cxx"
+                    | "cs"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn collect_route_receiver_assignment_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
+        return;
+    }
+    let source_lower = source.to_ascii_lowercase();
+    for (index, line) in source.lines().enumerate() {
+        let Some((receiver, method)) = packet_js_receiver_function_assignment(line) else {
+            continue;
+        };
+        let normalized_method = normalize_identifier(&method);
+        let route_method = matches!(
+            normalized_method.as_str(),
+            "init" | "handle" | "use" | "route" | "send" | "json" | "end" | "respond"
+        );
+        if !route_method {
+            continue;
+        }
+        let method_context = match normalized_method.as_str() {
+            "init" => source_lower.contains("configuration") || source_lower.contains("router"),
+            "handle" | "use" | "route" => source_lower.contains("router"),
+            "send" | "json" | "end" | "respond" => {
+                source_lower.contains("content-type")
+                    || source_lower.contains("content-length")
+                    || source_lower.contains(".end(")
+                    || source_lower.contains(".write(")
+            }
+            _ => false,
+        };
+        if !method_context {
+            continue;
+        }
+        let mut score = 90.0;
+        if matches!(
+            normalized_method.as_str(),
+            "handle" | "use" | "route" | "send"
+        ) {
+            score += 4.0;
+        }
+        if normalized_method == "init" {
+            score += 2.0;
+        }
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("{receiver}.{method}"),
+            kind: NodeKind::METHOD,
+            line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            score,
+            coverage_role: "receiver method assignment".to_string(),
+            producer: "packet_generic_receiver_method_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_js_receiver_function_assignment(line: &str) -> Option<(String, String)> {
+    let compact = line.trim();
+    let (left, right) = compact.split_once('=')?;
+    let right = right.trim_start();
+    if !right.starts_with("function") {
+        return None;
+    }
+    let (receiver, method) = left.trim().rsplit_once('.')?;
+    let receiver = receiver
+        .rsplit(|ch: char| !packet_source_identifier_char(ch))
+        .next()
+        .unwrap_or(receiver)
+        .trim();
+    let method = method.trim();
+    if receiver.is_empty() || method.is_empty() {
+        return None;
+    }
+    if !receiver.chars().all(packet_source_identifier_char)
+        || !method.chars().all(packet_source_identifier_char)
+    {
+        return None;
+    }
+    Some((receiver.to_string(), method.to_string()))
+}
+
+fn collect_csharp_mapper_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "cs" {
+        return;
+    }
+    let normalized_source = normalize_identifier(source);
+    let source_lower = source.to_ascii_lowercase();
+    if !(normalized_source.contains("mapper")
+        || (normalized_source.contains("map") && normalized_source.contains("destination")))
+    {
+        return;
+    }
+    let normalized_path = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let internal_mapper_strategy_path = normalized_path.contains("/mappers/")
+        || normalized_path.contains("/mapperstrateg")
+        || normalized_path.contains("/mappingstrateg");
+
+    if packet_csharp_source_has_public_mapper_api(&normalized_source) {
+        let mut public_mapper_interfaces = Vec::new();
+        if !internal_mapper_strategy_path {
+            for (name, line) in packet_csharp_declared_type_names(source, "interface") {
+                let normalized_name = normalize_identifier(&name);
+                if packet_csharp_public_mapper_api_name(&normalized_name)
+                    && !normalized_name.contains("internal")
+                {
+                    public_mapper_interfaces.push((name, line));
+                }
+            }
+        }
+        let runtime_mapper_method =
+            packet_csharp_runtime_mapper_method_candidate(source, &normalized_source);
+        let grouped_facade = packet_csharp_public_mapper_api_facade_group(
+            &public_mapper_interfaces,
+            runtime_mapper_method.as_ref(),
+        );
+        if let Some((display_name, line)) = grouped_facade {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name,
+                kind: NodeKind::METHOD,
+                line,
+                score: 112.0,
+                coverage_role: "mapper public api".to_string(),
+                producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                eligible_for_sufficiency: false,
+            });
+        } else {
+            for (name, line) in public_mapper_interfaces {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name: name,
+                    kind: NodeKind::INTERFACE,
+                    line,
+                    score: 108.0,
+                    coverage_role: "mapper public api".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            }
+            if let Some((owner, method, line)) = runtime_mapper_method.as_ref() {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name: format!("{owner}.{method}"),
+                    kind: NodeKind::METHOD,
+                    line: *line,
+                    score: 109.0,
+                    coverage_role: "mapper public api".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            }
+        }
+    }
+
+    if packet_csharp_source_has_mapping_configuration_owner(&normalized_source) {
+        for (name, line) in packet_csharp_declared_type_names(source, "class") {
+            let normalized_name = normalize_identifier(&name);
+            if normalized_name.contains("configuration")
+                && (normalized_name.contains("mapper") || normalized_name.contains("mapping"))
+            {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name: name,
+                    kind: NodeKind::CLASS,
+                    line,
+                    score: 99.0,
+                    coverage_role: "mapper configuration".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            }
+        }
+    }
+
+    if packet_csharp_source_has_type_map_lambda_plan(&normalized_source) {
+        let type_owner = packet_csharp_declared_type_names(source, "class")
+            .into_iter()
+            .find(|(name, _)| {
+                let normalized = normalize_identifier(name);
+                normalized.contains("map")
+                    && (normalized.contains("type")
+                        || normalized_source.contains("sourcetype")
+                        || normalized_source.contains("destinationtype"))
+            });
+        if let Some((owner, _)) = type_owner {
+            for (method, line) in packet_csharp_method_names(source) {
+                let normalized_method = normalize_identifier(&method);
+                if normalized_method.contains("lambda")
+                    && (normalized_method.contains("map") || source_lower.contains("mapexpression"))
+                {
+                    candidates.push(PacketGenericSourceShapeCandidate {
+                        path: path.to_path_buf(),
+                        display_name: format!("{owner}.{method}"),
+                        kind: NodeKind::METHOD,
+                        line,
+                        score: 99.0,
+                        coverage_role: "mapping execution plan".to_string(),
+                        producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                        eligible_for_sufficiency: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn packet_csharp_source_has_public_mapper_api(normalized_source: &str) -> bool {
+    normalized_source.contains("interface")
+        && normalized_source.contains("map")
+        && normalized_source.contains("source")
+        && normalized_source.contains("destination")
+        && (normalized_source.contains("mapper") || normalized_source.contains("mapping"))
+}
+
+fn packet_csharp_public_mapper_api_name(normalized_name: &str) -> bool {
+    normalized_name.contains("mapper")
+        && ![
+            "action",
+            "configuration",
+            "convention",
+            "destinationname",
+            "expression",
+            "member",
+            "operation",
+            "options",
+            "projection",
+            "source",
+        ]
+        .iter()
+        .any(|needle| normalized_name.contains(needle))
+}
+
+fn packet_csharp_runtime_mapper_method_candidate(
+    source: &str,
+    normalized_source: &str,
+) -> Option<(String, String, u32)> {
+    if !(normalized_source.contains("class")
+        && normalized_source.contains("mapper")
+        && normalized_source.contains("mapcore")
+        && normalized_source.contains("getexecutionplan"))
+    {
+        return None;
+    }
+    let owner = packet_csharp_declared_type_names(source, "class")
+        .into_iter()
+        .find_map(|(name, _)| {
+            packet_csharp_public_mapper_api_name(&normalize_identifier(&name)).then_some(name)
+        })?;
+    packet_csharp_method_names(source)
+        .into_iter()
+        .find(|(method, _)| normalize_identifier(method) == "map")
+        .map(|(method, line)| (owner, method, line))
+}
+
+fn packet_csharp_public_mapper_api_facade_group(
+    interfaces: &[(String, u32)],
+    runtime_method: Option<&(String, String, u32)>,
+) -> Option<(String, u32)> {
+    let mut names = Vec::new();
+    let mut line = u32::MAX;
+    for (name, name_line) in interfaces {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.clone());
+            line = line.min(*name_line);
+        }
+    }
+    if let Some((owner, method, method_line)) = runtime_method {
+        let display_name = format!("{owner}.{method}");
+        if !names.iter().any(|existing| existing == &display_name) {
+            names.push(display_name);
+            line = line.min(*method_line);
+        }
+    }
+    if names.len() < 2 {
+        return None;
+    }
+    Some((format!("public mapper API: {}", names.join(", ")), line))
+}
+
+fn packet_csharp_source_has_mapping_configuration_owner(normalized_source: &str) -> bool {
+    normalized_source.contains("configuration")
+        && (normalized_source.contains("configuredmaps")
+            || normalized_source.contains("resolvedmaps")
+            || normalized_source.contains("typemaps")
+            || normalized_source.contains("executionplans"))
+        && (normalized_source.contains("buildexecutionplan")
+            || normalized_source.contains("createmapper")
+            || normalized_source.contains("compilemappings"))
+}
+
+fn packet_csharp_source_has_type_map_lambda_plan(normalized_source: &str) -> bool {
+    normalized_source.contains("lambda")
+        && normalized_source.contains("map")
+        && (normalized_source.contains("sourcetype") || normalized_source.contains("source"))
+        && (normalized_source.contains("destinationtype")
+            || normalized_source.contains("destination"))
+        && (normalized_source.contains("planbuilder")
+            || normalized_source.contains("mapexpression")
+            || normalized_source.contains("expression"))
+}
+
+fn packet_csharp_declared_type_names(source: &str, keyword: &str) -> Vec<(String, u32)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if packet_source_line_is_comment_like(line) {
+                return None;
+            }
+            packet_text_after_keyword(line, keyword).and_then(|after| {
+                packet_identifier_tokens(after)
+                    .into_iter()
+                    .find(|token| !packet_csharp_modifier_token(token))
+                    .map(|token| {
+                        (
+                            token,
+                            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                        )
+                    })
+            })
+        })
+        .collect()
+}
+
+fn packet_csharp_method_names(source: &str) -> Vec<(String, u32)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if packet_source_line_is_comment_like(line) || !line.contains('(') {
+                return None;
+            }
+            let before_paren = line.split_once('(')?.0;
+            let method_prefix = before_paren
+                .rfind('<')
+                .map(|generic_start| &before_paren[..generic_start])
+                .unwrap_or(before_paren);
+            let name = packet_identifier_tokens(method_prefix)
+                .into_iter()
+                .rev()
+                .find(|token| !packet_csharp_modifier_token(token))?;
+            Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
+fn packet_csharp_modifier_token(token: &str) -> bool {
+    matches!(
+        normalize_identifier(token).as_str(),
+        "public"
+            | "private"
+            | "protected"
+            | "internal"
+            | "static"
+            | "sealed"
+            | "abstract"
+            | "partial"
+            | "readonly"
+            | "virtual"
+            | "override"
+            | "async"
+            | "new"
+            | "where"
+            | "return"
+    )
+}
+
+fn collect_runtime_formatting_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "h" | "hpp" | "hh" | "cc" | "cpp" | "cxx"
+    ) {
+        return;
+    }
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment_like(line) {
+            continue;
+        }
+        let Some((name, kind)) = packet_cpp_declared_type_name(line) else {
+            continue;
+        };
+        let normalized = normalize_identifier(&name);
+        let argument_store_shape = normalized.contains("format")
+            && (normalized.contains("arg") || normalized.contains("argument"))
+            && normalized.contains("store");
+        let failure_type_shape = normalized.contains("format")
+            && (normalized.contains("error") || normalized.contains("failure"));
+        if !argument_store_shape && !failure_type_shape {
+            continue;
+        }
+        let score = if argument_store_shape { 94.0 } else { 92.0 };
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: name,
+            kind,
+            line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            score,
+            coverage_role: if argument_store_shape {
+                "runtime format argument store".to_string()
+            } else {
+                "runtime formatting failure type".to_string()
+            },
+            producer: "packet_generic_runtime_formatting_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_cpp_declared_type_name(line: &str) -> Option<(String, NodeKind)> {
+    for (keyword, kind) in [
+        ("class", NodeKind::CLASS),
+        ("struct", NodeKind::STRUCT),
+        ("using", NodeKind::TYPEDEF),
+    ] {
+        let Some(after) = packet_text_after_keyword(line, keyword) else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "typename" | "template" | "public" | "private" | "protected" | "default"
+                )
+                || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+            {
+                continue;
+            }
+            return Some((token, kind));
+        }
+    }
+    None
+}
+
+fn packet_text_after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let lower = line.to_ascii_lowercase();
+    let index = lower.find(keyword)?;
+    let before = lower[..index].chars().last();
+    let after_index = index + keyword.len();
+    let after = lower[after_index..].chars().next();
+    if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(&line[after_index..])
+}
+
+fn packet_identifier_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for ch in input.chars() {
+        if packet_source_identifier_char(ch) {
+            token.push(ch);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn collect_css_animation_variable_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "css" {
+        return;
+    }
+    let lower = source.to_ascii_lowercase();
+    if !lower.contains(":root") || !lower.contains("--") {
+        return;
+    }
+    let custom_properties = packet_css_custom_properties(source);
+    let animation_properties = custom_properties
+        .into_iter()
+        .filter(|property| {
+            let normalized = normalize_identifier(property);
+            normalized.contains("animation")
+                || normalized.contains("animate")
+                || normalized.contains("duration")
+                || normalized.contains("delay")
+                || normalized.contains("repeat")
+        })
+        .collect::<Vec<_>>();
+    if animation_properties.is_empty() {
+        return;
+    }
+    let display_name = animation_properties
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "css custom property".to_string());
+    candidates.push(PacketGenericSourceShapeCandidate {
+        path: path.to_path_buf(),
+        display_name,
+        kind: NodeKind::CONSTANT,
+        line: packet_first_css_custom_property_line(source).unwrap_or(1),
+        score: 96.0 + animation_properties.len().min(4) as f32,
+        coverage_role: "css animation variables".to_string(),
+        producer: "packet_generic_css_variable_source_probe".to_string(),
+        eligible_for_sufficiency: true,
+    });
+}
+
+fn packet_css_custom_properties(source: &str) -> Vec<String> {
+    let mut properties = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(start) = trimmed.find("--") else {
+            continue;
+        };
+        let name = trimmed[start..]
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+            .next()
+            .unwrap_or_default();
+        if name.len() > 2 && !properties.iter().any(|existing| existing == name) {
+            properties.push(name.to_string());
+        }
+    }
+    properties
+}
+
+fn packet_first_css_custom_property_line(source: &str) -> Option<u32> {
+    source
+        .lines()
+        .position(|line| line.contains("--"))
+        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+}
+
+fn packet_source_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
 }
 
 fn collect_sql_schema_file_candidates(
@@ -10597,6 +11402,342 @@ mod tests {
             "required source probe should annotate appended anchor count: {:?}",
             answer.retrieval_trace.annotations
         );
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_receiver_method_anchors() {
+        let root = packet_temp_root("generic-source-shape-route");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/core/application.js",
+            r#"
+            service.init = function init() {
+              this.defaultConfiguration();
+              this.router = new Router();
+            };
+            service.handle = function handle(req, res, callback) {
+              this.router.handle(req, res, callback);
+            };
+            service.use = function use(fn) {
+              return this.router.use(fn);
+            };
+            service.route = function route(path) {
+              return this.router.route(path);
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/core/response.js",
+            r#"
+            reply.send = function send(body) {
+              this.set('Content-Length', body.length);
+              return this.end(body);
+            };
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Trace how a server application registers middleware/routes and handles a request through router and response helpers.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Trace how a server application registers middleware/routes and handles a request through router and response helpers.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "service.init",
+            "service.handle",
+            "service.use",
+            "service.route",
+            "reply.send",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic receiver-method source shape {expected}; got {displays:?}"
+            );
+        }
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_generic_source_shape_citations appended=")
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_runtime_formatting_type_anchors() {
+        let root = packet_temp_root("generic-source-shape-formatting");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "include/tool/base.hpp",
+            r#"
+            namespace detail {
+            struct runtime_format_arg_store {
+              void push_back();
+            };
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/dynamic.hpp",
+            r#"
+            template <typename Context> class dynamic_format_argument_store {
+            public:
+              void push_back();
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/errors.hpp",
+            r#"
+            class TOOL_EXPORT format_failure : public std::runtime_error {
+            };
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a formatting runtime turns arguments into type-erased format argument stores and reports formatting failure types.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a formatting runtime turns arguments into type-erased format argument stores and reports formatting failure types.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "runtime_format_arg_store",
+            "dynamic_format_argument_store",
+            "format_failure",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic formatting source shape {expected}; got {displays:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_csharp_mapper_plan_anchors() {
+        let root = packet_temp_root("generic-source-shape-csharp-mapper");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/RuntimeMapper.cs",
+            r#"
+            namespace ObjectMapping;
+            public interface IRuntimeMapperBase
+            {
+              TDestination Map<TSource, TDestination>(TSource source);
+              object Map(object source, Type sourceType, Type destinationType);
+            }
+            public interface IRuntimeMapper : IRuntimeMapperBase
+            {
+              IConfigurationProvider ConfigurationProvider { get; }
+            }
+            public sealed class RuntimeMapper : IRuntimeMapper
+            {
+              public TDestination Map<TSource, TDestination>(TSource source) =>
+                MapCore<TSource, TDestination>(source, default);
+              TDestination MapCore<TSource, TDestination>(TSource source, TDestination destination) =>
+                _configuration.GetExecutionPlan<TSource, TDestination>()(source, destination);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/Configuration/MappingConfiguration.cs",
+            r#"
+            namespace ObjectMapping;
+            public sealed class MappingConfiguration
+            {
+              private readonly Dictionary<TypePair, MappingPlan> _configuredMaps = new();
+              private readonly Dictionary<TypePair, MappingPlan> _resolvedMaps = new();
+              private readonly Dictionary<MapRequest, Delegate> _executionPlans = new();
+              public RuntimeMapper CreateMapper() => new(this);
+              public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) =>
+                _resolvedMaps[new(sourceType, destinationType)].MapExpression;
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/MappingPlan.cs",
+            r#"
+            namespace ObjectMapping;
+            public sealed class MappingPlan
+            {
+              public Type SourceType { get; }
+              public Type DestinationType { get; }
+              public LambdaExpression MapExpression { get; private set; }
+              internal LambdaExpression BuildMapperLambda(IGlobalMappingConfiguration configuration) =>
+                Types.ContainsGenericParameters ? null : new MappingPlanBuilder(configuration, this).BuildMapperLambda();
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.iter().any(|display| {
+                display.contains("IRuntimeMapperBase")
+                    && display.contains("IRuntimeMapper")
+                    && display.contains("RuntimeMapper.Map")
+            }),
+            "expected compact generic C# mapper facade source-shape; got {displays:?}"
+        );
+        for expected in ["MappingConfiguration", "MappingPlan.BuildMapperLambda"] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic C# mapper source-shape {expected}; got {displays:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_csharp_mapper_facade_group_survives_compact_budget() {
+        let root = packet_temp_root("generic-source-shape-csharp-mapper-facade");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/RuntimeMapper.cs",
+            r#"
+            namespace ObjectMapping;
+            public interface IRuntimeMapperBase
+            {
+              TDestination Map<TSource, TDestination>(TSource source);
+              object Map(object source, Type sourceType, Type destinationType);
+            }
+            public interface IRuntimeMapper : IRuntimeMapperBase
+            {
+              IConfigurationProvider ConfigurationProvider { get; }
+            }
+            internal interface IInternalRuntimeMapper : IRuntimeMapper
+            {
+              TDestination Map<TSource, TDestination>(TSource source, TDestination destination, ResolutionContext context);
+            }
+            public sealed class RuntimeMapper : IRuntimeMapper, IInternalRuntimeMapper
+            {
+              public TDestination Map<TSource, TDestination>(TSource source) =>
+                MapCore<TSource, TDestination>(source, default);
+              TDestination MapCore<TSource, TDestination>(TSource source, TDestination destination) =>
+                _configuration.GetExecutionPlan<TSource, TDestination>()(source, destination);
+            }
+            "#,
+        );
+
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.";
+        let filler = (0..20)
+            .map(|index| {
+                test_packet_citation(
+                    &format!("UnrelatedHelper{index}"),
+                    &format!("src/ObjectMapping/Helpers/UnrelatedHelper{index}.cs"),
+                    0.5,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut answer = packet_answer_fixture(prompt, filler);
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+        rank_packet_evidence(prompt, &mut answer);
+
+        let mut limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        limits.max_anchors = 5;
+        apply_packet_budget(
+            &root,
+            prompt,
+            PacketTaskClassDto::DataFlow,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+        );
+
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.iter().any(|display| {
+                display.contains("IRuntimeMapperBase")
+                    && display.contains("IRuntimeMapper")
+                    && display.contains("RuntimeMapper.Map")
+                    && !display.contains("IInternalRuntimeMapper")
+            }),
+            "expected compact generic mapper facade group to survive budget cap; got {displays:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_css_animation_variable_anchor() {
+        let root = packet_temp_root("generic-source-shape-css");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "styles/tokens.css",
+            r#"
+            :root {
+              --motion-duration: 250ms;
+              --motion-delay: 75ms;
+              --motion-repeat: 2;
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a stylesheet defines shared animation variables, base classes, and named keyframes.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a stylesheet defines shared animation variables, base classes, and named keyframes.",
+            &mut answer,
+        );
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "--motion-duration"
+                    && citation.kind == NodeKind::CONSTANT
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        packet_display_path(path).ends_with("styles/tokens.css")
+                    })
+            }),
+            "expected root custom-property animation variable citation; got {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

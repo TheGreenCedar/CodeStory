@@ -25,7 +25,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use codestory_contracts::api::AgentCitationDto;
+use codestory_contracts::api::{AgentCitationDto, NodeKind};
 use std::collections::HashSet;
 
 const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
@@ -178,6 +178,8 @@ impl SourceClaimProfile {
             Self::MappingConfigurationPlan => {
                 if packet_terms_indicate_mapper_configuration_plan_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_mapper_configuration_plan_claims(
+                        ctx.symbol,
+                        ctx.kind,
                         &ctx.file_name,
                         ctx.source,
                     ));
@@ -201,6 +203,7 @@ impl SourceClaimProfile {
 struct SourceClaimContext<'a> {
     source: &'a str,
     symbol: &'a str,
+    kind: NodeKind,
     path: String,
     file_name: String,
     normalized_prompt: String,
@@ -224,6 +227,7 @@ impl<'a> SourceClaimContext<'a> {
         Self {
             source,
             symbol,
+            kind: citation.kind,
             path,
             file_name,
             normalized_prompt: normalize_identifier(prompt),
@@ -1973,26 +1977,48 @@ fn packet_generic_site_build_phase_flow_claims(source: &str) -> Vec<String> {
     claims
 }
 
-fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str) -> Vec<String> {
+fn packet_generic_mapper_configuration_plan_claims(
+    symbol: &str,
+    kind: NodeKind,
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
     let file_name = file_name.to_ascii_lowercase();
     let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
+    let owner = packet_display_owner(symbol).unwrap_or_else(|| symbol.to_string());
 
-    if file_name.contains("configuration")
-        && file_name.contains("mapper")
-        && normalized_source.contains("mapper")
-        && normalized_source.contains("configuration")
-        && normalized_source.contains("configuredmaps")
-        && normalized_source.contains("resolvedmaps")
-        && normalized_source.contains("buildexecutionplan")
+    if packet_mapper_public_api_symbol(symbol, kind)
+        && normalized_source.contains("interface")
+        && normalized_source.contains("map")
+        && normalized_source.contains("source")
+        && normalized_source.contains("destination")
+        && (normalized_source.contains("mapper") || normalized_source.contains("mapping"))
     {
-        claims.push(
-            "Mapping configuration source builds and owns runtime mapping plans.".to_string(),
-        );
+        claims.push(format!(
+            "{owner} exposes public runtime mapper APIs for source-to-destination mapping."
+        ));
     }
 
-    if file_name == "mapper.cs"
-        && normalized_source.contains("classmapper")
+    if (normalize_identifier(symbol).contains("configuration")
+        || normalize_identifier(&file_name).contains("configuration"))
+        && normalized_source.contains("configuration")
+        && (normalized_source.contains("configuredmaps")
+            || normalized_source.contains("resolvedmaps")
+            || normalized_source.contains("typemaps")
+            || normalized_source.contains("executionplans"))
+        && (normalized_source.contains("buildexecutionplan")
+            || normalized_source.contains("createmapper")
+            || normalized_source.contains("compilemappings"))
+    {
+        claims.push(format!(
+            "{owner} builds and owns the mapping configuration used at runtime."
+        ));
+    }
+
+    if packet_mapper_public_api_symbol(symbol, kind)
+        && normalized_source.contains("class")
+        && normalized_source.contains("mapper")
         && normalized_source.contains("mapcore")
         && normalized_source.contains("getexecutionplan")
     {
@@ -2001,18 +2027,24 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
         );
     }
 
-    if file_name == "typemap.cs"
-        && normalized_source.contains("createmapperlambda")
-        && normalized_source.contains("planbuilder")
+    if packet_mapper_plan_symbol(symbol, &file_name)
+        && normalized_source.contains("lambda")
+        && normalized_source.contains("map")
+        && (normalized_source.contains("sourcetype") || normalized_source.contains("source"))
+        && (normalized_source.contains("destinationtype")
+            || normalized_source.contains("destination"))
+        && (normalized_source.contains("planbuilder")
+            || normalized_source.contains("mapexpression")
+            || normalized_source.contains("expression"))
     {
-        claims.push(
-            "Type-map source contributes lambda plans used by the mapping execution pipeline."
-                .to_string(),
-        );
+        claims.push(format!(
+            "{owner} contributes mapper lambda plans used by the mapping execution pipeline."
+        ));
     }
 
     if file_name.ends_with("planbuilder.cs")
-        && normalized_source.contains("createmapperlambda")
+        && normalized_source.contains("lambda")
+        && normalized_source.contains("map")
         && normalized_source.contains("createdestinationfunc")
         && normalized_source.contains("createassignmentfunc")
         && normalized_source.contains("createmapperfunc")
@@ -2024,6 +2056,39 @@ fn packet_generic_mapper_configuration_plan_claims(file_name: &str, source: &str
     }
 
     claims
+}
+
+fn packet_mapper_public_api_symbol(symbol: &str, kind: NodeKind) -> bool {
+    let normalized = normalize_identifier(symbol);
+    matches!(
+        kind,
+        NodeKind::INTERFACE | NodeKind::CLASS | NodeKind::METHOD
+    ) && normalized.contains("mapper")
+        && ![
+            "action",
+            "configuration",
+            "convention",
+            "destinationname",
+            "expression",
+            "member",
+            "operation",
+            "options",
+            "projection",
+            "source",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+fn packet_mapper_plan_symbol(symbol: &str, file_name: &str) -> bool {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_file = normalize_identifier(file_name);
+    normalized_symbol.contains("lambda")
+        || normalized_symbol.contains("typemap")
+        || normalized_symbol.contains("mappingplan")
+        || normalized_file.contains("typemap")
+        || normalized_file.contains("mappingplan")
+        || normalized_file.contains("planbuilder")
 }
 
 #[cfg(test)]
@@ -2413,6 +2478,79 @@ mod tests {
                 .any(|claim| claim.contains("ending the response")),
             "metadata-only helpers must not claim terminal response writes: {metadata_only_claims:?}"
         );
+    }
+
+    #[test]
+    fn mapper_plan_source_claims_use_generic_object_mapping_shapes() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.";
+        let cases = [
+            (
+                "IRuntimeMapper",
+                NodeKind::INTERFACE,
+                "src/ObjectMapping/RuntimeMapper.cs",
+                r#"
+                public interface IRuntimeMapperBase
+                {
+                    TDestination Map<TSource, TDestination>(TSource source);
+                    object Map(object source, Type sourceType, Type destinationType);
+                }
+                public interface IRuntimeMapper : IRuntimeMapperBase
+                {
+                    IConfigurationProvider ConfigurationProvider { get; }
+                }
+                public sealed class RuntimeMapper : IRuntimeMapper
+                {
+                    TDestination MapCore<TSource, TDestination>(TSource source, TDestination destination) =>
+                        _configuration.GetExecutionPlan<TSource, TDestination>()(source, destination);
+                }
+                "#,
+                "IRuntimeMapper exposes public runtime mapper APIs for source-to-destination mapping.",
+            ),
+            (
+                "MappingConfiguration",
+                NodeKind::CLASS,
+                "src/ObjectMapping/Configuration/MappingConfiguration.cs",
+                r#"
+                public sealed class MappingConfiguration
+                {
+                    private readonly Dictionary<TypePair, MappingPlan> _configuredMaps = new();
+                    private readonly Dictionary<TypePair, MappingPlan> _resolvedMaps = new();
+                    private readonly Dictionary<MapRequest, Delegate> _executionPlans = new();
+                    public RuntimeMapper CreateMapper() => new(this);
+                    public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) =>
+                        _resolvedMaps[new(sourceType, destinationType)].MapExpression;
+                }
+                "#,
+                "MappingConfiguration builds and owns the mapping configuration used at runtime.",
+            ),
+            (
+                "MappingPlan.BuildMapperLambda",
+                NodeKind::METHOD,
+                "src/ObjectMapping/MappingPlan.cs",
+                r#"
+                public sealed class MappingPlan
+                {
+                    public Type SourceType { get; }
+                    public Type DestinationType { get; }
+                    public LambdaExpression MapExpression { get; private set; }
+                    internal LambdaExpression BuildMapperLambda(IGlobalMappingConfiguration configuration) =>
+                        Types.ContainsGenericParameters ? null : new MappingPlanBuilder(configuration, this).BuildMapperLambda();
+                }
+                "#,
+                "MappingPlan contributes mapper lambda plans used by the mapping execution pipeline.",
+            ),
+        ];
+
+        for (symbol, kind, path, source, expected) in cases {
+            let mut citation = test_packet_citation(symbol, path);
+            citation.kind = kind;
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected generic mapper source claim `{expected}` for {symbol}; got {claims:?}"
+            );
+        }
     }
 
     #[test]

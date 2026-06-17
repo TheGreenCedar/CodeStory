@@ -660,6 +660,7 @@ fn promote_distinct_required_probe_matches(
 
 fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
     match normalize_identifier(query).as_str() {
+        "mapperpublicapi" | "mapperruntimeapi" | "mappingruntimeentrypoint" => Some(3),
         "sqlschemascripts" | "schemadialectscripts" => Some(3),
         _ => None,
     }
