@@ -3945,7 +3945,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_requires_planned_flow_probe_coverage() {
+    fn packet_sufficiency_treats_covered_planned_flow_probes_as_hints() {
         let (_answer, sufficiency) = build_sufficient_packet_fixture(
             "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.",
             PacketTaskClassDto::ArchitectureExplanation,
@@ -3969,22 +3969,22 @@ mod tests {
             ],
         );
 
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("exec session")
-                    && gap.contains("exec command")
-                    && gap.contains("turn start")),
-            "required flow probes should be named in sufficiency gaps: {sufficiency:?}"
+                .all(|gap| !gap.contains("exec session")
+                    && !gap.contains("exec command")
+                    && !gap.contains("turn start")),
+            "covered flow roles should keep planned probe strings as nonblocking hints: {sufficiency:?}"
         );
         assert!(
             sufficiency
                 .follow_up_commands
                 .iter()
-                .any(|command| command.contains("--query 'exec session'")),
-            "missing required probes should become targeted follow-up searches: {sufficiency:?}"
+                .all(|command| !command.contains("--query 'exec session'")),
+            "sufficient packets should not emit follow-up searches for covered probe hints: {sufficiency:?}"
         );
     }
 
@@ -4056,8 +4056,10 @@ mod tests {
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("pattern") && gap.contains("submit prevent default")),
-            "selected planned role probes should become sufficiency gaps: {sufficiency:?}"
+                .any(|gap| gap.contains("submit prevent default")
+                    && !gap.contains("pattern")
+                    && !gap.contains("validity state")),
+            "only selected planned probes for still-missing roles should become sufficiency gaps: {sufficiency:?}"
         );
     }
 
@@ -4186,7 +4188,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_rejects_module_facade_for_concrete_file_probe() {
+    fn packet_sufficiency_treats_concrete_file_probe_as_hint_when_roles_are_covered() {
         let _eval_probes = EvalProbesGuard::enabled();
         let (_answer, sufficiency) = build_sufficient_packet_fixture(
             "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.",
@@ -4215,13 +4217,13 @@ mod tests {
             ],
         );
 
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("exec_events")),
-            "facade module declaration should not satisfy the concrete exec_events file probe: {sufficiency:?}"
+                .all(|gap| !gap.contains("exec_events")),
+            "concrete file probes should be nonblocking hints when required flow roles are covered: {sufficiency:?}"
         );
     }
 
@@ -7379,7 +7381,7 @@ mod tests {
     }
 
     #[test]
-    fn architecture_sufficiency_reports_missing_flow_role_coverage() {
+    fn architecture_sufficiency_does_not_invent_flow_roles_without_requirements() {
         let question = "Explain the module relationships.";
         let citations = vec![
             test_packet_citation("Alpha", "src/alpha.rs", 0.9),
@@ -7397,8 +7399,8 @@ mod tests {
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("flow-role coverage")),
-            "architecture sufficiency should explain missing causal flow-role coverage: {sufficiency:?}"
+                .all(|gap| !gap.contains("flow-role coverage")),
+            "architecture sufficiency should only report flow-role gaps from shared requirements: {sufficiency:?}"
         );
     }
 

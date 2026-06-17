@@ -11,11 +11,11 @@
 
 ## Phase 2: Make Sufficiency Consume Flow Requirements
 
-- [ ] 2. Replace duplicate sufficiency flow-role logic
-  - [ ] 2.1 Extend `FlowRequirement` with a stable `role_id` and human label if needed.
-  - [ ] 2.2 Make `packet_sufficiency.rs` consume `packet_flow_requirements_for_terms` directly.
-  - [ ] 2.3 Delete the local `PacketFlowRole` triad once equivalent tests pass.
-  - [ ] 2.4 Treat missing probe queries as follow-up hints unless their required role is still missing.
+- [x] 2. Replace duplicate sufficiency flow-role logic
+  - [x] 2.1 Extend `FlowRequirement` with a stable `role_id` and human label if needed.
+  - [x] 2.2 Make `packet_sufficiency.rs` consume `packet_flow_requirements_for_terms` directly.
+  - [x] 2.3 Delete the local `PacketFlowRole` triad once equivalent tests pass.
+  - [x] 2.4 Treat missing probe queries as follow-up hints unless their required role is still missing.
   - _Requirements: 1.1, 1.3, 6.3_
 
 - [ ] 3. Demote generic navigation claims

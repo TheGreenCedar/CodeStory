@@ -1,6 +1,9 @@
 use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
+use crate::agent::packet_flow_requirements::{
+    CoverageMode, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
+};
 use crate::agent::packet_plan::packet_symbol_probe_queries;
 use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
@@ -111,6 +114,12 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
     let missing_required_flow_roles =
         packet_missing_required_flow_roles(question, task_class, &sufficiency_claims);
     let has_required_flow_roles = missing_required_flow_roles.is_empty();
+    let blocking_missing_probe_queries = packet_blocking_missing_probe_queries(
+        question,
+        task_class,
+        &missing_required_probe_queries,
+        &missing_required_flow_roles,
+    );
     let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
         answer,
         budget,
@@ -128,7 +137,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_minimum_claim_families,
         has_required_flow_roles,
         has_sufficiency_blocking_budget_omission,
-        missing_required_probe_queries: &missing_required_probe_queries,
+        missing_required_probe_queries: &blocking_missing_probe_queries,
         unresolved_sidecar_queries: &unresolved_sidecar_queries,
     });
 
@@ -147,22 +156,27 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_minimum_claim_families,
         has_required_flow_roles,
         has_sufficiency_blocking_budget_omission,
-        &missing_required_probe_queries,
+        &blocking_missing_probe_queries,
         &missing_required_flow_roles,
         &unresolved_sidecar_queries,
     );
+    let follow_up_probe_queries = if blocking_missing_probe_queries.is_empty() {
+        &missing_required_probe_queries
+    } else {
+        &blocking_missing_probe_queries
+    };
     let follow_up_commands = packet_follow_up_commands(
         project_root,
         question,
         status,
         budget,
-        &missing_required_probe_queries,
+        follow_up_probe_queries,
         targeted_follow_up_queries,
     );
     let coverage_report = packet_coverage_report(
         &sufficiency_claims,
         &missing_required_flow_roles,
-        &missing_required_probe_queries,
+        &blocking_missing_probe_queries,
         &unresolved_sidecar_queries,
         budget,
         has_sufficiency_blocking_budget_omission,
@@ -270,7 +284,7 @@ fn packet_sufficiency_gaps(
     has_required_flow_roles: bool,
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &[String],
-    missing_required_flow_roles: &[&'static str],
+    missing_required_flow_roles: &[FlowRole],
     unresolved_sidecar_queries: &[String],
 ) -> Vec<String> {
     let mut gaps = Vec::new();
@@ -305,10 +319,14 @@ fn packet_sufficiency_gaps(
         ));
     }
     if !answer.citations.is_empty() && !has_required_flow_roles {
+        let missing_labels = missing_required_flow_roles
+            .iter()
+            .map(|role| role.label())
+            .collect::<Vec<_>>()
+            .join(", ");
         gaps.push(format!(
             "{:?} packet missed required flow-role coverage: {}.",
-            task_class,
-            missing_required_flow_roles.join(", ")
+            task_class, missing_labels
         ));
     }
     if !missing_required_probe_queries.is_empty() {
@@ -693,7 +711,7 @@ pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bo
 
 fn packet_coverage_report(
     sufficiency_claims: &[PacketClaimDto],
-    missing_required_flow_roles: &[&'static str],
+    missing_required_flow_roles: &[FlowRole],
     missing_required_probe_queries: &[String],
     unresolved_sidecar_queries: &[String],
     budget: &PacketBudgetDto,
@@ -712,7 +730,7 @@ fn packet_coverage_report(
         .collect::<Vec<_>>();
     let missing = missing_required_flow_roles
         .iter()
-        .map(|role| (*role).to_string())
+        .map(|role| role.role_id().to_string())
         .chain(missing_required_probe_queries.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -729,29 +747,18 @@ fn packet_coverage_report(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PacketFlowRole {
-    EntryPoint,
-    Handoff,
-    BoundaryOrState,
-}
-
-impl PacketFlowRole {
-    fn label(self) -> &'static str {
-        match self {
-            Self::EntryPoint => "entrypoint/registration",
-            Self::Handoff => "handoff/dispatch",
-            Self::BoundaryOrState => "boundary/effect/state",
-        }
-    }
-}
-
 fn packet_missing_required_flow_roles(
     question: &str,
     task_class: PacketTaskClassDto,
     supported_claims: &[PacketClaimDto],
-) -> Vec<&'static str> {
+) -> Vec<FlowRole> {
     let question_terms = packet_probe_terms(question);
+    let requirements = packet_flow_requirements_for_terms(&question_terms, task_class);
+    let required = packet_required_flow_roles(&requirements);
+    if required.is_empty() {
+        return Vec::new();
+    }
+
     let site_build_flow = packet_terms_indicate_site_build_phase_flow(&question_terms);
     let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&question_terms);
     let shell_install_dispatch_flow =
@@ -767,23 +774,6 @@ fn packet_missing_required_flow_roles(
     let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
     let runtime_formatting_flow = packet_terms_indicate_runtime_formatting_flow(&question_terms);
     let string_predicate_flow = packet_terms_indicate_string_predicate_flow(&question_terms);
-    let required = packet_required_flow_roles(
-        task_class,
-        site_build_flow,
-        shell_install_dispatch_flow,
-        url_session_request_flow,
-        form_validation_flow,
-        server_request_dispatch_flow,
-        html_css_template_structure_flow,
-        stylesheet_animation_flow,
-        sql_schema_flow,
-        runtime_formatting_flow,
-        string_predicate_flow,
-    );
-    if required.is_empty() {
-        return Vec::new();
-    }
-
     let mut covered = HashSet::new();
     for claim in supported_claims {
         for role in packet_flow_roles_for_claim(
@@ -807,189 +797,58 @@ fn packet_missing_required_flow_roles(
         .iter()
         .copied()
         .filter(|role| !covered.contains(role))
-        .map(PacketFlowRole::label)
         .collect()
 }
 
-fn packet_required_flow_roles(
+fn packet_required_flow_roles(requirements: &[FlowRequirement]) -> Vec<FlowRole> {
+    let mut required = Vec::new();
+    for requirement in requirements
+        .iter()
+        .filter(|requirement| flow_requirement_blocks_sufficiency(requirement))
+    {
+        if !required
+            .iter()
+            .any(|role: &FlowRole| role.role_id() == requirement.role_id())
+        {
+            required.push(requirement.role);
+        }
+    }
+    required
+}
+
+fn flow_requirement_blocks_sufficiency(requirement: &FlowRequirement) -> bool {
+    !matches!(requirement.coverage_mode, CoverageMode::DiagnosticOnly)
+}
+
+fn packet_blocking_missing_probe_queries(
+    question: &str,
     task_class: PacketTaskClassDto,
-    site_build_flow: bool,
-    shell_install_dispatch_flow: bool,
-    url_session_request_flow: bool,
-    form_validation_flow: bool,
-    server_request_dispatch_flow: bool,
-    html_css_template_structure_flow: bool,
-    stylesheet_animation_flow: bool,
-    sql_schema_flow: bool,
-    runtime_formatting_flow: bool,
-    string_predicate_flow: bool,
-) -> &'static [PacketFlowRole] {
-    if shell_install_dispatch_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::RouteTracing => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
+    missing_required_probe_queries: &[String],
+    missing_required_flow_roles: &[FlowRole],
+) -> Vec<String> {
+    if missing_required_probe_queries.is_empty() || missing_required_flow_roles.is_empty() {
+        return Vec::new();
     }
 
-    if url_session_request_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::RouteTracing => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
+    let missing_role_ids = missing_required_flow_roles
+        .iter()
+        .map(|role| role.role_id())
+        .collect::<HashSet<_>>();
+    let question_terms = packet_probe_terms(question);
+    let blocking_query_seeds = packet_flow_requirements_for_terms(&question_terms, task_class)
+        .into_iter()
+        .filter(|requirement| {
+            flow_requirement_blocks_sufficiency(requirement)
+                && missing_role_ids.contains(requirement.role_id())
+        })
+        .flat_map(|requirement| requirement.query_seeds.iter().copied())
+        .collect::<HashSet<_>>();
 
-    if form_validation_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if server_request_dispatch_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::RouteTracing => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if html_css_template_structure_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if stylesheet_animation_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if sql_schema_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if runtime_formatting_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if string_predicate_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    if site_build_flow {
-        return match task_class {
-            PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::RouteTracing => &[
-                PacketFlowRole::EntryPoint,
-                PacketFlowRole::Handoff,
-                PacketFlowRole::BoundaryOrState,
-            ],
-            PacketTaskClassDto::BugLocalization
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::EditPlanning => &[],
-        };
-    }
-
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
-            PacketFlowRole::EntryPoint,
-            PacketFlowRole::Handoff,
-            PacketFlowRole::BoundaryOrState,
-        ],
-        PacketTaskClassDto::RouteTracing => &[PacketFlowRole::EntryPoint, PacketFlowRole::Handoff],
-        PacketTaskClassDto::BugLocalization
-        | PacketTaskClassDto::ChangeImpact
-        | PacketTaskClassDto::SymbolOwnership
-        | PacketTaskClassDto::EditPlanning => &[],
-    }
+    missing_required_probe_queries
+        .iter()
+        .filter(|query| blocking_query_seeds.contains(query.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn packet_flow_roles_for_claim(
@@ -1005,7 +864,7 @@ fn packet_flow_roles_for_claim(
     sql_schema_flow: bool,
     runtime_formatting_flow: bool,
     string_predicate_flow: bool,
-) -> HashSet<PacketFlowRole> {
+) -> HashSet<FlowRole> {
     let mut roles = HashSet::new();
     let lower = claim.claim.to_ascii_lowercase();
     let normalized = normalize_identifier(&claim.claim);
@@ -1015,18 +874,18 @@ fn packet_flow_roles_for_claim(
             && contains_any(&normalized, &["constructs", "processes"])
             && normalized.contains("site")
         {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("siteprocess")
             && contains_any(&normalized, &["read", "generate", "render", "write"])
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
         if (normalized.contains("reader") && normalized.contains("read"))
             || (normalized.contains("renderer") && normalized.contains("render"))
             || (normalized.contains("sitewrite") || normalized.contains("writephases"))
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TerminalBoundary);
         }
     }
 
@@ -1034,14 +893,14 @@ fn packet_flow_roles_for_claim(
         if (normalized.contains("mapper") || normalized.contains("objectmapping"))
             && normalized.contains("entrypoint")
         {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("mappingconfiguration")
             && (normalized.contains("configuration")
                 || normalized.contains("runtime")
                 || normalized.contains("plans"))
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
         if (normalized.contains("typemap") && normalized.contains("plan"))
             || normalized.contains("typemapsource")
@@ -1049,10 +908,10 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("planbuilder")
             || normalized.contains("executionpipeline")
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
         if normalized.contains("expressionplans") || normalized.contains("mappingconfiguration") {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
     }
 
@@ -1060,7 +919,7 @@ fn packet_flow_roles_for_claim(
         if normalized.contains("installsh")
             && (normalized.contains("bootstrap") || normalized.contains("sourced"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("dispatcher")
             || normalized.contains("dispatch")
@@ -1068,7 +927,7 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("downloadhelper")
             || normalized.contains("downloadassets")
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
         if normalized.contains("bashcompletion")
             || normalized.contains("completion")
@@ -1076,7 +935,7 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("alreadyactive")
             || normalized.contains("configurednodeversion")
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TerminalBoundary);
         }
     }
 
@@ -1084,14 +943,14 @@ fn packet_flow_roles_for_claim(
         if normalized.contains("sessionrequest")
             && (normalized.contains("creates") || normalized.contains("requestobjects"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("requestresume")
             || normalized.contains("resumes")
             || normalized.contains("urlsessiontask")
             || normalized.contains("eagerexecution")
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
         if normalized.contains("validation")
             || normalized.contains("requestvalidation")
@@ -1101,7 +960,7 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("callback")
             || normalized.contains("callbacks")
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Dispatch);
         }
         if normalized.contains("delegatecallback")
             || normalized.contains("delegatecallbacks")
@@ -1109,7 +968,7 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("urlsessioncallbacks")
             || (normalized.contains("delegate") && normalized.contains("callback"))
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
     }
 
@@ -1120,14 +979,13 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("formvalidationexamples"))
             && contains_any(&normalized, &["required", "pattern", "min", "max"])
         {
-            roles.insert(PacketFlowRole::EntryPoint);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TransformOrValidate);
         }
         if normalized.contains("custom")
             && normalized.contains("validation")
             && contains_any(&normalized, &["browser", "defaultui", "ui"])
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TransformOrValidate);
         }
         if normalized.contains("submit")
             && contains_any(
@@ -1135,8 +993,7 @@ fn packet_flow_roles_for_claim(
                 &["prevent", "prevents", "submission", "invalid"],
             )
         {
-            roles.insert(PacketFlowRole::Handoff);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TerminalBoundary);
         }
         if normalized.contains("validitystate")
             || (normalized.contains("validity")
@@ -1152,33 +1009,31 @@ fn packet_flow_roles_for_claim(
                     ],
                 ))
         {
-            roles.insert(PacketFlowRole::Handoff);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TransformOrValidate);
         }
     }
 
     if server_request_dispatch_flow {
         if contains_all(&normalized, &["wsgi", "app"]) && normalized.contains("entrypoint") {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Registration);
         }
         if contains_all(&normalized, &["full", "dispatch", "request"])
             && contains_any(&normalized, &["finalization", "finalize"])
             && contains_any(&normalized, &["preprocess", "exception", "wrap"])
         {
-            roles.insert(PacketFlowRole::Handoff);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Dispatch);
+            roles.insert(FlowRole::TerminalBoundary);
         }
         if contains_all(&normalized, &["dispatch", "request", "view", "function"])
             && !normalized.contains("full")
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
         if (normalized.contains("routedecorator") && normalized.contains("registersviewfunctions"))
             || (normalized.contains("routeregistrationdecorator")
                 && normalized.contains("urlrules"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Registration);
         }
     }
 
@@ -1186,29 +1041,27 @@ fn packet_flow_roles_for_claim(
         if normalized.contains("appshell")
             && (normalized.contains("divapp") || normalized.contains("modulescript"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("roottypography")
             || normalized.contains("colorscheme")
             || normalized.contains("bodylayout")
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
         if normalized.contains("appconstrains")
             || (normalized.contains("mountedapplication") && normalized.contains("padding"))
         {
-            roles.insert(PacketFlowRole::Handoff);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
         if normalized.contains("logo")
             && normalized.contains("button")
             && contains_any(&normalized, &["hover", "focus", "transition"])
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
         if normalized.contains("preferscolorschemelight") || normalized.contains("mediaquery") {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
     }
 
@@ -1217,13 +1070,13 @@ fn packet_flow_roles_for_claim(
             || (normalized.contains("imports") && normalized.contains("animationfiles"))
             || normalized.contains("baseclass")
         {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("imports")
             || normalized.contains("animationname")
             || normalized.contains("matchingkeyframes")
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Configuration);
         }
         if normalized.contains("customproperties")
             || normalized.contains("duration")
@@ -1231,7 +1084,7 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("repeat")
             || normalized.contains("keyframes")
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::Configuration);
         }
     }
 
@@ -1241,20 +1094,19 @@ fn packet_flow_roles_for_claim(
                 || normalized.contains("tables")
                 || normalized.contains("createtable"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::StateOrStorage);
         }
         if normalized.contains("rowsreference")
             || normalized.contains("foreignkey")
             || (normalized.contains("reference") && normalized.contains("rows"))
         {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Configuration);
         }
         if normalized.contains("sqldialect")
             || normalized.contains("schemascripts")
             || normalized.contains("dialectscripts")
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::StateOrStorage);
         }
     }
 
@@ -1267,8 +1119,7 @@ fn packet_flow_roles_for_claim(
             || (normalized.contains("runtimeformatting")
                 && normalized.contains("centralruntimeargumentpath"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::TransformOrValidate);
         }
         if (normalized.contains("formatto")
             || normalized.contains("outputiterator")
@@ -1277,18 +1128,16 @@ fn packet_flow_roles_for_claim(
                 || normalized.contains("formattedoutput")
                 || normalized.contains("output"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
-            roles.insert(PacketFlowRole::Handoff);
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::TerminalBoundary);
         }
         if normalized.contains("buffer") && normalized.contains("append") {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::StateOrStorage);
         }
         if normalized.contains("formaterror")
             || normalized.contains("formattingfailures")
             || normalized.contains("systemerrors")
         {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::ErrorOrFallback);
         }
     }
 
@@ -1297,10 +1146,10 @@ fn packet_flow_roles_for_claim(
             || normalized.contains("strings")
             || (normalized.contains("charsequence") && normalized.contains("utils"))
         {
-            roles.insert(PacketFlowRole::EntryPoint);
+            roles.insert(FlowRole::Entrypoint);
         }
         if normalized.contains("delegates") || normalized.contains("regionmatches") {
-            roles.insert(PacketFlowRole::Handoff);
+            roles.insert(FlowRole::Dispatch);
         }
         if contains_any(
             &normalized,
@@ -1315,7 +1164,7 @@ fn packet_flow_roles_for_claim(
                 "casesensitive",
             ],
         ) {
-            roles.insert(PacketFlowRole::BoundaryOrState);
+            roles.insert(FlowRole::StateOrStorage);
         }
     }
 
@@ -1340,7 +1189,7 @@ fn packet_flow_roles_for_claim(
             "apis",
         ],
     ) {
-        roles.insert(PacketFlowRole::EntryPoint);
+        insert_generic_entrypoint_roles(&mut roles);
     }
     if contains_any(
         &normalized,
@@ -1373,7 +1222,7 @@ fn packet_flow_roles_for_claim(
             "mapping",
         ],
     ) {
-        roles.insert(PacketFlowRole::Handoff);
+        insert_generic_dispatch_roles(&mut roles);
     }
     if contains_any(
         &normalized,
@@ -1414,7 +1263,7 @@ fn packet_flow_roles_for_claim(
         ],
     ) || lower.contains("side effect")
     {
-        roles.insert(PacketFlowRole::BoundaryOrState);
+        insert_generic_boundary_roles(&mut roles);
     }
 
     for citation in &claim.citations {
@@ -1425,7 +1274,7 @@ fn packet_flow_roles_for_claim(
             | Some(PacketEvidenceRole::RouteHandling)
             | Some(PacketEvidenceRole::CollectionConfiguration)
             | Some(PacketEvidenceRole::AppServerRequestProtocol) => {
-                roles.insert(PacketFlowRole::EntryPoint);
+                insert_generic_entrypoint_roles(&mut roles);
             }
             Some(PacketEvidenceRole::RequestDispatch)
             | Some(PacketEvidenceRole::CommandDispatch)
@@ -1437,7 +1286,7 @@ fn packet_flow_roles_for_claim(
             | Some(PacketEvidenceRole::IndexingWorkQueue)
             | Some(PacketEvidenceRole::BufferedIo)
             | Some(PacketEvidenceRole::InterceptorManagement) => {
-                roles.insert(PacketFlowRole::Handoff);
+                insert_generic_dispatch_roles(&mut roles);
             }
             _ => {}
         }
@@ -1456,7 +1305,7 @@ fn packet_flow_roles_for_claim(
             | Some(PacketEvidenceRole::SqlRelationshipConstraint)
             | Some(PacketEvidenceRole::SqlSchemaFile)
             | Some(PacketEvidenceRole::CandidateFileConstruction) => {
-                roles.insert(PacketFlowRole::BoundaryOrState);
+                insert_generic_boundary_roles(&mut roles);
             }
             _ => {}
         }
@@ -1464,14 +1313,13 @@ fn packet_flow_roles_for_claim(
         if sql_schema_flow {
             match packet_evidence_role(citation) {
                 Some(PacketEvidenceRole::SqlTableDefinition) => {
-                    roles.insert(PacketFlowRole::EntryPoint);
-                    roles.insert(PacketFlowRole::BoundaryOrState);
+                    roles.insert(FlowRole::StateOrStorage);
                 }
                 Some(PacketEvidenceRole::SqlRelationshipConstraint) => {
-                    roles.insert(PacketFlowRole::Handoff);
+                    roles.insert(FlowRole::Configuration);
                 }
                 Some(PacketEvidenceRole::SqlSchemaFile) => {
-                    roles.insert(PacketFlowRole::BoundaryOrState);
+                    roles.insert(FlowRole::StateOrStorage);
                 }
                 _ => {}
             }
@@ -1481,9 +1329,32 @@ fn packet_flow_roles_for_claim(
     roles
 }
 
+fn insert_generic_entrypoint_roles(roles: &mut HashSet<FlowRole>) {
+    roles.insert(FlowRole::Entrypoint);
+    roles.insert(FlowRole::Registration);
+}
+
+fn insert_generic_dispatch_roles(roles: &mut HashSet<FlowRole>) {
+    roles.insert(FlowRole::Dispatch);
+}
+
+fn insert_generic_boundary_roles(roles: &mut HashSet<FlowRole>) {
+    roles.insert(FlowRole::Configuration);
+    roles.insert(FlowRole::StateOrStorage);
+    roles.insert(FlowRole::TerminalBoundary);
+    roles.insert(FlowRole::ErrorOrFallback);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::{
+        AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentResponseSectionDto,
+        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
+        NodeKind, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
+    };
+    use std::path::Path;
 
     fn claim(text: &str) -> PacketClaimDto {
         PacketClaimDto {
@@ -1492,6 +1363,158 @@ mod tests {
             coverage_role: None,
             eligible_for_sufficiency: None,
         }
+    }
+
+    fn cited_anchor(name: &str) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(name.to_string()),
+            display_name: name.to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some(format!("src/{name}.rs")),
+            line: Some(1),
+            score: 1.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn answer_fixture(question: &str) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "packet-sufficiency-test".to_string(),
+            prompt: question.to_string(),
+            summary: "Covered by cited anchors.".to_string(),
+            freshness: None,
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "Covered by cited anchors.".to_string(),
+                }],
+            }],
+            citations: vec![
+                cited_anchor("first"),
+                cited_anchor("second"),
+                cited_anchor("third"),
+            ],
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "packet-sufficiency-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                annotations: Vec::new(),
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        }
+    }
+
+    fn budget_fixture() -> PacketBudgetDto {
+        PacketBudgetDto {
+            requested: PacketBudgetModeDto::Standard,
+            limits: PacketBudgetLimitsDto {
+                max_anchors: 16,
+                max_files: 16,
+                max_snippets: 16,
+                max_trail_edges: 32,
+                max_output_bytes: 32_000,
+            },
+            used: PacketBudgetUsageDto {
+                anchors: 3,
+                files: 3,
+                snippets: 0,
+                trail_edges: 0,
+                output_bytes: 512,
+            },
+            truncated: false,
+            omitted_sections: Vec::new(),
+            next_deeper_command: None,
+        }
+    }
+
+    #[test]
+    fn covered_flow_roles_make_missing_probe_queries_follow_up_hints() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "The form validation examples use native required, pattern, min, and max constraints.",
+            ),
+            claim("Submit handlers prevent submission when the form is invalid."),
+            claim("Custom error rendering branches on ValidityState fields to choose messages."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec![
+                "native form constraints".to_string(),
+                "constraint validation".to_string(),
+                "submit prevent default".to_string(),
+            ],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(sufficiency.follow_up_commands.is_empty());
+        assert!(
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report.missing.is_empty()),
+            "covered flow roles should keep missing exact probe strings out of blocking coverage: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn missing_flow_role_keeps_matching_probe_query_blocking() {
+        let question = "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "full_dispatch_request wraps preprocessing, dispatch, exception handling, and response finalization.",
+            ),
+            claim("dispatch_request invokes the view function selected by URL matching."),
+            claim("The response finalization path returns control to the server."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec!["route registration".to_string()],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "registration"));
+        assert!(report.missing.iter().any(|gap| gap == "route registration"));
     }
 
     #[test]
@@ -1514,13 +1537,13 @@ mod tests {
         );
 
         let route_missing = packet_missing_required_flow_roles(
-            "Trace how route registration reaches request handler dispatch through a router.",
+            "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.",
             PacketTaskClassDto::RouteTracing,
             &claims,
         );
         assert!(
-            !route_missing.is_empty(),
-            "ordinary route tracing should still require route-flow roles"
+            route_missing.contains(&FlowRole::Registration),
+            "server request tracing should still require request registration roles: {route_missing:?}"
         );
     }
 

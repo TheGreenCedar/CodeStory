@@ -27,6 +27,34 @@ pub(crate) enum FlowRole {
     ErrorOrFallback,
 }
 
+impl FlowRole {
+    pub(crate) const fn role_id(self) -> &'static str {
+        match self {
+            Self::Entrypoint => "entrypoint",
+            Self::Registration => "registration",
+            Self::Configuration => "configuration",
+            Self::StateOrStorage => "state_or_storage",
+            Self::Dispatch => "dispatch",
+            Self::TransformOrValidate => "transform_or_validate",
+            Self::TerminalBoundary => "terminal_boundary",
+            Self::ErrorOrFallback => "error_or_fallback",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Entrypoint => "entrypoint",
+            Self::Registration => "registration",
+            Self::Configuration => "configuration",
+            Self::StateOrStorage => "state/storage",
+            Self::Dispatch => "dispatch",
+            Self::TransformOrValidate => "transform/validate",
+            Self::TerminalBoundary => "terminal boundary",
+            Self::ErrorOrFallback => "error/fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoverageMode {
     RequiresResolvedSourceOrGraph,
@@ -41,6 +69,12 @@ pub(crate) struct FlowRequirement {
     pub role: FlowRole,
     pub query_seeds: &'static [&'static str],
     pub coverage_mode: CoverageMode,
+}
+
+impl FlowRequirement {
+    pub(crate) const fn role_id(&self) -> &'static str {
+        self.role.role_id()
+    }
 }
 
 pub(crate) fn packet_flow_requirements_for_terms(
