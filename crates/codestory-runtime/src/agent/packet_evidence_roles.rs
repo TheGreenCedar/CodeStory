@@ -32,6 +32,7 @@ pub(crate) enum PacketEvidenceRole {
     PersistenceAndSearchProjection,
     SymbolExtraction,
     RouteHandling,
+    BufferedIo,
     CollectionConfiguration,
     SourceEvidence,
 }
@@ -65,6 +66,7 @@ impl PacketEvidenceRole {
             Self::PersistenceAndSearchProjection => "persistence and search projection",
             Self::SymbolExtraction => "symbol extraction",
             Self::RouteHandling => "route handling",
+            Self::BufferedIo => "buffered io",
             Self::CollectionConfiguration => "collection configuration",
             Self::SourceEvidence => "source evidence",
         }
@@ -221,9 +223,12 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         Some(PacketEvidenceRole::SymbolExtraction)
     } else if display.contains("route")
         || display.contains("router")
+        || packet_display_or_path_is_route_dispatch(&normalized_display, &path)
         || packet_path_is_route_like(&path)
     {
         Some(PacketEvidenceRole::RouteHandling)
+    } else if packet_display_or_path_is_buffered_io(&normalized_display, &path) {
+        Some(PacketEvidenceRole::BufferedIo)
     } else if path.contains("/collections/") {
         Some(PacketEvidenceRole::CollectionConfiguration)
     } else if matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
@@ -257,6 +262,56 @@ fn packet_path_is_route_like(path: &str) -> bool {
         || normalized_path.contains("/route.")
         || normalized_path.ends_with("/route.ts")
         || normalized_path.ends_with("/route.tsx")
+}
+
+fn packet_display_or_path_is_route_dispatch(normalized_display: &str, path: &str) -> bool {
+    if normalized_display.contains("add") && normalized_display.contains("route") {
+        return true;
+    }
+    if normalized_display.contains("handle")
+        && (normalized_display.contains("request") || normalized_display.contains("http"))
+    {
+        return true;
+    }
+    if normalized_display.contains("combine") && normalized_display.contains("handler") {
+        return true;
+    }
+    normalized_display.ends_with("next") && packet_file_stem(path).contains("context")
+}
+
+fn packet_display_or_path_is_buffered_io(normalized_display: &str, path: &str) -> bool {
+    let file_stem = packet_file_stem(path);
+    let display_has_buffer = normalized_display.contains("buffer");
+    let display_has_io_peer = normalized_display.contains("source")
+        || normalized_display.contains("sink")
+        || normalized_display.contains("read")
+        || normalized_display.contains("write")
+        || normalized_display.contains("emit")
+        || normalized_display.contains("flush");
+    if display_has_buffer && (display_has_io_peer || file_stem.contains("buffer")) {
+        return true;
+    }
+    if matches!(
+        file_stem.as_str(),
+        "buffer" | "bufferedsource" | "bufferedsink"
+    ) {
+        return true;
+    }
+    matches!(normalized_display, "source" | "sink")
+        && matches!(file_stem.as_str(), "source" | "sink")
+}
+
+fn packet_file_stem(path: &str) -> String {
+    let file_name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path);
+    file_name
+        .split('.')
+        .next()
+        .map(normalize_identifier)
+        .unwrap_or_default()
 }
 
 fn display_is_command_entrypoint(display: &str, normalized_display: &str, path: &str) -> bool {
@@ -294,4 +349,67 @@ fn path_contains_test_segment(path: &str) -> bool {
         || path.starts_with("tests\\")
         || path.contains("\\test\\")
         || path.contains("\\tests\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin};
+
+    fn citation(display_name: &str, file_path: &str) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(display_name.to_string()),
+            display_name: display_name.to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some(file_path.to_string()),
+            line: Some(1),
+            score: 1.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: 1.0,
+                semantic: 0.0,
+                graph: 0.0,
+                total: 1.0,
+                provenance: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn buffered_io_role_matches_api_peers_without_path_literals() {
+        assert_eq!(
+            packet_evidence_role(&citation(
+                "BufferedReaderImpl",
+                "src/io/buffered_reader_impl.kt"
+            )),
+            Some(PacketEvidenceRole::BufferedIo)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("Buffer", "src/io/buffer.kt")),
+            Some(PacketEvidenceRole::BufferedIo)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("Source", "src/io/source.kt")),
+            Some(PacketEvidenceRole::BufferedIo)
+        );
+    }
+
+    #[test]
+    fn route_role_matches_dispatch_shapes_without_path_literals() {
+        assert_eq!(
+            packet_evidence_role(&citation("Server.handleHttpRequest", "src/http/server.go")),
+            Some(PacketEvidenceRole::RouteHandling)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("node.addRoute", "src/tree.go")),
+            Some(PacketEvidenceRole::RouteHandling)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("RequestContext.Next", "src/context.go")),
+            Some(PacketEvidenceRole::RouteHandling)
+        );
+    }
 }

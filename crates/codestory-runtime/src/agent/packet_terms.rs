@@ -100,14 +100,20 @@ pub(crate) fn packet_probe_terms(question: &str) -> Vec<String> {
 }
 
 fn packet_retains_non_primary_probe_term(question: &str, term: &str) -> bool {
-    if !matches!(term, "bench" | "benchmark" | "benchmarks") {
-        return false;
+    if matches!(term, "source" | "sources") {
+        let prompt_terms = prompt_search_terms(question);
+        return packet_terms_indicate_buffered_io_flow(&prompt_terms);
     }
-    let lowered = question.to_ascii_lowercase();
-    lowered.contains("architecture")
-        && (lowered.contains("boundary")
-            || lowered.contains("boundaries")
-            || lowered.contains("across"))
+
+    if matches!(term, "bench" | "benchmark" | "benchmarks") {
+        let lowered = question.to_ascii_lowercase();
+        return lowered.contains("architecture")
+            && (lowered.contains("boundary")
+                || lowered.contains("boundaries")
+                || lowered.contains("across"));
+    }
+
+    false
 }
 
 fn packet_terms_have_specific_flow_anchor(terms: &[String]) -> bool {
@@ -117,6 +123,11 @@ fn packet_terms_have_specific_flow_anchor(terms: &[String]) -> bool {
         || ((has("indexing") || has("indexer")) && (has("storage") || has("persistent")))
         || ((has("json") || has("jsonl")) && (has("exec") || has("thread") || has("turn")))
         || packet_terms_indicate_request_dispatch_flow(terms)
+        || packet_terms_indicate_server_route_dispatch_flow(terms)
+        || packet_terms_indicate_buffered_io_flow(terms)
+        || packet_terms_indicate_site_build_phase_flow(terms)
+        || packet_terms_indicate_form_validation_flow(terms)
+        || packet_terms_indicate_shell_install_dispatch_flow(terms)
         || (has("event") && has("loop"))
         || (has_any(&["command", "commands"]) && has_any(&["dispatch", "dispatches"]))
         || (has("search") && (has("flags") || has("matcher") || has("haystack")))
@@ -248,6 +259,99 @@ pub(crate) fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String])
             || has_any(&["engine", "method", "methods"]))
 }
 
+pub(crate) fn packet_terms_indicate_buffered_io_flow(terms: &[String]) -> bool {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    has_any(&["buffer", "buffers", "buffered"])
+        && (has_any(&["source", "sources", "sink", "sinks"])
+            || (has_any(&["read", "reads", "reader", "write", "writes", "writer"])
+                && has_any(&["byte", "bytes", "stream", "streams", "wrapper", "wrappers"])))
+}
+
+pub(crate) fn packet_terms_indicate_site_build_phase_flow(terms: &[String]) -> bool {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    let build_intent = has_any(&[
+        "build",
+        "builds",
+        "building",
+        "built",
+        "generate",
+        "generates",
+    ]);
+    let site_intent = has_any(&["site", "sites", "static", "page", "pages"]);
+    let phase_terms = [
+        ["read", "reads", "reader"],
+        ["generate", "generates", "generator"],
+        ["render", "renders", "renderer"],
+        ["write", "writes", "writer"],
+        ["phase", "phases", "lifecycle"],
+    ];
+    let covered_phases = phase_terms
+        .iter()
+        .filter(|needles| has_any(needles.as_slice()))
+        .count();
+
+    build_intent && site_intent && covered_phases >= 2
+}
+
+pub(crate) fn packet_terms_indicate_log_record_handler_flow(terms: &[String]) -> bool {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    let logger_or_log_call = has_any(&["log", "logger", "logging", "message", "messages"]);
+    let record_intent = has_any(&["record", "records", "logrecord", "logrecords"]);
+    let handler_intent = has_any(&[
+        "handler",
+        "handlers",
+        "handle",
+        "handled",
+        "processing",
+        "processor",
+        "processors",
+        "write",
+        "writes",
+    ]);
+
+    logger_or_log_call && record_intent && handler_intent
+}
+
+pub(crate) fn packet_terms_indicate_mapper_configuration_plan_flow(terms: &[String]) -> bool {
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    let mapper_intent = has_any(&["mapper", "mappers", "mapping", "map", "maps"]);
+    let configuration_intent = has_any(&[
+        "configuration",
+        "config",
+        "profile",
+        "profiles",
+        "mapperconfiguration",
+    ]);
+    let runtime_api_intent = has_any(&[
+        "runtime",
+        "api",
+        "apis",
+        "interface",
+        "interfaces",
+        "entry",
+        "entrypoint",
+    ]);
+    let source_destination_intent =
+        has_any(&["source", "sources"]) && has_any(&["destination", "destinations"]);
+    let plan_intent = has_any(&[
+        "plan",
+        "plans",
+        "planner",
+        "execution",
+        "expression",
+        "lambda",
+        "typemap",
+        "typemaps",
+        "type",
+        "types",
+    ]);
+
+    mapper_intent
+        && (configuration_intent || plan_intent)
+        && (runtime_api_intent || source_destination_intent || plan_intent || has("objects"))
+}
+
 pub(crate) fn packet_terms_indicate_prepared_session_adapter_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
@@ -354,32 +458,30 @@ pub(crate) fn packet_terms_indicate_hook_cache_flow(terms: &[String]) -> bool {
 }
 
 pub(crate) fn packet_terms_indicate_client_send_flow(terms: &[String]) -> bool {
-    let client_or_request_intent = packet_terms_have_any(
-        terms,
-        &[
-            "client",
-            "clients",
-            "request",
-            "requests",
-            "http",
-            "httpclient",
-        ],
-    );
+    let explicit_client_or_http_intent =
+        packet_terms_have_any(terms, &["client", "clients", "http", "httpclient"]);
+    let request_intent = packet_terms_have_any(terms, &["request", "requests"]);
     let send_or_transport_intent = packet_terms_have_any(
         terms,
-        &[
-            "convenience",
-            "helper",
-            "helpers",
-            "send",
-            "sending",
-            "sent",
-            "transport",
-            "transports",
-        ],
+        &["send", "sending", "sent", "transport", "transports"],
     );
+    let convenience_or_helper_intent =
+        packet_terms_have_any(terms, &["convenience", "helper", "helpers"]);
 
-    client_or_request_intent && send_or_transport_intent
+    (explicit_client_or_http_intent && (send_or_transport_intent || convenience_or_helper_intent))
+        || (request_intent && send_or_transport_intent)
+}
+
+pub(crate) fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bool {
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+
+    has_any(&["validation", "validate", "validates", "validity", "invalid"])
+        && has_any(&["form", "forms", "input", "inputs", "html"])
+        && (has_any(&["constraint", "constraints", "native"])
+            || has_any(&["custom", "javascript", "script", "scripts", "js"])
+            || has("pattern")
+            || has_any(&["required", "min", "max", "novalidate"]))
 }
 
 pub(crate) fn packet_terms_indicate_event_loop_command_flow(terms: &[String]) -> bool {
@@ -437,6 +539,28 @@ pub(crate) fn packet_terms_indicate_shell_version_use_flow(terms: &[String]) -> 
     ) && packet_terms_have_any(terms, &["use", "switch", "active", "current", "needed"])
 }
 
+pub(crate) fn packet_terms_indicate_shell_install_dispatch_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(
+        terms,
+        &["bash", "shell", "script", "function", "command", "commands"],
+    ) && packet_terms_have_any(
+        terms,
+        &[
+            "install",
+            "installer",
+            "bootstraps",
+            "bootstrap",
+            "download",
+            "downloads",
+            "completion",
+            "profile",
+            "source",
+            "sourced",
+            "use",
+        ],
+    ) && packet_terms_have_any(terms, &["dispatch", "dispatches", "function", "commands"])
+}
+
 pub(crate) fn packet_terms_indicate_string_predicate_flow(terms: &[String]) -> bool {
     packet_terms_have_any(
         terms,
@@ -472,4 +596,69 @@ pub(crate) fn packet_terms_indicate_runtime_formatting_flow(terms: &[String]) ->
             "output",
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_io_prompts_retain_source_as_api_concept() {
+        let terms = packet_probe_terms(
+            "Explain how buffered Source and Sink wrappers use Buffer state during reads and writes.",
+        );
+        for expected in ["source", "sink", "buffered", "buffer"] {
+            assert!(
+                terms.iter().any(|term| term == expected),
+                "expected {expected:?} in {terms:?}"
+            );
+        }
+        assert!(packet_terms_indicate_buffered_io_flow(&terms));
+    }
+
+    #[test]
+    fn site_build_prompts_are_detected_from_lifecycle_terms() {
+        let terms = packet_probe_terms(
+            "Trace how the build command creates a site and runs the read, generate, render, and write phases.",
+        );
+        assert!(packet_terms_indicate_site_build_phase_flow(&terms));
+    }
+
+    #[test]
+    fn mapper_configuration_plan_prompts_are_detected_from_flow_terms() {
+        let terms = packet_probe_terms(
+            "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type map plans.",
+        );
+
+        assert!(packet_terms_indicate_mapper_configuration_plan_flow(&terms));
+    }
+
+    #[test]
+    fn client_send_prompts_require_client_or_send_intent() {
+        let client_terms = packet_probe_terms(
+            "Explain how an HTTP package exposes top-level helpers, Client convenience methods, BaseRequest finalization, and IOClient send behavior.",
+        );
+        assert!(packet_terms_indicate_client_send_flow(&client_terms));
+
+        let route_terms = packet_probe_terms(
+            "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
+        );
+        assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+    }
+
+    #[test]
+    fn form_validation_prompts_are_detected_from_constraint_and_custom_terms() {
+        let terms = packet_probe_terms(
+            "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.",
+        );
+        assert!(packet_terms_indicate_form_validation_flow(&terms));
+    }
+
+    #[test]
+    fn shell_install_dispatch_prompts_are_detected_from_bootstrap_and_dispatch_terms() {
+        let terms = packet_probe_terms(
+            "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.",
+        );
+        assert!(packet_terms_indicate_shell_install_dispatch_flow(&terms));
+    }
 }

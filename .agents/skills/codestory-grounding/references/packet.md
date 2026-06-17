@@ -38,3 +38,4 @@ tracing, ownership discovery, or change-impact analysis.
 - `packet` is for broad questions; `context` is for one concrete target.
 - Prefer `packet --budget compact` before manually opening source files for a broad explanation or plan.
 - Treat `sufficiency.status=partial` as useful but incomplete evidence. The packet should say which next command would deepen or verify the answer.
+- Architecture, data-flow, and route-tracing sufficiency requires causal flow-role coverage, not just citation or claim counts. Generic "inspect this anchor" claims may guide follow-up, but they do not make a packet safe to answer from.

@@ -1854,6 +1854,44 @@ function normalizeSearchText(value) {
     .trim();
 }
 
+function anchorSearchVariants(anchor) {
+  const normalized = normalizeSearchText(anchor);
+  const variants = new Set();
+  if (normalized) {
+    variants.add(normalized);
+  }
+  if (/[a-z_][a-z0-9_]*::[a-z_][a-z0-9_]*/i.test(normalized)) {
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)::([a-z_][a-z0-9_]*)/gi, "$1.$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)::([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+  }
+  if (!normalized.includes("/") && normalized.includes("::")) {
+    const namespaceTail = normalized.split("::").filter(Boolean).at(-1);
+    if (namespaceTail && namespaceTail.length >= 4 && namespaceTail !== normalized) {
+      variants.add(namespaceTail);
+      if (/[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*/i.test(namespaceTail)) {
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+      }
+      if (/[a-z_][a-z0-9_]*#[a-z_][a-z0-9_]*/i.test(namespaceTail)) {
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1.$2"));
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+      }
+    }
+  }
+  if (
+    !normalized.includes("/") &&
+    /[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*/i.test(normalized)
+  ) {
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+  }
+  if (/[a-z_][a-z0-9_]*#[a-z_][a-z0-9_]*/i.test(normalized)) {
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1.$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+  }
+  return [...variants];
+}
+
 function redactUrlForDisplay(value) {
   if (value == null) {
     return value;
@@ -1863,11 +1901,11 @@ function redactUrlForDisplay(value) {
 
 function anchorMatched(haystack, anchor) {
   const normalizedHaystack = normalizeSearchText(haystack);
-  const normalizedAnchor = normalizeSearchText(anchor);
-  if (!normalizedAnchor) {
+  const variants = anchorSearchVariants(anchor);
+  if (!variants.length) {
     return false;
   }
-  return normalizedHaystack.includes(normalizedAnchor);
+  return variants.some((variant) => normalizedHaystack.includes(variant));
 }
 
 function scoreAnchorSet(anchors, haystack) {
@@ -2422,6 +2460,44 @@ function parseRipgrepMatches(stdout) {
   return matches;
 }
 
+function benignBaselineRipgrepWarningLines(stderr) {
+  const lines = String(stderr ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return {
+    lines,
+    benign:
+      lines.length > 0 &&
+      lines.every((line) => {
+        const lower = line.toLowerCase();
+        return (
+          lower.startsWith("rg:") &&
+          (lower.includes("(os error 2)") ||
+            lower.includes("(os error 3)") ||
+            lower.includes("cannot find the path specified") ||
+            lower.includes("cannot find the file specified") ||
+            lower.includes("no such file or directory"))
+        );
+      }),
+  };
+}
+
+function baselineSearchPreludeStatus(result, matches) {
+  if (result.exitCode === 0 || result.exitCode === 1) {
+    return { allowed: true, status: "pass", warning_lines: [] };
+  }
+  const warnings = benignBaselineRipgrepWarningLines(result.stderr);
+  if (result.exitCode === 2 && matches.length > 0 && warnings.benign) {
+    return {
+      allowed: true,
+      status: "pass_with_warnings",
+      warning_lines: warnings.lines,
+    };
+  }
+  return { allowed: false, status: "fail", warning_lines: warnings.lines };
+}
+
 function baselineFilePenalty(filePath) {
   const normalized = normalizePathLike(filePath).toLowerCase();
   let penalty = 0;
@@ -2625,8 +2701,8 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
     timeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000),
     timeoutMessage: "Baseline repository search timed out after 60000ms.",
   });
-  const searchAllowed = result.exitCode === 0 || result.exitCode === 1;
   const matches = parseRipgrepMatches(result.stdout);
+  const preludeStatus = baselineSearchPreludeStatus(result, matches);
   const selectedFiles = selectBaselineFiles(matches, terms);
   const { contextText, readCommands } = await buildBaselineContext(repoConfig, matches, selectedFiles);
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -2639,16 +2715,18 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
     category: "shell_search",
     aggregated_output: searchOutput,
     exit_code: result.exitCode,
-    status: searchAllowed ? "pass" : result.status,
+    status: preludeStatus.allowed ? preludeStatus.status : result.status,
   };
   const commands = [searchCommand, ...readCommands];
   const publicPrelude = {
     kind: "baseline_local_context",
-    status: searchAllowed ? "pass" : "fail",
+    status: preludeStatus.status,
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
     error: result.error,
+    warning_count: preludeStatus.warning_lines.length,
+    warning_lines: preludeStatus.warning_lines.slice(0, 12),
     wall_ms: wallMs,
     context_path: contextPath,
     stderr_path: stderrPath,
@@ -2809,7 +2887,7 @@ async function runOne(opts, run, outDir) {
   const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
   const started = performance.now();
   const preludeFailure = [baselinePrelude, codestoryPrelude].find(
-    (prelude) => prelude && prelude.public.status !== "pass",
+    (prelude) => prelude && !preludeAllowsAgentRun(prelude.public),
   );
   const shouldRunAgent = preludeFailure == null;
   const result = shouldRunAgent
@@ -2911,6 +2989,10 @@ async function runOne(opts, run, outDir) {
     ...output,
     resource_accounting: resourceAccountingForResult(output),
   };
+}
+
+function preludeAllowsAgentRun(publicPrelude) {
+  return publicPrelude?.status === "pass" || publicPrelude?.status === "pass_with_warnings";
 }
 
 async function gitOutput(args, cwd, timeoutMs = 10_000) {
@@ -4520,7 +4602,11 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
 }
 
 function packetRuntimeQualityGateRequired(opts = {}) {
-  return Boolean(opts.publishable || (opts.taskSuite === "holdout-retrieval" && !opts.allowFailures));
+  return Boolean(
+    opts.publishable ||
+      (["holdout-retrieval", "language-expansion-holdout"].includes(opts.taskSuite) &&
+        !opts.allowFailures),
+  );
 }
 
 function formatPacketRuntimeBlocker(blocker) {
@@ -5496,12 +5582,29 @@ function runSelfTest() {
     [null, false, true, "fail"],
   );
   assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }), true);
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "language-expansion-holdout" }), true);
   assert.equal(
     packetRuntimeQualityGateRequired({
-      taskSuite: "holdout-retrieval",
+      taskSuite: "language-expansion-holdout",
       allowFailures: true,
     }),
     false,
+  );
+  assert.deepEqual(
+    baselineSearchPreludeStatus(
+      {
+        exitCode: 2,
+        stderr: "rg: .\\missing: The system cannot find the path specified. (os error 3)\n",
+      },
+      [{ path: "src/main.rb", line: 1, column: 1, text: "build" }],
+    ),
+    {
+      allowed: true,
+      status: "pass_with_warnings",
+      warning_lines: [
+        "rg: .\\missing: The system cannot find the path specified. (os error 3)",
+      ],
+    },
   );
   assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
   assert.equal(
@@ -5884,6 +5987,7 @@ export {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
   copyResultArtifact,

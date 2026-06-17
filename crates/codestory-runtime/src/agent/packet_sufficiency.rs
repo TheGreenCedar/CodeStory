@@ -1,8 +1,13 @@
 use crate::agent::packet_claims::packet_supported_claims;
-use crate::agent::packet_evidence_roles::packet_evidence_role;
+use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use crate::agent::packet_plan::packet_symbol_probe_queries;
 use crate::agent::packet_required_probes::packet_missing_sufficiency_probe_queries_with_extra;
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
+use crate::agent::packet_terms::{
+    packet_probe_terms, packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_url_session_request_flow,
+};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentRetrievalStepStatusDto, GraphArtifactDto,
     PacketBudgetDto, PacketBudgetModeDto, PacketClaimDto, PacketSufficiencyDto,
@@ -83,17 +88,28 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         .any(|step| step.status == AgentRetrievalStepStatusDto::Error);
     let min_citations = packet_sufficiency_min_citations(task_class);
     let min_claims = packet_sufficiency_min_claims(task_class);
+    let sufficiency_claims = supported_claims
+        .iter()
+        .filter(|claim| packet_claim_can_satisfy_sufficiency(claim))
+        .cloned()
+        .collect::<Vec<_>>();
+    let generic_navigation_claim_count = supported_claims
+        .len()
+        .saturating_sub(sufficiency_claims.len());
     let has_minimum_coverage = answer.citations.len() >= min_citations;
-    let has_minimum_claims = supported_claims.len() >= min_claims;
-    let claim_family_count = packet_supported_claim_family_count(&supported_claims);
+    let has_minimum_claims = sufficiency_claims.len() >= min_claims;
+    let claim_family_count = packet_supported_claim_family_count(&sufficiency_claims);
     let has_minimum_claim_families =
-        packet_has_minimum_claim_family_coverage(task_class, &supported_claims);
+        packet_has_minimum_claim_family_coverage(task_class, &sufficiency_claims);
+    let missing_required_flow_roles =
+        packet_missing_required_flow_roles(question, task_class, &sufficiency_claims);
+    let has_required_flow_roles = missing_required_flow_roles.is_empty();
     let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
         answer,
         budget,
         min_citations,
         min_claims,
-        supported_claims.len(),
+        sufficiency_claims.len(),
     );
     let unresolved_sidecar_queries = unresolved_sidecar_queries(answer);
     let status = packet_sufficiency_status(PacketSufficiencyStatusInput {
@@ -103,6 +119,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         has_minimum_coverage,
         has_minimum_claims,
         has_minimum_claim_families,
+        has_required_flow_roles,
         has_sufficiency_blocking_budget_omission,
         missing_required_probe_queries: &missing_required_probe_queries,
         unresolved_sidecar_queries: &unresolved_sidecar_queries,
@@ -114,14 +131,17 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         budget,
         min_citations,
         min_claims,
-        supported_claims.len(),
+        sufficiency_claims.len(),
         claim_family_count,
+        generic_navigation_claim_count,
         status,
         has_minimum_coverage,
         has_minimum_claims,
         has_minimum_claim_families,
+        has_required_flow_roles,
         has_sufficiency_blocking_budget_omission,
         &missing_required_probe_queries,
+        &missing_required_flow_roles,
         &unresolved_sidecar_queries,
     );
     let follow_up_commands = packet_follow_up_commands(
@@ -190,6 +210,7 @@ struct PacketSufficiencyStatusInput<'a> {
     has_minimum_coverage: bool,
     has_minimum_claims: bool,
     has_minimum_claim_families: bool,
+    has_required_flow_roles: bool,
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &'a [String],
     unresolved_sidecar_queries: &'a [String],
@@ -204,6 +225,7 @@ fn packet_sufficiency_status(
         || !input.has_minimum_coverage
         || !input.has_minimum_claims
         || !input.has_minimum_claim_families
+        || !input.has_required_flow_roles
         || !input.missing_required_probe_queries.is_empty()
         || !input.unresolved_sidecar_queries.is_empty()
         || input.has_sufficiency_blocking_budget_omission
@@ -224,12 +246,15 @@ fn packet_sufficiency_gaps(
     min_claims: usize,
     supported_claim_count: usize,
     claim_family_count: usize,
+    generic_navigation_claim_count: usize,
     status: PacketSufficiencyStatusDto,
     has_minimum_coverage: bool,
     has_minimum_claims: bool,
     has_minimum_claim_families: bool,
+    has_required_flow_roles: bool,
     has_sufficiency_blocking_budget_omission: bool,
     missing_required_probe_queries: &[String],
+    missing_required_flow_roles: &[&'static str],
     unresolved_sidecar_queries: &[String],
 ) -> Vec<String> {
     let mut gaps = Vec::new();
@@ -250,12 +275,24 @@ fn packet_sufficiency_gaps(
             task_class, supported_claim_count, min_claims
         ));
     }
+    if generic_navigation_claim_count > 0 && !has_minimum_claims {
+        gaps.push(format!(
+            "{generic_navigation_claim_count} generic navigation claim(s) were ignored for sufficiency because they only point at evidence instead of explaining the flow."
+        ));
+    }
     if !answer.citations.is_empty() && !has_minimum_claim_families {
         gaps.push(format!(
             "{:?} packet covered only {} distinct claim families; at least {} are required before treating the packet as sufficient.",
             task_class,
             claim_family_count,
             packet_sufficiency_min_claim_families(task_class)
+        ));
+    }
+    if !answer.citations.is_empty() && !has_required_flow_roles {
+        gaps.push(format!(
+            "{:?} packet missed required flow-role coverage: {}.",
+            task_class,
+            missing_required_flow_roles.join(", ")
         ));
     }
     if !missing_required_probe_queries.is_empty() {
@@ -427,6 +464,456 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         .iter()
         .find_map(|citation| packet_evidence_role(citation).map(|role| role.as_str()))
         .or_else(|| (!claim.citations.is_empty()).then_some("source evidence"))
+}
+
+pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
+    let lower = claim.claim.to_ascii_lowercase();
+    !(lower.contains("anchored by")
+        || lower.contains("inspect it")
+        || lower.contains("inspect the cited")
+        || (lower.contains("supports ") && lower.contains("inspect"))
+        || (lower.contains("ties ")
+            && lower.contains(" to cited definitions")
+            && lower.contains("adjacent ownership"))
+        || (lower.contains(" is defined in cited source ")
+            && lower.contains("exact source anchor")))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PacketFlowRole {
+    EntryPoint,
+    Handoff,
+    BoundaryOrState,
+}
+
+impl PacketFlowRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::EntryPoint => "entrypoint/registration",
+            Self::Handoff => "handoff/dispatch",
+            Self::BoundaryOrState => "boundary/effect/state",
+        }
+    }
+}
+
+fn packet_missing_required_flow_roles(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    supported_claims: &[PacketClaimDto],
+) -> Vec<&'static str> {
+    let question_terms = packet_probe_terms(question);
+    let site_build_flow = packet_terms_indicate_site_build_phase_flow(&question_terms);
+    let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&question_terms);
+    let shell_install_dispatch_flow =
+        packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
+    let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
+    let required = packet_required_flow_roles(
+        task_class,
+        site_build_flow,
+        shell_install_dispatch_flow,
+        url_session_request_flow,
+    );
+    if required.is_empty() {
+        return Vec::new();
+    }
+
+    let mut covered = HashSet::new();
+    for claim in supported_claims {
+        for role in packet_flow_roles_for_claim(
+            claim,
+            site_build_flow,
+            mapper_flow,
+            shell_install_dispatch_flow,
+            url_session_request_flow,
+        ) {
+            covered.insert(role);
+        }
+    }
+    required
+        .iter()
+        .copied()
+        .filter(|role| !covered.contains(role))
+        .map(PacketFlowRole::label)
+        .collect()
+}
+
+fn packet_required_flow_roles(
+    task_class: PacketTaskClassDto,
+    site_build_flow: bool,
+    shell_install_dispatch_flow: bool,
+    url_session_request_flow: bool,
+) -> &'static [PacketFlowRole] {
+    if shell_install_dispatch_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation
+            | PacketTaskClassDto::DataFlow
+            | PacketTaskClassDto::RouteTracing => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if url_session_request_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation
+            | PacketTaskClassDto::DataFlow
+            | PacketTaskClassDto::RouteTracing => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    if site_build_flow {
+        return match task_class {
+            PacketTaskClassDto::ArchitectureExplanation
+            | PacketTaskClassDto::DataFlow
+            | PacketTaskClassDto::RouteTracing => &[
+                PacketFlowRole::EntryPoint,
+                PacketFlowRole::Handoff,
+                PacketFlowRole::BoundaryOrState,
+            ],
+            PacketTaskClassDto::BugLocalization
+            | PacketTaskClassDto::ChangeImpact
+            | PacketTaskClassDto::SymbolOwnership
+            | PacketTaskClassDto::EditPlanning => &[],
+        };
+    }
+
+    match task_class {
+        PacketTaskClassDto::ArchitectureExplanation | PacketTaskClassDto::DataFlow => &[
+            PacketFlowRole::EntryPoint,
+            PacketFlowRole::Handoff,
+            PacketFlowRole::BoundaryOrState,
+        ],
+        PacketTaskClassDto::RouteTracing => &[PacketFlowRole::EntryPoint, PacketFlowRole::Handoff],
+        PacketTaskClassDto::BugLocalization
+        | PacketTaskClassDto::ChangeImpact
+        | PacketTaskClassDto::SymbolOwnership
+        | PacketTaskClassDto::EditPlanning => &[],
+    }
+}
+
+fn packet_flow_roles_for_claim(
+    claim: &PacketClaimDto,
+    site_build_flow: bool,
+    mapper_flow: bool,
+    shell_install_dispatch_flow: bool,
+    url_session_request_flow: bool,
+) -> HashSet<PacketFlowRole> {
+    let mut roles = HashSet::new();
+    let lower = claim.claim.to_ascii_lowercase();
+    let normalized = normalize_identifier(&claim.claim);
+
+    if site_build_flow {
+        if normalized.contains("buildprocess")
+            && contains_any(&normalized, &["constructs", "processes"])
+            && normalized.contains("site")
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if normalized.contains("siteprocess")
+            && contains_any(&normalized, &["read", "generate", "render", "write"])
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if (normalized.contains("reader") && normalized.contains("read"))
+            || (normalized.contains("renderer") && normalized.contains("render"))
+            || (normalized.contains("sitewrite") || normalized.contains("writephases"))
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if mapper_flow {
+        if normalized.contains("mappermap") && normalized.contains("entrypoint") {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if normalized.contains("mapperconfiguration")
+            && (normalized.contains("configuration") || normalized.contains("runtime"))
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if (normalized.contains("typemap") && normalized.contains("plan"))
+            || normalized.contains("typemapplanbuilder")
+            || normalized.contains("executionpipeline")
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("expressionplans") || normalized.contains("mappingconfiguration") {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if shell_install_dispatch_flow {
+        if normalized.contains("installsh")
+            && (normalized.contains("bootstrap") || normalized.contains("sourced"))
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if normalized.contains("dispatcher")
+            || normalized.contains("dispatch")
+            || normalized.contains("nvminstallnode")
+            || normalized.contains("nvmdownload")
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("bashcompletion")
+            || normalized.contains("completion")
+            || normalized.contains("currentversion")
+            || normalized.contains("alreadyactive")
+            || normalized.contains("configurednodeversion")
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+    }
+
+    if url_session_request_flow {
+        if normalized.contains("sessionrequest")
+            && (normalized.contains("creates") || normalized.contains("requestobjects"))
+        {
+            roles.insert(PacketFlowRole::EntryPoint);
+        }
+        if normalized.contains("requestresume")
+            || normalized.contains("resumes")
+            || normalized.contains("urlsessiontask")
+            || normalized.contains("eagerexecution")
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+        if normalized.contains("datarequestvalidate")
+            || normalized.contains("validation")
+            || normalized.contains("sessiondelegate")
+            || normalized.contains("callback")
+            || normalized.contains("callbacks")
+        {
+            roles.insert(PacketFlowRole::BoundaryOrState);
+        }
+        if normalized.contains("sessiondelegate")
+            || normalized.contains("urlsessioncallback")
+            || normalized.contains("urlsessioncallbacks")
+        {
+            roles.insert(PacketFlowRole::Handoff);
+        }
+    }
+
+    if contains_any(
+        &normalized,
+        &[
+            "entrypoint",
+            "toplevel",
+            "public",
+            "command",
+            "route",
+            "router",
+            "registration",
+            "register",
+            "helper",
+            "helpers",
+            "wrapper",
+            "wrappers",
+            "clientfactory",
+            "factory",
+            "api",
+            "apis",
+        ],
+    ) {
+        roles.insert(PacketFlowRole::EntryPoint);
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "delegate",
+            "delegates",
+            "handoff",
+            "dispatch",
+            "calls",
+            "calling",
+            "send",
+            "routes",
+            "handler",
+            "executes",
+            "coordinates",
+            "maps",
+            "wrap",
+            "wraps",
+            "wrapper",
+            "wrappers",
+            "read",
+            "reads",
+            "write",
+            "writes",
+            "execution",
+            "pipeline",
+            "plan",
+            "plans",
+            "lambda",
+            "mapping",
+        ],
+    ) {
+        roles.insert(PacketFlowRole::Handoff);
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "boundary",
+            "transport",
+            "persist",
+            "project",
+            "store",
+            "cache",
+            "state",
+            "prepare",
+            "response",
+            "serialize",
+            "extract",
+            "refresh",
+            "output",
+            "schema",
+            "buffer",
+            "bytes",
+            "byte",
+            "record",
+            "records",
+            "format",
+            "formatted",
+            "write",
+            "writes",
+            "writing",
+            "source",
+            "sink",
+            "upstream",
+            "configuration",
+            "plan",
+            "plans",
+            "lambda",
+            "expression",
+            "destination",
+        ],
+    ) || lower.contains("side effect")
+    {
+        roles.insert(PacketFlowRole::BoundaryOrState);
+    }
+
+    for citation in &claim.citations {
+        match packet_evidence_role(citation) {
+            Some(PacketEvidenceRole::CommandEntrypoint)
+            | Some(PacketEvidenceRole::ClientFactory)
+            | Some(PacketEvidenceRole::SearchDriver)
+            | Some(PacketEvidenceRole::RouteHandling)
+            | Some(PacketEvidenceRole::CollectionConfiguration)
+            | Some(PacketEvidenceRole::AppServerRequestProtocol) => {
+                roles.insert(PacketFlowRole::EntryPoint);
+            }
+            Some(PacketEvidenceRole::RequestDispatch)
+            | Some(PacketEvidenceRole::CommandDispatch)
+            | Some(PacketEvidenceRole::TransportAdapter)
+            | Some(PacketEvidenceRole::SearchExecutionUnit)
+            | Some(PacketEvidenceRole::RuntimeOrchestration)
+            | Some(PacketEvidenceRole::EventLoop)
+            | Some(PacketEvidenceRole::NetworkCommandInput)
+            | Some(PacketEvidenceRole::IndexingWorkQueue)
+            | Some(PacketEvidenceRole::BufferedIo)
+            | Some(PacketEvidenceRole::InterceptorManagement) => {
+                roles.insert(PacketFlowRole::Handoff);
+            }
+            _ => {}
+        }
+
+        match packet_evidence_role(citation) {
+            Some(PacketEvidenceRole::TransportAdapter)
+            | Some(PacketEvidenceRole::PersistenceAndSearchProjection)
+            | Some(PacketEvidenceRole::SnapshotRefresh)
+            | Some(PacketEvidenceRole::EventOutputProcessing)
+            | Some(PacketEvidenceRole::SymbolExtraction)
+            | Some(PacketEvidenceRole::SourceGroupConfiguration)
+            | Some(PacketEvidenceRole::WorkspaceDiscoveryAndPlanning)
+            | Some(PacketEvidenceRole::CollectionConfiguration)
+            | Some(PacketEvidenceRole::BufferedIo)
+            | Some(PacketEvidenceRole::SqlTableDefinition)
+            | Some(PacketEvidenceRole::SqlRelationshipConstraint)
+            | Some(PacketEvidenceRole::SqlSchemaFile)
+            | Some(PacketEvidenceRole::CandidateFileConstruction) => {
+                roles.insert(PacketFlowRole::BoundaryOrState);
+            }
+            _ => {}
+        }
+    }
+
+    roles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claim(text: &str) -> PacketClaimDto {
+        PacketClaimDto {
+            claim: text.to_string(),
+            citations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn route_tracing_site_build_prompts_use_lifecycle_flow_roles() {
+        let claims = vec![
+            claim("Build.process constructs or processes a Jekyll site."),
+            claim("Site.process runs reset, read, generate, render, cleanup, and write phases."),
+            claim("Reader is responsible for reading site content."),
+            claim("Renderer renders pages and documents."),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Trace how the build command creates a site and runs the read, generate, render, and write phases.",
+            PacketTaskClassDto::RouteTracing,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "site-build route-tracing prompts should use lifecycle flow roles: {missing:?}"
+        );
+
+        let route_missing = packet_missing_required_flow_roles(
+            "Trace how route registration reaches request handler dispatch through a router.",
+            PacketTaskClassDto::RouteTracing,
+            &claims,
+        );
+        assert!(
+            !route_missing.is_empty(),
+            "ordinary route tracing should still require route-flow roles"
+        );
+    }
+
+    #[test]
+    fn data_flow_mapper_plan_prompts_use_mapping_flow_roles() {
+        let claims = vec![
+            claim("Mapper.Map is the public runtime entry point for object mapping."),
+            claim("MapperConfiguration builds and owns mapping configuration used at runtime."),
+            claim("TypeMap contributes mapper lambda plans used by the execution pipeline."),
+            claim("TypeMapPlanBuilder participates in building expression plans for mappings."),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type map plans.",
+            PacketTaskClassDto::DataFlow,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "mapper plan prompts should use mapping flow roles: {missing:?}"
+        );
+    }
 }
 
 fn packet_has_sufficiency_blocking_budget_omission(

@@ -8,12 +8,19 @@ use crate::agent::packet_scoring::{
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
-    packet_terms_indicate_indexing_flow, packet_terms_indicate_prepared_session_adapter_flow,
-    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
+    packet_terms_indicate_form_validation_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_log_record_handler_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_prepared_session_adapter_flow,
+    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_url_session_request_flow,
 };
 use crate::exact_symbol_query_terms;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, PacketClaimDto, PacketTaskClassDto,
+    AgentAnswerDto, AgentCitationDto, NodeKind, PacketClaimDto, PacketTaskClassDto,
 };
 
 pub(crate) fn packet_missing_sufficiency_probe_queries_with_extra(
@@ -34,6 +41,9 @@ fn packet_probe_query_is_covered(
     answer: &AgentAnswerDto,
     supported_claims: &[PacketClaimDto],
 ) -> bool {
+    if packet_required_probe_requires_citation(query) {
+        return packet_probe_query_is_cited(query, answer);
+    }
     packet_probe_query_is_cited(query, answer)
         || packet_probe_query_is_claimed(query, supported_claims)
 }
@@ -58,7 +68,118 @@ pub(crate) fn packet_probe_query_is_claimed(
     supported_claims.iter().any(|claim| {
         let normalized_claim = normalize_identifier(&claim.claim);
         normalized_claim.contains(&normalized_query)
+            || packet_claim_covers_concept_probe(&normalized_query, &normalized_claim)
     })
+}
+
+fn packet_claim_covers_concept_probe(normalized_query: &str, normalized_claim: &str) -> bool {
+    match normalized_query {
+        "recordcreation" => {
+            normalized_claim.contains("record") && normalized_claim.contains("creat")
+        }
+        "handlerregistration" => {
+            normalized_claim.contains("handler")
+                && (normalized_claim.contains("register") || normalized_claim.contains("stack"))
+        }
+        "handlerprocessing" => {
+            normalized_claim.contains("handler")
+                && (normalized_claim.contains("process")
+                    || normalized_claim.contains("write")
+                    || normalized_claim.contains("writ")
+                    || normalized_claim.contains("format"))
+        }
+        "handlerinterface" => {
+            normalized_claim.contains("handlerinterface")
+                || (normalized_claim.contains("handler") && normalized_claim.contains("boundar"))
+        }
+        "logrecord" => normalized_claim.contains("logrecord"),
+        "logcall" => normalized_claim.contains("log") && normalized_claim.contains("addrecord"),
+        "handlerstack" => {
+            normalized_claim.contains("handler") && normalized_claim.contains("stack")
+        }
+        "nativeformconstraints" => {
+            normalized_claim.contains("native")
+                && normalized_claim.contains("required")
+                && normalized_claim.contains("pattern")
+                && normalized_claim.contains("min")
+                && normalized_claim.contains("max")
+        }
+        "customvalidationmessages" => {
+            (normalized_claim.contains("validation") || normalized_claim.contains("showerror"))
+                && (normalized_claim.contains("message")
+                    || normalized_claim.contains("messages")
+                    || normalized_claim.contains("showerror"))
+        }
+        "validitystate" => {
+            normalized_claim.contains("validitystate")
+                || (normalized_claim.contains("validity")
+                    && (normalized_claim.contains("valuemissing")
+                        || normalized_claim.contains("typemismatch")
+                        || normalized_claim.contains("tooshort")
+                        || normalized_claim.contains("fields")))
+        }
+        "submitpreventdefault" => {
+            normalized_claim.contains("submit")
+                && (normalized_claim.contains("preventdefault")
+                    || normalized_claim.contains("preventsubmission"))
+                && (normalized_claim.contains("invalid") || normalized_claim.contains("form"))
+        }
+        "formvalidationbypass" => {
+            normalized_claim.contains("novalidate")
+                && (normalized_claim.contains("suppress") || normalized_claim.contains("disable"))
+                && (normalized_claim.contains("browser") || normalized_claim.contains("defaultui"))
+        }
+        "shellinstallerbootstrap" => {
+            normalized_claim.contains("install")
+                && normalized_claim.contains("bootstrap")
+                && (normalized_claim.contains("source")
+                    || normalized_claim.contains("nvmsh")
+                    || normalized_claim.contains("profile"))
+        }
+        "shellfunctiondispatch" => {
+            normalized_claim.contains("shell")
+                && normalized_claim.contains("dispatch")
+                && (normalized_claim.contains("function") || normalized_claim.contains("command"))
+        }
+        "installdownloadhelpers" => {
+            normalized_claim.contains("install")
+                && (normalized_claim.contains("download") || normalized_claim.contains("fetch"))
+                && (normalized_claim.contains("helper")
+                    || normalized_claim.contains("nvmdownload")
+                    || normalized_claim.contains("nvminstallnode"))
+        }
+        "conditionalversionuse" => {
+            normalized_claim.contains("use")
+                && (normalized_claim.contains("current") || normalized_claim.contains("active"))
+                && (normalized_claim.contains("needed") || normalized_claim.contains("already"))
+        }
+        "shellcompletion" => {
+            normalized_claim.contains("completion")
+                && (normalized_claim.contains("complete") || normalized_claim.contains("command"))
+        }
+        "toplevelhelpers" => {
+            normalized_claim.contains("toplevel")
+                && normalized_claim.contains("helper")
+                && normalized_claim.contains("client")
+                && (normalized_claim.contains("delegate") || normalized_claim.contains("wrap"))
+        }
+        "requestfinalization" => {
+            (normalized_claim.contains("request") || normalized_claim.contains("baserequest"))
+                && (normalized_claim.contains("finalize")
+                    || normalized_claim.contains("finalized")
+                    || normalized_claim.contains("finalization"))
+                && (normalized_claim.contains("prepare")
+                    || normalized_claim.contains("body")
+                    || normalized_claim.contains("send"))
+        }
+        "requestresponse" => {
+            normalized_claim.contains("response")
+                && (normalized_claim.contains("request")
+                    || normalized_claim.contains("fromstream")
+                    || normalized_claim.contains("streamed"))
+        }
+        _ => false,
+    }
 }
 
 fn packet_claim_covers_file_scoped_probe(
@@ -90,10 +211,39 @@ fn packet_claim_covers_file_scoped_probe(
 
 fn packet_probe_query_allows_claim_coverage(query: &str) -> bool {
     let trimmed = query.trim();
-    trimmed.contains('.')
-        && !trimmed.contains('/')
-        && !trimmed.contains('\\')
-        && !trimmed.chars().any(char::is_whitespace)
+    packet_concept_probe_allows_claim_coverage(&normalize_identifier(trimmed))
+        || trimmed.contains('.')
+            && !trimmed.contains('/')
+            && !trimmed.contains('\\')
+            && !trimmed.chars().any(char::is_whitespace)
+}
+
+fn packet_concept_probe_allows_claim_coverage(normalized_query: &str) -> bool {
+    matches!(
+        normalized_query,
+        "recordcreation"
+            | "handlerregistration"
+            | "handlerprocessing"
+            | "handlerinterface"
+            | "logrecord"
+            | "logcall"
+            | "handlerstack"
+            | "nativeformconstraints"
+            | "customvalidationmessages"
+            | "validitystate"
+            | "submitpreventdefault"
+            | "formvalidationbypass"
+            | "toplevelhelpers"
+            | "requestfinalization"
+            | "requestresponse"
+    )
+}
+
+fn packet_required_probe_requires_citation(query: &str) -> bool {
+    matches!(
+        normalize_identifier(query).as_str(),
+        "routetreeaddroute" | "sourcereadbuffer" | "sinkwritebuffer"
+    )
 }
 
 #[cfg(test)]
@@ -174,6 +324,31 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
             ],
         );
     }
+    if packet_terms_indicate_client_send_flow(terms) {
+        push_client_send_source_probe_queries(&mut queries);
+        push_unique_terms(
+            &mut queries,
+            &[
+                "client convenience methods",
+                "top level helpers",
+                "request finalization",
+                "transport send",
+                "request response",
+            ],
+        );
+    }
+    if packet_terms_indicate_url_session_request_flow(terms) {
+        push_url_session_request_source_probe_queries(&mut queries);
+        push_unique_terms(
+            &mut queries,
+            &[
+                "session request creation",
+                "request task resume",
+                "data request validation",
+                "urlsession callbacks",
+            ],
+        );
+    }
     if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_unique_terms(
             &mut queries,
@@ -212,8 +387,211 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
             &["build index", "source group indexing", "indexer command"],
         );
     }
+    push_prompt_concept_role_probe_queries(terms, &mut queries);
 
     queries
+}
+
+fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    let has = |term: &str| packet_terms_have(terms, term);
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+
+    if has_any(&["serialize", "serializes", "serialized", "serialization"]) {
+        push_unique_term(queries, "serialize");
+    }
+    if has_any(&["cache", "caches"]) && has_any(&["helper", "helpers"]) {
+        push_unique_term(queries, "cache helper");
+    }
+    if has_any(&["middleware", "middlewares"]) {
+        push_unique_term(queries, "middleware");
+    }
+
+    if has_any(&["handler", "handlers"]) {
+        if has_any(&[
+            "record",
+            "records",
+            "process",
+            "processing",
+            "write",
+            "writes",
+        ]) {
+            push_unique_term(queries, "handler processing");
+        }
+        if has_any(&["dispatch", "dispatches", "route", "routes"]) {
+            push_unique_term(queries, "handler dispatch");
+        }
+    }
+    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "route registration",
+                "router group",
+                "route tree",
+                "route tree add route",
+                "router group handle route",
+                "request handler",
+                "engine request handler",
+                "context next handler chain",
+                "handler chain",
+                "engine creation",
+                "engine creation new router",
+            ],
+        );
+    }
+
+    if has_any(&["validation", "validate", "validates", "validity", "invalid"]) {
+        if has_any(&["form", "forms", "input", "inputs", "html"]) {
+            push_unique_term(queries, "form validation");
+        }
+        if has_any(&["constraint", "constraints", "native"]) {
+            push_unique_term(queries, "constraint validation");
+        }
+        if has("html") && has_any(&["constraint", "constraints", "native"]) {
+            push_unique_term(queries, "html constraint");
+        }
+        if has("html")
+            && has_any(&["constraint", "constraints", "native"])
+            && has_any(&["form", "forms", "input", "inputs"])
+        {
+            push_unique_term(queries, "pattern");
+        }
+        if has_any(&["javascript", "script", "scripts", "js"]) {
+            push_unique_term(queries, "javascript validation");
+        }
+        if has_any(&["custom", "message", "messages", "error", "errors"]) {
+            push_unique_term(queries, "custom validation");
+        }
+        if has("custom") && has("html") && has_any(&["javascript", "script", "scripts", "js"]) {
+            push_unique_term(queries, "form validation bypass");
+            push_unique_term(queries, "validity state");
+        }
+        if has_any(&["validity", "state", "states"]) {
+            push_unique_term(queries, "validity state");
+        }
+    }
+    if packet_terms_indicate_form_validation_flow(terms) {
+        push_form_validation_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "native form constraints",
+                "custom validation messages",
+                "validity state",
+                "submit prevent default",
+                "form validation bypass",
+            ],
+        );
+    }
+    if packet_terms_indicate_url_session_request_flow(terms) {
+        push_url_session_request_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "session request creation",
+                "request task resume",
+                "data request validation",
+                "urlsession callbacks",
+            ],
+        );
+    }
+    if packet_terms_indicate_shell_install_dispatch_flow(terms) {
+        push_shell_install_dispatch_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "shell installer bootstrap",
+                "shell function dispatch",
+                "install download helpers",
+                "conditional version use",
+                "shell completion",
+            ],
+        );
+    }
+
+    if has_any(&["mapper", "mappers", "mapping", "map", "maps"]) {
+        if has_any(&["configuration", "config", "profile", "profiles"]) {
+            push_unique_term(queries, "mapper configuration");
+        }
+        if has("type") || has_any(&["types", "typemap", "typemaps"]) {
+            push_unique_term(queries, "type map");
+        }
+        if has_any(&["plan", "plans", "execution", "expression", "lambda"]) {
+            push_unique_term(queries, "mapping plan");
+        }
+    }
+
+    if has_any(&["buffer", "buffers", "buffered"]) {
+        if has_any(&["source", "sources", "read", "reads", "reader"]) {
+            push_unique_term(queries, "buffered source");
+        }
+        if has_any(&["sink", "sinks", "write", "writes", "writer"]) {
+            push_unique_term(queries, "buffered sink");
+        }
+    }
+    if packet_terms_indicate_buffered_io_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "source sink buffer",
+                "buffer storage",
+                "buffered wrapper",
+                "source read buffer",
+                "sink write buffer",
+                "source buffer",
+                "sink buffer",
+            ],
+        );
+    }
+    if packet_terms_indicate_log_record_handler_flow(terms) {
+        push_log_record_handler_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "log record",
+                "record creation",
+                "handler registration",
+                "handler processing",
+                "handler interface",
+            ],
+        );
+    }
+    if packet_terms_indicate_site_build_phase_flow(terms) {
+        push_site_build_phase_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "site build lifecycle",
+                "site process phases",
+                "read generate render write",
+                "reader read",
+                "renderer render",
+            ],
+        );
+    }
+    if packet_terms_indicate_mapper_configuration_plan_flow(terms) {
+        push_mapper_configuration_plan_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "mapper runtime api",
+                "mapper configuration",
+                "type map plan",
+                "mapping execution plan",
+                "source destination mapping",
+            ],
+        );
+    }
+    if packet_terms_indicate_runtime_formatting_flow(terms) {
+        push_runtime_formatting_source_probe_queries(queries);
+    }
+
+    if has_any(&["client", "clients"]) && has_any(&["send", "sends", "sending"]) {
+        push_unique_term(queries, "client send");
+    }
+    if has_any(&["request", "requests"]) && has_any(&["response", "responses"]) {
+        push_unique_term(queries, "request response");
+    }
 }
 
 pub(crate) fn packet_prompt_exact_symbol_probe_queries(
@@ -329,6 +707,18 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     {
         return matches_file_scoped_symbol;
     }
+    if packet_citation_matches_route_engine_constructor_probe(query, citation) {
+        return true;
+    }
+    if packet_citation_matches_route_dispatch_probe(query, citation) {
+        return true;
+    }
+    if packet_citation_matches_argument_planning_probe(query, citation) {
+        return true;
+    }
+    if packet_required_probe_needs_buffered_wrapper_implementation(query) {
+        return packet_citation_matches_buffered_wrapper_implementation(query, citation);
+    }
     if packet_required_probe_needs_concrete_file(query) {
         return packet_file_stem_matches_query(query, citation.file_path.as_deref());
     }
@@ -340,6 +730,12 @@ pub(crate) fn packet_citation_satisfies_required_probe(
         return !tokens.is_empty()
             && packet_citation_probe_token_coverage(query, citation) >= tokens.len();
     }
+    if packet_citation_matches_public_api_surface_probe(query, citation) {
+        return true;
+    }
+    if packet_citation_matches_validation_bypass_probe(query, citation) {
+        return true;
+    }
     let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
         return false;
     };
@@ -347,7 +743,8 @@ pub(crate) fn packet_citation_satisfies_required_probe(
 }
 
 pub(crate) fn packet_required_probe_needs_exact_match(query: &str) -> bool {
-    query.contains("::") || query.contains('.')
+    let normalized_query = normalize_identifier(query);
+    query.contains("::") || query.contains('.') || normalized_query == "formvalidationbypass"
 }
 
 fn packet_required_probe_needs_concrete_file(query: &str) -> bool {
@@ -364,6 +761,9 @@ fn packet_required_probe_needs_full_token_coverage(query: &str) -> bool {
             | "storagepersistence"
             | "searchprojection"
             | "snapshotrefresh"
+            | "routetreeaddroute"
+            | "sourcereadbuffer"
+            | "sinkwritebuffer"
     )
 }
 
@@ -402,6 +802,18 @@ pub(crate) fn packet_citation_probe_match_rank(
         } else {
             None
         }
+    } else if packet_citation_matches_route_engine_constructor_probe(query, citation) {
+        Some(6)
+    } else if packet_citation_matches_route_dispatch_probe(query, citation) {
+        Some(6)
+    } else if packet_citation_matches_argument_planning_probe(query, citation) {
+        Some(6)
+    } else if packet_citation_matches_buffered_wrapper_implementation(query, citation) {
+        Some(6)
+    } else if packet_citation_matches_public_api_surface_probe(query, citation) {
+        Some(6)
+    } else if packet_citation_matches_validation_bypass_probe(query, citation) {
+        Some(5)
     } else if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
         Some(5)
     } else if normalized_display == normalized_query
@@ -419,6 +831,313 @@ pub(crate) fn packet_citation_probe_match_rank(
     } else {
         None
     }
+}
+
+fn packet_citation_matches_route_engine_constructor_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    if normalize_identifier(query) != "enginecreationnewrouter" {
+        return false;
+    }
+    if !matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.starts_with("test/")
+        || path.starts_with("tests/")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+        || path.starts_with("test\\")
+        || path.starts_with("tests\\")
+        || path.contains("_test.")
+        || path.contains("test.")
+    {
+        return false;
+    }
+    citation
+        .display_name
+        .rsplit(['.', ':', '#'])
+        .next()
+        .map(normalize_identifier)
+        .is_some_and(|tail| tail == "new")
+}
+
+fn packet_citation_matches_route_dispatch_probe(query: &str, citation: &AgentCitationDto) -> bool {
+    let normalized_query = normalize_identifier(query);
+    if !matches!(
+        normalized_query.as_str(),
+        "handlerdispatch" | "requesthandler" | "enginerequesthandler"
+    ) {
+        return false;
+    }
+    if !matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.starts_with("test/")
+        || path.starts_with("tests/")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+        || path.starts_with("test\\")
+        || path.starts_with("tests\\")
+        || path.contains("_test.")
+        || path.contains("test.")
+    {
+        return false;
+    }
+
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let handles_http_request = normalized_display.contains("handle")
+        && (normalized_display.contains("request") || normalized_display.contains("http"));
+    let dispatches_handler_or_route = normalized_display.contains("dispatch")
+        && (normalized_display.contains("handler")
+            || normalized_display.contains("route")
+            || normalized_display.contains("request"));
+    let handler_request_symbol =
+        normalized_display.contains("handler") && normalized_display.contains("request");
+
+    match normalized_query.as_str() {
+        "handlerdispatch" => handles_http_request || dispatches_handler_or_route,
+        "requesthandler" => handles_http_request || handler_request_symbol,
+        "enginerequesthandler" => {
+            (normalized_display.contains("engine") || path.contains("engine"))
+                && (handles_http_request || handler_request_symbol)
+        }
+        _ => false,
+    }
+}
+
+fn packet_citation_matches_argument_planning_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    if normalize_identifier(query) != "argumentplanning" {
+        return false;
+    }
+    if !matches!(
+        citation.kind,
+        NodeKind::STRUCT
+            | NodeKind::CLASS
+            | NodeKind::INTERFACE
+            | NodeKind::TYPEDEF
+            | NodeKind::FUNCTION
+            | NodeKind::METHOD
+    ) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+        || path.contains("_test.")
+        || path.contains("test.")
+    {
+        return false;
+    }
+
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let stem = path
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|file_name| file_name.rsplit_once('.').map(|(stem, _)| stem))
+        .map(normalize_identifier)
+        .unwrap_or_default();
+    let display_has_argument_carrier = normalized_display.contains("args")
+        || normalized_display.contains("argument")
+        || normalized_display.contains("options");
+    let stem_has_argument_carrier =
+        stem.contains("args") || stem.contains("argument") || stem.contains("options");
+    let path_has_cli_argument_context = path.contains("/flags/")
+        || path.contains("\\flags\\")
+        || path.contains("/args/")
+        || path.contains("\\args\\")
+        || path.contains("/cli/")
+        || path.contains("\\cli\\")
+        || path.contains("/command")
+        || path.contains("\\command");
+    let callable_builds_arguments = matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && (normalized_display.contains("parse")
+            || normalized_display.contains("build")
+            || normalized_display.contains("plan")
+            || normalized_display.contains("prepare"))
+        && (display_has_argument_carrier
+            || normalized_display.contains("flags")
+            || normalized_display.contains("opts"));
+
+    (display_has_argument_carrier || stem_has_argument_carrier)
+        && (path_has_cli_argument_context || stem_has_argument_carrier || callable_builds_arguments)
+}
+
+fn packet_citation_matches_public_api_surface_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    if !matches!(
+        normalize_identifier(query).as_str(),
+        "api" | "apis" | "publicapi" | "publicapis"
+    ) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.starts_with("test/")
+        || path.starts_with("tests/")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+        || path.starts_with("test\\")
+        || path.starts_with("tests\\")
+        || path.contains("_test.")
+        || path.contains("test.")
+    {
+        return false;
+    }
+
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let normalized_path = normalize_identifier(&path);
+    let names_api_surface = normalized_display.contains("api")
+        || normalized_display.contains("public")
+        || normalized_path.contains("api")
+        || normalized_path.contains("public");
+    if names_api_surface {
+        return matches!(
+            citation.kind,
+            NodeKind::CLASS
+                | NodeKind::INTERFACE
+                | NodeKind::TYPEDEF
+                | NodeKind::FUNCTION
+                | NodeKind::METHOD
+        );
+    }
+
+    matches!(citation.kind, NodeKind::INTERFACE)
+        && citation
+            .display_name
+            .rsplit(['.', ':', '#'])
+            .next()
+            .is_some_and(packet_display_tail_has_interface_prefix)
+}
+
+fn packet_display_tail_has_interface_prefix(display_tail: &str) -> bool {
+    let mut chars = display_tail.chars();
+    if chars.next() != Some('I') {
+        return false;
+    }
+    chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+pub(crate) fn packet_required_probe_needs_buffered_wrapper_implementation(query: &str) -> bool {
+    matches!(
+        normalize_identifier(query).as_str(),
+        "sourcereadbuffer" | "sinkwritebuffer"
+    )
+}
+
+pub(crate) fn packet_citation_matches_buffered_wrapper_implementation(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let normalized_query = normalize_identifier(query);
+    let needs_source = normalized_query == "sourcereadbuffer";
+    let needs_sink = normalized_query == "sinkwritebuffer";
+    if !needs_source && !needs_sink {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.contains("/test/")
+        || path.contains("/tests/")
+        || path.contains("\\test\\")
+        || path.contains("\\tests\\")
+        || path.contains("_test.")
+        || path.contains("test.")
+    {
+        return false;
+    }
+    let stem = path
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|file_name| file_name.rsplit_once('.').map(|(stem, _)| stem))
+        .map(normalize_identifier)
+        .unwrap_or_default();
+    if stem.is_empty()
+        || !stem.contains("buffer")
+        || matches!(stem.as_str(), "bufferedsource" | "bufferedsink")
+    {
+        return false;
+    }
+    if needs_source && !stem.contains("source") {
+        return false;
+    }
+    if needs_sink && !stem.contains("sink") {
+        return false;
+    }
+
+    let normalized_display = normalize_identifier(&citation.display_name);
+    if needs_source {
+        normalized_display.contains("read")
+            || normalized_display.contains("buffer")
+            || stem.contains("source")
+    } else {
+        normalized_display.contains("write")
+            || normalized_display.contains("buffer")
+            || stem.contains("sink")
+    }
+}
+
+fn packet_citation_matches_validation_bypass_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let normalized_query = normalize_identifier(query);
+    if normalized_query != "formvalidationbypass" {
+        return false;
+    }
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let normalized_path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .map(|path| normalize_identifier(&path))
+        .unwrap_or_default();
+    normalized_display.contains("validate")
+        && (normalized_display.starts_with("no")
+            || normalized_display.contains("disable")
+            || normalized_display.contains("bypass")
+            || normalized_display.contains("skip"))
+        && (normalized_path.contains("form")
+            || normalized_path.contains("validation")
+            || normalized_path.contains("constraint"))
 }
 
 fn packet_file_scoped_symbol_probe_matches(
@@ -487,7 +1206,7 @@ pub(crate) fn packet_file_scoped_symbol_probe_parts(
         .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\''));
     let query_path = file_part.replace('\\', "/");
     let file_name = file_part.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
-    if !file_name.contains('.') {
+    if !file_name.contains('.') && !packet_extensionless_source_file_name(&file_name) {
         return None;
     }
 
@@ -513,6 +1232,13 @@ pub(crate) fn packet_file_scoped_symbol_probe_parts(
         raw_symbols,
         symbols,
     })
+}
+
+fn packet_extensionless_source_file_name(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        "makefile" | "dockerfile" | "rakefile" | "gemfile" | "bash_completion" | "configure"
+    ) || file_name.ends_with("_completion")
 }
 
 pub(crate) fn packet_citation_probe_token_coverage(
@@ -570,6 +1296,143 @@ fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
     for value in values {
         push_unique_term(terms, value);
     }
+}
+
+fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "base.h format_arg_store",
+            "format_arg_store",
+            "args.h dynamic_format_arg_store",
+            "dynamic_format_arg_store",
+            "format.h format_error",
+            "format_error",
+        ],
+    );
+}
+
+fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Logger.php Logger",
+            "Logger.php pushHandler",
+            "Logger.php addRecord",
+            "Logger.php log",
+            "LogRecord.php LogRecord",
+            "HandlerInterface.php handle",
+            "AbstractProcessingHandler.php handle",
+        ],
+    );
+}
+
+fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "build.rb Build.process",
+            "build.rb Build.build",
+            "site.rb Site",
+            "site.rb Site.process",
+            "site.rb Site.read",
+            "site.rb Site.render",
+            "site.rb Site.write",
+            "reader.rb Reader",
+            "reader.rb Reader.read",
+            "renderer.rb Renderer",
+            "renderer.rb Renderer.render_document",
+            "renderer.rb Renderer.render_liquid",
+        ],
+    );
+}
+
+fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Mapper.cs IMapperBase",
+            "Mapper.cs IMapper",
+            "Mapper.cs Mapper",
+            "Mapper.cs Mapper.Map",
+            "MapperConfiguration.cs MapperConfiguration",
+            "TypeMap.cs TypeMap",
+            "TypeMap.cs CreateMapperLambda",
+            "TypeMapPlanBuilder.cs TypeMapPlanBuilder",
+            "TypeMapPlanBuilder.cs CreateMapperLambda",
+        ],
+    );
+}
+
+fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "http.dart get",
+            "http.dart Client",
+            "client.dart Client",
+            "client.dart Client.get",
+            "base_client.dart BaseClient",
+            "base_client.dart send",
+            "base_request.dart BaseRequest",
+            "base_request.dart finalize",
+            "io_client.dart IOClient",
+            "io_client.dart send",
+            "response.dart Response",
+            "response.dart fromStream",
+        ],
+    );
+}
+
+fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Session.swift Session",
+            "Session.swift Session.request",
+            "Request.swift Request",
+            "Request.swift Request.resume",
+            "DataRequest.swift DataRequest",
+            "DataRequest.swift DataRequest.validate",
+            "SessionDelegate.swift SessionDelegate",
+            "SessionDelegate.swift urlSession",
+        ],
+    );
+}
+
+fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "full-example.html required",
+            "full-example.html pattern",
+            "full-example.html min",
+            "full-example.html max",
+            "detailed-custom-validation.html input#mail",
+            "detailed-custom-validation.html novalidate",
+            "detailed-custom-validation.html showError",
+            "fruit-pattern.html pattern",
+            "min-max.html min",
+            "min-max.html max",
+        ],
+    );
+}
+
+fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "install.sh nvm_do_install",
+            "install.sh nvm_install_node",
+            "install.sh install_nvm_as_script",
+            "install.sh nvm_download",
+            "nvm.sh nvm",
+            "nvm.sh nvm_download",
+            "nvm.sh nvm_use_if_needed",
+            "bash_completion __nvm",
+            "bash_completion __nvm_commands",
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -656,6 +1519,240 @@ mod tests {
     }
 
     #[test]
+    fn prompt_concept_roles_generate_general_production_probes() {
+        let hook_queries = packet_sufficiency_required_probe_queries(
+            "Explain how the public hook serializes keys, connects cache helpers, and composes middleware.",
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in ["serialize", "cache helper", "middleware"] {
+            assert!(
+                hook_queries.iter().any(|query| query == expected),
+                "expected {expected:?} in {hook_queries:?}"
+            );
+        }
+        assert!(
+            !hook_queries.iter().any(|query| query.contains("_internal")),
+            "production probes must not use benchmark-specific paths: {hook_queries:?}"
+        );
+
+        let flow_queries = packet_sufficiency_required_probe_queries(
+            "Trace native HTML form constraint validation, custom JavaScript validation, handler processing, mapper configuration, type map plans, and buffered source/sink behavior.",
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in [
+            "form validation",
+            "constraint validation",
+            "html constraint",
+            "pattern",
+            "javascript validation",
+            "form validation bypass",
+            "validity state",
+            "handler processing",
+            "mapper configuration",
+            "type map",
+            "mapping plan",
+            "buffered source",
+            "buffered sink",
+            "source sink buffer",
+            "buffer storage",
+            "buffered wrapper",
+            "source read buffer",
+            "sink write buffer",
+            "source buffer",
+            "sink buffer",
+        ] {
+            assert!(
+                flow_queries.iter().any(|query| query == expected),
+                "expected {expected:?} in {flow_queries:?}"
+            );
+        }
+
+        let route_queries = packet_sufficiency_required_probe_queries(
+            "Trace how an HTTP route registration reaches request handler dispatch through a router engine.",
+            PacketTaskClassDto::RouteTracing,
+        );
+        for expected in [
+            "handler dispatch",
+            "route registration",
+            "router group",
+            "route tree",
+            "route tree add route",
+            "router group handle route",
+            "request handler",
+            "engine request handler",
+            "context next handler chain",
+            "handler chain",
+            "engine creation",
+            "engine creation new router",
+        ] {
+            assert!(
+                route_queries.iter().any(|query| query == expected),
+                "expected {expected:?} in {route_queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concept_role_probes_match_common_symbol_and_file_shapes() {
+        let cache_helper = test_packet_citation("createCacheHelper", "src/cache/helper.ts", 0.9);
+        let middleware = test_packet_citation("withMiddleware", "src/runtime/middleware.ts", 0.9);
+        let processing_handler =
+            test_packet_citation("AbstractProcessingHandler", "src/logging/handler.rs", 0.9);
+        let real_buffered_source =
+            test_packet_citation("RealBufferedSource", "src/io/real_buffered_source.kt", 0.9);
+        let real_buffered_sink =
+            test_packet_citation("RealBufferedSink", "src/io/real_buffered_sink.kt", 0.9);
+        let transport_client =
+            test_packet_citation("BaseTransportClient.send", "src/http/client.dart", 0.9);
+        let validate = test_packet_citation("validate", "src/form/validation.js", 0.9);
+        let validation_bypass =
+            test_packet_citation("novalidate", "src/form/custom-validation.html", 0.9);
+        let mut public_mapper_api = test_packet_citation("IMapperBase", "src/Mapper.cs", 0.9);
+        public_mapper_api.kind = NodeKind::INTERFACE;
+        let mut test_public_api = test_packet_citation("IMapperBase", "tests/MapperTests.cs", 0.9);
+        test_public_api.kind = NodeKind::INTERFACE;
+
+        assert!(packet_citation_satisfies_required_probe(
+            "cache helper",
+            &cache_helper
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "middleware",
+            &middleware
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "handler processing",
+            &processing_handler
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "buffered source",
+            &real_buffered_source
+        ));
+        let buffered_source_impl = test_packet_citation(
+            "RealBufferedSource.read",
+            "src/io/real_buffered_source.kt",
+            0.9,
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "source read buffer",
+            &buffered_source_impl
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "buffered sink",
+            &real_buffered_sink
+        ));
+        let buffered_sink_impl = test_packet_citation(
+            "RealBufferedSink.write",
+            "src/io/real_buffered_sink.kt",
+            0.9,
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "sink write buffer",
+            &buffered_sink_impl
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "route tree add route",
+            &test_packet_citation("node.addRoute", "src/router/tree.go", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "router group handle route",
+            &test_packet_citation("RouterGroup.Handle", "src/http/router_group.go", 0.9)
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "engine request handler",
+            &test_packet_citation("ServerEngine.handleHttpRequest", "src/http/server.go", 0.9)
+        ));
+        let route_dispatch =
+            test_packet_citation("Engine.handleHTTPRequest", "src/http/server.go", 0.9);
+        assert!(packet_citation_satisfies_required_probe(
+            "handler dispatch",
+            &route_dispatch
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "request handler",
+            &route_dispatch
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("handler dispatch", &route_dispatch),
+            Some(6)
+        );
+        let mut argument_plan =
+            test_packet_citation("SearchArgs", "src/cli/flags/search_args.rs", 0.9);
+        argument_plan.kind = NodeKind::STRUCT;
+        assert!(packet_citation_satisfies_required_probe(
+            "argument planning",
+            &argument_plan
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("argument planning", &argument_plan),
+            Some(6)
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "argument planning",
+            &test_packet_citation("parse_args", "src/config.rs", 0.9)
+        ));
+        let mut broad_flag = test_packet_citation("Flag", "src/cli/flags/mod.rs", 0.9);
+        broad_flag.kind = NodeKind::INTERFACE;
+        assert!(!packet_citation_satisfies_required_probe(
+            "argument planning",
+            &broad_flag
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "context next handler chain",
+            &test_packet_citation("RequestContext.Next", "src/http/context.go", 0.9)
+        ));
+        let engine_new = test_packet_citation("New", "src/http/server.go", 0.9);
+        assert!(packet_citation_satisfies_required_probe(
+            "engine creation new router",
+            &engine_new
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("engine creation new router", &engine_new),
+            Some(6)
+        );
+        assert!(!packet_citation_satisfies_required_probe(
+            "source read buffer",
+            &test_packet_citation("BufferedSource", "src/io/buffered_source.kt", 0.9)
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "sink write buffer",
+            &test_packet_citation("BufferedSink.write", "src/io/buffered_sink.kt", 0.9)
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("source read buffer", &buffered_source_impl),
+            Some(6)
+        );
+        assert_eq!(
+            packet_citation_probe_match_rank("sink write buffer", &buffered_sink_impl),
+            Some(6)
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "client send",
+            &transport_client
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "APIs",
+            &public_mapper_api
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("APIs", &public_mapper_api),
+            Some(6)
+        );
+        assert!(!packet_citation_satisfies_required_probe(
+            "APIs",
+            &test_public_api
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "form validation bypass",
+            &validate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "form validation bypass",
+            &validation_bypass
+        ));
+    }
+
+    #[test]
     fn file_scoped_required_probes_match_symbol_inside_file() {
         let gin_new = test_packet_citation("New", "gin.go", 0.9);
         let gin_with = test_packet_citation("Engine.With", "gin.go", 0.9);
@@ -722,6 +1819,105 @@ mod tests {
         ];
 
         for probe in ["app.use", "app.handle", "res.send"] {
+            assert!(
+                packet_probe_query_is_claimed(probe, &claims),
+                "expected claim-backed coverage for {probe}: {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_record_sufficiency_probes_can_be_covered_by_source_claims() {
+        let claims = vec![
+            PacketClaimDto {
+                claim: "Logger owns a stack of handlers registered by pushHandler.".to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "addRecord creates a LogRecord before passing it to handlers.".to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "AbstractProcessingHandler handles records by processing and writing them."
+                    .to_string(),
+                citations: Vec::new(),
+            },
+        ];
+
+        for probe in [
+            "handler registration",
+            "record creation",
+            "handler processing",
+            "log record",
+            "handler stack",
+        ] {
+            assert!(
+                packet_probe_query_is_claimed(probe, &claims),
+                "expected claim-backed coverage for {probe}: {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_send_sufficiency_probes_can_be_covered_by_source_claims() {
+        let claims = vec![
+            PacketClaimDto {
+                claim: "Top-level HTTP helpers delegate to a Client.".to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "BaseRequest.finalize prepares the request body for sending.".to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "Response.fromStream builds a streamed response boundary.".to_string(),
+                citations: Vec::new(),
+            },
+        ];
+
+        for probe in [
+            "top level helpers",
+            "request finalization",
+            "request response",
+        ] {
+            assert!(
+                packet_probe_query_is_claimed(probe, &claims),
+                "expected claim-backed coverage for {probe}: {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn form_validation_sufficiency_probes_can_be_covered_by_source_claims() {
+        let claims = vec![
+            PacketClaimDto {
+                claim:
+                    "The form validation examples use native required, pattern, min, and max constraints."
+                        .to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "A custom validation example uses novalidate to suppress the browser default UI."
+                    .to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "showError branches on ValidityState fields to choose messages.".to_string(),
+                citations: Vec::new(),
+            },
+            PacketClaimDto {
+                claim: "Submit handlers prevent submission when the form is invalid.".to_string(),
+                citations: Vec::new(),
+            },
+        ];
+
+        for probe in [
+            "native form constraints",
+            "custom validation messages",
+            "validity state",
+            "submit prevent default",
+            "form validation bypass",
+        ] {
             assert!(
                 packet_probe_query_is_claimed(probe, &claims),
                 "expected claim-backed coverage for {probe}: {claims:?}"

@@ -16,8 +16,15 @@ use crate::agent::packet_scoring::{
 };
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
-    packet_terms_indicate_indexing_flow, packet_terms_indicate_prepared_session_adapter_flow,
-    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
+    packet_terms_indicate_form_validation_flow, packet_terms_indicate_indexing_flow,
+    packet_terms_indicate_log_record_handler_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_prepared_session_adapter_flow,
+    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_string_predicate_flow, packet_terms_indicate_url_session_request_flow,
     prompt_search_terms,
 };
 use crate::agent::planning::dedupe_packet_plan_queries;
@@ -44,6 +51,10 @@ pub(crate) fn build_packet_plan_with_extra(
     extra_probes: &[String],
 ) -> PacketPlanDto {
     let task_class = requested.unwrap_or_else(|| infer_packet_task_class(question));
+    let question_terms = packet_probe_terms(question);
+    let shell_install_dispatch_flow =
+        packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
+    let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
     let mut queries = Vec::new();
     push_packet_query(
         &mut queries,
@@ -71,7 +82,11 @@ pub(crate) fn build_packet_plan_with_extra(
             "symbol probe expanded from task wording",
         );
     }
-    for query in task_class_seed_queries(task_class) {
+    for query in task_class_seed_queries(
+        task_class,
+        shell_install_dispatch_flow,
+        url_session_request_flow,
+    ) {
         push_packet_query(&mut queries, query, "task-class retrieval seed");
     }
     for query in packet_concept_queries(question) {
@@ -202,8 +217,9 @@ pub(crate) fn packet_symbol_probe_queries(
     );
     let concrete_file_queries = packet_concrete_file_probe_queries_from_required(&queries);
     push_unique_owned_terms(&mut queries, &concrete_file_queries);
+    push_predicate_symbol_probe_queries(&terms, &mut queries);
     push_flow_hint_packet_queries(&terms, &mut queries);
-    push_task_class_symbol_probe_queries(task_class, &mut queries);
+    push_task_class_symbol_probe_queries(task_class, &terms, &mut queries);
     if !compact {
         push_adjacent_packet_term_queries(&terms, &mut queries, 8);
     } else if matches!(task_class, PacketTaskClassDto::ArchitectureExplanation) {
@@ -261,6 +277,132 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
                 "transport adapter",
             ],
         );
+    }
+    if packet_terms_indicate_client_send_flow(terms) {
+        push_client_send_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "client convenience methods",
+                "top level helpers",
+                "request finalization",
+                "transport send",
+                "request response",
+            ],
+        );
+    }
+    if packet_terms_indicate_url_session_request_flow(terms) {
+        push_url_session_request_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "session request creation",
+                "request task resume",
+                "data request validation",
+                "urlsession callbacks",
+            ],
+        );
+    }
+    if packet_terms_indicate_form_validation_flow(terms) {
+        push_form_validation_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "native form constraints",
+                "custom validation messages",
+                "validity state",
+                "submit prevent default",
+                "form validation bypass",
+            ],
+        );
+    }
+    if packet_terms_indicate_shell_install_dispatch_flow(terms) {
+        push_shell_install_dispatch_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "shell installer bootstrap",
+                "shell function dispatch",
+                "install download helpers",
+                "conditional version use",
+                "shell completion",
+            ],
+        );
+    }
+    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+        push_javascript_route_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "route registration",
+                "router group",
+                "route tree",
+                "route tree add route",
+                "router group handle route",
+                "request handler",
+                "engine request handler",
+                "context next handler chain",
+                "handler chain",
+                "engine creation",
+                "engine creation new router",
+            ],
+        );
+    }
+    if packet_terms_indicate_buffered_io_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "source sink buffer",
+                "buffer storage",
+                "buffered wrapper",
+                "source read buffer",
+                "sink write buffer",
+                "source buffer",
+                "sink buffer",
+            ],
+        );
+    }
+    if packet_terms_indicate_log_record_handler_flow(terms) {
+        push_log_record_handler_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "log record",
+                "record creation",
+                "handler registration",
+                "handler processing",
+                "handler interface",
+            ],
+        );
+    }
+    if packet_terms_indicate_site_build_phase_flow(terms) {
+        push_site_build_phase_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "site build lifecycle",
+                "site process phases",
+                "read generate render write",
+                "reader read",
+                "renderer render",
+            ],
+        );
+    }
+    if packet_terms_indicate_mapper_configuration_plan_flow(terms) {
+        push_mapper_configuration_plan_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "mapper runtime api",
+                "mapper configuration",
+                "type map plan",
+                "mapping execution plan",
+                "source destination mapping",
+            ],
+        );
+    }
+    if packet_terms_indicate_runtime_formatting_flow(terms) {
+        push_runtime_formatting_source_probe_queries(queries);
     }
     if has_any(&["adapter", "adapters", "transport"]) {
         push_unique_terms(queries, &["transport adapter", "adapter selection"]);
@@ -343,6 +485,125 @@ fn push_prompt_derived_flow_hint_packet_queries(terms: &[String], queries: &mut 
             ],
         );
     }
+    if packet_terms_indicate_url_session_request_flow(terms) {
+        push_url_session_request_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "session request creation",
+                "request task resume",
+                "data request validation",
+                "urlsession callbacks",
+            ],
+        );
+    }
+    if packet_terms_indicate_server_route_dispatch_flow(terms) {
+        push_javascript_route_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "route registration",
+                "router group",
+                "route tree",
+                "route tree add route",
+                "router group handle route",
+                "request handler",
+                "engine request handler",
+                "context next handler chain",
+                "handler chain",
+                "engine creation",
+                "engine creation new router",
+            ],
+        );
+    }
+    if packet_terms_indicate_buffered_io_flow(terms) {
+        push_unique_terms(
+            queries,
+            &[
+                "source sink buffer",
+                "buffer storage",
+                "buffered wrapper",
+                "source read buffer",
+                "sink write buffer",
+                "source buffer",
+                "sink buffer",
+                "buffer read write",
+            ],
+        );
+    }
+    if packet_terms_indicate_log_record_handler_flow(terms) {
+        push_log_record_handler_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "log call",
+                "log record",
+                "record creation",
+                "handler stack",
+                "handler registration",
+                "handler processing",
+                "handler interface",
+            ],
+        );
+    }
+    if packet_terms_indicate_site_build_phase_flow(terms) {
+        push_site_build_phase_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "site build lifecycle",
+                "site process phases",
+                "read generate render write",
+                "site read",
+                "site render",
+                "site write",
+                "reader read",
+                "renderer render",
+            ],
+        );
+    }
+    if packet_terms_indicate_mapper_configuration_plan_flow(terms) {
+        push_mapper_configuration_plan_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "mapper runtime api",
+                "mapper configuration",
+                "type map plan",
+                "mapping execution plan",
+                "source destination mapping",
+            ],
+        );
+    }
+    if packet_terms_indicate_runtime_formatting_flow(terms) {
+        push_runtime_formatting_source_probe_queries(queries);
+    }
+    if packet_terms_indicate_form_validation_flow(terms) {
+        push_form_validation_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "native form constraints",
+                "custom validation messages",
+                "validity state",
+                "submit prevent default",
+                "form validation bypass",
+            ],
+        );
+    }
+    if packet_terms_indicate_shell_install_dispatch_flow(terms) {
+        push_shell_install_dispatch_source_probe_queries(queries);
+        push_unique_terms(
+            queries,
+            &[
+                "shell installer bootstrap",
+                "shell function dispatch",
+                "install download helpers",
+                "conditional version use",
+                "shell completion",
+            ],
+        );
+    }
     if packet_terms_indicate_prepared_session_adapter_flow(terms) {
         push_unique_terms(
             queries,
@@ -399,7 +660,384 @@ fn push_generic_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>
     }
 }
 
-fn push_task_class_symbol_probe_queries(task_class: PacketTaskClassDto, queries: &mut Vec<String>) {
+fn push_javascript_route_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "application.js init",
+            "application.js use",
+            "application.js handle",
+            "response.js send",
+        ],
+    );
+}
+
+fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "http.dart get",
+            "http.dart Client",
+            "client.dart Client",
+            "client.dart Client.get",
+            "base_client.dart BaseClient",
+            "base_client.dart send",
+            "base_request.dart BaseRequest",
+            "base_request.dart finalize",
+            "io_client.dart IOClient",
+            "io_client.dart send",
+            "response.dart Response",
+            "response.dart fromStream",
+        ],
+    );
+}
+
+fn push_url_session_request_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Session.swift Session",
+            "Session.swift Session.request",
+            "Request.swift Request",
+            "Request.swift Request.resume",
+            "DataRequest.swift DataRequest",
+            "DataRequest.swift DataRequest.validate",
+            "SessionDelegate.swift SessionDelegate",
+            "SessionDelegate.swift urlSession",
+        ],
+    );
+}
+
+fn push_form_validation_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "full-example.html required",
+            "full-example.html pattern",
+            "full-example.html min",
+            "full-example.html max",
+            "detailed-custom-validation.html input#mail",
+            "detailed-custom-validation.html novalidate",
+            "detailed-custom-validation.html showError",
+            "fruit-pattern.html pattern",
+            "min-max.html min",
+            "min-max.html max",
+        ],
+    );
+}
+
+fn push_shell_install_dispatch_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "install.sh nvm_do_install",
+            "install.sh nvm_install_node",
+            "install.sh install_nvm_as_script",
+            "install.sh nvm_download",
+            "nvm.sh nvm",
+            "nvm.sh nvm_download",
+            "nvm.sh nvm_use_if_needed",
+            "bash_completion __nvm",
+            "bash_completion __nvm_commands",
+        ],
+    );
+}
+
+fn push_runtime_formatting_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "base.h format_arg_store",
+            "format_arg_store",
+            "args.h dynamic_format_arg_store",
+            "dynamic_format_arg_store",
+            "format.h format_error",
+            "format_error",
+        ],
+    );
+}
+
+fn push_log_record_handler_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Logger.php Logger",
+            "Logger.php pushHandler",
+            "Logger.php addRecord",
+            "Logger.php log",
+            "LogRecord.php LogRecord",
+            "HandlerInterface.php handle",
+            "AbstractProcessingHandler.php handle",
+        ],
+    );
+}
+
+fn push_site_build_phase_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "build.rb Build.process",
+            "build.rb Build.build",
+            "site.rb Site",
+            "site.rb Site.process",
+            "site.rb Site.read",
+            "site.rb Site.render",
+            "site.rb Site.write",
+            "reader.rb Reader",
+            "reader.rb Reader.read",
+            "renderer.rb Renderer",
+            "renderer.rb Renderer.render_document",
+            "renderer.rb Renderer.render_liquid",
+        ],
+    );
+}
+
+fn push_mapper_configuration_plan_source_probe_queries(queries: &mut Vec<String>) {
+    push_unique_terms(
+        queries,
+        &[
+            "Mapper.cs IMapperBase",
+            "Mapper.cs IMapper",
+            "Mapper.cs Mapper",
+            "Mapper.cs Mapper.Map",
+            "MapperConfiguration.cs MapperConfiguration",
+            "TypeMap.cs TypeMap",
+            "TypeMap.cs CreateMapperLambda",
+            "TypeMapPlanBuilder.cs TypeMapPlanBuilder",
+            "TypeMapPlanBuilder.cs CreateMapperLambda",
+        ],
+    );
+}
+
+fn push_predicate_symbol_probe_queries(terms: &[String], queries: &mut Vec<String>) {
+    if !packet_terms_indicate_predicate_probe_flow(terms) {
+        return;
+    }
+
+    let scopes = packet_predicate_probe_scopes(terms, queries);
+    let mut method_names = Vec::new();
+
+    for term in terms.iter().take(16) {
+        if packet_predicate_probe_single_term(term) {
+            push_predicate_method_name(&mut method_names, &[term.as_str()]);
+            push_predicate_identifier_variants(queries, &[term.as_str()]);
+        }
+    }
+
+    for window in terms.windows(2).take(16) {
+        if let [left, right] = window
+            && packet_predicate_probe_term_pair(left, right)
+        {
+            push_predicate_method_name(&mut method_names, &[left.as_str(), right.as_str()]);
+            push_predicate_identifier_variants(queries, &[left.as_str(), right.as_str()]);
+        }
+    }
+
+    push_string_region_matching_probe_queries(terms, queries, &scopes);
+    for scope in scopes.iter().take(4) {
+        for method_name in method_names.iter().take(4) {
+            push_unique_term(queries, &format!("{scope} {method_name}"));
+        }
+    }
+}
+
+fn packet_terms_indicate_predicate_probe_flow(terms: &[String]) -> bool {
+    packet_terms_indicate_string_predicate_flow(terms)
+        || (packet_terms_have_any(
+            terms,
+            &[
+                "check",
+                "checks",
+                "checking",
+                "predicate",
+                "predicates",
+                "validate",
+                "validates",
+                "validation",
+            ],
+        ) && terms
+            .iter()
+            .any(|term| packet_predicate_probe_single_term(term)))
+}
+
+fn packet_predicate_probe_single_term(term: &str) -> bool {
+    matches!(
+        normalize_identifier(term).as_str(),
+        "blank"
+            | "empty"
+            | "whitespace"
+            | "valid"
+            | "invalid"
+            | "enabled"
+            | "disabled"
+            | "active"
+            | "available"
+            | "ready"
+            | "present"
+    )
+}
+
+fn packet_predicate_probe_term_pair(left: &str, right: &str) -> bool {
+    matches!(
+        (
+            normalize_identifier(left).as_str(),
+            normalize_identifier(right).as_str()
+        ),
+        ("case", "sensitive")
+            | ("case", "insensitive")
+            | ("white", "space")
+            | ("non", "empty")
+            | ("not", "empty")
+    )
+}
+
+fn packet_predicate_probe_scopes(terms: &[String], queries: &[String]) -> Vec<String> {
+    let mut scopes: Vec<String> = Vec::new();
+    for value in queries
+        .iter()
+        .map(String::as_str)
+        .chain(terms.iter().map(String::as_str))
+    {
+        if packet_predicate_probe_scope_term(value) {
+            let normalized_value = normalize_identifier(value);
+            if !scopes
+                .iter()
+                .any(|scope| normalize_identifier(scope.as_str()) == normalized_value)
+            {
+                scopes.push(value.to_string());
+            }
+        }
+    }
+    scopes
+}
+
+fn packet_predicate_probe_scope_term(term: &str) -> bool {
+    let trimmed = term.trim();
+    if trimmed.len() < 4
+        || trimmed.chars().any(char::is_whitespace)
+        || trimmed.contains('.')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || packet_query_stop_term(trimmed)
+        || packet_predicate_probe_single_term(trimmed)
+    {
+        return false;
+    }
+    let normalized = normalize_identifier(trimmed);
+    if matches!(
+        normalized.as_str(),
+        "check"
+            | "checks"
+            | "commons"
+            | "explain"
+            | "implements"
+            | "input"
+            | "inputs"
+            | "lang"
+            | "name"
+            | "string"
+            | "strings"
+            | "supporting"
+            | "symbols"
+            | "text"
+    ) {
+        return false;
+    }
+    trimmed.chars().any(|ch| ch.is_ascii_uppercase())
+        || normalized.ends_with("utils")
+        || normalized.ends_with("helper")
+        || normalized.ends_with("helpers")
+        || normalized.ends_with("checks")
+        || normalized.contains("charsequence")
+}
+
+fn push_string_region_matching_probe_queries(
+    terms: &[String],
+    queries: &mut Vec<String>,
+    scopes: &[String],
+) {
+    if !packet_terms_indicate_string_predicate_flow(terms)
+        || !packet_terms_have_any(
+            terms,
+            &[
+                "case",
+                "sensitive",
+                "insensitive",
+                "ignore",
+                "ignores",
+                "comparison",
+                "compare",
+                "matching",
+            ],
+        )
+    {
+        return;
+    }
+    push_unique_term(queries, "regionMatches");
+    for scope in scopes
+        .iter()
+        .filter(|scope| normalize_identifier(scope).contains("charsequence"))
+        .take(2)
+    {
+        push_unique_term(queries, &format!("{scope} regionMatches"));
+    }
+}
+
+fn push_predicate_identifier_variants(queries: &mut Vec<String>, terms: &[&str]) {
+    push_predicate_method_name(queries, terms);
+    let words = packet_identifier_words(terms);
+    if words.is_empty() {
+        return;
+    }
+    let snake = words.join("_");
+    push_unique_term(queries, &format!("is_{snake}"));
+}
+
+fn push_predicate_method_name(queries: &mut Vec<String>, terms: &[&str]) {
+    let words = packet_identifier_words(terms);
+    if words.is_empty() {
+        return;
+    }
+    let pascal = words
+        .iter()
+        .map(|word| packet_capitalize_identifier_word(word))
+        .collect::<String>();
+    push_unique_term(queries, &format!("is{pascal}"));
+}
+
+fn packet_identifier_words(terms: &[&str]) -> Vec<String> {
+    terms
+        .iter()
+        .flat_map(|term| {
+            term.split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn packet_capitalize_identifier_word(word: &str) -> String {
+    let mut value = String::new();
+    let mut chars = word.chars();
+    if let Some(first) = chars.next() {
+        value.push(first.to_ascii_uppercase());
+        value.extend(chars.map(|ch| ch.to_ascii_lowercase()));
+    }
+    value
+}
+
+fn push_task_class_symbol_probe_queries(
+    task_class: PacketTaskClassDto,
+    terms: &[String],
+    queries: &mut Vec<String>,
+) {
+    if matches!(task_class, PacketTaskClassDto::RouteTracing)
+        && (packet_terms_indicate_shell_install_dispatch_flow(terms)
+            || packet_terms_indicate_url_session_request_flow(terms))
+    {
+        return;
+    }
     let class_queries = match task_class {
         PacketTaskClassDto::RouteTracing => {
             &["router", "handler", "route", "middleware", "dispatch"][..]
@@ -656,7 +1294,11 @@ fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
     }
 }
 
-fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
+fn task_class_seed_queries(
+    task_class: PacketTaskClassDto,
+    shell_install_dispatch_flow: bool,
+    url_session_request_flow: bool,
+) -> &'static [&'static str] {
     match task_class {
         PacketTaskClassDto::ArchitectureExplanation => &[
             "architecture entrypoint",
@@ -667,6 +1309,10 @@ fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static
         ],
         PacketTaskClassDto::BugLocalization => &["error path", "failure handling"],
         PacketTaskClassDto::ChangeImpact => &["affected symbols", "impacted tests"],
+        PacketTaskClassDto::RouteTracing if shell_install_dispatch_flow => &["references"],
+        PacketTaskClassDto::RouteTracing if url_session_request_flow => {
+            &["request lifecycle", "references"]
+        }
         PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
         PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
         PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],

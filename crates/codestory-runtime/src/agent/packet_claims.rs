@@ -518,74 +518,77 @@ pub(crate) fn packet_claim_for_role(
         .unwrap_or_default();
     match role {
         PacketEvidenceRole::CommandEntrypoint => format!(
-            "The command or public entrypoint for this flow is anchored by `{symbol}`; inspect it before following downstream coordination."
+            "The command or public entrypoint for this flow is `{symbol}`, which starts downstream coordination."
         ),
-        PacketEvidenceRole::ClientFactory => format!(
-            "Client factory behavior is anchored by `{symbol}`; inspect it for instance creation and request-method binding."
-        ),
-        PacketEvidenceRole::InterceptorManagement => format!(
-            "Interceptor management is anchored by `{symbol}`; inspect it for fulfilled/rejected handler registration and iteration."
-        ),
+        PacketEvidenceRole::ClientFactory => {
+            format!("`{symbol}` creates client instances or binds request methods for this flow.")
+        }
+        PacketEvidenceRole::InterceptorManagement => {
+            format!("`{symbol}` manages fulfilled/rejected interceptor registration and iteration.")
+        }
         PacketEvidenceRole::RequestDispatch => format!(
-            "Request dispatch is anchored by `{symbol}`; inspect it for config transformation and adapter handoff."
+            "`{symbol}` dispatches requests by transforming config and handing off to an adapter or handler."
         ),
         PacketEvidenceRole::TransportAdapter => format!(
-            "Transport adapter selection is anchored by `{symbol}`; inspect it for environment-specific transport choice."
+            "`{symbol}` is the transport adapter boundary for environment-specific sending."
         ),
         PacketEvidenceRole::EventLoop => format!(
-            "Event-loop polling is anchored by `{symbol}`; inspect it for readable/writable file-event dispatch."
+            "`{symbol}` polls event-loop state and dispatches readable or writable file events."
         ),
-        PacketEvidenceRole::NetworkCommandInput => format!(
-            "Network command input is anchored by `{symbol}`; inspect it for socket reads and command-buffer processing."
-        ),
+        PacketEvidenceRole::NetworkCommandInput => {
+            format!("`{symbol}` reads network or socket input into command-buffer processing.")
+        }
         PacketEvidenceRole::CommandDispatch => format!(
-            "Command dispatch is anchored by `{symbol}`; inspect it for command lookup, validation, execution, and propagation."
+            "`{symbol}` dispatches commands through lookup, validation, execution, or propagation."
         ),
         PacketEvidenceRole::ArgumentPlanning => format!(
-            "Argument planning is anchored by `{symbol}`; inspect it for walker, matcher, searcher, and printer construction."
+            "`{symbol}` plans arguments by constructing walker, matcher, searcher, or printer behavior."
         ),
         PacketEvidenceRole::SearchDriver => format!(
-            "Search driver behavior is anchored by `{symbol}`; inspect it for entrypoint routing and sequential or parallel search selection."
+            "`{symbol}` routes search entrypoint behavior into sequential or parallel execution."
         ),
-        PacketEvidenceRole::SearchExecutionUnit => format!(
-            "Search worker behavior is anchored by `{symbol}`; inspect it for per-candidate matcher/searcher/printer execution."
-        ),
+        PacketEvidenceRole::SearchExecutionUnit => {
+            format!("`{symbol}` executes per-candidate matcher, searcher, or printer work.")
+        }
         PacketEvidenceRole::RuntimeOrchestration => format!(
-            "Runtime orchestration is anchored by `{symbol}`; verify coordination, state transitions, and downstream service calls there."
+            "`{symbol}` coordinates runtime state transitions and downstream service calls."
         ),
         PacketEvidenceRole::WorkspaceDiscoveryAndPlanning => format!(
-            "Workspace discovery or planning is anchored by `{symbol}`; inspect it for file selection, manifest, or execution-plan behavior."
+            "`{symbol}` handles workspace file selection, manifests, or execution-plan behavior."
         ),
-        PacketEvidenceRole::SourceGroupConfiguration => format!(
-            "Source-group configuration is anchored by `{symbol}`; inspect it for how project settings become source-group-specific indexing inputs."
-        ),
+        PacketEvidenceRole::SourceGroupConfiguration => {
+            format!("`{symbol}` maps project settings into source-group-specific indexing inputs.")
+        }
         PacketEvidenceRole::IndexingWorkQueue => format!(
-            "Indexing work queue behavior is anchored by `{symbol}`; inspect it for build-index commands, parser handoff, or source-file work items."
+            "`{symbol}` turns build-index commands into parser handoff or source-file work items."
         ),
-        PacketEvidenceRole::SymbolExtraction => format!(
-            "Symbol extraction is anchored by `{symbol}`; inspect it for nodes, edges, occurrences, or file-level indexing."
-        ),
-        PacketEvidenceRole::PersistenceAndSearchProjection => format!(
-            "Persistence or search projection is anchored by `{symbol}`; inspect it for durable graph/search state."
-        ),
-        PacketEvidenceRole::SnapshotRefresh => format!(
-            "Snapshot refresh is anchored by `{symbol}`; inspect it for post-write summary or cache refresh behavior."
-        ),
-        PacketEvidenceRole::RouteHandling => format!(
-            "Route handling is anchored by `{symbol}`; inspect it before tracing request dispatch or handler ownership."
-        ),
-        PacketEvidenceRole::CollectionConfiguration => format!(
-            "Collection configuration is anchored by `{symbol}`; inspect schema fields, hooks, and access rules."
-        ),
-        PacketEvidenceRole::EventOutputProcessing => format!(
-            "JSON/event output processing is anchored by `{symbol}`; inspect it for typed event serialization and stdout behavior."
-        ),
-        PacketEvidenceRole::AppServerRequestProtocol => format!(
-            "App-server request protocol evidence is anchored by `{symbol}`; inspect it for thread or turn start request shape."
-        ),
-        PacketEvidenceRole::TestsAndRegressionCoverage => format!(
-            "Regression coverage for this flow is anchored by `{symbol}`; use it to choose focused verification before broader suites."
-        ),
+        PacketEvidenceRole::SymbolExtraction => {
+            format!("`{symbol}` extracts nodes, edges, occurrences, or file-level symbol data.")
+        }
+        PacketEvidenceRole::PersistenceAndSearchProjection => {
+            format!("`{symbol}` persists or projects durable graph/search state.")
+        }
+        PacketEvidenceRole::SnapshotRefresh => {
+            format!("`{symbol}` refreshes post-write summaries or cache state.")
+        }
+        PacketEvidenceRole::RouteHandling => {
+            format!("`{symbol}` handles route dispatch or handler ownership for the request path.")
+        }
+        PacketEvidenceRole::BufferedIo => {
+            format!("`{symbol}` connects buffered read/write state with Source or Sink handoff.")
+        }
+        PacketEvidenceRole::CollectionConfiguration => {
+            format!("`{symbol}` defines collection schema fields, hooks, or access rules.")
+        }
+        PacketEvidenceRole::EventOutputProcessing => {
+            format!("`{symbol}` serializes typed runtime events for JSON/event output.")
+        }
+        PacketEvidenceRole::AppServerRequestProtocol => {
+            format!("`{symbol}` defines app-server thread or turn start request protocol shape.")
+        }
+        PacketEvidenceRole::TestsAndRegressionCoverage => {
+            format!("`{symbol}` covers regression behavior for focused verification choices.")
+        }
         PacketEvidenceRole::SourceEvidence => {
             let flow_terms = packet_claim_flow_terms(rank_terms, citation);
             let focus = if flow_terms.is_empty() {
@@ -594,7 +597,7 @@ pub(crate) fn packet_claim_for_role(
                 flow_terms.join(", ")
             };
             format!(
-                "`{symbol}` in `{path}` {}; inspect definitions and downstream handoff there.",
+                "`{symbol}` in `{path}` {}.",
                 packet_source_evidence_flow_sentence(prompt, &focus)
             )
         }
@@ -602,7 +605,7 @@ pub(crate) fn packet_claim_for_role(
         | PacketEvidenceRole::SqlRelationshipConstraint
         | PacketEvidenceRole::SqlSchemaFile
         | PacketEvidenceRole::CandidateFileConstruction => {
-            format!("Evidence for this flow is anchored by `{symbol}`.")
+            format!("Schema or candidate-file evidence identifies `{symbol}` as part of this flow.")
         }
     }
 }
@@ -612,9 +615,7 @@ fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
     if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
         return sentence;
     }
-    format!(
-        "supports {focus} in this flow; inspect the cited source, local definitions, and adjacent ownership there"
-    )
+    format!("ties {focus} in this flow to cited definitions and adjacent ownership")
 }
 
 fn packet_claim_flow_terms(rank_terms: &[String], citation: &AgentCitationDto) -> Vec<String> {
