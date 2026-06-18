@@ -90,6 +90,9 @@ named runtime profile modules:
   High-risk product profiles that resemble benchmark holdout families carry
   source-claim contract metadata for domain, proof roles, evidence tier, and
   positive/negative fixtures before they can leave the pending-migration state.
+  Non-high-risk product profiles remain pending by design; migrate one only
+  when a concrete overfit-risk signal justifies a PR-sized contract and
+  positive/false-positive fixture pair.
 - `packet_command_profiles.rs` owns command-span probes and command-flow claim
   templates.
 - `packet_evidence_roles.rs` owns typed citation role classification; labels

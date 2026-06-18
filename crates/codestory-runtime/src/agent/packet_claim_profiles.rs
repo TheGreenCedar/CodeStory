@@ -2544,6 +2544,48 @@ mod tests {
     }
 
     #[test]
+    fn non_high_risk_product_profiles_stay_pending_until_risk_evidence() {
+        let pending = [
+            SourceClaimProfile::ServerRoute,
+            SourceClaimProfile::ServerRequestDispatch,
+            SourceClaimProfile::HookCache,
+            SourceClaimProfile::ClientSend,
+            SourceClaimProfile::UrlSessionRequest,
+            SourceClaimProfile::StringPredicate,
+            SourceClaimProfile::StylesheetAnimation,
+            SourceClaimProfile::HtmlCssTemplateStructure,
+            SourceClaimProfile::SqlSchema,
+            SourceClaimProfile::RuntimeFormatting,
+            SourceClaimProfile::LoggerHandlerFlow,
+            SourceClaimProfile::SiteBuildPhase,
+            SourceClaimProfile::FormValidation,
+            SourceClaimProfile::EventLoopCommand,
+            SourceClaimProfile::SearchExecution,
+            SourceClaimProfile::BufferedIo,
+        ];
+
+        let actual_pending: Vec<_> = GENERIC_PRODUCT_CLAIM_PROFILES
+            .iter()
+            .filter_map(|entry| match entry.contract {
+                SourceClaimProfileContractStatus::PendingMigration => Some(entry.profile),
+                SourceClaimProfileContractStatus::Contracted(_) => None,
+            })
+            .collect();
+
+        assert_eq!(actual_pending.len(), pending.len());
+        for profile in pending {
+            assert!(
+                actual_pending.contains(&profile),
+                "expected {profile:?} to remain pending migration"
+            );
+            assert!(
+                contracted_product_profile(profile).is_none(),
+                "{profile:?} needs concrete overfit-risk evidence before contract migration"
+            );
+        }
+    }
+
+    #[test]
     fn contracted_product_profile_fixtures_execute_positive_and_negative_paths() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
 
