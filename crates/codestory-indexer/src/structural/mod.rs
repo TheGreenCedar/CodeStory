@@ -3,6 +3,7 @@
 mod blanking;
 mod common;
 pub(crate) mod css;
+mod github_actions;
 mod html;
 mod sql;
 
@@ -17,9 +18,13 @@ pub fn structural_language_name(path: &Path) -> &'static str {
 use crate::intermediate_storage::IntermediateStorage;
 use anyhow::Result;
 use codestory_contracts::graph::NodeId;
+use codestory_contracts::language_support::is_github_actions_workflow_path;
 use std::path::Path;
 
 pub fn is_structural_candidate_path(path: &Path) -> bool {
+    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+        return true;
+    }
     matches!(
         structural_extension(path).as_deref(),
         Some("html" | "htm" | "css" | "sql")
@@ -56,11 +61,22 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
     });
     storage.nodes.push(file_node);
 
-    match structural_extension(path).as_deref() {
-        Some("html" | "htm") => html::collect_html_entities(path, source, file_id, &mut storage),
-        Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1),
-        Some("sql") => sql::collect_sql_entities(path, source, file_id, &mut storage),
-        _ => {}
+    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+        github_actions::collect_github_actions_workflow_entities(
+            path,
+            source,
+            file_id,
+            &mut storage,
+        );
+    } else {
+        match structural_extension(path).as_deref() {
+            Some("html" | "htm") => {
+                html::collect_html_entities(path, source, file_id, &mut storage)
+            }
+            Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1),
+            Some("sql") => sql::collect_sql_entities(path, source, file_id, &mut storage),
+            _ => {}
+        }
     }
 
     storage.callable_projection_states = crate::build_callable_projection_states(
@@ -105,6 +121,69 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn indexes_github_actions_workflow_as_structural_source_proof() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workflow_dir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        let path = workflow_dir.join("ci.yml");
+        let yaml = r#"name: CI
+on:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo test
+        run: cargo test
+"#;
+        std::fs::write(&path, yaml).expect("write workflow");
+
+        let storage = index_structural_file(&path).expect("index workflow");
+
+        assert_eq!(storage.files[0].language, "github_actions_workflow");
+        assert!(
+            storage
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::MODULE
+                    && node.serialized_name == "CI"
+                    && node.start_line == Some(1)
+                    && node.start_col == Some(7)
+                    && node.end_col == Some(8)),
+            "workflow name should be an exact source-span node"
+        );
+        let build = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(|value| value.contains("github-actions:job:"))
+                    && node.serialized_name == "build"
+            })
+            .expect("build job node");
+        assert_eq!(build.start_line, Some(5));
+        assert_eq!(build.start_col, Some(3));
+        assert_eq!(build.end_col, Some(7));
+        assert!(
+            storage.nodes.iter().any(|node| {
+                node.kind == NodeKind::ANNOTATION && node.serialized_name.contains("Cargo test")
+            }),
+            "named workflow step should be collected"
+        );
+        assert!(
+            storage
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::MEMBER)
+        );
+        assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
     }
 
     #[test]

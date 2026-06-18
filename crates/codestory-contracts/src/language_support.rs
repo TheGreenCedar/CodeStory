@@ -1,3 +1,6 @@
+use crate::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
+use crate::graph::NodeKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageSupportMode {
     ParserBackedGraph,
@@ -33,6 +36,7 @@ pub enum LanguageClaimTier {
     FilenameRoute,
     GrammarParse,
     SourceGraphExtraction,
+    StructuralSourceProof,
     TypedSemanticEdges,
     PacketSufficientAnswerQuality,
 }
@@ -43,6 +47,7 @@ impl LanguageClaimTier {
             Self::FilenameRoute => "filename_route",
             Self::GrammarParse => "grammar_parse",
             Self::SourceGraphExtraction => "source_graph_extraction",
+            Self::StructuralSourceProof => "structural_source_proof",
             Self::TypedSemanticEdges => "typed_semantic_edges",
             Self::PacketSufficientAnswerQuality => "packet_sufficient_answer_quality",
         }
@@ -54,6 +59,7 @@ pub enum LanguageProofRole {
     ExtensionRouting,
     ParserSmoke,
     GraphFixture,
+    StructuralCollectorFixture,
     SemanticResolverFixture,
     PacketRuntimeArtifact,
 }
@@ -64,6 +70,7 @@ impl LanguageProofRole {
             Self::ExtensionRouting => "extension_routing",
             Self::ParserSmoke => "parser_smoke",
             Self::GraphFixture => "graph_fixture",
+            Self::StructuralCollectorFixture => "structural_collector_fixture",
             Self::SemanticResolverFixture => "semantic_resolver_fixture",
             Self::PacketRuntimeArtifact => "packet_runtime_artifact",
         }
@@ -94,6 +101,11 @@ pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
         provenance_expectations: &["fidelity or tictactoe graph fixture"],
     },
     LanguageClaimTierContract {
+        tier: LanguageClaimTier::StructuralSourceProof,
+        allowed_proof_roles: &[LanguageProofRole::StructuralCollectorFixture],
+        provenance_expectations: &["structural collector fixture with exact source spans"],
+    },
+    LanguageClaimTierContract {
         tier: LanguageClaimTier::TypedSemanticEdges,
         allowed_proof_roles: &[LanguageProofRole::SemanticResolverFixture],
         provenance_expectations: &["targeted resolver regression"],
@@ -102,6 +114,43 @@ pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
         tier: LanguageClaimTier::PacketSufficientAnswerQuality,
         allowed_proof_roles: &[LanguageProofRole::PacketRuntimeArtifact],
         provenance_expectations: &["publishable packet-runtime artifact"],
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StructuralSourceProofContract {
+    pub collector_name: &'static str,
+    pub path_pattern: &'static str,
+    pub emitted_node_kinds: &'static [NodeKind],
+    pub source_span: &'static str,
+    pub evidence_tier: PacketEvidenceTierDto,
+    pub resolution: PacketEvidenceResolutionDto,
+    pub confidence: f32,
+    pub unsupported_shape_notes: &'static [&'static str],
+    pub claim_boundary: &'static str,
+    pub semantic_proof_allowed: bool,
+}
+
+const GITHUB_ACTIONS_WORKFLOW_NODE_KINDS: &[NodeKind] =
+    &[NodeKind::MODULE, NodeKind::FUNCTION, NodeKind::ANNOTATION];
+const GITHUB_ACTIONS_WORKFLOW_UNSUPPORTED_SHAPES: &[&str] = &[
+    "YAML anchors, aliases, and merge keys are not interpreted.",
+    "Matrix expansion, expressions, reusable-workflow calls, and shell bodies are not semantically resolved.",
+    "The collector records exact source anchors; it does not validate GitHub Actions execution semantics.",
+];
+
+pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
+    StructuralSourceProofContract {
+        collector_name: "github_actions_workflow",
+        path_pattern: ".github/workflows/*.{yml,yaml}",
+        emitted_node_kinds: GITHUB_ACTIONS_WORKFLOW_NODE_KINDS,
+        source_span: "1-based source line and column span for the matched workflow, job, or step anchor",
+        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GITHUB_ACTIONS_WORKFLOW_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not parser-backed graph parity, typed semantic resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
     },
 ];
 
@@ -123,7 +172,7 @@ const PARSER_BACKED_CLAIM_TIERS: &[LanguageClaimTier] = &[
 ];
 const STRUCTURAL_CLAIM_TIERS: &[LanguageClaimTier] = &[
     LanguageClaimTier::FilenameRoute,
-    LanguageClaimTier::SourceGraphExtraction,
+    LanguageClaimTier::StructuralSourceProof,
 ];
 
 pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
@@ -196,6 +245,13 @@ pub fn language_support_profile_for_language_name(
 pub fn language_name_for_path(path: Option<&str>) -> Option<&'static str> {
     let ext = path?.rsplit('.').next()?.trim_start_matches('.');
     language_support_profile_for_ext(ext).map(|profile| profile.language_name)
+}
+
+pub fn is_github_actions_workflow_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
+        && normalized.contains(".github/workflows/")
 }
 
 pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
@@ -300,7 +356,8 @@ mod tests {
                 }
                 LanguageSupportMode::StructuralCollector => {
                     assert!(!tiers.contains(&LanguageClaimTier::GrammarParse));
-                    assert!(tiers.contains(&LanguageClaimTier::SourceGraphExtraction));
+                    assert!(tiers.contains(&LanguageClaimTier::StructuralSourceProof));
+                    assert!(!tiers.contains(&LanguageClaimTier::SourceGraphExtraction));
                 }
             }
 
@@ -315,5 +372,37 @@ mod tests {
                 profile.language_name
             );
         }
+    }
+
+    #[test]
+    fn structural_source_proof_contract_is_exact_source_not_semantic() {
+        let contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+            .iter()
+            .find(|contract| contract.collector_name == "github_actions_workflow")
+            .expect("github actions structural contract");
+        assert_eq!(contract.path_pattern, ".github/workflows/*.{yml,yaml}");
+        assert!(contract.emitted_node_kinds.contains(&NodeKind::MODULE));
+        assert!(contract.emitted_node_kinds.contains(&NodeKind::FUNCTION));
+        assert_eq!(contract.evidence_tier, PacketEvidenceTierDto::ExactSource);
+        assert_eq!(
+            contract.resolution,
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        );
+        assert_eq!(contract.confidence, 1.0);
+        assert!(!contract.unsupported_shape_notes.is_empty());
+        assert!(!contract.semantic_proof_allowed);
+        assert!(contract.claim_boundary.contains("not parser-backed"));
+    }
+
+    #[test]
+    fn github_actions_workflow_path_is_path_scoped_not_yaml_support() {
+        assert!(is_github_actions_workflow_path(
+            "repo/.github/workflows/ci.yml"
+        ));
+        assert!(is_github_actions_workflow_path(
+            r"repo\.github\workflows\release.yaml"
+        ));
+        assert!(!is_github_actions_workflow_path("openapi.yaml"));
+        assert!(language_support_profile_for_ext("yaml").is_none());
     }
 }

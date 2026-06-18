@@ -4,6 +4,7 @@ use codestory_contracts::api::{
     AgentCitationDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHit,
     SearchHitOrigin,
 };
+use codestory_contracts::language_support::is_github_actions_workflow_path;
 
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
 pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
@@ -36,16 +37,17 @@ pub(crate) fn evidence_candidate_from_hit(hit: &SearchHit) -> EvidenceCandidate 
 
 pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     let candidate = evidence_candidate_from_hit(hit);
+    let structural_source_proof = hit_is_structural_source_proof(hit);
     hit.evidence_tier = Some(candidate.tier);
     hit.evidence_producer = Some(candidate.producer);
     hit.resolution_status = Some(candidate.resolution);
     if hit.loss_reason.is_none() {
         hit.loss_reason = candidate.loss_reason;
     }
-    hit.eligible_for_sufficiency = Some(evidence_is_sufficiency_eligible(
-        candidate.tier,
-        candidate.resolution,
-    ));
+    hit.eligible_for_sufficiency = Some(
+        !structural_source_proof
+            && evidence_is_sufficiency_eligible(candidate.tier, candidate.resolution),
+    );
 }
 
 pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
@@ -61,6 +63,14 @@ pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &
         .or_else(|| Some(evidence_resolution_for_hit(hit)));
     citation.loss_reason = hit.loss_reason.clone();
     citation.coverage_role = hit.coverage_role.clone();
+    if citation_is_structural_source_proof(citation) {
+        citation.evidence_tier = Some(PacketEvidenceTier::ExactSource);
+        citation.resolution_status = Some(evidence_resolution_for_citation(citation));
+        citation.evidence_producer =
+            Some("structural_github_actions_workflow_collector".to_string());
+        citation.eligible_for_sufficiency = Some(false);
+        return;
+    }
     citation.eligible_for_sufficiency = hit.eligible_for_sufficiency.or_else(|| {
         Some(evidence_is_sufficiency_eligible(
             citation
@@ -89,6 +99,9 @@ pub(crate) fn evidence_is_sufficiency_eligible(
 }
 
 pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
+    if citation_is_structural_source_proof(citation) {
+        return citation.eligible_for_sufficiency.unwrap_or(false);
+    }
     let tier = citation
         .evidence_tier
         .unwrap_or_else(|| evidence_tier_for_citation(citation));
@@ -101,6 +114,9 @@ pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool
 }
 
 pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
+    if hit_is_structural_source_proof(hit) {
+        return PacketEvidenceTier::ExactSource;
+    }
     if let Some(tier) = hit.evidence_tier {
         return tier;
     }
@@ -129,6 +145,13 @@ pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
 }
 
 pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceResolution {
+    if hit_is_structural_source_proof(hit) {
+        return if hit.file_path.is_some() && hit.line.is_some() {
+            PacketEvidenceResolution::SourceRangeOnly
+        } else {
+            PacketEvidenceResolution::Unresolved
+        };
+    }
     if let Some(resolution) = hit.resolution_status {
         return resolution;
     }
@@ -142,6 +165,9 @@ pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceReso
 }
 
 pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
+    if hit_is_structural_source_proof(hit) {
+        return "structural_github_actions_workflow_collector".to_string();
+    }
     if let Some(producer) = hit.evidence_producer.as_ref() {
         return producer.clone();
     }
@@ -157,6 +183,9 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
 }
 
 fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
+    if citation_is_structural_source_proof(citation) {
+        return PacketEvidenceTier::ExactSource;
+    }
     if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
         if breakdown.provenance.iter().any(|value| {
             value.contains("synthetic")
@@ -182,11 +211,86 @@ fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier
 }
 
 fn evidence_resolution_for_citation(citation: &AgentCitationDto) -> PacketEvidenceResolution {
+    if citation_is_structural_source_proof(citation) {
+        return if citation.file_path.is_some() && citation.line.is_some() {
+            PacketEvidenceResolution::SourceRangeOnly
+        } else {
+            PacketEvidenceResolution::Unresolved
+        };
+    }
     if citation.resolvable {
         PacketEvidenceResolution::Resolved
     } else if citation.file_path.is_some() && citation.line.is_some() {
         PacketEvidenceResolution::SourceRangeOnly
     } else {
         PacketEvidenceResolution::Unresolved
+    }
+}
+
+fn hit_is_structural_source_proof(hit: &SearchHit) -> bool {
+    hit.file_path
+        .as_deref()
+        .is_some_and(is_github_actions_workflow_path)
+}
+
+fn citation_is_structural_source_proof(citation: &AgentCitationDto) -> bool {
+    citation
+        .file_path
+        .as_deref()
+        .is_some_and(is_github_actions_workflow_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin};
+
+    fn workflow_hit() -> SearchHit {
+        SearchHit {
+            node_id: NodeId("workflow-build".to_string()),
+            display_name: "build".to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some(".github/workflows/ci.yml".to_string()),
+            line: Some(5),
+            score: 1.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: 0.0,
+                semantic: 0.0,
+                graph: 1.0,
+                total: 1.0,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
+                provenance: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn github_actions_structural_hit_is_exact_source_diagnostic() {
+        let mut hit = workflow_hit();
+
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_github_actions_workflow_collector")
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 }
