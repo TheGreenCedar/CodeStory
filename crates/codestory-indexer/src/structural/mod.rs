@@ -3,6 +3,7 @@
 mod blanking;
 mod common;
 pub(crate) mod css;
+mod github_actions;
 mod html;
 mod sql;
 
@@ -17,9 +18,13 @@ pub fn structural_language_name(path: &Path) -> &'static str {
 use crate::intermediate_storage::IntermediateStorage;
 use anyhow::Result;
 use codestory_contracts::graph::NodeId;
+use codestory_contracts::language_support::is_github_actions_workflow_path;
 use std::path::Path;
 
 pub fn is_structural_candidate_path(path: &Path) -> bool {
+    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+        return true;
+    }
     matches!(
         structural_extension(path).as_deref(),
         Some("html" | "htm" | "css" | "sql")
@@ -56,11 +61,22 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
     });
     storage.nodes.push(file_node);
 
-    match structural_extension(path).as_deref() {
-        Some("html" | "htm") => html::collect_html_entities(path, source, file_id, &mut storage),
-        Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1),
-        Some("sql") => sql::collect_sql_entities(path, source, file_id, &mut storage),
-        _ => {}
+    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+        github_actions::collect_github_actions_workflow_entities(
+            path,
+            source,
+            file_id,
+            &mut storage,
+        );
+    } else {
+        match structural_extension(path).as_deref() {
+            Some("html" | "htm") => {
+                html::collect_html_entities(path, source, file_id, &mut storage)
+            }
+            Some("css") => css::collect_css_entities(path, source, file_id, &mut storage, 1),
+            Some("sql") => sql::collect_sql_entities(path, source, file_id, &mut storage),
+            _ => {}
+        }
     }
 
     storage.callable_projection_states = crate::build_callable_projection_states(
@@ -105,6 +121,165 @@ mod tests {
         let storage = index_structural_file(&path).expect("index sql");
         assert!(storage.nodes.iter().any(|n| n.kind == NodeKind::CLASS));
         assert_eq!(storage.files[0].language, "sql");
+    }
+
+    #[test]
+    fn indexes_github_actions_workflow_as_structural_source_proof() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workflow_dir = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        let path = workflow_dir.join("ci.yml");
+        let yaml = r#"name: CI
+on:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo test
+        run: cargo test
+      - run: cargo fmt
+"#;
+        std::fs::write(&path, yaml).expect("write workflow");
+
+        let storage = index_structural_file(&path).expect("index workflow");
+
+        assert_eq!(storage.files[0].language, "github_actions_workflow");
+        assert!(
+            storage
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::MODULE
+                    && node.serialized_name == "CI"
+                    && node.start_line == Some(1)
+                    && node.start_col == Some(7)
+                    && node.end_col == Some(8)),
+            "workflow name should be an exact source-span node"
+        );
+        let build = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(|value| value.contains("github-actions:job:"))
+                    && node.serialized_name == "build"
+            })
+            .expect("build job node");
+        assert_eq!(build.start_line, Some(5));
+        assert_eq!(build.start_col, Some(3));
+        assert_eq!(build.end_col, Some(7));
+        assert_exact_step_span(&storage, "- uses: actions/checkout@v4", 8, 7);
+        assert_exact_step_span(&storage, "- name: Cargo test", 9, 7);
+        assert_exact_step_span(&storage, "- run: cargo fmt", 11, 7);
+        assert!(
+            storage
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::MEMBER)
+        );
+        assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
+    }
+
+    #[test]
+    fn unnamed_github_actions_workflow_uses_jobs_source_anchor() {
+        let yaml = r#"on:
+  push:
+jobs:
+  test:
+    steps:
+      - run: cargo test
+"#;
+
+        let storage = index_structural_source(Path::new(".github/workflows/unnamed.yml"), yaml)
+            .expect("index workflow");
+
+        assert!(
+            !storage
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::MODULE && node.serialized_name == "unnamed"),
+            "workflow module must not be derived from the filename"
+        );
+        let workflow = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::MODULE && node.serialized_name == "jobs:")
+            .expect("jobs source anchor");
+        assert_eq!(workflow.start_line, Some(3));
+        assert_eq!(workflow.start_col, Some(1));
+        assert_eq!(workflow.end_col, Some(5));
+    }
+
+    #[test]
+    fn github_actions_workflow_name_span_uses_scalar_value_not_key_text() {
+        assert_workflow_name_span(
+            r#"name: "name"
+on:
+  push:
+jobs:
+  test:
+    steps:
+      - run: cargo test
+"#,
+            "name",
+            8,
+            11,
+        );
+        assert_workflow_name_span(
+            r#"name: me
+on:
+  push:
+jobs:
+  test:
+    steps:
+      - run: cargo test
+"#,
+            "me",
+            7,
+            8,
+        );
+    }
+
+    fn assert_workflow_name_span(
+        source: &str,
+        expected_name: &str,
+        expected_start_col: u32,
+        expected_end_col: u32,
+    ) {
+        let storage = index_structural_source(Path::new(".github/workflows/name.yml"), source)
+            .expect("index workflow");
+        let workflow = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::MODULE && node.serialized_name == expected_name)
+            .unwrap_or_else(|| panic!("missing workflow node {expected_name}"));
+        assert_eq!(workflow.start_line, Some(1));
+        assert_eq!(workflow.start_col, Some(expected_start_col));
+        assert_eq!(workflow.end_col, Some(expected_end_col));
+    }
+
+    fn assert_exact_step_span(
+        storage: &IntermediateStorage,
+        source_anchor: &str,
+        line: u32,
+        col: u32,
+    ) {
+        let node = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::ANNOTATION && node.serialized_name == source_anchor)
+            .unwrap_or_else(|| panic!("missing exact step anchor {source_anchor}"));
+        assert_eq!(node.start_line, Some(line));
+        assert_eq!(node.start_col, Some(col));
+        assert_eq!(
+            node.end_col,
+            Some(col + source_anchor.len() as u32 - 1),
+            "step span must cover only source text"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Parser-backed graph | Extension routes to a parser and graph rules. | Full semantic navigation. |
 | Fidelity-gated | Core symbol/import/call/member shapes pass fixture suites. | Every language feature is covered. |
 | Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
-| Structural collector | Dedicated extractor emits structural entities. | Parser-backed code navigation. |
+| Structural source-proof | Dedicated extractor emits exact source anchors for structural files. | Parser-backed graph extraction or semantic code navigation. |
 | Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
 | Packet proof gate | A packet-runtime artifact proves the current packet citation and sufficiency contract for the measured tasks. | Public product-grade language quality. |
 | Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
@@ -26,7 +26,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural collector | HTML, CSS, SQL | structural collector tests | structural entity extraction |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows | structural collector tests | exact-source structural anchors |
 
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
@@ -36,13 +36,14 @@ report is not blanket promotion proof for every parser-backed language.
 The source-derived ladder in `language_support.rs` maps current profiles only to
 the tiers they prove. Parser-backed profiles currently claim filename routing,
 grammar parse, and source graph extraction. Structural collectors claim filename
-routing and source graph extraction only.
+routing and structural source-proof only.
 
 | Tier | Allowed proof role | Provenance expectation | Does not mean |
 | --- | --- | --- | --- |
 | `filename_route` | `extension_routing` | `LANGUAGE_SUPPORT_PROFILES` extension registry | Parser availability. |
 | `grammar_parse` | `parser_smoke` | Live tree-sitter parser config and parse smoke | Graph fidelity. |
 | `source_graph_extraction` | `graph_fixture` | Fidelity or tictactoe graph fixture | Typed semantic resolution. |
+| `structural_source_proof` | `structural_collector_fixture` | Structural collector fixture with exact source spans | Parser-backed graph extraction or semantic proof. |
 | `typed_semantic_edges` | `semantic_resolver_fixture` | Targeted resolver regression | Broad semantic parity. |
 | `packet_sufficient_answer_quality` | `packet_runtime_artifact` | Publishable packet-runtime artifact | Runtime language support. |
 
@@ -61,11 +62,21 @@ status. It is blocked:
 | Sufficiency | `107/108` sufficient, `1` partial | One packet is not proof-complete. |
 | Cold SLA | `8` misses | Cold latency still blocks publishable promotion. |
 
+GitHub Actions workflow support is path-scoped to `.github/workflows/*.{yml,yaml}`.
+The pilot emits workflow, job, and step anchors with `exact_source` /
+`source_range_only` evidence. Unsupported shapes stay explicit: YAML anchors and
+merge keys are not interpreted, matrix expansion and expressions are not
+resolved, reusable workflows and shell bodies are not semantically traced, and
+the collector does not validate GitHub Actions execution semantics. Packet
+evidence treats these anchors as diagnostic unless a future structural role
+explicitly admits them; they must not satisfy semantic proof roles.
+
 Safe wording: packet-runtime is implemented and completing the suite, but
 publishable agent-facing packet quality is not promoted until a coherent run has
 all quality, sufficiency, and cold-SLA gates green. This evidence is a
 development/proof-gate signal, not public product-grade proof for every
-parser-backed language. HTML, CSS, and SQL remain structural collectors.
+parser-backed language. HTML, CSS, SQL, and GitHub Actions workflows remain
+structural source-proof collectors.
 
 Older development comparison: the language-expansion comparison artifact built
 on 2026-06-17:
@@ -134,8 +145,9 @@ Workspace parser policy:
 - `tree-sitter-graph = "0.12"`
 
 Validation: each listed candidate passed an isolated `cargo check` probe with
-the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, and SQL
-remain structural runtime paths, not parser-backed runtime claims.
+the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,
+and GitHub Actions workflows remain structural runtime paths, not parser-backed
+runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |
 | --- | --- | ---: | --- |

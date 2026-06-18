@@ -2910,6 +2910,26 @@ mod tests {
     }
 
     #[test]
+    fn github_actions_exact_source_does_not_satisfy_semantic_packet_proof() {
+        let claim = cited_claim(
+            "The CI workflow build job runs the test command.",
+            Some("command dispatch"),
+            cited_anchor_with_tier(
+                "build",
+                ".github/workflows/ci.yml",
+                PacketEvidenceTierDto::ExactSource,
+                None,
+            ),
+            None,
+        );
+
+        assert!(
+            !packet_claim_can_satisfy_sufficiency(&claim),
+            "structural workflow exact-source evidence must not satisfy semantic packet proof roles"
+        );
+    }
+
+    #[test]
     fn covered_flow_roles_make_missing_probe_queries_follow_up_hints() {
         let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
         let answer = answer_fixture(question);

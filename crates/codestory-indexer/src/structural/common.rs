@@ -3,9 +3,13 @@ use codestory_contracts::graph::{
     AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, SourceLocation,
 };
+use codestory_contracts::language_support::is_github_actions_workflow_path;
 use std::path::Path;
 
 pub(crate) fn structural_language_name(path: &Path) -> &'static str {
+    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+        return "github_actions_workflow";
+    }
     match path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -146,6 +150,8 @@ pub(crate) fn push_structural_node(
 ) -> NodeId {
     let node_id = NodeId(crate::generate_id(canonical_id));
     let label_len = name.len().max(1);
+    let start_col = col.max(1);
+    let end_col = start_col.saturating_add(label_len as u32).saturating_sub(1);
     storage.nodes.push(Node {
         id: node_id,
         kind,
@@ -154,9 +160,9 @@ pub(crate) fn push_structural_node(
         canonical_id: Some(canonical_id.to_string()),
         file_node_id: Some(file_id),
         start_line: Some(line),
-        start_col: Some(col.max(1)),
+        start_col: Some(start_col),
         end_line: Some(line),
-        end_col: Some(label_len as u32),
+        end_col: Some(end_col),
     });
     storage.component_access.push((node_id, AccessKind::Public));
     storage.occurrences.push(Occurrence {
@@ -165,9 +171,9 @@ pub(crate) fn push_structural_node(
         location: SourceLocation {
             file_node_id: file_id,
             start_line: line,
-            start_col: col.max(1),
+            start_col,
             end_line: line,
-            end_col: label_len as u32,
+            end_col,
         },
     });
     node_id
