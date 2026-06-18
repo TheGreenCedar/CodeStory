@@ -3,7 +3,7 @@ use crate::generation::{
     SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
     manifest_staleness_reason, manifest_unavailable_reason,
 };
-use crate::health::{RetrievalStatusReport, probe_sidecar_health};
+use crate::health::{RetrievalStatusReport, attach_manifest_contract, probe_sidecar_health};
 use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
 use anyhow::{Context, Result};
 use codestory_contracts::language_support::{
@@ -88,9 +88,12 @@ fn sidecar_status_inner(
             .context("check strict sidecar readiness")?
         {
             return Ok(enrich_status_with_semantic_doc_stats(
-                crate::health::unavailable_status_report(
-                    format!("sidecar_manifest_stale: {reason}"),
-                    Some(manifest.clone()),
+                attach_manifest_contract(
+                    crate::health::unavailable_status_report(
+                        format!("sidecar_manifest_stale: {reason}"),
+                        Some(manifest.clone()),
+                    ),
+                    project_root,
                 ),
                 &storage,
             ));
@@ -99,16 +102,25 @@ fn sidecar_status_inner(
             && let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest)
         {
             return Ok(enrich_status_with_semantic_doc_stats(
-                crate::health::unavailable_status_report(reason, Some(manifest.clone())),
+                attach_manifest_contract(
+                    crate::health::unavailable_status_report(reason, Some(manifest.clone())),
+                    project_root,
+                ),
                 &storage,
             ));
         }
         let report = probe_sidecar_health(&layout, &project_id, manifest);
-        return Ok(enrich_status_with_semantic_doc_stats(report, &storage));
+        return Ok(enrich_status_with_semantic_doc_stats(
+            attach_manifest_contract(report, project_root),
+            &storage,
+        ));
     } else {
         None
     };
-    Ok(probe_sidecar_health(&layout, &project_id, manifest))
+    Ok(attach_manifest_contract(
+        probe_sidecar_health(&layout, &project_id, manifest),
+        project_root,
+    ))
 }
 
 fn enrich_status_with_semantic_doc_stats(
