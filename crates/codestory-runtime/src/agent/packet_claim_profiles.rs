@@ -1,6 +1,7 @@
 use crate::agent::eval_probes::eval_probes_enabled;
 use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_evidence_roles::PacketEvidenceRole;
+use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_source_patterns::{
     packet_display_owner, packet_human_join, packet_source_constructed_type, packet_source_has_all,
@@ -28,30 +29,146 @@ use crate::agent::packet_terms::{
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
 use std::collections::HashSet;
 
-const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
-    SourceClaimProfile::ServerRoute,
-    SourceClaimProfile::ServerRequestDispatch,
-    SourceClaimProfile::ShellInstallDispatch,
-    SourceClaimProfile::ShellVersionUse,
-    SourceClaimProfile::HookCache,
-    SourceClaimProfile::ClientSend,
-    SourceClaimProfile::UrlSessionRequest,
-    SourceClaimProfile::StringPredicate,
-    SourceClaimProfile::StylesheetAnimation,
-    SourceClaimProfile::HtmlCssTemplateStructure,
-    SourceClaimProfile::SqlSchema,
-    SourceClaimProfile::RuntimeFormatting,
-    SourceClaimProfile::LoggerHandlerFlow,
-    SourceClaimProfile::SiteBuildPhase,
-    SourceClaimProfile::MappingConfigurationPlan,
-    SourceClaimProfile::FormValidation,
-    SourceClaimProfile::ClientRequestDispatch,
-    SourceClaimProfile::EventLoopCommand,
-    SourceClaimProfile::SearchExecution,
-    SourceClaimProfile::BufferedIo,
+const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProductProfile] = &[
+    SourceClaimProductProfile::pending(SourceClaimProfile::ServerRoute),
+    SourceClaimProductProfile::pending(SourceClaimProfile::ServerRequestDispatch),
+    SourceClaimProductProfile::contracted(
+        SourceClaimProfile::ShellInstallDispatch,
+        SourceClaimProfileContract {
+            domain: "shell-install-dispatch",
+            scope: SourceClaimProfileScope::Product,
+            allowed_evidence_tier: CoverageMode::AllowsLexicalSource,
+            allowed_proof_roles: &[
+                FlowRole::Entrypoint,
+                FlowRole::Dispatch,
+                FlowRole::TerminalBoundary,
+            ],
+            positive_fixture_id: "generic-shell-install-dispatch-positive",
+            false_positive_fixture_id: "generic-shell-install-dispatch-helper-negative",
+        },
+    ),
+    SourceClaimProductProfile::contracted(
+        SourceClaimProfile::ShellVersionUse,
+        SourceClaimProfileContract {
+            domain: "shell-version-use",
+            scope: SourceClaimProfileScope::Product,
+            allowed_evidence_tier: CoverageMode::AllowsLexicalSource,
+            allowed_proof_roles: &[FlowRole::Dispatch],
+            positive_fixture_id: "generic-shell-version-use-positive",
+            false_positive_fixture_id: "generic-shell-version-use-helper-negative",
+        },
+    ),
+    SourceClaimProductProfile::pending(SourceClaimProfile::HookCache),
+    SourceClaimProductProfile::pending(SourceClaimProfile::ClientSend),
+    SourceClaimProductProfile::pending(SourceClaimProfile::UrlSessionRequest),
+    SourceClaimProductProfile::pending(SourceClaimProfile::StringPredicate),
+    SourceClaimProductProfile::pending(SourceClaimProfile::StylesheetAnimation),
+    SourceClaimProductProfile::pending(SourceClaimProfile::HtmlCssTemplateStructure),
+    SourceClaimProductProfile::pending(SourceClaimProfile::SqlSchema),
+    SourceClaimProductProfile::pending(SourceClaimProfile::RuntimeFormatting),
+    SourceClaimProductProfile::pending(SourceClaimProfile::LoggerHandlerFlow),
+    SourceClaimProductProfile::pending(SourceClaimProfile::SiteBuildPhase),
+    SourceClaimProductProfile::contracted(
+        SourceClaimProfile::MappingConfigurationPlan,
+        SourceClaimProfileContract {
+            domain: "object-mapping-plan",
+            scope: SourceClaimProfileScope::Product,
+            allowed_evidence_tier: CoverageMode::RequiresResolvedSourceOrGraph,
+            allowed_proof_roles: &[FlowRole::Configuration, FlowRole::Dispatch],
+            positive_fixture_id: "generic-object-mapping-plan-positive",
+            false_positive_fixture_id: "generic-object-mapping-cache-helper-negative",
+        },
+    ),
+    SourceClaimProductProfile::pending(SourceClaimProfile::FormValidation),
+    SourceClaimProductProfile::contracted(
+        SourceClaimProfile::ClientRequestDispatch,
+        SourceClaimProfileContract {
+            domain: "session-request-dispatch",
+            scope: SourceClaimProfileScope::Product,
+            allowed_evidence_tier: CoverageMode::RequiresResolvedSourceOrGraph,
+            allowed_proof_roles: &[
+                FlowRole::Entrypoint,
+                FlowRole::Dispatch,
+                FlowRole::TransformOrValidate,
+                FlowRole::TerminalBoundary,
+            ],
+            positive_fixture_id: "generic-session-request-dispatch-positive",
+            false_positive_fixture_id: "generic-session-request-transport-negative",
+        },
+    ),
+    SourceClaimProductProfile::pending(SourceClaimProfile::EventLoopCommand),
+    SourceClaimProductProfile::pending(SourceClaimProfile::SearchExecution),
+    SourceClaimProductProfile::pending(SourceClaimProfile::BufferedIo),
 ];
 
 #[derive(Debug, Clone, Copy)]
+struct SourceClaimProductProfile {
+    profile: SourceClaimProfile,
+    contract: SourceClaimProfileContractStatus,
+}
+
+impl SourceClaimProductProfile {
+    const fn pending(profile: SourceClaimProfile) -> Self {
+        Self {
+            profile,
+            contract: SourceClaimProfileContractStatus::PendingMigration,
+        }
+    }
+
+    const fn contracted(profile: SourceClaimProfile, contract: SourceClaimProfileContract) -> Self {
+        Self {
+            profile,
+            contract: SourceClaimProfileContractStatus::Contracted(contract),
+        }
+    }
+
+    fn collect(&self, ctx: &SourceClaimContext<'_>, claims: &mut Vec<String>) {
+        self.contract.assert_valid();
+        self.profile.collect(ctx, claims);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SourceClaimProfileContractStatus {
+    Contracted(SourceClaimProfileContract),
+    PendingMigration,
+}
+
+impl SourceClaimProfileContractStatus {
+    fn assert_valid(self) {
+        if let Self::Contracted(contract) = self {
+            debug_assert!(matches!(contract.scope, SourceClaimProfileScope::Product));
+            debug_assert!(matches!(
+                contract.allowed_evidence_tier,
+                CoverageMode::RequiresResolvedSourceOrGraph
+                    | CoverageMode::AllowsSourceRange
+                    | CoverageMode::AllowsLexicalSource
+                    | CoverageMode::DiagnosticOnly
+            ));
+            debug_assert!(!contract.domain.is_empty());
+            debug_assert!(!contract.allowed_proof_roles.is_empty());
+            debug_assert!(!contract.positive_fixture_id.is_empty());
+            debug_assert!(!contract.false_positive_fixture_id.is_empty());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceClaimProfileContract {
+    domain: &'static str,
+    scope: SourceClaimProfileScope,
+    allowed_evidence_tier: CoverageMode,
+    allowed_proof_roles: &'static [FlowRole],
+    positive_fixture_id: &'static str,
+    false_positive_fixture_id: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceClaimProfileScope {
+    Product,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceClaimProfile {
     ServerRoute,
     ServerRequestDispatch,
@@ -2232,6 +2349,239 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
+        }
+    }
+
+    fn contracted_product_profile(
+        profile: SourceClaimProfile,
+    ) -> Option<SourceClaimProfileContract> {
+        GENERIC_PRODUCT_CLAIM_PROFILES
+            .iter()
+            .find(|entry| entry.profile == profile)
+            .and_then(|entry| match entry.contract {
+                SourceClaimProfileContractStatus::Contracted(contract) => Some(contract),
+                SourceClaimProfileContractStatus::PendingMigration => None,
+            })
+    }
+
+    struct ContractFixture {
+        prompt: &'static str,
+        symbol: &'static str,
+        path: &'static str,
+        source: &'static str,
+        expected_claim: Option<&'static str>,
+    }
+
+    fn contract_fixture(id: &str) -> ContractFixture {
+        match id {
+            "generic-shell-install-dispatch-positive" => ContractFixture {
+                prompt: "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.",
+                symbol: "install_runtime",
+                path: "tools/install-runtime.sh",
+                source: r#"
+                install_runtime() {
+                  SOURCE_STR='[ -s "$TOOL_DIR/runtime.sh" ] && source "$TOOL_DIR/runtime.sh"'
+                  download_file "$RUNTIME_SOURCE" "$TOOL_DIR/runtime.sh"
+                }
+                "#,
+                expected_claim: Some("The installer bootstraps shell runtime sourcing."),
+            },
+            "generic-shell-install-dispatch-helper-negative" => ContractFixture {
+                prompt: "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.",
+                symbol: "helper_cache",
+                path: "tools/helpers.sh",
+                source: "helper_cache() { echo cache; }",
+                expected_claim: None,
+            },
+            "generic-shell-version-use-positive" => ContractFixture {
+                prompt: "Explain how a shell command switches versions only when the requested version is not already active.",
+                symbol: "use_if_needed",
+                path: "tools/runtime.sh",
+                source: r#"
+                use_if_needed() {
+                  current="$(current_version)"
+                  if [ "${1-}" = "$current" ]; then
+                    return
+                  fi
+                  tool use "$@"
+                }
+                "#,
+                expected_claim: Some(
+                    "use_if_needed switches versions only when the requested version is not already active.",
+                ),
+            },
+            "generic-shell-version-use-helper-negative" => ContractFixture {
+                prompt: "Explain how a shell command switches versions only when the requested version is not already active.",
+                symbol: "use_version",
+                path: "tools/runtime.sh",
+                source: "use_version() { echo current; }",
+                expected_claim: None,
+            },
+            "generic-object-mapping-plan-positive" => ContractFixture {
+                prompt: "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.",
+                symbol: "MappingPlan.BuildMapperLambda",
+                path: "src/ObjectMapping/MappingPlan.cs",
+                source: r#"
+                public sealed class MappingPlan
+                {
+                    public LambdaExpression MapExpression { get; private set; }
+                    internal LambdaExpression BuildMapperLambda(IGlobalMappingConfiguration configuration) =>
+                        Types.ContainsGenericParameters ? null : new MappingPlanBuilder(configuration, this).BuildMapperLambda();
+                }
+                "#,
+                expected_claim: Some(
+                    "Type-map source contributes lambda plans used by the mapping execution pipeline.",
+                ),
+            },
+            "generic-object-mapping-cache-helper-negative" => ContractFixture {
+                prompt: "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.",
+                symbol: "CacheConfig",
+                path: "src/ObjectMapping/CacheConfig.cs",
+                source: "public sealed class CacheConfig { public string Key { get; set; } }",
+                expected_claim: None,
+            },
+            "generic-session-request-dispatch-positive" => ContractFixture {
+                prompt: "Explain how a session request call creates a prepared request and sends it through an adapter.",
+                symbol: "Session.request",
+                path: "src/http/session_flow.py",
+                source: "def request(self, method, url, **kwargs):\n    req = Request(method=method, url=url)\n    prep = self.prepare_request(req)\n    return self.send(prep, **kwargs)\n",
+                expected_claim: Some(
+                    "The session request method creates a request object and prepares it into a transport-ready request object.",
+                ),
+            },
+            "generic-session-request-transport-negative" => ContractFixture {
+                prompt: "Explain how a session request call creates a prepared request and sends it through an adapter.",
+                symbol: "Session",
+                path: "src/http/session_flow.py",
+                source: "adapter = self.get_adapter(url=request.url)\n# http proxy environment settings\n",
+                expected_claim: None,
+            },
+            other => panic!("unknown source-claim profile fixture id {other}"),
+        }
+    }
+
+    #[test]
+    fn high_risk_product_profiles_have_anti_overfit_contracts() {
+        let expectations = [
+            (
+                SourceClaimProfile::ShellInstallDispatch,
+                "shell-install-dispatch",
+                CoverageMode::AllowsLexicalSource,
+                &[
+                    FlowRole::Entrypoint,
+                    FlowRole::Dispatch,
+                    FlowRole::TerminalBoundary,
+                ][..],
+                "generic-shell-install-dispatch-positive",
+                "generic-shell-install-dispatch-helper-negative",
+            ),
+            (
+                SourceClaimProfile::ShellVersionUse,
+                "shell-version-use",
+                CoverageMode::AllowsLexicalSource,
+                &[FlowRole::Dispatch][..],
+                "generic-shell-version-use-positive",
+                "generic-shell-version-use-helper-negative",
+            ),
+            (
+                SourceClaimProfile::MappingConfigurationPlan,
+                "object-mapping-plan",
+                CoverageMode::RequiresResolvedSourceOrGraph,
+                &[FlowRole::Configuration, FlowRole::Dispatch][..],
+                "generic-object-mapping-plan-positive",
+                "generic-object-mapping-cache-helper-negative",
+            ),
+            (
+                SourceClaimProfile::ClientRequestDispatch,
+                "session-request-dispatch",
+                CoverageMode::RequiresResolvedSourceOrGraph,
+                &[
+                    FlowRole::Entrypoint,
+                    FlowRole::Dispatch,
+                    FlowRole::TransformOrValidate,
+                    FlowRole::TerminalBoundary,
+                ][..],
+                "generic-session-request-dispatch-positive",
+                "generic-session-request-transport-negative",
+            ),
+        ];
+
+        for (
+            profile,
+            domain,
+            allowed_evidence_tier,
+            allowed_proof_roles,
+            positive_fixture_id,
+            false_positive_fixture_id,
+        ) in expectations
+        {
+            let contract = contracted_product_profile(profile)
+                .unwrap_or_else(|| panic!("expected anti-overfit contract for {profile:?}"));
+            assert_eq!(contract.domain, domain);
+            assert_eq!(contract.scope, SourceClaimProfileScope::Product);
+            assert_eq!(contract.allowed_evidence_tier, allowed_evidence_tier);
+            assert_eq!(contract.allowed_proof_roles, allowed_proof_roles);
+            assert_eq!(contract.positive_fixture_id, positive_fixture_id);
+            assert_eq!(
+                contract.false_positive_fixture_id,
+                false_positive_fixture_id
+            );
+
+            for value in [
+                contract.domain,
+                contract.positive_fixture_id,
+                contract.false_positive_fixture_id,
+            ] {
+                let lower = value.to_ascii_lowercase();
+                for blocked in ["requests", "nvm", "automapper", "axios"] {
+                    assert!(
+                        !lower.contains(blocked),
+                        "contract value `{value}` must stay generic"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contracted_product_profile_fixtures_execute_positive_and_negative_paths() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+
+        for entry in GENERIC_PRODUCT_CLAIM_PROFILES {
+            let SourceClaimProfileContractStatus::Contracted(contract) = entry.contract else {
+                continue;
+            };
+
+            let positive = contract_fixture(contract.positive_fixture_id);
+            let citation = test_packet_citation(positive.symbol, positive.path);
+            let claims = packet_source_derived_claims_for_citation(
+                positive.prompt,
+                &citation,
+                positive.source,
+            );
+            let expected = positive
+                .expected_claim
+                .expect("positive contract fixture must name an expected claim");
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "positive fixture `{}` for {} should emit `{expected}`; got {claims:?}",
+                contract.positive_fixture_id,
+                contract.domain
+            );
+
+            let negative = contract_fixture(contract.false_positive_fixture_id);
+            let citation = test_packet_citation(negative.symbol, negative.path);
+            let claims = packet_source_derived_claims_for_citation(
+                negative.prompt,
+                &citation,
+                negative.source,
+            );
+            assert!(
+                claims.is_empty(),
+                "negative fixture `{}` for {} should not emit product claims; got {claims:?}",
+                contract.false_positive_fixture_id,
+                contract.domain
+            );
         }
     }
 

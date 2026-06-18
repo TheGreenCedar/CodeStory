@@ -87,6 +87,9 @@ named runtime profile modules:
   hook/cache, client-send, URLSession request lifecycle, string-predicate,
   stylesheet animation, SQL schema, runtime-formatting, and search-execution
   flows.
+  High-risk product profiles that resemble benchmark holdout families carry
+  source-claim contract metadata for domain, proof roles, evidence tier, and
+  positive/negative fixtures before they can leave the pending-migration state.
 - `packet_command_profiles.rs` owns command-span probes and command-flow claim
   templates.
 - `packet_evidence_roles.rs` owns typed citation role classification; labels
