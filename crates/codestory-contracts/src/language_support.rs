@@ -29,6 +29,83 @@ impl LanguageEvidenceTier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageClaimTier {
+    FilenameRoute,
+    GrammarParse,
+    SourceGraphExtraction,
+    TypedSemanticEdges,
+    PacketSufficientAnswerQuality,
+}
+
+impl LanguageClaimTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FilenameRoute => "filename_route",
+            Self::GrammarParse => "grammar_parse",
+            Self::SourceGraphExtraction => "source_graph_extraction",
+            Self::TypedSemanticEdges => "typed_semantic_edges",
+            Self::PacketSufficientAnswerQuality => "packet_sufficient_answer_quality",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanguageProofRole {
+    ExtensionRouting,
+    ParserSmoke,
+    GraphFixture,
+    SemanticResolverFixture,
+    PacketRuntimeArtifact,
+}
+
+impl LanguageProofRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExtensionRouting => "extension_routing",
+            Self::ParserSmoke => "parser_smoke",
+            Self::GraphFixture => "graph_fixture",
+            Self::SemanticResolverFixture => "semantic_resolver_fixture",
+            Self::PacketRuntimeArtifact => "packet_runtime_artifact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanguageClaimTierContract {
+    pub tier: LanguageClaimTier,
+    pub allowed_proof_roles: &'static [LanguageProofRole],
+    pub provenance_expectations: &'static [&'static str],
+}
+
+pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
+    LanguageClaimTierContract {
+        tier: LanguageClaimTier::FilenameRoute,
+        allowed_proof_roles: &[LanguageProofRole::ExtensionRouting],
+        provenance_expectations: &["LANGUAGE_SUPPORT_PROFILES extension registry"],
+    },
+    LanguageClaimTierContract {
+        tier: LanguageClaimTier::GrammarParse,
+        allowed_proof_roles: &[LanguageProofRole::ParserSmoke],
+        provenance_expectations: &["live tree-sitter parser config and parse smoke"],
+    },
+    LanguageClaimTierContract {
+        tier: LanguageClaimTier::SourceGraphExtraction,
+        allowed_proof_roles: &[LanguageProofRole::GraphFixture],
+        provenance_expectations: &["fidelity or tictactoe graph fixture"],
+    },
+    LanguageClaimTierContract {
+        tier: LanguageClaimTier::TypedSemanticEdges,
+        allowed_proof_roles: &[LanguageProofRole::SemanticResolverFixture],
+        provenance_expectations: &["targeted resolver regression"],
+    },
+    LanguageClaimTierContract {
+        tier: LanguageClaimTier::PacketSufficientAnswerQuality,
+        allowed_proof_roles: &[LanguageProofRole::PacketRuntimeArtifact],
+        provenance_expectations: &["publishable packet-runtime artifact"],
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageSupportProfile {
     pub language_name: &'static str,
     pub extensions: &'static [&'static str],
@@ -39,6 +116,15 @@ pub struct LanguageSupportProfile {
 
 const PARSER_BACKED_GRAPH: &str = "parser-backed graph, fidelity-gated";
 const STRUCTURAL_COLLECTOR: &str = "structural collector only";
+const PARSER_BACKED_CLAIM_TIERS: &[LanguageClaimTier] = &[
+    LanguageClaimTier::FilenameRoute,
+    LanguageClaimTier::GrammarParse,
+    LanguageClaimTier::SourceGraphExtraction,
+];
+const STRUCTURAL_CLAIM_TIERS: &[LanguageClaimTier] = &[
+    LanguageClaimTier::FilenameRoute,
+    LanguageClaimTier::SourceGraphExtraction,
+];
 
 pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     parser_profile("python", &["py", "pyi"]),
@@ -118,6 +204,23 @@ pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
         .flat_map(|profile| profile.extensions.iter().copied())
 }
 
+pub fn language_claim_tiers_for_profile(
+    profile: &LanguageSupportProfile,
+) -> &'static [LanguageClaimTier] {
+    match profile.support_mode {
+        LanguageSupportMode::ParserBackedGraph => PARSER_BACKED_CLAIM_TIERS,
+        LanguageSupportMode::StructuralCollector => STRUCTURAL_CLAIM_TIERS,
+    }
+}
+
+pub fn language_claim_tier_contract(
+    tier: LanguageClaimTier,
+) -> Option<&'static LanguageClaimTierContract> {
+    LANGUAGE_CLAIM_TIER_CONTRACTS
+        .iter()
+        .find(|contract| contract.tier == tier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +259,60 @@ mod tests {
             assert!(
                 seen.insert(extension),
                 "extension should have exactly one owner: {extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_tier_contracts_cover_profile_tiers_without_overclaiming() {
+        for contract in LANGUAGE_CLAIM_TIER_CONTRACTS {
+            assert!(
+                !contract.allowed_proof_roles.is_empty(),
+                "{} needs a proof role",
+                contract.tier.as_str()
+            );
+            assert!(
+                !contract.provenance_expectations.is_empty(),
+                "{} needs provenance expectations",
+                contract.tier.as_str()
+            );
+        }
+
+        for profile in LANGUAGE_SUPPORT_PROFILES {
+            let tiers = language_claim_tiers_for_profile(profile);
+            assert!(
+                tiers.contains(&LanguageClaimTier::FilenameRoute),
+                "{} must at least claim filename routing",
+                profile.language_name
+            );
+            for tier in tiers {
+                assert!(
+                    language_claim_tier_contract(*tier).is_some(),
+                    "{} has no tier contract",
+                    tier.as_str()
+                );
+            }
+
+            match profile.support_mode {
+                LanguageSupportMode::ParserBackedGraph => {
+                    assert!(tiers.contains(&LanguageClaimTier::GrammarParse));
+                    assert!(tiers.contains(&LanguageClaimTier::SourceGraphExtraction));
+                }
+                LanguageSupportMode::StructuralCollector => {
+                    assert!(!tiers.contains(&LanguageClaimTier::GrammarParse));
+                    assert!(tiers.contains(&LanguageClaimTier::SourceGraphExtraction));
+                }
+            }
+
+            assert!(
+                !tiers.contains(&LanguageClaimTier::TypedSemanticEdges),
+                "{} runtime profile must not imply typed semantic edges",
+                profile.language_name
+            );
+            assert!(
+                !tiers.contains(&LanguageClaimTier::PacketSufficientAnswerQuality),
+                "{} runtime profile must not imply packet-quality proof",
+                profile.language_name
             );
         }
     }

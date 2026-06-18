@@ -2105,6 +2105,7 @@ mod packet_tests {
             avoid_opening_paths: Vec::new(),
             gaps: vec!["No focused symbol selected.".to_string()],
             follow_up_commands: Vec::new(),
+            coverage_report: None,
         })
         .expect("serialize");
 
@@ -2118,6 +2119,7 @@ mod packet_tests {
             avoid_opening_paths: vec!["crates/codestory-cli/src/main.rs".to_string()],
             gaps: vec!["Sidecar readiness is not full.".to_string()],
             follow_up_commands: Vec::new(),
+            coverage_report: None,
         })
         .expect("serialize");
 
