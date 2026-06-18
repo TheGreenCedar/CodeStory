@@ -164,7 +164,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
 | holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
 | `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
-| Windows `retrieval-sidecar-smoke` CI job | fail-closed sidecar smoke | [`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract) |
+| Linux + Windows `retrieval-sidecar-smoke` CI jobs | split fail-closed sidecar smoke | [`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract) |
 | Ragas/Phoenix nightly eval | optional | Not configured |
 
 ### North-Star SLOs
