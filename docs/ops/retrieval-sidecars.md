@@ -185,6 +185,37 @@ Confirm bindings with:
 ./target/release/codestory-cli retrieval status --project .
 ```
 
+## Local trust boundaries and cleanup
+
+`retrieval bootstrap` is a local mutating setup command: it may start Compose,
+write `retrieval-sidecars.json`, create sidecar cache dirs, and repair/prune
+unprotected `codestory_*` Qdrant collections. Use
+`node scripts/setup-retrieval-env.mjs --check-only` for a no-change prerequisite
+check; there is no `retrieval bootstrap --dry-run` contract. `retrieval down`
+only clears the sidecar state file; stop Docker/Compose separately if containers
+must be removed.
+
+Generated sidecar artifacts are disposable local cache state. To restore from a
+bad sidecar setup, stop sidecars, move the affected Qdrant, Zoekt, or SCIP cache
+dir aside under the CodeStory cache root, rebuild with `retrieval bootstrap` and
+`retrieval index`, and delete the backup only after `retrieval status --format
+json` reports the expected mode. To uninstall sidecar caches, remove the
+CodeStory-owned Qdrant, Zoekt, SCIP, and `retrieval-sidecars.json` paths listed
+above after the services are stopped.
+
+Downloaded model artifacts are local trust boundaries. The GGUF file under
+`CODESTORY_EMBED_MODEL_DIR` or `target/retrieval-models` is accepted only after
+size and SHA-256 verification; uninstall it by deleting that model directory.
+Managed ONNX assets installed by `setup embeddings` live under the
+`managed-embeddings` cache root; use `setup embeddings --dry-run --format json`
+to inspect the plan and remove that directory to uninstall them.
+
+General sidecar artifact import/export is a non-goal until a dedicated command
+exists. Existing reuse is limited to health-probed generated sidecars for the
+current manifest. `manifest_contract` proves sidecar readiness and freshness for
+the local source/input hash; it does not prove answer quality or agent
+usefulness without packet/drill evidence.
+
 ---
 
 ## CLI workflow
