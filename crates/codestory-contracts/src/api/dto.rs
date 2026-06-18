@@ -1876,6 +1876,10 @@ pub struct PacketCoverageReportDto {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub covered: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub provenance_counts: std::collections::BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ineligible: Vec<String>,

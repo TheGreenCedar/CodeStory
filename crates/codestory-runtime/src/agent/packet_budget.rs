@@ -725,6 +725,11 @@ mod tests {
         let mut packet = test_packet("Explain route dispatch gaps.", 4096);
         packet.sufficiency.coverage_report = Some(PacketCoverageReportDto {
             covered: vec!["request dispatch".to_string()],
+            provenance_labels: vec!["graph_neighbor".to_string()],
+            provenance_counts: std::collections::BTreeMap::from([(
+                "graph_neighbor".to_string(),
+                1,
+            )]),
             missing: vec!["route handling".to_string()],
             ineligible: vec!["claim=\"diagnostic\" reason=\"claim marked diagnostic\"".to_string()],
             unresolved: vec!["RouteDispatcher".to_string()],
@@ -740,6 +745,8 @@ mod tests {
             .as_ref()
             .expect("coverage report");
         assert_eq!(report.covered, vec!["request dispatch".to_string()]);
+        assert_eq!(report.provenance_labels, vec!["graph_neighbor".to_string()]);
+        assert_eq!(report.provenance_counts.get("graph_neighbor"), Some(&1));
         assert_eq!(report.missing, vec!["route handling".to_string()]);
         assert!(report.ineligible.is_empty());
         assert_eq!(report.unresolved, vec!["RouteDispatcher".to_string()]);
