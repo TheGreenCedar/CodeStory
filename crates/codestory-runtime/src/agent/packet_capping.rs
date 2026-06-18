@@ -611,8 +611,17 @@ fn promote_distinct_required_probe_matches(
         .filter(|index| packet_citation_satisfies_required_probe(query, &answer.citations[**index]))
         .filter_map(|index| packet_citation_file_path_key(&answer.citations[*index]))
         .collect::<HashSet<_>>();
+    let prefer_shared_source_set = !packet_query_mentions_platform_source_set(query);
 
     while promoted_paths.len() < limit {
+        let promoted_source_set_score = promoted_indices
+            .iter()
+            .filter(|index| {
+                packet_citation_satisfies_required_probe(query, &answer.citations[**index])
+            })
+            .map(|index| packet_source_set_path_score(&answer.citations[*index]))
+            .max()
+            .unwrap_or_default();
         let mut best_match = None;
         for (index, citation) in answer.citations.iter().enumerate() {
             if promoted_indices.contains(&index) {
@@ -625,6 +634,12 @@ fn promote_distinct_required_probe_matches(
                 continue;
             }
             if !packet_required_probe_multi_match_candidate(query, citation) {
+                continue;
+            }
+            if prefer_shared_source_set
+                && promoted_source_set_score >= 2
+                && packet_source_set_path_score(citation) < promoted_source_set_score
+            {
                 continue;
             }
             let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
@@ -665,6 +680,8 @@ fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
     match normalize_identifier(query).as_str() {
         "mapperpublicapi" | "mapperruntimeapi" | "mappingruntimeentrypoint" => Some(3),
         "sqlschemascripts" | "schemadialectscripts" => Some(3),
+        "bufferedsource" | "bufferedsink" | "bufferedwrapper" | "sourcebuffer" | "sinkbuffer"
+        | "sourcereadbuffer" | "sinkwritebuffer" => Some(2),
         "httptoplevelhelper"
         | "publicclientfacade"
         | "clientconveniencemethod"
@@ -686,6 +703,7 @@ fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
         "sessionrequestcreation"
         | "requestobjectcreation"
         | "requestresumedispatch"
+        | "datarequestvalidation"
         | "requestvalidationpipeline"
         | "delegatecallbackhandling"
         | "urlsessioncallbackboundary" => Some(2),
@@ -960,6 +978,11 @@ fn packet_prefer_required_probe_match(
         if candidate_test_like != existing_test_like {
             return !candidate_test_like;
         }
+        if let Some(prefer_candidate) =
+            packet_prefer_shared_source_set_citation(query, candidate, existing)
+        {
+            return prefer_candidate;
+        }
     }
     if candidate_rank != existing_rank {
         return candidate_rank > existing_rank;
@@ -986,6 +1009,68 @@ fn packet_prefer_required_probe_match(
     }
     packet_exact_definition_file_citation(candidate)
         && !packet_exact_definition_file_citation(existing)
+}
+
+fn packet_prefer_shared_source_set_citation(
+    query: &str,
+    candidate: &AgentCitationDto,
+    existing: &AgentCitationDto,
+) -> Option<bool> {
+    if packet_query_mentions_platform_source_set(query) {
+        return None;
+    }
+    let candidate_score = packet_source_set_path_score(candidate);
+    let existing_score = packet_source_set_path_score(existing);
+    (candidate_score != existing_score).then_some(candidate_score > existing_score)
+}
+
+fn packet_query_mentions_platform_source_set(query: &str) -> bool {
+    let normalized = normalize_identifier(query);
+    [
+        "jvm", "nonjvm", "android", "ios", "native", "linux", "windows", "darwin", "apple", "wasm",
+        "nodejs", "browser",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
+fn packet_source_set_path_score(citation: &AgentCitationDto) -> u8 {
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if path.is_empty() {
+        return 1;
+    }
+    // Path-name heuristic; replace with indexed source-set metadata if that exists.
+    if path.contains("/commonmain/")
+        || path.contains("/common/")
+        || path.contains("/shared/")
+        || path.contains("/src/main/")
+    {
+        return 2;
+    }
+    if path.contains("/jvmmain/")
+        || path.contains("/nonjvmmain/")
+        || path.contains("/androidmain/")
+        || path.contains("/iosmain/")
+        || path.contains("/nativemain/")
+        || path.contains("/linuxmain/")
+        || path.contains("/windowsmain/")
+        || path.contains("/darwinmain/")
+        || path.contains("/applemain/")
+        || path.contains("/wasmmain/")
+        || path.contains("/wasmwasimain/")
+        || path.contains("/nodejsmain/")
+        || path.contains("/jsmain/")
+        || path.contains("/browsermain/")
+    {
+        return 0;
+    }
+    1
 }
 
 fn packet_required_probe_prefers_implementation(query: &str) -> bool {
@@ -1205,6 +1290,11 @@ mod tests {
                 "Network command input",
                 "Network command input reader",
             ),
+            (
+                "source read buffer",
+                "RealBufferedSource.read",
+                "BufferedSource.readIntoBuffer",
+            ),
         ] {
             let mut answer = answer_fixture(vec![
                 citation(&format!("{query} guide"), "docs/flow-guide.md", 100.0),
@@ -1235,5 +1325,74 @@ mod tests {
                 Some("src/flow/secondary.rs")
             );
         }
+
+        let query = "data request validation";
+        let mut answer = answer_fixture(vec![
+            citation(&format!("{query} guide"), "docs/flow-guide.md", 100.0),
+            citation(&format!("{query} test"), "tests/flow_test.rs", 99.0),
+            citation("DataRequest.validate", "src/flow/primary.rs", 4.0),
+            citation(
+                "DataRequest.validationPipeline",
+                "src/flow/secondary.rs",
+                3.0,
+            ),
+        ]);
+
+        let protected = promote_required_probe_citations(&mut answer, &[query.to_string()]);
+        let protected_paths = answer
+            .citations
+            .iter()
+            .filter(|citation| protected.contains(&packet_citation_key(citation)))
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            protected_paths,
+            HashSet::from(["src/flow/primary.rs", "src/flow/secondary.rs"]),
+            "query `{query}` should protect both primary-source validation matches before docs/tests: {protected_paths:?}"
+        );
+    }
+
+    #[test]
+    fn required_probe_prefers_shared_source_set_over_platform_variant() {
+        let mut answer = answer_fixture(vec![
+            citation(
+                "RealBufferedSource.read",
+                "src/jvmMain/kotlin/io/RealBufferedSource.kt",
+                100.0,
+            ),
+            citation(
+                "RealBufferedSource.read",
+                "src/commonMain/kotlin/io/RealBufferedSource.kt",
+                1.0,
+            ),
+            citation(
+                "BufferedSource",
+                "src/commonMain/kotlin/io/BufferedSource.kt",
+                0.5,
+            ),
+        ]);
+
+        let protected = promote_required_probe_citations(
+            &mut answer,
+            &[
+                "source read buffer".to_string(),
+                "buffered source".to_string(),
+            ],
+        );
+        let protected_paths = answer
+            .citations
+            .iter()
+            .filter(|citation| protected.contains(&packet_citation_key(citation)))
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+
+        assert!(
+            protected_paths
+                .iter()
+                .take(2)
+                .all(|path| path.contains("commonMain")),
+            "generic source probes should protect shared source-set evidence before platform variants: {protected_paths:?}"
+        );
     }
 }

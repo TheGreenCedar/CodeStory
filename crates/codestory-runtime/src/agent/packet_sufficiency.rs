@@ -129,6 +129,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
     let has_sufficiency_blocking_budget_omission = packet_has_sufficiency_blocking_budget_omission(
         budget,
         &missing_required_flow_requirements,
+        &missing_required_probe_queries,
     );
     let unresolved_sidecar_queries = unresolved_sidecar_queries(answer);
     let blocking_unresolved_sidecar_queries = packet_blocking_unresolved_sidecar_queries(
@@ -3585,6 +3586,52 @@ mod tests {
     }
 
     #[test]
+    fn compact_budget_blocks_sufficiency_when_source_proof_probe_is_missing() {
+        let question = "Explain how buffered Source and Sink wrappers use Buffer state during reads and writes.";
+        let answer = answer_fixture(question);
+        let budget = compact_truncated_budget(question, vec!["citations", "trail_edges"]);
+        let claims = vec![
+            claim("Buffer is the in-memory byte store used by buffered reads and writes."),
+            claim("A buffered source wrapper reads from an upstream Source into a Buffer."),
+            claim("A buffered sink wrapper writes buffered bytes to an upstream Sink."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: vec!["source read buffer".to_string()],
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("answer-critical evidence")),
+            "compact packets missing source-proof probes should not report sufficient: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'source read buffer'")),
+            "missing source-proof probe should remain the first repair path: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--budget standard")),
+            "compact source-proof omissions should recommend the standard packet: {sufficiency:?}"
+        );
+    }
+
+    #[test]
     fn route_tracing_site_build_prompts_use_lifecycle_flow_roles() {
         let claims = vec![
             claim("Build.process constructs or processes a site."),
@@ -4153,6 +4200,7 @@ mod tests {
 fn packet_has_sufficiency_blocking_budget_omission(
     budget: &PacketBudgetDto,
     missing_required_flow_requirements: &[FlowRequirement],
+    missing_required_probe_queries: &[String],
 ) -> bool {
     if !budget.truncated {
         return false;
@@ -4166,7 +4214,10 @@ fn packet_has_sufficiency_blocking_budget_omission(
         return true;
     }
 
-    if missing_required_flow_requirements.is_empty() {
+    let missing_proof_probe = missing_required_probe_queries
+        .iter()
+        .any(|query| packet_missing_probe_requires_compact_proof(query));
+    if missing_required_flow_requirements.is_empty() && !missing_proof_probe {
         return false;
     }
 
@@ -4177,6 +4228,19 @@ fn packet_has_sufficiency_blocking_budget_omission(
             "citations" | "markdown_blocks" | "trail_edges" | "output_bytes" => true,
             _ => false,
         })
+}
+
+fn packet_missing_probe_requires_compact_proof(query: &str) -> bool {
+    matches!(
+        normalize_identifier(query).as_str(),
+        "sourcereadbuffer"
+            | "sinkwritebuffer"
+            | "requestresumedispatch"
+            | "requestvalidationpipeline"
+            | "datarequestvalidation"
+            | "delegatecallbackhandling"
+            | "urlsessioncallbackboundary"
+    )
 }
 
 pub(crate) fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
