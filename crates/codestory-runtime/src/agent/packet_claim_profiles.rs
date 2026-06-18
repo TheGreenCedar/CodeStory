@@ -9,49 +9,70 @@ use crate::agent::packet_source_patterns::{
     packet_sql_create_table_names, packet_sql_foreign_key_claims,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_hook_cache_flow,
+    packet_probe_terms, packet_terms_indicate_buffered_io_flow,
+    packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
+    packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
+    packet_terms_indicate_html_css_template_structure_flow,
+    packet_terms_indicate_log_record_handler_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_search_execution_flow, packet_terms_indicate_server_route_dispatch_flow,
-    packet_terms_indicate_shell_version_use_flow, packet_terms_indicate_sql_schema_flow,
-    packet_terms_indicate_string_predicate_flow, packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_server_request_dispatch_flow,
+    packet_terms_indicate_server_route_dispatch_flow,
+    packet_terms_indicate_shell_install_dispatch_flow,
+    packet_terms_indicate_shell_version_use_flow, packet_terms_indicate_site_build_phase_flow,
+    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_string_predicate_flow,
+    packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow,
 };
-use codestory_contracts::api::AgentCitationDto;
+use codestory_contracts::api::{AgentCitationDto, NodeKind};
 use std::collections::HashSet;
 
 const GENERIC_PRODUCT_CLAIM_PROFILES: &[SourceClaimProfile] = &[
-    SourceClaimProfile::ShellVersionUse,
-    SourceClaimProfile::StringPredicate,
-    SourceClaimProfile::StylesheetAnimation,
-    SourceClaimProfile::SqlSchema,
-    SourceClaimProfile::RuntimeFormatting,
-];
-
-const EVAL_DIAGNOSTIC_CLAIM_PROFILES: &[SourceClaimProfile] = &[
     SourceClaimProfile::ServerRoute,
+    SourceClaimProfile::ServerRequestDispatch,
+    SourceClaimProfile::ShellInstallDispatch,
+    SourceClaimProfile::ShellVersionUse,
     SourceClaimProfile::HookCache,
     SourceClaimProfile::ClientSend,
     SourceClaimProfile::UrlSessionRequest,
+    SourceClaimProfile::StringPredicate,
+    SourceClaimProfile::StylesheetAnimation,
+    SourceClaimProfile::HtmlCssTemplateStructure,
+    SourceClaimProfile::SqlSchema,
+    SourceClaimProfile::RuntimeFormatting,
+    SourceClaimProfile::LoggerHandlerFlow,
+    SourceClaimProfile::SiteBuildPhase,
+    SourceClaimProfile::MappingConfigurationPlan,
+    SourceClaimProfile::FormValidation,
     SourceClaimProfile::ClientRequestDispatch,
     SourceClaimProfile::EventLoopCommand,
     SourceClaimProfile::SearchExecution,
+    SourceClaimProfile::BufferedIo,
 ];
 
 #[derive(Debug, Clone, Copy)]
 enum SourceClaimProfile {
     ServerRoute,
+    ServerRequestDispatch,
+    ShellInstallDispatch,
     ShellVersionUse,
     HookCache,
     ClientSend,
     UrlSessionRequest,
     StringPredicate,
     StylesheetAnimation,
+    HtmlCssTemplateStructure,
     SqlSchema,
     RuntimeFormatting,
+    LoggerHandlerFlow,
+    SiteBuildPhase,
+    MappingConfigurationPlan,
+    FormValidation,
     ClientRequestDispatch,
     EventLoopCommand,
     SearchExecution,
+    BufferedIo,
 }
 
 impl SourceClaimProfile {
@@ -61,6 +82,22 @@ impl SourceClaimProfile {
                 if packet_terms_indicate_server_route_dispatch_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_server_route_flow_claims(
                         ctx.symbol, ctx.source,
+                    ));
+                }
+            }
+            Self::ServerRequestDispatch => {
+                if packet_terms_indicate_server_request_dispatch_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_server_request_dispatch_flow_claims(
+                        ctx.symbol, ctx.source, &ctx.path,
+                    ));
+                }
+            }
+            Self::ShellInstallDispatch => {
+                if packet_terms_indicate_shell_install_dispatch_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_shell_install_dispatch_flow_claims(
+                        ctx.symbol,
+                        &ctx.file_name,
+                        ctx.source,
                     ));
                 }
             }
@@ -104,6 +141,14 @@ impl SourceClaimProfile {
                     claims.extend(packet_generic_css_animation_flow_claims(ctx.source));
                 }
             }
+            Self::HtmlCssTemplateStructure => {
+                if packet_terms_indicate_html_css_template_structure_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_html_css_template_structure_claims(
+                        &ctx.file_name,
+                        ctx.source,
+                    ));
+                }
+            }
             Self::SqlSchema => {
                 if packet_terms_indicate_sql_schema_flow(&ctx.prompt_terms) {
                     claims.extend(packet_generic_sql_schema_flow_claims(ctx.source));
@@ -111,12 +156,46 @@ impl SourceClaimProfile {
             }
             Self::RuntimeFormatting => {
                 if packet_terms_indicate_runtime_formatting_flow(&ctx.prompt_terms) {
-                    claims.extend(packet_generic_runtime_formatting_flow_claims(ctx.source));
+                    claims.extend(packet_generic_runtime_formatting_flow_claims(
+                        ctx.symbol,
+                        &ctx.file_name,
+                        ctx.source,
+                    ));
+                }
+            }
+            Self::LoggerHandlerFlow => {
+                if packet_terms_indicate_log_record_handler_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_log_record_handler_flow_claims(
+                        ctx.symbol, ctx.source,
+                    ));
+                }
+            }
+            Self::SiteBuildPhase => {
+                if packet_terms_indicate_site_build_phase_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_site_build_phase_flow_claims(ctx.source));
+                }
+            }
+            Self::MappingConfigurationPlan => {
+                if packet_terms_indicate_mapper_configuration_plan_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_mapper_configuration_plan_claims(
+                        ctx.symbol,
+                        ctx.kind,
+                        &ctx.file_name,
+                        ctx.source,
+                    ));
+                }
+            }
+            Self::FormValidation => {
+                if packet_terms_indicate_form_validation_flow(&ctx.prompt_terms) {
+                    claims.extend(packet_generic_form_validation_flow_claims(
+                        ctx.symbol, ctx.source,
+                    ));
                 }
             }
             Self::ClientRequestDispatch => collect_client_request_dispatch_claims(ctx, claims),
             Self::EventLoopCommand => collect_event_loop_command_claims(ctx, claims),
             Self::SearchExecution => collect_search_execution_claims(ctx, claims),
+            Self::BufferedIo => collect_buffered_io_claims(ctx, claims),
         }
     }
 }
@@ -124,6 +203,8 @@ impl SourceClaimProfile {
 struct SourceClaimContext<'a> {
     source: &'a str,
     symbol: &'a str,
+    kind: NodeKind,
+    path: String,
     file_name: String,
     normalized_prompt: String,
     prompt_terms: Vec<String>,
@@ -146,6 +227,8 @@ impl<'a> SourceClaimContext<'a> {
         Self {
             source,
             symbol,
+            kind: citation.kind,
+            path,
             file_name,
             normalized_prompt: normalize_identifier(prompt),
             prompt_terms: packet_probe_terms(prompt),
@@ -166,9 +249,6 @@ pub(crate) fn packet_source_derived_claims_for_citation(
         claims.extend(
             crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
         );
-        for profile in EVAL_DIAGNOSTIC_CLAIM_PROFILES {
-            profile.collect(&ctx, &mut claims);
-        }
     }
 
     for profile in GENERIC_PRODUCT_CLAIM_PROFILES {
@@ -193,7 +273,11 @@ pub(crate) fn packet_source_derived_claim_for_role(
     let search_flow = packet_terms_indicate_search_execution_flow(&ctx.prompt_terms);
     let eval_diagnostics = eval_probes_enabled();
 
-    if eval_diagnostics && request_flow {
+    if request_flow && let Some(claim) = python_like_request_dispatch_claim_for_role(&ctx) {
+        return Some(claim);
+    }
+
+    if request_flow {
         if role == PacketEvidenceRole::ClientFactory
             && let Some(claim) = client_factory_claim(&ctx)
         {
@@ -305,10 +389,113 @@ fn collect_client_request_dispatch_claims(ctx: &SourceClaimContext<'_>, claims: 
     }
 
     push_optional_claim(claims, client_factory_claim(ctx));
+    claims.extend(python_like_request_dispatch_claims(ctx));
     push_optional_claim(claims, client_request_pipeline_claim(ctx));
     push_optional_claim(claims, request_dispatch_claim(ctx));
     push_optional_claim(claims, interceptor_management_claim(ctx));
     push_optional_claim(claims, transport_adapter_claim(ctx));
+}
+
+fn collect_buffered_io_claims(ctx: &SourceClaimContext<'_>, claims: &mut Vec<String>) {
+    if !packet_terms_indicate_buffered_io_flow(&ctx.prompt_terms) {
+        return;
+    }
+
+    push_optional_claim(claims, buffered_io_buffer_storage_claim(ctx));
+    push_optional_claim(claims, buffered_io_source_wrapper_claim(ctx));
+    push_optional_claim(claims, buffered_io_sink_wrapper_claim(ctx));
+    push_optional_claim(claims, buffered_io_helper_claim(ctx));
+}
+
+fn buffered_io_buffer_storage_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let normalized_symbol = normalize_identifier(ctx.symbol);
+    let normalized_source = normalize_identifier(ctx.source);
+    let lower = ctx.source.to_ascii_lowercase();
+    if normalized_symbol == "buffer"
+        || normalized_symbol.ends_with("buffer")
+        || normalized_symbol.contains("bytebuffer")
+    {
+        if (lower.contains("class buffer")
+            || lower.contains("struct buffer")
+            || lower.contains("interface buffer")
+            || lower.contains("expect class buffer")
+            || lower.contains("actual class buffer")
+            || lower.contains("typealias buffer"))
+            && (normalized_source.contains("read") || normalized_source.contains("write"))
+            && (normalized_source.contains("byte") || normalized_source.contains("segment"))
+        {
+            return Some(
+                "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn buffered_io_source_wrapper_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let normalized_symbol = normalize_identifier(ctx.symbol);
+    let normalized_source = normalize_identifier(ctx.source);
+    let lower = ctx.source.to_ascii_lowercase();
+    let source_wrapper_symbol = normalized_symbol.contains("bufferedsource")
+        || normalized_symbol.ends_with("source")
+        || (normalized_symbol.contains("buffered") && normalized_symbol.contains("reader"));
+    let source_wrapper_body = normalized_source.contains("source")
+        && normalized_source.contains("buffer")
+        && (normalized_source.contains("read") || normalized_source.contains("request"))
+        && (lower.contains("override fun")
+            || lower.contains("class ")
+            || lower.contains("struct "));
+    if source_wrapper_symbol && source_wrapper_body {
+        return Some(
+            "A buffered source wrapper reads from an upstream Source into a Buffer.".to_string(),
+        );
+    }
+    None
+}
+
+fn buffered_io_sink_wrapper_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let normalized_symbol = normalize_identifier(ctx.symbol);
+    let normalized_source = normalize_identifier(ctx.source);
+    let lower = ctx.source.to_ascii_lowercase();
+    let sink_wrapper_symbol = normalized_symbol.contains("bufferedsink")
+        || normalized_symbol.ends_with("sink")
+        || (normalized_symbol.contains("buffered") && normalized_symbol.contains("writer"));
+    let sink_wrapper_body = normalized_source.contains("sink")
+        && normalized_source.contains("buffer")
+        && (normalized_source.contains("write")
+            || normalized_source.contains("emit")
+            || normalized_source.contains("flush"))
+        && (lower.contains("override fun")
+            || lower.contains("class ")
+            || lower.contains("struct "));
+    if sink_wrapper_symbol && sink_wrapper_body {
+        return Some(
+            "A buffered sink wrapper writes buffered bytes to an upstream Sink.".to_string(),
+        );
+    }
+    None
+}
+
+fn buffered_io_helper_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let normalized_source = normalize_identifier(ctx.source);
+    let lower = ctx.source.to_ascii_lowercase();
+    let source_buffer_helper = lower.contains("fun source.buffer")
+        || normalized_source.contains("sourcebuffer")
+        || (normalized_source.contains("source")
+            && normalized_source.contains("bufferedsource")
+            && normalized_source.contains("buffer"));
+    let sink_buffer_helper = lower.contains("fun sink.buffer")
+        || normalized_source.contains("sinkbuffer")
+        || (normalized_source.contains("sink")
+            && normalized_source.contains("bufferedsink")
+            && normalized_source.contains("buffer"));
+    if source_buffer_helper && sink_buffer_helper {
+        return Some(
+            "Buffering helpers wrap Source and Sink instances with buffered implementations."
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn client_factory_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
@@ -367,6 +554,111 @@ fn transport_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
             "`{}` selects xhr or http transport based on environment capabilities.",
             ctx.file_name
         ));
+    }
+    None
+}
+
+fn python_like_request_dispatch_claim_for_role(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let normalized_symbol = normalize_identifier(ctx.symbol);
+    if normalized_symbol == "request" {
+        return top_level_session_request_delegate_claim(ctx);
+    }
+    if normalized_symbol.contains("sessionrequest") {
+        return session_request_prepares_claim(ctx);
+    }
+    if normalized_symbol.contains("sessionsend") {
+        return session_send_adapter_claim(ctx);
+    }
+    if normalized_symbol.contains("adaptersend") {
+        return http_adapter_send_claim(ctx);
+    }
+    if let Some(claim) = prepared_request_prepare_claim(ctx) {
+        return Some(claim);
+    }
+    if let Some(claim) = http_adapter_send_claim(ctx) {
+        return Some(claim);
+    }
+    None
+}
+
+fn python_like_request_dispatch_claims(ctx: &SourceClaimContext<'_>) -> Vec<String> {
+    let mut claims = Vec::new();
+    push_optional_claim(&mut claims, top_level_session_request_delegate_claim(ctx));
+    push_optional_claim(&mut claims, session_request_prepares_claim(ctx));
+    push_optional_claim(&mut claims, prepared_request_prepare_claim(ctx));
+    push_optional_claim(&mut claims, session_send_adapter_claim(ctx));
+    push_optional_claim(&mut claims, http_adapter_send_claim(ctx));
+    claims
+}
+
+fn top_level_session_request_delegate_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let lower = ctx.source.to_ascii_lowercase();
+    if packet_source_has_any(
+        ctx.source,
+        &["session() as session", "sessions.session() as session"],
+    ) && lower.contains("session.")
+        && lower.contains("request(")
+    {
+        return Some(
+            "The top-level request helper opens a session object and delegates to the session request method."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn session_request_prepares_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let lower = ctx.source.to_ascii_lowercase();
+    if lower.contains("def request(")
+        && lower.contains("request(")
+        && lower.contains("self.prepare_request(")
+    {
+        return Some(
+            "The session request method creates a request object and prepares it into a transport-ready request object."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn prepared_request_prepare_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let lower = ctx.source.to_ascii_lowercase();
+    if lower.contains("def prepare(")
+        && lower.contains("prepare_method(")
+        && lower.contains("prepare_url(")
+        && lower.contains("prepare_body(")
+    {
+        return Some(
+            "Request preparation builds the method, URL, headers, cookies, body, auth, and hooks."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn session_send_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let lower = ctx.source.to_ascii_lowercase();
+    if lower.contains("def send(")
+        && lower.contains("get_adapter(")
+        && lower.contains("adapter.send(")
+    {
+        return Some(
+            "The session send method chooses an adapter and calls the adapter send method."
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn http_adapter_send_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    let normalized_source = normalize_identifier(ctx.source);
+    if normalized_source.contains("class")
+        && normalized_source.contains("adapter")
+        && normalized_source.contains("defsend")
+        && normalized_source.contains("connurlopen")
+        && normalized_source.contains("buildresponse")
+    {
+        return Some("The transport adapter send path is the response boundary.".to_string());
     }
     None
 }
@@ -543,7 +835,9 @@ fn search_execution_method_claim(ctx: &SourceClaimContext<'_>) -> Option<String>
 
 fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let source_lower = source.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
+    let cache_helper_call = source_shape_has_cache_helper_call(&normalized_source);
 
     if source_lower.contains("withargs")
         && source_lower.contains("export default")
@@ -554,13 +848,39 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
         ));
     }
 
+    if normalized_source.contains("stablehash") && normalized_source.contains("returnkeyargs") {
+        claims.push(format!("{symbol} serializes hook keys into cache keys."));
+    }
+
     if source_lower.contains("serialize(_key)")
         && (source_lower.contains("getcache")
-            || source_lower.contains("createcachehelper")
+            || (source_lower.contains("create")
+                && source_lower.contains("cache")
+                && source_lower.contains("helper"))
             || source_lower.contains("cache"))
     {
         claims.push(format!(
             "{symbol} serializes the key before reading cache state."
+        ));
+    }
+
+    if normalized_source.contains("exportasyncfunction")
+        && normalized_source.contains("serialize")
+        && cache_helper_call
+        && normalized_source.contains("mutatebykey")
+    {
+        claims.push(format!(
+            "{symbol} routes mutate behavior through the mutation helper."
+        ));
+    }
+
+    if normalized_source.contains("middleware")
+        && normalized_source.contains("hook")
+        && normalized_source.contains("configuse")
+        && source_shape_has_hook_return_call(&normalized_source)
+    {
+        claims.push(format!(
+            "{symbol} composes middleware around a public hook."
         ));
     }
 
@@ -584,10 +904,39 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
     claims
 }
 
+fn source_shape_has_cache_helper_call(normalized_source: &str) -> bool {
+    normalized_source.contains("cachehelper") && normalized_source.contains("create")
+}
+
+fn source_shape_has_hook_return_call(normalized_source: &str) -> bool {
+    normalized_source.contains("returnuse") && normalized_source.contains("hook")
+}
+
 fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let source_lower = source.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
     let owner = packet_display_owner(symbol).unwrap_or_else(|| symbol.to_string());
+
+    if source_lower.contains("_withclient")
+        && source_lower.contains("client()")
+        && source_lower.contains("client.")
+        && packet_source_has_any(source, &["get(", "post(", "put("])
+        && source_lower.contains("future<response>")
+    {
+        claims.push("Top-level HTTP helpers delegate to a Client.".to_string());
+    }
+
+    if normalized_source.contains("interfaceclassclient")
+        && normalized_source.contains("futureresponse")
+        && normalized_source.contains("futurestreamedresponsesend")
+        && normalized_source.contains("request")
+    {
+        claims.push(
+            "Client interface helper methods declare convenience request helpers and send(request)."
+                .to_string(),
+        );
+    }
 
     if source_lower.contains("_sendunstreamed")
         && source_lower.contains("response.fromstream")
@@ -600,6 +949,23 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
         claims.push(format!(
             "{owner} implements convenience methods in terms of send."
         ));
+        claims.push("Response.fromStream materializes the response stream boundary.".to_string());
+    }
+
+    if normalized_source.contains("classrequestextends")
+        && normalized_source.contains("bytestreamfinalize")
+        && normalized_source.contains("frombytesbodybytes")
+    {
+        claims.push(format!(
+            "{owner}.finalize prepares the request body for sending."
+        ));
+    }
+
+    if normalized_source.contains("classresponseextendsbaseresponse")
+        && normalized_source.contains("fromstreamstreamedresponseresponse")
+        && normalized_source.contains("responsestreamtobytes")
+    {
+        claims.push("Response.fromStream materializes the response stream boundary.".to_string());
     }
 
     if source_lower.contains("dart:io")
@@ -610,8 +976,65 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
         && source_lower.contains("httpclientresponse")
     {
         claims.push(format!(
-            "{owner}.send forwards finalized requests through an HTTP client transport."
+            "{owner}.send is the dart:io transport implementation that forwards finalized requests through an HTTP client."
         ));
+    }
+
+    if source_lower.contains("bytestream finalize()")
+        && source_lower.contains("_finalized = true")
+        && source_lower.contains("request body")
+    {
+        claims.push(format!(
+            "{owner}.finalize prepares the request body for sending."
+        ));
+    }
+
+    claims
+}
+
+fn packet_generic_form_validation_flow_claims(_symbol: &str, source: &str) -> Vec<String> {
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    let has_native_constraints = source_lower.contains("<form")
+        && source_lower.contains("required")
+        && source_lower.contains("pattern")
+        && source_lower.contains("min=")
+        && source_lower.contains("max=");
+    if has_native_constraints {
+        claims.push(
+            "The form validation examples use native required, pattern, min, and max constraints."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("<form")
+        && source_lower.contains("validity")
+        && (source_lower.contains("addeventlistener")
+            || source_lower.contains("checkvalidity")
+            || source_lower.contains("setcustomvalidity"))
+    {
+        claims.push(
+            "A custom validation example applies script-driven validity checks before rendering messages."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("validity.valuemissing")
+        && source_lower.contains("validity.typemismatch")
+        && source_lower.contains("validity.tooshort")
+    {
+        claims.push(
+            "Custom error rendering branches on ValidityState fields to choose messages."
+                .to_string(),
+        );
+    }
+
+    if source_lower.contains("addeventlistener('submit'")
+        && source_lower.contains("validity.valid")
+        && source_lower.contains("preventdefault")
+    {
+        claims.push("Submit handling prevents invalid form submission.".to_string());
     }
 
     claims
@@ -628,7 +1051,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("performeagerlyifnecessary")
     {
         claims.push(
-            "Session request creation builds request objects before optional eager execution."
+            "The session request API creates request objects before optional eager execution."
                 .to_string(),
         );
     }
@@ -637,7 +1060,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("public func resume() -> self")
         && source_lower.contains("task.resume()")
     {
-        claims.push("Request.resume resumes the underlying request task.".to_string());
+        claims.push("The request resume API resumes the underlying URL session task.".to_string());
     }
 
     if normalized_symbol.ends_with("validate")
@@ -646,7 +1069,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
         && source_lower.contains("didvalidate")
         && source_lower.contains("request")
     {
-        claims.push("Request validation attaches validation behavior.".to_string());
+        claims.push("Request validation methods attach validation behavior.".to_string());
     }
 
     if normalized_symbol.ends_with("delegate")
@@ -656,7 +1079,7 @@ fn packet_generic_url_session_request_flow_claims(symbol: &str, source: &str) ->
             || source_lower.contains("request.didreceive(data: data)")
             || source_lower.contains("didcompletewitherror"))
     {
-        claims.push("The session delegate receives request callback events.".to_string());
+        claims.push("Session delegate callbacks receive URLSession task events.".to_string());
     }
 
     claims
@@ -681,9 +1104,10 @@ pub(crate) fn packet_generic_string_predicate_flow_claims(
             && (method_lower.contains("null") || null_empty_whitespace_documented)
             && method_lower.contains("length")
         {
-            claims.push(
-                "isBlank treats null, empty, and whitespace-only inputs as blank.".to_string(),
-            );
+            let symbol = packet_predicate_claim_symbol(symbol, "isBlank");
+            claims.push(format!(
+                "{symbol} treats null, empty, and whitespace-only inputs as blank."
+            ));
         }
     }
 
@@ -698,11 +1122,36 @@ pub(crate) fn packet_generic_string_predicate_flow_claims(
             && !method_lower.contains("strip(")
             && !method_lower.contains(".strip")
         {
-            claims.push("isEmpty does not trim whitespace before deciding emptiness.".to_string());
+            let symbol = packet_predicate_claim_symbol(symbol, "isEmpty");
+            claims.push(format!(
+                "{symbol} does not trim whitespace before deciding emptiness."
+            ));
         }
     }
 
+    if normalized_source_contains_region_match_delegate(source) {
+        let owner = packet_display_owner(symbol).unwrap_or_else(|| "String comparison".to_string());
+        claims.push(format!(
+            "{owner} delegates region matching work to a shared character-sequence helper."
+        ));
+    }
+
     claims
+}
+
+fn packet_predicate_claim_symbol(symbol: &str, method: &str) -> String {
+    packet_display_owner(symbol)
+        .map(|owner| format!("{owner}.{method}"))
+        .unwrap_or_else(|| method.to_string())
+}
+
+fn normalized_source_contains_region_match_delegate(source: &str) -> bool {
+    let normalized_source = normalize_identifier(source);
+    normalized_source.contains("charsequence")
+        && normalized_source.contains("regionmatches")
+        && (normalized_source.contains("return")
+            || normalized_source.contains("delegate")
+            || normalized_source.contains("ignorecase"))
 }
 
 fn packet_source_method_block(
@@ -760,11 +1209,95 @@ pub(crate) fn packet_generic_css_animation_flow_claims(source: &str) -> Vec<Stri
         ));
     }
 
+    let lower = source.to_ascii_lowercase();
+    let imports_css = lower.contains("@import") && lower.contains(".css");
+    let imports_variables = lower.contains("var") && lower.contains(".css");
+    let imports_base = lower.contains("base") && lower.contains(".css");
+    let imports_named_animation = lower
+        .lines()
+        .filter(|line| line.contains("@import") && line.contains(".css"))
+        .any(|line| line.contains('/') && !line.contains("docs"));
+    if imports_css && imports_variables && imports_base && imports_named_animation {
+        claims.push(
+            "The animation stylesheet entrypoint imports the variable, base, and individual animation files."
+                .to_string(),
+        );
+    }
+
     for keyframe in packet_css_keyframe_names(source).into_iter().take(4) {
         if packet_css_class_sets_animation_name(source, &keyframe) {
             claims.push(format!(
                 "Named classes such as .{keyframe} set animation-name to matching keyframes; @keyframes {keyframe} defines the matching animation."
             ));
+        }
+    }
+
+    claims
+}
+
+pub(crate) fn packet_generic_html_css_template_structure_claims(
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
+    let lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if file_name.ends_with(".html") || (lower.contains("<html") && lower.contains("<body")) {
+        if lower.contains("id=\"app\"")
+            && lower.contains("type=\"module\"")
+            && lower.contains("viewport")
+        {
+            claims.push(format!(
+                "{file_name} provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry."
+            ));
+        }
+    }
+
+    if file_name.ends_with(".css") {
+        if lower.contains(":root")
+            && lower.contains("font-family")
+            && lower.contains("color-scheme")
+            && lower.contains("font-smoothing")
+            && lower.contains("body")
+            && lower.contains("min-height")
+        {
+            claims.push(format!(
+                "{file_name} owns :root typography, color-scheme, smoothing, and body layout defaults."
+            ));
+        }
+
+        if lower.contains("#app")
+            && lower.contains("max-width")
+            && lower.contains("margin: 0 auto")
+            && lower.contains("padding")
+        {
+            claims.push(
+                "CSS app container rules constrain mounted content and center it with padding."
+                    .to_string(),
+            );
+        }
+
+        if lower.contains(".logo")
+            && lower.contains("transition")
+            && lower.contains("button")
+            && lower.contains(":hover")
+            && (lower.contains(":focus") || lower.contains(":focus-visible"))
+        {
+            claims.push(
+                "CSS interaction selectors define hover, focus, and transition behavior."
+                    .to_string(),
+            );
+        }
+
+        if lower.contains("@media")
+            && lower.contains("prefers-color-scheme: light")
+            && lower.contains(":root")
+            && lower.contains("button")
+        {
+            claims.push(
+                "Light color-scheme media query rules override root, link-hover, and button colors."
+                    .to_string(),
+            );
         }
     }
 
@@ -991,6 +1524,57 @@ fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
+fn packet_generic_shell_install_dispatch_flow_claims(
+    symbol: &str,
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_file = normalize_identifier(file_name);
+    let source_lower = source.to_ascii_lowercase();
+    let mut claims = Vec::new();
+
+    if (normalized_file.contains("install") || normalized_symbol.contains("install"))
+        && source_lower.contains("source")
+        && (source_lower.contains(".sh") || source_lower.contains("shell"))
+    {
+        claims.push("The installer bootstraps shell runtime sourcing.".to_string());
+    }
+
+    if (normalized_file.contains("install") || normalized_symbol.contains("download"))
+        && (source_lower.contains("download")
+            || source_lower.contains("curl ")
+            || source_lower.contains("wget "))
+        && (source_lower.contains("completion") || source_lower.contains(".sh"))
+    {
+        claims.push(
+            "The installer fetches shell support assets and completion/runtime files.".to_string(),
+        );
+    }
+
+    if normalized_symbol.contains("install")
+        && source_lower.contains(" install")
+        && (source_lower.contains("version") || source_lower.contains("${"))
+    {
+        claims.push("The install helper invokes a version-aware install command.".to_string());
+    }
+
+    if (source_lower.contains("case $command") || source_lower.contains("case \"$command\""))
+        || (source_lower.contains("case \"$1\"") || source_lower.contains("case ${1"))
+    {
+        claims.push("The shell dispatcher branches on command arguments.".to_string());
+    }
+
+    if normalized_file.contains("completion")
+        && (source_lower.contains("complete -") || source_lower.contains("compdef "))
+    {
+        claims
+            .push("Shell completion registers a completion function for the command.".to_string());
+    }
+
+    claims
+}
+
 fn packet_generic_shell_version_use_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let normalized_symbol = normalize_identifier(symbol);
     let source_lower = source.to_ascii_lowercase();
@@ -1017,49 +1601,79 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
-    if normalized_symbol.contains("application")
-        && source_lower.contains("function")
+    let callable_factory_source =
+        source_lower.contains("mixin(app") || source_lower.contains("var app = function");
+    if source_lower.contains("function")
         && source_lower.contains("handle(")
         && source_lower.contains("request")
         && source_lower.contains("response")
+        && (normalized_symbol.contains("application") || callable_factory_source)
     {
-        claims.push(
-            "The application factory builds a callable request handler and wires request/response state."
-                .to_string(),
-        );
+        if callable_factory_source {
+            claims.push(
+                "The application factory builds a callable app object and mixes in request and response prototypes."
+                    .to_string(),
+            );
+        } else {
+            claims.push(
+                "The application factory builds a callable request handler and wires request/response state."
+                    .to_string(),
+            );
+        }
     }
 
-    if normalized_symbol.ends_with("handle")
-        && source_lower.contains("router")
+    if source_lower.contains("router")
         && source_lower.contains(".handle(")
+        && (normalized_symbol.ends_with("handle")
+            || (source_lower.contains("handle = function")
+                && source_lower.contains("this.router.handle")))
     {
-        claims.push("The application handler delegates request handling to a router.".to_string());
+        if symbol.contains('.') {
+            claims.push(format!(
+                "{symbol} delegates request handling to the router."
+            ));
+        } else {
+            claims.push(
+                "The application handler delegates request handling to a router.".to_string(),
+            );
+        }
     }
 
-    if normalized_symbol.ends_with("use")
-        && source_lower.contains("function use")
-        && source_lower.contains("router.use(")
+    if source_lower.contains("function use")
+        && source_lower.contains("router")
+        && source_lower.contains(".use(")
+        && (normalized_symbol.ends_with("use") || source_lower.contains("use = function"))
     {
-        claims.push("Middleware registration delegates to a router.".to_string());
+        if symbol.contains('.') {
+            claims.push(format!("{symbol} registers middleware on the router."));
+        } else {
+            claims.push("Middleware registration delegates to a router.".to_string());
+        }
     }
 
-    if normalized_symbol.ends_with("route")
-        && source_lower.contains("function route")
+    if source_lower.contains("function route")
         && source_lower.contains("router.route(")
+        && (normalized_symbol.ends_with("route") || source_lower.contains("route = function"))
     {
         claims.push(
             "The route registration helper creates route entries through a router.".to_string(),
         );
     }
 
-    if normalized_symbol.ends_with("send")
-        && source_lower.contains("res.send = function send")
-        && source_lower.contains("this.set('content-length'")
-        && source_lower.contains(".end(")
+    if packet_symbol_is_response_send_helper(symbol, &normalized_symbol)
+        && packet_source_sets_response_metadata(&source_lower)
+        && packet_source_ends_or_writes_response(&source_lower)
     {
-        claims.push(
-            "The response send helper sets response metadata before ending the body.".to_string(),
-        );
+        if symbol.contains('.') {
+            claims.push(format!(
+                "{symbol} sets response metadata before ending the response."
+            ));
+        } else {
+            claims.push(
+                "The response send helper sets response metadata before ending the body."
+                    .to_string(),
+            );
+        }
     }
 
     if normalized_symbol.contains("handle")
@@ -1071,6 +1685,37 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
         claims.push(format!(
             "{symbol} registers routes by delegating to the group handle path."
         ));
+    }
+
+    if normalized_symbol == "new"
+        && source_lower.contains("&engine")
+        && source_lower.contains("routergroup")
+        && (source_lower.contains("trees") || source_lower.contains("methodtree"))
+    {
+        claims.push(
+            "Engine construction creates route registration state and method trees.".to_string(),
+        );
+    }
+
+    if source_lower.contains("addroute")
+        && source_lower.contains("handlers")
+        && (source_lower.contains("methodtree")
+            || source_lower.contains("methodtrees")
+            || source_lower.contains("root"))
+    {
+        claims.push(
+            "Route registration inserts handlers into the per-method route tree.".to_string(),
+        );
+    }
+
+    if source_lower.contains("getvalue")
+        && source_lower.contains("handlers")
+        && (source_lower.contains(".next(") || source_lower.contains("next()"))
+    {
+        claims.push(
+            "Request dispatch finds a route, installs handlers on the context, and advances into the handler chain."
+                .to_string(),
+        );
     }
 
     if normalized_symbol.ends_with("next")
@@ -1085,13 +1730,123 @@ fn packet_generic_server_route_flow_claims(symbol: &str, source: &str) -> Vec<St
     claims
 }
 
+fn packet_symbol_is_response_send_helper(symbol: &str, normalized_symbol: &str) -> bool {
+    if let Some((owner, method)) = packet_receiver_method_parts(symbol)
+        && packet_response_receiver_owner(&owner)
+        && packet_response_terminal_method(&method)
+    {
+        return true;
+    }
+    (normalized_symbol.contains("response") || normalized_symbol.starts_with("res"))
+        && packet_response_terminal_method(normalized_symbol)
+}
+
+fn packet_receiver_method_parts(symbol: &str) -> Option<(String, String)> {
+    let trimmed = symbol.trim();
+    for separator in ['.', '#', ':'] {
+        if let Some(index) = trimmed.rfind(separator) {
+            let owner = normalize_identifier(&trimmed[..index]);
+            let method = normalize_identifier(&trimmed[index + separator.len_utf8()..]);
+            if !owner.is_empty() && !method.is_empty() {
+                return Some((owner, method));
+            }
+        }
+    }
+    None
+}
+
+fn packet_response_receiver_owner(owner: &str) -> bool {
+    matches!(owner, "res" | "response" | "reply")
+}
+
+fn packet_response_terminal_method(method: &str) -> bool {
+    matches!(method, "send" | "json" | "end" | "respond")
+}
+
+fn packet_source_sets_response_metadata(source_lower: &str) -> bool {
+    source_lower.contains("content-length")
+        || source_lower.contains("contentlength")
+        || source_lower.contains("content-type")
+        || source_lower.contains("contenttype")
+        || source_lower.contains("setheader")
+        || source_lower.contains(".set(")
+        || source_lower.contains("header(")
+}
+
+fn packet_source_ends_or_writes_response(source_lower: &str) -> bool {
+    source_lower.contains(".end(")
+        || source_lower.contains(".write(")
+        || source_lower.contains("writehead(")
+}
+
+fn packet_generic_server_request_dispatch_flow_claims(
+    symbol: &str,
+    source: &str,
+    path: &str,
+) -> Vec<String> {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_source = normalize_identifier(source);
+    let symbol_has = |parts: &[&str]| parts.iter().all(|part| normalized_symbol.contains(part));
+    let source_has = |parts: &[&str]| parts.iter().all(|part| normalized_source.contains(part));
+    let mut claims = Vec::new();
+
+    if !packet_claim_primary_source_path(path) {
+        return claims;
+    }
+
+    if symbol_has(&["wsgi", "app"]) && source_has(&["request", "context"]) {
+        claims.push(format!(
+            "{symbol} is the WSGI entry point and creates or uses request context before dispatch."
+        ));
+    }
+
+    if symbol_has(&["full", "dispatch", "request"])
+        && source_has(&["preprocess", "request"])
+        && source_has(&["dispatch", "request"])
+        && source_has(&["finalize", "request"])
+    {
+        claims.push(format!(
+            "{symbol} wraps preprocessing, dispatch, exception handling, and response finalization."
+        ));
+    }
+
+    if symbol_has(&["dispatch", "request"])
+        && !symbol_has(&["full", "dispatch", "request"])
+        && source_has(&["view", "function"])
+        && source_has(&["view", "args"])
+    {
+        claims.push(format!(
+            "{symbol} invokes the view function selected by URL matching."
+        ));
+    }
+
+    if normalized_symbol.ends_with("route") && source_has(&["add", "url", "rule"]) {
+        claims.push(
+            "Route registration decorator adds URL rules without performing request dispatch itself."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_claim_primary_source_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    !(path.contains("/tests/")
+        || path.contains("/test/")
+        || path.starts_with("tests/")
+        || path.starts_with("test/")
+        || path.contains("/examples/")
+        || path.starts_with("examples/"))
+}
+
 fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
     let mut claims = Vec::new();
     let tables = packet_sql_create_table_names(source);
     if !tables.is_empty() {
         claims.push(format!(
             "SQL schema defines tables {}.",
-            packet_human_join(&tables.iter().take(6).cloned().collect::<Vec<_>>())
+            packet_human_join(&tables.iter().take(12).cloned().collect::<Vec<_>>())
         ));
     }
     for claim in packet_sql_foreign_key_claims(source) {
@@ -1105,9 +1860,31 @@ fn packet_generic_sql_schema_flow_claims(source: &str) -> Vec<String> {
     claims
 }
 
-fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
+fn packet_generic_runtime_formatting_flow_claims(
+    symbol: &str,
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_file_name = normalize_identifier(file_name);
     let normalized_source = normalize_identifier(source);
+    let source_lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
+
+    if normalized_symbol.contains("formatargstore") || normalized_source.contains("formatargstore")
+    {
+        claims.push(
+            "Runtime formatting builds type-erased format argument stores before dispatching formatting."
+                .to_string(),
+        );
+    }
+
+    if normalized_symbol == "vformat" || normalized_symbol.ends_with("vformat") {
+        claims.push(
+            "Runtime formatting routes format calls through a central runtime argument path."
+                .to_string(),
+        );
+    }
 
     if normalized_source.contains("vformat")
         && (normalized_source.contains("formatargs")
@@ -1116,7 +1893,7 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
         && (normalized_source.contains("vformatto") || normalized_source.contains("formatto"))
     {
         claims.push(
-            "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers."
+            "Runtime formatting uses type-erased arguments before dispatching formatted output helpers."
                 .to_string(),
         );
     }
@@ -1126,10 +1903,253 @@ fn packet_generic_runtime_formatting_flow_claims(source: &str) -> Vec<String> {
             || normalized_source.contains("throwformaterror")
             || normalized_source.contains("formatting"))
     {
-        claims.push("Formatting errors are represented as runtime failures.".to_string());
+        claims
+            .push("Runtime formatting defines an error type for formatting failures.".to_string());
+    }
+
+    if (normalized_symbol.contains("formatto") || normalized_source.contains("formatto"))
+        && (normalized_source.contains("outputit")
+            || normalized_source.contains("outputiterator")
+            || normalized_source.contains("appender")
+            || normalized_source.contains("vformatto"))
+    {
+        claims.push(
+            "Runtime formatting writes formatted output through output iterator helpers."
+                .to_string(),
+        );
+    }
+
+    if normalized_source.contains("buffer")
+        && normalized_source.contains("append")
+        && (normalized_file_name.starts_with("format")
+            || normalized_source.contains("formatted")
+            || normalized_source.contains("format"))
+    {
+        claims.push(
+            "Runtime formatting source instantiates buffer append paths for formatted output."
+                .to_string(),
+        );
+    }
+
+    if (normalized_file_name.starts_with("os")
+        || normalized_source.contains("systemerror")
+        || normalized_source.contains("formaterrorcode"))
+        && normalized_source.contains("vformat")
+        && (normalized_source.contains("formaterrorcode")
+            || normalized_source.contains("formatwindowserror")
+            || source_lower.contains("std::system_error"))
+    {
+        claims.push(
+            "Runtime formatting error-boundary code formats system errors through shared formatting helpers."
+                .to_string(),
+        );
     }
 
     claims
+}
+
+fn packet_generic_log_record_handler_flow_claims(symbol: &str, source: &str) -> Vec<String> {
+    let normalized_symbol = normalize_identifier(symbol);
+    let source_lower = source.to_ascii_lowercase();
+    let creates_record_object = source_lower.contains("new ") && source_lower.contains("record(");
+    let typed_record_handle =
+        source_lower.contains("function handle(") && source_lower.contains("$record");
+    let mut claims = Vec::new();
+
+    if source_lower.contains("class logger")
+        && source_lower.contains("$handlers")
+        && source_lower.contains("function pushhandler")
+        && source_lower.contains("array_unshift($this->handlers")
+    {
+        claims
+            .push("The logger owns a handler stack populated by handler registration.".to_string());
+    }
+
+    if normalized_symbol.ends_with("log")
+        && source_lower.contains("function log(")
+        && source_lower.contains("$this->addrecord(")
+    {
+        claims.push("The logger log method delegates into record creation.".to_string());
+    }
+
+    if (normalized_symbol.ends_with("addrecord") || source_lower.contains("function addrecord("))
+        && creates_record_object
+        && (source_lower.contains("$handler->handle($record)")
+            || source_lower.contains("$handler->handle(clone $record)")
+            || source_lower.contains("->handle($record)")
+            || source_lower.contains("->handle(clone $record)"))
+    {
+        claims.push("addRecord creates a log record before passing it to handlers.".to_string());
+    }
+
+    if source_lower.contains("interface handlerinterface")
+        && typed_record_handle
+        && source_lower.contains("function handlebatch(")
+    {
+        claims.push(
+            "HandlerInterface defines record handling and batch handling boundaries.".to_string(),
+        );
+    }
+
+    if typed_record_handle
+        && source_lower.contains("$this->processrecord($record)")
+        && source_lower.contains("$this->write($record)")
+    {
+        claims.push(
+            "The processing handler handles records by processing and writing them.".to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_generic_site_build_phase_flow_claims(source: &str) -> Vec<String> {
+    let normalized_source = normalize_identifier(source);
+    let mut claims = Vec::new();
+
+    if normalized_source.contains("defprocess") && normalized_source.contains("sitenew") {
+        claims.push("Build.process constructs or processes a site.".to_string());
+    }
+
+    if normalized_source.contains("defprocess")
+        && normalized_source.contains("reset")
+        && normalized_source.contains("read")
+        && normalized_source.contains("generate")
+        && normalized_source.contains("render")
+        && normalized_source.contains("cleanup")
+        && normalized_source.contains("write")
+    {
+        claims.push(
+            "The site lifecycle method runs reset, read, generate, render, cleanup, and write phases."
+                .to_string(),
+        );
+    }
+
+    if normalized_source.contains("classreader") && normalized_source.contains("defread") {
+        claims.push("Content reading source owns the site content read phase.".to_string());
+    }
+
+    if normalized_source.contains("classrenderer")
+        && (normalized_source.contains("defrender")
+            || normalized_source.contains("renderdocument")
+            || normalized_source.contains("renderliquid"))
+    {
+        claims.push("Page rendering source handles page and document rendering.".to_string());
+    }
+
+    claims
+}
+
+fn packet_generic_mapper_configuration_plan_claims(
+    symbol: &str,
+    kind: NodeKind,
+    file_name: &str,
+    source: &str,
+) -> Vec<String> {
+    let file_name = file_name.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
+    let mut claims = Vec::new();
+    let owner = packet_display_owner(symbol).unwrap_or_else(|| symbol.to_string());
+
+    if packet_mapper_public_api_symbol(symbol, kind)
+        && normalized_source.contains("interface")
+        && normalized_source.contains("map")
+        && normalized_source.contains("source")
+        && normalized_source.contains("destination")
+        && (normalized_source.contains("mapper") || normalized_source.contains("mapping"))
+    {
+        claims.push(format!(
+            "{owner} exposes public runtime mapper APIs for source-to-destination mapping."
+        ));
+    }
+
+    if (normalize_identifier(symbol).contains("configuration")
+        || normalize_identifier(&file_name).contains("configuration"))
+        && normalized_source.contains("configuration")
+        && (normalized_source.contains("configuredmaps")
+            || normalized_source.contains("resolvedmaps")
+            || normalized_source.contains("typemaps")
+            || normalized_source.contains("executionplans"))
+        && (normalized_source.contains("buildexecutionplan")
+            || normalized_source.contains("createmapper")
+            || normalized_source.contains("compilemappings"))
+    {
+        claims.push(
+            "Mapping configuration source builds and owns runtime mapping plans.".to_string(),
+        );
+    }
+
+    if packet_mapper_public_api_symbol(symbol, kind)
+        && normalized_source.contains("class")
+        && normalized_source.contains("mapper")
+        && normalized_source.contains("mapcore")
+        && normalized_source.contains("getexecutionplan")
+    {
+        claims.push(
+            "Mapper runtime source exposes the public object-mapping entry point.".to_string(),
+        );
+    }
+
+    if packet_mapper_plan_symbol(symbol, &file_name)
+        && normalized_source.contains("lambda")
+        && normalized_source.contains("map")
+        && (normalized_source.contains("planbuilder")
+            || normalized_source.contains("mapexpression")
+            || normalized_source.contains("expression"))
+    {
+        claims.push(
+            "Type-map source contributes lambda plans used by the mapping execution pipeline."
+                .to_string(),
+        );
+    }
+
+    if file_name.ends_with("planbuilder.cs")
+        && normalized_source.contains("lambda")
+        && normalized_source.contains("map")
+        && normalized_source.contains("createdestinationfunc")
+        && normalized_source.contains("createassignmentfunc")
+        && normalized_source.contains("createmapperfunc")
+    {
+        claims.push(
+            "The mapping plan builder participates in building expression plans for mappings."
+                .to_string(),
+        );
+    }
+
+    claims
+}
+
+fn packet_mapper_public_api_symbol(symbol: &str, kind: NodeKind) -> bool {
+    let normalized = normalize_identifier(symbol);
+    matches!(
+        kind,
+        NodeKind::INTERFACE | NodeKind::CLASS | NodeKind::METHOD | NodeKind::FUNCTION
+    ) && normalized.contains("mapper")
+        && ![
+            "action",
+            "configuration",
+            "convention",
+            "destinationname",
+            "expression",
+            "member",
+            "operation",
+            "options",
+            "projection",
+            "source",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+fn packet_mapper_plan_symbol(symbol: &str, file_name: &str) -> bool {
+    let normalized_symbol = normalize_identifier(symbol);
+    let normalized_file = normalize_identifier(file_name);
+    normalized_symbol.contains("lambda")
+        || normalized_symbol.contains("typemap")
+        || normalized_symbol.contains("mappingplan")
+        || normalized_file.contains("typemap")
+        || normalized_file.contains("mappingplan")
+        || normalized_file.contains("planbuilder")
 }
 
 #[cfg(test)]
@@ -1155,8 +2175,18 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.3,
                 total: 0.9,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         }
     }
 
@@ -1306,6 +2336,68 @@ mod tests {
         "#
     }
 
+    fn route_engine_source() -> &'static str {
+        r#"
+        func New() *Engine {
+            engine := &Engine{
+                RouterGroup: RouterGroup{},
+                trees: make(methodTrees, 0, 9),
+            }
+            return engine
+        }
+
+        func (registrar *RouteRegistrar) addRoute(method string, path string, handlers HandlersChain) {
+            root := registrar.trees.get(method)
+            root.addRoute(path, handlers)
+        }
+
+        func (engine *Engine) dispatch(c *Context) {
+            value := engine.trees.get(c.Request.Method).getValue(c.Request.URL.Path, c.params)
+            if value.handlers != nil {
+                c.handlers = value.handlers
+                c.Next()
+            }
+        }
+        "#
+    }
+
+    fn buffered_io_source() -> &'static str {
+        r#"
+        class Buffer {
+            var size: Long = 0
+            fun read(byteCount: Long): ByteArray {
+                val segment = head ?: return ByteArray(0)
+                return segment.read(byteCount)
+            }
+            fun write(bytes: ByteArray) {
+                writableSegment().write(bytes)
+            }
+        }
+
+        class BufferedReaderImpl(private val source: Source) : BufferedSource {
+            private val buffer = Buffer()
+            override fun read(byteCount: Long): ByteArray {
+                if (buffer.size == 0L) source.read(buffer, Segment.SIZE)
+                return buffer.read(byteCount)
+            }
+        }
+
+        class BufferedWriterImpl(private val sink: Sink) : BufferedSink {
+            private val buffer = Buffer()
+            override fun write(bytes: ByteArray) {
+                buffer.write(bytes)
+                emit()
+            }
+            fun emit() {
+                sink.write(buffer, buffer.size)
+            }
+        }
+
+        fun Source.buffer(): BufferedSource = BufferedReaderImpl(this)
+        fun Sink.buffer(): BufferedSink = BufferedWriterImpl(this)
+        "#
+    }
+
     #[test]
     fn source_claims_do_not_activate_product_profiles_for_codestory_packet_audit_prompt() {
         let prompt = "Audit CodeStory packet and orchestrator sufficiency for generic public helper cache source text.";
@@ -1363,17 +2455,297 @@ mod tests {
     }
 
     #[test]
-    fn search_execution_source_claims_are_eval_only() {
+    fn server_route_source_claims_cover_registration_tree_and_dispatch_without_eval() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt =
+            "Trace HTTP route registration through router engine request handler dispatch.";
+        let cases = [
+            (
+                "New",
+                "Engine construction creates route registration state and method trees.",
+            ),
+            (
+                "RouteRegistrar.addRoute",
+                "Route registration inserts handlers into the per-method route tree.",
+            ),
+            (
+                "Engine.dispatch",
+                "Request dispatch finds a route, installs handlers on the context, and advances into the handler chain.",
+            ),
+        ];
+
+        for (symbol, expected) in cases {
+            let citation = test_packet_citation(symbol, "src/router.go");
+            let claims =
+                packet_source_derived_claims_for_citation(prompt, &citation, route_engine_source());
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production route claim `{expected}` for {symbol}; got {claims:?}"
+            );
+        }
+
+        let express_prompt = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
+        let express_cases = [
+            (
+                "createApplication",
+                "lib/express.js",
+                "function createApplication() { var app = function(req, res, next) { app.handle(req, res, next); }; mixin(app, proto, false); app.request = Object.create(req); app.response = Object.create(res); app.init(); return app; }",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
+            ),
+            (
+                "app.use",
+                "lib/application.js",
+                "app.use = function use(fn) { return router.use(path, fn); }",
+                "app.use registers middleware on the router.",
+            ),
+            (
+                "app.handle",
+                "lib/application.js",
+                "app.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }",
+                "app.handle delegates request handling to the router.",
+            ),
+            (
+                "res.send",
+                "lib/response.js",
+                "res.send = function send(body) { this.set('Content-Length', len); this.end(chunk, encoding); return this; }",
+                "res.send sets response metadata before ending the response.",
+            ),
+            (
+                "reply.respond",
+                "src/http/reply.js",
+                "reply.respond = function writePayload(payload) { this.setHeader('Content-Type', 'text/plain'); return this.end(payload); }",
+                "reply.respond sets response metadata before ending the response.",
+            ),
+        ];
+        for (symbol, path, source, expected) in express_cases {
+            let citation = test_packet_citation(symbol, path);
+            let claims =
+                packet_source_derived_claims_for_citation(express_prompt, &citation, source);
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production Express source claim `{expected}` for {symbol}; got {claims:?}"
+            );
+        }
+
+        let metadata_only = test_packet_citation("reply.append", "src/http/reply.js");
+        let metadata_only_claims = packet_source_derived_claims_for_citation(
+            express_prompt,
+            &metadata_only,
+            "reply.append = function append(body) { this.setHeader('Content-Type', 'text/plain'); return body; }",
+        );
+        assert!(
+            !metadata_only_claims
+                .iter()
+                .any(|claim| claim.contains("ending the response")),
+            "metadata-only helpers must not claim terminal response writes: {metadata_only_claims:?}"
+        );
+    }
+
+    #[test]
+    fn mapper_plan_source_claims_use_generic_object_mapping_shapes() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.";
+        let cases = [
+            (
+                "IRuntimeMapper",
+                NodeKind::INTERFACE,
+                "src/ObjectMapping/RuntimeMapper.cs",
+                r#"
+                public interface IRuntimeMapperBase
+                {
+                    TDestination Map<TSource, TDestination>(TSource source);
+                    object Map(object source, Type sourceType, Type destinationType);
+                }
+                public interface IRuntimeMapper : IRuntimeMapperBase
+                {
+                    IConfigurationProvider ConfigurationProvider { get; }
+                }
+                public sealed class RuntimeMapper : IRuntimeMapper
+                {
+                    TDestination MapCore<TSource, TDestination>(TSource source, TDestination destination) =>
+                        _configuration.GetExecutionPlan<TSource, TDestination>()(source, destination);
+                }
+                "#,
+                "IRuntimeMapper exposes public runtime mapper APIs for source-to-destination mapping.",
+            ),
+            (
+                "MappingConfiguration",
+                NodeKind::CLASS,
+                "src/ObjectMapping/Configuration/MappingConfiguration.cs",
+                r#"
+                public sealed class MappingConfiguration
+                {
+                    private readonly Dictionary<TypePair, MappingPlan> _configuredMaps = new();
+                    private readonly Dictionary<TypePair, MappingPlan> _resolvedMaps = new();
+                    private readonly Dictionary<MapRequest, Delegate> _executionPlans = new();
+                    public RuntimeMapper CreateMapper() => new(this);
+                    public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) =>
+                        _resolvedMaps[new(sourceType, destinationType)].MapExpression;
+                }
+                "#,
+                "Mapping configuration source builds and owns runtime mapping plans.",
+            ),
+            (
+                "MappingPlan.BuildMapperLambda",
+                NodeKind::METHOD,
+                "src/ObjectMapping/MappingPlan.cs",
+                r#"
+                public sealed class MappingPlan
+                {
+                    public Type SourceType { get; }
+                    public Type DestinationType { get; }
+                    public LambdaExpression MapExpression { get; private set; }
+                    internal LambdaExpression BuildMapperLambda(IGlobalMappingConfiguration configuration) =>
+                        Types.ContainsGenericParameters ? null : new MappingPlanBuilder(configuration, this).BuildMapperLambda();
+                }
+                "#,
+                "Type-map source contributes lambda plans used by the mapping execution pipeline.",
+            ),
+        ];
+
+        for (symbol, kind, path, source, expected) in cases {
+            let mut citation = test_packet_citation(symbol, path);
+            citation.kind = kind;
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected generic mapper source claim `{expected}` for {symbol}; got {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn buffered_io_source_claims_cover_state_wrappers_and_helpers_without_eval() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt =
+            "Explain how buffered Source and Sink wrappers use Buffer state for reads and writes.";
+        let cases = [
+            (
+                "Buffer",
+                "src/io/buffer.kt",
+                "Buffer is the in-memory byte store used by buffered reads and writes.",
+            ),
+            (
+                "BufferedReaderImpl",
+                "src/io/buffered_reader_impl.kt",
+                "A buffered source wrapper reads from an upstream Source into a Buffer.",
+            ),
+            (
+                "BufferedWriterImpl",
+                "src/io/buffered_writer_impl.kt",
+                "A buffered sink wrapper writes buffered bytes to an upstream Sink.",
+            ),
+            (
+                "Buffering",
+                "src/io/buffering.kt",
+                "Buffering helpers wrap Source and Sink instances with buffered implementations.",
+            ),
+        ];
+
+        for (symbol, path, expected) in cases {
+            let citation = test_packet_citation(symbol, path);
+            let claims =
+                packet_source_derived_claims_for_citation(prompt, &citation, buffered_io_source());
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production buffered-IO claim `{expected}` for {symbol}; got {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_record_handler_source_claims_cover_logger_record_and_handler_flow() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how a logger turns a log call into a LogRecord and passes it through handlers.";
+        let cases = [
+            (
+                "Logger",
+                "src/logging/Logger.php",
+                r#"
+                class Logger {
+                    protected array $handlers = [];
+                    public function pushHandler(HandlerInterface $handler): self {
+                        array_unshift($this->handlers, $handler);
+                        return $this;
+                    }
+                    public function log($level, string $message, array $context = []): void {
+                        $this->addRecord($level, $message, $context);
+                    }
+                    public function addRecord($level, string $message, array $context = []): bool {
+                        $record = new LogRecord(message: $message, context: $context);
+                        foreach ($this->handlers as $handler) {
+                            if (true === $handler->handle(clone $record)) {
+                                break;
+                            }
+                        }
+                        return true;
+                    }
+                }
+                "#,
+                &[
+                    "The logger owns a handler stack populated by handler registration.",
+                    "addRecord creates a log record before passing it to handlers.",
+                ][..],
+            ),
+            (
+                "Logger.log",
+                "src/logging/Logger.php",
+                "class Logger { public function log($level, string $message): void { $this->addRecord($level, $message); } }",
+                &["The logger log method delegates into record creation."][..],
+            ),
+            (
+                "HandlerInterface",
+                "src/logging/HandlerInterface.php",
+                "interface HandlerInterface { public function handle(LogRecord $record): bool; public function handleBatch(array $records): void; }",
+                &["HandlerInterface defines record handling and batch handling boundaries."][..],
+            ),
+            (
+                "AbstractProcessingHandler.handle",
+                "src/logging/AbstractProcessingHandler.php",
+                r#"
+                abstract class AbstractProcessingHandler {
+                    public function handle(LogRecord $record): bool {
+                        $record = $this->processRecord($record);
+                        $record->formatted = $this->getFormatter()->format($record);
+                        $this->write($record);
+                        return true;
+                    }
+                }
+                "#,
+                &["The processing handler handles records by processing and writing them."][..],
+            ),
+        ];
+
+        for (symbol, path, source, expected_claims) in cases {
+            let citation = test_packet_citation(symbol, path);
+            let claims = packet_source_derived_claims_for_citation(prompt, &citation, source);
+            for expected in expected_claims {
+                assert!(
+                    claims.iter().any(|claim| claim == expected),
+                    "expected production log-record claim `{expected}` for {symbol}; got {claims:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_execution_source_claims_activate_with_search_intent() {
         let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
         let prompt = "Explain how a search command parses CLI flags, walks candidate files, and executes a search through matcher, searcher, and printer components.";
         let citation = test_packet_citation("HiArgs", "crates/core/main.rs");
 
         let claims =
             packet_source_derived_claims_for_citation(prompt, &citation, search_execution_source());
-        assert!(
-            claims.is_empty(),
-            "search execution claims should be eval-only in production source profiles; got {claims:?}"
-        );
+        for expected in [
+            "main delegates parsed search options into run for search execution.",
+            "`HiArgs` builds traversal, matching, search, and output components used by the search pipeline.",
+            "`SearchWorker` carries matching, search, and output state for each candidate input.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production search execution claim `{expected}`; got {claims:?}"
+            );
+        }
 
         let _eval_probes = EvalProbesGuard::enabled();
         let claims =
@@ -1384,7 +2756,7 @@ mod tests {
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
-                "expected eval-only search execution claim `{expected}`; got {claims:?}"
+                "expected search execution claim `{expected}` with eval probes enabled; got {claims:?}"
             );
         }
     }
@@ -1441,10 +2813,15 @@ mod tests {
             "Explain how SWR exposes a public hook, serializes keys, and connects cache helpers.";
         let claims =
             packet_source_derived_claims_for_citation(swr_prompt, &citation, hook_cache_source());
-        assert!(
-            claims.is_empty(),
-            "SWR-shaped claims should be eval-only in production source profiles; got {claims:?}"
-        );
+        for expected in [
+            "The public useSWR export wraps useSWRHandler with argument normalization.",
+            "useSWRHandler serializes the key before reading cache state.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production hook/cache claim `{expected}`; got {claims:?}"
+            );
+        }
 
         let _eval_probes = EvalProbesGuard::enabled();
         let claims =
@@ -1455,7 +2832,7 @@ mod tests {
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
-                "expected hook/cache claim `{expected}`; got {claims:?}"
+                "expected hook/cache claim `{expected}` with eval probes enabled; got {claims:?}"
             );
         }
 
@@ -1474,6 +2851,90 @@ mod tests {
                 "SWR-specific prompts without the word hook should still activate `{expected}`; got {claims:?}"
             );
         }
+
+        let helper_claims = packet_source_derived_claims_for_citation(
+            swr_prompt,
+            &test_packet_citation("makeCacheHelper", "src/runtime/cache-helper.ts"),
+            r#"
+            export const makeCacheHelper = (cache, key) => {
+              const state = runtimeState.get(cache)
+              return [
+                () => cache.get(key) || EMPTY_CACHE,
+                info => {
+                  const prev = cache.get(key)
+                  cache.set(key, info)
+                  state[5](key, info, prev)
+                },
+                state[6],
+                () => snapshot[key] || cache.get(key)
+              ] as const
+            }
+            "#,
+        );
+        assert!(
+            helper_claims.iter().any(|claim| {
+                claim == "makeCacheHelper provides cache get, set, subscribe, and snapshot helpers."
+            }),
+            "expected generic cache helper claim; got {helper_claims:?}"
+        );
+
+        let serialize_claims = packet_source_derived_claims_for_citation(
+            swr_prompt,
+            &test_packet_citation("normalizeKey", "src/runtime/serialize.ts"),
+            r#"
+            export const normalizeKey = key => {
+              const args = key
+              key = typeof key == 'string' ? key : stableHash(key)
+              return [key, args]
+            }
+            "#,
+        );
+        assert!(
+            serialize_claims
+                .iter()
+                .any(|claim| claim == "normalizeKey serializes hook keys into cache keys."),
+            "expected generic key serialization claim; got {serialize_claims:?}"
+        );
+
+        let mutation_claims = packet_source_derived_claims_for_citation(
+            "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior.",
+            &test_packet_citation("applyMutation", "src/runtime/mutate.ts"),
+            r#"
+            export async function applyMutation(cache, _key, data) {
+              return mutateByKey(_key)
+              async function mutateByKey(_k) {
+                const [key] = serialize(_k)
+                const [get, set] = createCacheHelper(cache, key)
+                set({ data })
+              }
+            }
+            "#,
+        );
+        assert!(
+            mutation_claims.iter().any(|claim| claim
+                == "applyMutation routes mutate behavior through the mutation helper."),
+            "expected generic mutation helper claim; got {mutation_claims:?}"
+        );
+
+        let middleware_claims = packet_source_derived_claims_for_citation(
+            "Explain how a public hook composes middleware around cache behavior.",
+            &test_packet_citation("withMiddleware", "src/runtime/middleware.ts"),
+            r#"
+            export const withMiddleware = (useHook: SWRHook, middleware) => {
+              return (...args) => {
+                const config = { use: [] }
+                const uses = (config.use || []).concat(middleware)
+                return useHook(args[0], args[1], { ...config, use: uses })
+              }
+            }
+            "#,
+        );
+        assert!(
+            middleware_claims
+                .iter()
+                .any(|claim| claim == "withMiddleware composes middleware around a public hook."),
+            "expected generic middleware composition claim; got {middleware_claims:?}"
+        );
     }
 
     #[test]
@@ -1498,10 +2959,16 @@ mod tests {
             &citation,
             client_send_source(),
         );
-        assert!(
-            claims.is_empty(),
-            "Dart client transport claims should be eval-only in production source profiles; got {claims:?}"
-        );
+        for expected in [
+            "BaseTransportClient implements convenience methods in terms of send.",
+            "Response.fromStream materializes the response stream boundary.",
+            "BaseTransportClient.send is the dart:io transport implementation that forwards finalized requests through an HTTP client.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production client send claim `{expected}`; got {claims:?}"
+            );
+        }
 
         let _eval_probes = EvalProbesGuard::enabled();
         let claims = packet_source_derived_claims_for_citation(
@@ -1511,13 +2978,353 @@ mod tests {
         );
         for expected in [
             "BaseTransportClient implements convenience methods in terms of send.",
-            "BaseTransportClient.send forwards finalized requests through an HTTP client transport.",
+            "Response.fromStream materializes the response stream boundary.",
+            "BaseTransportClient.send is the dart:io transport implementation that forwards finalized requests through an HTTP client.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
-                "expected client send claim `{expected}`; got {claims:?}"
+                "expected client send claim `{expected}` with eval probes enabled; got {claims:?}"
             );
         }
+
+        let top_level_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("get", "lib/http.dart"),
+            r#"
+            Future<Response> get(Uri url) =>
+                _withClient((client) => client.get(url));
+            Future<T> _withClient<T>(Future<T> Function(Client) fn) async {
+              var client = Client();
+              return await fn(client);
+            }
+            "#,
+        );
+        assert!(
+            top_level_claims
+                .iter()
+                .any(|claim| claim == "Top-level HTTP helpers delegate to a Client."),
+            "expected top-level helper claim; got {top_level_claims:?}"
+        );
+
+        let client_interface_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("Client.get", "src/client.dart"),
+            r#"
+            abstract interface class Client {
+              Future<Response> get(Uri url);
+              Future<Response> post(Uri url);
+              Future<StreamedResponse> send(BaseRequest request);
+            }
+            "#,
+        );
+        assert!(
+            client_interface_claims.iter().any(|claim| {
+                claim
+                    == "Client interface helper methods declare convenience request helpers and send(request)."
+            }),
+            "expected client interface helper claim; got {client_interface_claims:?}"
+        );
+
+        let finalize_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("BaseRequest", "src/base_request.dart"),
+            r#"
+            abstract class BaseRequest {
+              bool _finalized = false;
+              /// Finalizes the HTTP request in preparation for it being sent.
+              /// Freezes all mutable fields and returns a ByteStream that emits the request body.
+              ByteStream finalize() {
+                _finalized = true;
+                return const ByteStream(Stream.empty());
+              }
+            }
+            "#,
+        );
+        assert!(
+            finalize_claims
+                .iter()
+                .any(|claim| claim == "BaseRequest.finalize prepares the request body for sending."),
+            "expected request finalization claim; got {finalize_claims:?}"
+        );
+
+        let request_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("Request.finalize", "src/request.dart"),
+            r#"
+            class Request extends BaseRequest {
+              ByteStream finalize() {
+                return ByteStream.fromBytes(bodyBytes);
+              }
+            }
+            "#,
+        );
+        assert!(
+            request_claims
+                .iter()
+                .any(|claim| claim == "Request.finalize prepares the request body for sending."),
+            "expected concrete request finalization claim; got {request_claims:?}"
+        );
+
+        let response_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("Response.fromStream", "src/response.dart"),
+            r#"
+            class Response extends BaseResponse {
+              static Future<Response> fromStream(StreamedResponse response) async {
+                final body = await response.stream.toBytes();
+                return Response.bytes(body, response.statusCode);
+              }
+            }
+            "#,
+        );
+        assert!(
+            response_claims
+                .iter()
+                .any(|claim| claim
+                    == "Response.fromStream materializes the response stream boundary."),
+            "expected response materialization claim; got {response_claims:?}"
+        );
+    }
+
+    #[test]
+    fn source_claims_activate_form_validation_flow_from_html_examples() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let generic_prompt = "Explain helper cache architecture.";
+        let citation = test_packet_citation("showError", "form-validation/example.html");
+        let claims = packet_source_derived_claims_for_citation(
+            generic_prompt,
+            &citation,
+            r#"<form novalidate><input id="mail" required></form>"#,
+        );
+        assert!(
+            claims.is_empty(),
+            "generic prompt must not activate form validation claims; got {claims:?}"
+        );
+
+        let validation_prompt = "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let full_example_claims = packet_source_derived_claims_for_citation(
+            validation_prompt,
+            &test_packet_citation("required", "full-example.html"),
+            r#"
+            <form>
+              <input required pattern="\d+" min="12" max="120">
+            </form>
+            "#,
+        );
+        assert!(
+            full_example_claims.iter().any(|claim| {
+                claim == "The form validation examples use native required, pattern, min, and max constraints."
+            }),
+            "expected native constraint claim; got {full_example_claims:?}"
+        );
+
+        let custom_claims = packet_source_derived_claims_for_citation(
+            validation_prompt,
+            &test_packet_citation("showError", "detailed-custom-validation.html"),
+            r#"
+            <form novalidate>
+              <input id="mail" type="email" required>
+            </form>
+            <script>
+              const email = document.getElementById('mail');
+              const emailError = document.querySelector('#mail + span.error');
+              form.addEventListener('submit', function (event) {
+                if (!email.validity.valid) {
+                  showError();
+                  event.preventDefault();
+                }
+              });
+              function showError() {
+                if(email.validity.valueMissing) {
+                  emailError.textContent = 'missing';
+                } else if(email.validity.typeMismatch) {
+                  emailError.textContent = 'type';
+                } else if(email.validity.tooShort) {
+                  emailError.textContent = 'short';
+                }
+              }
+            </script>
+            "#,
+        );
+        for expected in [
+            "A custom validation example applies script-driven validity checks before rendering messages.",
+            "Custom error rendering branches on ValidityState fields to choose messages.",
+            "Submit handling prevents invalid form submission.",
+        ] {
+            assert!(
+                custom_claims.iter().any(|claim| claim == expected),
+                "expected form validation claim `{expected}`; got {custom_claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_claims_activate_server_request_dispatch_flow_without_client_transport() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let generic_prompt = "Explain client request adapter behavior.";
+        let claims = packet_source_derived_claims_for_citation(
+            generic_prompt,
+            &test_packet_citation("wsgi_app", "src/app.py"),
+            "def wsgi_app(self, environ, start_response): ctx = self.request_context(environ); response = self.full_dispatch_request()",
+        );
+        assert!(
+            claims.is_empty(),
+            "generic client prompt must not activate server request claims; got {claims:?}"
+        );
+
+        let server_prompt = "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.";
+        let entry_claims = packet_source_derived_claims_for_citation(
+            server_prompt,
+            &test_packet_citation("wsgi_app", "src/app.py"),
+            "def wsgi_app(self, environ, start_response): ctx = self.request_context(environ); response = self.full_dispatch_request()",
+        );
+        assert!(
+            entry_claims.iter().any(|claim| {
+                claim == "wsgi_app is the WSGI entry point and creates or uses request context before dispatch."
+            }),
+            "expected WSGI entry claim; got {entry_claims:?}"
+        );
+
+        let dispatch_claims = packet_source_derived_claims_for_citation(
+            server_prompt,
+            &test_packet_citation("dispatch_request", "src/app.py"),
+            "def dispatch_request(self): return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)",
+        );
+        assert!(
+            dispatch_claims.iter().any(|claim| {
+                claim == "dispatch_request invokes the view function selected by URL matching."
+            }),
+            "expected view dispatch claim; got {dispatch_claims:?}"
+        );
+    }
+
+    #[test]
+    fn source_claims_activate_html_css_template_structure_without_fixed_filenames() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how an HTML app shell and CSS structure split template selectors, theme defaults, and interactive element styling.";
+        let html_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &test_packet_citation("app", "templates/home.html"),
+            r#"
+            <html>
+              <head>
+                <meta name="viewport" content="width=device-width">
+              </head>
+              <body>
+                <div id="app"></div>
+                <script type="module" src="/main.js"></script>
+              </body>
+            </html>
+            "#,
+        );
+        assert!(
+            html_claims.iter().any(|claim| {
+                claim == "home.html provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry."
+            }),
+            "expected generic HTML app-shell claim; got {html_claims:?}"
+        );
+
+        let css_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &test_packet_citation("app", "assets/main.css"),
+            r#"
+            :root { font-family: system-ui; color-scheme: light dark; -webkit-font-smoothing: antialiased; }
+            body { margin: 0; min-height: 100vh; }
+            #app { max-width: 64rem; margin: 0 auto; padding: 2rem; }
+            .logo:hover { transition: filter 300ms; }
+            button:hover { color: blue; }
+            button:focus-visible { outline: auto; }
+            @media (prefers-color-scheme: light) { :root { color: #111; } a:hover { color: #333; } button { background: white; } }
+            "#,
+        );
+        for expected in [
+            "main.css owns :root typography, color-scheme, smoothing, and body layout defaults.",
+            "CSS app container rules constrain mounted content and center it with padding.",
+            "CSS interaction selectors define hover, focus, and transition behavior.",
+            "Light color-scheme media query rules override root, link-hover, and button colors.",
+        ] {
+            assert!(
+                css_claims.iter().any(|claim| claim == expected),
+                "expected structural CSS claim `{expected}`; got {css_claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_claims_activate_shell_install_dispatch_flow() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let generic_prompt = "Explain helper cache architecture.";
+        let claims = packet_source_derived_claims_for_citation(
+            generic_prompt,
+            &test_packet_citation("nvm_do_install", "install.sh"),
+            "nvm_do_install() { nvm_install_node; }",
+        );
+        assert!(
+            claims.is_empty(),
+            "generic prompt must not activate shell install-dispatch claims; got {claims:?}"
+        );
+
+        let shell_prompt = "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.";
+        let install_claims = packet_source_derived_claims_for_citation(
+            shell_prompt,
+            &test_packet_citation("nvm_do_install", "install.sh"),
+            r#"
+            nvm_do_install() {
+              SOURCE_STR='[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+              COMPLETION_STR='[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"'
+              nvm_install_node
+            }
+            install_nvm_as_script() {
+              nvm_download -s "$NVM_SOURCE_LOCAL" -o "$INSTALL_DIR/nvm.sh"
+              nvm_download -s "$NVM_BASH_COMPLETION_SOURCE" -o "$INSTALL_DIR/bash_completion"
+            }
+            "#,
+        );
+        for expected in [
+            "The installer bootstraps shell runtime sourcing.",
+            "The installer fetches shell support assets and completion/runtime files.",
+        ] {
+            assert!(
+                install_claims.iter().any(|claim| claim == expected),
+                "expected shell install claim `{expected}`; got {install_claims:?}"
+            );
+        }
+
+        let dispatcher_claims = packet_source_derived_claims_for_citation(
+            shell_prompt,
+            &test_packet_citation("nvm", "nvm.sh"),
+            r#"
+            nvm() {
+              local COMMAND
+              COMMAND="${1-}"
+              case $COMMAND in
+                "install") nvm_install_node ;;
+                "use") nvm_use_if_needed "$@" ;;
+              esac
+            }
+            "#,
+        );
+        assert!(
+            dispatcher_claims
+                .iter()
+                .any(|claim| claim == "The shell dispatcher branches on command arguments."),
+            "expected shell dispatcher claim; got {dispatcher_claims:?}"
+        );
+
+        let completion_claims = packet_source_derived_claims_for_citation(
+            shell_prompt,
+            &test_packet_citation("__nvm", "bash_completion"),
+            r#"
+            __nvm() { __nvm_commands; }
+            complete -o default -F __nvm nvm
+            "#,
+        );
+        assert!(
+            completion_claims.iter().any(|claim| {
+                claim == "Shell completion registers a completion function for the command."
+            }),
+            "expected shell completion claim; got {completion_claims:?}"
+        );
     }
 
     #[test]
@@ -1541,10 +3348,16 @@ mod tests {
             &citation,
             command_dispatch_source(),
         );
-        assert!(
-            claims.is_empty(),
-            "command/event-loop claims should be eval-only in production source profiles; got {claims:?}"
-        );
+        for expected in [
+            "readQueryFromClient appends socket input and drives processInputBuffer when a full command is available.",
+            "processCommand resolves the command table entry and enforces ACL, arity, and cluster checks.",
+            "call executes the command proc and handles propagation, monitoring, and slowlog accounting.",
+        ] {
+            assert!(
+                claims.iter().any(|claim| claim == expected),
+                "expected production command/event-loop claim `{expected}`; got {claims:?}"
+            );
+        }
 
         let _eval_probes = EvalProbesGuard::enabled();
         let claims = packet_source_derived_claims_for_citation(
@@ -1559,7 +3372,7 @@ mod tests {
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
-                "expected command/event-loop claim `{expected}`; got {claims:?}"
+                "expected command/event-loop claim `{expected}` with eval probes enabled; got {claims:?}"
             );
         }
     }

@@ -199,6 +199,12 @@ mod golden_tests {
             origin: SearchHitOrigin::IndexedSymbol,
             resolvable: true,
             match_quality: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
         let results = vec![("exec_events".to_string(), vec![hit])];

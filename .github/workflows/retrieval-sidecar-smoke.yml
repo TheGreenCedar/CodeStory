@@ -1,4 +1,4 @@
-# Windows retrieval manifest-missing shape smoke.
+# Retrieval smoke: Linux carries generic contracts; Windows keeps manifest-missing shape coverage.
 # Contract: docs/ops/retrieval-sidecars.md#preflight-smoke-contract
 
 name: retrieval-sidecar-smoke
@@ -32,26 +32,37 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows-smoke:
-    runs-on: windows-latest
-    timeout-minutes: 45
+  linux-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Generalization lint (production paths)
+        run: node scripts/lint-retrieval-generalization.mjs
 
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Generalization lint (production paths)
-        run: node scripts/lint-retrieval-generalization.mjs
-
-      - name: Retrieval bootstrap manifest-missing contract
-        run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
+      - name: Restore Cargo registry, git sources, and build output
+        id: cargo-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
 
       - name: Runtime library contract tests
         run: cargo test -p codestory-runtime --lib
@@ -67,3 +78,52 @@ jobs:
 
       - name: Retrieval crate unit tests
         run: cargo test -p codestory-retrieval
+
+      - name: Save Cargo registry, git sources, and build output
+        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
+
+  windows-manifest-missing:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore Cargo registry, git sources, and build output
+        id: cargo-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-stable-
+
+      - name: Retrieval bootstrap manifest-missing contract
+        run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
+
+      - name: Save Cargo registry, git sources, and build output
+        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}

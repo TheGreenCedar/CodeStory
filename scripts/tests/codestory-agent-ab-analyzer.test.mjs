@@ -8,6 +8,7 @@ import {
   analyzeTranscript,
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
+  baselineSearchPreludeStatus,
   benchmarkRunId,
   commandCategory,
   copyResultArtifact,
@@ -21,6 +22,7 @@ import {
   parseJsonLines,
   packetComposition,
   packetCommandArgs,
+  packetRuntimeCacheObservations,
   packetForAgentPrompt,
   packetManifestExtraProbes,
   packetManifestQualitySummary,
@@ -39,6 +41,7 @@ import {
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
+  cachePolicyForRun,
 } from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
@@ -88,6 +91,26 @@ test("parses packet-runtime benchmark run id", () => {
       ]),
     /--prepare-codestory-jobs must be a positive integer/,
   );
+});
+
+test("packet-runtime cache observations preserve prepared cache provenance", () => {
+  const cachePreparation = [
+    {
+      repo: "codestory",
+      retrieval_status: { retrieval_mode: "full" },
+    },
+  ];
+  const opts = {
+    cachePreparationByRepo: new Map(cachePreparation.map((row) => [row.repo, row])),
+  };
+
+  for (const transportMode of ["cold_cli_packet", "warm_stdio_packet"]) {
+    const observations = packetRuntimeCacheObservations(opts, "codestory", transportMode);
+
+    assert.equal(observations.cache_prepared, true);
+    assert.equal(observations.cache_preparation, cachePreparation[0]);
+    assert.equal(cachePolicyForRun(observations), "prepared-sidecar-cache-read-only");
+  }
 });
 
 test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
@@ -661,7 +684,7 @@ test("public-core corpus keeps publishable coverage locked", async () => {
   });
   const audit = publicCoreCorpusAudit(tasks);
 
-  assert.equal(tasks.length, 18);
+  assert.equal(tasks.length, 19);
   assert.equal(audit.repo_count, 5);
   assert.deepEqual(Object.keys(audit.class_counts), [
     "architecture_explanation",
@@ -671,7 +694,7 @@ test("public-core corpus keeps publishable coverage locked", async () => {
     "route_tracing",
     "symbol_ownership",
   ]);
-  assert.deepEqual(Object.values(audit.class_counts), [3, 3, 3, 3, 3, 3]);
+  assert.deepEqual(Object.values(audit.class_counts), [4, 3, 3, 3, 3, 3]);
   assert.deepEqual(audit.missing_classes, []);
   assert.deepEqual(audit.underfilled_classes, []);
 });
@@ -1106,6 +1129,93 @@ test("aggregate anchor recall uses fuzzy claim matching", () => {
   assert.equal(quality.pass, true);
 });
 
+test("quality scoring treats class member separator variants as symbol matches", () => {
+  const task = {
+    id: "php-symbol-separator",
+    task_class: "data_flow",
+    expected_files: ["src/Logger.php"],
+    expected_symbols: ["Logger::addRecord", "AbstractProcessingHandler::handle"],
+    expected_claims: ["addRecord creates a LogRecord before passing it to handlers."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 1,
+      min_expected_file_recall: 1,
+      min_expected_symbol_recall: 1,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 1,
+      max_forbidden_claims: 0,
+    },
+  };
+  const events = [
+    agentMessageEvent(
+      "`Logger.addRecord` in `src/Logger.php` creates a LogRecord before passing it to handlers. `AbstractProcessingHandler.handle` writes the processed record.",
+    ),
+  ];
+
+  const quality = scoreQuality(events, task);
+
+  assert.equal(quality.expected_symbols.recall, 1);
+  assert.equal(quality.pass, true);
+});
+
+test("quality scoring treats Ruby instance separator variants as symbol matches", () => {
+  const task = {
+    id: "ruby-symbol-separator",
+    task_class: "route_tracing",
+    expected_files: ["lib/jekyll/site.rb"],
+    expected_symbols: ["Site#process", "Site#read", "Site#render", "Site#write"],
+    expected_claims: ["Site.process runs reset, read, generate, render, cleanup, and write phases."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 1,
+      min_expected_file_recall: 1,
+      min_expected_symbol_recall: 1,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 1,
+      max_forbidden_claims: 0,
+    },
+  };
+  const events = [
+    agentMessageEvent(
+      "`Site.process` in `lib/jekyll/site.rb` runs reset, read, generate, render, cleanup, and write phases. `Site.read`, `Site.render`, and `Site.write` are the lifecycle phase methods.",
+    ),
+  ];
+
+  const quality = scoreQuality(events, task);
+
+  assert.equal(quality.expected_symbols.recall, 1);
+  assert.equal(quality.pass, true);
+});
+
+test("quality scoring treats namespace-qualified symbol tails as matches", () => {
+  const task = {
+    id: "ruby-namespace-symbol-tail",
+    task_class: "route_tracing",
+    expected_files: ["lib/jekyll/commands/build.rb", "lib/jekyll/site.rb"],
+    expected_symbols: ["Jekyll::Commands::Build.process", "Jekyll::Site"],
+    expected_claims: ["Build.process constructs or processes a Jekyll site."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 1,
+      min_expected_file_recall: 1,
+      min_expected_symbol_recall: 1,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 1,
+      max_forbidden_claims: 0,
+    },
+  };
+  const events = [
+    agentMessageEvent(
+      "`Build.process` in `lib/jekyll/commands/build.rb` constructs or processes a Jekyll site, and `Site` in `lib/jekyll/site.rb` owns the lifecycle state.",
+    ),
+  ];
+
+  const quality = scoreQuality(events, task);
+
+  assert.equal(quality.expected_symbols.recall, 1);
+  assert.equal(quality.pass, true);
+});
+
 test("quality scoring does not promote transcript-only expected anchors", () => {
   const task = runtimeQualityTask("runtime-flow", {
     min_expected_file_recall: 1,
@@ -1329,6 +1439,35 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     }),
     false,
   );
+});
+
+test("baseline prelude tolerates benign ripgrep missing-path warnings when matches exist", () => {
+  const status = baselineSearchPreludeStatus(
+    {
+      exitCode: 2,
+      stderr:
+        "rg: .\\test\\source\\symlink-test\\missing-target: The system cannot find the path specified. (os error 3)\n" +
+        "rg: .\\test\\source\\_includes\\tmp: The system cannot find the file specified. (os error 2)\n",
+    },
+    [{ path: "src/site.rb", line: 1, column: 1, text: "build_site" }],
+  );
+
+  assert.equal(status.allowed, true);
+  assert.equal(status.status, "pass_with_warnings");
+  assert.equal(status.warning_lines.length, 2);
+});
+
+test("baseline prelude keeps non-benign ripgrep errors fail-closed", () => {
+  const status = baselineSearchPreludeStatus(
+    {
+      exitCode: 2,
+      stderr: "rg: ./secret: Permission denied (os error 13)\n",
+    },
+    [{ path: "src/site.rb", line: 1, column: 1, text: "build_site" }],
+  );
+
+  assert.equal(status.allowed, false);
+  assert.equal(status.status, "fail");
 });
 
 const LOCAL_REAL_COMPACT_BUDGET_TASKS = [
@@ -2066,14 +2205,38 @@ test("packet runtime publishable gate rejects diagnostic packet probes", () => {
   assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
 });
 
+test("packet runtime publishable gate separates product and harness blockers", () => {
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        quality: { pass: false },
+        codestory_cache_provenance: localCacheProvenance({
+          cache_policy: "unprepared-cache-blocked",
+          retrieval_mode: "full",
+        }),
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 2);
+  assert.deepEqual(blockers.map((blocker) => blocker.category), ["product", "harness-contract"]);
+  assert.match(blockers[0].reasons.join("\n"), /manifest quality failed/);
+  assert.match(blockers[1].reasons.join("\n"), /CodeStory sidecar cache was not prepared/);
+});
+
 test("holdout packet runtime requires quality gate unless failures are allowed", () => {
   assert.equal(
     packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }),
     true,
   );
   assert.equal(
+    packetRuntimeQualityGateRequired({ taskSuite: "language-expansion-holdout" }),
+    true,
+  );
+  assert.equal(
     packetRuntimeQualityGateRequired({
-      taskSuite: "holdout-retrieval",
+      taskSuite: "language-expansion-holdout",
       allowFailures: true,
     }),
     false,

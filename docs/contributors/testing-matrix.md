@@ -92,20 +92,48 @@ See [oss-language-corpus.md](../testing/oss-language-corpus.md) for PowerShell c
 language filtering, cache configuration, and the JSONL report path.
 
 That corpus is not the strict agent A/B comparison. For language-level
-with/without CodeStory agent evidence, run the manifest-backed holdout suite:
+packet-runtime promotion evidence, run the manifest-backed holdout suite:
 
 ```sh
+cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs \
+  --packet-runtime \
+  --packet-runtime-mode both \
   --task-suite language-expansion-holdout \
-  --arms without_codestory,with_codestory \
-  --repeats 3 --materialize-repos --prepare-codestory-cache \
-  --out-dir target/agent-benchmark/language-expansion-holdout \
-  --timeout-ms 600000
+  --repeats 3 \
+  --materialize-repos \
+  --jobs 4 \
+  --prepare-codestory-jobs 2 \
+  --codestory-cli ./target/release/codestory-cli \
+  --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes \
+  --timeout-ms 180000 \
+  --publishable
 ```
 
-The A/B ledger records elapsed time, tokens, estimated cost, observed tool
-calls, command counts, source reads, post-packet source reads, and manifest
-quality gates for each supported language task.
+The packet-runtime ledger must cover cold and warm modes, three repeats, row
+concurrency `--jobs 4`, prepared sidecars, full sidecar provenance, no
+`--allow-failures`, no quality misses, no sufficiency gaps, and no SLA misses.
+Keep `--prepare-codestory-jobs` lower or capped; examples use `2` unless the
+prep lane is intentionally serial.
+
+The June 18 current scorecard is blocked: the non-publishable diagnostic
+artifact
+`target/agent-benchmark/language-expansion-proof-full-form-command-shapes`
+generated `2026-06-18T12:03:23.059Z` passed `108/108` success, quality, and
+sufficiency gates but had `9` cold SLA misses. The publishable artifact
+`target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`
+generated `2026-06-18T12:23:54.418Z` passed `108/108` success, `106/108`
+quality, and `107/108` sufficiency, with `1` partial and `8` cold SLA misses.
+Promotion blockers are apache-commons-lang cold SLA `3/3`, redis cold SLA
+`3/3`, AutoMapper cold SLA `1/3`, dart-http cold SLA `1/3`, square-okio cold
+quality `2/3`, and Alamofire cold quality `2/3` plus `1` partial sufficiency.
+
+With/without CodeStory A/B ledgers remain useful development comparisons for
+elapsed time, tokens, estimated cost, observed tool calls, command counts,
+source reads, post-packet source reads, and manifest quality gates. Stale
+`--reuse-baseline-from` or fixed no-CodeStory comparisons are diagnostic unless
+fingerprint-compatible, and they are never enough for packet-runtime promotion
+by themselves.
 
 ## Store Changes
 
@@ -164,7 +192,7 @@ Release-readiness evidence is tiered:
 | Stats-only / degraded sidecar | Diagnostic timing or contract evidence without prepared full sidecars, or stats output whose `proof_tier` is `stats_only` | Useful local regression signal only; not release proof for packet/search readiness. The current passing `codestory_repo_release_e2e_emits_stats` harness asserts full sidecar status instead of completing as a passing no-full-sidecar row. |
 | Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after local Zoekt, SCIP, and required dense-anchor Qdrant/llama.cpp are prepared; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` with current symbol-doc and dense-anchor manifest fields; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
 | Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
-| Promotion-grade benchmark | Baseline and candidate benchmark rows are captured with sidecar status, search shadow mode, and no-regression threshold | Required for performance or retrieval-quality promotion claims. |
+| Promotion-grade benchmark | Full holdout packet-runtime rows cover cold and warm modes with three repeats, `--jobs 4`, prepared sidecars, `--publishable`, no `--allow-failures`, full sidecar provenance, no quality misses, no sufficiency gaps, and no SLA misses. Fixed-baseline A/B rows are supporting diagnostics only unless fingerprint-compatible. | Required for performance or retrieval-quality promotion claims. |
 
 When logging release evidence, state the highest tier reached and the exact
 skip env vars used. The stats JSON reports `proof_tier` as the highest tier

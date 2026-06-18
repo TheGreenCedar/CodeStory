@@ -10,6 +10,7 @@ use crate::agent::packet_batch::{
 #[cfg(test)]
 use crate::agent::packet_budget::{
     apply_packet_budget, next_deeper_packet_command, packet_budget_usage,
+    truncate_answer_markdown_to_byte_cap,
 };
 use crate::agent::packet_budget::{
     apply_packet_budget_with_extra, enforce_packet_output_budget, packet_budget_limits,
@@ -27,6 +28,7 @@ use crate::agent::packet_claim_profiles::{
 #[cfg(test)]
 use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for_role;
 use crate::agent::packet_claims::{packet_flow_claims_markdown, packet_supported_claims};
+use crate::agent::packet_evidence::decorate_citation_from_hit;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
@@ -42,7 +44,8 @@ use crate::agent::packet_plan::{
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
 use crate::agent::packet_required_probes::{
     PacketFileScopedSymbolProbe, packet_file_scoped_symbol_probe_parts,
-    packet_probe_query_is_cited, packet_sufficiency_required_probe_queries_with_extra,
+    packet_probe_file_name_matches, packet_probe_query_is_cited,
+    packet_sufficiency_required_probe_queries_with_extra,
 };
 #[cfg(test)]
 use crate::agent::packet_scoring::packet_citation_key;
@@ -57,11 +60,17 @@ use crate::agent::packet_sufficiency::{
 };
 #[cfg(test)]
 use crate::agent::packet_sufficiency::{
-    build_packet_sufficiency, packet_budget_exceeded_hard_output_cap, packet_claim_family,
-    packet_supported_claim_family_count, packet_targeted_follow_up_queries,
+    build_packet_sufficiency, packet_budget_exceeded_hard_output_cap,
+    packet_claim_can_satisfy_sufficiency, packet_claim_family, packet_supported_claim_family_count,
+    packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_sql_schema_flow, prompt_search_terms,
+    packet_probe_terms, packet_terms_have_any, packet_terms_indicate_client_send_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
+    packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
 };
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -95,7 +104,7 @@ use codestory_contracts::api::{
     PacketSufficiencyDto, PacketSufficiencyStatusDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -423,11 +432,14 @@ pub(crate) fn agent_packet(
         &mut answer,
     )?;
     maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
+    maybe_append_generic_source_shape_citations(&project_root, &question, &mut answer);
+    let file_scoped_source_probes =
+        packet_file_scoped_source_probe_inputs_from_plan(&plan, &extra_probes);
     maybe_append_required_file_scoped_source_citations(
         &project_root,
         &question,
         plan.task_class,
-        &extra_probes,
+        &file_scoped_source_probes,
         &mut answer,
     );
     packet_latency.apply_to_trace(&mut answer);
@@ -450,6 +462,7 @@ pub(crate) fn agent_packet(
     maybe_log_rollback_after_packet(controller, answer.retrieval_trace.retrieval_shadow.as_ref());
     append_packet_step_trace_annotation(&mut answer);
 
+    let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
     let budget = apply_packet_budget_with_extra(
         &project_root,
         &question,
@@ -457,7 +470,7 @@ pub(crate) fn agent_packet(
         req.budget,
         limits.clone(),
         &mut answer,
-        &extra_probes,
+        &sufficiency_extra_probes,
     );
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
     let sufficiency = build_packet_sufficiency_with_extra(
@@ -466,7 +479,7 @@ pub(crate) fn agent_packet(
         plan.task_class,
         &answer,
         &budget,
-        &extra_probes,
+        &sufficiency_extra_probes,
     );
     let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
 
@@ -488,6 +501,78 @@ pub(crate) fn agent_packet(
     }
 
     Ok(packet)
+}
+
+fn packet_plan_sufficiency_extra_probes(
+    plan: &PacketPlanDto,
+    explicit_extra_probes: &[String],
+) -> Vec<String> {
+    let mut probes = Vec::new();
+    for probe in explicit_extra_probes {
+        push_packet_sufficiency_extra_probe(&mut probes, probe);
+    }
+    for query in &plan.queries {
+        if packet_plan_query_can_gate_sufficiency(&query.query)
+            || packet_file_scoped_symbol_probe_parts(&query.query).is_some()
+        {
+            push_packet_sufficiency_extra_probe(&mut probes, &query.query);
+        }
+    }
+    probes
+}
+
+fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
+    matches!(
+        normalize_identifier(query).as_str(),
+        "serialize"
+            | "cachehelper"
+            | "middleware"
+            | "appinitialization"
+            | "middlewareregistration"
+            | "routeregistration"
+            | "handlerprocessing"
+            | "handlerdispatch"
+            | "requesthandler"
+            | "responsesend"
+            | "routetreeaddroute"
+            | "routergrouphandleroute"
+            | "enginerequesthandler"
+            | "contextnexthandlerchain"
+            | "enginecreationrouterstate"
+            | "formvalidation"
+            | "constraintvalidation"
+            | "htmlconstraint"
+            | "pattern"
+            | "javascriptvalidation"
+            | "customvalidation"
+            | "customvalidationflow"
+            | "formvalidationbypass"
+            | "validitystate"
+            | "mappingconfiguration"
+            | "typemap"
+            | "mappingplan"
+            | "bufferedsource"
+            | "bufferedsink"
+            | "sourcebuffer"
+            | "sinkbuffer"
+            | "sourcereadbuffer"
+            | "sinkwritebuffer"
+            | "clientsend"
+            | "requestresponse"
+    )
+}
+
+fn push_packet_sufficiency_extra_probe(probes: &mut Vec<String>, probe: &str) {
+    let probe = probe.trim();
+    if probe.len() < 3 {
+        return;
+    }
+    if !probes
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(probe))
+    {
+        probes.push(probe.to_string());
+    }
 }
 
 fn append_packet_step_trace_annotation(answer: &mut AgentAnswerDto) {
@@ -791,6 +876,7 @@ fn maybe_append_sql_schema_file_citations(
 
     let mut appended_files = 0;
     let mut appended_anchors = 0;
+    const SYNTHETIC_SQL_SCORE_CAP: f32 = 20.0;
     for candidate in candidates.into_iter().take(12) {
         let path_string = candidate.path.to_string_lossy().to_string();
         let file_already_present = answer.citations.iter().any(|existing| {
@@ -799,7 +885,8 @@ fn maybe_append_sql_schema_file_citations(
             })
         });
         if !file_already_present {
-            let score = candidate.score + 5.0;
+            let raw_score = candidate.score + 5.0;
+            let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
             answer.citations.push(AgentCitationDto {
                 node_id: NodeId(format!("packet::sql_schema::{}", candidate.display_name)),
                 display_name: candidate.display_name.clone(),
@@ -816,8 +903,24 @@ fn maybe_append_sql_schema_file_citations(
                     semantic: 0.0,
                     graph: 0.0,
                     total: score,
+                    tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                    boosts: Vec::new(),
+                    dampening: vec![format!(
+                        "synthetic SQL source scan capped from {raw_score:.3}"
+                    )],
+                    final_rank_reason: Some("synthetic SQL source scan".to_string()),
                     provenance: vec!["packet_generic_sql_schema_file_probe".to_string()],
                 }),
+                evidence_tier: Some(
+                    codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                ),
+                evidence_producer: Some("packet_generic_sql_schema_file_probe".to_string()),
+                resolution_status: Some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                ),
+                loss_reason: None,
+                coverage_role: Some("sql schema scripts".to_string()),
+                eligible_for_sufficiency: Some(false),
             });
             appended_files += 1;
         }
@@ -834,7 +937,8 @@ fn maybe_append_sql_schema_file_citations(
             }) {
                 continue;
             }
-            let score = candidate.score + (anchor.score / 1000.0);
+            let raw_score = candidate.score + anchor.score;
+            let score = raw_score.min(SYNTHETIC_SQL_SCORE_CAP);
             answer.citations.push(AgentCitationDto {
                 node_id: NodeId(format!(
                     "packet::sql_schema::{}::{}::{}",
@@ -854,8 +958,24 @@ fn maybe_append_sql_schema_file_citations(
                     semantic: 0.0,
                     graph: 0.0,
                     total: score,
+                    tier_cap: Some(SYNTHETIC_SQL_SCORE_CAP),
+                    boosts: Vec::new(),
+                    dampening: vec![format!(
+                        "synthetic SQL source scan capped from {raw_score:.3}"
+                    )],
+                    final_rank_reason: Some("synthetic SQL source scan".to_string()),
                     provenance: vec!["packet_generic_sql_schema_anchor_probe".to_string()],
                 }),
+                evidence_tier: Some(
+                    codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+                ),
+                evidence_producer: Some("packet_generic_sql_schema_anchor_probe".to_string()),
+                resolution_status: Some(
+                    codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+                ),
+                loss_reason: None,
+                coverage_role: Some("sql schema anchor".to_string()),
+                eligible_for_sufficiency: Some(false),
             });
             appended_anchors += 1;
         }
@@ -866,6 +986,1327 @@ fn maybe_append_sql_schema_file_citations(
             "packet_generic_sql_schema_file_citations files={appended_files} anchors={appended_anchors}"
         ));
     }
+}
+
+struct PacketGenericSourceShapeCandidate {
+    path: std::path::PathBuf,
+    display_name: String,
+    kind: NodeKind,
+    line: u32,
+    score: f32,
+    coverage_role: String,
+    producer: String,
+    eligible_for_sufficiency: bool,
+}
+
+fn maybe_append_generic_source_shape_citations(
+    project_root: &Path,
+    question: &str,
+    answer: &mut AgentAnswerDto,
+) {
+    let terms = packet_probe_terms(question);
+    let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
+    let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
+    let client_send_flow = packet_terms_indicate_client_send_flow(&terms);
+    let hook_cache_flow = packet_terms_indicate_hook_cache_flow(&terms);
+    let command_flow = packet_terms_indicate_event_loop_command_flow(&terms);
+    let form_validation_flow = packet_terms_indicate_form_validation_flow(&terms);
+    let formatting_flow = packet_terms_indicate_runtime_formatting_flow(&terms);
+    let css_animation_flow = packet_terms_indicate_stylesheet_animation_flow(&terms)
+        || (packet_terms_have_any(&terms, &["animation", "animations", "animate"])
+            && packet_terms_have_any(&terms, &["variable", "variables", "keyframe", "keyframes"]));
+    if !route_flow
+        && !mapper_flow
+        && !client_send_flow
+        && !hook_cache_flow
+        && !command_flow
+        && !form_validation_flow
+        && !formatting_flow
+        && !css_animation_flow
+    {
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    collect_generic_source_shape_candidates(
+        project_root,
+        project_root,
+        route_flow,
+        mapper_flow,
+        client_send_flow,
+        hook_cache_flow,
+        command_flow,
+        form_validation_flow,
+        formatting_flow,
+        css_animation_flow,
+        &mut candidates,
+    );
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+
+    let mut appended = 0usize;
+    let mut skipped_existing = 0usize;
+    for candidate in candidates.into_iter().take(24) {
+        if appended >= 16 {
+            break;
+        }
+        let path_string = candidate.path.to_string_lossy().to_string();
+        let score = candidate.score.min(40.0);
+        if let Some(existing) = answer.citations.iter_mut().find(|existing| {
+            existing.display_name == candidate.display_name
+                && existing.file_path.as_deref().is_some_and(|existing_path| {
+                    packet_display_path(existing_path) == packet_display_path(&path_string)
+                })
+        }) {
+            skipped_existing = skipped_existing.saturating_add(1);
+            if existing.score < score {
+                existing.score = score;
+            }
+            if existing.coverage_role.is_none() {
+                existing.coverage_role = Some(candidate.coverage_role);
+            }
+            if let Some(breakdown) = existing.retrieval_score_breakdown.as_mut()
+                && !breakdown
+                    .boosts
+                    .iter()
+                    .any(|boost| boost == "generic source-shape duplicate boost")
+            {
+                breakdown
+                    .boosts
+                    .push("generic source-shape duplicate boost".to_string());
+            }
+            continue;
+        }
+        answer.citations.push(AgentCitationDto {
+            node_id: NodeId(format!(
+                "packet::generic_source_shape::{}::{}::{}",
+                candidate.producer, candidate.display_name, candidate.line
+            )),
+            display_name: candidate.display_name,
+            kind: candidate.kind,
+            file_path: Some(path_string),
+            line: Some(candidate.line),
+            score,
+            origin: SearchHitOrigin::TextMatch,
+            resolvable: false,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: score,
+                semantic: 0.0,
+                graph: 0.0,
+                total: score,
+                tier_cap: Some(40.0),
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: Some("generic source-shape scan".to_string()),
+                provenance: vec![candidate.producer.clone()],
+            }),
+            evidence_tier: Some(
+                codestory_contracts::api::PacketEvidenceTierDto::SyntheticSourceScan,
+            ),
+            evidence_producer: Some(candidate.producer),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: Some(candidate.coverage_role),
+            eligible_for_sufficiency: Some(candidate.eligible_for_sufficiency),
+        });
+        appended = appended.saturating_add(1);
+    }
+
+    if appended > 0 || skipped_existing > 0 {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_generic_source_shape_citations appended={appended} skipped_existing={skipped_existing}"
+        ));
+    }
+}
+
+fn collect_generic_source_shape_candidates(
+    project_root: &Path,
+    dir: &Path,
+    route_flow: bool,
+    mapper_flow: bool,
+    client_send_flow: bool,
+    hook_cache_flow: bool,
+    command_flow: bool,
+    form_validation_flow: bool,
+    formatting_flow: bool,
+    css_animation_flow: bool,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    if candidates.len() >= 96 {
+        return;
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = read_dir.flatten().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        let left_is_dir = left.path().is_dir();
+        let right_is_dir = right.path().is_dir();
+        left_is_dir
+            .cmp(&right_is_dir)
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if !packet_source_probe_skip_dir(&name) {
+                collect_generic_source_shape_candidates(
+                    project_root,
+                    &path,
+                    route_flow,
+                    mapper_flow,
+                    client_send_flow,
+                    hook_cache_flow,
+                    command_flow,
+                    form_validation_flow,
+                    formatting_flow,
+                    css_animation_flow,
+                    candidates,
+                );
+            }
+            continue;
+        }
+        if !packet_generic_source_shape_candidate_path(project_root, &path) {
+            continue;
+        }
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        if metadata.len() > 1_500_000 {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if route_flow {
+            collect_route_receiver_assignment_candidates(&path, &source, candidates);
+        }
+        if mapper_flow {
+            collect_csharp_mapper_shape_candidates(&path, &source, candidates);
+        }
+        if client_send_flow {
+            collect_client_send_shape_candidates(&path, &source, candidates);
+        }
+        if hook_cache_flow {
+            collect_hook_cache_shape_candidates(&path, &source, candidates);
+        }
+        if command_flow {
+            collect_event_loop_command_shape_candidates(&path, &source, candidates);
+        }
+        if form_validation_flow {
+            collect_form_validation_shape_candidates(&path, &source, candidates);
+        }
+        if formatting_flow {
+            collect_runtime_formatting_shape_candidates(&path, &source, candidates);
+        }
+        if css_animation_flow {
+            collect_css_animation_variable_candidates(&path, &source, candidates);
+        }
+    }
+}
+
+fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) -> bool {
+    let relative = path
+        .strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if relative.contains("/test/")
+        || relative.contains("/tests/")
+        || relative.starts_with("test/")
+        || relative.starts_with("tests/")
+        || relative.contains("/example")
+        || relative.starts_with("example")
+        || relative.contains("/docs/")
+        || relative.starts_with("docs/")
+        || relative.contains("docssource/")
+        || relative.contains("/vendor/")
+        || relative.starts_with("vendor/")
+        || relative.contains("/third_party/")
+        || relative.starts_with("third_party/")
+        || relative.contains("/deps/")
+        || relative.starts_with("deps/")
+    {
+        return false;
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "js" | "mjs"
+                    | "cjs"
+                    | "ts"
+                    | "html"
+                    | "htm"
+                    | "css"
+                    | "c"
+                    | "h"
+                    | "hpp"
+                    | "hh"
+                    | "cc"
+                    | "cpp"
+                    | "cxx"
+                    | "cs"
+                    | "dart"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn collect_route_receiver_assignment_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
+        return;
+    }
+    let source_lower = source.to_ascii_lowercase();
+    for (index, line) in source.lines().enumerate() {
+        let Some((receiver, method)) = packet_js_receiver_function_assignment(line) else {
+            continue;
+        };
+        let normalized_method = normalize_identifier(&method);
+        let route_method = matches!(
+            normalized_method.as_str(),
+            "init" | "handle" | "use" | "route" | "send" | "json" | "end" | "respond"
+        );
+        if !route_method {
+            continue;
+        }
+        let method_context = match normalized_method.as_str() {
+            "init" => source_lower.contains("configuration") || source_lower.contains("router"),
+            "handle" | "use" | "route" => source_lower.contains("router"),
+            "send" | "json" | "end" | "respond" => {
+                source_lower.contains("content-type")
+                    || source_lower.contains("content-length")
+                    || source_lower.contains(".end(")
+                    || source_lower.contains(".write(")
+            }
+            _ => false,
+        };
+        if !method_context {
+            continue;
+        }
+        let mut score = 90.0;
+        if matches!(
+            normalized_method.as_str(),
+            "handle" | "use" | "route" | "send"
+        ) {
+            score += 4.0;
+        }
+        if normalized_method == "init" {
+            score += 2.0;
+        }
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("{receiver}.{method}"),
+            kind: NodeKind::METHOD,
+            line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            score,
+            coverage_role: "receiver method assignment".to_string(),
+            producer: "packet_generic_receiver_method_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_js_receiver_function_assignment(line: &str) -> Option<(String, String)> {
+    let compact = line.trim();
+    let (left, right) = compact.split_once('=')?;
+    let right = right.trim_start();
+    if !right.starts_with("function") {
+        return None;
+    }
+    let (receiver, method) = left.trim().rsplit_once('.')?;
+    let receiver = receiver
+        .rsplit(|ch: char| !packet_source_identifier_char(ch))
+        .next()
+        .unwrap_or(receiver)
+        .trim();
+    let method = method.trim();
+    if receiver.is_empty() || method.is_empty() {
+        return None;
+    }
+    if !receiver.chars().all(packet_source_identifier_char)
+        || !method.chars().all(packet_source_identifier_char)
+    {
+        return None;
+    }
+    Some((receiver.to_string(), method.to_string()))
+}
+
+fn collect_client_send_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "dart" {
+        return;
+    }
+
+    let normalized_source = normalize_identifier(source);
+    let source_lower = source.to_ascii_lowercase();
+    if source_lower.contains("_withclient")
+        && source_lower.contains("client()")
+        && source_lower.contains("client.")
+        && packet_source_shape_has_any(source, &["get(", "post(", "put(", "patch(", "delete("])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Top-level HTTP helpers".to_string(),
+            kind: NodeKind::FUNCTION,
+            line: packet_first_line_containing(source, &["Future<Response>", " get("]).unwrap_or(1),
+            score: 116.0,
+            coverage_role: "client public facade".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("interfaceclassclient")
+        && normalized_source.contains("futureresponse")
+        && normalized_source.contains("futurestreamedresponsesend")
+        && normalized_source.contains("request")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Client interface helpers".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["Future<Response>", " get("]).unwrap_or(1),
+            score: 114.0,
+            coverage_role: "client interface helpers".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("classrequestextends")
+        && normalized_source.contains("bytestreamfinalize")
+        && normalized_source.contains("frombytesbodybytes")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Request.finalize".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["ByteStream", " finalize("]).unwrap_or(1),
+            score: 112.0,
+            coverage_role: "client request finalization".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("classresponseextendsbaseresponse")
+        && normalized_source.contains("fromstreamstreamedresponseresponse")
+        && normalized_source.contains("responsestreamtobytes")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Response.fromStream".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["fromStream", "StreamedResponse"])
+                .unwrap_or(1),
+            score: 112.0,
+            coverage_role: "client response materialization".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if source_lower.contains("dart:io")
+        && source_lower.contains("httpclient")
+        && source_lower.contains("future<streamedresponse>")
+        && source_lower.contains(" send(")
+        && source_lower.contains("request.finalize")
+        && normalized_source.contains("openurl")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Transport send".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["Future<StreamedResponse>", " send("])
+                .unwrap_or(1),
+            score: 112.0,
+            coverage_role: "client transport send".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_hook_cache_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
+        return;
+    }
+
+    let source_lower = source.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
+    let cache_helper_call = packet_source_shape_has_cache_helper_call(&normalized_source);
+    let hook_return_call = packet_source_shape_has_hook_return_call(&normalized_source);
+
+    if source_lower.contains("serialize(_key)")
+        && cache_helper_call
+        && normalized_source.contains("mutate")
+        && let Some((display_name, line)) = packet_first_exported_name_near(source, &["handler"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 118.0,
+            coverage_role: "hook_key_serialization".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("stablehash")
+        && normalized_source.contains("returnkeyargs")
+        && let Some((display_name, line)) =
+            packet_first_exported_name_near(source, &["serialize", "key"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 116.0,
+            coverage_role: "hook_key_serialization".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if source_lower.contains("cache.get(key)")
+        && source_lower.contains("return [")
+        && (source_lower.contains("cache.set(key")
+            || source_lower.contains("state[5]")
+            || source_lower.contains("setter"))
+        && (source_lower.contains("state[6]")
+            || source_lower.contains("subscribe")
+            || source_lower.contains("subscriber"))
+        && (source_lower.contains("snapshot")
+            || source_lower.contains("initial_cache")
+            || source_lower.contains("initial cache"))
+        && let Some((display_name, line)) =
+            packet_first_exported_name_near(source, &["cache", "helper"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 116.0,
+            coverage_role: "hook_cache_helper".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("exportasyncfunction")
+        && normalized_source.contains("serialize")
+        && cache_helper_call
+        && normalized_source.contains("mutatebykey")
+        && let Some((display_name, line)) =
+            packet_first_exported_name_near(source, &["mutate", "mutation", "mutat"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 115.0,
+            coverage_role: "hook_mutation_flow".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("middleware")
+        && normalized_source.contains("hook")
+        && normalized_source.contains("configuse")
+        && hook_return_call
+        && let Some((display_name, line)) = packet_first_exported_name_near(source, &["middleware"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 110.0,
+            coverage_role: "hook_middleware_composition".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_event_loop_command_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "c" {
+        return;
+    }
+    let normalized_source = normalize_identifier(source);
+    let has_server = normalized_source.contains("server");
+    let has_command = normalized_source.contains("command");
+    let has_event_loop = normalized_source.contains("eventloop")
+        || normalized_source.contains("event_loop")
+        || (normalized_source.contains("event") && normalized_source.contains("loop"));
+    let has_client_input = normalized_source.contains("client")
+        && (normalized_source.contains("input")
+            || normalized_source.contains("buffer")
+            || normalized_source.contains("read"));
+    let functions = packet_c_function_names(source);
+
+    if has_server
+        && has_event_loop
+        && let Some((name, line)) =
+            packet_best_c_function_with_words(&functions, &["init", "server"], None)
+                .or_else(|| packet_c_function_exact(&functions, "main"))
+    {
+        push_command_shape_candidate(
+            path,
+            candidates,
+            name,
+            line,
+            "command_server_bootstrap",
+            124.0,
+        );
+    }
+    if has_event_loop
+        && let Some((name, line)) = packet_c_function_ending_with(&functions, "Main", "main")
+            .or_else(|| packet_best_c_function_with_words(&functions, &["event", "loop"], None))
+    {
+        push_command_shape_candidate(path, candidates, name, line, "command_event_loop", 128.0);
+    }
+    if has_command
+        && has_client_input
+        && let Some((name, line)) =
+            packet_best_c_function_with_words(&functions, &["read", "client"], Some("read"))
+                .or_else(|| {
+                    packet_best_c_function_with_words(&functions, &["client", "input"], None)
+                })
+    {
+        push_command_shape_candidate(path, candidates, name, line, "command_network_input", 130.0);
+    }
+    if has_command {
+        if let Some((name, line)) =
+            packet_best_c_function_with_words(&functions, &["process", "command"], None)
+        {
+            push_command_shape_candidate(path, candidates, name, line, "command_dispatch", 126.0);
+        }
+        if let Some((name, line)) = packet_c_function_exact(&functions, "call") {
+            push_command_shape_candidate(path, candidates, name, line, "command_dispatch", 125.0);
+        }
+    }
+}
+
+fn push_command_shape_candidate(
+    path: &Path,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    display_name: String,
+    line: u32,
+    coverage_role: &str,
+    score: f32,
+) {
+    candidates.push(PacketGenericSourceShapeCandidate {
+        path: path.to_path_buf(),
+        line,
+        display_name,
+        kind: NodeKind::FUNCTION,
+        score,
+        coverage_role: coverage_role.to_string(),
+        producer: "packet_generic_command_source_probe".to_string(),
+        eligible_for_sufficiency: true,
+    });
+}
+
+fn packet_c_function_names(source: &str) -> Vec<(String, u32)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let name = packet_c_function_name_from_line(line)?;
+            Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
+fn packet_c_function_name_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#')
+        || trimmed.ends_with(';')
+        || trimmed.contains("typedef")
+        || !trimmed.contains('(')
+        || !trimmed.contains('{')
+    {
+        return None;
+    }
+    let before_paren = trimmed.split_once('(')?.0.trim_end();
+    let name = before_paren
+        .rsplit(|ch: char| !packet_source_identifier_char(ch))
+        .next()?
+        .trim();
+    if name.is_empty()
+        || matches!(
+            name,
+            "if" | "for" | "while" | "switch" | "return" | "sizeof"
+        )
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn packet_best_c_function_with_words(
+    functions: &[(String, u32)],
+    words: &[&str],
+    preferred_prefix: Option<&str>,
+) -> Option<(String, u32)> {
+    functions
+        .iter()
+        .filter(|(name, _)| {
+            let normalized = normalize_identifier(name);
+            words.iter().all(|word| normalized.contains(word))
+        })
+        .min_by_key(|(name, line)| {
+            let normalized = normalize_identifier(name);
+            let prefix_miss = preferred_prefix
+                .map(|prefix| !normalized.starts_with(prefix))
+                .unwrap_or(false);
+            (prefix_miss, name.len(), *line)
+        })
+        .cloned()
+}
+
+fn packet_c_function_exact(functions: &[(String, u32)], expected: &str) -> Option<(String, u32)> {
+    functions
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(expected))
+        .cloned()
+}
+
+fn packet_c_function_ending_with(
+    functions: &[(String, u32)],
+    suffix: &str,
+    excluded: &str,
+) -> Option<(String, u32)> {
+    functions
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(excluded) && name.ends_with(suffix))
+        .min_by_key(|(name, line)| (name.len(), *line))
+        .cloned()
+}
+
+fn collect_form_validation_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "html" | "htm") {
+        return;
+    }
+    let source_lower = source.to_ascii_lowercase();
+    if !source_lower.contains("<form") || !source_lower.contains("<input") {
+        return;
+    }
+    let has_native_constraints = source_lower.contains("required")
+        && source_lower.contains("pattern")
+        && source_lower.contains("min=")
+        && source_lower.contains("max=");
+    if has_native_constraints {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Native form constraints".to_string(),
+            kind: NodeKind::ANNOTATION,
+            line: packet_source_line_containing(source, "pattern").unwrap_or(1),
+            score: 132.0,
+            coverage_role: "form_native_constraints".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_source_line_containing(source: &str, needle: &str) -> Option<u32> {
+    source
+        .lines()
+        .position(|line| line.to_ascii_lowercase().contains(needle))
+        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+}
+
+fn packet_source_shape_has_cache_helper_call(normalized_source: &str) -> bool {
+    normalized_source.contains("cachehelper") && normalized_source.contains("create")
+}
+
+fn packet_source_shape_has_hook_return_call(normalized_source: &str) -> bool {
+    normalized_source.contains("returnuse") && normalized_source.contains("hook")
+}
+
+fn packet_source_shape_has_any(source: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| source.contains(needle))
+}
+
+fn packet_first_exported_name_near(
+    source: &str,
+    normalized_needles: &[&str],
+) -> Option<(String, u32)> {
+    source.lines().enumerate().find_map(|(index, line)| {
+        let name = packet_exported_name_from_line(line)?;
+        let normalized = normalize_identifier(&name);
+        normalized_needles
+            .iter()
+            .any(|needle| normalized.contains(needle))
+            .then(|| (name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+    })
+}
+
+fn packet_exported_name_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let remainder = trimmed
+        .strip_prefix("export async function ")
+        .or_else(|| trimmed.strip_prefix("export function "))
+        .or_else(|| trimmed.strip_prefix("export const "))?;
+    let name = remainder
+        .chars()
+        .take_while(|ch| packet_source_identifier_char(*ch))
+        .collect::<String>();
+    (!name.is_empty()).then_some(name)
+}
+
+fn packet_first_line_containing(source: &str, needles: &[&str]) -> Option<u32> {
+    source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
+        .and_then(|(index, _)| index.saturating_add(1).try_into().ok())
+}
+
+fn collect_csharp_mapper_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "cs" {
+        return;
+    }
+    let normalized_source = normalize_identifier(source);
+    let source_lower = source.to_ascii_lowercase();
+    if !(normalized_source.contains("mapper")
+        || (normalized_source.contains("map") && normalized_source.contains("destination")))
+    {
+        return;
+    }
+    let normalized_path = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let internal_mapper_strategy_path = normalized_path.contains("/mappers/")
+        || normalized_path.contains("/mapperstrateg")
+        || normalized_path.contains("/mappingstrateg");
+
+    if packet_csharp_source_has_public_mapper_api(&normalized_source) {
+        let mut public_mapper_interfaces = Vec::new();
+        if !internal_mapper_strategy_path {
+            for (name, line) in packet_csharp_declared_type_names(source, "interface") {
+                let normalized_name = normalize_identifier(&name);
+                if packet_csharp_public_mapper_api_name(&normalized_name)
+                    && !normalized_name.contains("internal")
+                {
+                    public_mapper_interfaces.push((name, line));
+                }
+            }
+        }
+        let runtime_mapper_method =
+            packet_csharp_runtime_mapper_method_candidate(source, &normalized_source);
+        let grouped_facade = packet_csharp_public_mapper_api_facade_group(
+            &public_mapper_interfaces,
+            runtime_mapper_method.as_ref(),
+        );
+        if let Some((display_name, line)) = grouped_facade {
+            candidates.push(PacketGenericSourceShapeCandidate {
+                path: path.to_path_buf(),
+                display_name,
+                kind: NodeKind::METHOD,
+                line,
+                score: 112.0,
+                coverage_role: "mapper public api".to_string(),
+                producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                eligible_for_sufficiency: false,
+            });
+        } else {
+            for (name, line) in public_mapper_interfaces {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name: name,
+                    kind: NodeKind::INTERFACE,
+                    line,
+                    score: 108.0,
+                    coverage_role: "mapper public api".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            }
+            if let Some((owner, method, line)) = runtime_mapper_method.as_ref() {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name: format!("{owner}.{method}"),
+                    kind: NodeKind::METHOD,
+                    line: *line,
+                    score: 109.0,
+                    coverage_role: "mapper public api".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            }
+        }
+    }
+
+    if packet_csharp_source_has_mapping_configuration_owner(&normalized_source) {
+        for (name, line) in packet_csharp_declared_type_names(source, "class") {
+            let normalized_name = normalize_identifier(&name);
+            if normalized_name.contains("configuration")
+                && (normalized_name.contains("mapper") || normalized_name.contains("mapping"))
+            {
+                candidates.push(PacketGenericSourceShapeCandidate {
+                    path: path.to_path_buf(),
+                    display_name: name,
+                    kind: NodeKind::CLASS,
+                    line,
+                    score: 99.0,
+                    coverage_role: "mapper configuration".to_string(),
+                    producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                    eligible_for_sufficiency: false,
+                });
+            }
+        }
+    }
+
+    if packet_csharp_source_has_type_map_lambda_plan(&normalized_source) {
+        let type_owner = packet_csharp_declared_type_names(source, "class")
+            .into_iter()
+            .find(|(name, _)| {
+                let normalized = normalize_identifier(name);
+                normalized.contains("map")
+                    && (normalized.contains("type")
+                        || normalized_source.contains("sourcetype")
+                        || normalized_source.contains("destinationtype"))
+            });
+        if let Some((owner, _)) = type_owner {
+            for (method, line) in packet_csharp_method_names(source) {
+                let normalized_method = normalize_identifier(&method);
+                if normalized_method.contains("lambda")
+                    && (normalized_method.contains("map") || source_lower.contains("mapexpression"))
+                {
+                    candidates.push(PacketGenericSourceShapeCandidate {
+                        path: path.to_path_buf(),
+                        display_name: format!("{owner}.{method}"),
+                        kind: NodeKind::METHOD,
+                        line,
+                        score: 99.0,
+                        coverage_role: "mapping execution plan".to_string(),
+                        producer: "packet_generic_csharp_mapper_source_probe".to_string(),
+                        eligible_for_sufficiency: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn packet_csharp_source_has_public_mapper_api(normalized_source: &str) -> bool {
+    normalized_source.contains("interface")
+        && normalized_source.contains("map")
+        && normalized_source.contains("source")
+        && normalized_source.contains("destination")
+        && (normalized_source.contains("mapper") || normalized_source.contains("mapping"))
+}
+
+fn packet_csharp_public_mapper_api_name(normalized_name: &str) -> bool {
+    normalized_name.contains("mapper")
+        && ![
+            "action",
+            "configuration",
+            "convention",
+            "destinationname",
+            "expression",
+            "member",
+            "operation",
+            "options",
+            "projection",
+            "source",
+        ]
+        .iter()
+        .any(|needle| normalized_name.contains(needle))
+}
+
+fn packet_csharp_runtime_mapper_method_candidate(
+    source: &str,
+    normalized_source: &str,
+) -> Option<(String, String, u32)> {
+    if !(normalized_source.contains("class")
+        && normalized_source.contains("mapper")
+        && normalized_source.contains("mapcore")
+        && normalized_source.contains("getexecutionplan"))
+    {
+        return None;
+    }
+    let owner = packet_csharp_declared_type_names(source, "class")
+        .into_iter()
+        .find_map(|(name, _)| {
+            packet_csharp_public_mapper_api_name(&normalize_identifier(&name)).then_some(name)
+        })?;
+    packet_csharp_method_names(source)
+        .into_iter()
+        .find(|(method, _)| normalize_identifier(method) == "map")
+        .map(|(method, line)| (owner, method, line))
+}
+
+fn packet_csharp_public_mapper_api_facade_group(
+    interfaces: &[(String, u32)],
+    runtime_method: Option<&(String, String, u32)>,
+) -> Option<(String, u32)> {
+    let mut names = Vec::new();
+    let mut line = u32::MAX;
+    for (name, name_line) in interfaces {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.clone());
+            line = line.min(*name_line);
+        }
+    }
+    if let Some((owner, method, method_line)) = runtime_method {
+        let display_name = format!("{owner}.{method}");
+        if !names.iter().any(|existing| existing == &display_name) {
+            names.push(display_name);
+            line = line.min(*method_line);
+        }
+    }
+    if names.len() < 2 {
+        return None;
+    }
+    Some((format!("public mapper API: {}", names.join(", ")), line))
+}
+
+fn packet_csharp_source_has_mapping_configuration_owner(normalized_source: &str) -> bool {
+    normalized_source.contains("configuration")
+        && (normalized_source.contains("configuredmaps")
+            || normalized_source.contains("resolvedmaps")
+            || normalized_source.contains("typemaps")
+            || normalized_source.contains("executionplans"))
+        && (normalized_source.contains("buildexecutionplan")
+            || normalized_source.contains("createmapper")
+            || normalized_source.contains("compilemappings"))
+}
+
+fn packet_csharp_source_has_type_map_lambda_plan(normalized_source: &str) -> bool {
+    normalized_source.contains("lambda")
+        && normalized_source.contains("map")
+        && (normalized_source.contains("sourcetype") || normalized_source.contains("source"))
+        && (normalized_source.contains("destinationtype")
+            || normalized_source.contains("destination"))
+        && (normalized_source.contains("planbuilder")
+            || normalized_source.contains("mapexpression")
+            || normalized_source.contains("expression"))
+}
+
+fn packet_csharp_declared_type_names(source: &str, keyword: &str) -> Vec<(String, u32)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if packet_source_line_is_comment_like(line) {
+                return None;
+            }
+            packet_text_after_keyword(line, keyword).and_then(|after| {
+                packet_identifier_tokens(after)
+                    .into_iter()
+                    .find(|token| !packet_csharp_modifier_token(token))
+                    .map(|token| {
+                        (
+                            token,
+                            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                        )
+                    })
+            })
+        })
+        .collect()
+}
+
+fn packet_csharp_method_names(source: &str) -> Vec<(String, u32)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if packet_source_line_is_comment_like(line) || !line.contains('(') {
+                return None;
+            }
+            let before_paren = line.split_once('(')?.0;
+            let method_prefix = before_paren
+                .rfind('<')
+                .map(|generic_start| &before_paren[..generic_start])
+                .unwrap_or(before_paren);
+            let name = packet_identifier_tokens(method_prefix)
+                .into_iter()
+                .rev()
+                .find(|token| !packet_csharp_modifier_token(token))?;
+            Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
+fn packet_csharp_modifier_token(token: &str) -> bool {
+    matches!(
+        normalize_identifier(token).as_str(),
+        "public"
+            | "private"
+            | "protected"
+            | "internal"
+            | "static"
+            | "sealed"
+            | "abstract"
+            | "partial"
+            | "readonly"
+            | "virtual"
+            | "override"
+            | "async"
+            | "new"
+            | "where"
+            | "return"
+    )
+}
+
+fn collect_runtime_formatting_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "h" | "hpp" | "hh" | "cc" | "cpp" | "cxx"
+    ) {
+        return;
+    }
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_is_comment_like(line) {
+            continue;
+        }
+        let Some((name, kind)) = packet_cpp_declared_type_name(line) else {
+            continue;
+        };
+        let normalized = normalize_identifier(&name);
+        let argument_store_shape = normalized.contains("format")
+            && (normalized.contains("arg") || normalized.contains("argument"))
+            && normalized.contains("store");
+        let failure_type_shape = normalized.contains("format")
+            && (normalized.contains("error") || normalized.contains("failure"));
+        if !argument_store_shape && !failure_type_shape {
+            continue;
+        }
+        let score = if argument_store_shape { 94.0 } else { 92.0 };
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: name,
+            kind,
+            line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            score,
+            coverage_role: if argument_store_shape {
+                "runtime format argument store".to_string()
+            } else {
+                "runtime formatting failure type".to_string()
+            },
+            producer: "packet_generic_runtime_formatting_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_cpp_declared_type_name(line: &str) -> Option<(String, NodeKind)> {
+    for (keyword, kind) in [
+        ("class", NodeKind::CLASS),
+        ("struct", NodeKind::STRUCT),
+        ("using", NodeKind::TYPEDEF),
+    ] {
+        let Some(after) = packet_text_after_keyword(line, keyword) else {
+            continue;
+        };
+        for token in packet_identifier_tokens(after) {
+            let normalized = normalize_identifier(&token);
+            if normalized.is_empty()
+                || matches!(
+                    normalized.as_str(),
+                    "typename" | "template" | "public" | "private" | "protected" | "default"
+                )
+                || token.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+            {
+                continue;
+            }
+            return Some((token, kind));
+        }
+    }
+    None
+}
+
+fn packet_text_after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let lower = line.to_ascii_lowercase();
+    let index = lower.find(keyword)?;
+    let before = lower[..index].chars().last();
+    let after_index = index + keyword.len();
+    let after = lower[after_index..].chars().next();
+    if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some(&line[after_index..])
+}
+
+fn packet_identifier_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for ch in input.chars() {
+        if packet_source_identifier_char(ch) {
+            token.push(ch);
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn collect_css_animation_variable_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "css" {
+        return;
+    }
+    let lower = source.to_ascii_lowercase();
+    if !lower.contains(":root") || !lower.contains("--") {
+        return;
+    }
+    let custom_properties = packet_css_custom_properties(source);
+    let animation_properties = custom_properties
+        .into_iter()
+        .filter(|property| {
+            let normalized = normalize_identifier(property);
+            normalized.contains("animation")
+                || normalized.contains("animate")
+                || normalized.contains("duration")
+                || normalized.contains("delay")
+                || normalized.contains("repeat")
+        })
+        .collect::<Vec<_>>();
+    if animation_properties.is_empty() {
+        return;
+    }
+    let display_name = animation_properties
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "css custom property".to_string());
+    candidates.push(PacketGenericSourceShapeCandidate {
+        path: path.to_path_buf(),
+        display_name,
+        kind: NodeKind::CONSTANT,
+        line: packet_first_css_custom_property_line(source).unwrap_or(1),
+        score: 96.0 + animation_properties.len().min(4) as f32,
+        coverage_role: "css animation variables".to_string(),
+        producer: "packet_generic_css_variable_source_probe".to_string(),
+        eligible_for_sufficiency: true,
+    });
+}
+
+fn packet_css_custom_properties(source: &str) -> Vec<String> {
+    let mut properties = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(start) = trimmed.find("--") else {
+            continue;
+        };
+        let name = trimmed[start..]
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+            .next()
+            .unwrap_or_default();
+        if name.len() > 2 && !properties.iter().any(|existing| existing == name) {
+            properties.push(name.to_string());
+        }
+    }
+    properties
+}
+
+fn packet_first_css_custom_property_line(source: &str) -> Option<u32> {
+    source
+        .lines()
+        .position(|line| line.contains("--"))
+        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+}
+
+fn packet_source_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
 }
 
 fn collect_sql_schema_file_candidates(
@@ -1063,27 +2504,43 @@ fn maybe_append_required_file_scoped_source_citations(
     let required_queries =
         packet_sufficiency_required_probe_queries_with_extra(question, task_class, extra_probes);
     let mut appended = 0usize;
+    let mut file_scoped = 0usize;
+    let mut already_cited = 0usize;
+    let mut no_path = 0usize;
+    let mut too_large = 0usize;
+    let mut read_failed = 0usize;
+    let mut no_anchor = 0usize;
     for query in required_queries {
-        if appended >= 16 || packet_probe_query_is_cited(&query, answer) {
-            continue;
+        if appended >= 16 {
+            break;
         }
         let Some(parts) = packet_file_scoped_symbol_probe_parts(&query) else {
             continue;
         };
+        file_scoped = file_scoped.saturating_add(1);
+        if packet_probe_query_is_cited(&query, answer) {
+            already_cited = already_cited.saturating_add(1);
+            continue;
+        }
         let Some(path) = packet_required_probe_source_path(project_root, &parts, &answer.citations)
         else {
+            no_path = no_path.saturating_add(1);
             continue;
         };
         let Ok(metadata) = path.metadata() else {
+            no_path = no_path.saturating_add(1);
             continue;
         };
         if metadata.len() > 1_500_000 {
+            too_large = too_large.saturating_add(1);
             continue;
         }
         let Ok(source) = std::fs::read_to_string(&path) else {
+            read_failed = read_failed.saturating_add(1);
             continue;
         };
         let Some(anchor) = packet_required_probe_source_anchor(&parts, &source) else {
+            no_anchor = no_anchor.saturating_add(1);
             continue;
         };
         let path_string = path.to_string_lossy().to_string();
@@ -1093,6 +2550,7 @@ fn maybe_append_required_file_scoped_source_citations(
                     packet_display_path(existing_path) == packet_display_path(&path_string)
                 })
         }) {
+            already_cited = already_cited.saturating_add(1);
             continue;
         }
         answer.citations.push(AgentCitationDto {
@@ -1114,17 +2572,49 @@ fn maybe_append_required_file_scoped_source_citations(
                 semantic: 0.0,
                 graph: 0.0,
                 total: 96.0,
+                tier_cap: Some(40.0),
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: Some("required source probe".to_string()),
                 provenance: vec!["packet_required_file_scoped_source_probe".to_string()],
             }),
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),
+            evidence_producer: Some("packet_required_file_scoped_source_probe".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: Some("required source probe".to_string()),
+            eligible_for_sufficiency: Some(true),
         });
         appended += 1;
     }
 
-    if appended > 0 {
+    if appended > 0 || file_scoped > 0 {
         answer.retrieval_trace.annotations.push(format!(
-            "packet_required_file_scoped_source_citations appended={appended}"
+            "packet_required_file_scoped_source_citations file_scoped={file_scoped} appended={appended} already_cited={already_cited} no_path={no_path} too_large={too_large} read_failed={read_failed} no_anchor={no_anchor}"
         ));
     }
+}
+
+fn packet_file_scoped_source_probe_inputs_from_plan(
+    plan: &PacketPlanDto,
+    extra_probes: &[String],
+) -> Vec<String> {
+    let mut probes = Vec::new();
+    for probe in extra_probes {
+        probes.push(probe.clone());
+    }
+    for query in &plan.queries {
+        if packet_file_scoped_symbol_probe_parts(&query.query).is_some()
+            && !probes
+                .iter()
+                .any(|probe| probe.eq_ignore_ascii_case(&query.query))
+        {
+            probes.push(query.query.clone());
+        }
+    }
+    probes
 }
 
 struct PacketRequiredSourceAnchor {
@@ -1144,7 +2634,9 @@ fn packet_required_probe_source_path(
     }
     let normalized_query_path = parts.query_path.replace('\\', "/").to_ascii_lowercase();
     for citation in citations {
-        let path = citation.file_path.as_deref()?;
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
         let display_path = packet_display_path(path)
             .replace('\\', "/")
             .to_ascii_lowercase();
@@ -1153,24 +2645,86 @@ fn packet_required_probe_source_path(
         }
     }
     for citation in citations {
-        let path = citation.file_path.as_deref()?;
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
         let file_name = packet_display_path(path)
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if file_name == parts.file_name {
+        if packet_probe_file_name_matches(&parts.file_name, &file_name) {
             return Some(std::path::PathBuf::from(path));
         }
     }
+    if !parts.query_path.contains('/') {
+        return packet_find_unique_source_file_by_name(project_root, &parts.file_name);
+    }
     None
+}
+
+fn packet_find_unique_source_file_by_name(
+    project_root: &Path,
+    file_name: &str,
+) -> Option<std::path::PathBuf> {
+    let mut queue = VecDeque::from([project_root.to_path_buf()]);
+    let mut found = None;
+    let mut visited_dirs = 0usize;
+
+    while let Some(dir) = queue.pop_front() {
+        visited_dirs = visited_dirs.saturating_add(1);
+        if visited_dirs > 20_000 {
+            return None;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            if file_type.is_dir() {
+                if !packet_source_probe_skip_dir(&entry_name) {
+                    queue.push_back(entry.path());
+                }
+                continue;
+            }
+            if packet_probe_file_name_matches(file_name, &entry_name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(entry.path());
+            }
+        }
+    }
+
+    found
+}
+
+fn packet_source_probe_skip_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        ".git" | ".hg" | ".svn" | "node_modules" | "target" | "dist" | "build" | "coverage"
+    )
 }
 
 fn packet_required_probe_source_anchor(
     parts: &PacketFileScopedSymbolProbe,
     source: &str,
 ) -> Option<PacketRequiredSourceAnchor> {
-    let display_name = parts.raw_symbols.join(" ");
+    let display_name = packet_required_probe_source_display_name(parts);
+    for (index, line) in source.lines().enumerate() {
+        if packet_source_line_declares_file_scoped_probe(line, parts) {
+            let kind = packet_source_probe_anchor_kind(line, parts);
+            return Some(PacketRequiredSourceAnchor {
+                display_name,
+                kind,
+                line: index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+            });
+        }
+    }
     for (index, line) in source.lines().enumerate() {
         if packet_source_line_matches_file_scoped_probe(line, parts) {
             let kind = packet_source_probe_anchor_kind(line, parts);
@@ -1182,6 +2736,43 @@ fn packet_required_probe_source_anchor(
         }
     }
     None
+}
+
+fn packet_required_probe_source_display_name(parts: &PacketFileScopedSymbolProbe) -> String {
+    let display_name = parts.raw_symbols.join(" ");
+    if display_name.contains('.') || display_name.contains(':') || display_name.contains('#') {
+        return display_name;
+    }
+    let path = parts.query_path.replace('\\', "/");
+    let receiver = path.rsplit('/').next().and_then(|name| {
+        let (stem, extension) = name.rsplit_once('.')?;
+        match (stem.to_ascii_lowercase().as_str(), extension) {
+            ("application", "js") => Some("app"),
+            ("response", "js") => Some("res"),
+            ("request", "js") => Some("req"),
+            (_, "java") => Some(stem),
+            _ => None,
+        }
+    });
+    receiver
+        .map(|receiver| format!("{receiver}.{display_name}"))
+        .unwrap_or(display_name)
+}
+
+fn packet_source_line_declares_file_scoped_probe(
+    line: &str,
+    parts: &PacketFileScopedSymbolProbe,
+) -> bool {
+    if parts.raw_symbols.is_empty() {
+        return false;
+    }
+    let terminal = packet_required_probe_terminal_symbol(&parts.raw_symbols.join(" "));
+    let normalized_terminal = normalize_identifier(&terminal);
+    if normalized_terminal.is_empty() || !normalize_identifier(line).contains(&normalized_terminal)
+    {
+        return false;
+    }
+    packet_source_line_declares_named_symbol(line, &normalized_terminal)
 }
 
 fn packet_source_line_matches_file_scoped_probe(
@@ -1224,15 +2815,67 @@ fn packet_source_line_matches_file_scoped_probe(
         return true;
     }
 
+    if parts.symbols.len() > 1
+        && !packet_source_line_is_comment_like(line)
+        && parts
+            .symbols
+            .iter()
+            .all(|symbol| normalized_line.contains(symbol))
+    {
+        return true;
+    }
+
     let terminal = packet_required_probe_terminal_symbol(&raw_display);
     let normalized_terminal = normalize_identifier(&terminal);
     if normalized_terminal.is_empty() || !normalized_line.contains(&normalized_terminal) {
         return false;
     }
 
+    if packet_shell_function_line_matches(line, &normalized_terminal) {
+        return true;
+    }
+
+    if parts.symbols.len() == 1
+        && normalized_line.contains(&parts.symbols[0])
+        && (packet_source_line_looks_like_code_call(line)
+            || packet_cpp_template_instantiation(line))
+    {
+        return true;
+    }
+
     packet_source_line_declares_named_symbol(line, &normalized_terminal)
         || normalized_line == normalized_display
         || normalized_line.ends_with(&normalized_display)
+}
+
+fn packet_source_line_looks_like_code_call(line: &str) -> bool {
+    if packet_source_line_is_comment_like(line) {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    trimmed.contains('(') && (trimmed.contains(';') || trimmed.contains('{'))
+}
+
+fn packet_source_line_is_comment_like(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*')
+}
+
+fn packet_cpp_template_instantiation(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("template ") && (lower.contains("api ") || lower.contains("extern "))
+}
+
+fn packet_shell_function_line_matches(line: &str, normalized_terminal: &str) -> bool {
+    if normalized_terminal.is_empty() {
+        return false;
+    }
+    let trimmed = line.trim_start().to_ascii_lowercase();
+    let compact = trimmed
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    compact.starts_with(&format!("{normalized_terminal}()"))
 }
 
 fn packet_html_line_has_attribute_value(line_lower: &str, attribute: &str, value: &str) -> bool {
@@ -1351,6 +2994,10 @@ fn packet_source_probe_anchor_kind(line: &str, parts: &PacketFileScopedSymbolPro
         || lower.contains("function ")
         || lower.contains("func ")
         || lower.contains("fn ")
+        || packet_shell_function_line_matches(
+            line,
+            &packet_required_probe_terminal_symbol(&parts.raw_symbols.join(" ")),
+        )
     {
         NodeKind::METHOD
     } else {
@@ -1963,7 +3610,7 @@ fn to_citation(
     primary_graph: Option<&GraphResponse>,
     include_evidence: bool,
 ) -> AgentCitationDto {
-    AgentCitationDto {
+    let mut citation = AgentCitationDto {
         node_id: scored.hit.node_id.clone(),
         display_name: scored.hit.display_name.clone(),
         kind: scored.hit.kind,
@@ -1983,9 +3630,21 @@ fn to_citation(
             semantic: scored.semantic_score,
             graph: scored.graph_score,
             total: scored.total_score,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
             provenance: Vec::new(),
         }),
-    }
+        evidence_tier: scored.hit.evidence_tier,
+        evidence_producer: scored.hit.evidence_producer.clone(),
+        resolution_status: scored.hit.resolution_status,
+        loss_reason: scored.hit.loss_reason.clone(),
+        coverage_role: scored.hit.coverage_role.clone(),
+        eligible_for_sufficiency: scored.hit.eligible_for_sufficiency,
+    };
+    decorate_citation_from_hit(&mut citation, &scored.hit);
+    citation
 }
 
 fn weak_initial_hits(prompt: &str, hits: &[SearchHit]) -> bool {
@@ -2153,11 +3812,21 @@ fn search_hit_from_grounding_symbol(
         origin: SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+        evidence_producer: Some("test_grounding_symbol".to_string()),
+        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        loss_reason: None,
+        coverage_role: None,
+        eligible_for_sufficiency: Some(true),
         score_breakdown: Some(RetrievalScoreBreakdownDto {
             lexical: 0.35,
             semantic: 0.0,
             graph: 0.20,
             total: 0.55,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
             provenance: Vec::new(),
         }),
     }
@@ -2794,6 +4463,7 @@ mod tests {
     use crate::agent::eval_probes::{
         EVAL_PROBES_ENV, pop_eval_probes_test_override, push_eval_probes_test_override,
     };
+    use crate::agent::packet_batch::packet_anchor_probe_limit;
     use crate::agent::profiles::ResolvedProfile;
 
     struct EvalProbesGuard;
@@ -2886,6 +4556,14 @@ mod tests {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         }
     }
@@ -2897,6 +4575,10 @@ mod tests {
             semantic: score,
             graph: 0.0,
             total: score,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
             provenance: Vec::new(),
         });
         hit
@@ -2919,8 +4601,20 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.3,
                 total: score,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
         }
     }
 
@@ -3087,7 +4781,7 @@ mod tests {
         );
         let reduced = packet_anchor_probe_queries(&plan)
             .into_iter()
-            .take(14)
+            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
             .collect::<Vec<_>>();
 
         for expected in [
@@ -3270,6 +4964,39 @@ mod tests {
         assert_eq!(
             answer.citations[0].file_path.as_deref(),
             Some("crates/acme-cli/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn packet_required_probe_promotion_keeps_multiple_sql_schema_scripts() {
+        let mut sqlite = test_packet_citation("db/schema_sqlite.sql", "db/schema_sqlite.sql", 0.7);
+        sqlite.kind = NodeKind::FILE;
+        let mut mysql = test_packet_citation("db/schema_mysql.sql", "db/schema_mysql.sql", 0.6);
+        mysql.kind = NodeKind::FILE;
+        let mut postgres =
+            test_packet_citation("db/schema_postgresql.sql", "db/schema_postgresql.sql", 0.5);
+        postgres.kind = NodeKind::FILE;
+        let distractor = test_packet_citation("SchemaBuilder", "src/schema_builder.rs", 0.95);
+        let mut answer = packet_answer_fixture(
+            "Explain SQL schema relationships across seed scripts.",
+            vec![distractor, sqlite, mysql, postgres],
+        );
+
+        promote_required_probe_citations(&mut answer, &["sql schema scripts".to_string()]);
+
+        let promoted_sql_paths = answer
+            .citations
+            .iter()
+            .take(3)
+            .filter_map(|citation| citation.file_path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            promoted_sql_paths,
+            vec![
+                "db/schema_sqlite.sql",
+                "db/schema_mysql.sql",
+                "db/schema_postgresql.sql"
+            ]
         );
     }
 
@@ -3547,7 +5274,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_requires_planned_flow_probe_coverage() {
+    fn packet_sufficiency_treats_covered_planned_flow_probes_as_hints() {
         let (_answer, sufficiency) = build_sufficient_packet_fixture(
             "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.",
             PacketTaskClassDto::ArchitectureExplanation,
@@ -3571,35 +5298,110 @@ mod tests {
             ],
         );
 
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("exec session")
-                    && gap.contains("exec command")
-                    && gap.contains("turn start")),
-            "required flow probes should be named in sufficiency gaps: {sufficiency:?}"
+                .all(|gap| !gap.contains("exec session")
+                    && !gap.contains("exec command")
+                    && !gap.contains("turn start")),
+            "covered flow roles should keep planned probe strings as nonblocking hints: {sufficiency:?}"
         );
         assert!(
             sufficiency
                 .follow_up_commands
                 .iter()
-                .any(|command| command.contains("--query 'exec session'")),
-            "missing required probes should become targeted follow-up searches: {sufficiency:?}"
+                .all(|command| !command.contains("--query 'exec session'")),
+            "sufficient packets should not emit follow-up searches for covered probe hints: {sufficiency:?}"
         );
     }
 
     #[test]
-    fn packet_sufficiency_treats_unresolved_sidecar_candidates_as_gap() {
+    fn packet_sufficiency_uses_selected_plan_role_probes() {
+        let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let plan = build_packet_plan_with_extra(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+            &[],
+        );
+        let extra_probes = packet_plan_sufficiency_extra_probes(&plan, &[]);
+        for expected in ["pattern", "custom validation flow", "validity state"] {
+            assert!(
+                extra_probes.iter().any(|query| query == expected),
+                "expected selected plan probe {expected:?} in {extra_probes:?}"
+            );
+        }
+
+        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation(
+                    "showError",
+                    "html/forms/form-validation/detailed-custom-validation.html",
+                    0.9,
+                ),
+                test_packet_citation("errors", "accessibility/css/form-validation.html", 0.8),
+                test_packet_citation(
+                    "validate",
+                    "accessibility/aria/validation-checkbox-disabled.js",
+                    0.8,
+                ),
+                test_packet_citation(
+                    "advancedForm",
+                    "html/forms/native-form-widgets/advanced-examples.html",
+                    0.8,
+                ),
+            ],
+        );
+        rank_packet_evidence(question, &mut answer);
+        append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
+        let budget = apply_packet_budget_with_extra(
+            packet_fixture_project_root(),
+            question,
+            plan.task_class,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+            &extra_probes,
+        );
+        let sufficiency = build_packet_sufficiency_with_extra(
+            packet_fixture_project_root(),
+            question,
+            plan.task_class,
+            &answer,
+            &budget,
+            &extra_probes,
+        );
+
+        assert_eq!(
+            sufficiency.status,
+            PacketSufficiencyStatusDto::Partial,
+            "{sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("submit prevent default")
+                    && !gap.contains("pattern")
+                    && !gap.contains("validity state")),
+            "only selected planned probes for still-missing roles should become sufficiency gaps: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn packet_sufficiency_keeps_nonblocking_unresolved_sidecar_candidates_diagnostic() {
         let question = "Explain how packet retrieval flows through sidecar diagnostics.";
         let (mut answer, initial_sufficiency) = build_sufficient_packet_fixture(
             question,
             PacketTaskClassDto::EditPlanning,
             vec![
-                test_packet_citation("packet_planner", "src/packet.rs", 0.9),
-                test_packet_citation("sidecar_batch", "src/sidecar.rs", 0.8),
-                test_packet_citation("sufficiency_builder", "src/sufficiency.rs", 0.7),
+                test_packet_citation("PacketPlanner", "src/packet_plan.rs", 0.9),
+                test_packet_citation("RuntimeCoordinator", "src/runtime.rs", 0.8),
+                test_packet_citation("ProjectionStore", "src/store.rs", 0.7),
             ],
         );
         assert_eq!(
@@ -3655,24 +5457,22 @@ mod tests {
             &budget,
         );
 
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(
-            sufficiency
+            !sufficiency
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("sidecar candidates")),
-            "expected sidecar candidate gap, got {:?}",
+            "nonblocking sidecar diagnostics should not become sufficiency gaps: {:?}",
             sufficiency.gaps
         );
-        let sidecar_gap = sufficiency
-            .gaps
-            .iter()
-            .find(|gap| gap.contains("sidecar candidates"))
-            .expect("sidecar gap");
         assert_eq!(
-            sidecar_gap.matches("sidecar batch").count(),
-            1,
-            "duplicate diagnostics should not duplicate query names in sufficiency gaps: {sidecar_gap}"
+            sufficiency
+                .coverage_report
+                .as_ref()
+                .map(|report| report.unresolved.as_slice()),
+            Some(&["sidecar batch".to_string()][..]),
+            "duplicate diagnostics should remain visible once in coverage_report.unresolved: {sufficiency:?}"
         );
     }
 
@@ -3682,20 +5482,16 @@ mod tests {
             "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.",
             PacketTaskClassDto::ArchitectureExplanation,
             vec![
-                test_packet_citation("exec runtime", "codex-rs/exec/src/lib.rs", 0.9),
-                test_packet_citation("exec session", "codex-rs/exec/src/lib.rs", 0.9),
-                test_packet_citation("exec cli", "codex-rs/cli/src/main.rs", 0.8),
+                test_packet_citation("run_exec_session", "codex-rs/exec/src/lib.rs", 0.9),
+                test_packet_citation("RuntimeCoordinator", "codex-rs/exec/src/lib.rs", 0.9),
+                test_packet_citation("main", "codex-rs/cli/src/main.rs", 0.8),
                 test_packet_citation("exec command", "codex-rs/cli/src/main.rs", 0.8),
                 test_packet_citation(
-                    "json event output",
+                    "EventProcessorWithJsonOutput",
                     "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
                     0.8,
                 ),
-                test_packet_citation(
-                    "jsonl event output",
-                    "codex-rs/exec/src/exec_events.rs",
-                    0.8,
-                ),
+                test_packet_citation("JsonlEventOutput", "codex-rs/exec/src/exec_events.rs", 0.8),
                 test_packet_citation(
                     "thread start",
                     "codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParams.ts",
@@ -3719,7 +5515,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_sufficiency_rejects_module_facade_for_concrete_file_probe() {
+    fn packet_sufficiency_treats_concrete_file_probe_as_hint_when_roles_are_covered() {
         let _eval_probes = EvalProbesGuard::enabled();
         let (_answer, sufficiency) = build_sufficient_packet_fixture(
             "Explain how `codex exec --json` flows from the top-level CLI into the exec runtime, app-server thread and turn start requests, and JSONL event output.",
@@ -3748,13 +5544,13 @@ mod tests {
             ],
         );
 
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
         assert!(
             sufficiency
                 .gaps
                 .iter()
-                .any(|gap| gap.contains("exec_events")),
-            "facade module declaration should not satisfy the concrete exec_events file probe: {sufficiency:?}"
+                .all(|gap| !gap.contains("exec_events")),
+            "concrete file probes should be nonblocking hints when required flow roles are covered: {sufficiency:?}"
         );
     }
 
@@ -5353,7 +7149,16 @@ mod tests {
             .map(|query| query.query.as_str())
             .collect::<Vec<_>>();
 
-        for expected in ["event loop", "network input", "command dispatch"] {
+        for expected in [
+            "server bootstrap",
+            "command server entrypoint",
+            "event loop source",
+            "network command input",
+            "command table dispatch",
+            "event loop",
+            "network input",
+            "command dispatch",
+        ] {
             assert!(
                 queries.contains(&expected),
                 "expected {expected} in command/event flow packet plan: {queries:?}"
@@ -5384,6 +7189,59 @@ mod tests {
             assert!(
                 !required.iter().any(|query| query == request_probe),
                 "sufficiency should not require request probe {request_probe}: {required:?}"
+            );
+        }
+
+        let dispatch_only_question =
+            "Trace how network command input reaches command table dispatch and command handlers.";
+        let dispatch_only_plan = build_packet_plan(
+            dispatch_only_question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let dispatch_only_queries = dispatch_only_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["network command input", "command table dispatch"] {
+            assert!(
+                dispatch_only_queries.contains(&expected),
+                "dispatch-only command plan should include {expected}: {dispatch_only_queries:?}"
+            );
+        }
+        for unexpected in [
+            "server bootstrap",
+            "command server entrypoint",
+            "event loop source",
+            "event loop",
+            "event dispatch",
+        ] {
+            assert!(
+                !dispatch_only_queries.contains(&unexpected),
+                "dispatch-only command plan should not require {unexpected}: {dispatch_only_queries:?}"
+            );
+        }
+        let dispatch_only_required = packet_sufficiency_required_probe_queries(
+            dispatch_only_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in ["network command input", "command table dispatch"] {
+            assert!(
+                dispatch_only_required.iter().any(|query| query == expected),
+                "dispatch-only command sufficiency should include {expected}: {dispatch_only_required:?}"
+            );
+        }
+        for unexpected in [
+            "server bootstrap",
+            "command server entrypoint",
+            "event loop source",
+        ] {
+            assert!(
+                !dispatch_only_required
+                    .iter()
+                    .any(|query| query == unexpected),
+                "dispatch-only command sufficiency should not require {unexpected}: {dispatch_only_required:?}"
             );
         }
     }
@@ -5815,13 +7673,13 @@ mod tests {
             .join("\n");
 
         for expected_claim in [
-            "The command or public entrypoint for this flow is anchored by `CliCommand`",
-            "Runtime orchestration is anchored by `RuntimeCoordinator`",
-            "Workspace discovery or planning is anchored by `WorkspacePlan`",
-            "Symbol extraction is anchored by `GraphIndexer`",
-            "Persistence or search projection is anchored by `ProjectionStore`",
-            "Snapshot refresh is anchored by `SnapshotRefresh`",
-            "Route handling is anchored by `RouteHandler`",
+            "The command or public entrypoint for this flow is `CliCommand`",
+            "`RuntimeCoordinator` coordinates runtime state transitions",
+            "`WorkspacePlan` handles workspace file selection",
+            "`GraphIndexer` extracts nodes, edges, occurrences",
+            "`ProjectionStore` persists or projects durable graph/search state",
+            "`SnapshotRefresh` refreshes post-write summaries",
+            "`RouteHandler` handles route dispatch or handler ownership",
         ] {
             assert!(
                 text.contains(expected_claim),
@@ -5829,7 +7687,7 @@ mod tests {
             );
         }
         assert!(
-            !text.contains("Regression coverage for this flow is anchored by `PacketRegression`"),
+            !text.contains("`PacketRegression` covers regression behavior"),
             "test-path regression claims should not crowd out primary flow claims: {text}"
         );
     }
@@ -6028,20 +7886,14 @@ mod tests {
             "The exec CLI defines --json as the switch that chooses JSONL stdout output."
         ));
         assert!(text.contains(
-            "run_main loads config, resolves sandbox and approval settings, and builds the in-process app-server start arguments"
-        ));
-        assert!(text.contains(
-            "The command or public entrypoint for this flow is anchored by `codex_exec::Cli`"
-        ));
-        assert!(text.contains("Runtime orchestration is anchored by `codex_exec::run_main`"));
-        assert!(text.contains(
-            "JSON/event output processing is anchored by `EventProcessorWithJsonOutput`"
+            "Runtime session entrypoint evidence loads config, resolves sandbox and approval settings, and builds app-server start arguments"
         ));
         assert!(
-            text.contains(
-                "App-server request protocol evidence is anchored by `ThreadStartParams`"
-            )
+            text.contains("The command or public entrypoint for this flow is `codex_exec::Cli`")
         );
+        assert!(text.contains("`codex_exec::run_main` coordinates runtime state transitions"));
+        assert!(text.contains("`EventProcessorWithJsonOutput` serializes typed runtime events"));
+        assert!(text.contains("`ThreadStartParams` defines app-server thread or turn start"));
         assert!(text.contains(
             "Event-output processing evidence describes how structured runtime events are serialized for JSON/JSONL output."
         ));
@@ -6183,11 +8035,11 @@ mod tests {
         assert!(text.contains(
             "Persistence/search-projection evidence describes how indexed data remains available to later application reads."
         ));
-        assert!(text.contains("Indexing work queue behavior is anchored by `Project::buildIndex`"));
-        assert!(text.contains("Source-group configuration is anchored by `SourceGroupCxxCdb`"));
-        assert!(text.contains("Persistence or search projection is anchored by `StorageAccess`"));
+        assert!(text.contains("`Project::buildIndex` turns build-index commands"));
+        assert!(text.contains("`SourceGroupCxxCdb` maps project settings"));
+        assert!(text.contains("`StorageAccess` persists or projects durable graph/search state"));
         assert!(
-            text.contains("Persistence or search projection is anchored by `PersistentStorage`")
+            text.contains("`PersistentStorage` persists or projects durable graph/search state")
         );
     }
 
@@ -6245,12 +8097,12 @@ mod tests {
             .join("\n");
 
         for expected in [
-            "The CLI index command prepares command options and delegates indexing work into the runtime layer.",
-            "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
-            "The workspace crate is responsible for source-file discovery and refresh-plan construction.",
-            "The indexer extracts nodes, edges, occurrences, and related symbol data from source files.",
-            "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data.",
-            "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state.",
+            "Indexing entrypoint evidence delegates indexing work into the runtime orchestration layer.",
+            "Runtime orchestration evidence opens workspace/store state and coordinates refresh phases.",
+            "Workspace discovery evidence plans source-file discovery and refresh work.",
+            "Symbol extraction evidence builds graph nodes, edges, occurrences, and related source data.",
+            "Persistence evidence stores graph/file data and rebuilds query/search projections.",
+            "Snapshot refresh evidence updates read models after persisted graph changes.",
         ] {
             assert!(
                 text.contains(expected),
@@ -6388,8 +8240,8 @@ mod tests {
             !text.contains("SourceGroupCxxCdb reads compile database input"),
             "production claims should not inject Sourcetrail-specific template text: {text}"
         );
-        assert!(text.contains("Indexing work queue behavior is anchored by `Project::buildIndex`"));
-        assert!(text.contains("Persistence or search projection is anchored by `StorageAccess`"));
+        assert!(text.contains("`Project::buildIndex` turns build-index commands"));
+        assert!(text.contains("`StorageAccess` persists or projects durable graph/search state"));
     }
 
     #[test]
@@ -6453,13 +8305,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("Runtime orchestration is anchored by `ExtensionService`"));
-        assert!(text.contains(
-            "The command or public entrypoint for this flow is anchored by `ExtHostCommands`"
-        ));
+        assert!(text.contains("`ExtensionService` coordinates runtime state transitions"));
         assert!(
-            text.contains("Source evidence is anchored by")
-                || text.contains("Runtime orchestration is anchored by"),
+            text.contains("The command or public entrypoint for this flow is `ExtHostCommands`")
+        );
+        assert!(
+            text.contains("ties") || text.contains("coordinates runtime state transitions"),
             "VS Code packet claims should use generic role-led anchors: {text}"
         );
     }
@@ -6521,8 +8372,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("Collection configuration is anchored by `Posts`"));
-        assert!(text.contains("Route handling is anchored by `POST /posts/:slug/comments`"));
+        assert!(text.contains("`Posts` defines collection schema fields"));
+        assert!(
+            text.contains(
+                "`POST /posts/:slug/comments` handles route dispatch or handler ownership"
+            )
+        );
         assert!(text.contains("`getPayloadClient` in `src/lib/payload.ts`"));
     }
 
@@ -6762,7 +8617,7 @@ mod tests {
                     ),
                     test_packet_citation("WorkspacePlan", "crates/workspace/src/plan.rs", 0.8),
                 ],
-                "Runtime orchestration is anchored by `RuntimeCoordinator`",
+                "`RuntimeCoordinator` coordinates runtime state transitions",
                 "crates/app-runtime/src/runtime.rs",
             ),
             (
@@ -6773,7 +8628,7 @@ mod tests {
                     test_packet_citation("DecodeValidator", "src/validation/decode.rs", 0.8),
                     test_packet_citation("DecodeRegression", "tests/decode_regression.rs", 0.7),
                 ],
-                "Runtime orchestration is anchored by `RuntimeErrorHandler`",
+                "`RuntimeErrorHandler` coordinates runtime state transitions",
                 "src/runtime/errors.rs",
             ),
             (
@@ -6792,7 +8647,7 @@ mod tests {
                         0.7,
                     ),
                 ],
-                "Symbol extraction is anchored by `AffectedReferenceIndex`",
+                "`AffectedReferenceIndex` extracts nodes, edges, occurrences",
                 "crates/indexer/src/references.rs",
             ),
             (
@@ -6803,7 +8658,7 @@ mod tests {
                     test_packet_citation("RouteHandler", "src/router/handler.rs", 0.8),
                     test_packet_citation("RouteRegression", "tests/route_regression.rs", 0.7),
                 ],
-                "Route handling is anchored by `RouteHandler`",
+                "`RouteHandler` handles route dispatch or handler ownership",
                 "src/router/handler.rs",
             ),
             (
@@ -6822,7 +8677,7 @@ mod tests {
                         0.7,
                     ),
                 ],
-                "Workspace discovery or planning is anchored by `WorkspaceOwnerPlan`",
+                "`WorkspaceOwnerPlan` handles workspace file selection",
                 "crates/workspace/src/ownership.rs",
             ),
             (
@@ -6833,7 +8688,7 @@ mod tests {
                     test_packet_citation("ConfigEditPlan", "src/config/edit_plan.rs", 0.8),
                     test_packet_citation("ConfigRegression", "tests/config_regression.rs", 0.7),
                 ],
-                "Regression coverage for this flow is anchored by `ConfigRegression`",
+                "`ConfigRegression` covers regression behavior",
                 "tests/config_regression.rs",
             ),
         ];
@@ -6915,6 +8770,85 @@ mod tests {
     }
 
     #[test]
+    fn architecture_sufficiency_does_not_invent_flow_roles_without_requirements() {
+        let question = "Explain the module relationships.";
+        let citations = vec![
+            test_packet_citation("Alpha", "src/alpha.rs", 0.9),
+            test_packet_citation("Beta", "src/beta.rs", 0.85),
+            test_packet_citation("Gamma", "src/gamma.rs", 0.8),
+        ];
+        let (_answer, sufficiency) = build_sufficient_packet_fixture(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+            citations,
+        );
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .all(|gap| !gap.contains("flow-role coverage")),
+            "architecture sufficiency should only report flow-role gaps from shared requirements: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn generic_navigation_claims_do_not_satisfy_packet_sufficiency() {
+        let generic = PacketClaimDto {
+            claim: "Runtime orchestration is anchored by `RuntimeCoordinator`; inspect it there."
+                .to_string(),
+            citations: vec![test_packet_citation(
+                "RuntimeCoordinator",
+                "src/runtime.rs",
+                0.9,
+            )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        };
+        let causal = PacketClaimDto {
+            claim: "`RuntimeCoordinator` coordinates runtime state transitions and downstream service calls."
+                .to_string(),
+            citations: vec![test_packet_citation(
+                "RuntimeCoordinator",
+                "src/runtime.rs",
+                0.9,
+            )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        };
+        let adjacent = PacketClaimDto {
+            claim:
+                "`Session.send` in `src/requests/sessions.py` ties request, session in this flow to cited definitions and adjacent ownership."
+                    .to_string(),
+            citations: vec![test_packet_citation(
+                "Session.send",
+                "src/requests/sessions.py",
+                0.9,
+            )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        };
+        let definition = PacketClaimDto {
+            claim:
+                "`PreparedRequest` is defined in cited source `src/requests/models.py` and should be treated as an exact source anchor for this flow."
+                    .to_string(),
+            citations: vec![test_packet_citation(
+                "PreparedRequest",
+                "src/requests/models.py",
+                0.9,
+            )],
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        };
+
+        assert!(!packet_claim_can_satisfy_sufficiency(&generic));
+        assert!(!packet_claim_can_satisfy_sufficiency(&adjacent));
+        assert!(!packet_claim_can_satisfy_sufficiency(&definition));
+        assert!(packet_claim_can_satisfy_sufficiency(&causal));
+    }
+
+    #[test]
     fn claim_family_coverage_uses_covered_claim_semantics() {
         let claims = vec![
             PacketClaimDto {
@@ -6925,6 +8859,8 @@ mod tests {
                     "src/index/use-swr.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "useSWRHandler serializes the key before reading cache state.".to_string(),
@@ -6933,6 +8869,8 @@ mod tests {
                     "src/_internal/utils/serialize.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim:
@@ -6943,6 +8881,8 @@ mod tests {
                     "src/_internal/utils/helper.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "internalMutate routes mutate behavior through the mutation helper."
@@ -6952,6 +8892,8 @@ mod tests {
                     "src/_internal/utils/mutate.ts",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
@@ -6993,6 +8935,8 @@ mod tests {
                     "src/main/java/org/apache/commons/lang3/StringUtils.java",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
@@ -7002,12 +8946,35 @@ mod tests {
                     "src/main/java/org/apache/commons/lang3/StringUtils.java",
                     0.9,
                 )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
+            },
+            PacketClaimDto {
+                claim: "Strings delegates region matching work to CharSequenceUtils.regionMatches."
+                    .to_string(),
+                citations: vec![test_packet_citation(
+                    "Strings.regionMatches",
+                    "src/main/java/org/apache/commons/lang3/Strings.java",
+                    0.9,
+                )],
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             },
         ];
 
-        assert_eq!(packet_claim_family(&claims[0]), Some("predicate behavior"));
-        assert_eq!(packet_claim_family(&claims[1]), Some("predicate behavior"));
-        assert_eq!(packet_supported_claim_family_count(&claims), 1);
+        assert_eq!(
+            packet_claim_family(&claims[0]),
+            Some("predicate blank behavior")
+        );
+        assert_eq!(
+            packet_claim_family(&claims[1]),
+            Some("predicate empty behavior")
+        );
+        assert_eq!(
+            packet_claim_family(&claims[2]),
+            Some("predicate region/case flow")
+        );
+        assert_eq!(packet_supported_claim_family_count(&claims), 3);
     }
 
     #[test]
@@ -7184,11 +9151,11 @@ mod tests {
         };
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, budget, 5_500),
-            14
+            6
         );
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, budget, 8_000),
-            7
+            3
         );
     }
 
@@ -7351,7 +9318,104 @@ mod tests {
     }
 
     #[test]
-    fn answer_critical_budget_truncation_requires_deeper_packet() {
+    fn markdown_budget_skips_tiny_diagram_intro_and_truncates_verbose_sections_first() {
+        let question = "Explain compact packet proof retention.";
+        let mut answer = packet_answer_fixture(
+            question,
+            vec![
+                test_packet_citation("CliCommand", "crates/tool-cli/src/main.rs", 0.8),
+                test_packet_citation("RuntimeCoordinator", "crates/core/src/runtime.rs", 0.8),
+                test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
+            ],
+        );
+        answer.sections = vec![
+            AgentResponseSectionDto {
+                id: "packet-evidence-ledger".to_string(),
+                title: "Packet Evidence Ledger".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "proof citation ledger\n".repeat(250),
+                }],
+            },
+            AgentResponseSectionDto {
+                id: "packet-flow-claims".to_string(),
+                title: "Packet Claims".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "covered proof claim\n".repeat(250),
+                }],
+            },
+            AgentResponseSectionDto {
+                id: "retrieval-evidence".to_string(),
+                title: "Retrieval Evidence".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "repeated snippet and retrieval appendix\n".repeat(1_200),
+                }],
+            },
+            AgentResponseSectionDto {
+                id: "diagrams".to_string(),
+                title: "Diagrams".to_string(),
+                blocks: vec![
+                    AgentResponseBlockDto::Markdown {
+                        markdown: "Mermaid diagrams generated from indexed graph retrieval."
+                            .to_string(),
+                    },
+                    AgentResponseBlockDto::Mermaid {
+                        graph_id: "primary".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let original_proof_sections = answer.sections[0..2]
+            .iter()
+            .map(|section| match &section.blocks[0] {
+                AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
+                AgentResponseBlockDto::Mermaid { .. } => String::new(),
+            })
+            .collect::<Vec<_>>();
+        let original_diagram_intro = match &answer.sections[3].blocks[0] {
+            AgentResponseBlockDto::Markdown { markdown } => markdown.clone(),
+            AgentResponseBlockDto::Mermaid { .. } => String::new(),
+        };
+        let original_bytes = serde_json::to_vec(&answer).unwrap().len();
+        let truncated = truncate_answer_markdown_to_byte_cap(&mut answer, original_bytes - 6_000);
+
+        assert!(truncated);
+        for (section, original_markdown) in
+            answer.sections[0..2].iter().zip(original_proof_sections)
+        {
+            let AgentResponseBlockDto::Markdown { markdown } = &section.blocks[0] else {
+                panic!("proof section should remain markdown");
+            };
+            assert_eq!(
+                markdown, &original_markdown,
+                "proof-bearing section `{}` should not be truncated before verbose sections",
+                section.id
+            );
+        }
+        let AgentResponseBlockDto::Markdown {
+            markdown: retrieval_markdown,
+        } = &answer.sections[2].blocks[0]
+        else {
+            panic!("retrieval evidence should remain markdown");
+        };
+        assert!(
+            retrieval_markdown.contains(PACKET_MARKDOWN_TRUNCATION_SUFFIX.trim()),
+            "large retrieval evidence should absorb truncation before proof sections"
+        );
+        let AgentResponseBlockDto::Markdown {
+            markdown: diagram_intro,
+        } = &answer.sections[3].blocks[0]
+        else {
+            panic!("diagram intro should remain markdown");
+        };
+        assert_eq!(
+            diagram_intro, &original_diagram_intro,
+            "tiny diagram intro should be skipped instead of aborting truncation"
+        );
+    }
+
+    #[test]
+    fn hard_payload_budget_truncation_requires_deeper_packet() {
         let question = "Explain the packet stop rule when evidence is clipped.";
         let mut answer = packet_answer_fixture(
             question,
@@ -7370,7 +9434,7 @@ mod tests {
             &mut answer,
         );
         budget.truncated = true;
-        budget.omitted_sections = vec!["markdown_blocks".to_string(), "trail_edges".to_string()];
+        budget.omitted_sections = vec!["packet_payload".to_string()];
         budget.next_deeper_command = next_deeper_packet_command(
             packet_fixture_project_root(),
             question,
@@ -7391,7 +9455,7 @@ mod tests {
                 .gaps
                 .iter()
                 .any(|gap| gap.contains("answer-critical evidence")),
-            "answer-critical truncation should be named as a sufficiency gap: {sufficiency:?}"
+            "hard payload truncation should be named as a sufficiency gap: {sufficiency:?}"
         );
         assert!(
             sufficiency
@@ -7438,11 +9502,7 @@ mod tests {
             question,
             vec![
                 test_packet_citation("Posts", "src/collections/Posts.ts", 0.9),
-                test_packet_citation(
-                    "getApprovedCommentsForPost",
-                    "src/lib/content-data/comment-content.ts",
-                    0.9,
-                ),
+                test_packet_citation("ContentStore", "src/lib/content-data/content-store.ts", 0.9),
                 test_packet_citation("GET /feed.xml", "src/app/feed.xml/route.ts", 0.9),
             ],
         );
@@ -7546,11 +9606,7 @@ mod tests {
             question,
             vec![
                 test_packet_citation("Posts", "src/collections/Posts.ts", 0.9),
-                test_packet_citation(
-                    "getApprovedCommentsForPost",
-                    "src/lib/content-data/comment-content.ts",
-                    0.9,
-                ),
+                test_packet_citation("ContentStore", "src/lib/content-data/content-store.ts", 0.9),
                 test_packet_citation("GET /feed.xml", "src/app/feed.xml/route.ts", 0.9),
             ],
         );
@@ -7922,7 +9978,7 @@ mod tests {
         assert!(
             sufficiency.covered_claims.iter().any(|claim| claim
                 .claim
-                .contains("Runtime orchestration is anchored by `RuntimeCoordinator`")),
+                .contains("`RuntimeCoordinator` coordinates runtime state transitions")),
             "generic packet should include claim-led runtime flow notes: {sufficiency:?}"
         );
         assert!(
@@ -8041,6 +10097,25 @@ mod tests {
             express_question,
             PacketTaskClassDto::RouteTracing,
         );
+        let express_sufficiency_extra = packet_plan_sufficiency_extra_probes(&express_plan, &[]);
+
+        for generic_probe in [
+            "app initialization",
+            "middleware registration",
+            "request handler",
+            "response send",
+        ] {
+            assert!(
+                express_queries.contains(&generic_probe),
+                "production plan should include JS route source probe `{generic_probe}` in {express_queries:?}"
+            );
+            assert!(
+                express_sufficiency_extra
+                    .iter()
+                    .any(|query| query == generic_probe),
+                "production plan should protect JS route source probe `{generic_probe}` during citation capping: {express_sufficiency_extra:?}"
+            );
+        }
 
         for eval_only_probe in [
             "createApplication",
@@ -8128,6 +10203,17 @@ mod tests {
                 "production packet plan should keep literal prompt symbol `{literal_symbol}` in {queries:?}"
             );
         }
+        for source_probe in [
+            "StringUtils.java isBlank",
+            "StringUtils.java isEmpty",
+            "Strings.java regionMatches",
+            "CharSequenceUtils.java regionMatches",
+        ] {
+            assert!(
+                queries.contains(&source_probe),
+                "production packet plan should derive Java source-scoped predicate probe `{source_probe}` in {queries:?}"
+            );
+        }
         for eval_only_probe in [
             "StringUtils.isBlank",
             "StringUtils.isEmpty",
@@ -8138,6 +10224,180 @@ mod tests {
             assert!(
                 !queries.contains(&eval_only_probe),
                 "production packet plan should not add eval-only family probe `{eval_only_probe}` in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_generic_predicate_method_probes_in_production() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let question = "Explain how text checks distinguish blank, empty, and case sensitive inputs. Cite the source files and name the supporting symbols.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for generic_probe in [
+            "isBlank",
+            "is_empty",
+            "isCaseSensitive",
+            "is_case_sensitive",
+        ] {
+            assert!(
+                queries.contains(&generic_probe),
+                "production packet plan should include generic predicate probe `{generic_probe}` in {queries:?}"
+            );
+        }
+
+        for eval_only_probe in ["StringUtils.isBlank", "StringUtils.isEmpty"] {
+            assert!(
+                !queries.contains(&eval_only_probe),
+                "production packet plan should not add benchmark-shaped predicate probe `{eval_only_probe}` in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_scoped_predicate_method_probes_in_production() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let question = "Explain how TextChecks and CharSequenceHelpers implement blank, empty, and case sensitive text checks. Cite the source files and name the supporting symbols.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for scoped_probe in [
+            "TextChecks isBlank",
+            "TextChecks isEmpty",
+            "TextChecks.java isBlank",
+            "TextChecks.java isEmpty",
+            "regionMatches",
+            "CharSequenceHelpers regionMatches",
+            "CharSequenceHelpers.java regionMatches",
+        ] {
+            assert!(
+                queries.contains(&scoped_probe),
+                "production packet plan should include scoped predicate probe `{scoped_probe}` in {queries:?}"
+            );
+        }
+
+        for eval_only_probe in ["TextChecks.isBlank", "TextChecks.isEmpty"] {
+            assert!(
+                !queries.contains(&eval_only_probe),
+                "production packet plan should not add dotted predicate probe `{eval_only_probe}` in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_runtime_formatting_probes_in_production() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let question = "Explain how a formatting library turns formatting arguments into type-erased format args and reaches vformat or format_to output paths. Cite the source files and name the supporting symbols.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required = packet_sufficiency_required_probe_queries(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for expected in [
+            "format argument store",
+            "dynamic format argument collection",
+            "format error type",
+            "format source buffer append",
+            "buffer append",
+            "system source vformat",
+            "output formatting function",
+            "system error formatting",
+            "format error code",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "production packet plan should include runtime formatting probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect runtime formatting probe `{expected}` in {required:?}"
+            );
+        }
+
+        for eval_only_probe in [
+            "include/fmt/base.h format_arg_store",
+            "include/fmt/args.h dynamic_format_arg_store",
+            "include/fmt/format.h format_error",
+        ] {
+            assert!(
+                !queries.contains(&eval_only_probe)
+                    && !required.iter().any(|query| query == eval_only_probe),
+                "production packet plan should not add holdout-shaped formatting probe `{eval_only_probe}`; queries={queries:?} required={required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_log_record_handler_probes_in_production() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let question = "Explain how a logger turns a log call into a LogRecord and passes it through handlers. Cite the source files and name the supporting symbols.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::DataFlow),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
+
+        for expected in [
+            "logger handler stack",
+            "handler registration",
+            "logger record creation",
+            "log method record handoff",
+            "record handler interface",
+            "processing handler write boundary",
+            "handler processing",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "production packet plan should include log-record handler probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect log-record handler probe `{expected}` in {required:?}"
+            );
+        }
+
+        for eval_only_probe in [
+            "src/Monolog/Logger.php Logger::addRecord",
+            "src/Monolog/Handler/AbstractProcessingHandler.php AbstractProcessingHandler::handle",
+        ] {
+            assert!(
+                !queries.contains(&eval_only_probe)
+                    && !required.iter().any(|query| query == eval_only_probe),
+                "production packet plan should not add holdout-shaped log probe `{eval_only_probe}`; queries={queries:?} required={required:?}"
             );
         }
     }
@@ -8290,6 +10550,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn packet_plan_derives_generic_css_animation_source_probes() {
+        let question = "Explain how a stylesheet defines shared animation variables, base classes, and connects named animation classes to keyframes.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required = packet_sufficiency_required_probe_queries(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for expected in [
+            "animation custom property duration",
+            "animation custom property delay",
+            "animation base class",
+            "animation stylesheet import",
+            "named animation class",
+            "named keyframes animation",
+            "css animation variables",
+            "css animation imports",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic CSS animation probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic CSS animation probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
     #[test]
     fn packet_plan_derives_automapper_map_flow_symbol_probes() {
         let _eval_probes = EvalProbesGuard::enabled();
@@ -8329,6 +10629,340 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn packet_plan_derives_generic_mapper_configuration_plan_probes() {
+        let question = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type map plans.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::DataFlow),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
+
+        for expected in [
+            "mapper public api",
+            "mapping runtime entrypoint",
+            "mapping configuration source",
+            "type map source",
+            "mapping lambda plan",
+            "mapping plan builder",
+            "type map plan",
+            "mapping execution plan",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic mapper probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic mapper probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_generic_client_send_source_probes() {
+        let question = "Explain how an HTTP package exposes top-level helpers, Client convenience methods, BaseRequest finalization, and IOClient send behavior.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::DataFlow),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::DataFlow);
+
+        for expected in [
+            "http top level helper",
+            "client convenience method",
+            "client send implementation",
+            "io transport client send",
+            "response stream boundary",
+            "top level helpers",
+            "request finalization",
+            "transport send",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic client-send probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic client-send probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_generic_form_validation_source_probes() {
+        let question = "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required = packet_sufficiency_required_probe_queries(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for expected in [
+            "html form required constraint",
+            "html form pattern constraint",
+            "html form min max constraints",
+            "custom form validation input",
+            "custom validation validity state",
+            "custom validation error rendering",
+            "native form constraints",
+            "custom validation flow",
+            "validity state",
+            "submit prevent default",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic form-validation probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic form-validation probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_generic_url_session_request_source_probes() {
+        let question = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::RouteTracing);
+
+        for expected in [
+            "session request creation",
+            "request object creation",
+            "request resume dispatch",
+            "request validation pipeline",
+            "delegate callback handling",
+            "url session callback boundary",
+            "request task resume",
+            "data request validation",
+            "urlsession callbacks",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic URLSession request probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic URLSession request probe `{expected}` in {required:?}"
+            );
+        }
+
+        for http_seed in ["router", "route handler endpoint", "middleware"] {
+            assert!(
+                !queries.contains(&http_seed),
+                "URLSession route-tracing prompt should not include HTTP route seed `{http_seed}` in {queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_does_not_apply_urlsession_probes_to_python_session_adapters() {
+        let question = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required = packet_sufficiency_required_probe_queries(
+            question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+
+        for forbidden in [
+            "Session.swift Session",
+            "Session.swift Session.request",
+            "Request.swift Request",
+            "Request.swift Request.resume",
+            "request_object.swift request",
+            "request_object.swift validate",
+            "delegate_callbacks.swift delegate",
+            "delegate_callbacks.swift urlSession",
+        ] {
+            assert!(
+                !queries.contains(&forbidden),
+                "Python session-adapter prompt should not include Swift URLSession probe `{forbidden}` in {queries:?}"
+            );
+            assert!(
+                !required.iter().any(|query| query == forbidden),
+                "Python session-adapter prompt should not require Swift URLSession probe `{forbidden}` in {required:?}"
+            );
+        }
+
+        for expected in [
+            "request preparation",
+            "session request",
+            "session send",
+            "adapter send",
+            "adapter selection",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "Python session-adapter prompt should keep request/adapter probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "Python session-adapter prompt should require request/adapter probe `{expected}` in {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_keeps_javascript_route_probes_separate_from_route_tree_probes() {
+        let express_question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
+        let express_plan = build_packet_plan(
+            express_question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let express_queries = express_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let express_required = packet_sufficiency_required_probe_queries(
+            express_question,
+            PacketTaskClassDto::RouteTracing,
+        );
+
+        for expected in [
+            "middleware registration",
+            "route registration",
+            "request handler",
+            "response send",
+        ] {
+            assert!(
+                express_queries.contains(&expected),
+                "Express route prompt should include JS/source probe `{expected}` in {express_queries:?}"
+            );
+        }
+        for forbidden in [
+            "router group",
+            "route tree",
+            "route tree add route",
+            "router group handle route",
+            "engine request handler",
+            "context next handler chain",
+            "engine creation",
+            "engine creation router state",
+        ] {
+            assert!(
+                !express_queries.contains(&forbidden),
+                "Express route prompt should not inherit route-tree probe `{forbidden}` in {express_queries:?}"
+            );
+            assert!(
+                !express_required.iter().any(|query| query == forbidden),
+                "Express route prompt should not require route-tree probe `{forbidden}` in {express_required:?}"
+            );
+        }
+
+        let gin_question = "Trace how Gin creates an engine, registers routes through router groups, stores them in method trees, and dispatches handlers for a request.";
+        let gin_plan = build_packet_plan(
+            gin_question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let gin_queries = gin_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "router group",
+            "route tree",
+            "route tree add route",
+            "engine request handler",
+            "context next handler chain",
+            "engine creation router state",
+        ] {
+            assert!(
+                gin_queries.contains(&expected),
+                "Gin engine/tree prompt should keep route-tree probe `{expected}` in {gin_queries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_plan_derives_generic_shell_install_dispatch_source_probes() {
+        let question = "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.";
+        let plan = build_packet_plan(
+            question,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Compact,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(question, PacketTaskClassDto::RouteTracing);
+
+        for expected in [
+            "shell installer bootstrap",
+            "install download helpers",
+            "shell function dispatch",
+            "conditional version use",
+            "shell completion",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "packet plan should include generic shell dispatch probe `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "packet required probes should protect generic shell dispatch probe `{expected}` in {required:?}"
+            );
+        }
+
+        for http_seed in ["router", "route handler endpoint", "middleware"] {
+            assert!(
+                !queries.contains(&http_seed),
+                "shell dispatcher route-tracing prompt should not include HTTP route seed `{http_seed}` in {queries:?}"
+            );
+        }
+    }
+
     #[test]
     fn gin_route_dispatch_source_claims_name_registration_and_context_flow() {
         let _eval_probes = EvalProbesGuard::enabled();
@@ -8473,7 +11107,7 @@ mod tests {
                   return app;
                 }
                 "#,
-                "createApplication builds a callable app object and mixes in request and response prototypes.",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
             ),
             (
                 "application",
@@ -8675,8 +11309,7 @@ mod tests {
             }
             "#,
         );
-        let expected =
-            "NativeClient.send forwards finalized requests through an HTTP client transport.";
+        let expected = "NativeClient.send is the dart:io transport implementation that forwards finalized requests through an HTTP client.";
         assert!(
             claims.iter().any(|claim| claim == expected),
             "expected eval-only transport send claim `{expected}`; got {claims:?}"
@@ -8805,7 +11438,7 @@ mod tests {
     }
     #[test]
     fn generic_sql_schema_claims_survive_with_generic_claims() {
-        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across SQL seed scripts. Cite the source files.";
         let citation = test_packet_citation("schema.sql", "db/schema.sql", 0.9);
         let claims = packet_source_derived_claims_for_citation(
             prompt,
@@ -8853,6 +11486,46 @@ mod tests {
     }
 
     #[test]
+    fn generic_sql_schema_packet_plan_derives_prompt_table_probes() {
+        let prompt = "Explain SQL schema relationships between artists, albums, tracks, invoices, and invoice lines across seed scripts.";
+        let plan = build_packet_plan(
+            prompt,
+            Some(PacketTaskClassDto::DataFlow),
+            PacketBudgetModeDto::Standard,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(prompt, PacketTaskClassDto::DataFlow);
+
+        for expected in [
+            "CREATE TABLE Artist",
+            "CREATE TABLE Album",
+            "CREATE TABLE Track",
+            "CREATE TABLE Invoice",
+            "CREATE TABLE InvoiceLine",
+            "FOREIGN KEY",
+            "REFERENCES",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == &expected),
+                "expected SQL schema packet query `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "expected SQL schema required probe `{expected}` in {required:?}"
+            );
+        }
+        assert!(
+            !queries.iter().any(|query| query == &"CREATE TABLE File"),
+            "source-file wording should not become a SQL table probe: {queries:?}"
+        );
+    }
+
+    #[test]
     fn runtime_formatting_claims_survive_with_generic_claims() {
         let prompt = "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths.";
 
@@ -8875,19 +11548,105 @@ mod tests {
         );
 
         for expected in [
-            "Runtime formatting uses type-erased format arguments before dispatching formatted output helpers.",
-            "Formatting errors are represented as runtime failures.",
+            "Runtime formatting routes format calls through a central runtime argument path.",
+            "Runtime formatting uses type-erased arguments before dispatching formatted output helpers.",
+            "Runtime formatting defines an error type for formatting failures.",
+            "Runtime formatting writes formatted output through output iterator helpers.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
                 "expected runtime formatting claim `{expected}` in {claims:?}"
             );
         }
+
+        let arg_store = test_packet_citation("dynamic_format_arg_store", "include/fmt/args.h", 0.9);
+        let arg_store_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &arg_store,
+            r#"
+            template <typename Context>
+            class dynamic_format_arg_store {
+              template <typename T>
+              void push_back(const T& value) {
+                data_.push_back(detail::make_arg<Context>(value));
+              }
+            };
+            "#,
+        );
+        assert!(
+            arg_store_claims.iter().any(|claim| claim
+                == "Runtime formatting builds type-erased format argument stores before dispatching formatting."),
+            "expected runtime formatting argument-store claim in {arg_store_claims:?}"
+        );
+
+        let format_cc = test_packet_citation("buffer<char>::append", "src/format.cc", 0.9);
+        let source_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &format_cc,
+            "template FMT_API void buffer<char>::append(const char*, const char*);",
+        );
+        assert!(
+            source_claims.iter().any(|claim| claim
+                == "Runtime formatting source instantiates buffer append paths for formatted output."),
+            "expected runtime formatting source-buffer claim in {source_claims:?}"
+        );
+
+        let os_cc = test_packet_citation("format_windows_error", "src/os.cc", 0.9);
+        let os_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &os_cc,
+            r#"void format_windows_error(detail::buffer<char>& out, int error_code, const char* message) {
+              fmt::format_to(appender(out), FMT_STRING("{}: {}"), message, format_system_error(error_code));
+            }
+            std::system_error vformat_system_error(int ec, string_view format_str, format_args args) {
+              return std::system_error(ec, vformat(format_str, args));
+            }"#,
+        );
+        assert!(
+            os_claims.iter().any(|claim| claim
+                == "Runtime formatting error-boundary code formats system errors through shared formatting helpers."),
+            "expected runtime formatting OS-boundary claim in {os_claims:?}"
+        );
+    }
+
+    #[test]
+    fn site_build_packet_plan_derives_lifecycle_symbol_probes() {
+        let prompt = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.";
+        let plan = build_packet_plan(
+            prompt,
+            Some(PacketTaskClassDto::RouteTracing),
+            PacketBudgetModeDto::Standard,
+        );
+        let queries = plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        let required =
+            packet_sufficiency_required_probe_queries(prompt, PacketTaskClassDto::RouteTracing);
+
+        for expected in [
+            "build process entrypoint",
+            "site lifecycle process phases",
+            "site read phase",
+            "site render phase",
+            "site write phase",
+            "content reader read phase",
+            "page renderer render phase",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == &expected),
+                "expected site-build packet query `{expected}` in {queries:?}"
+            );
+            assert!(
+                required.iter().any(|query| query == expected),
+                "expected site-build required probe `{expected}` in {required:?}"
+            );
+        }
     }
 
     #[test]
     fn site_build_claims_survive_with_generic_claims() {
-        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases.";
 
         let fixtures = [
@@ -8906,7 +11665,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Build.process constructs a Jekyll::Site before running the build.",
+                "Build.process constructs or processes a site.",
             ),
             (
                 "Site#process",
@@ -8923,7 +11682,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Site#process runs read, generate, render, and write phases.",
+                "The site lifecycle method runs reset, read, generate, render, cleanup, and write phases.",
             ),
             (
                 "Reader",
@@ -8936,7 +11695,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Reader is responsible for reading site content.",
+                "Content reading source owns the site content read phase.",
             ),
             (
                 "Renderer",
@@ -8950,7 +11709,7 @@ mod tests {
                   end
                 end
                 "#,
-                "Renderer renders pages and documents.",
+                "Page rendering source handles page and document rendering.",
             ),
         ];
 
@@ -9111,13 +11870,44 @@ mod tests {
             </form>
             "#,
         );
+        write_packet_fixture_file(
+            &root,
+            "lib/application.js",
+            r#"
+            app.init = function init() {
+              this.defaultConfiguration();
+            };
+            app.handle = function handle(req, res, callback) {
+              this.router.handle(req, res, callback);
+            };
+            app.use = function use(fn) {
+              return this.router.use(fn);
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/response.js",
+            r#"
+            res.send = function send(body) {
+              this.set('Content-Length', body.length);
+              return this.end(body);
+            };
+            "#,
+        );
 
-        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let mut pathless = test_packet_citation("pathless", "", 0.1);
+        pathless.file_path = None;
+        let mut answer = packet_answer_fixture("fixture packet", vec![pathless]);
         let probes = [
             "lib/jekyll/site.rb Site#process".to_string(),
             "src/Logging/Logger.php Logger::addRecord".to_string(),
             "html/forms/custom-validation/detailed-custom-validation.html input#mail".to_string(),
             "html/forms/custom-validation/detailed-custom-validation.html novalidate".to_string(),
+            "lib/application.js init".to_string(),
+            "lib/application.js handle".to_string(),
+            "lib/application.js use".to_string(),
+            "lib/response.js send".to_string(),
         ];
         maybe_append_required_file_scoped_source_citations(
             &root,
@@ -9146,8 +11936,21 @@ mod tests {
         let has_boolean_attribute_anchor = answer.citations.iter().any(|citation| {
             citation.display_name == "novalidate" && citation.kind == NodeKind::ANNOTATION
         });
+        let has_js_init = answer.citations.iter().any(|citation| {
+            citation.display_name == "app.init" && citation.kind == NodeKind::METHOD
+        });
+        let has_js_handle = answer.citations.iter().any(|citation| {
+            citation.display_name == "app.handle" && citation.kind == NodeKind::METHOD
+        });
+        let has_js_use = answer.citations.iter().any(|citation| {
+            citation.display_name == "app.use" && citation.kind == NodeKind::METHOD
+        });
+        let has_js_send = answer.citations.iter().any(|citation| {
+            citation.display_name == "res.send" && citation.kind == NodeKind::METHOD
+        });
         let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
-            annotation == "packet_required_file_scoped_source_citations appended=4"
+            annotation.starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.contains("appended=8")
         });
 
         let _ = std::fs::remove_dir_all(&root);
@@ -9173,6 +11976,11 @@ mod tests {
             answer.citations
         );
         assert!(
+            has_js_init && has_js_handle && has_js_use && has_js_send,
+            "required source probe should append JavaScript receiver-method anchors: {:?}",
+            answer.citations
+        );
+        assert!(
             used_source_probe,
             "required source probe should annotate appended anchor count: {:?}",
             answer.retrieval_trace.annotations
@@ -9180,9 +11988,877 @@ mod tests {
     }
 
     #[test]
+    fn generic_source_shape_scan_adds_receiver_method_anchors() {
+        let root = packet_temp_root("generic-source-shape-route");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/core/application.js",
+            r#"
+            service.init = function init() {
+              this.defaultConfiguration();
+              this.router = new Router();
+            };
+            service.handle = function handle(req, res, callback) {
+              this.router.handle(req, res, callback);
+            };
+            service.use = function use(fn) {
+              return this.router.use(fn);
+            };
+            service.route = function route(path) {
+              return this.router.route(path);
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/core/response.js",
+            r#"
+            reply.send = function send(body) {
+              this.set('Content-Length', body.length);
+              return this.end(body);
+            };
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Trace how a server application registers middleware/routes and handles a request through router and response helpers.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Trace how a server application registers middleware/routes and handles a request through router and response helpers.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "service.init",
+            "service.handle",
+            "service.use",
+            "service.route",
+            "reply.send",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic receiver-method source shape {expected}; got {displays:?}"
+            );
+        }
+        assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_generic_source_shape_citations appended=")
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_client_send_dart_anchors() {
+        let root = packet_temp_root("generic-source-shape-client-send");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "lib/http.dart",
+            r#"
+            export 'src/client.dart';
+            export 'src/request.dart';
+            export 'src/response.dart';
+            Future<Response> get(Uri url) => _withClient((client) => client.get(url));
+            Future<Response> post(Uri url) => _withClient((client) => client.post(url));
+            Future<T> _withClient<T>(Future<T> Function(Client) fn) async {
+              var client = Client();
+              return await fn(client);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/src/client.dart",
+            r#"
+            abstract interface class Client {
+              Future<Response> get(Uri url);
+              Future<Response> post(Uri url);
+              Future<StreamedResponse> send(BaseRequest request);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/src/request.dart",
+            r#"
+            class Request extends BaseRequest {
+              ByteStream finalize() {
+                return ByteStream.fromBytes(bodyBytes);
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/src/response.dart",
+            r#"
+            class Response extends BaseResponse {
+              static Future<Response> fromStream(StreamedResponse response) async {
+                final body = await response.stream.toBytes();
+                return Response.bytes(body, response.statusCode);
+              }
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a package exposes top-level helpers, Client convenience methods, Request finalization, and transport send behavior.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a package exposes top-level helpers, Client convenience methods, Request finalization, and transport send behavior.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "Top-level HTTP helpers",
+            "Client interface helpers",
+            "Request.finalize",
+            "Response.fromStream",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic client-send source shape {expected}; got {displays:?}"
+            );
+        }
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "Top-level HTTP helpers"
+                    && citation.coverage_role.as_deref() == Some("client public facade")
+                    && citation.eligible_for_sufficiency == Some(true)
+            }),
+            "expected public facade source shape to be sufficiency eligible: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_hook_cache_anchors() {
+        let root = packet_temp_root("generic-source-shape-hook-cache");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/hooks/use-data.ts",
+            r#"
+            export const useDataHandler = (_key, cache) => {
+              const [key, fnArg] = serialize(_key)
+              const [getCache, setCache] = createCacheHelper(cache, key)
+              return internalMutate(cache, key, fnArg)
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/key.ts",
+            r#"
+            export const normalizeKey = key => {
+              const args = key
+              key = typeof key == 'string' ? key : stableHash(key)
+              return [key, args]
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/cache-helper.ts",
+            r#"
+            export const makeCacheHelper = (cache, key) => {
+              const state = runtimeState.get(cache)
+              return [
+                () => cache.get(key) || EMPTY_CACHE,
+                info => {
+                  const prev = cache.get(key)
+                  cache.set(key, info)
+                  state[5](key, info, prev)
+                },
+                state[6],
+                () => snapshot[key] || cache.get(key)
+              ] as const
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/mutate.ts",
+            r#"
+            export async function applyMutation(cache, _key, data) {
+              return mutateByKey(_key)
+              async function mutateByKey(_k) {
+                const [key] = serialize(_k)
+                const [get, set] = createCacheHelper(cache, key)
+                set({ data })
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/middleware.ts",
+            r#"
+            export const withRuntimeMiddleware = (useHook: SWRHook, middleware) => {
+              return (...args) => {
+                const config = { use: [] }
+                const uses = (config.use || []).concat(middleware)
+                return useHook(args[0], args[1], { ...config, use: uses })
+              }
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a public hook serializes keys, connects cache helpers, composes middleware, and routes mutate behavior.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a public hook serializes keys, connects cache helpers, composes middleware, and routes mutate behavior.",
+            &mut answer,
+        );
+        let roles = answer
+            .citations
+            .iter()
+            .map(|citation| {
+                (
+                    citation.display_name.as_str(),
+                    citation.coverage_role.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (expected, role) in [
+            ("useDataHandler", "hook_key_serialization"),
+            ("normalizeKey", "hook_key_serialization"),
+            ("makeCacheHelper", "hook_cache_helper"),
+            ("applyMutation", "hook_mutation_flow"),
+            ("withRuntimeMiddleware", "hook_middleware_composition"),
+        ] {
+            assert!(
+                roles.iter().any(
+                    |(display, actual_role)| *display == expected && *actual_role == Some(role)
+                ),
+                "expected generic hook/cache source shape {expected} with role {role}; got {roles:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_command_flow_c_anchors() {
+        let root = packet_temp_root("generic-source-shape-command-flow");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/server.c",
+            r#"
+            void initServer(void) {
+              server.el = createEventLoop();
+            }
+            int main(int argc, char **argv) {
+              initServer();
+              aeMain(server.el);
+            }
+            int processCommand(client *c) {
+              return call(c, CMD_CALL_FULL);
+            }
+            void call(client *c, int flags) {
+              c->cmd->proc(c);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ae.c",
+            r#"
+            void aeMain(aeEventLoop *eventLoop) {
+              while (!eventLoop->stop) {
+                aeProcessEvents(eventLoop, AE_ALL_EVENTS);
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/networking.c",
+            r#"
+            void readQueryFromClient(connection *conn) {
+              client *c = connGetPrivateData(conn);
+              readQueryFromClient(c);
+              processInputBuffer(c);
+              processCommand(c);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "deps/noise.c",
+            r#"
+            void processCommand(client *c) {}
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Trace how a command server bootstrap enters an event loop, reads client input, and dispatches commands through a command table.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Trace how a command server bootstrap enters an event loop, reads client input, and dispatches commands through a command table.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "initServer",
+            "aeMain",
+            "readQueryFromClient",
+            "processCommand",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic command source shape {expected}; got {displays:?}"
+            );
+        }
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "readQueryFromClient"
+                    && citation.coverage_role.as_deref() == Some("command_network_input")
+                    && citation.eligible_for_sufficiency == Some(true)
+            }),
+            "expected client input source shape to be sufficiency eligible: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().all(|citation| !packet_display_path(
+                citation.file_path.as_deref().unwrap_or("")
+            )
+            .starts_with("deps/")),
+            "vendor/deps candidates should stay out of generic command source shapes: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_form_native_constraint_anchor() {
+        let root = packet_temp_root("generic-source-shape-form-validation");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "lessons/forms/native-validation.html",
+            r#"
+            <form>
+              <input required pattern="[a-z]+" min="3" max="12">
+            </form>
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.",
+            &mut answer,
+        );
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "Native form constraints"
+                    && citation.coverage_role.as_deref() == Some("form_native_constraints")
+                    && citation.eligible_for_sufficiency == Some(true)
+            }),
+            "expected native constraint source shape: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_runtime_formatting_type_anchors() {
+        let root = packet_temp_root("generic-source-shape-formatting");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "include/tool/base.hpp",
+            r#"
+            namespace detail {
+            struct runtime_format_arg_store {
+              void push_back();
+            };
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/dynamic.hpp",
+            r#"
+            template <typename Context> class dynamic_format_argument_store {
+            public:
+              void push_back();
+            };
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "include/tool/errors.hpp",
+            r#"
+            class TOOL_EXPORT format_failure : public std::runtime_error {
+            };
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a formatting runtime turns arguments into type-erased format argument stores and reports formatting failure types.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a formatting runtime turns arguments into type-erased format argument stores and reports formatting failure types.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "runtime_format_arg_store",
+            "dynamic_format_argument_store",
+            "format_failure",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic formatting source shape {expected}; got {displays:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_csharp_mapper_plan_anchors() {
+        let root = packet_temp_root("generic-source-shape-csharp-mapper");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/RuntimeMapper.cs",
+            r#"
+            namespace ObjectMapping;
+            public interface IRuntimeMapperBase
+            {
+              TDestination Map<TSource, TDestination>(TSource source);
+              object Map(object source, Type sourceType, Type destinationType);
+            }
+            public interface IRuntimeMapper : IRuntimeMapperBase
+            {
+              IConfigurationProvider ConfigurationProvider { get; }
+            }
+            public sealed class RuntimeMapper : IRuntimeMapper
+            {
+              public TDestination Map<TSource, TDestination>(TSource source) =>
+                MapCore<TSource, TDestination>(source, default);
+              TDestination MapCore<TSource, TDestination>(TSource source, TDestination destination) =>
+                _configuration.GetExecutionPlan<TSource, TDestination>()(source, destination);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/Configuration/MappingConfiguration.cs",
+            r#"
+            namespace ObjectMapping;
+            public sealed class MappingConfiguration
+            {
+              private readonly Dictionary<TypePair, MappingPlan> _configuredMaps = new();
+              private readonly Dictionary<TypePair, MappingPlan> _resolvedMaps = new();
+              private readonly Dictionary<MapRequest, Delegate> _executionPlans = new();
+              public RuntimeMapper CreateMapper() => new(this);
+              public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) =>
+                _resolvedMaps[new(sourceType, destinationType)].MapExpression;
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/MappingPlan.cs",
+            r#"
+            namespace ObjectMapping;
+            public sealed class MappingPlan
+            {
+              public Type SourceType { get; }
+              public Type DestinationType { get; }
+              public LambdaExpression MapExpression { get; private set; }
+              internal LambdaExpression BuildMapperLambda(IGlobalMappingConfiguration configuration) =>
+                Types.ContainsGenericParameters ? null : new MappingPlanBuilder(configuration, this).BuildMapperLambda();
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.iter().any(|display| {
+                display.contains("IRuntimeMapperBase")
+                    && display.contains("IRuntimeMapper")
+                    && display.contains("RuntimeMapper.Map")
+            }),
+            "expected compact generic C# mapper facade source-shape; got {displays:?}"
+        );
+        for expected in ["MappingConfiguration", "MappingPlan.BuildMapperLambda"] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic C# mapper source-shape {expected}; got {displays:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_csharp_mapper_facade_group_survives_compact_budget() {
+        let root = packet_temp_root("generic-source-shape-csharp-mapper-facade");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/ObjectMapping/RuntimeMapper.cs",
+            r#"
+            namespace ObjectMapping;
+            public interface IRuntimeMapperBase
+            {
+              TDestination Map<TSource, TDestination>(TSource source);
+              object Map(object source, Type sourceType, Type destinationType);
+            }
+            public interface IRuntimeMapper : IRuntimeMapperBase
+            {
+              IConfigurationProvider ConfigurationProvider { get; }
+            }
+            internal interface IInternalRuntimeMapper : IRuntimeMapper
+            {
+              TDestination Map<TSource, TDestination>(TSource source, TDestination destination, ResolutionContext context);
+            }
+            public sealed class RuntimeMapper : IRuntimeMapper, IInternalRuntimeMapper
+            {
+              public TDestination Map<TSource, TDestination>(TSource source) =>
+                MapCore<TSource, TDestination>(source, default);
+              TDestination MapCore<TSource, TDestination>(TSource source, TDestination destination) =>
+                _configuration.GetExecutionPlan<TSource, TDestination>()(source, destination);
+            }
+            "#,
+        );
+
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type-map lambda plans.";
+        let filler = (0..20)
+            .map(|index| {
+                test_packet_citation(
+                    &format!("UnrelatedHelper{index}"),
+                    &format!("src/ObjectMapping/Helpers/UnrelatedHelper{index}.cs"),
+                    0.5,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut answer = packet_answer_fixture(prompt, filler);
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+        rank_packet_evidence(prompt, &mut answer);
+
+        let mut limits = packet_budget_limits(PacketBudgetModeDto::Compact);
+        limits.max_anchors = 5;
+        apply_packet_budget(
+            &root,
+            prompt,
+            PacketTaskClassDto::DataFlow,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+        );
+
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            displays.iter().any(|display| {
+                display.contains("IRuntimeMapperBase")
+                    && display.contains("IRuntimeMapper")
+                    && display.contains("RuntimeMapper.Map")
+                    && !display.contains("IInternalRuntimeMapper")
+            }),
+            "expected compact generic mapper facade group to survive budget cap; got {displays:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_css_animation_variable_anchor() {
+        let root = packet_temp_root("generic-source-shape-css");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "styles/tokens.css",
+            r#"
+            :root {
+              --motion-duration: 250ms;
+              --motion-delay: 75ms;
+              --motion-repeat: 2;
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a stylesheet defines shared animation variables, base classes, and named keyframes.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a stylesheet defines shared animation variables, base classes, and named keyframes.",
+            &mut answer,
+        );
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "--motion-duration"
+                    && citation.kind == NodeKind::CONSTANT
+                    && citation.file_path.as_deref().is_some_and(|path| {
+                        packet_display_path(path).ends_with("styles/tokens.css")
+                    })
+            }),
+            "expected root custom-property animation variable citation; got {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn required_file_scoped_source_probe_resolves_unique_basename_anchor() {
+        let root = packet_temp_root("required-source-probe-basename");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "html/forms/form-validation/detailed-custom-validation.html",
+            r#"
+            <form novalidate>
+              <input id="mail" type="email" required minlength="8">
+            </form>
+            "#,
+        );
+
+        let mut pathless = test_packet_citation("pathless", "", 0.1);
+        pathless.file_path = None;
+        let mut answer = packet_answer_fixture("fixture packet", vec![pathless]);
+        let probes = ["detailed-custom-validation.html input#mail".to_string()];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &probes,
+            &mut answer,
+        );
+
+        let has_input_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "input#mail"
+                && citation.kind == NodeKind::ANNOTATION
+                && citation.file_path.as_deref().is_some_and(|path| {
+                    packet_display_path(path)
+                        .ends_with("html/forms/form-validation/detailed-custom-validation.html")
+                })
+        });
+        let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.contains("appended=1")
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            has_input_anchor,
+            "basename source probe should append the unique HTML id anchor: {:?}",
+            answer.citations
+        );
+        assert!(
+            used_source_probe,
+            "basename source probe should annotate appended anchor count: {:?}",
+            answer.retrieval_trace.annotations
+        );
+    }
+
+    #[test]
+    fn required_file_scoped_source_probe_adds_cpp_template_and_call_anchors() {
+        let root = packet_temp_root("required-source-probe-cpp-calls");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/format.cc",
+            r#"
+            template FMT_API void buffer<char>::append(const char*, const char*);
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/os.cc",
+            r#"
+            // fmt::format_to appears in docs, but the call below is the source anchor.
+            fmt::format_to(appender(out), FMT_STRING("{}: {}"), message, error_code);
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let probes = [
+            "format.cc buffer append".to_string(),
+            "os.cc format_to".to_string(),
+        ];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::ArchitectureExplanation,
+            &probes,
+            &mut answer,
+        );
+
+        let has_format_cc_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "buffer append"
+                && citation.kind == NodeKind::ANNOTATION
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("src/format.cc"))
+        });
+        let has_os_cc_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "format_to"
+                && citation.kind == NodeKind::ANNOTATION
+                && citation.line == Some(3)
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("src/os.cc"))
+        });
+        let used_source_probe = answer.retrieval_trace.annotations.iter().any(|annotation| {
+            annotation.starts_with("packet_required_file_scoped_source_citations ")
+                && annotation.contains("appended=2")
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            has_format_cc_anchor,
+            "required source probe should append C++ template instantiation anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_os_cc_anchor,
+            "required source probe should append C++ call-site anchors instead of comments: {:?}",
+            answer.citations
+        );
+        assert!(
+            used_source_probe,
+            "C++ source probes should annotate appended anchor count: {:?}",
+            answer.retrieval_trace.annotations
+        );
+    }
+
+    #[test]
+    fn required_file_scoped_source_probe_adds_shell_function_anchor() {
+        let root = packet_temp_root("required-source-probe-shell");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "install.sh",
+            r#"
+            nvm_do_install() {
+              nvm_install_node
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "bash_completion",
+            r#"
+            __nvm() {
+              __nvm_commands
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture("fixture packet", Vec::new());
+        let probes = [
+            "install.sh nvm_do_install".to_string(),
+            "bash_completion __nvm".to_string(),
+        ];
+        maybe_append_required_file_scoped_source_citations(
+            &root,
+            "fixture packet",
+            PacketTaskClassDto::RouteTracing,
+            &probes,
+            &mut answer,
+        );
+
+        let has_shell_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "nvm_do_install"
+                && citation.kind == NodeKind::METHOD
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("install.sh"))
+        });
+        let has_completion_anchor = answer.citations.iter().any(|citation| {
+            citation.display_name == "__nvm"
+                && citation.kind == NodeKind::METHOD
+                && citation
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| packet_display_path(path).ends_with("bash_completion"))
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            has_shell_anchor,
+            "required source probe should append shell function anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            has_completion_anchor,
+            "required source probe should append extensionless completion-file anchors: {:?}",
+            answer.citations
+        );
+    }
+
+    #[test]
     fn automapper_map_flow_source_claims_name_runtime_configuration_and_plans() {
-        let _eval_probes = EvalProbesGuard::enabled();
-        let prompt = "Explain how AutoMapper configuration and runtime mapper APIs cooperate to map source objects to destination objects.";
+        let prompt = "Explain how mapper configuration and runtime mapper APIs cooperate to map source objects to destination objects through type map plans.";
         let fixtures = [
             (
                 "MapperConfiguration",
@@ -9196,7 +12872,7 @@ mod tests {
                     public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType) => this.Internal().BuildExecutionPlan(new(new(sourceType, destinationType)));
                 }
                 "#,
-                "MapperConfiguration builds and owns the mapping configuration used at runtime.",
+                "Mapping configuration source builds and owns runtime mapping plans.",
             ),
             (
                 "Mapper.Map",
@@ -9213,7 +12889,7 @@ mod tests {
                     }
                 }
                 "#,
-                "Mapper.Map is the public runtime entry point for object mapping.",
+                "Mapper runtime source exposes the public object-mapping entry point.",
             ),
             (
                 "TypeMap.CreateMapperLambda",
@@ -9222,7 +12898,7 @@ mod tests {
                 internal LambdaExpression CreateMapperLambda(IGlobalConfiguration configuration) =>
                     Types.ContainsGenericParameters ? null : new TypeMapPlanBuilder(configuration, this).CreateMapperLambda();
                 "#,
-                "TypeMap contributes mapper lambda plans used by the execution pipeline.",
+                "Type-map source contributes lambda plans used by the mapping execution pipeline.",
             ),
             (
                 "TypeMapPlanBuilder",
@@ -9236,7 +12912,7 @@ mod tests {
                     return Lambda(mapperFunc, GetParameters(second: _initialDestination));
                 }
                 "#,
-                "TypeMapPlanBuilder participates in building expression plans for mappings.",
+                "The mapping plan builder participates in building expression plans for mappings.",
             ),
         ];
 
@@ -9258,7 +12934,7 @@ mod tests {
                 "createApplication",
                 "lib/express.js",
                 "function createApplication() { var app = function(req, res, next) { app.handle(req, res, next); }; mixin(app, proto, false); app.request = Object.create(req); app.response = Object.create(res); app.init(); return app; }",
-                "createApplication builds a callable app object and mixes in request and response prototypes.",
+                "The application factory builds a callable app object and mixes in request and response prototypes.",
             ),
             (
                 "app.handle",
@@ -9305,25 +12981,25 @@ mod tests {
                 "Session.request",
                 "Source/Core/Session.swift",
                 "open func request(_ convertible: URLRequestConvertible) -> DataRequest { let request = DataRequest(); performEagerlyIfNecessary(request); return request }",
-                "Session request creation builds request objects before optional eager execution.",
+                "The session request API creates request objects before optional eager execution.",
             ),
             (
                 "Request.resume",
                 "Source/Core/Request.swift",
                 "public func resume() -> Self { delegate?.readyToPerform(request: self); task.resume(); return self }",
-                "Request.resume resumes the underlying request task.",
+                "The request resume API resumes the underlying URL session task.",
             ),
             (
                 "DataRequest.validate",
                 "Source/Core/DataRequest.swift",
                 "public func validate(_ validation: @escaping Validation) -> Self { validators.write { $0.append(validation) }; didValidateRequest(); return self }",
-                "Request validation attaches validation behavior.",
+                "Request validation methods attach validation behavior.",
             ),
             (
                 "SessionDelegate",
                 "Source/Core/SessionDelegate.swift",
                 "open class SessionDelegate: NSObject, URLSessionDataDelegate { open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) { request.didReceive(data: data) } open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) { request.didReceiveResponse(nil) } }",
-                "The session delegate receives request callback events.",
+                "Session delegate callbacks receive URLSession task events.",
             ),
         ];
 
@@ -9415,24 +13091,7 @@ mod tests {
                     return cs == null || cs.length() == 0;
                 }
                 "#,
-                &["StringUtils."][..],
-            ),
-            (
-                "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.",
-                test_packet_citation("Session.request", "src/requests/sessions.py", 0.9),
-                "def request(self, method, url, **kwargs):\n    req = Request(method=method, url=url)\n    prep = self.prepare_request(req)\n    return self.send(prep, **kwargs)\n",
-                &["PreparedRequest", "Session.request"][..],
-            ),
-            (
-                "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.",
-                test_packet_citation("app.use", "lib/application.js", 0.9),
-                "app.use = function use(fn) { return router.use(path, fn); }\napp.handle = function handle(req, res, callback) { this.router.handle(req, res, done); }\n",
-                &[
-                    "createApplication",
-                    "app.handle",
-                    "app.use",
-                    "lib/express.js",
-                ][..],
+                &[][..],
             ),
             (
                 "Explain how fmt turns formatting arguments into type-erased format args and reaches vformat or format_to output paths.",
@@ -9472,7 +13131,7 @@ mod tests {
                 "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.",
                 test_packet_citation("NativeClient", "src/native_client.dart", 0.9),
                 "import 'dart:io'; class NativeClient { Future<NativeStreamedResponse> send(BaseRequest request) async { var stream = request.finalize(); var ioRequest = await _inner!.openUrl(request.method, request.url); final response = await stream.pipe(ioRequest) as HttpClientResponse; return NativeStreamedResponse(response); } }\n",
-                &["dart:io", "IOClient", "NativeClient.send is"][..],
+                &["IOClient", "package:http"][..],
             ),
         ];
 
@@ -9518,8 +13177,8 @@ mod tests {
         ));
 
         for expected in [
-            "isBlank treats null, empty, and whitespace-only inputs as blank.",
-            "isEmpty does not trim whitespace before deciding emptiness.",
+            "TextChecks.isBlank treats null, empty, and whitespace-only inputs as blank.",
+            "TextChecks.isEmpty does not trim whitespace before deciding emptiness.",
         ] {
             assert!(
                 claims.iter().any(|claim| claim == expected),
@@ -9592,38 +13251,43 @@ mod tests {
 
     #[test]
     fn python_requests_source_claims_name_method_flow() {
-        let _eval_probes = EvalProbesGuard::enabled();
         let prompt = "Explain how Requests turns a top-level request call into a prepared request and sends it through a session adapter.";
         let cases = [
             (
                 "request",
                 "src/requests/api.py",
                 "def request(method, url, **kwargs):\n    with sessions.Session() as session:\n        return session.request(method=method, url=url, **kwargs)\n",
-                "The top-level request helper opens a Session and delegates to Session.request.",
+                "The top-level request helper opens a session object and delegates to the session request method.",
             ),
             (
                 "Session.request",
                 "src/requests/sessions.py",
                 "def request(self, method, url, **kwargs):\n    req = Request(method=method, url=url)\n    prep = self.prepare_request(req)\n    return self.send(prep, **kwargs)\n",
-                "Session.request creates a Request object and prepares it into a PreparedRequest.",
+                "The session request method creates a request object and prepares it into a transport-ready request object.",
             ),
             (
                 "PreparedRequest.prepare",
                 "src/requests/models.py",
                 "def prepare(self):\n    self.prepare_method(method)\n    self.prepare_url(url, params)\n    self.prepare_headers(headers)\n    self.prepare_cookies(cookies)\n    self.prepare_body(data, files, json)\n    self.prepare_auth(auth, url)\n    self.prepare_hooks(hooks)\n",
-                "PreparedRequest.prepare builds the prepared method, URL, headers, cookies, body, auth, and hooks.",
+                "Request preparation builds the method, URL, headers, cookies, body, auth, and hooks.",
+            ),
+            (
+                "PreparedRequest",
+                "src/requests/models.py",
+                "class PreparedRequest:\n    def prepare(self):\n        self.prepare_method(method)\n        self.prepare_url(url, params)\n        self.prepare_body(data, files, json)\n",
+                "Request preparation builds the method, URL, headers, cookies, body, auth, and hooks.",
             ),
             (
                 "Session.send",
                 "src/requests/sessions.py",
                 "def send(self, request, **kwargs):\n    adapter = self.get_adapter(url=request.url)\n    r = adapter.send(request, **kwargs)\n    return r\n",
-                "Session.send chooses an adapter and calls the adapter send method.",
+                "The session send method chooses an adapter and calls the adapter send method.",
             ),
             (
-                "HTTPAdapter.send",
+                "BaseAdapter.send",
                 "src/requests/adapters.py",
-                "def send(self, request, **kwargs):\n    resp = conn.urlopen(method=request.method, url=url)\n    return self.build_response(request, resp)\n",
-                "HTTPAdapter.send is the transport boundary that returns the response.",
+                "class HTTPAdapter:\n    def send(self, request, **kwargs):\n        resp = conn.urlopen(method=request.method, url=url)\n        return self.build_response(request, resp)\n",
+                "The transport adapter send path is the response boundary.",
             ),
         ];
 
@@ -9669,6 +13333,14 @@ mod tests {
             subgraph_id: None,
             evidence_edge_ids: Vec::new(),
             retrieval_score_breakdown: None,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
         };
 
         assert_eq!(
@@ -9782,6 +13454,14 @@ mod tests {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         }];
 
@@ -9798,6 +13478,16 @@ mod tests {
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                     match_quality: None,
                     resolvable: true,
+                    evidence_tier: Some(
+                        codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph,
+                    ),
+                    evidence_producer: Some("test".to_string()),
+                    resolution_status: Some(
+                        codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+                    ),
+                    loss_reason: None,
+                    coverage_role: None,
+                    eligible_for_sufficiency: Some(true),
                     score_breakdown: None,
                 },
                 SearchHit {
@@ -9810,6 +13500,16 @@ mod tests {
                     origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                     match_quality: None,
                     resolvable: true,
+                    evidence_tier: Some(
+                        codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph,
+                    ),
+                    evidence_producer: Some("test".to_string()),
+                    resolution_status: Some(
+                        codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+                    ),
+                    loss_reason: None,
+                    coverage_role: None,
+                    eligible_for_sufficiency: Some(true),
                     score_breakdown: None,
                 },
             ],

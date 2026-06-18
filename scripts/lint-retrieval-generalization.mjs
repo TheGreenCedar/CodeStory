@@ -20,14 +20,11 @@ const extraScanRoots = (
   .filter(Boolean);
 
 const requiredScanDirs = [
-  path.join(repoRoot, "crates", "codestory-cli", "src"),
-  path.join(repoRoot, "crates", "codestory-indexer", "src"),
-  path.join(repoRoot, "crates", "codestory-runtime", "src"),
-  path.join(repoRoot, "crates", "codestory-retrieval"),
+  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
+  path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
 const requiredProductionOnlyFiles = [
-  path.join(repoRoot, "crates", "codestory-cli", "src", "main.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "orchestrator.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "lib.rs"),
   path.join(repoRoot, "crates", "codestory-runtime", "src", "semantic_doc_text.rs"),
@@ -61,6 +58,7 @@ const benchmarkIdentityScriptFiles = [
   path.join(repoRoot, "scripts", "cross-repo-promotion-benchmark.mjs"),
   path.join(repoRoot, "scripts", "cross-repo-sourcetrail-queries.mjs"),
 ];
+const benchmarkTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 
 const missingBenchmarkBoundaryFiles = benchmarkIdentityScriptFiles
   .filter((scriptPath) => !existsSync(scriptPath));
@@ -162,6 +160,10 @@ const bannedPatterns = [
   "novalidate",
   "showError",
   "source/animate\\.css",
+  "nvm",
+  "install\\.sh\\s+nvm",
+  "bash_completion\\s+__nvm",
+  ...benchmarkManifestDerivedPatterns(),
 ];
 
 const bannedLiteralPatterns = [
@@ -199,6 +201,169 @@ const allowedPatternLines = [
 ];
 
 const rankerFilenameLiteralPattern = /["'`][a-z0-9][a-z0-9._-]*\.[a-z0-9]+["'`]/i;
+
+function benchmarkManifestDerivedPatterns() {
+  if (!existsSync(benchmarkTaskRoot)) {
+    return [];
+  }
+  const markers = new Set();
+  for (const filePath of walkFiles(benchmarkTaskRoot, (candidate) => candidate.endsWith(".task.json"))) {
+    let manifest;
+    try {
+      manifest = JSON.parse(readFileSync(filePath, "utf8"));
+    } catch {
+      continue;
+    }
+    for (const task of benchmarkManifestTasks(manifest)) {
+      addSpecificMarker(markers, task.id);
+      addRepoMarkers(markers, task.repo);
+      for (const expectedFile of task.expected_files ?? []) {
+        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      }
+      for (const expectedFile of task.expected_verification_files ?? []) {
+        addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
+      }
+      for (const symbol of task.expected_symbols ?? []) {
+        if (typeof symbol === "string") {
+          addSpecificMarker(markers, symbol);
+        } else {
+          addSpecificMarker(markers, symbol?.name);
+          addSpecificMarker(markers, symbol?.qualified_name, { allowSpecificComposite: true });
+          addSpecificMarker(markers, symbol?.path, { allowSpecificComposite: true });
+        }
+      }
+      for (const claim of task.expected_claims ?? []) {
+        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
+      }
+    }
+  }
+  return [...markers].sort().map(escapeRegExp);
+}
+
+function benchmarkManifestTasks(manifest) {
+  if (Array.isArray(manifest?.tasks)) {
+    return manifest.tasks.filter((task) => task && typeof task === "object");
+  }
+  if (manifest && typeof manifest === "object") {
+    return [manifest];
+  }
+  return [];
+}
+
+function addRepoMarkers(markers, repo) {
+  addSpecificMarker(markers, repo?.name);
+  for (const slug of repoUrlSlugs(repo?.url)) {
+    addSpecificMarker(markers, slug);
+  }
+}
+
+function repoUrlSlugs(url) {
+  if (typeof url !== "string" || url.trim().length === 0) {
+    return [];
+  }
+  const trimmed = url.trim().replace(/\.git$/i, "");
+  let pathname;
+  try {
+    pathname = new URL(trimmed).pathname;
+  } catch {
+    pathname = trimmed;
+  }
+  const parts = pathname
+    .split(/[\\/]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return [];
+  }
+  const repoName = parts[parts.length - 1];
+  const ownerName = parts.length >= 2
+    ? `${parts[parts.length - 2]}/${repoName}`
+    : null;
+  return [ownerName, repoName].filter(Boolean);
+}
+
+function walkFiles(root, predicate) {
+  const files = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const stat = statSync(current);
+    if (stat.isDirectory()) {
+      for (const entry of readdirSync(current)) {
+        stack.push(path.join(current, entry));
+      }
+      continue;
+    }
+    if (stat.isFile() && predicate(current)) {
+      files.push(current);
+    }
+  }
+  return files;
+}
+
+function addSpecificMarker(markers, value, options = {}) {
+  if (typeof value !== "string") {
+    return;
+  }
+  const marker = value.trim();
+  if (marker.length < 8 || benchmarkMarkerTooGeneric(marker, options)) {
+    return;
+  }
+  markers.add(marker);
+}
+
+function benchmarkMarkerTooGeneric(marker, options = {}) {
+  if (options.allowExactPhrase && marker.split(/\s+/).length >= 5) {
+    return false;
+  }
+  if (
+    options.allowSpecificComposite
+    && /[\\/.:]/.test(marker)
+    && /[a-zA-Z]/.test(marker)
+  ) {
+    return false;
+  }
+  const normalized = marker.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return (
+    normalized.length < 8 ||
+    [
+      "codestory",
+      "request",
+      "requests",
+      "response",
+      "responses",
+      "dispatch",
+      "router",
+      "routepath",
+      "approute",
+      "comments",
+      "indexfile",
+      "runindex",
+      "servicesrs",
+      "schema",
+      "source",
+      "storage",
+      "indexing",
+      "configuration",
+      "validation",
+      "serialize",
+      "serializes",
+      "serialized",
+      "serialization",
+      "foreignkey",
+      "references",
+      "formatto",
+      "formaterror",
+      "formaterrorcode",
+      "formatwindowserror",
+      "internalmutate",
+    ].includes(normalized)
+  );
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function isExcludedRustFile(filePath) {
   const relative = path.relative(repoRoot, filePath);

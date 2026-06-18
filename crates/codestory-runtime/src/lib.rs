@@ -4004,8 +4004,26 @@ fn build_search_engine_from_projection(
     search_storage_path: &Path,
     projection: &[SearchSymbolProjection],
 ) -> Result<SearchEngine, ApiError> {
-    let mut engine = SearchEngine::new(Some(search_storage_path))
-        .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+    index_projection_into_search_engine(SearchEngine::new(Some(search_storage_path)), projection)
+}
+
+fn rebuild_search_engine_from_projection(
+    search_storage_path: &Path,
+    projection: &[SearchSymbolProjection],
+    existing: SearchEngine,
+) -> Result<SearchEngine, ApiError> {
+    index_projection_into_search_engine(
+        SearchEngine::recreate_persisted_from_existing(search_storage_path, existing),
+        projection,
+    )
+}
+
+fn index_projection_into_search_engine(
+    engine: anyhow::Result<SearchEngine>,
+    projection: &[SearchSymbolProjection],
+) -> Result<SearchEngine, ApiError> {
+    let mut engine =
+        engine.map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
     let mut search_nodes = Vec::with_capacity(projection.len().min(SEARCH_NODE_BATCH_SIZE));
     for entry in projection {
         search_nodes.push((entry.node_id, entry.display_name.clone()));
@@ -4041,26 +4059,36 @@ fn load_persisted_search_state(
     let engine = if projection.is_empty() {
         build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
     } else {
-        match SearchEngine::open_existing(search_storage_path.as_path()) {
-            Ok(mut engine) => {
-                engine.load_symbol_projection(
-                    projection
-                        .iter()
-                        .map(|entry| (entry.node_id, entry.display_name.clone())),
-                );
-                if engine.full_text_doc_count() != projection.len() {
-                    build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
-                } else {
-                    engine
-                }
-            }
-            Err(error) => {
+        let (mut engine, open_error) =
+            SearchEngine::open_existing_or_recreate(search_storage_path.as_path())
+                .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
+        if let Some(error) = open_error {
+            tracing::warn!(
+                "Failed to open persisted search index at {}: {}. Rebuilding from projection.",
+                search_storage_path.display(),
+                error
+            );
+            index_projection_into_search_engine(Ok(engine), &projection)?
+        } else {
+            engine.load_symbol_projection(
+                projection
+                    .iter()
+                    .map(|entry| (entry.node_id, entry.display_name.clone())),
+            );
+            if engine.full_text_doc_count() != projection.len() {
                 tracing::warn!(
-                    "Failed to open persisted search index at {}: {}. Rebuilding from projection.",
+                    "Persisted search index at {} has {} docs but projection has {}. Rebuilding from projection.",
                     search_storage_path.display(),
-                    error
+                    engine.full_text_doc_count(),
+                    projection.len()
                 );
-                build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
+                rebuild_search_engine_from_projection(
+                    search_storage_path.as_path(),
+                    &projection,
+                    engine,
+                )?
+            } else {
+                engine
             }
         }
     };
@@ -7366,6 +7394,14 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("route_endpoint".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         })
     }
@@ -7643,6 +7679,14 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::TextMatch,
             match_quality: Some(SearchMatchQualityDto::RepoText),
             resolvable: false,
+            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::LexicalSource),
+            evidence_producer: Some("repo_text_fallback".to_string()),
+            resolution_status: Some(
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
+            ),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
             score_breakdown: None,
         }
     }
@@ -9548,6 +9592,10 @@ impl AppController {
                     semantic: scored.semantic_score,
                     graph: scored.graph_score,
                     total: scored.total_score,
+                    tier_cap: None,
+                    boosts: Vec::new(),
+                    dampening: Vec::new(),
+                    final_rank_reason: None,
                     provenance: Vec::new(),
                 });
                 out.push(HybridSearchScoredHit {
@@ -10867,6 +10915,12 @@ mod tests {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             }
         }
@@ -12541,6 +12595,12 @@ pub fn exact_symbol_anchor() {{}}
             origin,
             match_quality: None,
             resolvable,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         }
     }
@@ -14077,6 +14137,12 @@ fn build_llm_symbol_doc_text() -> String {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
         let method = SearchHit {
@@ -14089,6 +14155,12 @@ fn build_llm_symbol_doc_text() -> String {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
 
@@ -15329,6 +15401,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15341,6 +15419,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
         ];
@@ -15357,6 +15441,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             }],
         );
@@ -15379,6 +15469,12 @@ fn build_llm_symbol_doc_text() -> String {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
             score_breakdown: None,
         };
         let query = "exact symbol first semantic ranking search_hybrid_with_scores";
@@ -15414,6 +15510,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15426,6 +15528,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15438,6 +15546,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
         ];
@@ -15472,6 +15586,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
             SearchHit {
@@ -15484,6 +15604,12 @@ fn build_llm_symbol_doc_text() -> String {
                 origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
                 match_quality: None,
                 resolvable: true,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
                 score_breakdown: None,
             },
         ];

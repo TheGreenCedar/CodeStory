@@ -523,6 +523,16 @@ pub(crate) fn promote_required_probe_citations(
     let focus_roots = packet_command_focus_roots(&answer.citations);
     let mut promoted_indices = Vec::new();
     for query in required_probe_queries {
+        if let Some(limit) = packet_required_probe_multi_match_limit(query) {
+            promote_distinct_required_probe_matches(
+                answer,
+                query,
+                limit,
+                &mut promoted_indices,
+                &focus_roots,
+            );
+            continue;
+        }
         if promoted_indices
             .iter()
             .any(|index| packet_citation_satisfies_required_probe(query, &answer.citations[*index]))
@@ -587,6 +597,138 @@ pub(crate) fn promote_required_probe_citations(
         required_probe_queries.join("|").replace('`', "'")
     ));
     protected_citation_keys
+}
+
+fn promote_distinct_required_probe_matches(
+    answer: &AgentAnswerDto,
+    query: &str,
+    limit: usize,
+    promoted_indices: &mut Vec<usize>,
+    focus_roots: &[PacketCommandFocusRoot],
+) {
+    let mut promoted_paths = promoted_indices
+        .iter()
+        .filter(|index| packet_citation_satisfies_required_probe(query, &answer.citations[**index]))
+        .filter_map(|index| packet_citation_file_path_key(&answer.citations[*index]))
+        .collect::<HashSet<_>>();
+
+    while promoted_paths.len() < limit {
+        let mut best_match = None;
+        for (index, citation) in answer.citations.iter().enumerate() {
+            if promoted_indices.contains(&index) {
+                continue;
+            }
+            let Some(path) = packet_citation_file_path_key(citation) else {
+                continue;
+            };
+            if promoted_paths.contains(&path) {
+                continue;
+            }
+            if !packet_required_probe_multi_match_candidate(query, citation) {
+                continue;
+            }
+            let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
+                continue;
+            };
+            if packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
+                && !packet_citation_satisfies_required_probe(query, citation)
+            {
+                continue;
+            }
+            if best_match
+                .map(|(best_index, best_rank)| {
+                    packet_prefer_required_probe_match(
+                        query,
+                        citation,
+                        match_rank,
+                        &answer.citations[best_index],
+                        best_rank,
+                        focus_roots,
+                    )
+                })
+                .unwrap_or(true)
+            {
+                best_match = Some((index, match_rank));
+            }
+        }
+        let Some((index, _)) = best_match else {
+            break;
+        };
+        if let Some(path) = packet_citation_file_path_key(&answer.citations[index]) {
+            promoted_paths.insert(path);
+        }
+        promoted_indices.push(index);
+    }
+}
+
+fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
+    match normalize_identifier(query).as_str() {
+        "mapperpublicapi" | "mapperruntimeapi" | "mappingruntimeentrypoint" => Some(3),
+        "sqlschemascripts" | "schemadialectscripts" => Some(3),
+        "httptoplevelhelper"
+        | "publicclientfacade"
+        | "clientconveniencemethod"
+        | "clientinterfacemethod"
+        | "clientinterfacehelper"
+        | "requestfinalization"
+        | "transportreadyrequestobject"
+        | "clientsendimplementation"
+        | "transportsend"
+        | "requestresponse"
+        | "responsestreamboundary" => Some(2),
+        "htmlformrequiredconstraint"
+        | "htmlformpatternconstraint"
+        | "htmlformminmaxconstraints"
+        | "customformvalidationinput"
+        | "customvalidationvaliditystate"
+        | "customvalidationerrorrendering"
+        | "submitpreventdefault" => Some(2),
+        "sessionrequestcreation"
+        | "requestobjectcreation"
+        | "requestresumedispatch"
+        | "requestvalidationpipeline"
+        | "delegatecallbackhandling"
+        | "urlsessioncallbackboundary" => Some(2),
+        "serverbootstrap"
+        | "commandserverentrypoint"
+        | "eventloopsource"
+        | "networkcommandinput"
+        | "commandtabledispatch"
+        | "commanddispatch" => Some(2),
+        _ => None,
+    }
+}
+
+fn packet_required_probe_multi_match_candidate(query: &str, citation: &AgentCitationDto) -> bool {
+    if query_mentions_non_primary_source(query) {
+        return true;
+    }
+    if packet_display_name_is_test_like(&citation.display_name) {
+        return false;
+    }
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if path.is_empty() {
+        return true;
+    }
+    if retrieval_file_role_from_path(&path).is_non_primary() {
+        return false;
+    }
+    !path.contains("/test/")
+        && !path.contains("/tests/")
+        && !path.contains("/docs/")
+        && !path.contains("/doc/")
+        && !path.contains("/tools/")
+        && !path.contains("/tool/")
+        && !path.contains("/examples/")
+        && !path.contains("/example/")
+        && !path.contains("/third_party/")
+        && !path.contains("/vendor/")
+        && !path.contains("/node_modules/")
 }
 
 pub(crate) fn promote_focus_neighborhood_citations(
@@ -973,4 +1115,125 @@ fn packet_citation_focus_root_score(
         .map(|root| root.weight)
         .max()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{
+        AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
+        AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId, PacketEvidenceResolutionDto,
+        PacketEvidenceTierDto,
+    };
+
+    fn citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(format!("test::{display_name}")),
+            display_name: display_name.to_string(),
+            kind: NodeKind::FUNCTION,
+            file_path: Some(file_path.to_string()),
+            line: Some(1),
+            score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: Some(PacketEvidenceTierDto::ResolvedGraph),
+            evidence_producer: Some("test".to_string()),
+            resolution_status: Some(PacketEvidenceResolutionDto::Resolved),
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn answer_fixture(citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "packet-capping-test".to_string(),
+            prompt: "Trace the generic flow.".to_string(),
+            summary: "Covered by cited anchors.".to_string(),
+            freshness: None,
+            sections: vec![AgentResponseSectionDto {
+                id: "answer".to_string(),
+                title: "Answer".to_string(),
+                blocks: vec![AgentResponseBlockDto::Markdown {
+                    markdown: "Covered by cited anchors.".to_string(),
+                }],
+            }],
+            citations,
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "packet-capping-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                annotations: Vec::new(),
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        }
+    }
+
+    #[test]
+    fn multi_match_required_probes_promote_distinct_primary_sources() {
+        for (query, first_display, second_display) in [
+            (
+                "client send implementation",
+                "Client send implementation",
+                "Client send implementation adapter",
+            ),
+            (
+                "submit prevent default",
+                "Submit prevent default guard",
+                "Submit prevent default handler",
+            ),
+            (
+                "session request creation",
+                "Session request creation",
+                "Session request creation builder",
+            ),
+            (
+                "network command input",
+                "Network command input",
+                "Network command input reader",
+            ),
+        ] {
+            let mut answer = answer_fixture(vec![
+                citation(&format!("{query} guide"), "docs/flow-guide.md", 100.0),
+                citation(&format!("{query} test"), "tests/flow_test.rs", 99.0),
+                citation(first_display, "src/flow/primary.rs", 4.0),
+                citation(second_display, "src/flow/secondary.rs", 3.0),
+            ]);
+
+            let protected = promote_required_probe_citations(&mut answer, &[query.to_string()]);
+            let protected_paths = answer
+                .citations
+                .iter()
+                .filter(|citation| protected.contains(&packet_citation_key(citation)))
+                .filter_map(|citation| citation.file_path.as_deref())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                protected_paths,
+                vec!["src/flow/primary.rs", "src/flow/secondary.rs"],
+                "query `{query}` should protect two primary-source matches before docs/tests: {protected_paths:?}"
+            );
+            assert_eq!(
+                answer.citations[0].file_path.as_deref(),
+                Some("src/flow/primary.rs")
+            );
+            assert_eq!(
+                answer.citations[1].file_path.as_deref(),
+                Some("src/flow/secondary.rs")
+            );
+        }
+    }
 }

@@ -2,10 +2,7 @@ use crate::agent::eval_probes::{
     eval_citation_shaped_claim, eval_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
 };
-use crate::agent::packet_citations::{
-    packet_citation_matching_display, packet_citation_matching_display_contains,
-    packet_citation_source_text,
-};
+use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_claim_profiles::{
     packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation,
 };
@@ -126,14 +123,10 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         return;
     }
 
-    let cli_entry = packet_citation_matching_display(citations, "run_index")
-        .or_else(|| packet_citation_matching_display(citations, "Command::Index"))
-        .or_else(|| packet_citation_matching_display(citations, "IndexCommand"))
-        .or_else(|| packet_citation_matching_display(citations, "CliDirection"));
+    let cli_entry = packet_citation_matching_role(citations, PacketEvidenceRole::CommandEntrypoint);
     let runtime_entry =
-        packet_citation_matching_display_contains(citations, "IndexService::run_indexing")
-            .or_else(|| packet_citation_matching_display(citations, "Runtime::index_service"));
-    if let Some(runtime_entry) = runtime_entry {
+        packet_citation_matching_role(citations, PacketEvidenceRole::RuntimeOrchestration);
+    if let Some(runtime_entry) = &runtime_entry {
         let mut claim_citations = Vec::new();
         if let Some(cli_entry) = cli_entry {
             claim_citations.push(cli_entry.clone());
@@ -142,37 +135,38 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The CLI index command prepares command options and delegates indexing work into the runtime layer.",
+            "Indexing entrypoint evidence delegates indexing work into the runtime orchestration layer.",
             claim_citations,
         );
     }
 
     let workspace_plan =
-        packet_citation_matching_display(citations, "WorkspaceManifest::build_execution_plan");
-    if let Some(runtime_entry) = runtime_entry {
+        packet_citation_matching_role(citations, PacketEvidenceRole::WorkspaceDiscoveryAndPlanning);
+    if let Some(runtime_entry) = &runtime_entry {
         let mut claim_citations = vec![runtime_entry.clone()];
-        if let Some(workspace_plan) = workspace_plan {
+        if let Some(workspace_plan) = &workspace_plan {
             claim_citations.push(workspace_plan.clone());
         }
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.",
+            "Runtime orchestration evidence opens workspace/store state and coordinates refresh phases.",
             claim_citations,
         );
     }
 
-    if let Some(workspace_plan) = workspace_plan {
+    if let Some(workspace_plan) = &workspace_plan {
         packet_push_flow_template_claim(
             claims,
             seen,
-            "The workspace crate is responsible for source-file discovery and refresh-plan construction.",
+            "Workspace discovery evidence plans source-file discovery and refresh work.",
             Some(workspace_plan.clone()),
         );
     }
 
-    let workspace_indexer = packet_citation_matching_display(citations, "WorkspaceIndexer::run");
-    let index_file = packet_citation_matching_display(citations, "index_file");
+    let workspace_indexer =
+        packet_citation_matching_role(citations, PacketEvidenceRole::IndexingWorkQueue);
+    let index_file = packet_citation_matching_role(citations, PacketEvidenceRole::SymbolExtraction);
     if workspace_indexer.is_some() || index_file.is_some() {
         let mut claim_citations = Vec::new();
         if let Some(workspace_indexer) = workspace_indexer {
@@ -184,17 +178,16 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The indexer extracts nodes, edges, occurrences, and related symbol data from source files.",
+            "Symbol extraction evidence builds graph nodes, edges, occurrences, and related source data.",
             claim_citations,
         );
     }
 
-    let storage_flush =
-        packet_citation_matching_display(citations, "Storage::flush_projection_batch");
-    let search_projection = packet_citation_matching_display(
+    let storage_flush = packet_citation_matching_role(
         citations,
-        "Storage::rebuild_search_symbol_projection_from_node_table",
+        PacketEvidenceRole::PersistenceAndSearchProjection,
     );
+    let search_projection = storage_flush.clone();
     if storage_flush.is_some() || search_projection.is_some() {
         let mut claim_citations = Vec::new();
         if let Some(storage_flush) = storage_flush {
@@ -206,21 +199,31 @@ fn packet_append_indexing_pipeline_flow_template_claims(
         packet_push_flow_template_claim_with_citations(
             claims,
             seen,
-            "The store persists graph and file data to SQLite and rebuilds query/search projections from persisted data.",
+            "Persistence evidence stores graph/file data and rebuilds query/search projections.",
             claim_citations,
         );
     }
 
     if let Some(snapshot_refresh) =
-        packet_citation_matching_display(citations, "SnapshotStore::refresh_all_with_stats")
+        packet_citation_matching_role(citations, PacketEvidenceRole::SnapshotRefresh)
     {
         packet_push_flow_template_claim(
             claims,
             seen,
-            "Snapshot refresh happens after persisted data changes so later grounding and summary reads see current indexed state.",
+            "Snapshot refresh evidence updates read models after persisted graph changes.",
             Some(snapshot_refresh.clone()),
         );
     }
+}
+
+fn packet_citation_matching_role(
+    citations: &[AgentCitationDto],
+    role: PacketEvidenceRole,
+) -> Option<AgentCitationDto> {
+    citations
+        .iter()
+        .find(|citation| packet_evidence_role(citation) == Some(role))
+        .cloned()
 }
 
 fn packet_append_source_derived_flow_claims(
@@ -235,12 +238,79 @@ fn packet_append_source_derived_flow_claims(
             _ => continue,
         };
         for claim in packet_source_derived_claims_for_citation(prompt, citation, &source) {
-            packet_push_flow_template_claim(claims, seen, &claim, Some(citation.clone()));
+            let claim_citation =
+                packet_preferred_source_derived_claim_citation(&claim, citation, citations);
+            packet_push_flow_template_claim(claims, seen, &claim, Some(claim_citation));
             if claims.len() >= 18 {
                 return;
             }
         }
     }
+}
+
+fn packet_preferred_source_derived_claim_citation(
+    claim: &str,
+    source_citation: &AgentCitationDto,
+    citations: &[AgentCitationDto],
+) -> AgentCitationDto {
+    if packet_claim_text_indicates_sql_relationship(claim)
+        && let Some(relationship_citation) =
+            packet_matching_sql_relationship_citation(source_citation, citations)
+    {
+        return relationship_citation;
+    }
+    source_citation.clone()
+}
+
+fn packet_matching_sql_relationship_citation(
+    source_citation: &AgentCitationDto,
+    citations: &[AgentCitationDto],
+) -> Option<AgentCitationDto> {
+    let source_path = source_citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .map(|path| normalize_identifier(&path));
+    citations
+        .iter()
+        .filter(|citation| {
+            packet_evidence_role(citation) == Some(PacketEvidenceRole::SqlRelationshipConstraint)
+        })
+        .find(|citation| {
+            source_path.as_deref().is_some_and(|source_path| {
+                citation
+                    .file_path
+                    .as_deref()
+                    .map(packet_display_path)
+                    .map(|path| normalize_identifier(&path) == source_path)
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| {
+            citations.iter().find(|citation| {
+                packet_evidence_role(citation)
+                    == Some(PacketEvidenceRole::SqlRelationshipConstraint)
+            })
+        })
+        .cloned()
+}
+
+fn packet_claim_text_indicates_sql_relationship(claim: &str) -> bool {
+    let normalized = normalize_identifier(claim);
+    normalized.contains("rowsreference")
+        || normalized.contains("foreignkey")
+        || normalized.contains("references")
+        || ((normalized.contains("relationship")
+            || normalized.contains("relationships")
+            || normalized.contains("constraint")
+            || normalized.contains("constraints"))
+            && (normalized.contains("sql")
+                || normalized.contains("schema")
+                || normalized.contains("table")
+                || normalized.contains("rows")
+                || normalized.contains("foreign")
+                || normalized.contains("reference")
+                || normalized.contains("referential")))
 }
 
 fn packet_append_sql_schema_file_claims(
@@ -433,6 +503,8 @@ fn packet_push_flow_template_claim_with_citations(
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
         citations,
+        coverage_role: Some("flow template".to_string()),
+        eligible_for_sufficiency: Some(true),
     });
 }
 
@@ -461,6 +533,8 @@ pub(crate) fn append_ranked_citation_claims(
                 claims.push(PacketClaimDto {
                     claim: shaped,
                     citations: vec![citation.clone()],
+                    coverage_role: citation.coverage_role.clone(),
+                    eligible_for_sufficiency: Some(false),
                 });
             }
             continue;
@@ -488,6 +562,8 @@ pub(crate) fn append_ranked_citation_claims(
         claims.push(PacketClaimDto {
             claim: packet_claim_for_role(role, citation, prompt, rank_terms),
             citations: vec![citation.clone()],
+            coverage_role: Some(role.as_str().to_string()),
+            eligible_for_sufficiency: Some(true),
         });
         if claims.len() >= 18 {
             break;
@@ -518,74 +594,77 @@ pub(crate) fn packet_claim_for_role(
         .unwrap_or_default();
     match role {
         PacketEvidenceRole::CommandEntrypoint => format!(
-            "The command or public entrypoint for this flow is anchored by `{symbol}`; inspect it before following downstream coordination."
+            "The command or public entrypoint for this flow is `{symbol}`, which starts downstream coordination."
         ),
-        PacketEvidenceRole::ClientFactory => format!(
-            "Client factory behavior is anchored by `{symbol}`; inspect it for instance creation and request-method binding."
-        ),
-        PacketEvidenceRole::InterceptorManagement => format!(
-            "Interceptor management is anchored by `{symbol}`; inspect it for fulfilled/rejected handler registration and iteration."
-        ),
+        PacketEvidenceRole::ClientFactory => {
+            format!("`{symbol}` creates client instances or binds request methods for this flow.")
+        }
+        PacketEvidenceRole::InterceptorManagement => {
+            format!("`{symbol}` manages fulfilled/rejected interceptor registration and iteration.")
+        }
         PacketEvidenceRole::RequestDispatch => format!(
-            "Request dispatch is anchored by `{symbol}`; inspect it for config transformation and adapter handoff."
+            "`{symbol}` dispatches requests by transforming config and handing off to an adapter or handler."
         ),
         PacketEvidenceRole::TransportAdapter => format!(
-            "Transport adapter selection is anchored by `{symbol}`; inspect it for environment-specific transport choice."
+            "`{symbol}` is the transport adapter boundary for environment-specific sending."
         ),
         PacketEvidenceRole::EventLoop => format!(
-            "Event-loop polling is anchored by `{symbol}`; inspect it for readable/writable file-event dispatch."
+            "`{symbol}` polls event-loop state and dispatches readable or writable file events."
         ),
-        PacketEvidenceRole::NetworkCommandInput => format!(
-            "Network command input is anchored by `{symbol}`; inspect it for socket reads and command-buffer processing."
-        ),
+        PacketEvidenceRole::NetworkCommandInput => {
+            format!("`{symbol}` reads network or socket input into command-buffer processing.")
+        }
         PacketEvidenceRole::CommandDispatch => format!(
-            "Command dispatch is anchored by `{symbol}`; inspect it for command lookup, validation, execution, and propagation."
+            "`{symbol}` dispatches commands through lookup, validation, execution, or propagation."
         ),
         PacketEvidenceRole::ArgumentPlanning => format!(
-            "Argument planning is anchored by `{symbol}`; inspect it for walker, matcher, searcher, and printer construction."
+            "`{symbol}` plans arguments by constructing walker, matcher, searcher, or printer behavior."
         ),
         PacketEvidenceRole::SearchDriver => format!(
-            "Search driver behavior is anchored by `{symbol}`; inspect it for entrypoint routing and sequential or parallel search selection."
+            "`{symbol}` routes search entrypoint behavior into sequential or parallel execution."
         ),
-        PacketEvidenceRole::SearchExecutionUnit => format!(
-            "Search worker behavior is anchored by `{symbol}`; inspect it for per-candidate matcher/searcher/printer execution."
-        ),
+        PacketEvidenceRole::SearchExecutionUnit => {
+            format!("`{symbol}` executes per-candidate matcher, searcher, or printer work.")
+        }
         PacketEvidenceRole::RuntimeOrchestration => format!(
-            "Runtime orchestration is anchored by `{symbol}`; verify coordination, state transitions, and downstream service calls there."
+            "`{symbol}` coordinates runtime state transitions and downstream service calls."
         ),
         PacketEvidenceRole::WorkspaceDiscoveryAndPlanning => format!(
-            "Workspace discovery or planning is anchored by `{symbol}`; inspect it for file selection, manifest, or execution-plan behavior."
+            "`{symbol}` handles workspace file selection, manifests, or execution-plan behavior."
         ),
-        PacketEvidenceRole::SourceGroupConfiguration => format!(
-            "Source-group configuration is anchored by `{symbol}`; inspect it for how project settings become source-group-specific indexing inputs."
-        ),
+        PacketEvidenceRole::SourceGroupConfiguration => {
+            format!("`{symbol}` maps project settings into source-group-specific indexing inputs.")
+        }
         PacketEvidenceRole::IndexingWorkQueue => format!(
-            "Indexing work queue behavior is anchored by `{symbol}`; inspect it for build-index commands, parser handoff, or source-file work items."
+            "`{symbol}` turns build-index commands into parser handoff or source-file work items."
         ),
-        PacketEvidenceRole::SymbolExtraction => format!(
-            "Symbol extraction is anchored by `{symbol}`; inspect it for nodes, edges, occurrences, or file-level indexing."
-        ),
-        PacketEvidenceRole::PersistenceAndSearchProjection => format!(
-            "Persistence or search projection is anchored by `{symbol}`; inspect it for durable graph/search state."
-        ),
-        PacketEvidenceRole::SnapshotRefresh => format!(
-            "Snapshot refresh is anchored by `{symbol}`; inspect it for post-write summary or cache refresh behavior."
-        ),
-        PacketEvidenceRole::RouteHandling => format!(
-            "Route handling is anchored by `{symbol}`; inspect it before tracing request dispatch or handler ownership."
-        ),
-        PacketEvidenceRole::CollectionConfiguration => format!(
-            "Collection configuration is anchored by `{symbol}`; inspect schema fields, hooks, and access rules."
-        ),
-        PacketEvidenceRole::EventOutputProcessing => format!(
-            "JSON/event output processing is anchored by `{symbol}`; inspect it for typed event serialization and stdout behavior."
-        ),
-        PacketEvidenceRole::AppServerRequestProtocol => format!(
-            "App-server request protocol evidence is anchored by `{symbol}`; inspect it for thread or turn start request shape."
-        ),
-        PacketEvidenceRole::TestsAndRegressionCoverage => format!(
-            "Regression coverage for this flow is anchored by `{symbol}`; use it to choose focused verification before broader suites."
-        ),
+        PacketEvidenceRole::SymbolExtraction => {
+            format!("`{symbol}` extracts nodes, edges, occurrences, or file-level symbol data.")
+        }
+        PacketEvidenceRole::PersistenceAndSearchProjection => {
+            format!("`{symbol}` persists or projects durable graph/search state.")
+        }
+        PacketEvidenceRole::SnapshotRefresh => {
+            format!("`{symbol}` refreshes post-write summaries or cache state.")
+        }
+        PacketEvidenceRole::RouteHandling => {
+            format!("`{symbol}` handles route dispatch or handler ownership for the request path.")
+        }
+        PacketEvidenceRole::BufferedIo => {
+            format!("`{symbol}` connects buffered read/write state with Source or Sink handoff.")
+        }
+        PacketEvidenceRole::CollectionConfiguration => {
+            format!("`{symbol}` defines collection schema fields, hooks, or access rules.")
+        }
+        PacketEvidenceRole::EventOutputProcessing => {
+            format!("`{symbol}` serializes typed runtime events for JSON/event output.")
+        }
+        PacketEvidenceRole::AppServerRequestProtocol => {
+            format!("`{symbol}` defines app-server thread or turn start request protocol shape.")
+        }
+        PacketEvidenceRole::TestsAndRegressionCoverage => {
+            format!("`{symbol}` covers regression behavior for focused verification choices.")
+        }
         PacketEvidenceRole::SourceEvidence => {
             let flow_terms = packet_claim_flow_terms(rank_terms, citation);
             let focus = if flow_terms.is_empty() {
@@ -594,7 +673,7 @@ pub(crate) fn packet_claim_for_role(
                 flow_terms.join(", ")
             };
             format!(
-                "`{symbol}` in `{path}` {}; inspect definitions and downstream handoff there.",
+                "`{symbol}` in `{path}` {}.",
                 packet_source_evidence_flow_sentence(prompt, &focus)
             )
         }
@@ -602,7 +681,7 @@ pub(crate) fn packet_claim_for_role(
         | PacketEvidenceRole::SqlRelationshipConstraint
         | PacketEvidenceRole::SqlSchemaFile
         | PacketEvidenceRole::CandidateFileConstruction => {
-            format!("Evidence for this flow is anchored by `{symbol}`.")
+            format!("Schema or candidate-file evidence identifies `{symbol}` as part of this flow.")
         }
     }
 }
@@ -612,9 +691,7 @@ fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
     if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
         return sentence;
     }
-    format!(
-        "supports {focus} in this flow; inspect the cited source, local definitions, and adjacent ownership there"
-    )
+    format!("ties {focus} in this flow to cited definitions and adjacent ownership")
 }
 
 fn packet_claim_flow_terms(rank_terms: &[String], citation: &AgentCitationDto) -> Vec<String> {
@@ -729,6 +806,8 @@ fn packet_push_claim(
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
         citations: citation.map(|value| vec![value]).unwrap_or_default(),
+        coverage_role: Some("source definition".to_string()),
+        eligible_for_sufficiency: Some(false),
     });
 }
 
@@ -847,4 +926,175 @@ fn packet_identifier_tokens(identifier: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codestory_contracts::api::{
+        AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
+        NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin,
+    };
+
+    fn test_answer(prompt: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
+        AgentAnswerDto {
+            answer_id: "packet-claims-test".to_string(),
+            prompt: prompt.to_string(),
+            summary: "test answer".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations,
+            subgraph_ids: Vec::new(),
+            retrieval_version: "test".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: AgentRetrievalTraceDto {
+                request_id: "packet-claims-test".to_string(),
+                resolved_profile: AgentRetrievalPresetDto::Architecture,
+                policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 1,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                annotations: Vec::new(),
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        }
+    }
+
+    fn test_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(format!("test::{display_name}")),
+            display_name: display_name.to_string(),
+            kind: NodeKind::ANNOTATION,
+            file_path: Some(file_path.to_string()),
+            line: Some(1),
+            score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: Some(RetrievalScoreBreakdownDto {
+                lexical: score,
+                semantic: 0.0,
+                graph: 0.0,
+                total: score,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
+                provenance: Vec::new(),
+            }),
+            evidence_tier: None,
+            evidence_producer: Some("test".to_string()),
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+        }
+    }
+
+    fn write_sql_fixture(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "codestory-packet-claims-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create packet claims temp dir");
+        let path = root.join("schema.sql");
+        std::fs::write(
+            &path,
+            r#"
+            CREATE TABLE Child
+            (
+                ChildId INTEGER NOT NULL,
+                ParentId INTEGER NOT NULL,
+                FOREIGN KEY (ParentId) REFERENCES Parent (ParentId)
+            );
+            CREATE TABLE Parent
+            (
+                ParentId INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("write packet claims sql fixture");
+        path
+    }
+
+    #[test]
+    fn sql_relationship_claims_attach_to_retained_foreign_key_citations() {
+        let path = write_sql_fixture("foreign-key");
+        let path_text = path.to_string_lossy().to_string();
+        let answer = test_answer(
+            "Explain SQL schema relationships between child and parent rows.",
+            vec![
+                test_citation("CREATE TABLE Child", &path_text, 0.9),
+                test_citation("FOREIGN KEY", &path_text, 0.8),
+            ],
+        );
+
+        let claims = packet_supported_claims(&answer);
+        let relationship_claim = claims
+            .iter()
+            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
+        assert!(
+            relationship_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "FOREIGN KEY"),
+            "relationship claim should cite retained FK evidence: {relationship_claim:?}"
+        );
+        assert!(
+            !relationship_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "CREATE TABLE Child"),
+            "relationship claim should not stay attached only to table evidence: {relationship_claim:?}"
+        );
+
+        let table_claim = claims
+            .iter()
+            .find(|claim| claim.claim == "SQL schema defines tables Child and Parent.")
+            .unwrap_or_else(|| panic!("expected table claim in {claims:?}"));
+        assert!(
+            table_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "CREATE TABLE Child"),
+            "table claim should keep table-definition evidence: {table_claim:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
+    }
+
+    #[test]
+    fn sql_relationship_claims_can_attach_to_retained_references_citations() {
+        let path = write_sql_fixture("references");
+        let path_text = path.to_string_lossy().to_string();
+        let answer = test_answer(
+            "Explain SQL schema relationships and references between child and parent rows.",
+            vec![
+                test_citation("CREATE TABLE Child", &path_text, 0.9),
+                test_citation("REFERENCES", &path_text, 0.8),
+            ],
+        );
+
+        let claims = packet_supported_claims(&answer);
+        let relationship_claim = claims
+            .iter()
+            .find(|claim| claim.claim == "Child rows reference Parent rows through ParentId.")
+            .unwrap_or_else(|| panic!("expected relationship claim in {claims:?}"));
+        assert!(
+            relationship_claim
+                .citations
+                .iter()
+                .any(|citation| citation.display_name == "REFERENCES"),
+            "relationship claim should cite retained REFERENCES evidence: {relationship_claim:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("sql fixture parent"));
+    }
 }

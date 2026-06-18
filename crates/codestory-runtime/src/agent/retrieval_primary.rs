@@ -1,6 +1,7 @@
 //! Mandatory sidecar retrieval integration for packet and agent ask paths.
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
+use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::agent::retrieval_rollback::{RollbackCheckInput, check_and_log_rollback_warnings};
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
@@ -1302,6 +1303,7 @@ fn resolve_sidecar_candidates_with_stats(
             continue;
         };
         hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
+        decorate_search_hit_evidence(&mut hit);
         hits.push(hit);
     }
 
@@ -1325,6 +1327,10 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         semantic,
         graph,
         total: candidate.score,
+        tier_cap: None,
+        boosts: Vec::new(),
+        dampening: Vec::new(),
+        final_rank_reason: None,
         provenance,
     }
 }
@@ -1467,6 +1473,41 @@ mod tests {
         );
 
         assert_eq!(node_id, Some(CoreNodeId(2)));
+    }
+
+    #[test]
+    fn unresolved_sidecar_candidates_are_diagnostic_only() {
+        let result = QueryResult {
+            query: "application use".into(),
+            features: classify_query("application use"),
+            hits: vec![CandidateHit::with_source(
+                "lib/application.js",
+                Some("use".to_string()),
+                0.7,
+                CandidateSource::Scip,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 100,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let resolution = SidecarCandidateResolutionOutcome {
+            resolved_hits: Vec::new(),
+            attempted_candidate_count: 1,
+            unresolved_candidate_count: 1,
+        };
+
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution);
+
+        assert_eq!(diagnostic.candidate_count, 1);
+        assert_eq!(diagnostic.resolved_hit_count, 0);
+        assert_eq!(diagnostic.unresolved_candidate_count, 1);
+        assert!(diagnostic.diagnostic.is_some());
     }
 
     #[test]

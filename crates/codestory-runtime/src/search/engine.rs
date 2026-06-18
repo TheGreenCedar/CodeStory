@@ -3,6 +3,7 @@ use crate::symbol_query::RetrievalFileRole;
 use crate::symbol_query::query_mentions_non_primary_source;
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::graph::NodeId;
+use fs4::fs_std::FileExt;
 use ndarray::Array2;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
@@ -15,6 +16,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -1564,6 +1566,159 @@ pub struct SearchEngine {
     full_text_index_enabled: bool,
     #[cfg(test)]
     query_embedding_cache: HashMap<String, Vec<f32>>,
+    _persisted_index_guard: Option<PersistedSearchIndexGuard>,
+}
+
+struct PersistedSearchIndexGuard {
+    file: File,
+    path: PathBuf,
+    mode: PersistedSearchIndexLockMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedSearchIndexLockMode {
+    Shared,
+    Exclusive,
+}
+
+impl PersistedSearchIndexGuard {
+    fn acquire_shared(search_dir: &Path) -> Result<Self> {
+        Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
+    }
+
+    fn acquire_exclusive(search_dir: &Path) -> Result<Self> {
+        Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Exclusive)
+    }
+
+    fn acquire_with_mode(search_dir: &Path, mode: PersistedSearchIndexLockMode) -> Result<Self> {
+        let lock_path = persisted_search_index_lock_path(search_dir);
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create search index lock parent {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open search index lock {}", lock_path.display()))?;
+        match mode {
+            PersistedSearchIndexLockMode::Shared => {
+                FileExt::lock_shared(&file).with_context(|| {
+                    format!(
+                        "Failed to take shared search index lock {}",
+                        search_dir.display()
+                    )
+                })?
+            }
+            PersistedSearchIndexLockMode::Exclusive => FileExt::lock_exclusive(&file)
+                .with_context(|| {
+                    format!(
+                        "Failed to take exclusive search index lock {}",
+                        search_dir.display()
+                    )
+                })?,
+        }
+        Ok(Self {
+            file,
+            path: lock_path,
+            mode,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_acquire_shared(search_dir: &Path) -> Result<Self> {
+        Self::try_acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
+    }
+
+    #[cfg(test)]
+    fn try_acquire_exclusive(search_dir: &Path) -> Result<Self> {
+        Self::try_acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Exclusive)
+    }
+
+    #[cfg(test)]
+    fn try_acquire_with_mode(
+        search_dir: &Path,
+        mode: PersistedSearchIndexLockMode,
+    ) -> Result<Self> {
+        let lock_path = persisted_search_index_lock_path(search_dir);
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create search index lock parent {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open search index lock {}", lock_path.display()))?;
+        let acquired = match mode {
+            PersistedSearchIndexLockMode::Shared => {
+                FileExt::try_lock_shared(&file).with_context(|| {
+                    format!(
+                        "Failed to take shared search index lock {}",
+                        search_dir.display()
+                    )
+                })?
+            }
+            PersistedSearchIndexLockMode::Exclusive => FileExt::try_lock_exclusive(&file)
+                .with_context(|| {
+                    format!(
+                        "Failed to take exclusive search index lock {}",
+                        search_dir.display()
+                    )
+                })?,
+        };
+        if !acquired {
+            bail!(
+                "Search index {} is already locked in {:?} mode",
+                search_dir.display(),
+                mode
+            );
+        }
+        Ok(Self {
+            file,
+            path: lock_path,
+            mode,
+        })
+    }
+
+    fn is_exclusive(&self) -> bool {
+        self.mode == PersistedSearchIndexLockMode::Exclusive
+    }
+}
+
+impl Drop for PersistedSearchIndexGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "Failed to unlock persisted search index lock: {error}"
+            );
+        }
+    }
+}
+
+fn persisted_search_index_lock_path(search_dir: &Path) -> PathBuf {
+    let mut path = search_dir.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 impl SearchEngine {
@@ -1574,7 +1729,10 @@ impl SearchEngine {
         schema_builder.build()
     }
 
-    fn new_with_index(index: Index) -> Result<Self> {
+    fn new_with_index(
+        index: Index,
+        persisted_index_guard: Option<PersistedSearchIndexGuard>,
+    ) -> Result<Self> {
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -1593,6 +1751,7 @@ impl SearchEngine {
             full_text_index_enabled: symbol_full_text_index_enabled_from_env(),
             #[cfg(test)]
             query_embedding_cache: HashMap::new(),
+            _persisted_index_guard: persisted_index_guard,
         })
     }
 
@@ -1657,19 +1816,66 @@ impl SearchEngine {
     pub fn new(storage_path: Option<&Path>) -> Result<Self> {
         let schema = Self::build_schema();
         let index = if let Some(path) = storage_path {
-            recreate_search_storage_dir(path)?;
-            Index::create_in_dir(path, schema.clone())
-                .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?
+            let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+            return Self::new_persisted_with_guard(path, guard);
         } else {
             Index::create_in_ram(schema)
         };
-        Self::new_with_index(index)
+        Self::new_with_index(index, None)
     }
 
+    #[allow(dead_code)]
     pub fn open_existing(path: &Path) -> Result<Self> {
+        let guard = PersistedSearchIndexGuard::acquire_shared(path)?;
+        Self::open_persisted_with_guard(path, guard)
+    }
+
+    pub(crate) fn open_existing_or_recreate(path: &Path) -> Result<(Self, Option<anyhow::Error>)> {
+        let shared_guard = PersistedSearchIndexGuard::acquire_shared(path)?;
+        match Self::open_persisted_with_guard(path, shared_guard) {
+            Ok(engine) => Ok((engine, None)),
+            Err(open_error) => {
+                let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+                let engine = Self::new_persisted_with_guard(path, guard)?;
+                Ok((engine, Some(open_error)))
+            }
+        }
+    }
+
+    pub(crate) fn recreate_persisted_from_existing(
+        path: &Path,
+        mut existing: Self,
+    ) -> Result<Self> {
+        let guard = existing._persisted_index_guard.take();
+        drop(existing);
+        match guard.filter(|guard| guard.is_exclusive()) {
+            Some(guard) => Self::new_persisted_with_guard(path, guard),
+            None => {
+                let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+                Self::new_persisted_with_guard(path, guard)
+            }
+        }
+    }
+
+    fn new_persisted_with_guard(path: &Path, guard: PersistedSearchIndexGuard) -> Result<Self> {
+        if !guard.is_exclusive() {
+            bail!(
+                "Recreating persisted search index {} requires an exclusive lock",
+                path.display()
+            );
+        }
+        recreate_search_storage_dir(path)?;
+        let schema = Self::build_schema();
+        let index = Index::create_in_dir(path, schema)
+            .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?;
+        Self::new_with_index(index, Some(guard))
+    }
+
+    fn open_persisted_with_guard(path: &Path, guard: PersistedSearchIndexGuard) -> Result<Self> {
         let index = Index::open_in_dir(path)
             .with_context(|| format!("Failed to open tantivy index at {}", path.display()))?;
-        Self::new_with_index(index)
+        Self::new_with_index(index, Some(guard))
+            .with_context(|| format!("Failed to initialize tantivy reader at {}", path.display()))
     }
 
     #[cfg(test)]
@@ -2965,6 +3171,101 @@ mod tests {
         );
         assert_eq!(reopened.search_full_text("betasymbol")?, vec![NodeId(2)]);
         assert_eq!(reopened.search_symbol("Beta"), vec![NodeId(2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_search_index_lock_is_sibling_and_held_by_engine() -> Result<()> {
+        let dir = tempdir()?;
+        let search_dir = dir.path().join("codestory.search");
+        let lock_path = persisted_search_index_lock_path(&search_dir);
+
+        let mut engine = SearchEngine::new(Some(search_dir.as_path()))?;
+        assert!(search_dir.exists());
+        assert!(lock_path.exists());
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()).is_err(),
+            "new persisted engine should hold an exclusive search-index lock"
+        );
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_shared(search_dir.as_path()).is_err(),
+            "exclusive search-index lock should block readers while rebuilding"
+        );
+
+        engine.index_nodes(vec![(NodeId(1), "Locked Symbol".to_string())])?;
+        drop(engine);
+
+        let _guard = PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path())?;
+        assert!(
+            lock_path.exists(),
+            "recreating the search dir must not delete its sibling lock"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_search_index_rebuild_reuses_existing_lock() -> Result<()> {
+        let dir = tempdir()?;
+        let search_dir = dir.path().join("search");
+
+        let mut engine = SearchEngine::new(Some(search_dir.as_path()))?;
+        engine.index_nodes(vec![(NodeId(1), "Before Rebuild".to_string())])?;
+        drop(engine);
+
+        let existing = SearchEngine::open_existing(search_dir.as_path())?;
+        {
+            let _second_reader =
+                PersistedSearchIndexGuard::try_acquire_shared(search_dir.as_path())?;
+            assert!(
+                PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()).is_err(),
+                "open_existing should hold a shared search-index lock"
+            );
+        }
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()).is_err(),
+            "open_existing should keep writers out while the reader is alive"
+        );
+
+        let mut rebuilt =
+            SearchEngine::recreate_persisted_from_existing(search_dir.as_path(), existing)?;
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()).is_err(),
+            "rebuild should keep an exclusive search-index lock while recreating the index"
+        );
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_shared(search_dir.as_path()).is_err(),
+            "exclusive rebuild lock should block readers"
+        );
+        rebuilt.index_nodes(vec![(NodeId(2), "After Rebuild".to_string())])?;
+        assert_eq!(rebuilt.search_full_text("after")?, vec![NodeId(2)]);
+        drop(rebuilt);
+
+        let _guard = PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_search_index_open_failure_rebuild_keeps_lock() -> Result<()> {
+        let dir = tempdir()?;
+        let search_dir = dir.path().join("missing.search");
+
+        let (mut engine, open_error) =
+            SearchEngine::open_existing_or_recreate(search_dir.as_path())?;
+        assert!(open_error.is_some());
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path()).is_err(),
+            "open-failure fallback should keep an exclusive search-index lock"
+        );
+        assert!(
+            PersistedSearchIndexGuard::try_acquire_shared(search_dir.as_path()).is_err(),
+            "open-failure fallback should block readers until rebuilt"
+        );
+
+        engine.index_nodes(vec![(NodeId(1), "Recovered Symbol".to_string())])?;
+        assert_eq!(engine.search_full_text("recovered")?, vec![NodeId(1)]);
+        drop(engine);
+
+        let _guard = PersistedSearchIndexGuard::try_acquire_exclusive(search_dir.as_path())?;
         Ok(())
     }
 

@@ -544,6 +544,12 @@ pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
         origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
         match_quality: None,
         resolvable: true,
+        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+        evidence_producer: Some("node_details".to_string()),
+        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        loss_reason: None,
+        coverage_role: None,
+        eligible_for_sufficiency: Some(true),
         score_breakdown: None,
     }
 }

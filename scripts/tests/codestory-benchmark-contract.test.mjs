@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   assertSidecarMandatoryEnv,
+  benchmarkContractCompatibility,
   benchmarkChildEnv,
+  benchmarkRunContract,
   retrievalContractSummary,
   retrievalEnv,
   shouldPrepareRetrievalIndex,
@@ -88,4 +90,41 @@ test("retrieval env captures sidecar variables", () => {
   assert.equal(env.CODESTORY_RETRIEVAL_SHADOW, null);
   assert.equal(env.CODESTORY_RETRIEVAL_V2, null);
   assert.equal(env.CODESTORY_RETRIEVAL_V2_SHADOW, null);
+});
+
+test("benchmark reuse contract accepts identical fingerprints", () => {
+  const opts = { runner: "codex", model: "gpt-test", sandbox: "workspace-write" };
+  const task = { id: "task-a", manifest_path: null, prompt: "Explain flow" };
+  const env = benchmarkChildEnv({});
+  const current = benchmarkRunContract({ opts, task, env });
+  const previous = benchmarkRunContract({ opts, task, env });
+
+  assert.equal(current.compatibility_fingerprint, previous.compatibility_fingerprint);
+  assert.deepEqual(benchmarkContractCompatibility(current, previous), {
+    compatible: true,
+    mismatches: [],
+  });
+});
+
+test("benchmark reuse contract rejects model drift and missing fingerprints", () => {
+  const env = benchmarkChildEnv({});
+  const task = { id: "task-a", manifest_path: null, prompt: "Explain flow" };
+  const current = benchmarkRunContract({
+    opts: { runner: "codex", model: "new-model", sandbox: "workspace-write" },
+    task,
+    env,
+  });
+  const previous = benchmarkRunContract({
+    opts: { runner: "codex", model: "old-model", sandbox: "workspace-write" },
+    task,
+    env,
+  });
+
+  const drift = benchmarkContractCompatibility(current, previous);
+  assert.equal(drift.compatible, false);
+  assert.ok(drift.mismatches.some((line) => line.startsWith("model:")));
+
+  const missing = benchmarkContractCompatibility(current, {});
+  assert.equal(missing.compatible, false);
+  assert.match(missing.mismatches[0], /missing benchmark_contract/);
 });

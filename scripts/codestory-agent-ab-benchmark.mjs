@@ -13,7 +13,9 @@ import {
   discoverPreviousPacketSummary,
 } from "./codestory-agent-value-score.mjs";
 import {
+  benchmarkContractCompatibility,
   benchmarkChildEnv,
+  benchmarkRunContract,
   retrievalContractSummary,
   retrievalEnv as benchmarkRetrievalEnv,
   shouldPrepareRetrievalIndex,
@@ -21,6 +23,8 @@ import {
 } from "./codestory-benchmark-contract.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const benchmarkHarnessPath = fileURLToPath(import.meta.url);
+const benchmarkScorerPath = path.join(scriptDir, "codestory-agent-value-score.mjs");
 const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
 const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
@@ -107,7 +111,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -1229,7 +1233,7 @@ The benchmark harness already ran the required first repository-context command 
 ${prelude.public.command}
 \`\`\`
 
-Use this packet as the first CodeStory context source. If \`sufficiency.status\` is \`"sufficient"\` and \`sufficiency.follow_up_commands\` is empty, answer from this packet without ordinary source reads. Include a compact \`Support files\` section with the packet citation and avoid-opening paths.
+Use this packet as the first CodeStory context source. If \`sufficiency.status\` is \`"sufficient"\` and \`sufficiency.follow_up_commands\` is empty, answer from this packet without ordinary source reads. Preserve exact source identifiers and covered-claim phrases from \`sufficiency.covered_claims\` and citation display names. Do not merge repeated exact anchors into shorthand that drops required prefixes; write each exact anchor independently when naming declarations, tables, symbols, or source-defined selectors. Include a compact \`Support files\` section with the packet citation and avoid-opening paths.
 ${manifestBlock}
 ${supportPathBlock}
 
@@ -1854,6 +1858,44 @@ function normalizeSearchText(value) {
     .trim();
 }
 
+function anchorSearchVariants(anchor) {
+  const normalized = normalizeSearchText(anchor);
+  const variants = new Set();
+  if (normalized) {
+    variants.add(normalized);
+  }
+  if (/[a-z_][a-z0-9_]*::[a-z_][a-z0-9_]*/i.test(normalized)) {
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)::([a-z_][a-z0-9_]*)/gi, "$1.$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)::([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+  }
+  if (!normalized.includes("/") && normalized.includes("::")) {
+    const namespaceTail = normalized.split("::").filter(Boolean).at(-1);
+    if (namespaceTail && namespaceTail.length >= 4 && namespaceTail !== normalized) {
+      variants.add(namespaceTail);
+      if (/[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*/i.test(namespaceTail)) {
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+      }
+      if (/[a-z_][a-z0-9_]*#[a-z_][a-z0-9_]*/i.test(namespaceTail)) {
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1.$2"));
+        variants.add(namespaceTail.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+      }
+    }
+  }
+  if (
+    !normalized.includes("/") &&
+    /[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*/i.test(normalized)
+  ) {
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+  }
+  if (/[a-z_][a-z0-9_]*#[a-z_][a-z0-9_]*/i.test(normalized)) {
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1.$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1::$2"));
+  }
+  return [...variants];
+}
+
 function redactUrlForDisplay(value) {
   if (value == null) {
     return value;
@@ -1863,11 +1905,11 @@ function redactUrlForDisplay(value) {
 
 function anchorMatched(haystack, anchor) {
   const normalizedHaystack = normalizeSearchText(haystack);
-  const normalizedAnchor = normalizeSearchText(anchor);
-  if (!normalizedAnchor) {
+  const variants = anchorSearchVariants(anchor);
+  if (!variants.length) {
     return false;
   }
-  return normalizedHaystack.includes(normalizedAnchor);
+  return variants.some((variant) => normalizedHaystack.includes(variant));
 }
 
 function scoreAnchorSet(anchors, haystack) {
@@ -2422,6 +2464,44 @@ function parseRipgrepMatches(stdout) {
   return matches;
 }
 
+function benignBaselineRipgrepWarningLines(stderr) {
+  const lines = String(stderr ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return {
+    lines,
+    benign:
+      lines.length > 0 &&
+      lines.every((line) => {
+        const lower = line.toLowerCase();
+        return (
+          lower.startsWith("rg:") &&
+          (lower.includes("(os error 2)") ||
+            lower.includes("(os error 3)") ||
+            lower.includes("cannot find the path specified") ||
+            lower.includes("cannot find the file specified") ||
+            lower.includes("no such file or directory"))
+        );
+      }),
+  };
+}
+
+function baselineSearchPreludeStatus(result, matches) {
+  if (result.exitCode === 0 || result.exitCode === 1) {
+    return { allowed: true, status: "pass", warning_lines: [] };
+  }
+  const warnings = benignBaselineRipgrepWarningLines(result.stderr);
+  if (result.exitCode === 2 && matches.length > 0 && warnings.benign) {
+    return {
+      allowed: true,
+      status: "pass_with_warnings",
+      warning_lines: warnings.lines,
+    };
+  }
+  return { allowed: false, status: "fail", warning_lines: warnings.lines };
+}
+
 function baselineFilePenalty(filePath) {
   const normalized = normalizePathLike(filePath).toLowerCase();
   let penalty = 0;
@@ -2625,8 +2705,8 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
     timeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000),
     timeoutMessage: "Baseline repository search timed out after 60000ms.",
   });
-  const searchAllowed = result.exitCode === 0 || result.exitCode === 1;
   const matches = parseRipgrepMatches(result.stdout);
+  const preludeStatus = baselineSearchPreludeStatus(result, matches);
   const selectedFiles = selectBaselineFiles(matches, terms);
   const { contextText, readCommands } = await buildBaselineContext(repoConfig, matches, selectedFiles);
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -2639,16 +2719,18 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
     category: "shell_search",
     aggregated_output: searchOutput,
     exit_code: result.exitCode,
-    status: searchAllowed ? "pass" : result.status,
+    status: preludeStatus.allowed ? preludeStatus.status : result.status,
   };
   const commands = [searchCommand, ...readCommands];
   const publicPrelude = {
     kind: "baseline_local_context",
-    status: searchAllowed ? "pass" : "fail",
+    status: preludeStatus.status,
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
     error: result.error,
+    warning_count: preludeStatus.warning_lines.length,
+    warning_lines: preludeStatus.warning_lines.slice(0, 12),
     wall_ms: wallMs,
     context_path: contextPath,
     stderr_path: stderrPath,
@@ -2809,7 +2891,7 @@ async function runOne(opts, run, outDir) {
   const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
   const started = performance.now();
   const preludeFailure = [baselinePrelude, codestoryPrelude].find(
-    (prelude) => prelude && prelude.public.status !== "pass",
+    (prelude) => prelude && !preludeAllowsAgentRun(prelude.public),
   );
   const shouldRunAgent = preludeFailure == null;
   const result = shouldRunAgent
@@ -2864,8 +2946,10 @@ async function runOne(opts, run, outDir) {
         transport_mode: "agent_runner",
       })
     : null;
+  const benchmarkContract = benchmarkContractForRun(opts, run, env);
 
   const output = {
+    benchmark_run_id: runId,
     repo: run.repo,
     task_id: run.task?.id ?? null,
     task_name: run.task?.name ?? null,
@@ -2884,6 +2968,8 @@ async function runOne(opts, run, outDir) {
     repo_path: repoConfig.path,
     repo_provenance: provenance,
     codestory_cache_provenance: cacheProvenance,
+    benchmark_contract: benchmarkContract,
+    promotion_eligible: benchmarkContract.promotion_eligible,
     status: result.timedOut ? "timeout" : result.exitCode === 0 ? "pass" : "fail",
     exit_code: result.exitCode,
     signal: result.signal,
@@ -2911,6 +2997,10 @@ async function runOne(opts, run, outDir) {
     ...output,
     resource_accounting: resourceAccountingForResult(output),
   };
+}
+
+function preludeAllowsAgentRun(publicPrelude) {
+  return publicPrelude?.status === "pass" || publicPrelude?.status === "pass_with_warnings";
 }
 
 async function gitOutput(args, cwd, timeoutMs = 10_000) {
@@ -3260,6 +3350,28 @@ function cachePolicyForRun(observations = {}) {
     return "timed-run-indexed-cache";
   }
   return observations.cache_prepared ? "prepared-sidecar-cache-read-only" : "unprepared-cache-blocked";
+}
+
+function cachePreparationForRepo(opts, repoName) {
+  const preparation = opts.cachePreparationByRepo;
+  if (preparation instanceof Map) {
+    return preparation.get(repoName) ?? null;
+  }
+  if (Array.isArray(preparation)) {
+    return preparation.find((row) => row?.repo === repoName) ?? null;
+  }
+  return null;
+}
+
+function packetRuntimeCacheObservations(opts, repoName, transportMode) {
+  const cachePreparation = cachePreparationForRepo(opts, repoName);
+  return {
+    codestory_index_commands_observed: 0,
+    indexing_in_timed_run: false,
+    cache_prepared: Boolean(cachePreparation),
+    cache_preparation: cachePreparation,
+    transport_mode: transportMode,
+  };
 }
 
 async function codestoryCacheProvenance(opts, config, observations = {}) {
@@ -3864,11 +3976,11 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const repoConfig = ALL_REPOS[task.repo];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(opts, repoConfig, {
-    codestory_index_commands_observed: 0,
-    indexing_in_timed_run: false,
-    transport_mode: "cold_cli_packet",
-  });
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    packetRuntimeCacheObservations(opts, task.repo, "cold_cli_packet"),
+  );
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
@@ -4012,11 +4124,11 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
   const repoConfig = ALL_REPOS[repoName];
   const codestoryCli = resolveCodeStoryCli(opts);
   const provenance = await repoProvenance(repoConfig);
-  const cacheProvenance = await codestoryCacheProvenance(opts, repoConfig, {
-    codestory_index_commands_observed: 0,
-    indexing_in_timed_run: false,
-    transport_mode: "warm_stdio_packet",
-  });
+  const cacheProvenance = await codestoryCacheProvenance(
+    opts,
+    repoConfig,
+    packetRuntimeCacheObservations(opts, repoName, "warm_stdio_packet"),
+  );
   const client = createStdioClient(
     codestoryCli,
     ["serve", "--project", repoConfig.path, "--stdio", "--refresh", "none"],
@@ -4473,59 +4585,68 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
   const enforcePacketRuntimeTelemetry = Boolean(opts.publishable || opts.enforcePacketRuntimeTelemetry);
   return results
-    .map((row) => {
-      const reasons = [];
+    .flatMap((row) => {
+      const productReasons = [];
+      const harnessReasons = [];
       if (row.status !== "pass") {
-        reasons.push(`status=${row.status}`);
+        productReasons.push(`status=${row.status}`);
       }
       if (!row.quality) {
-        reasons.push("missing manifest quality score");
+        productReasons.push("missing manifest quality score");
       } else if (!row.quality.pass) {
-        reasons.push("manifest quality failed");
+        productReasons.push("manifest quality failed");
       }
       if (row.sufficiency?.sufficient_quality_mismatch) {
-        reasons.push("packet sufficiency says sufficient but manifest quality failed");
+        productReasons.push("packet sufficiency says sufficient but manifest quality failed");
       }
       if (enforcePacketRuntimeTelemetry) {
         if (row.packet_extra_probe_strategy) {
-          reasons.push(`diagnostic packet extra probes used: ${row.packet_extra_probe_strategy}`);
+          harnessReasons.push(`diagnostic packet extra probes used: ${row.packet_extra_probe_strategy}`);
         }
         if (!row.sufficiency) {
-          reasons.push("missing packet sufficiency telemetry");
+          harnessReasons.push("missing packet sufficiency telemetry");
         } else if (row.sufficiency.status !== "sufficient") {
-          reasons.push(`packet sufficiency status=${row.sufficiency.status ?? "unknown"}; expected sufficient`);
+          productReasons.push(`packet sufficiency status=${row.sufficiency.status ?? "unknown"}; expected sufficient`);
         }
         const latency = row.packet_latency;
         if (!latency) {
-          reasons.push("missing packet latency telemetry");
+          harnessReasons.push("missing packet latency telemetry");
         } else {
           if (latency.sla_missed !== false) {
-            reasons.push(`packet retrieval SLA missed=${latency.sla_missed ?? "unknown"}; expected false`);
+            productReasons.push(`packet retrieval SLA missed=${latency.sla_missed ?? "unknown"}; expected false`);
           }
           const shadow = latency.retrieval_shadow;
           if (!shadow) {
-            reasons.push("missing retrieval shadow telemetry");
+            harnessReasons.push("missing retrieval shadow telemetry");
           } else if (shadow.retrieval_mode !== "full") {
-            reasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
+            productReasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
           }
         }
       }
       if (enforceRepoProvenance) {
-        reasons.push(...repoProvenanceBlockers(row));
-        reasons.push(...cacheProvenanceBlockers(row));
+        harnessReasons.push(...repoProvenanceBlockers(row));
+        harnessReasons.push(...cacheProvenanceBlockers(row));
       }
-      return reasons.length ? { result: row, reasons } : null;
+      return [
+        productReasons.length ? { result: row, category: "product", reasons: productReasons } : null,
+        harnessReasons.length ? { result: row, category: "harness-contract", reasons: harnessReasons } : null,
+      ];
     })
     .filter(Boolean);
 }
 
 function packetRuntimeQualityGateRequired(opts = {}) {
-  return Boolean(opts.publishable || (opts.taskSuite === "holdout-retrieval" && !opts.allowFailures));
+  return Boolean(
+    opts.publishable ||
+      (["holdout-retrieval", "language-expansion-holdout"].includes(opts.taskSuite) &&
+        !opts.allowFailures),
+  );
 }
 
 function formatPacketRuntimeBlocker(blocker) {
   const row = blocker.result;
-  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${blocker.reasons.join("; ")}`;
+  const category = blocker.category ? `${blocker.category}: ` : "";
+  return `  ${row.repo} ${row.task_id} ${row.mode} repeat ${row.repeat}: ${category}${blocker.reasons.join("; ")}`;
 }
 
 function groupTasksByRepo(tasks) {
@@ -4690,6 +4811,14 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
     output_dir: outDir,
     retrieval_env: retrievalEnv(),
     retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
+    benchmark_contract: benchmarkRunContract({
+      opts,
+      task: null,
+      env: process.env,
+      harnessPath: benchmarkHarnessPath,
+      scorerPath: benchmarkScorerPath,
+      cliIdentity: opts.codestoryCli ?? process.env.CODESTORY_CLI ?? null,
+    }),
     summary,
   };
   const packetRuntimeSummaryPath = path.join(outDir, "packet-runtime-summary.json");
@@ -5496,12 +5625,29 @@ function runSelfTest() {
     [null, false, true, "fail"],
   );
   assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }), true);
+  assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "language-expansion-holdout" }), true);
   assert.equal(
     packetRuntimeQualityGateRequired({
-      taskSuite: "holdout-retrieval",
+      taskSuite: "language-expansion-holdout",
       allowFailures: true,
     }),
     false,
+  );
+  assert.deepEqual(
+    baselineSearchPreludeStatus(
+      {
+        exitCode: 2,
+        stderr: "rg: .\\missing: The system cannot find the path specified. (os error 3)\n",
+      },
+      [{ path: "src/main.rb", line: 1, column: 1, text: "build" }],
+    ),
+    {
+      allowed: true,
+      status: "pass_with_warnings",
+      warning_lines: [
+        "rg: .\\missing: The system cannot find the path specified. (os error 3)",
+      ],
+    },
   );
   assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "local-real" }), false);
   assert.equal(
@@ -5522,6 +5668,21 @@ function runSelfTest() {
     }),
     "already-ready",
   );
+  const packetRuntimePreparation = [
+    {
+      repo: "codestory",
+      retrieval_status: { retrieval_mode: "full" },
+    },
+  ];
+  for (const transportMode of ["cold_cli_packet", "warm_stdio_packet"]) {
+    const observations = packetRuntimeCacheObservations(
+      { cachePreparationByRepo: packetRuntimePreparation },
+      "codestory",
+      transportMode,
+    );
+    assert.equal(cachePolicyForRun(observations), "prepared-sidecar-cache-read-only");
+    assert.equal(observations.cache_preparation, packetRuntimePreparation[0]);
+  }
 
   const plannedAgentRuns = planAgentRuns(
     { arms: ["without_codestory", "with_codestory"], repeats: 1, repos: null },
@@ -5596,6 +5757,17 @@ function taskSnapshotMatches(currentTask, candidate) {
   const current = taskSnapshotForResult(currentTask);
   const previous = candidate?.task_manifest_snapshot ?? null;
   return JSON.stringify(current ?? null) === JSON.stringify(previous ?? null);
+}
+
+function benchmarkContractForRun(opts, run, env = process.env) {
+  return benchmarkRunContract({
+    opts,
+    task: run.task ?? null,
+    env,
+    harnessPath: benchmarkHarnessPath,
+    scorerPath: benchmarkScorerPath,
+    cliIdentity: run.arm === "with_codestory" ? opts.codestoryCli ?? env.CODESTORY_CLI ?? null : null,
+  });
 }
 
 function resolveRunArtifactPath(runDir, artifactPath) {
@@ -5696,6 +5868,19 @@ async function loadReusableBaselines(opts, plannedRuns, outDir) {
       continue;
     }
     const reanalyzed = await recomputeRunAnalysis(row, opts, sourceRunDir, taskCache);
+    const currentContract = benchmarkContractForRun(opts, planned);
+    const compatibility = benchmarkContractCompatibility(
+      currentContract,
+      reanalyzed.benchmark_contract,
+    );
+    if (!compatibility.compatible) {
+      throw new Error(
+        [
+          `Refusing to reuse incompatible baseline row for ${planned.repo} ${planned.task?.id ?? ""} repeat ${planned.repeat}.`,
+          ...compatibility.mismatches,
+        ].join(" "),
+      );
+    }
     const runId = benchmarkRunId([
       planned.repo,
       ...(planned.task ? [planned.task.id] : []),
@@ -5706,7 +5891,15 @@ async function loadReusableBaselines(opts, plannedRuns, outDir) {
     reusable.set(key, {
       ...copied,
       reused_from: sourceRunDir,
+      reused_from_run_id: row.benchmark_run_id ?? null,
       reused_at: new Date().toISOString(),
+      benchmark_contract: {
+        ...currentContract,
+        reused_from: sourceRunDir,
+        reused_from_run_id: row.benchmark_run_id ?? null,
+        promotion_eligible: true,
+      },
+      promotion_eligible: true,
       resource_accounting: resourceAccountingForResult(copied),
     });
   }
@@ -5884,6 +6077,7 @@ export {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  baselineSearchPreludeStatus,
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
   copyResultArtifact,
@@ -5898,6 +6092,7 @@ export {
   materializeRepos,
   parseArgs,
   parseJsonLines,
+  cachePolicyForRun,
   packetComposition,
   packetCommandArgs,
   packetForAgentPrompt,
@@ -5905,6 +6100,7 @@ export {
   packetManifestQualitySummary,
   packetPreludeManifestComplete,
   packetLatencyTelemetry,
+  packetRuntimeCacheObservations,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
   PACKET_COMPOSITION_WEIGHTS,

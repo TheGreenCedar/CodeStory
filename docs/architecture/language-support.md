@@ -17,6 +17,9 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
 | Structural collector | Dedicated extractor emits structural entities. | Parser-backed code navigation. |
 | Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
+| Packet proof gate | A packet-runtime artifact proves the current packet citation and sufficiency contract for the measured tasks. | Public product-grade language quality. |
+| Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
+| Development comparison | A reused-baseline or local-real artifact informs tuning and diagnosis. | Fresh publishable promotion proof. |
 
 ## Current Runtime Claims
 
@@ -30,25 +33,56 @@ report is not blanket promotion proof for every parser-backed language.
 
 ## Latest Agent-Facing Evidence
 
-The latest full language-expansion paired A/B run was completed on 2026-06-16:
-`target/agent-benchmark/language-expansion-holdout-20260616-0.8.0-retry/reanalyzed-summary.md`.
+The current publishable packet-runtime proof gate is the June 18 packet-runtime
+status. It is blocked:
 
-That run is useful operational evidence, not a broad answer-quality promotion:
+| Measure | Status | Read |
+| --- | ---: | --- |
+| Runs | `108/108` success | Runtime completed all measured tasks. |
+| Quality | `106/108` pass | Two rows still miss the quality bar. |
+| Sufficiency | `107/108` sufficient, `1` partial | One packet is not proof-complete. |
+| Cold SLA | `8` misses | Cold latency still blocks publishable promotion. |
+
+Safe wording: packet-runtime is implemented and completing the suite, but
+publishable agent-facing packet quality is not promoted until a coherent run has
+all quality, sufficiency, and cold-SLA gates green. This evidence is a
+development/proof-gate signal, not public product-grade proof for every
+parser-backed language. HTML, CSS, and SQL remain structural collectors.
+
+Older development comparison: the language-expansion comparison artifact built
+on 2026-06-17:
+`target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.md`.
+
+It is an offline reused-baseline composite. It combines the fixed no-CodeStory
+baseline at `target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4`
+with the CodeStory-only confirmation at
+`target/agent-benchmark/language-expansion-holdout-20260617-post-round24-codeonly-prepj1-j2`.
+No harness arm was executed to create the composite, and no no-CodeStory rows
+were rerun.
+
+That artifact is a development-quality read, not a final public promotion
+claim:
 
 | Measure | With CodeStory | Without CodeStory | Read |
 | --- | ---: | ---: | --- |
 | Runs attempted | `54` | `54` | Three repeats across 18 language tasks. |
-| Run success | `54/54` | `51/54` | All baseline failures were the Ruby/Jekyll row. |
-| Quality pass | `16/54` | `19/51` successful rows | Answer quality remains uneven. |
-| All-in wall time | `6,411,835 ms` | `7,523,716 ms` | CodeStory ratio `0.852`. |
-| Total tokens | `7,859,161` | `9,087,330` | CodeStory ratio `0.865`. |
+| Run success | `54/54` | `54/54` | Both arms successful in their source artifacts. |
+| Quality pass | `54/54` | `24/54` | CodeStory quality is never worse per row; some rows tie a saturated baseline. |
+| All-in wall time | `3,383,687 ms` | `7,943,578 ms` | CodeStory ratio `0.426`. |
+| Total tokens | `2,141,124` | `9,692,559` | CodeStory ratio `0.221`. |
 | Commands | `54` | `471` | CodeStory kept exploration bounded. |
 | Source reads | `0` | `417` | The CodeStory arm stayed packet-first. |
 
-Safe wording: CodeStory completed the full 18-language A/B arm with lower
-overall wall time, token use, command count, and direct source reads. Do not say
-the run proves first-class agent-facing quality across every language; the
-quality score is mixed and several rows still need better handoff semantics.
+Safe wording: on the fixed-baseline development comparison, CodeStory is
+quality-equal or better on every measured language task and materially cheaper
+overall. Do not describe this as product-grade proof for every supported
+language or framework until repeat, freshness, breadth, and promotion metadata
+are recorded. Future language-expansion loops may reuse the fixed no-CodeStory
+control only when the benchmark contract accepts the reused rows as
+fingerprint-compatible. Missing or incompatible fingerprints are diagnostic-only;
+generate a new control artifact when the task suite, pinned repo state, harness
+contract, scorer boundary, model, CLI identity, or retrieval contract changes
+with explicit approval.
 
 ## Resolution Claims
 
@@ -141,13 +175,16 @@ Before adding a parser-backed language or widening a public claim:
    ```
 
 7. For agent-facing evidence, run at least the targeted language task from the
-   A/B suite, and run the full suite before making language-wide claims:
+   A/B suite. Reuse the fixed no-CodeStory control only when
+   `--reuse-baseline-from` accepts the baseline fingerprints; otherwise treat the
+   reused comparison as diagnostic or create a new approved control artifact:
 
    ```sh
    node scripts/codestory-agent-ab-benchmark.mjs \
      --task-suite language-expansion-holdout \
      --arms without_codestory,with_codestory \
      --repeats 3 --materialize-repos --prepare-codestory-cache \
+     --reuse-baseline-from target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4 \
      --out-dir target/agent-benchmark/language-expansion-holdout \
      --timeout-ms 600000
    ```

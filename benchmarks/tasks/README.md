@@ -96,20 +96,54 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --list --task-suite language-expansion-holdout --materialize-repos
 ```
 
-Run a strict paired comparison:
+Run the promotion-eligible packet-runtime shape:
 
 ```powershell
+cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs `
+  --packet-runtime `
+  --packet-runtime-mode both `
   --task-suite language-expansion-holdout `
-  --arms without_codestory,with_codestory `
-  --repeats 3 --materialize-repos --prepare-codestory-cache `
-  --out-dir target/agent-benchmark/language-expansion-holdout `
-  --timeout-ms 600000
+  --repeats 3 `
+  --materialize-repos `
+  --jobs 4 `
+  --prepare-codestory-jobs 2 `
+  --codestory-cli target/release/codestory-cli.exe `
+  --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes `
+  --timeout-ms 180000 `
+  --publishable
 ```
 
 Use `--task-ids <id>` for a cheaper targeted run. The Markdown summary table
 includes the human-readable A/B columns; `runs.jsonl` remains the source of
 truth for per-run metrics.
+
+Promotion requires full `language-expansion-holdout` packet-runtime coverage,
+cold and warm modes, `--repeats 3`, `--jobs 4`, prepared sidecars,
+`--publishable`, no `--allow-failures`, full sidecar provenance, no quality
+misses, no sufficiency gaps, and no SLA misses. `--jobs 4` is valid row
+concurrency for this eval lane. Keep `--prepare-codestory-jobs` lower or capped;
+use `2` for examples unless intentionally running serial prep.
+
+Fixed no-CodeStory controls and `--reuse-baseline-from` are development
+diagnostics unless the benchmark contract accepts matching fingerprints. They
+are never enough for packet-runtime promotion by themselves. Generate a new
+control artifact only when the task suite, pinned repo state, harness contract,
+or scorer boundary changes with explicit approval.
+
+Run a diagnostic comparison with a compatible fixed no-CodeStory control:
+
+```powershell
+node scripts/codestory-agent-ab-benchmark.mjs `
+  --task-suite language-expansion-holdout `
+  --arms without_codestory,with_codestory `
+  --repeats 3 `
+  --materialize-repos `
+  --prepare-codestory-cache `
+  --reuse-baseline-from target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4 `
+  --out-dir target/agent-benchmark/language-expansion-holdout `
+  --timeout-ms 600000
+```
 
 For runtime packet fixes, prefer a packet-first gated loop before launching
 nested agents:
@@ -129,8 +163,8 @@ independent nested A/B repo groups, and `--prepare-codestory-jobs` caps cache
 prep across repos. If a packet probe fails from transient sidecar
 unavailability, the score wrapper reruns just those task ids serially in a
 `packet-probes-retry` artifact before deciding which rows enter the A/B phase.
-Baseline reuse is valid only when the task manifest and scorer boundary are
-unchanged.
+Baseline reuse is valid only when the task manifest, scorer, harness, model,
+CLI identity, retrieval contract, and packet threshold fingerprints match.
 
 For anti-overfit language checks, run promotion-oriented packet gates with
 production defaults. Exact benchmark probes belong in benchmark manifests,
@@ -140,12 +174,18 @@ product code when they generalize to real projects.
 
 Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize the
 durable result in [language-expansion-ab-report.md](../../docs/testing/language-expansion-ab-report.md)
-instead of preserving local run directory catalogs here. The current packet
-runtime artifact passes manifest quality for `12/18` rows and is
-packet-sufficient for `9/18`; the packet-eligible A/B slice is a quality
-and efficiency win for its selected `9/9` CodeStory rows only. Treat that as
-packet-eligible slice evidence, not broad promotion proof for all public
-language-support profiles.
+instead of preserving local run directory catalogs here. The current June 18
+diagnostic full form+command packet-runtime artifact at
+`target/agent-benchmark/language-expansion-proof-full-form-command-shapes`
+passes `108/108` success, quality, and sufficiency gates, but has `9` cold SLA
+misses and is non-publishable development proof only. The current publishable
+artifact at
+`target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`
+passes `108/108` success, `106/108` quality, and `107/108` sufficiency, with
+`1` partial row and `8` cold SLA misses. Promotion is blocked by
+apache-commons-lang cold SLA `3/3`, redis cold SLA `3/3`, AutoMapper cold SLA
+`1/3`, dart-http cold SLA `1/3`, square-okio cold quality `2/3`, and Alamofire
+cold quality `2/3` plus `1` partial sufficiency.
 
 ## Local Real-Repo Corpus
 

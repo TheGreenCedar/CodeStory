@@ -192,11 +192,7 @@ pub(crate) fn packet_append_command_flow_template_claims(
         }
 
         let runtime_citation = run_main_citation.or_else(|| {
-            packet_citation_matching_path_and_display(
-                citations,
-                &descriptor.crate_segment,
-                "run_exec_session",
-            )
+            packet_citation_matching_path_and_display_shape(citations, &descriptor.crate_segment)
         });
         if let Some(runtime_citation) = runtime_citation
             && (normalized_prompt.contains("appserver")
@@ -221,11 +217,24 @@ pub(crate) fn packet_append_command_flow_template_claims(
             packet_push_flow_template_claim(
                 claims,
                 seen,
-                "run_main loads config, resolves sandbox and approval settings, and builds the in-process app-server start arguments.",
+                "Runtime session entrypoint evidence loads config, resolves sandbox and approval settings, and builds app-server start arguments.",
                 Some(runtime_citation.clone()),
             );
         }
     }
+}
+
+fn packet_citation_matching_path_and_display_shape<'a>(
+    citations: &'a [AgentCitationDto],
+    crate_segment: &str,
+) -> Option<&'a AgentCitationDto> {
+    citations.iter().find(|citation| {
+        let path = citation.file_path.as_deref().unwrap_or_default();
+        let display = normalize_identifier(&citation.display_name);
+        path.contains(crate_segment)
+            && display.contains("run")
+            && (display.contains("session") || display.contains("runtime"))
+    })
 }
 
 fn packet_backtick_spans(question: &str) -> Vec<&str> {
@@ -346,6 +355,8 @@ fn packet_push_flow_template_claim_with_citations(
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
         citations,
+        coverage_role: Some("command profile".to_string()),
+        eligible_for_sufficiency: Some(true),
     });
 }
 
