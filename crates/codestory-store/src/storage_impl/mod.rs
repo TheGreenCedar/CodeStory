@@ -4,7 +4,9 @@ use codestory_contracts::graph::{
     TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
-use rusqlite::{Connection, MAIN_DB, Result, Row, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, MAIN_DB, OpenFlags, Result, Row, params, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -839,6 +841,29 @@ impl Storage {
         };
         storage.init(mode)?;
         Ok(storage)
+    }
+
+    pub fn database_schema_version(path: &Path) -> Result<u32, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(version.max(0) as u32)
+    }
+
+    pub fn copy_database_snapshot(
+        source_path: &Path,
+        target_path: &Path,
+    ) -> Result<(), StorageError> {
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                StorageError::Other(format!(
+                    "Failed to create SQLite snapshot target dir {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        source.backup(MAIN_DB, target_path, None::<fn(rusqlite::backup::Progress)>)?;
+        Ok(())
     }
 
     pub fn new_in_memory() -> Result<Self, StorageError> {

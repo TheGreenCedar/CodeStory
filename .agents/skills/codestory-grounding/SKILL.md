@@ -77,7 +77,7 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 
 ## Command Routing
 
-- Setup and health: `setup embeddings`, `doctor`, `index`, `ground`.
+- Setup and health: `setup embeddings`, `doctor`, `index`, `ground`, `cache rehydrate`.
 - Broad task packet: `packet`; answer from it when sufficient, otherwise follow
   the named follow-up commands.
 - Candidate discovery: `search --why`; choose concrete ids before `context`.
@@ -95,6 +95,7 @@ needed, load only the relevant command reference below.
 Detailed argument tables, output examples, and usage patterns for each command:
 
 - [index](references/index.md) - Build or refresh the symbol index
+- [cache](references/cache.md) - Reuse compatible CodeStory caches across worktrees
 - [ground](references/ground.md) - Compact codebase context snapshot
 - [doctor](references/doctor.md) - Read-only project/cache/index/retrieval health check
 - [packet](references/packet.md) - Broad task packet with sufficiency contract

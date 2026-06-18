@@ -53,7 +53,7 @@ pub(crate) enum Command {
     Ready(ReadyCommand),
     #[command(about = "Install or check local setup assets.")]
     Setup(SetupCommand),
-    #[command(about = "Inspect portable cache identity contracts.")]
+    #[command(about = "Prepare or inspect local cache artifacts.")]
     Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
     Search(SearchCommand),
@@ -473,12 +473,45 @@ pub(crate) struct CacheCommand {
 pub(crate) enum CacheAction {
     #[command(about = "Report canonical repository identity inputs.")]
     Identity(CacheIdentityCommand),
+    #[command(about = "Copy a compatible CodeStory cache from another worktree.")]
+    Rehydrate(CacheRehydrateCommand),
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct CacheIdentityCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheRehydrateCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Existing worktree whose CodeStory cache should be reused."
+    )]
+    pub(crate) from_project: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Source cache directory to copy. If omitted, the normal cache location for --from-project is used."
+    )]
+    pub(crate) from_cache_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Check compatibility and print the planned action without copying."
+    )]
+    pub(crate) dry_run: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(

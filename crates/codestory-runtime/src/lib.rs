@@ -57,6 +57,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod agent;
 pub use agent::packet_step_trace_json;
 mod browser;
+mod cache_rehydrate;
 pub mod graph_analysis;
 mod graph_builders;
 mod graph_canonical;
@@ -75,6 +76,7 @@ mod system_actions;
 mod trail_story;
 
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
+pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
