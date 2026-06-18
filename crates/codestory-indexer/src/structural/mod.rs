@@ -184,6 +184,36 @@ jobs:
         assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
     }
 
+    #[test]
+    fn unnamed_github_actions_workflow_uses_jobs_source_anchor() {
+        let yaml = r#"on:
+  push:
+jobs:
+  test:
+    steps:
+      - run: cargo test
+"#;
+
+        let storage = index_structural_source(Path::new(".github/workflows/unnamed.yml"), yaml)
+            .expect("index workflow");
+
+        assert!(
+            !storage
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::MODULE && node.serialized_name == "unnamed"),
+            "workflow module must not be derived from the filename"
+        );
+        let workflow = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::MODULE && node.serialized_name == "jobs:")
+            .expect("jobs source anchor");
+        assert_eq!(workflow.start_line, Some(3));
+        assert_eq!(workflow.start_col, Some(1));
+        assert_eq!(workflow.end_col, Some(5));
+    }
+
     fn assert_exact_step_span(
         storage: &IntermediateStorage,
         source_anchor: &str,

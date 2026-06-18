@@ -11,8 +11,9 @@ pub(crate) fn collect_github_actions_workflow_entities(
     storage: &mut IntermediateStorage,
 ) {
     let path_key = path.to_string_lossy().replace('\\', "/");
-    let (workflow_name, workflow_line, workflow_col) =
-        workflow_name(source).unwrap_or_else(|| fallback_workflow_name(path));
+    let Some((workflow_name, workflow_line, workflow_col)) = workflow_anchor(source) else {
+        return;
+    };
     let workflow_id = push_structural_node(
         storage,
         file_id,
@@ -136,7 +137,11 @@ fn collect_jobs_and_steps(
     }
 }
 
-fn workflow_name(source: &str) -> Option<(String, u32, u32)> {
+fn workflow_anchor(source: &str) -> Option<(String, u32, u32)> {
+    top_level_workflow_name(source).or_else(|| top_level_jobs_anchor(source))
+}
+
+fn top_level_workflow_name(source: &str) -> Option<(String, u32, u32)> {
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
         if leading_spaces(line) == 0
@@ -156,16 +161,16 @@ fn workflow_name(source: &str) -> Option<(String, u32, u32)> {
     None
 }
 
-fn fallback_workflow_name(path: &Path) -> (String, u32, u32) {
-    (
-        path.file_stem()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("workflow")
-            .to_string(),
-        1,
-        1,
-    )
+fn top_level_jobs_anchor(source: &str) -> Option<(String, u32, u32)> {
+    source.lines().enumerate().find_map(|(line_idx, line)| {
+        (leading_spaces(line) == 0 && line.trim_start() == "jobs:").then(|| {
+            (
+                "jobs:".to_string(),
+                line_idx.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                line.find("jobs:").unwrap_or(0).saturating_add(1) as u32,
+            )
+        })
+    })
 }
 
 fn yaml_mapping_key(trimmed_line: &str) -> Option<String> {
