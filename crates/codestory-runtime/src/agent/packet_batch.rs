@@ -470,7 +470,7 @@ pub(crate) fn run_packet_anchor_expansion(
 pub(crate) fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
     match budget {
         PacketBudgetModeDto::Tiny => 0,
-        PacketBudgetModeDto::Compact => 12,
+        PacketBudgetModeDto::Compact => 4,
         PacketBudgetModeDto::Standard => 40,
         PacketBudgetModeDto::Deep => 40,
     }
@@ -800,14 +800,14 @@ mod tests {
 
     #[test]
     fn compact_packet_anchor_probe_limit_stays_bounded() {
-        assert_eq!(packet_anchor_probe_limit(PacketBudgetModeDto::Compact), 12);
+        assert_eq!(packet_anchor_probe_limit(PacketBudgetModeDto::Compact), 4);
         assert_eq!(
             packet_anchor_probe_limit_for_budget(
                 PacketBudgetModeDto::Compact,
                 PacketLatencyBudget::new(None),
                 0,
             ),
-            12
+            4
         );
     }
 
@@ -816,11 +816,11 @@ mod tests {
         let latency = PacketLatencyBudget::new(Some(18_000));
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 9_000,),
-            6
+            2
         );
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 13_500,),
-            3
+            1
         );
     }
 
