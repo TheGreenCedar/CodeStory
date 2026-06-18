@@ -31,6 +31,24 @@ profiles to parser and rule construction in `get_language_for_ext`.
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
 
+## Claim Ladder
+
+The source-derived ladder in `language_support.rs` maps current profiles only to
+the tiers they prove. Parser-backed profiles currently claim filename routing,
+grammar parse, and source graph extraction. Structural collectors claim filename
+routing and source graph extraction only.
+
+| Tier | Allowed proof role | Provenance expectation | Does not mean |
+| --- | --- | --- | --- |
+| `filename_route` | `extension_routing` | `LANGUAGE_SUPPORT_PROFILES` extension registry | Parser availability. |
+| `grammar_parse` | `parser_smoke` | Live tree-sitter parser config and parse smoke | Graph fidelity. |
+| `source_graph_extraction` | `graph_fixture` | Fidelity or tictactoe graph fixture | Typed semantic resolution. |
+| `typed_semantic_edges` | `semantic_resolver_fixture` | Targeted resolver regression | Broad semantic parity. |
+| `packet_sufficient_answer_quality` | `packet_runtime_artifact` | Publishable packet-runtime artifact | Runtime language support. |
+
+No current language profile claims `typed_semantic_edges` or
+`packet_sufficient_answer_quality` from the profile registry alone.
+
 ## Latest Agent-Facing Evidence
 
 The current publishable packet-runtime proof gate is the June 18 packet-runtime
