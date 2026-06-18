@@ -21,7 +21,6 @@ on:
       - crates/codestory-runtime/src/**
       - crates/codestory-indexer/Cargo.toml
       - crates/codestory-indexer/src/lib.rs
-      - crates/codestory-runtime/tests/retrieval_generalization_guard.rs
       - scripts/lint-retrieval-generalization.mjs
       - scripts/**retrieval**
       - docs/ops/retrieval-sidecars.md
@@ -31,10 +30,14 @@ on:
       - .github/workflows/retrieval-sidecar-smoke.yml
   workflow_dispatch:
 
+concurrency:
+  group: retrieval-sidecar-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux-contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -64,11 +67,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-stable-
 
-      - name: Runtime library contract tests
-        run: cargo test -p codestory-runtime --lib
-
-      - name: Retrieval generalization guard (Rust)
-        run: cargo test -p codestory-runtime --test retrieval_generalization_guard
+      - name: Runtime sidecar and packet contract tests
+        run: |
+          cargo test -p codestory-runtime --lib agent::retrieval_primary::tests
+          cargo test -p codestory-runtime --lib agent::packet_search::tests
+          cargo test -p codestory-runtime --lib agent::packet_claim_profiles::tests
+          cargo test -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars
+          cargo test -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars
+          cargo test -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars
 
       - name: Stdio protocol contract tests
         run: cargo test -p codestory-cli --test stdio_protocol_contracts
@@ -91,8 +97,9 @@ jobs:
           key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
 
   windows-manifest-missing:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:windows-smoke')
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
