@@ -2341,6 +2341,7 @@ function preludePublicFields(prelude) {
     stderr_bytes: prelude.stderr_bytes,
     packet_parse_error: prelude.packet_parse_error,
     packet_sufficiency_status: prelude.packet_sufficiency_status,
+    packet_sufficiency: prelude.packet_sufficiency ?? null,
     packet_citation_count: prelude.packet_citation_count,
     packet_avoid_opening_count: prelude.packet_avoid_opening_count,
     packet_latency: prelude.packet_latency,
@@ -2798,6 +2799,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
       parseError = error.message;
     }
   }
+  const manifestQuality = packetManifestQualitySummary(packet, run.task);
   const publicPrelude = preludePublicFields({
     command,
     args,
@@ -2813,13 +2815,14 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
     packet_parse_error: parseError,
     packet_sufficiency_status: packet?.sufficiency?.status ?? null,
+    packet_sufficiency: packetSufficiencyTelemetry(packet, manifestQuality),
     packet_citation_count: Array.isArray(packet?.answer?.citations)
       ? packet.answer.citations.length
       : null,
     packet_avoid_opening_count: packet ? packetAvoidOpeningRawPaths(packet).length : null,
     packet_latency: packetLatencyTelemetry(packet, wallMs),
     packet_composition: packetComposition(packet, run.task),
-    packet_manifest_quality: packetManifestQualitySummary(packet, run.task),
+    packet_manifest_quality: manifestQuality,
     packet_extra_probe_count: extraProbes.length,
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
   });
@@ -2891,7 +2894,7 @@ async function runOne(opts, run, outDir) {
   const { command, args, stdin, killProcessTree } = runnerCommand(opts, repoConfig.path, prompt);
   const started = performance.now();
   const preludeFailure = [baselinePrelude, codestoryPrelude].find(
-    (prelude) => prelude && !preludeAllowsAgentRun(prelude.public),
+    (prelude) => prelude && !preludeAllowsAgentRun(prelude.public, opts),
   );
   const shouldRunAgent = preludeFailure == null;
   const result = shouldRunAgent
@@ -2999,8 +3002,8 @@ async function runOne(opts, run, outDir) {
   };
 }
 
-function preludeAllowsAgentRun(publicPrelude) {
-  return publicPrelude?.status === "pass" || publicPrelude?.status === "pass_with_warnings";
+function preludeAllowsAgentRun(publicPrelude, opts = {}) {
+  return publicPrelude?.status === "pass" || (!opts.publishable && publicPrelude?.status === "pass_with_warnings");
 }
 
 async function gitOutput(args, cwd, timeoutMs = 10_000) {
@@ -3583,7 +3586,8 @@ async function reanalyzeAgentRunDirectory(opts) {
 
 function formatAgentPublishableBlocker(blocker) {
   const result = blocker.result;
-  return `  ${result.repo} ${result.task_id ?? ""} ${result.arm} repeat ${result.repeat}: ${blocker.reasons.join("; ")}; total_tokens=${result.usage?.total_tokens ?? ""} packet_first=${result.packet_first_pass ?? ""} quality=${result.quality?.pass ?? ""}`;
+  const category = blocker.category ? `${blocker.category}: ` : "";
+  return `  ${result.repo} ${result.task_id ?? ""} ${result.arm} repeat ${result.repeat}: ${category}${blocker.reasons.join("; ")}; total_tokens=${result.usage?.total_tokens ?? ""} packet_first=${result.packet_first_pass ?? ""} quality=${result.quality?.pass ?? ""}`;
 }
 
 function resolveCodeStoryCli(opts, exists = existsSync) {
@@ -3874,6 +3878,30 @@ function cappedStringArray(value, limit) {
     : [];
 }
 
+function packetRetrievalShadow(packet) {
+  return (
+    packet?.benchmark_trace?.retrieval_trace?.retrieval_shadow ??
+    packet?.answer?.retrieval_trace?.retrieval_shadow ??
+    null
+  );
+}
+
+function packetCoverageUnresolvedCount(packet) {
+  const unresolved =
+    packet?.coverage_report?.unresolved ??
+    packet?.answer?.coverage_report?.unresolved ??
+    packet?.sufficiency?.coverage_report?.unresolved ??
+    null;
+  if (Array.isArray(unresolved)) {
+    return unresolved.length;
+  }
+  const number = finiteNumber(unresolved);
+  if (number != null) {
+    return number;
+  }
+  return unresolved && typeof unresolved === "object" ? Object.keys(unresolved).length : null;
+}
+
 function packetShape(packet) {
   if (!packet || typeof packet !== "object") {
     return null;
@@ -3900,6 +3928,7 @@ function packetSufficiencyTelemetry(packet, quality) {
   const gaps = cappedStringArray(packet.sufficiency?.gaps, 8);
   const openNext = cappedStringArray(packet.sufficiency?.open_next, 6);
   const followUpCommands = cappedStringArray(packet.sufficiency?.follow_up_commands, 6);
+  const retrievalShadow = packetRetrievalShadow(packet);
   return {
     status,
     covered_claims_count: packet.sufficiency?.covered_claims?.length ?? 0,
@@ -3910,6 +3939,10 @@ function packetSufficiencyTelemetry(packet, quality) {
     gaps,
     open_next: openNext,
     follow_up_commands: followUpCommands,
+    retrieval_mode: retrievalShadow?.retrieval_mode ?? null,
+    degraded_reason: retrievalShadow?.degraded_reason ?? null,
+    unresolved_candidate_count: finiteNumber(retrievalShadow?.unresolved_candidate_count),
+    coverage_unresolved_count: packetCoverageUnresolvedCount(packet),
     sufficient_quality_mismatch: status === "sufficient" && qualityPass === false,
   };
 }
@@ -3944,10 +3977,7 @@ function packetLatencyTelemetry(packet, wallMs) {
     return null;
   }
   const retrievalTrace = packet.answer?.retrieval_trace ?? null;
-  const benchmarkRetrievalTrace = packet.benchmark_trace?.retrieval_trace ?? null;
-  const retrievalShadow = packetRetrievalShadowTelemetry(
-    benchmarkRetrievalTrace?.retrieval_shadow ?? retrievalTrace?.retrieval_shadow ?? null,
-  );
+  const retrievalShadow = packetRetrievalShadowTelemetry(packetRetrievalShadow(packet));
   const freshness = packet.answer?.freshness ?? null;
   const steps = Array.isArray(retrievalTrace?.steps) ? retrievalTrace.steps : [];
   const topStep = [...steps].sort((left, right) => (right.duration_ms ?? 0) - (left.duration_ms ?? 0))[0] ?? null;
@@ -4588,6 +4618,7 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
     .flatMap((row) => {
       const productReasons = [];
       const harnessReasons = [];
+      const environmentReasons = [];
       if (row.status !== "pass") {
         productReasons.push(`status=${row.status}`);
       }
@@ -4605,8 +4636,16 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
         }
         if (!row.sufficiency) {
           harnessReasons.push("missing packet sufficiency telemetry");
-        } else if (row.sufficiency.status !== "sufficient") {
-          productReasons.push(`packet sufficiency status=${row.sufficiency.status ?? "unknown"}; expected sufficient`);
+        } else {
+          addPacketSufficiencyPublishableReasons(row.sufficiency, productReasons, harnessReasons, "packet");
+          if (row.sufficiency.retrieval_mode && row.sufficiency.retrieval_mode !== "full") {
+            environmentReasons.push(
+              `packet retrieval mode=${row.sufficiency.retrieval_mode}; expected full`,
+            );
+          }
+          if (row.sufficiency.degraded_reason) {
+            environmentReasons.push(`packet retrieval degraded=${row.sufficiency.degraded_reason}`);
+          }
         }
         const latency = row.packet_latency;
         if (!latency) {
@@ -4619,20 +4658,47 @@ function packetRuntimePublishableBlockers(results, opts = {}) {
           if (!shadow) {
             harnessReasons.push("missing retrieval shadow telemetry");
           } else if (shadow.retrieval_mode !== "full") {
-            productReasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
+            environmentReasons.push(`packet retrieval shadow mode=${shadow.retrieval_mode ?? "unknown"}; expected full`);
           }
         }
       }
       if (enforceRepoProvenance) {
-        harnessReasons.push(...repoProvenanceBlockers(row));
-        harnessReasons.push(...cacheProvenanceBlockers(row));
+        environmentReasons.push(...repoProvenanceBlockers(row));
+        environmentReasons.push(...cacheProvenanceBlockers(row));
       }
       return [
         productReasons.length ? { result: row, category: "product", reasons: productReasons } : null,
         harnessReasons.length ? { result: row, category: "harness-contract", reasons: harnessReasons } : null,
+        environmentReasons.length ? { result: row, category: "environment", reasons: environmentReasons } : null,
       ];
     })
     .filter(Boolean);
+}
+
+function addPacketSufficiencyPublishableReasons(sufficiency, productReasons, harnessReasons, label) {
+  if (sufficiency.status !== "sufficient") {
+    productReasons.push(`${label} sufficiency status=${sufficiency.status ?? "unknown"}; expected sufficient`);
+  }
+  const followUps = presentFiniteNumber(sufficiency.follow_up_commands_count);
+  if (followUps > 0) {
+    productReasons.push(`${label} follow-up commands=${followUps}; expected 0`);
+  }
+  const openNext = presentFiniteNumber(sufficiency.open_next_count);
+  if (openNext > 0) {
+    productReasons.push(`${label} open-next items=${openNext}; expected 0`);
+  }
+  const gaps = presentFiniteNumber(sufficiency.gaps_count);
+  if (gaps > 0) {
+    productReasons.push(`${label} sufficiency gaps=${gaps}; expected 0`);
+  }
+  const unresolvedCandidates = presentFiniteNumber(sufficiency.unresolved_candidate_count);
+  if (unresolvedCandidates > 0) {
+    harnessReasons.push(`${label} unresolved retrieval candidates=${unresolvedCandidates}; expected 0`);
+  }
+  const unresolvedCoverage = presentFiniteNumber(sufficiency.coverage_unresolved_count);
+  if (unresolvedCoverage > 0) {
+    harnessReasons.push(`${label} unresolved coverage diagnostics=${unresolvedCoverage}; expected 0`);
+  }
 }
 
 function packetRuntimeQualityGateRequired(opts = {}) {
@@ -4866,7 +4932,7 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
   const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
     console.error(
-      "--publishable failed: packet runtime rows must pass, include passing manifest quality gates, and use pinned clean repo provenance.",
+      "--publishable failed: packet runtime rows must pass, include passing manifest quality gates, report sufficient packets with zero follow-ups or unresolved diagnostics, and use pinned clean repo provenance.",
     );
     for (const blocker of blockers) {
       console.error(formatPacketRuntimeBlocker(blocker));
@@ -5297,38 +5363,40 @@ function agentPublishableBlockers(results, opts = {}) {
   const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket;
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
   return results
-    .map((result) => {
-      const reasons = [];
+    .flatMap((result) => {
+      const productReasons = [];
+      const harnessReasons = [];
+      const environmentReasons = [];
       if (result.status !== "pass") {
-        reasons.push(`status=${result.status}`);
+        productReasons.push(`status=${result.status}`);
       }
       if (presentFiniteNumber(result.wall_ms) == null) {
-        reasons.push("missing wall time");
+        harnessReasons.push("missing wall time");
       }
       if (result.usage?.total_tokens == null) {
-        reasons.push("missing total token usage");
+        harnessReasons.push("missing total token usage");
       }
       if (presentFiniteNumber(result.tool_calls_observed) == null) {
-        reasons.push("missing tool call count");
+        harnessReasons.push("missing tool call count");
       }
       if (presentFiniteNumber(result.transcript_analysis?.command_count) == null) {
-        reasons.push("missing command count");
+        harnessReasons.push("missing command count");
       }
       if (
         result.arm === "without_codestory" &&
         (result.transcript_analysis?.command_categories?.codestory_cli ?? 0) > 0
       ) {
-        reasons.push("without_codestory arm used CodeStory");
+        environmentReasons.push("without_codestory arm used CodeStory");
       }
       if (
         result.arm === "without_codestory" &&
         result.task_id &&
         (presentFiniteNumber(result.transcript_analysis?.command_count) ?? 0) <= 0
       ) {
-        reasons.push("without_codestory arm did not inspect local repository");
+        productReasons.push("without_codestory arm did not inspect local repository");
       }
       if (result.packet_first_required && !result.packet_first_pass) {
-        reasons.push("missing answer packet as first successful context command");
+        productReasons.push("missing answer packet as first successful context command");
       }
       if (
         opts.publishable &&
@@ -5336,20 +5404,71 @@ function agentPublishableBlockers(results, opts = {}) {
         result.packet_first_required &&
         maxSourceReadsAfterPacket == null
       ) {
-        reasons.push("missing explicit post-packet source-read budget");
+        harnessReasons.push("missing explicit post-packet source-read budget");
       }
       const packetExtraProbeStrategy =
         result.codestory_harness_prelude?.packet_extra_probe_strategy ??
         result.packet_extra_probe_strategy ??
         null;
       if (opts.publishable && result.arm === "with_codestory" && packetExtraProbeStrategy) {
-        reasons.push(`diagnostic packet extra probes used: ${packetExtraProbeStrategy}`);
+        harnessReasons.push(`diagnostic packet extra probes used: ${packetExtraProbeStrategy}`);
+      }
+      for (const { label, prelude } of [
+        { label: "baseline", prelude: result.baseline_harness_prelude },
+        { label: "codestory", prelude: result.codestory_harness_prelude },
+      ]) {
+        if (!prelude) {
+          continue;
+        }
+        if (prelude.status !== "pass") {
+          harnessReasons.push(`${label} prelude status=${prelude.status ?? "unknown"}; expected pass`);
+        }
+        if (prelude.packet_manifest_quality && !prelude.packet_manifest_quality.pass) {
+          productReasons.push(`${label} prelude packet manifest quality failed`);
+        }
+        const preludeSufficiency =
+          prelude.packet_sufficiency ??
+          (prelude.packet_sufficiency_status
+            ? { status: prelude.packet_sufficiency_status }
+            : null);
+        if (preludeSufficiency) {
+          addPacketSufficiencyPublishableReasons(
+            preludeSufficiency,
+            productReasons,
+            harnessReasons,
+            `${label} prelude packet`,
+          );
+        }
+        if (!prelude.packet_sufficiency) {
+          const unresolvedCandidates = presentFiniteNumber(
+            prelude.packet_latency?.retrieval_shadow?.unresolved_candidate_count,
+          );
+          if (unresolvedCandidates > 0) {
+            harnessReasons.push(
+              `${label} prelude packet unresolved retrieval candidates=${unresolvedCandidates}; expected 0`,
+            );
+          }
+        }
+        const preludeRetrieval =
+          prelude.packet_sufficiency ??
+          prelude.packet_latency?.retrieval_shadow ??
+          null;
+        if (preludeRetrieval?.retrieval_mode && preludeRetrieval.retrieval_mode !== "full") {
+          environmentReasons.push(
+            `${label} prelude packet retrieval mode=${preludeRetrieval.retrieval_mode}; expected full`,
+          );
+        }
+        if (preludeRetrieval?.degraded_reason) {
+          environmentReasons.push(
+            `${label} prelude packet retrieval degraded=${preludeRetrieval.degraded_reason}`,
+          );
+        }
       }
       if (result.task_id && !result.quality) {
-        reasons.push("missing manifest quality score");
+        harnessReasons.push("missing manifest quality score");
       }
       if (result.quality && !result.quality.pass) {
-        reasons.push("manifest quality failed");
+        productReasons.push("manifest quality failed");
       }
       const readsAfterPacket = result.transcript_analysis?.ordinary_source_reads_after_first_packet;
       if (
@@ -5358,19 +5477,23 @@ function agentPublishableBlockers(results, opts = {}) {
         readsAfterPacket != null &&
         readsAfterPacket > maxSourceReadsAfterPacket
       ) {
-        reasons.push(`ordinary source reads after packet=${readsAfterPacket} > ${maxSourceReadsAfterPacket}`);
+        productReasons.push(`ordinary source reads after packet=${readsAfterPacket} > ${maxSourceReadsAfterPacket}`);
       }
       if (enforceRepoProvenance) {
-        reasons.push(...repoProvenanceBlockers(result));
+        environmentReasons.push(...repoProvenanceBlockers(result));
       }
       const externalContextCalls = result.transcript_analysis?.external_context_tool_calls ?? 0;
       if (externalContextCalls > 0) {
-        reasons.push(`external web/search tool calls=${externalContextCalls} > 0`);
+        environmentReasons.push(`external web/search tool calls=${externalContextCalls} > 0`);
       }
       if (result.arm === "with_codestory" && (opts.publishable || opts.enforceCacheProvenance)) {
-        reasons.push(...cacheProvenanceBlockers(result));
+        environmentReasons.push(...cacheProvenanceBlockers(result));
       }
-      return reasons.length ? { result, reasons } : null;
+      return [
+        productReasons.length ? { result, category: "product", reasons: productReasons } : null,
+        harnessReasons.length ? { result, category: "harness-contract", reasons: harnessReasons } : null,
+        environmentReasons.length ? { result, category: "environment", reasons: environmentReasons } : null,
+      ];
     })
     .filter(Boolean);
 }
@@ -5607,6 +5730,34 @@ function runSelfTest() {
     packetSufficiencyTelemetry(packetFixture, { pass: false }).sufficient_quality_mismatch,
     true,
   );
+  assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }), true);
+  assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }, { publishable: true }), false);
+  const weakPacketTelemetry = packetSufficiencyTelemetry(
+    {
+      sufficiency: {
+        status: "partial",
+        covered_claims: [],
+        gaps: ["missing route proof"],
+        open_next: ["inspect route"],
+        follow_up_commands: ["codestory-cli search --query route"],
+      },
+      coverage_report: {
+        unresolved: ["route handler"],
+      },
+      benchmark_trace: {
+        retrieval_trace: {
+          retrieval_shadow: {
+            retrieval_mode: "full",
+            unresolved_candidate_count: 2,
+          },
+        },
+      },
+    },
+    { pass: true },
+  );
+  assert.equal(weakPacketTelemetry.follow_up_commands_count, 1);
+  assert.equal(weakPacketTelemetry.unresolved_candidate_count, 2);
+  assert.equal(weakPacketTelemetry.coverage_unresolved_count, 1);
   assert.deepEqual(
     packetRuntimePublishableBlockers([
       { status: "pass", quality: { pass: true } },
@@ -5623,6 +5774,61 @@ function runSelfTest() {
       return row.status === "pass" ? row.quality?.pass ?? null : row.status;
     }),
     [null, false, true, "fail"],
+  );
+  assert.deepEqual(
+    packetRuntimePublishableBlockers(
+      [
+        {
+          repo: "repo",
+          task_id: "task",
+          mode: "cold_cli_packet",
+          repeat: 1,
+          status: "pass",
+          quality: { pass: true },
+          sufficiency: weakPacketTelemetry,
+          packet_latency: {
+            sla_missed: false,
+            retrieval_shadow: { retrieval_mode: "full" },
+          },
+        },
+      ],
+      { enforcePacketRuntimeTelemetry: true },
+    ).map((blocker) => blocker.category),
+    ["product", "harness-contract"],
+  );
+  assert.deepEqual(
+    agentPublishableBlockers([
+      {
+        repo: "repo",
+        task_id: "task",
+        arm: "with_codestory",
+        repeat: 1,
+        status: "pass",
+        wall_ms: 1,
+        usage: { total_tokens: 1 },
+        tool_calls_observed: 1,
+        transcript_analysis: {
+          command_count: 1,
+          external_context_tool_calls: 0,
+          ordinary_source_reads_after_first_packet: 0,
+        },
+        packet_first_required: true,
+        packet_first_pass: true,
+        quality: { pass: true },
+        codestory_harness_prelude: {
+          status: "pass_with_warnings",
+          packet_sufficiency_status: "partial",
+          packet_manifest_quality: { pass: false },
+          packet_latency: {
+            retrieval_shadow: {
+              retrieval_mode: "full",
+              unresolved_candidate_count: 2,
+            },
+          },
+        },
+      },
+    ]).map((blocker) => blocker.category),
+    ["product", "harness-contract"],
   );
   assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "holdout-retrieval" }), true);
   assert.equal(packetRuntimeQualityGateRequired({ taskSuite: "language-expansion-holdout" }), true);
@@ -6058,7 +6264,7 @@ async function main() {
   if (opts.publishable) {
     const blockers = agentPublishableBlockers(results, opts);
     if (blockers.length) {
-      console.error("--publishable failed: every run must pass, report total token usage, pass manifest quality gates when present, run packet first when required, and stay within the post-packet source-read budget.");
+      console.error("--publishable failed: every run must pass, report total token usage, pass preludes without warnings, pass manifest quality gates when present, run packet first when required, report sufficient packets with zero follow-ups or unresolved diagnostics, and stay within the post-packet source-read budget.");
       for (const blocker of blockers) {
         console.error(formatAgentPublishableBlocker(blocker));
       }
