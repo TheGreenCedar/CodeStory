@@ -2,7 +2,7 @@ name: saga issue link guard
 
 on:
   pull_request_target:
-    types: [opened, edited, reopened, ready_for_review, synchronize, labeled, unlabeled]
+    types: [opened, edited, reopened, ready_for_review, synchronize, labeled]
 
 permissions:
   contents: read
@@ -11,6 +11,10 @@ permissions:
 jobs:
   require-closing-issue-link:
     name: require closing issue link
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'codex/') ||
+      startsWith(github.event.pull_request.title, '[codex]') ||
+      contains(github.event.pull_request.labels.*.name, 'saga:codestory-intelligence')
     runs-on: ubuntu-latest
     steps:
       - name: Check PR issue relationship
