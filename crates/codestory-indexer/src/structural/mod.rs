@@ -214,6 +214,54 @@ jobs:
         assert_eq!(workflow.end_col, Some(5));
     }
 
+    #[test]
+    fn github_actions_workflow_name_span_uses_scalar_value_not_key_text() {
+        assert_workflow_name_span(
+            r#"name: "name"
+on:
+  push:
+jobs:
+  test:
+    steps:
+      - run: cargo test
+"#,
+            "name",
+            8,
+            11,
+        );
+        assert_workflow_name_span(
+            r#"name: me
+on:
+  push:
+jobs:
+  test:
+    steps:
+      - run: cargo test
+"#,
+            "me",
+            7,
+            8,
+        );
+    }
+
+    fn assert_workflow_name_span(
+        source: &str,
+        expected_name: &str,
+        expected_start_col: u32,
+        expected_end_col: u32,
+    ) {
+        let storage = index_structural_source(Path::new(".github/workflows/name.yml"), source)
+            .expect("index workflow");
+        let workflow = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::MODULE && node.serialized_name == expected_name)
+            .unwrap_or_else(|| panic!("missing workflow node {expected_name}"));
+        assert_eq!(workflow.start_line, Some(1));
+        assert_eq!(workflow.start_col, Some(expected_start_col));
+        assert_eq!(workflow.end_col, Some(expected_end_col));
+    }
+
     fn assert_exact_step_span(
         storage: &IntermediateStorage,
         source_anchor: &str,

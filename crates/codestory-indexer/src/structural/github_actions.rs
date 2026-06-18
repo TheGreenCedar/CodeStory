@@ -147,9 +147,12 @@ fn top_level_workflow_name(source: &str) -> Option<(String, u32, u32)> {
         if leading_spaces(line) == 0
             && let Some(rest) = trimmed.strip_prefix("name:")
         {
-            let value = clean_yaml_scalar(rest.trim());
+            let value_text = rest.trim_start();
+            let value = clean_yaml_scalar(value_text);
             if !value.is_empty() {
-                let col = line.find(&value).unwrap_or(0).saturating_add(1);
+                let value_offset = rest.len().saturating_sub(value_text.len())
+                    + value_text.find(&value).unwrap_or(0);
+                let col = "name:".len().saturating_add(value_offset).saturating_add(1);
                 return Some((
                     value,
                     line_idx.saturating_add(1).try_into().unwrap_or(u32::MAX),
