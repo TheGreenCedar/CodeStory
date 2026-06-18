@@ -68,6 +68,33 @@ without it, the suite checks that non-full retrieval fails closed.
 Use Criterion benches from `crates/codestory-bench` only when the measured hot
 path is narrower than the repo-scale e2e test can explain.
 
+## Current Ops Gates
+
+Keep performance/scale/ops proof split by lane. A timing row can show trend or
+regression risk, but it is not answer-quality proof.
+
+| Gate | Current metric or threshold | Command that proves it | Source |
+| --- | --- | --- | --- |
+| Repeat refresh | `repeat_semantic_docs_embedded == 0`; repeat graph phase `< 20s`; repeat semantic reuse phase `< 3s`; repeat full-refresh process smoke `< 45s` | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs` |
+| Retrieval status | After sidecar indexing, `retrieval_mode == "full"` and `retrieval status --format json` reports current manifest provenance: source root, input hash, generation, schema, graph hash, symbol-doc count, dense-anchor count, degraded modes, and lane provenance. Non-`full` status is diagnostic only. | `codestory-cli retrieval bootstrap --project <repo> --format json`; `codestory-cli retrieval index --project <repo> --refresh full --format json`; `codestory-cli retrieval status --project <repo> --format json` | `docs/ops/retrieval-sidecars.md`, `crates/codestory-retrieval/src/sidecar.rs`, `crates/codestory-runtime/src/agent/retrieval_primary.rs` |
+| Packet runtime | Product sidecar query budget defaults to `1,000ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
+| Benchmark promotion | `--publishable` requires at least 3 repeats, sidecar-primary retrieval, no diagnostic extra probes, no failed rows, token usage, clean preludes, manifest quality gates when present, packet-first compliance, sufficient packets with no unresolved diagnostics, and the explicit `--max-source-reads-after-packet` budget. Holdout/local task quality thresholds live in the task manifests; stats-log timing rows do not promote answer quality. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli target/release/codestory-cli --timeout-ms 180000` | `scripts/codestory-agent-ab-benchmark.mjs`, `scripts/codestory-benchmark-contract.mjs`, `benchmarks/tasks/`, `docs/testing/retrieval-architecture.md` |
+
+Current telemetry snapshot from `docs/testing/codestory-e2e-stats-log.md`
+(2026-06-18 `d8d59e9e+wt`, #41 hardening row): `retrieval_mode full`,
+`retrieval_index_seconds 4.34`, `retrieval_status_seconds 0.39`, repeat full
+refresh `29.45s` with `750` reused and `0` embedded, index `75.36s`, semantic
+phase `49.45s`. This row is useful regression telemetry; it does not prove
+answer quality because the real drill was intentionally skipped.
+
+Do not promote importable or rebuildable graph/sidecar artifacts in this slice.
+A follow-up PR for that idea must require provenance before reuse: source root,
+commit or dirty-tree label, CodeStory CLI version, sidecar schema, sidecar input
+hash, graph artifact hash, semantic policy version, embedding backend/dim,
+symbol-doc count, dense-anchor count, dense reason counts, lane artifact paths,
+the exact rebuild command, and a fresh `retrieval status --format json` proof
+showing the imported/rebuilt artifact is still `full`.
+
 ## Promotion Record
 
 For every accepted performance change, record:
