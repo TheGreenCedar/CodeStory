@@ -508,6 +508,7 @@ dependencies = [
  "codestory-workspace",
  "crossbeam-channel",
  "feature-probe",
+ "fs4",
  "ndarray",
  "nucleo-matcher",
  "ort",

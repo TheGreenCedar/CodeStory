@@ -12,6 +12,7 @@ codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
 feature-probe = { workspace = true }
+fs4 = { workspace = true }
 ndarray = { workspace = true }
 nucleo-matcher = { workspace = true }
 ort = { workspace = true }
