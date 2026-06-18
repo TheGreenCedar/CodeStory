@@ -10,6 +10,7 @@ use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_indicate_form_validation_flow,
     packet_terms_indicate_html_css_template_structure_flow,
+    packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_server_request_dispatch_flow,
@@ -680,6 +681,39 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         {
             return Some("public api/export");
         }
+        if normalized_claim.contains("handlerstack")
+            || normalized_claim.contains("pushhandler")
+            || (normalized_claim.contains("handler")
+                && contains_any(&normalized_claim, &["registration", "registered"])
+                && contains_any(&normalized_claim, &["log", "logger", "record"]))
+        {
+            return Some("logger handler stack");
+        }
+        if normalized_claim.contains("addrecord")
+            || (normalized_claim.contains("log")
+                && normalized_claim.contains("record")
+                && contains_any(&normalized_claim, &["creates", "creation"]))
+            || (normalized_claim.contains("record")
+                && normalized_claim.contains("creates")
+                && normalized_claim.contains("handlers"))
+        {
+            return Some("log record creation");
+        }
+        if normalized_claim.contains("handlerinterface")
+            && contains_any(
+                &normalized_claim,
+                &["handlebatch", "handlingboundaries", "contract"],
+            )
+        {
+            return Some("handler interface contract");
+        }
+        if normalized_claim.contains("processing")
+            && normalized_claim.contains("handler")
+            && normalized_claim.contains("records")
+            && contains_any(&normalized_claim, &["processing", "writing", "write"])
+        {
+            return Some("handler processing");
+        }
         if contains_any(
             &normalized_claim,
             &[
@@ -896,6 +930,7 @@ struct PacketFlowContext {
     sql_schema_flow: bool,
     runtime_formatting_flow: bool,
     string_predicate_flow: bool,
+    log_record_handler_flow: bool,
 }
 
 impl PacketFlowContext {
@@ -925,6 +960,7 @@ impl PacketFlowContext {
             sql_schema_flow: packet_terms_indicate_sql_schema_flow(&question_terms),
             runtime_formatting_flow: packet_terms_indicate_runtime_formatting_flow(&question_terms),
             string_predicate_flow: packet_terms_indicate_string_predicate_flow(&question_terms),
+            log_record_handler_flow: packet_terms_indicate_log_record_handler_flow(&question_terms),
         }
     }
 
@@ -947,6 +983,11 @@ impl PacketFlowContext {
         requirement: &FlowRequirement,
         include_generic_fallback_roles: bool,
     ) -> bool {
+        if flow_requirement_is_log_record_handler(requirement)
+            && packet_claim_is_generic_navigation_or_source_evidence(claim)
+        {
+            return false;
+        }
         if StructuralLanguagePolicy::claim_satisfies_requirement(requirement, claim) {
             return true;
         }
@@ -969,6 +1010,7 @@ impl PacketFlowContext {
             self.sql_schema_flow,
             self.runtime_formatting_flow,
             self.string_predicate_flow,
+            self.log_record_handler_flow,
             include_generic_fallback_roles,
         );
         claim_roles.contains(&requirement.role)
@@ -1005,6 +1047,8 @@ impl StructuralLanguagePolicy {
                 | "form_native_constraints"
                 | "form_custom_validation"
                 | "form_submit_guard"
+                | "logger_event"
+                | "handler_processing"
                 | "css_animation_entrypoint"
                 | "css_animation_structure"
         )
@@ -1021,6 +1065,8 @@ impl StructuralLanguagePolicy {
             "form_native_constraints" => Self::claim_text_names_native_constraints(&normalized),
             "form_custom_validation" => Self::claim_text_names_custom_validation(&normalized),
             "form_submit_guard" => Self::claim_text_names_submit_guard(&normalized),
+            "logger_event" => Self::claim_text_names_log_record_creation(&normalized),
+            "handler_processing" => Self::claim_text_names_log_handler_processing(&normalized),
             "css_animation_entrypoint" => {
                 normalized.contains("animationstylesheetentrypoint")
                     || (normalized.contains("imports") && normalized.contains("animationfiles"))
@@ -1098,6 +1144,44 @@ impl StructuralLanguagePolicy {
                 &["prevent", "prevents", "submission", "invalid"],
             )
     }
+
+    fn claim_text_names_log_record_creation(normalized: &str) -> bool {
+        normalized.contains("addrecord")
+            || normalized.contains("recordcreation")
+            || (normalized.contains("log")
+                && normalized.contains("record")
+                && contains_any(normalized, &["create", "creates", "created", "creation"]))
+            || (normalized.contains("record")
+                && contains_any(normalized, &["create", "creates", "created", "creation"])
+                && normalized.contains("handler"))
+    }
+
+    fn claim_text_names_log_handler_processing(normalized: &str) -> bool {
+        normalized.contains("handler")
+            && normalized.contains("record")
+            && ((contains_any(normalized, &["process", "processing", "processed"])
+                && contains_any(
+                    normalized,
+                    &[
+                        "handle", "handles", "handling", "write", "writes", "writing",
+                    ],
+                ))
+                || (normalized.contains("batch")
+                    && normalized.contains("boundar")
+                    && contains_any(
+                        normalized,
+                        &[
+                            "execute",
+                            "executes",
+                            "execution",
+                            "handle",
+                            "handles",
+                            "processing",
+                            "write",
+                            "writing",
+                        ],
+                    )))
+    }
 }
 
 fn packet_missing_required_flow_roles(
@@ -1107,6 +1191,10 @@ fn packet_missing_required_flow_roles(
 ) -> Vec<FlowRole> {
     let missing = packet_missing_required_flow_requirements(question, task_class, supported_claims);
     packet_missing_requirement_roles(&missing)
+}
+
+fn flow_requirement_is_log_record_handler(requirement: &FlowRequirement) -> bool {
+    matches!(requirement.id, "logger_event" | "handler_processing")
 }
 
 fn packet_missing_required_flow_requirements(
@@ -1274,6 +1362,7 @@ fn packet_flow_roles_for_claim(
     sql_schema_flow: bool,
     runtime_formatting_flow: bool,
     string_predicate_flow: bool,
+    log_record_handler_flow: bool,
     include_generic_fallback_roles: bool,
 ) -> HashSet<FlowRole> {
     let mut roles = HashSet::new();
@@ -1576,6 +1665,33 @@ fn packet_flow_roles_for_claim(
             ],
         ) {
             roles.insert(FlowRole::StateOrStorage);
+        }
+    }
+
+    if log_record_handler_flow {
+        if normalized.contains("addrecord")
+            || normalized.contains("logmethod")
+            || normalized.contains("recordcreation")
+            || (normalized.contains("log")
+                && normalized.contains("record")
+                && normalized.contains("creates"))
+        {
+            roles.insert(FlowRole::Entrypoint);
+        }
+        if normalized.contains("handlerstack")
+            || normalized.contains("handlerregistration")
+            || normalized.contains("pushhandler")
+            || (normalized.contains("handler")
+                && normalized.contains("interface")
+                && contains_any(
+                    &normalized,
+                    &["handlebatch", "handlingboundaries", "contract"],
+                ))
+            || (normalized.contains("processing")
+                && normalized.contains("handler")
+                && contains_any(&normalized, &["processing", "writing", "write"]))
+        {
+            roles.insert(FlowRole::Dispatch);
         }
     }
 
@@ -2168,6 +2284,269 @@ mod tests {
         assert!(
             report.ineligible[0].contains("reason=\"claim marked diagnostic\""),
             "plain SQL source-scan file evidence should remain diagnostic: {report:?}"
+        );
+    }
+
+    #[test]
+    fn log_record_handler_source_claims_make_data_flow_sufficient() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let answer = answer_fixture(question);
+        let budget = compact_truncated_budget(question, vec!["citations"]);
+        let claims = vec![
+            cited_claim(
+                "addRecord creates a log record before passing it to handlers.",
+                None,
+                cited_anchor_with_tier(
+                    "Logger::addRecord",
+                    "src/logging/Logger.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+            cited_claim(
+                "The processing handler handles records by processing and writing them.",
+                None,
+                cited_anchor_with_tier(
+                    "ProcessingHandler::handle",
+                    "src/logging/ProcessingHandler.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(
+            sufficiency.gaps.is_empty(),
+            "eligible logger/record/handler claims should not leave citation-budget or family gaps: {sufficiency:?}"
+        );
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        for expected in ["log record creation", "handler processing"] {
+            assert!(
+                report.covered.contains(&expected.to_string()),
+                "log-record DataFlow should report concrete covered family `{expected}`: {report:?}"
+            );
+        }
+        assert!(
+            report.ineligible.is_empty(),
+            "role-backed log-record source claims should be sufficiency-eligible: {report:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_handler_registration_does_not_get_logger_handler_family() {
+        let unrelated = claim("Request handler registration wires middleware callbacks.");
+        assert_ne!(
+            packet_claim_family(&unrelated),
+            Some("logger handler stack"),
+            "unrelated handler registration should not be labeled as log handler stack"
+        );
+        assert_eq!(
+            packet_supported_claim_family_count(&[unrelated]),
+            0,
+            "unrelated handler registration should not add log-record sufficiency-family coverage"
+        );
+
+        let exact_stack =
+            claim("The logger owns a handler stack populated by handler registration.");
+        assert_eq!(
+            packet_claim_family(&exact_stack),
+            Some("logger handler stack"),
+            "log/logger handler-stack wording should still carry the family"
+        );
+    }
+
+    #[test]
+    fn add_record_only_claim_does_not_satisfy_handler_processing_dispatch() {
+        let claims = vec![claim(
+            "addRecord creates a log record before passing it to handlers.",
+        )];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how a logger turns a log call into a record object and passes it through handlers.",
+            PacketTaskClassDto::DataFlow,
+            &claims,
+        );
+        assert!(
+            missing.contains(&FlowRole::Dispatch),
+            "addRecord-only evidence should not close handler processing through generic handler fallback: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn handler_stack_without_processing_or_write_evidence_stays_partial() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            cited_claim(
+                "addRecord creates a log record before passing it to handlers.",
+                None,
+                cited_anchor_with_tier(
+                    "Logger::addRecord",
+                    "src/logging/Logger.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+            cited_claim(
+                "The logger owns a handler stack populated by handler registration.",
+                None,
+                cited_anchor_with_tier(
+                    "Logger::pushHandler",
+                    "src/logging/Logger.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.contains(&"handler_processing".to_string()),
+            "handler stack/registration should not close processing without process/write evidence: {report:?}"
+        );
+        assert!(
+            report.covered.contains(&"logger handler stack".to_string()),
+            "handler stack evidence should remain covered context even when processing is missing: {report:?}"
+        );
+    }
+
+    #[test]
+    fn handler_stack_and_processing_without_record_creation_stays_partial() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            cited_claim(
+                "The logger owns a handler stack populated by handler registration.",
+                None,
+                cited_anchor_with_tier(
+                    "Logger::pushHandler",
+                    "src/logging/Logger.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+            cited_claim(
+                "The processing handler handles records by processing and writing them.",
+                None,
+                cited_anchor_with_tier(
+                    "ProcessingHandler::handle",
+                    "src/logging/ProcessingHandler.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.contains(&"logger_event".to_string()),
+            "handler stack plus processing should not close logger event without record-creation evidence: {report:?}"
+        );
+        assert!(
+            report.covered.contains(&"handler processing".to_string()),
+            "processing evidence should still cover handler processing: {report:?}"
+        );
+    }
+
+    #[test]
+    fn generic_source_navigation_handler_claim_stays_diagnostic() {
+        let question = "Explain how a logger turns a log call into a record object and passes it through handlers.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            cited_claim(
+                "addRecord creates a log record before passing it to handlers.",
+                None,
+                cited_anchor_with_tier(
+                    "Logger::addRecord",
+                    "src/logging/Logger.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+            cited_claim(
+                "`HandlerInterface` ties handler interface record handling boundaries in this flow to cited definitions and adjacent ownership.",
+                Some("source evidence"),
+                cited_anchor_with_tier(
+                    "HandlerInterface",
+                    "src/logging/HandlerInterface.php",
+                    PacketEvidenceTierDto::ResolvedGraph,
+                    Some(true),
+                ),
+                None,
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.contains(&"handler_processing".to_string()),
+            "generic source-navigation handler text should not close handler processing: {report:?}"
+        );
+        assert!(
+            report.ineligible.iter().any(|entry| {
+                entry.contains("role=\"source evidence\"")
+                    && entry.contains(
+                        "generic navigation/source-evidence claim lacks required coverage role",
+                    )
+            }),
+            "source-navigation handler claim should remain diagnostic-only: {report:?}"
         );
     }
 
@@ -3046,6 +3425,30 @@ mod tests {
         assert!(
             missing.is_empty(),
             "SQL schema prompts should use table, relationship, and dialect roles: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn data_flow_log_record_handler_prompts_use_record_and_handler_roles() {
+        let claims = vec![
+            claim("The logger owns a handler stack populated by handler registration."),
+            claim("addRecord creates a log record before passing it to handlers."),
+            claim("The handler interface defines record handling and batch handling boundaries."),
+            claim("The processing handler handles records by processing and writing them."),
+        ];
+
+        let missing = packet_missing_required_flow_roles(
+            "Explain how a logger turns a log call into a record object and passes it through handlers.",
+            PacketTaskClassDto::DataFlow,
+            &claims,
+        );
+        assert!(
+            missing.is_empty(),
+            "log-record handler prompts should use record creation and handler processing roles: {missing:?}"
+        );
+        assert!(
+            packet_supported_claim_family_count(&claims) >= 3,
+            "log-record handler claims should cover distinct sufficiency families"
         );
     }
 
