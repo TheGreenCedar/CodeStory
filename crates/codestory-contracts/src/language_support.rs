@@ -249,9 +249,19 @@ pub fn language_name_for_path(path: Option<&str>) -> Option<&'static str> {
 
 pub fn is_github_actions_workflow_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let mut parts = normalized.rsplit('/');
+    let Some(file_name) = parts.next().filter(|part| !part.is_empty()) else {
+        return false;
+    };
+    let Some(parent) = parts.next() else {
+        return false;
+    };
+    let Some(grandparent) = parts.next() else {
+        return false;
+    };
     (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
-        && normalized.contains(".github/workflows/")
+        && parent == "workflows"
+        && grandparent == ".github"
 }
 
 pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
@@ -403,6 +413,15 @@ mod tests {
             r"repo\.github\workflows\release.yaml"
         ));
         assert!(!is_github_actions_workflow_path("openapi.yaml"));
+        assert!(!is_github_actions_workflow_path(
+            "docs/not.github/workflows/ci.yml"
+        ));
+        assert!(!is_github_actions_workflow_path(
+            "repo/.github/workflows/nested/ci.yml"
+        ));
+        assert!(!is_github_actions_workflow_path(
+            "repo/.github/workflows/readme.md"
+        ));
         assert!(language_support_profile_for_ext("yaml").is_none());
     }
 }

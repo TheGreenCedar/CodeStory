@@ -139,6 +139,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Cargo test
         run: cargo test
+      - run: cargo fmt
 "#;
         std::fs::write(&path, yaml).expect("write workflow");
 
@@ -171,12 +172,9 @@ jobs:
         assert_eq!(build.start_line, Some(5));
         assert_eq!(build.start_col, Some(3));
         assert_eq!(build.end_col, Some(7));
-        assert!(
-            storage.nodes.iter().any(|node| {
-                node.kind == NodeKind::ANNOTATION && node.serialized_name.contains("Cargo test")
-            }),
-            "named workflow step should be collected"
-        );
+        assert_exact_step_span(&storage, "- uses: actions/checkout@v4", 8, 7);
+        assert_exact_step_span(&storage, "- name: Cargo test", 9, 7);
+        assert_exact_step_span(&storage, "- run: cargo fmt", 11, 7);
         assert!(
             storage
                 .edges
@@ -184,6 +182,26 @@ jobs:
                 .any(|edge| edge.kind == EdgeKind::MEMBER)
         );
         assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
+    }
+
+    fn assert_exact_step_span(
+        storage: &IntermediateStorage,
+        source_anchor: &str,
+        line: u32,
+        col: u32,
+    ) {
+        let node = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::ANNOTATION && node.serialized_name == source_anchor)
+            .unwrap_or_else(|| panic!("missing exact step anchor {source_anchor}"));
+        assert_eq!(node.start_line, Some(line));
+        assert_eq!(node.start_col, Some(col));
+        assert_eq!(
+            node.end_col,
+            Some(col + source_anchor.len() as u32 - 1),
+            "step span must cover only source text"
+        );
     }
 
     #[test]

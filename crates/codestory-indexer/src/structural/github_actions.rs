@@ -119,15 +119,14 @@ fn collect_jobs_and_steps(
         }
         if in_steps
             && indent > steps_indent
-            && let Some((step_label, step_col)) = step_label(line_text)
+            && let Some((step_anchor, step_col)) = step_anchor(line_text)
         {
             step_index = step_index.saturating_add(1);
-            let name = format!("{job_name} step {step_index}: {step_label}");
             let step_id = push_structural_node(
                 storage,
                 file_id,
                 NodeKind::ANNOTATION,
-                &name,
+                &step_anchor,
                 &format!("github-actions:step:{path_key}:{job_name}:{step_index}"),
                 line,
                 step_col,
@@ -178,21 +177,15 @@ fn yaml_mapping_key(trimmed_line: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-fn step_label(line: &str) -> Option<(String, u32)> {
+fn step_anchor(line: &str) -> Option<(String, u32)> {
     let indent = leading_spaces(line);
     let trimmed = line.trim_start();
-    let rest = trimmed.strip_prefix("- ")?;
+    trimmed.strip_prefix("- ")?;
     for key in ["name:", "uses:", "run:"] {
-        if let Some(value) = rest.trim_start().strip_prefix(key) {
-            let value = clean_yaml_scalar(value.trim());
-            let label = if value.is_empty() {
-                key.trim_end_matches(':').to_string()
-            } else {
-                value
-            };
+        if trimmed[2..].trim_start().starts_with(key) {
             return Some((
-                label,
-                indent.saturating_add(3).try_into().unwrap_or(u32::MAX),
+                trimmed.to_string(),
+                indent.saturating_add(1).try_into().unwrap_or(u32::MAX),
             ));
         }
     }
