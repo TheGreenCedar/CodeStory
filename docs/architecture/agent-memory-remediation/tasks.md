@@ -52,9 +52,9 @@
 ## Phase 6: Anti-Overfit And Promotion Gates
 
 - [ ] 7. Strengthen production/eval boundary checks
-  - [ ] 7.1 Expand `scripts/lint-retrieval-generalization.mjs` to scan production packet modules for manifest-derived repo slugs, paths, symbols, and exact expected claims.
-  - [ ] 7.2 Add a fixture that proves a generic role rule can satisfy a synthetic non-benchmark repo prompt.
-  - [ ] 7.3 Run the 7-task subset before the full gate.
+  - [x] 7.1 Expand `scripts/lint-retrieval-generalization.mjs` to scan production packet modules for manifest-derived repo slugs, paths, symbols, and exact expected claims.
+  - [x] 7.2 Add a fixture that proves a generic role rule can satisfy a synthetic non-benchmark repo prompt.
+  - [x] 7.3 Run the 7-task subset before the full gate.
   - [ ] 7.4 Run the full `language-expansion-holdout` packet-runtime publishable gate with `--jobs 4` after subset pass.
   - _Requirements: 6.1, 6.2, 6.3_
 

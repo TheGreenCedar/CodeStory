@@ -10,10 +10,13 @@ use crate::agent::packet_scoring::{
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_command_dispatch_flow, packet_terms_indicate_command_event_loop_flow,
+    packet_terms_indicate_command_server_bootstrap_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
     packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
     packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_network_command_input_flow,
     packet_terms_indicate_prepared_session_adapter_flow,
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
@@ -474,6 +477,9 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
             ],
         );
     }
+    if packet_terms_indicate_event_loop_command_flow(terms) {
+        push_command_loop_source_probe_queries_for_terms(terms, &mut queries);
+    }
     if packet_terms_indicate_url_session_request_flow(terms) {
         push_url_session_request_source_probe_queries(&mut queries);
         push_unique_terms(
@@ -908,6 +914,9 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     query: &str,
     citation: &AgentCitationDto,
 ) -> bool {
+    if packet_citation_matches_required_coverage_role(query, citation) {
+        return true;
+    }
     if let Some(matches_file_scoped_symbol) =
         packet_file_scoped_symbol_probe_matches(query, citation)
     {
@@ -1002,6 +1011,9 @@ pub(crate) fn packet_citation_probe_match_rank(
     if normalized_query.is_empty() {
         return Some(0);
     }
+    if packet_citation_matches_required_coverage_role(query, citation) {
+        return Some(6);
+    }
     let normalized_display = normalize_identifier(&citation.display_name);
     let normalized_path = citation
         .file_path
@@ -1050,6 +1062,51 @@ pub(crate) fn packet_citation_probe_match_rank(
     } else {
         None
     }
+}
+
+fn packet_citation_matches_required_coverage_role(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let Some(coverage_role) = citation.coverage_role.as_deref() else {
+        return false;
+    };
+    let normalized_role = normalize_identifier(coverage_role);
+    let normalized_query = normalize_identifier(query);
+    normalized_role == normalized_query
+        || match normalized_query.as_str() {
+            "serverbootstrap" | "commandserverentrypoint" => {
+                normalized_role == "commandserverbootstrap"
+            }
+            "eventloop" | "eventloopsource" => normalized_role == "commandeventloop",
+            "networkinput" | "networkcommandinput" => normalized_role == "commandnetworkinput",
+            "commanddispatch" | "commandtabledispatch" => normalized_role == "commanddispatch",
+            "httptoplevelhelper" | "publicclientfacade" => normalized_role == "clientpublicfacade",
+            "clientconveniencemethod" | "clientinterfacemethod" | "clientinterfacehelper" => {
+                normalized_role == "clientinterfacehelpers"
+            }
+            "requestfinalization" | "transportreadyrequestobject" => {
+                normalized_role == "clientrequestfinalization"
+            }
+            "clientsendimplementation" | "transportsend" => {
+                normalized_role == "clienttransportsend"
+            }
+            "requestresponse" | "responsestreamboundary" => {
+                normalized_role == "clientresponsematerialization"
+            }
+            "nativeformconstraints"
+            | "htmlconstraint"
+            | "htmlformrequiredconstraint"
+            | "htmlformpatternconstraint"
+            | "htmlformminmaxconstraints" => normalized_role == "formnativeconstraints",
+            "customvalidation"
+            | "customvalidationflow"
+            | "customformvalidationinput"
+            | "customvalidationvaliditystate"
+            | "customvalidationerrorrendering" => normalized_role == "formcustomvalidation",
+            "submitpreventdefault" | "submitinvalidguard" => normalized_role == "formsubmitguard",
+            _ => false,
+        }
 }
 
 fn packet_citation_matches_sql_schema_scripts_probe(
@@ -1746,7 +1803,9 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
         queries,
         &[
             "http top level helper",
+            "public client facade",
             "client convenience method",
+            "client interface helper",
             "client send implementation",
             "request finalization",
             "request preparation",
@@ -1758,6 +1817,24 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
             "response stream boundary",
         ],
     );
+}
+
+pub(crate) fn push_command_loop_source_probe_queries_for_terms(
+    terms: &[String],
+    queries: &mut Vec<String>,
+) {
+    if packet_terms_indicate_command_server_bootstrap_flow(terms) {
+        push_unique_terms(queries, &["server bootstrap", "command server entrypoint"]);
+    }
+    if packet_terms_indicate_command_event_loop_flow(terms) {
+        push_unique_terms(queries, &["event loop source"]);
+    }
+    if packet_terms_indicate_network_command_input_flow(terms) {
+        push_unique_terms(queries, &["network command input"]);
+    }
+    if packet_terms_indicate_command_dispatch_flow(terms) {
+        push_unique_terms(queries, &["command table dispatch"]);
+    }
 }
 
 fn push_server_request_dispatch_source_probe_queries(queries: &mut Vec<String>) {
@@ -2044,6 +2121,33 @@ mod tests {
             packet_citation_probe_token_coverage("jsonl event output", &citation),
             3
         );
+    }
+
+    #[test]
+    fn required_probe_queries_match_exact_coverage_role_ids() {
+        let mut citation = test_packet_citation("readClientInput", "src/networking.c", 40.0);
+        citation.coverage_role = Some("command_network_input".to_string());
+
+        assert!(packet_citation_satisfies_required_probe(
+            "network command input",
+            &citation
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("network command input", &citation),
+            Some(6)
+        );
+
+        citation.coverage_role = Some("client_response_materialization".to_string());
+        assert!(packet_citation_satisfies_required_probe(
+            "response stream boundary",
+            &citation
+        ));
+
+        citation.coverage_role = Some("form_native_constraints".to_string());
+        assert!(packet_citation_satisfies_required_probe(
+            "html form pattern constraint",
+            &citation
+        ));
     }
 
     #[test]

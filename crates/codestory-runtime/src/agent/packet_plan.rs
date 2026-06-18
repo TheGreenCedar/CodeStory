@@ -10,8 +10,8 @@ use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_
 use crate::agent::packet_required_probes::{
     packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
     packet_sufficiency_required_probe_queries_from_terms,
-    push_indexing_flow_required_probe_queries, push_search_flow_probe_queries,
-    push_sql_schema_required_probe_queries,
+    push_command_loop_source_probe_queries_for_terms, push_indexing_flow_required_probe_queries,
+    push_search_flow_probe_queries, push_sql_schema_required_probe_queries,
 };
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
@@ -19,11 +19,13 @@ use crate::agent::packet_scoring::{
 use crate::agent::packet_terms::{
     packet_probe_terms, packet_terms_have, packet_terms_have_any,
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_command_dispatch_flow, packet_terms_indicate_command_event_loop_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
     packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
     packet_terms_indicate_javascript_route_source_flow,
     packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_terms_indicate_network_command_input_flow,
     packet_terms_indicate_prepared_session_adapter_flow,
     packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
     packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
@@ -216,13 +218,13 @@ pub(crate) fn packet_symbol_probe_queries(
         &mut queries,
         &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
     );
+    if eval_probes_enabled() {
+        push_prompt_named_file_probe_queries(&terms, &mut queries);
+    }
     push_unique_owned_terms(
         &mut queries,
         &packet_flow_requirement_queries_for_terms(&terms, task_class),
     );
-    if eval_probes_enabled() {
-        push_prompt_named_file_probe_queries(&terms, &mut queries);
-    }
     push_prompt_derived_exact_flow_anchor_queries(&terms, &mut queries);
     push_unique_owned_terms(
         &mut queries,
@@ -310,6 +312,8 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
             &[
                 "client convenience methods",
                 "top level helpers",
+                "public client facade",
+                "client interface helper",
                 "request finalization",
                 "transport send",
                 "request response",
@@ -473,16 +477,19 @@ fn push_prompt_derived_exact_flow_anchor_queries(terms: &[String], queries: &mut
     if has_any(&["adapter", "adapters", "transport"]) {
         push_unique_terms(queries, &["transport adapter", "adapter selection"]);
     }
-    if has("event") && has("loop") {
-        push_unique_terms(
-            queries,
-            &[
-                "event loop",
-                "event dispatch",
-                "network input",
-                "command dispatch",
-            ],
-        );
+    if packet_terms_indicate_event_loop_command_flow(terms) {
+        push_command_loop_source_probe_queries_for_terms(terms, queries);
+        if packet_terms_indicate_command_event_loop_flow(terms) {
+            push_unique_terms(queries, &["event loop", "event dispatch"]);
+        }
+        if packet_terms_indicate_network_command_input_flow(terms) {
+            push_unique_terms(queries, &["network input"]);
+        }
+        if packet_terms_indicate_command_dispatch_flow(terms) {
+            push_unique_terms(queries, &["command dispatch"]);
+        }
+    } else if has("event") && has("loop") {
+        push_unique_terms(queries, &["event loop", "event dispatch"]);
     }
     if has_any(&["client", "network", "reads", "socket"]) {
         push_unique_terms(queries, &["client input", "network input"]);
@@ -822,7 +829,9 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
         queries,
         &[
             "http top level helper",
+            "public client facade",
             "client convenience method",
+            "client interface helper",
             "client send implementation",
             "request finalization",
             "request preparation",

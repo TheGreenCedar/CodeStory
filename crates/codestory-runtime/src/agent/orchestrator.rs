@@ -65,8 +65,9 @@ use crate::agent::packet_sufficiency::{
     packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_have_any,
-    packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_probe_terms, packet_terms_have_any, packet_terms_indicate_client_send_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
     packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
@@ -1006,11 +1007,23 @@ fn maybe_append_generic_source_shape_citations(
     let terms = packet_probe_terms(question);
     let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
     let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
+    let client_send_flow = packet_terms_indicate_client_send_flow(&terms);
+    let hook_cache_flow = packet_terms_indicate_hook_cache_flow(&terms);
+    let command_flow = packet_terms_indicate_event_loop_command_flow(&terms);
+    let form_validation_flow = packet_terms_indicate_form_validation_flow(&terms);
     let formatting_flow = packet_terms_indicate_runtime_formatting_flow(&terms);
     let css_animation_flow = packet_terms_indicate_stylesheet_animation_flow(&terms)
         || (packet_terms_have_any(&terms, &["animation", "animations", "animate"])
             && packet_terms_have_any(&terms, &["variable", "variables", "keyframe", "keyframes"]));
-    if !route_flow && !mapper_flow && !formatting_flow && !css_animation_flow {
+    if !route_flow
+        && !mapper_flow
+        && !client_send_flow
+        && !hook_cache_flow
+        && !command_flow
+        && !form_validation_flow
+        && !formatting_flow
+        && !css_animation_flow
+    {
         return;
     }
 
@@ -1020,6 +1033,10 @@ fn maybe_append_generic_source_shape_citations(
         project_root,
         route_flow,
         mapper_flow,
+        client_send_flow,
+        hook_cache_flow,
+        command_flow,
+        form_validation_flow,
         formatting_flow,
         css_animation_flow,
         &mut candidates,
@@ -1116,6 +1133,10 @@ fn collect_generic_source_shape_candidates(
     dir: &Path,
     route_flow: bool,
     mapper_flow: bool,
+    client_send_flow: bool,
+    hook_cache_flow: bool,
+    command_flow: bool,
+    form_validation_flow: bool,
     formatting_flow: bool,
     css_animation_flow: bool,
     candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
@@ -1144,6 +1165,10 @@ fn collect_generic_source_shape_candidates(
                     &path,
                     route_flow,
                     mapper_flow,
+                    client_send_flow,
+                    hook_cache_flow,
+                    command_flow,
+                    form_validation_flow,
                     formatting_flow,
                     css_animation_flow,
                     candidates,
@@ -1168,6 +1193,18 @@ fn collect_generic_source_shape_candidates(
         }
         if mapper_flow {
             collect_csharp_mapper_shape_candidates(&path, &source, candidates);
+        }
+        if client_send_flow {
+            collect_client_send_shape_candidates(&path, &source, candidates);
+        }
+        if hook_cache_flow {
+            collect_hook_cache_shape_candidates(&path, &source, candidates);
+        }
+        if command_flow {
+            collect_event_loop_command_shape_candidates(&path, &source, candidates);
+        }
+        if form_validation_flow {
+            collect_form_validation_shape_candidates(&path, &source, candidates);
         }
         if formatting_flow {
             collect_runtime_formatting_shape_candidates(&path, &source, candidates);
@@ -1194,6 +1231,12 @@ fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) 
         || relative.contains("/docs/")
         || relative.starts_with("docs/")
         || relative.contains("docssource/")
+        || relative.contains("/vendor/")
+        || relative.starts_with("vendor/")
+        || relative.contains("/third_party/")
+        || relative.starts_with("third_party/")
+        || relative.contains("/deps/")
+        || relative.starts_with("deps/")
     {
         return false;
     }
@@ -1205,7 +1248,10 @@ fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) 
                 "js" | "mjs"
                     | "cjs"
                     | "ts"
+                    | "html"
+                    | "htm"
                     | "css"
+                    | "c"
                     | "h"
                     | "hpp"
                     | "hh"
@@ -1213,6 +1259,7 @@ fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) 
                     | "cpp"
                     | "cxx"
                     | "cs"
+                    | "dart"
             )
         })
         .unwrap_or(false)
@@ -1304,6 +1351,481 @@ fn packet_js_receiver_function_assignment(line: &str) -> Option<(String, String)
         return None;
     }
     Some((receiver.to_string(), method.to_string()))
+}
+
+fn collect_client_send_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "dart" {
+        return;
+    }
+
+    let normalized_source = normalize_identifier(source);
+    let source_lower = source.to_ascii_lowercase();
+    if source_lower.contains("_withclient")
+        && source_lower.contains("client()")
+        && source_lower.contains("client.")
+        && packet_source_shape_has_any(source, &["get(", "post(", "put(", "patch(", "delete("])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Top-level HTTP helpers".to_string(),
+            kind: NodeKind::FUNCTION,
+            line: packet_first_line_containing(source, &["Future<Response>", " get("]).unwrap_or(1),
+            score: 116.0,
+            coverage_role: "client public facade".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("interfaceclassclient")
+        && normalized_source.contains("futureresponse")
+        && normalized_source.contains("futurestreamedresponsesend")
+        && normalized_source.contains("request")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Client interface helpers".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["Future<Response>", " get("]).unwrap_or(1),
+            score: 114.0,
+            coverage_role: "client interface helpers".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("classrequestextends")
+        && normalized_source.contains("bytestreamfinalize")
+        && normalized_source.contains("frombytesbodybytes")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Request.finalize".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["ByteStream", " finalize("]).unwrap_or(1),
+            score: 112.0,
+            coverage_role: "client request finalization".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("classresponseextendsbaseresponse")
+        && normalized_source.contains("fromstreamstreamedresponseresponse")
+        && normalized_source.contains("responsestreamtobytes")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Response.fromStream".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["fromStream", "StreamedResponse"])
+                .unwrap_or(1),
+            score: 112.0,
+            coverage_role: "client response materialization".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if source_lower.contains("dart:io")
+        && source_lower.contains("httpclient")
+        && source_lower.contains("future<streamedresponse>")
+        && source_lower.contains(" send(")
+        && source_lower.contains("request.finalize")
+        && normalized_source.contains("openurl")
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Transport send".to_string(),
+            kind: NodeKind::METHOD,
+            line: packet_first_line_containing(source, &["Future<StreamedResponse>", " send("])
+                .unwrap_or(1),
+            score: 112.0,
+            coverage_role: "client transport send".to_string(),
+            producer: "packet_generic_client_send_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_hook_cache_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "js" | "mjs" | "cjs" | "ts") {
+        return;
+    }
+
+    let source_lower = source.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
+    let cache_helper_call = packet_source_shape_has_cache_helper_call(&normalized_source);
+    let hook_return_call = packet_source_shape_has_hook_return_call(&normalized_source);
+
+    if source_lower.contains("serialize(_key)")
+        && cache_helper_call
+        && normalized_source.contains("mutate")
+        && let Some((display_name, line)) = packet_first_exported_name_near(source, &["handler"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 118.0,
+            coverage_role: "hook_key_serialization".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("stablehash")
+        && normalized_source.contains("returnkeyargs")
+        && let Some((display_name, line)) =
+            packet_first_exported_name_near(source, &["serialize", "key"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 116.0,
+            coverage_role: "hook_key_serialization".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if source_lower.contains("cache.get(key)")
+        && source_lower.contains("return [")
+        && (source_lower.contains("cache.set(key")
+            || source_lower.contains("state[5]")
+            || source_lower.contains("setter"))
+        && (source_lower.contains("state[6]")
+            || source_lower.contains("subscribe")
+            || source_lower.contains("subscriber"))
+        && (source_lower.contains("snapshot")
+            || source_lower.contains("initial_cache")
+            || source_lower.contains("initial cache"))
+        && let Some((display_name, line)) =
+            packet_first_exported_name_near(source, &["cache", "helper"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 116.0,
+            coverage_role: "hook_cache_helper".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("exportasyncfunction")
+        && normalized_source.contains("serialize")
+        && cache_helper_call
+        && normalized_source.contains("mutatebykey")
+        && let Some((display_name, line)) =
+            packet_first_exported_name_near(source, &["mutate", "mutation", "mutat"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 115.0,
+            coverage_role: "hook_mutation_flow".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+
+    if normalized_source.contains("middleware")
+        && normalized_source.contains("hook")
+        && normalized_source.contains("configuse")
+        && hook_return_call
+        && let Some((display_name, line)) = packet_first_exported_name_near(source, &["middleware"])
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 110.0,
+            coverage_role: "hook_middleware_composition".to_string(),
+            producer: "packet_generic_hook_cache_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_event_loop_command_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "c" {
+        return;
+    }
+    let normalized_source = normalize_identifier(source);
+    let has_server = normalized_source.contains("server");
+    let has_command = normalized_source.contains("command");
+    let has_event_loop = normalized_source.contains("eventloop")
+        || normalized_source.contains("event_loop")
+        || (normalized_source.contains("event") && normalized_source.contains("loop"));
+    let has_client_input = normalized_source.contains("client")
+        && (normalized_source.contains("input")
+            || normalized_source.contains("buffer")
+            || normalized_source.contains("read"));
+    let functions = packet_c_function_names(source);
+
+    if has_server
+        && has_event_loop
+        && let Some((name, line)) =
+            packet_best_c_function_with_words(&functions, &["init", "server"], None)
+                .or_else(|| packet_c_function_exact(&functions, "main"))
+    {
+        push_command_shape_candidate(
+            path,
+            candidates,
+            name,
+            line,
+            "command_server_bootstrap",
+            124.0,
+        );
+    }
+    if has_event_loop
+        && let Some((name, line)) = packet_c_function_ending_with(&functions, "Main", "main")
+            .or_else(|| packet_best_c_function_with_words(&functions, &["event", "loop"], None))
+    {
+        push_command_shape_candidate(path, candidates, name, line, "command_event_loop", 128.0);
+    }
+    if has_command
+        && has_client_input
+        && let Some((name, line)) =
+            packet_best_c_function_with_words(&functions, &["read", "client"], Some("read"))
+                .or_else(|| {
+                    packet_best_c_function_with_words(&functions, &["client", "input"], None)
+                })
+    {
+        push_command_shape_candidate(path, candidates, name, line, "command_network_input", 130.0);
+    }
+    if has_command {
+        if let Some((name, line)) =
+            packet_best_c_function_with_words(&functions, &["process", "command"], None)
+        {
+            push_command_shape_candidate(path, candidates, name, line, "command_dispatch", 126.0);
+        }
+        if let Some((name, line)) = packet_c_function_exact(&functions, "call") {
+            push_command_shape_candidate(path, candidates, name, line, "command_dispatch", 125.0);
+        }
+    }
+}
+
+fn push_command_shape_candidate(
+    path: &Path,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+    display_name: String,
+    line: u32,
+    coverage_role: &str,
+    score: f32,
+) {
+    candidates.push(PacketGenericSourceShapeCandidate {
+        path: path.to_path_buf(),
+        line,
+        display_name,
+        kind: NodeKind::FUNCTION,
+        score,
+        coverage_role: coverage_role.to_string(),
+        producer: "packet_generic_command_source_probe".to_string(),
+        eligible_for_sufficiency: true,
+    });
+}
+
+fn packet_c_function_names(source: &str) -> Vec<(String, u32)> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let name = packet_c_function_name_from_line(line)?;
+            Some((name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+        })
+        .collect()
+}
+
+fn packet_c_function_name_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#')
+        || trimmed.ends_with(';')
+        || trimmed.contains("typedef")
+        || !trimmed.contains('(')
+        || !trimmed.contains('{')
+    {
+        return None;
+    }
+    let before_paren = trimmed.split_once('(')?.0.trim_end();
+    let name = before_paren
+        .rsplit(|ch: char| !packet_source_identifier_char(ch))
+        .next()?
+        .trim();
+    if name.is_empty()
+        || matches!(
+            name,
+            "if" | "for" | "while" | "switch" | "return" | "sizeof"
+        )
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn packet_best_c_function_with_words(
+    functions: &[(String, u32)],
+    words: &[&str],
+    preferred_prefix: Option<&str>,
+) -> Option<(String, u32)> {
+    functions
+        .iter()
+        .filter(|(name, _)| {
+            let normalized = normalize_identifier(name);
+            words.iter().all(|word| normalized.contains(word))
+        })
+        .min_by_key(|(name, line)| {
+            let normalized = normalize_identifier(name);
+            let prefix_miss = preferred_prefix
+                .map(|prefix| !normalized.starts_with(prefix))
+                .unwrap_or(false);
+            (prefix_miss, name.len(), *line)
+        })
+        .cloned()
+}
+
+fn packet_c_function_exact(functions: &[(String, u32)], expected: &str) -> Option<(String, u32)> {
+    functions
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(expected))
+        .cloned()
+}
+
+fn packet_c_function_ending_with(
+    functions: &[(String, u32)],
+    suffix: &str,
+    excluded: &str,
+) -> Option<(String, u32)> {
+    functions
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(excluded) && name.ends_with(suffix))
+        .min_by_key(|(name, line)| (name.len(), *line))
+        .cloned()
+}
+
+fn collect_form_validation_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "html" | "htm") {
+        return;
+    }
+    let source_lower = source.to_ascii_lowercase();
+    if !source_lower.contains("<form") || !source_lower.contains("<input") {
+        return;
+    }
+    let has_native_constraints = source_lower.contains("required")
+        && source_lower.contains("pattern")
+        && source_lower.contains("min=")
+        && source_lower.contains("max=");
+    if has_native_constraints {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "Native form constraints".to_string(),
+            kind: NodeKind::ANNOTATION,
+            line: packet_source_line_containing(source, "pattern").unwrap_or(1),
+            score: 132.0,
+            coverage_role: "form_native_constraints".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_source_line_containing(source: &str, needle: &str) -> Option<u32> {
+    source
+        .lines()
+        .position(|line| line.to_ascii_lowercase().contains(needle))
+        .map(|index| index.saturating_add(1).try_into().unwrap_or(u32::MAX))
+}
+
+fn packet_source_shape_has_cache_helper_call(normalized_source: &str) -> bool {
+    normalized_source.contains("cachehelper") && normalized_source.contains("create")
+}
+
+fn packet_source_shape_has_hook_return_call(normalized_source: &str) -> bool {
+    normalized_source.contains("returnuse") && normalized_source.contains("hook")
+}
+
+fn packet_source_shape_has_any(source: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| source.contains(needle))
+}
+
+fn packet_first_exported_name_near(
+    source: &str,
+    normalized_needles: &[&str],
+) -> Option<(String, u32)> {
+    source.lines().enumerate().find_map(|(index, line)| {
+        let name = packet_exported_name_from_line(line)?;
+        let normalized = normalize_identifier(&name);
+        normalized_needles
+            .iter()
+            .any(|needle| normalized.contains(needle))
+            .then(|| (name, index.saturating_add(1).try_into().unwrap_or(u32::MAX)))
+    })
+}
+
+fn packet_exported_name_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let remainder = trimmed
+        .strip_prefix("export async function ")
+        .or_else(|| trimmed.strip_prefix("export function "))
+        .or_else(|| trimmed.strip_prefix("export const "))?;
+    let name = remainder
+        .chars()
+        .take_while(|ch| packet_source_identifier_char(*ch))
+        .collect::<String>();
+    (!name.is_empty()).then_some(name)
+}
+
+fn packet_first_line_containing(source: &str, needles: &[&str]) -> Option<u32> {
+    source
+        .lines()
+        .enumerate()
+        .find(|(_, line)| needles.iter().all(|needle| line.contains(needle)))
+        .and_then(|(index, _)| index.saturating_add(1).try_into().ok())
 }
 
 fn collect_csharp_mapper_shape_candidates(
@@ -6627,7 +7149,16 @@ mod tests {
             .map(|query| query.query.as_str())
             .collect::<Vec<_>>();
 
-        for expected in ["event loop", "network input", "command dispatch"] {
+        for expected in [
+            "server bootstrap",
+            "command server entrypoint",
+            "event loop source",
+            "network command input",
+            "command table dispatch",
+            "event loop",
+            "network input",
+            "command dispatch",
+        ] {
             assert!(
                 queries.contains(&expected),
                 "expected {expected} in command/event flow packet plan: {queries:?}"
@@ -6658,6 +7189,59 @@ mod tests {
             assert!(
                 !required.iter().any(|query| query == request_probe),
                 "sufficiency should not require request probe {request_probe}: {required:?}"
+            );
+        }
+
+        let dispatch_only_question =
+            "Trace how network command input reaches command table dispatch and command handlers.";
+        let dispatch_only_plan = build_packet_plan(
+            dispatch_only_question,
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+        let dispatch_only_queries = dispatch_only_plan
+            .queries
+            .iter()
+            .map(|query| query.query.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["network command input", "command table dispatch"] {
+            assert!(
+                dispatch_only_queries.contains(&expected),
+                "dispatch-only command plan should include {expected}: {dispatch_only_queries:?}"
+            );
+        }
+        for unexpected in [
+            "server bootstrap",
+            "command server entrypoint",
+            "event loop source",
+            "event loop",
+            "event dispatch",
+        ] {
+            assert!(
+                !dispatch_only_queries.contains(&unexpected),
+                "dispatch-only command plan should not require {unexpected}: {dispatch_only_queries:?}"
+            );
+        }
+        let dispatch_only_required = packet_sufficiency_required_probe_queries(
+            dispatch_only_question,
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in ["network command input", "command table dispatch"] {
+            assert!(
+                dispatch_only_required.iter().any(|query| query == expected),
+                "dispatch-only command sufficiency should include {expected}: {dispatch_only_required:?}"
+            );
+        }
+        for unexpected in [
+            "server bootstrap",
+            "command server entrypoint",
+            "event loop source",
+        ] {
+            assert!(
+                !dispatch_only_required
+                    .iter()
+                    .any(|query| query == unexpected),
+                "dispatch-only command sufficiency should not require {unexpected}: {dispatch_only_required:?}"
             );
         }
     }
@@ -11466,6 +12050,345 @@ mod tests {
         assert!(answer.retrieval_trace.annotations.iter().any(|annotation| {
             annotation.starts_with("packet_generic_source_shape_citations appended=")
         }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_client_send_dart_anchors() {
+        let root = packet_temp_root("generic-source-shape-client-send");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "lib/http.dart",
+            r#"
+            export 'src/client.dart';
+            export 'src/request.dart';
+            export 'src/response.dart';
+            Future<Response> get(Uri url) => _withClient((client) => client.get(url));
+            Future<Response> post(Uri url) => _withClient((client) => client.post(url));
+            Future<T> _withClient<T>(Future<T> Function(Client) fn) async {
+              var client = Client();
+              return await fn(client);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/src/client.dart",
+            r#"
+            abstract interface class Client {
+              Future<Response> get(Uri url);
+              Future<Response> post(Uri url);
+              Future<StreamedResponse> send(BaseRequest request);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/src/request.dart",
+            r#"
+            class Request extends BaseRequest {
+              ByteStream finalize() {
+                return ByteStream.fromBytes(bodyBytes);
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lib/src/response.dart",
+            r#"
+            class Response extends BaseResponse {
+              static Future<Response> fromStream(StreamedResponse response) async {
+                final body = await response.stream.toBytes();
+                return Response.bytes(body, response.statusCode);
+              }
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a package exposes top-level helpers, Client convenience methods, Request finalization, and transport send behavior.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a package exposes top-level helpers, Client convenience methods, Request finalization, and transport send behavior.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "Top-level HTTP helpers",
+            "Client interface helpers",
+            "Request.finalize",
+            "Response.fromStream",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic client-send source shape {expected}; got {displays:?}"
+            );
+        }
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "Top-level HTTP helpers"
+                    && citation.coverage_role.as_deref() == Some("client public facade")
+                    && citation.eligible_for_sufficiency == Some(true)
+            }),
+            "expected public facade source shape to be sufficiency eligible: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_hook_cache_anchors() {
+        let root = packet_temp_root("generic-source-shape-hook-cache");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/hooks/use-data.ts",
+            r#"
+            export const useDataHandler = (_key, cache) => {
+              const [key, fnArg] = serialize(_key)
+              const [getCache, setCache] = createCacheHelper(cache, key)
+              return internalMutate(cache, key, fnArg)
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/key.ts",
+            r#"
+            export const normalizeKey = key => {
+              const args = key
+              key = typeof key == 'string' ? key : stableHash(key)
+              return [key, args]
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/cache-helper.ts",
+            r#"
+            export const makeCacheHelper = (cache, key) => {
+              const state = runtimeState.get(cache)
+              return [
+                () => cache.get(key) || EMPTY_CACHE,
+                info => {
+                  const prev = cache.get(key)
+                  cache.set(key, info)
+                  state[5](key, info, prev)
+                },
+                state[6],
+                () => snapshot[key] || cache.get(key)
+              ] as const
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/mutate.ts",
+            r#"
+            export async function applyMutation(cache, _key, data) {
+              return mutateByKey(_key)
+              async function mutateByKey(_k) {
+                const [key] = serialize(_k)
+                const [get, set] = createCacheHelper(cache, key)
+                set({ data })
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/runtime/middleware.ts",
+            r#"
+            export const withRuntimeMiddleware = (useHook: SWRHook, middleware) => {
+              return (...args) => {
+                const config = { use: [] }
+                const uses = (config.use || []).concat(middleware)
+                return useHook(args[0], args[1], { ...config, use: uses })
+              }
+            }
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how a public hook serializes keys, connects cache helpers, composes middleware, and routes mutate behavior.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how a public hook serializes keys, connects cache helpers, composes middleware, and routes mutate behavior.",
+            &mut answer,
+        );
+        let roles = answer
+            .citations
+            .iter()
+            .map(|citation| {
+                (
+                    citation.display_name.as_str(),
+                    citation.coverage_role.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (expected, role) in [
+            ("useDataHandler", "hook_key_serialization"),
+            ("normalizeKey", "hook_key_serialization"),
+            ("makeCacheHelper", "hook_cache_helper"),
+            ("applyMutation", "hook_mutation_flow"),
+            ("withRuntimeMiddleware", "hook_middleware_composition"),
+        ] {
+            assert!(
+                roles.iter().any(
+                    |(display, actual_role)| *display == expected && *actual_role == Some(role)
+                ),
+                "expected generic hook/cache source shape {expected} with role {role}; got {roles:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_command_flow_c_anchors() {
+        let root = packet_temp_root("generic-source-shape-command-flow");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/server.c",
+            r#"
+            void initServer(void) {
+              server.el = createEventLoop();
+            }
+            int main(int argc, char **argv) {
+              initServer();
+              aeMain(server.el);
+            }
+            int processCommand(client *c) {
+              return call(c, CMD_CALL_FULL);
+            }
+            void call(client *c, int flags) {
+              c->cmd->proc(c);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/ae.c",
+            r#"
+            void aeMain(aeEventLoop *eventLoop) {
+              while (!eventLoop->stop) {
+                aeProcessEvents(eventLoop, AE_ALL_EVENTS);
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/networking.c",
+            r#"
+            void readQueryFromClient(connection *conn) {
+              client *c = connGetPrivateData(conn);
+              readQueryFromClient(c);
+              processInputBuffer(c);
+              processCommand(c);
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "deps/noise.c",
+            r#"
+            void processCommand(client *c) {}
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Trace how a command server bootstrap enters an event loop, reads client input, and dispatches commands through a command table.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Trace how a command server bootstrap enters an event loop, reads client input, and dispatches commands through a command table.",
+            &mut answer,
+        );
+        let displays = answer
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "initServer",
+            "aeMain",
+            "readQueryFromClient",
+            "processCommand",
+        ] {
+            assert!(
+                displays.contains(&expected),
+                "expected generic command source shape {expected}; got {displays:?}"
+            );
+        }
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "readQueryFromClient"
+                    && citation.coverage_role.as_deref() == Some("command_network_input")
+                    && citation.eligible_for_sufficiency == Some(true)
+            }),
+            "expected client input source shape to be sufficiency eligible: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().all(|citation| !packet_display_path(
+                citation.file_path.as_deref().unwrap_or("")
+            )
+            .starts_with("deps/")),
+            "vendor/deps candidates should stay out of generic command source shapes: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_form_native_constraint_anchor() {
+        let root = packet_temp_root("generic-source-shape-form-validation");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "lessons/forms/native-validation.html",
+            r#"
+            <form>
+              <input required pattern="[a-z]+" min="3" max="12">
+            </form>
+            "#,
+        );
+
+        let mut answer = packet_answer_fixture(
+            "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.",
+            Vec::new(),
+        );
+        maybe_append_generic_source_shape_citations(
+            &root,
+            "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.",
+            &mut answer,
+        );
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "Native form constraints"
+                    && citation.coverage_role.as_deref() == Some("form_native_constraints")
+                    && citation.eligible_for_sufficiency == Some(true)
+            }),
+            "expected native constraint source shape: {:?}",
+            answer.citations
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

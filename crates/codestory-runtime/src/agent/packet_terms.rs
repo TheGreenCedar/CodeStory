@@ -574,31 +574,61 @@ pub(crate) fn packet_terms_indicate_form_validation_flow(terms: &[String]) -> bo
 }
 
 pub(crate) fn packet_terms_indicate_event_loop_command_flow(terms: &[String]) -> bool {
+    packet_terms_indicate_command_server_bootstrap_flow(terms)
+        || packet_terms_indicate_command_event_loop_flow(terms)
+        || packet_terms_indicate_network_command_input_flow(terms)
+        || packet_terms_indicate_command_dispatch_flow(terms)
+}
+
+pub(crate) fn packet_terms_indicate_command_server_bootstrap_flow(terms: &[String]) -> bool {
     let has = |term: &str| packet_terms_have(terms, term);
     let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    let event_loop_intent = has("eventloop") || (has("event") && has("loop"));
-    let command_dispatch_intent = has_any(&["command", "commands"])
+    has_any(&["command", "commands"])
         && has_any(&[
-            "acl",
-            "arity",
-            "call",
-            "dispatch",
-            "dispatches",
-            "execute",
-            "executes",
-            "execution",
-            "handler",
-            "handlers",
-            "input",
-            "network",
-            "process",
-            "slowlog",
-            "table",
-        ]);
-    let network_command_input_intent =
-        has_any(&["network", "socket", "client", "input"]) && has_any(&["command", "commands"]);
+            "bootstrap",
+            "bootstraps",
+            "server",
+            "start",
+            "starts",
+            "main",
+        ])
+        && (has_any(&["server", "bootstrap", "bootstraps", "main"])
+            || has("eventloop")
+            || (has("event") && has("loop")))
+}
 
-    event_loop_intent || command_dispatch_intent || network_command_input_intent
+pub(crate) fn packet_terms_indicate_command_event_loop_flow(terms: &[String]) -> bool {
+    let has = |term: &str| packet_terms_have(terms, term);
+    packet_terms_have_any(terms, &["command", "commands"])
+        && (has("eventloop") || (has("event") && has("loop")))
+}
+
+pub(crate) fn packet_terms_indicate_network_command_input_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["network", "socket", "client", "input"])
+        && packet_terms_have_any(terms, &["command", "commands"])
+}
+
+pub(crate) fn packet_terms_indicate_command_dispatch_flow(terms: &[String]) -> bool {
+    packet_terms_have_any(terms, &["command", "commands"])
+        && packet_terms_have_any(
+            terms,
+            &[
+                "acl",
+                "arity",
+                "call",
+                "dispatch",
+                "dispatches",
+                "execute",
+                "executes",
+                "execution",
+                "handler",
+                "handlers",
+                "process",
+                "proc",
+                "slowlog",
+                "table",
+            ],
+        )
 }
 
 pub(crate) fn packet_terms_indicate_url_session_request_flow(terms: &[String]) -> bool {
@@ -747,6 +777,28 @@ mod tests {
             "Trace how Express creates an application, registers middleware routes, and handles an incoming request through the router and response helpers.",
         );
         assert!(!packet_terms_indicate_client_send_flow(&route_terms));
+    }
+
+    #[test]
+    fn event_loop_command_flow_requires_command_intent() {
+        let command_terms = packet_probe_terms(
+            "Trace how a command server bootstrap enters an event loop, reads network command input, and dispatches commands through a command table.",
+        );
+        assert!(packet_terms_indicate_event_loop_command_flow(
+            &command_terms
+        ));
+
+        let dispatch_terms =
+            packet_probe_terms("Trace network command input through command table dispatch.");
+        assert!(packet_terms_indicate_event_loop_command_flow(
+            &dispatch_terms
+        ));
+
+        let bare_event_loop_terms =
+            packet_probe_terms("Explain how an event loop schedules timers and I/O callbacks.");
+        assert!(!packet_terms_indicate_event_loop_command_flow(
+            &bare_event_loop_terms
+        ));
     }
 
     #[test]

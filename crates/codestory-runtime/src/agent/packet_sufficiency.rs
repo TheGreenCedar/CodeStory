@@ -681,6 +681,62 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         {
             return Some("public api/export");
         }
+        if (normalized_claim.contains("toplevelhttphelper")
+            || normalized_claim.contains("toplevelhttphelpers")
+            || normalized_claim.contains("delegate")
+                && normalized_claim.contains("client")
+                && normalized_claim.contains("helper"))
+            && normalized_claim.contains("client")
+        {
+            return Some("client public facade");
+        }
+        if normalized_claim.contains("conveniencemethod")
+            || normalized_claim.contains("conveniencemethods")
+        {
+            return Some("client convenience methods");
+        }
+        if normalized_claim.contains("finalize")
+            && contains_any(&normalized_claim, &["request", "body", "sending"])
+        {
+            return Some("client request finalization");
+        }
+        if normalized_claim.contains("transportimplementation")
+            || (normalized_claim.contains("send")
+                && contains_any(&normalized_claim, &["transport", "httpclient", "adapter"]))
+        {
+            return Some("client transport send");
+        }
+        if normalized_claim.contains("responsefromstream")
+            || normalized_claim.contains("responsematerialization")
+            || normalized_claim.contains("responsestream")
+        {
+            return Some("client response materialization");
+        }
+        if normalized_claim.contains("server")
+            && contains_any(&normalized_claim, &["bootstrap", "initializes", "main"])
+        {
+            return Some("command server bootstrap");
+        }
+        if normalized_claim.contains("eventloop")
+            || (normalized_claim.contains("event") && normalized_claim.contains("loop"))
+        {
+            return Some("command event loop");
+        }
+        if normalized_claim.contains("socketinput")
+            || normalized_claim.contains("networkcommandinput")
+            || (normalized_claim.contains("network")
+                && normalized_claim.contains("input")
+                && normalized_claim.contains("command"))
+        {
+            return Some("command network input");
+        }
+        if normalized_claim.contains("commandtable")
+            || normalized_claim.contains("commanddispatch")
+            || (normalized_claim.contains("command")
+                && contains_any(&normalized_claim, &["dispatch", "proc", "slowlog"]))
+        {
+            return Some("command dispatch");
+        }
         if normalized_claim.contains("handlerstack")
             || normalized_claim.contains("pushhandler")
             || (normalized_claim.contains("handler")
@@ -992,7 +1048,7 @@ impl PacketFlowContext {
             return true;
         }
         if StructuralLanguagePolicy::requires_specific_proof(requirement) {
-            return false;
+            return self.claim_declares_exact_requirement_id(claim, requirement);
         }
         if self.claim_declares_requirement_role(claim, requirement) {
             return true;
@@ -1034,6 +1090,16 @@ impl PacketFlowContext {
         normalized == normalize_identifier(requirement.role_id())
             || normalized == normalize_identifier(requirement.role.label())
     }
+
+    fn claim_declares_exact_requirement_id(
+        &self,
+        claim: &PacketClaimDto,
+        requirement: &FlowRequirement,
+    ) -> bool {
+        claim.coverage_role.as_deref().is_some_and(|role_label| {
+            normalize_identifier(role_label) == normalize_identifier(requirement.id)
+        })
+    }
 }
 
 struct StructuralLanguagePolicy;
@@ -1047,6 +1113,19 @@ impl StructuralLanguagePolicy {
                 | "form_native_constraints"
                 | "form_custom_validation"
                 | "form_submit_guard"
+                | "client_public_facade"
+                | "client_interface_helpers"
+                | "client_request_finalization"
+                | "client_transport_send"
+                | "client_response_materialization"
+                | "hook_public_export"
+                | "hook_key_serialization"
+                | "hook_cache_helper"
+                | "hook_mutation_flow"
+                | "command_server_bootstrap"
+                | "command_event_loop"
+                | "command_network_input"
+                | "command_dispatch"
                 | "logger_event"
                 | "handler_processing"
                 | "css_animation_entrypoint"
@@ -1065,6 +1144,47 @@ impl StructuralLanguagePolicy {
             "form_native_constraints" => Self::claim_text_names_native_constraints(&normalized),
             "form_custom_validation" => Self::claim_text_names_custom_validation(&normalized),
             "form_submit_guard" => Self::claim_text_names_submit_guard(&normalized),
+            "client_public_facade" => Self::claim_text_names_client_public_facade(&normalized),
+            "client_interface_helpers" => {
+                Self::claim_text_names_client_interface_helpers(&normalized)
+            }
+            "client_request_finalization" => {
+                Self::claim_text_names_client_request_finalization(&normalized)
+            }
+            "client_transport_send" => Self::claim_text_names_client_transport_send(&normalized),
+            "client_response_materialization" => {
+                Self::claim_text_names_client_response_materialization(&normalized)
+            }
+            "hook_public_export" => Self::claim_text_names_hook_public_export(&normalized),
+            "hook_key_serialization" => Self::claim_text_names_hook_key_serialization(&normalized),
+            "hook_cache_helper" => Self::claim_text_names_hook_cache_helper(&normalized),
+            "hook_mutation_flow" => Self::claim_text_names_hook_mutation_flow(&normalized),
+            "command_server_bootstrap" => {
+                Self::claim_text_names_command_server_bootstrap(&normalized)
+                    || claim.citations.iter().any(|citation| {
+                        packet_evidence_role(citation)
+                            == Some(PacketEvidenceRole::CommandEntrypoint)
+                    })
+            }
+            "command_event_loop" => {
+                Self::claim_text_names_command_event_loop(&normalized)
+                    || claim.citations.iter().any(|citation| {
+                        packet_evidence_role(citation) == Some(PacketEvidenceRole::EventLoop)
+                    })
+            }
+            "command_network_input" => {
+                Self::claim_text_names_command_network_input(&normalized)
+                    || claim.citations.iter().any(|citation| {
+                        packet_evidence_role(citation)
+                            == Some(PacketEvidenceRole::NetworkCommandInput)
+                    })
+            }
+            "command_dispatch" => {
+                Self::claim_text_names_command_dispatch(&normalized)
+                    || claim.citations.iter().any(|citation| {
+                        packet_evidence_role(citation) == Some(PacketEvidenceRole::CommandDispatch)
+                    })
+            }
             "logger_event" => Self::claim_text_names_log_record_creation(&normalized),
             "handler_processing" => Self::claim_text_names_log_handler_processing(&normalized),
             "css_animation_entrypoint" => {
@@ -1143,6 +1263,94 @@ impl StructuralLanguagePolicy {
                 normalized,
                 &["prevent", "prevents", "submission", "invalid"],
             )
+    }
+
+    fn claim_text_names_client_public_facade(normalized: &str) -> bool {
+        (normalized.contains("toplevelhttphelper")
+            || normalized.contains("toplevelhttphelpers")
+            || normalized.contains("publicfacade"))
+            && normalized.contains("client")
+    }
+
+    fn claim_text_names_client_interface_helpers(normalized: &str) -> bool {
+        normalized.contains("conveniencemethod")
+            || normalized.contains("conveniencemethods")
+            || normalized.contains("clientinterfacehelper")
+    }
+
+    fn claim_text_names_client_request_finalization(normalized: &str) -> bool {
+        normalized.contains("finalize")
+            && normalized.contains("request")
+            && contains_any(
+                normalized,
+                &["body", "sending", "transportready", "prepare"],
+            )
+    }
+
+    fn claim_text_names_client_transport_send(normalized: &str) -> bool {
+        normalized.contains("send")
+            && contains_any(
+                normalized,
+                &["transport", "httpclient", "adapter", "dartio"],
+            )
+    }
+
+    fn claim_text_names_client_response_materialization(normalized: &str) -> bool {
+        normalized.contains("responsefromstream")
+            || normalized.contains("responsematerialization")
+            || normalized.contains("responsestream")
+            || (normalized.contains("response") && normalized.contains("streamboundary"))
+    }
+
+    fn claim_text_names_hook_public_export(normalized: &str) -> bool {
+        normalized.contains("public")
+            && normalized.contains("export")
+            && normalized.contains("wraps")
+            && contains_any(normalized, &["hook", "argumentnormalization", "handler"])
+    }
+
+    fn claim_text_names_hook_key_serialization(normalized: &str) -> bool {
+        normalized.contains("serialize")
+            && contains_any(normalized, &["key", "keys", "cachekey", "cachekeys"])
+    }
+
+    fn claim_text_names_hook_cache_helper(normalized: &str) -> bool {
+        normalized.contains("cache")
+            && normalized.contains("helper")
+            && contains_any(
+                normalized,
+                &["get", "set", "subscribe", "snapshot", "state"],
+            )
+    }
+
+    fn claim_text_names_hook_mutation_flow(normalized: &str) -> bool {
+        contains_any(normalized, &["mutate", "mutation", "internalmutate"])
+            && contains_any(normalized, &["helper", "routes", "flows", "dispatch"])
+    }
+
+    fn claim_text_names_command_server_bootstrap(normalized: &str) -> bool {
+        normalized.contains("server")
+            && contains_any(normalized, &["bootstrap", "initializes", "main"])
+    }
+
+    fn claim_text_names_command_event_loop(normalized: &str) -> bool {
+        normalized.contains("eventloop")
+            || (normalized.contains("event") && normalized.contains("loop"))
+    }
+
+    fn claim_text_names_command_network_input(normalized: &str) -> bool {
+        normalized.contains("socketinput")
+            || normalized.contains("networkcommandinput")
+            || (normalized.contains("network")
+                && normalized.contains("input")
+                && normalized.contains("command"))
+    }
+
+    fn claim_text_names_command_dispatch(normalized: &str) -> bool {
+        normalized.contains("commandtable")
+            || normalized.contains("commanddispatch")
+            || (normalized.contains("command")
+                && contains_any(normalized, &["dispatch", "proc", "slowlog"]))
     }
 
     fn claim_text_names_log_record_creation(normalized: &str) -> bool {
@@ -2919,6 +3127,224 @@ mod tests {
         let report = sufficiency.coverage_report.as_ref().unwrap();
         assert!(report.missing.is_empty());
         assert!(report.budget_omitted.is_empty());
+    }
+
+    #[test]
+    fn client_send_split_requirements_remain_distinct() {
+        let question = "Explain how an HTTP client exposes top-level helpers, provides client convenience methods, finalizes requests before transport send, and materializes responses.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("Top-level HTTP helpers delegate to a Client."),
+            claim("Client convenience methods live on the client interface helper."),
+            claim("Base request finalize prepares request bodies for sending."),
+            claim("The transport send implementation sends through an HTTP client adapter."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/http-client"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert_eq!(
+            report.missing,
+            vec!["client_response_materialization".to_string()],
+            "client-send coverage must preserve the missing response boundary slot: {report:?}"
+        );
+    }
+
+    #[test]
+    fn client_send_complete_split_requirements_are_sufficient() {
+        let question = "Explain how an HTTP client exposes top-level helpers, provides client convenience methods, finalizes requests before transport send, and materializes responses.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("Top-level HTTP helpers delegate to a Client."),
+            claim("Client convenience methods live on the client interface helper."),
+            claim("Base request finalize prepares request bodies for sending."),
+            claim("The transport send implementation sends through an HTTP client adapter."),
+            claim("Response.fromStream materializes the response stream boundary."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/http-client"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "complete client-send split roles should leave no flow gaps: {report:?}"
+        );
+    }
+
+    #[test]
+    fn hook_cache_requirements_remain_distinct() {
+        let question = "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior through a mutation helper.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("The public useData export wraps useDataHandler with argument normalization."),
+            claim("useDataHandler serializes hook keys into cache keys."),
+            claim("applyMutation routes mutate behavior through the mutation helper."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/hook-cache"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert_eq!(
+            report.missing,
+            vec!["hook_cache_helper".to_string()],
+            "hook/cache coverage must preserve the missing cache-helper slot: {report:?}"
+        );
+    }
+
+    #[test]
+    fn hook_cache_complete_requirements_are_sufficient() {
+        let question = "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior through a mutation helper.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("The public useData export wraps useDataHandler with argument normalization."),
+            claim("useDataHandler serializes hook keys into cache keys."),
+            claim("makeCacheHelper provides cache get, set, subscribe, and snapshot helpers."),
+            claim("applyMutation routes mutate behavior through the mutation helper."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/hook-cache"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "complete hook/cache roles should leave no flow gaps: {report:?}"
+        );
+    }
+
+    #[test]
+    fn command_loop_split_requirements_remain_distinct() {
+        let question = "Trace how a command server bootstrap enters an event loop, reads network command input, and dispatches commands through a command table.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("Server bootstrap initializes the command server main loop."),
+            claim("The event loop source polls file events."),
+            claim("Command table dispatch routes commands to handlers."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/command-server"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert_eq!(
+            report.missing,
+            vec!["command_network_input".to_string()],
+            "command-loop coverage must not let generic dispatch close network input: {report:?}"
+        );
+    }
+
+    #[test]
+    fn command_dispatch_prompt_does_not_require_bootstrap_or_event_loop() {
+        let question =
+            "Trace how network command input reaches command table dispatch and command handlers.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("Network command input reads commands from socket input."),
+            claim("Command table dispatch routes commands to handlers."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/command-server"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "dispatch/input prompt should not inherit bootstrap or event-loop gaps: {report:?}"
+        );
+    }
+
+    #[test]
+    fn command_loop_complete_split_requirements_are_sufficient() {
+        let question = "Trace how a command server bootstrap enters an event loop, reads network command input, and dispatches commands through a command table.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let claims = vec![
+            claim("Server bootstrap initializes the command server main loop."),
+            claim("The event loop source polls file events."),
+            claim("Network command input reads commands from socket input."),
+            claim("Command table dispatch routes commands to handlers."),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/command-server"),
+            question,
+            task_class: PacketTaskClassDto::DataFlow,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "complete command-loop split roles should leave no flow gaps: {report:?}"
+        );
     }
 
     #[test]

@@ -835,7 +835,9 @@ fn search_execution_method_claim(ctx: &SourceClaimContext<'_>) -> Option<String>
 
 fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let source_lower = source.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
+    let cache_helper_call = source_shape_has_cache_helper_call(&normalized_source);
 
     if source_lower.contains("withargs")
         && source_lower.contains("export default")
@@ -844,6 +846,10 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
         claims.push(format!(
             "The public {public_hook} export wraps {handler} with argument normalization."
         ));
+    }
+
+    if normalized_source.contains("stablehash") && normalized_source.contains("returnkeyargs") {
+        claims.push(format!("{symbol} serializes hook keys into cache keys."));
     }
 
     if source_lower.contains("serialize(_key)")
@@ -855,6 +861,26 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
     {
         claims.push(format!(
             "{symbol} serializes the key before reading cache state."
+        ));
+    }
+
+    if normalized_source.contains("exportasyncfunction")
+        && normalized_source.contains("serialize")
+        && cache_helper_call
+        && normalized_source.contains("mutatebykey")
+    {
+        claims.push(format!(
+            "{symbol} routes mutate behavior through the mutation helper."
+        ));
+    }
+
+    if normalized_source.contains("middleware")
+        && normalized_source.contains("hook")
+        && normalized_source.contains("configuse")
+        && source_shape_has_hook_return_call(&normalized_source)
+    {
+        claims.push(format!(
+            "{symbol} composes middleware around a public hook."
         ));
     }
 
@@ -878,8 +904,17 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
     claims
 }
 
+fn source_shape_has_cache_helper_call(normalized_source: &str) -> bool {
+    normalized_source.contains("cachehelper") && normalized_source.contains("create")
+}
+
+fn source_shape_has_hook_return_call(normalized_source: &str) -> bool {
+    normalized_source.contains("returnuse") && normalized_source.contains("hook")
+}
+
 fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<String> {
     let source_lower = source.to_ascii_lowercase();
+    let normalized_source = normalize_identifier(source);
     let mut claims = Vec::new();
     let owner = packet_display_owner(symbol).unwrap_or_else(|| symbol.to_string());
 
@@ -890,6 +925,17 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
         && source_lower.contains("future<response>")
     {
         claims.push("Top-level HTTP helpers delegate to a Client.".to_string());
+    }
+
+    if normalized_source.contains("interfaceclassclient")
+        && normalized_source.contains("futureresponse")
+        && normalized_source.contains("futurestreamedresponsesend")
+        && normalized_source.contains("request")
+    {
+        claims.push(
+            "Client interface helper methods declare convenience request helpers and send(request)."
+                .to_string(),
+        );
     }
 
     if source_lower.contains("_sendunstreamed")
@@ -903,6 +949,23 @@ fn packet_generic_client_send_flow_claims(symbol: &str, source: &str) -> Vec<Str
         claims.push(format!(
             "{owner} implements convenience methods in terms of send."
         ));
+        claims.push("Response.fromStream materializes the response stream boundary.".to_string());
+    }
+
+    if normalized_source.contains("classrequestextends")
+        && normalized_source.contains("bytestreamfinalize")
+        && normalized_source.contains("frombytesbodybytes")
+    {
+        claims.push(format!(
+            "{owner}.finalize prepares the request body for sending."
+        ));
+    }
+
+    if normalized_source.contains("classresponseextendsbaseresponse")
+        && normalized_source.contains("fromstreamstreamedresponseresponse")
+        && normalized_source.contains("responsestreamtobytes")
+    {
+        claims.push("Response.fromStream materializes the response stream boundary.".to_string());
     }
 
     if source_lower.contains("dart:io")
@@ -2011,9 +2074,9 @@ fn packet_generic_mapper_configuration_plan_claims(
             || normalized_source.contains("createmapper")
             || normalized_source.contains("compilemappings"))
     {
-        claims.push(format!(
-            "{owner} builds and owns the mapping configuration used at runtime."
-        ));
+        claims.push(
+            "Mapping configuration source builds and owns runtime mapping plans.".to_string(),
+        );
     }
 
     if packet_mapper_public_api_symbol(symbol, kind)
@@ -2030,16 +2093,14 @@ fn packet_generic_mapper_configuration_plan_claims(
     if packet_mapper_plan_symbol(symbol, &file_name)
         && normalized_source.contains("lambda")
         && normalized_source.contains("map")
-        && (normalized_source.contains("sourcetype") || normalized_source.contains("source"))
-        && (normalized_source.contains("destinationtype")
-            || normalized_source.contains("destination"))
         && (normalized_source.contains("planbuilder")
             || normalized_source.contains("mapexpression")
             || normalized_source.contains("expression"))
     {
-        claims.push(format!(
-            "{owner} contributes mapper lambda plans used by the mapping execution pipeline."
-        ));
+        claims.push(
+            "Type-map source contributes lambda plans used by the mapping execution pipeline."
+                .to_string(),
+        );
     }
 
     if file_name.ends_with("planbuilder.cs")
@@ -2062,7 +2123,7 @@ fn packet_mapper_public_api_symbol(symbol: &str, kind: NodeKind) -> bool {
     let normalized = normalize_identifier(symbol);
     matches!(
         kind,
-        NodeKind::INTERFACE | NodeKind::CLASS | NodeKind::METHOD
+        NodeKind::INTERFACE | NodeKind::CLASS | NodeKind::METHOD | NodeKind::FUNCTION
     ) && normalized.contains("mapper")
         && ![
             "action",
@@ -2522,7 +2583,7 @@ mod tests {
                         _resolvedMaps[new(sourceType, destinationType)].MapExpression;
                 }
                 "#,
-                "MappingConfiguration builds and owns the mapping configuration used at runtime.",
+                "Mapping configuration source builds and owns runtime mapping plans.",
             ),
             (
                 "MappingPlan.BuildMapperLambda",
@@ -2538,7 +2599,7 @@ mod tests {
                         Types.ContainsGenericParameters ? null : new MappingPlanBuilder(configuration, this).BuildMapperLambda();
                 }
                 "#,
-                "MappingPlan contributes mapper lambda plans used by the mapping execution pipeline.",
+                "Type-map source contributes lambda plans used by the mapping execution pipeline.",
             ),
         ];
 
@@ -2790,6 +2851,90 @@ mod tests {
                 "SWR-specific prompts without the word hook should still activate `{expected}`; got {claims:?}"
             );
         }
+
+        let helper_claims = packet_source_derived_claims_for_citation(
+            swr_prompt,
+            &test_packet_citation("makeCacheHelper", "src/runtime/cache-helper.ts"),
+            r#"
+            export const makeCacheHelper = (cache, key) => {
+              const state = runtimeState.get(cache)
+              return [
+                () => cache.get(key) || EMPTY_CACHE,
+                info => {
+                  const prev = cache.get(key)
+                  cache.set(key, info)
+                  state[5](key, info, prev)
+                },
+                state[6],
+                () => snapshot[key] || cache.get(key)
+              ] as const
+            }
+            "#,
+        );
+        assert!(
+            helper_claims.iter().any(|claim| {
+                claim == "makeCacheHelper provides cache get, set, subscribe, and snapshot helpers."
+            }),
+            "expected generic cache helper claim; got {helper_claims:?}"
+        );
+
+        let serialize_claims = packet_source_derived_claims_for_citation(
+            swr_prompt,
+            &test_packet_citation("normalizeKey", "src/runtime/serialize.ts"),
+            r#"
+            export const normalizeKey = key => {
+              const args = key
+              key = typeof key == 'string' ? key : stableHash(key)
+              return [key, args]
+            }
+            "#,
+        );
+        assert!(
+            serialize_claims
+                .iter()
+                .any(|claim| claim == "normalizeKey serializes hook keys into cache keys."),
+            "expected generic key serialization claim; got {serialize_claims:?}"
+        );
+
+        let mutation_claims = packet_source_derived_claims_for_citation(
+            "Explain how a public hook serializes keys, connects cache helpers, and routes mutate behavior.",
+            &test_packet_citation("applyMutation", "src/runtime/mutate.ts"),
+            r#"
+            export async function applyMutation(cache, _key, data) {
+              return mutateByKey(_key)
+              async function mutateByKey(_k) {
+                const [key] = serialize(_k)
+                const [get, set] = createCacheHelper(cache, key)
+                set({ data })
+              }
+            }
+            "#,
+        );
+        assert!(
+            mutation_claims.iter().any(|claim| claim
+                == "applyMutation routes mutate behavior through the mutation helper."),
+            "expected generic mutation helper claim; got {mutation_claims:?}"
+        );
+
+        let middleware_claims = packet_source_derived_claims_for_citation(
+            "Explain how a public hook composes middleware around cache behavior.",
+            &test_packet_citation("withMiddleware", "src/runtime/middleware.ts"),
+            r#"
+            export const withMiddleware = (useHook: SWRHook, middleware) => {
+              return (...args) => {
+                const config = { use: [] }
+                const uses = (config.use || []).concat(middleware)
+                return useHook(args[0], args[1], { ...config, use: uses })
+              }
+            }
+            "#,
+        );
+        assert!(
+            middleware_claims
+                .iter()
+                .any(|claim| claim == "withMiddleware composes middleware around a public hook."),
+            "expected generic middleware composition claim; got {middleware_claims:?}"
+        );
     }
 
     #[test]
@@ -2816,6 +2961,7 @@ mod tests {
         );
         for expected in [
             "BaseTransportClient implements convenience methods in terms of send.",
+            "Response.fromStream materializes the response stream boundary.",
             "BaseTransportClient.send is the dart:io transport implementation that forwards finalized requests through an HTTP client.",
         ] {
             assert!(
@@ -2832,6 +2978,7 @@ mod tests {
         );
         for expected in [
             "BaseTransportClient implements convenience methods in terms of send.",
+            "Response.fromStream materializes the response stream boundary.",
             "BaseTransportClient.send is the dart:io transport implementation that forwards finalized requests through an HTTP client.",
         ] {
             assert!(
@@ -2859,6 +3006,25 @@ mod tests {
             "expected top-level helper claim; got {top_level_claims:?}"
         );
 
+        let client_interface_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("Client.get", "src/client.dart"),
+            r#"
+            abstract interface class Client {
+              Future<Response> get(Uri url);
+              Future<Response> post(Uri url);
+              Future<StreamedResponse> send(BaseRequest request);
+            }
+            "#,
+        );
+        assert!(
+            client_interface_claims.iter().any(|claim| {
+                claim
+                    == "Client interface helper methods declare convenience request helpers and send(request)."
+            }),
+            "expected client interface helper claim; got {client_interface_claims:?}"
+        );
+
         let finalize_claims = packet_source_derived_claims_for_citation(
             client_prompt,
             &test_packet_citation("BaseRequest", "src/base_request.dart"),
@@ -2879,6 +3045,44 @@ mod tests {
                 .iter()
                 .any(|claim| claim == "BaseRequest.finalize prepares the request body for sending."),
             "expected request finalization claim; got {finalize_claims:?}"
+        );
+
+        let request_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("Request.finalize", "src/request.dart"),
+            r#"
+            class Request extends BaseRequest {
+              ByteStream finalize() {
+                return ByteStream.fromBytes(bodyBytes);
+              }
+            }
+            "#,
+        );
+        assert!(
+            request_claims
+                .iter()
+                .any(|claim| claim == "Request.finalize prepares the request body for sending."),
+            "expected concrete request finalization claim; got {request_claims:?}"
+        );
+
+        let response_claims = packet_source_derived_claims_for_citation(
+            client_prompt,
+            &test_packet_citation("Response.fromStream", "src/response.dart"),
+            r#"
+            class Response extends BaseResponse {
+              static Future<Response> fromStream(StreamedResponse response) async {
+                final body = await response.stream.toBytes();
+                return Response.bytes(body, response.statusCode);
+              }
+            }
+            "#,
+        );
+        assert!(
+            response_claims
+                .iter()
+                .any(|claim| claim
+                    == "Response.fromStream materializes the response stream boundary."),
+            "expected response materialization claim; got {response_claims:?}"
         );
     }
 

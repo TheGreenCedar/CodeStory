@@ -1,13 +1,16 @@
 //! Generic packet flow requirements shared by planning, probes, and sufficiency.
 
 use crate::agent::packet_terms::{
-    packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_form_validation_flow,
-    packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
-    packet_terms_indicate_log_record_handler_flow,
+    packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
+    packet_terms_indicate_client_send_flow, packet_terms_indicate_command_dispatch_flow,
+    packet_terms_indicate_command_event_loop_flow,
+    packet_terms_indicate_command_server_bootstrap_flow,
+    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
+    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_html_css_template_structure_flow,
+    packet_terms_indicate_indexing_flow, packet_terms_indicate_log_record_handler_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_runtime_formatting_flow,
-    packet_terms_indicate_search_execution_flow,
+    packet_terms_indicate_network_command_input_flow, packet_terms_indicate_request_dispatch_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
     packet_terms_indicate_server_request_dispatch_flow,
     packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
     packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
@@ -102,7 +105,13 @@ pub(crate) fn packet_flow_requirements_for_terms(
         requirements.extend_from_slice(REQUEST_DISPATCH_FLOW);
     }
     if packet_terms_indicate_client_send_flow(terms) {
-        requirements.extend_from_slice(CLIENT_SEND_FLOW);
+        push_client_send_requirements_for_terms(terms, &mut requirements);
+    }
+    if packet_terms_indicate_hook_cache_flow(terms) {
+        push_hook_cache_requirements_for_terms(terms, &mut requirements);
+    }
+    if packet_terms_indicate_event_loop_command_flow(terms) {
+        push_command_loop_requirements_for_terms(terms, &mut requirements);
     }
     if packet_terms_indicate_url_session_request_flow(terms) {
         requirements.extend_from_slice(URL_SESSION_FLOW);
@@ -178,6 +187,101 @@ fn dedupe_requirements(requirements: Vec<FlowRequirement>) -> Vec<FlowRequiremen
     deduped
 }
 
+fn push_command_loop_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    if packet_terms_indicate_command_server_bootstrap_flow(terms) {
+        requirements.push(COMMAND_SERVER_BOOTSTRAP_REQUIREMENT);
+    }
+    if packet_terms_indicate_command_event_loop_flow(terms) {
+        requirements.push(COMMAND_EVENT_LOOP_REQUIREMENT);
+    }
+    if packet_terms_indicate_network_command_input_flow(terms) {
+        requirements.push(COMMAND_NETWORK_INPUT_REQUIREMENT);
+    }
+    if packet_terms_indicate_command_dispatch_flow(terms) {
+        requirements.push(COMMAND_DISPATCH_REQUIREMENT);
+    }
+}
+
+fn push_client_send_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    if has_any(&[
+        "top", "level", "public", "facade", "expose", "exposes", "api", "package",
+    ]) {
+        requirements.push(CLIENT_PUBLIC_FACADE_REQUIREMENT);
+    }
+    if has_any(&[
+        "convenience",
+        "conveniences",
+        "method",
+        "methods",
+        "interface",
+        "interfaces",
+        "helper",
+        "helpers",
+    ]) && has_any(&["client", "clients", "http", "httpclient"])
+    {
+        requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
+    }
+    if has_any(&[
+        "finalize",
+        "finalizes",
+        "finalized",
+        "finalization",
+        "body",
+        "bodies",
+        "prepare",
+        "prepares",
+        "prepared",
+    ]) {
+        requirements.push(CLIENT_REQUEST_FINALIZATION_REQUIREMENT);
+    }
+    if has_any(&["send", "sending", "sent"])
+        || (has_any(&["transport", "transports"]) && has_any(&["implementation", "implements"]))
+    {
+        requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
+    }
+    if has_any(&[
+        "response",
+        "responses",
+        "materialize",
+        "materializes",
+        "materialization",
+        "stream",
+        "boundary",
+    ]) {
+        requirements.push(CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT);
+    }
+    if requirements
+        .iter()
+        .all(|requirement| !requirement.id.starts_with("client_"))
+    {
+        requirements.push(CLIENT_TRANSPORT_SEND_REQUIREMENT);
+    }
+}
+
+fn push_hook_cache_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
+    requirements.push(HOOK_PUBLIC_EXPORT_REQUIREMENT);
+    if has_any(&["serialize", "serializes", "serialized", "key", "keys"]) {
+        requirements.push(HOOK_KEY_SERIALIZATION_REQUIREMENT);
+    }
+    if has_any(&["cache", "caches", "caching", "helper", "helpers"]) {
+        requirements.push(HOOK_CACHE_HELPER_REQUIREMENT);
+    }
+    if has_any(&["mutate", "mutates", "mutation", "mutations"]) {
+        requirements.push(HOOK_MUTATION_FLOW_REQUIREMENT);
+    }
+}
+
 const INDEXING_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "indexing_entrypoint",
@@ -229,20 +333,96 @@ const URL_SESSION_FLOW: &[FlowRequirement] = &[
     },
 ];
 
-const CLIENT_SEND_FLOW: &[FlowRequirement] = &[
-    FlowRequirement {
-        id: "client_helpers",
-        role: FlowRole::Entrypoint,
-        query_seeds: &["top level helpers", "client convenience methods"],
-        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    },
-    FlowRequirement {
-        id: "client_send",
-        role: FlowRole::Dispatch,
-        query_seeds: &["request finalization", "transport send", "request response"],
-        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
-    },
-];
+const CLIENT_PUBLIC_FACADE_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_public_facade",
+    role: FlowRole::Entrypoint,
+    query_seeds: &["http top level helper", "public client facade"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_interface_helpers",
+    role: FlowRole::Entrypoint,
+    query_seeds: &["client convenience method", "client interface helper"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_request_finalization",
+    role: FlowRole::TransformOrValidate,
+    query_seeds: &["request finalization", "transport-ready request object"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const CLIENT_TRANSPORT_SEND_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_transport_send",
+    role: FlowRole::Dispatch,
+    query_seeds: &["transport send", "client send implementation"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_response_materialization",
+    role: FlowRole::TerminalBoundary,
+    query_seeds: &["request response", "response stream boundary"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const HOOK_PUBLIC_EXPORT_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "hook_public_export",
+    role: FlowRole::Entrypoint,
+    query_seeds: &["public hook export", "hook argument wrapper"],
+    coverage_mode: CoverageMode::AllowsSourceRange,
+};
+
+const HOOK_KEY_SERIALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "hook_key_serialization",
+    role: FlowRole::TransformOrValidate,
+    query_seeds: &["key serialization", "serialize hook key"],
+    coverage_mode: CoverageMode::AllowsSourceRange,
+};
+
+const HOOK_CACHE_HELPER_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "hook_cache_helper",
+    role: FlowRole::StateOrStorage,
+    query_seeds: &["cache helper", "cache state helper"],
+    coverage_mode: CoverageMode::AllowsSourceRange,
+};
+
+const HOOK_MUTATION_FLOW_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "hook_mutation_flow",
+    role: FlowRole::Dispatch,
+    query_seeds: &["mutation helper", "mutate dispatch"],
+    coverage_mode: CoverageMode::AllowsSourceRange,
+};
+
+const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "command_server_bootstrap",
+    role: FlowRole::Entrypoint,
+    query_seeds: &["server bootstrap", "command server entrypoint"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "command_event_loop",
+    role: FlowRole::Dispatch,
+    query_seeds: &["event loop", "event loop source"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "command_network_input",
+    role: FlowRole::Dispatch,
+    query_seeds: &["network input", "network command input"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
+
+const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "command_dispatch",
+    role: FlowRole::Dispatch,
+    query_seeds: &["command dispatch", "command table dispatch"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
 
 const SQL_SCHEMA_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
@@ -444,3 +624,58 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::packet_terms::packet_probe_terms;
+
+    fn client_requirement_ids(prompt: &str) -> Vec<&'static str> {
+        packet_flow_requirements_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::DataFlow,
+        )
+        .into_iter()
+        .filter_map(|requirement| {
+            requirement
+                .id
+                .starts_with("client_")
+                .then_some(requirement.id)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn broad_client_send_prompt_requires_full_lifecycle() {
+        assert_eq!(
+            client_requirement_ids(
+                "Explain how an HTTP client exposes top-level helpers, provides client convenience methods, finalizes requests before transport send, and materializes responses."
+            ),
+            vec![
+                "client_public_facade",
+                "client_interface_helpers",
+                "client_request_finalization",
+                "client_transport_send",
+                "client_response_materialization",
+            ]
+        );
+    }
+
+    #[test]
+    fn focused_client_finalization_prompt_does_not_require_full_lifecycle() {
+        assert_eq!(
+            client_requirement_ids(
+                "Explain how an HTTP client finalizes requests before transport."
+            ),
+            vec!["client_request_finalization"]
+        );
+    }
+
+    #[test]
+    fn focused_client_transport_prompt_does_not_require_full_lifecycle() {
+        assert_eq!(
+            client_requirement_ids("Explain how an HTTP client performs transport send."),
+            vec!["client_transport_send"]
+        );
+    }
+}
