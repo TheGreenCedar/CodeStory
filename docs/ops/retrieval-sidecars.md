@@ -346,11 +346,14 @@ count is zero, Qdrant reuse is skipped explicitly and cannot mask stale graph/le
 ## Preflight smoke contract
 
 Use the full sequence locally before index/query changes. The CI job
-`retrieval-sidecar-smoke` splits reduced checks across Linux and Windows because
-full index/query on the monorepo can exceed runner budgets and CI does not fetch
-the GGUF embedding model. Linux carries the generic lint/runtime/search/retrieval
-contracts. Windows keeps the path-sensitive manifest-missing bootstrap/status
-shape.
+`retrieval-sidecar-smoke` keeps default PR feedback on the fast Linux contract
+lane because full index/query on the monorepo can exceed runner budgets and CI
+does not fetch the GGUF embedding model. Linux carries the generic
+lint/runtime/search/retrieval contract slices. Windows keeps the path-sensitive
+manifest-missing bootstrap/status shape, but it runs only on `workflow_dispatch`
+or when a PR has the `ci:windows-smoke` label. Superseded PR runs are canceled
+automatically so a new push does not leave an older smoke run burning runner
+time.
 
 **Local full sequence:**
 
@@ -365,30 +368,52 @@ shape.
 Linux `linux-contracts`:
 
 1. generalization lint - exit 0
-2. `cargo test -p codestory-runtime --lib` - exit 0
-3. `cargo test -p codestory-runtime --test retrieval_generalization_guard` - exit 0
-4. `cargo test -p codestory-cli --test stdio_protocol_contracts` - exit 0
-5. `cargo test -p codestory-cli --test search_json_output` - exit 0 for non-live fail-closed search contracts
-6. `cargo test -p codestory-retrieval` - exit 0
+2. Targeted runtime sidecar and packet contract filters - exit 0:
+   - `cargo test -p codestory-runtime --lib agent::retrieval_primary::tests`
+   - `cargo test -p codestory-runtime --lib agent::packet_search::tests`
+   - `cargo test -p codestory-runtime --lib agent::packet_claim_profiles::tests`
+   - `cargo test -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars`
+   - `cargo test -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars`
+   - `cargo test -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars`
+3. `cargo test -p codestory-cli --test stdio_protocol_contracts` - exit 0
+4. `cargo test -p codestory-cli --test search_json_output` - exit 0 for non-live fail-closed search contracts
+5. `cargo test -p codestory-retrieval` - exit 0
 
-Windows `windows-manifest-missing`:
+Windows `windows-manifest-missing` (manual or `ci:windows-smoke` label):
 
 1. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` - exit 0;
    this integration suite runs the clean pre-index bootstrap/status shape and
    asserts `degraded_reason == "retrieval_manifest_missing"` without reporting
    `retrieval_mode=full`
 
-The reduced CI sequence is not a full sidecar smoke. It verifies generic
-runtime/stdio/search/retrieval contracts on Linux, and it creates local
-cache/state directories plus verifies manifest-missing status JSON on Windows. It does
-not start sidecars, fetch `bge-base-en-v1.5.Q8_0.gguf`, or build the project manifest required for
-`retrieval_mode=full`. The included `retrieval_bootstrap_contracts` suite builds the CLI through
-Cargo's integration-test path instead of a standalone release build step. The included
-`search_json_output` suite covers non-live fail-closed search behavior; it does not claim stdio,
-CLI, or runtime full-mode success. Full-mode gates must start real sidecars, provision the GGUF
-model, index a fixture or target workspace, and verify `retrieval_mode == "full"`. The live
-full-mode contracts are ignored or env-gated by default and should be run explicitly only after
-those dependencies are prepared: set
+The reduced CI sequence is not a full sidecar smoke and it is not a full runtime
+library sweep. It verifies generic runtime/stdio/search/retrieval contract slices
+on Linux. When the optional Windows lane runs, it creates local cache/state
+directories plus verifies manifest-missing status JSON on Windows. It does not start sidecars, fetch
+`bge-base-en-v1.5.Q8_0.gguf`, build the project manifest required for
+`retrieval_mode=full`, or run every `codestory-runtime --lib` test. The included
+`retrieval_bootstrap_contracts` suite builds the CLI through Cargo's
+integration-test path instead of a standalone release build step. The included
+`search_json_output` suite covers non-live fail-closed search behavior; it does
+not claim stdio, CLI, or runtime full-mode success. Full-mode gates must start
+real sidecars, provision the GGUF model, index a fixture or target workspace, and
+verify `retrieval_mode == "full"`. A full runtime library sweep remains a
+promotion/pre-merge lane for broad runtime work:
+
+```sh
+cargo test -p codestory-runtime --lib
+```
+
+The Rust fixture guard for the generalization lint is also a deep/manual lane,
+not a default PR smoke step. Run it when changing the lint itself or its fixture
+coverage:
+
+```sh
+cargo test -p codestory-runtime --test retrieval_generalization_guard
+```
+
+The live full-mode contracts are ignored or env-gated by default and should be
+run explicitly only after those dependencies are prepared: set
 `CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1` before running stdio full-mode contracts
 with `-- --ignored --nocapture`,
 `cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_json_emits_sidecar_primary_results_without_repo_text_fallback`
@@ -403,7 +428,6 @@ and the ignored `retrieval_eval_*` tests with `CODESTORY_RETRIEVAL_EVAL_FULL_TES
 retrieval/stdio sources (`retrieval.rs`, `main.rs`, `args.rs`, `runtime.rs`, `stdio_*.rs`),
 `crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs`,
 `search_json_output.rs`, `stdio_protocol_contracts.rs`, `crates/codestory-runtime/src/**`,
-`crates/codestory-runtime/tests/retrieval_generalization_guard.rs`,
 `crates/codestory-indexer/Cargo.toml`, `crates/codestory-indexer/src/lib.rs`,
 `scripts/lint-retrieval-generalization.mjs`, `scripts/**retrieval**`,
 `docs/ops/retrieval-sidecars.md`, `docs/architecture/retrieval-*.md`,
@@ -413,13 +437,12 @@ retrieval/stdio sources (`retrieval.rs`, `main.rs`, `args.rs`, `runtime.rs`, `st
 
 1. Linux generalization lint exits 0.
 2. Linux Rust cache restore/save completes or gracefully misses without masking later failures.
-3. `cargo test -p codestory-runtime --lib` exits 0.
-4. `cargo test -p codestory-runtime --test retrieval_generalization_guard` exits 0.
-5. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
-6. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
-7. `cargo test -p codestory-retrieval` exits 0.
-8. Windows Rust cache restore/save completes or gracefully misses without masking later failures.
-9. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and non-`full` mode on a clean temp project before indexing.
+3. Linux targeted runtime sidecar and packet contract filters exit 0.
+4. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
+5. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
+6. `cargo test -p codestory-retrieval` exits 0.
+7. If the Windows lane is requested, Windows Rust cache restore/save completes or gracefully misses without masking later failures.
+8. If the Windows lane is requested, `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and non-`full` mode on a clean temp project before indexing.
 
 Both jobs restore a Rust build cache before Cargo steps; a new cache key may
 still pay one cold compile, but later pushes should reuse warmed target and Cargo
@@ -427,8 +450,9 @@ dependency state. Cache restore/save steps are non-blocking, and save runs after
 failed Cargo steps so follow-up pushes do not repeatedly pay the full cold-compile
 cost. The manifest-missing smoke lives in `retrieval_bootstrap_contracts`
 so Cargo builds the CLI through the integration-test path instead of paying for a
-standalone build step before the tests. `retrieval_generalization_guard` invokes
-the same lint from Rust in the generic Linux job.
+standalone build step before the tests. The production generalization lint stays
+in the generic Linux job; the Rust fixture guard is reserved for lint-rule
+changes or promotion review.
 
 **Holdout prefetch (benchmark harness, not sidecar CLI):**
 
