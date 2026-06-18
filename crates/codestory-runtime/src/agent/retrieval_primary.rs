@@ -1005,9 +1005,16 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
         .map(|hit| hit.file_path.clone())
         .collect();
 
-    let effective_candidate_count = candidate_count.max(result.hits.len());
-    let unresolved_candidate_count = effective_candidate_count.saturating_sub(resolved_hit_count);
     let candidate_resolution_counts = build_candidate_resolution_counts(resolution_labels);
+    let effective_candidate_count = candidate_count.max(result.hits.len());
+    let unresolved_candidate_count = if resolution_labels.is_empty() {
+        effective_candidate_count.saturating_sub(resolved_hit_count)
+    } else {
+        resolution_labels
+            .iter()
+            .filter(|label| label.as_str() != "resolved")
+            .count()
+    };
 
     RetrievalShadowDto {
         retrieval_mode: trace.retrieval_mode.clone(),
@@ -1700,6 +1707,10 @@ mod tests {
         assert_eq!(shadow.candidates[1].resolved_node_id.as_deref(), Some("3"));
         assert_eq!(shadow.candidates[1].search_hit_rank, Some(2));
         assert_eq!(shadow.candidates[1].final_rank, None);
+        assert_eq!(
+            shadow.unresolved_candidate_count, 0,
+            "resolved candidates rejected by the final result window are not unresolved sidecar candidates"
+        );
     }
 
     #[test]
