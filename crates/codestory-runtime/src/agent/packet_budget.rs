@@ -18,6 +18,7 @@ use std::path::Path;
 const MARKDOWN_TRUNCATION_FLOOR_BYTES: usize = 256;
 const AVOID_OPENING_OMISSION: &str = "avoid_opening";
 const COVERAGE_REPORT_INELIGIBLE_OMISSION: &str = "coverage_report.ineligible";
+const RETRIEVAL_TRACE_SUMMARY_OMISSION: &str = "retrieval_trace_summary";
 
 pub(crate) fn packet_budget_limits(mode: PacketBudgetModeDto) -> PacketBudgetLimitsDto {
     match mode {
@@ -150,6 +151,11 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
             continue;
         }
 
+        if trim_packet_retrieval_trace_summary(packet) {
+            push_omitted_section(&mut packet.budget, RETRIEVAL_TRACE_SUMMARY_OMISSION);
+            continue;
+        }
+
         if truncate_answer_markdown_to_byte_cap(&mut packet.answer, next_answer_cap) {
             push_omitted_section(&mut packet.budget, "markdown_blocks");
             packet.budget.used = packet_budget_usage(&packet.answer);
@@ -165,6 +171,7 @@ pub(crate) fn enforce_packet_output_budget(project_root: &Path, packet: &mut Age
         push_omitted_section(&mut packet.budget, "output_bytes");
         push_omitted_section(&mut packet.budget, "packet_payload");
         rebuild_packet_budget_dependents(project_root, packet, &extra_probes);
+        let _ = refresh_packet_output_bytes(packet);
     } else {
         remove_omitted_section(&mut packet.budget, "output_bytes");
         remove_omitted_section(&mut packet.budget, "packet_payload");
@@ -194,6 +201,35 @@ fn trim_packet_sufficiency_verbose_lists(packet: &mut AgentPacketDto) -> Vec<&'s
     trimmed_sections
 }
 
+fn trim_packet_retrieval_trace_summary(packet: &mut AgentPacketDto) -> bool {
+    let trace = &mut packet.retrieval_trace_summary.retrieval_trace;
+    let trimmed = !trace.request_id.is_empty()
+        || trace.total_latency_ms != 0
+        || trace.sla_target_ms.is_some()
+        || trace.sla_missed
+        || trace.semantic_fallback_count != 0
+        || !trace.semantic_fallbacks.is_empty()
+        || !trace.annotations.is_empty()
+        || !trace.steps.is_empty()
+        || !trace.packet_sidecar_diagnostics.is_empty()
+        || trace.retrieval_shadow.is_some();
+
+    if trimmed {
+        trace.request_id.clear();
+        trace.total_latency_ms = 0;
+        trace.sla_target_ms = None;
+        trace.sla_missed = false;
+        trace.semantic_fallback_count = 0;
+        trace.semantic_fallbacks.clear();
+        trace.annotations.clear();
+        trace.steps.clear();
+        trace.packet_sidecar_diagnostics.clear();
+        trace.retrieval_shadow = None;
+    }
+
+    trimmed
+}
+
 fn rebuild_packet_budget_dependents(
     project_root: &Path,
     packet: &mut AgentPacketDto,
@@ -220,6 +256,11 @@ fn rebuild_packet_budget_dependents(
         .omitted_sections
         .iter()
         .any(|section| section == COVERAGE_REPORT_INELIGIBLE_OMISSION);
+    let trim_trace_summary = packet
+        .budget
+        .omitted_sections
+        .iter()
+        .any(|section| section == RETRIEVAL_TRACE_SUMMARY_OMISSION);
 
     if trim_avoid_opening {
         packet.sufficiency.avoid_opening.clear();
@@ -227,6 +268,9 @@ fn rebuild_packet_budget_dependents(
     }
     if trim_ineligible && let Some(report) = packet.sufficiency.coverage_report.as_mut() {
         report.ineligible.clear();
+    }
+    if trim_trace_summary {
+        let _ = trim_packet_retrieval_trace_summary(packet);
     }
 }
 
@@ -487,10 +531,128 @@ mod tests {
     use super::*;
     use codestory_contracts::api::{
         AgentCitationDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
-        AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId, NodeKind, PacketClaimDto,
-        PacketCoverageReportDto, PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto,
-        PacketSufficiencyDto, PacketSufficiencyStatusDto, SearchHitOrigin,
+        AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalTraceDto, NodeId, NodeKind,
+        PacketClaimDto, PacketCoverageReportDto, PacketPlanDto, PacketPlanQueryDto,
+        PacketRetrievalTraceSummaryDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
+        SearchHitOrigin,
     };
+
+    #[test]
+    fn compact_budget_trims_summary_trace_before_hard_payload_omission() {
+        let question = "Explain duplicated packet trace diagnostics.";
+        let mut packet = test_packet(question, 1);
+        install_duplicate_summary_trace_payload(&mut packet, 180);
+
+        let mut trimmed_probe = packet.clone();
+        assert!(trim_packet_retrieval_trace_summary(&mut trimmed_probe));
+        push_omitted_section(&mut trimmed_probe.budget, RETRIEVAL_TRACE_SUMMARY_OMISSION);
+        let trimmed_len = serialized_packet_len(&trimmed_probe);
+        let max_output_bytes = u32::try_from(trimmed_len + 4096).expect("test cap fits u32");
+        packet.budget.limits.max_output_bytes = max_output_bytes;
+        assert!(
+            serialized_packet_len(&packet) > max_output_bytes as usize,
+            "fixture must start over the packet output cap"
+        );
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let serialized_len = serialized_packet_len(&packet);
+        assert!(
+            serialized_len <= max_output_bytes as usize,
+            "trimming summary trace should bring the packet under cap: {serialized_len} > {max_output_bytes}"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&RETRIEVAL_TRACE_SUMMARY_OMISSION.to_string())
+        );
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .contains(&"output_bytes".to_string())
+        );
+        assert!(
+            !packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
+        assert_eq!(packet.retrieval_trace_summary.search_steps, 1);
+        assert_eq!(packet.retrieval_trace_summary.trail_steps, 1);
+        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 1);
+        assert!(
+            packet
+                .retrieval_trace_summary
+                .retrieval_trace
+                .request_id
+                .is_empty()
+        );
+        assert!(
+            packet
+                .retrieval_trace_summary
+                .retrieval_trace
+                .steps
+                .is_empty()
+        );
+        assert_eq!(packet.answer.retrieval_trace.steps.len(), 3);
+        assert!(
+            packet
+                .answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.contains("canonical trace annotation"))
+        );
+    }
+
+    #[test]
+    fn compact_budget_keeps_hard_payload_omission_when_summary_trace_trim_is_not_enough() {
+        let question = "Explain still oversized packet diagnostics.";
+        let mut packet = test_packet(question, 512);
+        install_duplicate_summary_trace_payload(&mut packet, 24);
+
+        enforce_packet_output_budget(test_project_root(), &mut packet);
+
+        let serialized_len = serialized_packet_len(&packet);
+        assert!(
+            serialized_len > packet.budget.limits.max_output_bytes as usize,
+            "fixture should remain over cap after summary trace trimming"
+        );
+        assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&RETRIEVAL_TRACE_SUMMARY_OMISSION.to_string())
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"output_bytes".to_string())
+        );
+        assert!(
+            packet
+                .budget
+                .omitted_sections
+                .contains(&"packet_payload".to_string())
+        );
+        assert!(packet.budget.truncated);
+        assert_eq!(packet.retrieval_trace_summary.search_steps, 1);
+        assert_eq!(packet.retrieval_trace_summary.trail_steps, 1);
+        assert_eq!(packet.retrieval_trace_summary.source_read_steps, 1);
+        assert!(
+            packet
+                .retrieval_trace_summary
+                .retrieval_trace
+                .steps
+                .is_empty()
+        );
+        assert_eq!(packet.answer.retrieval_trace.steps.len(), 3);
+    }
 
     #[test]
     fn compact_budget_trims_ineligible_coverage_report_before_payload_omission() {
@@ -711,6 +873,49 @@ mod tests {
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
         }
+    }
+
+    fn install_duplicate_summary_trace_payload(packet: &mut AgentPacketDto, repeat: usize) {
+        packet.answer.retrieval_trace.request_id = "canonical-answer-trace".to_string();
+        packet.answer.retrieval_trace.total_latency_ms = 123;
+        packet.answer.retrieval_trace.sla_target_ms = Some(1_000);
+        packet.answer.retrieval_trace.sla_missed = true;
+        packet.answer.retrieval_trace.annotations = vec![format!(
+            "canonical trace annotation {}",
+            "answer-retained ".repeat(repeat)
+        )];
+        packet.answer.retrieval_trace.steps = vec![
+            AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::Search,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 10,
+                input: Vec::new(),
+                output: Vec::new(),
+                message: Some("search duplicate diagnostic ".repeat(repeat)),
+            },
+            AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::Trail,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 20,
+                input: Vec::new(),
+                output: Vec::new(),
+                message: Some("trail duplicate diagnostic ".repeat(repeat)),
+            },
+            AgentRetrievalStepDto {
+                kind: AgentRetrievalStepKindDto::SourceRead,
+                status: AgentRetrievalStepStatusDto::Ok,
+                duration_ms: 30,
+                input: Vec::new(),
+                output: Vec::new(),
+                message: Some("source duplicate diagnostic ".repeat(repeat)),
+            },
+        ];
+        packet.retrieval_trace_summary = PacketRetrievalTraceSummaryDto {
+            retrieval_trace: packet.answer.retrieval_trace.clone(),
+            source_read_steps: 1,
+            search_steps: 1,
+            trail_steps: 1,
+        };
     }
 
     fn test_project_root() -> &'static Path {
