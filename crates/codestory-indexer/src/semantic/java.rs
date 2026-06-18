@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct JavaSemanticResolver;
 
 impl SemanticResolver for JavaSemanticResolver {
-    fn language(&self) -> &'static str {
-        "java"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

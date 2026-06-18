@@ -9,13 +9,11 @@ use codestory_contracts::{
     language_support::supported_extensions,
 };
 
-pub struct GenericSemanticResolver {
-    language: &'static str,
-}
+pub struct GenericSemanticResolver;
 
 impl GenericSemanticResolver {
-    pub const fn new(language: &'static str) -> Self {
-        Self { language }
+    pub const fn new(_language: &'static str) -> Self {
+        Self
     }
 
     fn resolve_import(
@@ -78,10 +76,6 @@ impl GenericSemanticResolver {
 }
 
 impl SemanticResolver for GenericSemanticResolver {
-    fn language(&self) -> &'static str {
-        self.language
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

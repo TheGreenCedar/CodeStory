@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct PhpSemanticResolver;
 
 impl SemanticResolver for PhpSemanticResolver {
-    fn language(&self) -> &'static str {
-        "php"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct RubySemanticResolver;
 
 impl SemanticResolver for RubySemanticResolver {
-    fn language(&self) -> &'static str {
-        "ruby"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

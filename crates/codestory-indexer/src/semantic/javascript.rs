@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct JavaScriptSemanticResolver;
 
 impl SemanticResolver for JavaScriptSemanticResolver {
-    fn language(&self) -> &'static str {
-        "javascript"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,
