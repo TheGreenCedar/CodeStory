@@ -330,6 +330,13 @@ fn scip_capabilities(availability: &ScipAvailability, project_dir: &Path) -> Sid
 }
 
 fn has_real_scip_artifact(project_dir: &Path) -> bool {
+    let Some(revision) = std::fs::read_to_string(project_dir.join("revision.txt"))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return false;
+    };
     project_dir
         .join(crate::scip_index::SCIP_SYMBOLS_FILE)
         .is_file()
@@ -338,6 +345,10 @@ fn has_real_scip_artifact(project_dir: &Path) -> bool {
             .is_file()
         && project_dir.join("revision.txt").is_file()
         && !project_dir.join("index.scip.stub").is_file()
+        && crate::scip_index::load_fresh_scip_symbols(project_dir, &revision)
+            .ok()
+            .flatten()
+            .is_some_and(|index| !index.symbols.is_empty())
 }
 
 pub fn probe_sidecar_health(

@@ -1,5 +1,8 @@
 use crate::config::SidecarLayout;
-use crate::scip_index::{SCIP_SYMBOLS_FILE, ScipSymbolRecord, load_scip_symbols};
+use crate::scip_index::{
+    SCIP_INDEX_FILE, SCIP_SYMBOLS_FILE, ScipSymbolRecord, load_fresh_scip_symbols,
+    load_scip_symbols,
+};
 use std::cmp::Ordering;
 use std::path::Path;
 
@@ -51,12 +54,16 @@ impl ScipClient {
             };
         }
         let revision = read_scip_revision(&project_dir).unwrap_or_else(|| "stub-v1".into());
-        let has_graph_index = has_real_scip_artifact(&project_dir);
-        let is_stub_revision = revision == "stub-v1" || !has_graph_index;
+        let artifact_status = scip_artifact_status(&project_dir, &revision);
+        let is_stub_revision = revision == "stub-v1" || artifact_status == "scip_stub";
         ScipHealthProbe {
             availability: if is_stub_revision {
                 ScipAvailability::Unavailable {
                     reason: "scip_stub".into(),
+                }
+            } else if artifact_status == "scip_stale" {
+                ScipAvailability::Unavailable {
+                    reason: "scip_stale".into(),
                 }
             } else {
                 ScipAvailability::Ready {
@@ -75,11 +82,14 @@ impl ScipClient {
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
         let probe = Self::health_probe(layout, project_id);
-        let ScipAvailability::Ready { .. } = probe.availability else {
+        let ScipAvailability::Ready { revision } = probe.availability else {
             return Ok(Vec::new());
         };
         let project_dir = layout.scip_project_dir(project_id);
-        let Some(index) = load_scip_symbols(&project_dir)? else {
+        let Some(index) = load_fresh_scip_symbols(&project_dir, &revision)? else {
+            return Ok(Vec::new());
+        };
+        let Some(provenance) = index.contract.provenance_label() else {
             return Ok(Vec::new());
         };
         let profile = ScipQueryProfile::new(query);
@@ -87,7 +97,7 @@ impl ScipClient {
         for symbol in index.symbols {
             if symbol_matches_query(&symbol, &profile) {
                 let score = score_symbol_match(&symbol, &profile);
-                hits.push(symbol_to_hit(&symbol, score, 0));
+                hits.push(symbol_to_hit(&symbol, score, 0, provenance));
             }
         }
         hits.sort_by(|left, right| {
@@ -110,11 +120,14 @@ impl ScipClient {
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
         let probe = Self::health_probe(layout, project_id);
-        let ScipAvailability::Ready { .. } = probe.availability else {
+        let ScipAvailability::Ready { revision } = probe.availability else {
             return Ok(Vec::new());
         };
         let project_dir = layout.scip_project_dir(project_id);
-        let Some(index) = load_scip_symbols(&project_dir)? else {
+        let Some(index) = load_fresh_scip_symbols(&project_dir, &revision)? else {
+            return Ok(Vec::new());
+        };
+        let Some(provenance) = index.contract.provenance_label() else {
             return Ok(Vec::new());
         };
         let mut hits = Vec::new();
@@ -135,6 +148,7 @@ impl ScipClient {
                         symbol,
                         0.65,
                         anchor.scip_hop_distance.unwrap_or(0) + 1,
+                        provenance,
                     ));
                 }
             }
@@ -144,7 +158,12 @@ impl ScipClient {
     }
 }
 
-fn symbol_to_hit(symbol: &ScipSymbolRecord, score: f32, hop: u32) -> super::CandidateHit {
+fn symbol_to_hit(
+    symbol: &ScipSymbolRecord,
+    score: f32,
+    hop: u32,
+    provenance: &str,
+) -> super::CandidateHit {
     use super::candidate::{CandidateHit, CandidateSource};
     CandidateHit {
         node_id: None,
@@ -153,7 +172,7 @@ fn symbol_to_hit(symbol: &ScipSymbolRecord, score: f32, hop: u32) -> super::Cand
         start_line: Some(symbol.start_line),
         score,
         source: CandidateSource::Scip,
-        provenance: Vec::new(),
+        provenance: vec![provenance.into()],
         file_role: None,
         scip_hop_distance: Some(hop),
         rank_features: None,
@@ -368,27 +387,110 @@ fn read_scip_revision(dir: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn has_real_scip_artifact(project_dir: &Path) -> bool {
+fn scip_artifact_status(project_dir: &Path, revision: &str) -> &'static str {
     if !project_dir.join(SCIP_SYMBOLS_FILE).is_file()
-        || !project_dir
-            .join(crate::scip_index::SCIP_INDEX_FILE)
-            .is_file()
+        || !project_dir.join(SCIP_INDEX_FILE).is_file()
         || !project_dir.join("revision.txt").is_file()
         || project_dir.join("index.scip.stub").is_file()
     {
-        return false;
+        return "scip_stub";
     }
     load_scip_symbols(project_dir)
         .ok()
         .flatten()
-        .is_some_and(|index| !index.symbols.is_empty())
+        .filter(|index| !index.symbols.is_empty())
+        .map_or("scip_stub", |index| {
+            if index.is_fresh_for(revision) {
+                "ready"
+            } else {
+                "scip_stale"
+            }
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scip_index::{SCIP_INDEX_FILE, ScipSymbolsIndex};
+    use crate::scip_index::{
+        SCIP_IMPORTED_PROOF_PROVENANCE, ScipPackageIdentity, ScipProofAdapterContract,
+        ScipProofRecord, ScipSymbolsIndex,
+    };
     use tempfile::TempDir;
+
+    fn write_scip_index(
+        project_dir: &Path,
+        revision: &str,
+        contract: ScipProofAdapterContract,
+        symbols: Vec<ScipSymbolRecord>,
+        proofs: Vec<ScipProofRecord>,
+    ) {
+        let index = ScipSymbolsIndex {
+            revision: revision.to_string(),
+            contract,
+            symbols,
+            proofs,
+        };
+        std::fs::write(
+            project_dir.join(SCIP_SYMBOLS_FILE),
+            serde_json::to_string_pretty(&index).expect("serialize"),
+        )
+        .expect("write symbols");
+        std::fs::write(project_dir.join("revision.txt"), format!("{revision}\n"))
+            .expect("revision");
+        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "codestory-scip-v1\n").expect("index");
+    }
+
+    fn imported_contract(revision: &str) -> ScipProofAdapterContract {
+        ScipProofAdapterContract {
+            evidence_source: SCIP_IMPORTED_PROOF_PROVENANCE.into(),
+            producer: "scip-fixture".into(),
+            producer_version: "0.1.0".into(),
+            producer_args: vec!["scip".into(), "index".into(), "--cwd=.".into()],
+            producer_config: "fixture-config-v1".into(),
+            revision: revision.into(),
+            package: ScipPackageIdentity {
+                manager: "cargo".into(),
+                name: "fixture_package".into(),
+                version: Some("1.2.3".into()),
+            },
+            position_encoding: "line_one_based_utf16_column_zero_based".into(),
+            freshness: "fresh".into(),
+        }
+    }
+
+    fn imported_symbol() -> ScipSymbolRecord {
+        ScipSymbolRecord {
+            path: "src/lib.rs".into(),
+            symbol: "fixture_package::run".into(),
+            start_line: 3,
+            end_line: 3,
+        }
+    }
+
+    fn valid_imported_proofs() -> Vec<ScipProofRecord> {
+        vec![
+            ScipProofRecord {
+                role: "definition".into(),
+                path: "src/lib.rs".into(),
+                symbol: "fixture_package::run".into(),
+                start_line: 3,
+                start_character_utf16: 4,
+                end_line: 3,
+                end_character_utf16: 7,
+                target_symbol: None,
+            },
+            ScipProofRecord {
+                role: "reference".into(),
+                path: "src/main.rs".into(),
+                symbol: "fixture_package::main".into(),
+                start_line: 8,
+                start_character_utf16: 9,
+                end_line: 8,
+                end_character_utf16: 12,
+                target_symbol: Some("fixture_package::run".into()),
+            },
+        ]
+    }
 
     #[test]
     fn anchor_search_scores_all_matches_before_truncating() {
@@ -421,17 +523,13 @@ mod tests {
             start_line: 99,
             end_line: 99,
         });
-        let index = ScipSymbolsIndex {
-            revision: "graph-test".to_string(),
+        write_scip_index(
+            &project_dir,
+            "graph-test",
+            ScipProofAdapterContract::graph_projection("graph-test"),
             symbols,
-        };
-        std::fs::write(
-            project_dir.join(SCIP_SYMBOLS_FILE),
-            serde_json::to_string_pretty(&index).expect("serialize"),
-        )
-        .expect("write symbols");
-        std::fs::write(project_dir.join("revision.txt"), "graph-test\n").expect("revision");
-        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "codestory-scip-v1\n").expect("index");
+            Vec::new(),
+        );
 
         let hits = ScipClient::anchor_search(&layout, project_id, "needle", 8).expect("search");
 
@@ -459,9 +557,11 @@ mod tests {
         let project_dir = layout.scip_project_dir(project_id);
         std::fs::create_dir_all(&project_dir).expect("scip dir");
 
-        let index = ScipSymbolsIndex {
-            revision: "graph-test".to_string(),
-            symbols: vec![
+        write_scip_index(
+            &project_dir,
+            "graph-test",
+            ScipProofAdapterContract::graph_projection("graph-test"),
+            vec![
                 ScipSymbolRecord {
                     path: "workspace/app/src/main.rs".to_string(),
                     symbol: "workspace_app::Cli".to_string(),
@@ -481,14 +581,8 @@ mod tests {
                     end_line: 42,
                 },
             ],
-        };
-        std::fs::write(
-            project_dir.join(SCIP_SYMBOLS_FILE),
-            serde_json::to_string_pretty(&index).expect("serialize"),
-        )
-        .expect("write symbols");
-        std::fs::write(project_dir.join("revision.txt"), "graph-test\n").expect("revision");
-        std::fs::write(project_dir.join(SCIP_INDEX_FILE), "codestory-scip-v1\n").expect("index");
+            Vec::new(),
+        );
 
         let hits = ScipClient::anchor_search(&layout, project_id, "workspace_app::Cli", 8)
             .expect("search");
@@ -531,5 +625,166 @@ mod tests {
                 reason: "scip_stub".into()
             }
         );
+    }
+
+    #[test]
+    fn imported_proof_contract_labels_scip_candidates() {
+        let root = TempDir::new().expect("root");
+        let layout = SidecarLayout {
+            zoekt_http_port: 1,
+            qdrant_http_port: 2,
+            qdrant_grpc_port: 3,
+            zoekt_data_dir: root.path().join("zoekt"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("state.json"),
+        };
+        let project_id = "project";
+        let project_dir = layout.scip_project_dir(project_id);
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let revision = "imported-a";
+        write_scip_index(
+            &project_dir,
+            revision,
+            imported_contract(revision),
+            vec![imported_symbol()],
+            valid_imported_proofs(),
+        );
+
+        let loaded = load_scip_symbols(&project_dir)
+            .expect("load")
+            .expect("index");
+        assert_eq!(loaded.contract.producer, "scip-fixture");
+        assert_eq!(loaded.contract.producer_version, "0.1.0");
+        assert_eq!(loaded.contract.producer_args, ["scip", "index", "--cwd=."]);
+        assert_eq!(loaded.contract.producer_config, "fixture-config-v1");
+        assert_eq!(loaded.contract.revision, revision);
+        assert_eq!(loaded.contract.package.manager, "cargo");
+        assert_eq!(loaded.contract.package.name, "fixture_package");
+        assert_eq!(loaded.contract.package.version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            loaded.contract.position_encoding,
+            "line_one_based_utf16_column_zero_based"
+        );
+        assert_eq!(loaded.contract.freshness, "fresh");
+        assert_eq!(loaded.proofs.len(), 2);
+
+        let hits = ScipClient::anchor_search(&layout, project_id, "fixture_package::run", 4)
+            .expect("search");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, crate::candidate::CandidateSource::Scip);
+        assert_eq!(hits[0].provenance, vec![SCIP_IMPORTED_PROOF_PROVENANCE]);
+    }
+
+    #[test]
+    fn imported_contract_without_proofs_fails_closed() {
+        let root = TempDir::new().expect("root");
+        let layout = SidecarLayout {
+            zoekt_http_port: 1,
+            qdrant_http_port: 2,
+            qdrant_grpc_port: 3,
+            zoekt_data_dir: root.path().join("zoekt"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("state.json"),
+        };
+        let project_id = "project";
+        let project_dir = layout.scip_project_dir(project_id);
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let revision = "imported-no-proofs";
+        write_scip_index(
+            &project_dir,
+            revision,
+            imported_contract(revision),
+            vec![imported_symbol()],
+            Vec::new(),
+        );
+
+        let probe = ScipClient::health_probe(&layout, project_id);
+        assert_eq!(
+            probe.availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_stale".into()
+            }
+        );
+        let hits = ScipClient::anchor_search(&layout, project_id, "fixture_package::run", 4)
+            .expect("search");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn unknown_evidence_source_fails_closed() {
+        let root = TempDir::new().expect("root");
+        let layout = SidecarLayout {
+            zoekt_http_port: 1,
+            qdrant_http_port: 2,
+            qdrant_grpc_port: 3,
+            zoekt_data_dir: root.path().join("zoekt"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("state.json"),
+        };
+        let project_id = "project";
+        let project_dir = layout.scip_project_dir(project_id);
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let revision = "imported-unknown-source";
+        let mut contract = imported_contract(revision);
+        contract.evidence_source = "imported-scip-proof".into();
+        write_scip_index(
+            &project_dir,
+            revision,
+            contract,
+            vec![imported_symbol()],
+            valid_imported_proofs(),
+        );
+
+        let probe = ScipClient::health_probe(&layout, project_id);
+        assert_eq!(
+            probe.availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_stale".into()
+            }
+        );
+        let hits = ScipClient::anchor_search(&layout, project_id, "fixture_package::run", 4)
+            .expect("search");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn stale_scip_import_fails_closed_without_candidates() {
+        let root = TempDir::new().expect("root");
+        let layout = SidecarLayout {
+            zoekt_http_port: 1,
+            qdrant_http_port: 2,
+            qdrant_grpc_port: 3,
+            zoekt_data_dir: root.path().join("zoekt"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("state.json"),
+        };
+        let project_id = "project";
+        let project_dir = layout.scip_project_dir(project_id);
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        let mut contract = imported_contract("old-import");
+        contract.freshness = "stale".into();
+        write_scip_index(
+            &project_dir,
+            "current-import",
+            contract,
+            vec![imported_symbol()],
+            valid_imported_proofs(),
+        );
+
+        let probe = ScipClient::health_probe(&layout, project_id);
+        assert_eq!(
+            probe.availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_stale".into()
+            }
+        );
+        let hits = ScipClient::anchor_search(&layout, project_id, "fixture_package::run", 4)
+            .expect("search");
+        assert!(hits.is_empty());
     }
 }

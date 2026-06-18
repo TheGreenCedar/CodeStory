@@ -8,6 +8,9 @@ use std::path::Path;
 
 pub const SCIP_SYMBOLS_FILE: &str = "symbols.index.json";
 pub const SCIP_INDEX_FILE: &str = "index.scip";
+pub const SCIP_IMPORTED_PROOF_PROVENANCE: &str = "imported_scip_proof";
+pub const SCIP_GRAPH_PROJECTION_PROVENANCE: &str = "scip_graph_projection";
+const SCIP_POSITION_ENCODING: &str = "line_one_based_utf16_column_zero_based";
 const STUB_MARKER: &str = "index.scip.stub";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,10 +21,163 @@ pub struct ScipSymbolRecord {
     pub end_line: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScipPackageIdentity {
+    pub manager: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScipProofAdapterContract {
+    pub evidence_source: String,
+    pub producer: String,
+    pub producer_version: String,
+    pub producer_args: Vec<String>,
+    pub producer_config: String,
+    pub revision: String,
+    pub package: ScipPackageIdentity,
+    pub position_encoding: String,
+    pub freshness: String,
+}
+
+impl ScipProofAdapterContract {
+    pub fn graph_projection(revision: &str) -> Self {
+        Self {
+            evidence_source: SCIP_GRAPH_PROJECTION_PROVENANCE.into(),
+            producer: "codestory-retrieval".into(),
+            producer_version: env!("CARGO_PKG_VERSION").into(),
+            producer_args: vec!["emit_scip_artifacts_from_store".into()],
+            producer_config: "search_symbol_projection".into(),
+            revision: revision.into(),
+            package: ScipPackageIdentity {
+                manager: "codestory".into(),
+                name: "local-workspace".into(),
+                version: None,
+            },
+            position_encoding: SCIP_POSITION_ENCODING.into(),
+            freshness: "fresh".into(),
+        }
+    }
+
+    pub(crate) fn evidence_source(&self) -> Option<ScipEvidenceSource> {
+        match self.evidence_source.as_str() {
+            SCIP_IMPORTED_PROOF_PROVENANCE => Some(ScipEvidenceSource::ImportedProof),
+            SCIP_GRAPH_PROJECTION_PROVENANCE => Some(ScipEvidenceSource::GraphProjection),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn provenance_label(&self) -> Option<&'static str> {
+        match self.evidence_source()? {
+            ScipEvidenceSource::ImportedProof => Some(SCIP_IMPORTED_PROOF_PROVENANCE),
+            ScipEvidenceSource::GraphProjection => Some(SCIP_GRAPH_PROJECTION_PROVENANCE),
+        }
+    }
+
+    pub(crate) fn is_fresh_for(&self, revision: &str) -> bool {
+        self.revision == revision
+            && self.freshness == "fresh"
+            && self.position_encoding == SCIP_POSITION_ENCODING
+            && self.evidence_source().is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScipEvidenceSource {
+    ImportedProof,
+    GraphProjection,
+}
+
+impl Default for ScipProofAdapterContract {
+    fn default() -> Self {
+        let mut contract = Self::graph_projection("");
+        contract.freshness = "stale".into();
+        contract
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScipProofRecord {
+    pub role: String,
+    pub path: String,
+    pub symbol: String,
+    pub start_line: u32,
+    pub start_character_utf16: u32,
+    pub end_line: u32,
+    pub end_character_utf16: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_symbol: Option<String>,
+}
+
+impl ScipProofRecord {
+    fn definition(symbol: &ScipSymbolRecord) -> Self {
+        Self {
+            role: "definition".into(),
+            path: symbol.path.clone(),
+            symbol: symbol.symbol.clone(),
+            start_line: symbol.start_line,
+            start_character_utf16: 0,
+            end_line: symbol.end_line,
+            end_character_utf16: 0,
+            target_symbol: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScipSymbolsIndex {
     pub revision: String,
+    #[serde(default)]
+    pub contract: ScipProofAdapterContract,
     pub symbols: Vec<ScipSymbolRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proofs: Vec<ScipProofRecord>,
+}
+
+impl ScipSymbolsIndex {
+    pub(crate) fn is_fresh_for(&self, revision: &str) -> bool {
+        self.revision == revision
+            && self.contract.is_fresh_for(revision)
+            && self.has_required_proof_records()
+    }
+
+    fn has_required_proof_records(&self) -> bool {
+        match self.contract.evidence_source() {
+            Some(ScipEvidenceSource::GraphProjection) => true,
+            Some(ScipEvidenceSource::ImportedProof) => {
+                self.proofs.iter().any(|proof| self.proof_is_valid(proof))
+            }
+            None => false,
+        }
+    }
+
+    fn proof_is_valid(&self, proof: &ScipProofRecord) -> bool {
+        if proof.path.trim().is_empty()
+            || proof.symbol.trim().is_empty()
+            || proof.start_line == 0
+            || proof.end_line < proof.start_line
+            || (proof.end_line == proof.start_line
+                && proof.end_character_utf16 < proof.start_character_utf16)
+        {
+            return false;
+        }
+
+        match proof.role.as_str() {
+            "definition" => self.symbols.iter().any(|symbol| {
+                symbol.path == proof.path
+                    && symbol.symbol == proof.symbol
+                    && symbol.start_line <= proof.start_line
+                    && symbol.end_line >= proof.end_line
+            }),
+            "reference" => proof
+                .target_symbol
+                .as_deref()
+                .is_some_and(|target| self.symbols.iter().any(|symbol| symbol.symbol == target)),
+            _ => false,
+        }
+    }
 }
 
 /// Write graph-backed SCIP artifacts; returns revision string on success.
@@ -66,9 +222,12 @@ pub fn emit_scip_artifacts_from_store(
     }
 
     let revision = scip_revision_for_symbols(&symbols);
+    let proofs = symbols.iter().map(ScipProofRecord::definition).collect();
     let index = ScipSymbolsIndex {
         revision: revision.clone(),
+        contract: ScipProofAdapterContract::graph_projection(&revision),
         symbols,
+        proofs,
     };
     let json = serde_json::to_string_pretty(&index).context("serialize scip symbols index")?;
     std::fs::write(project_dir.join(SCIP_SYMBOLS_FILE), json)
@@ -94,6 +253,7 @@ fn scip_revision_for_symbols(symbols: &[ScipSymbolRecord]) -> String {
         hasher.update(symbol.path.as_bytes());
         hasher.update(symbol.symbol.as_bytes());
         hasher.update(symbol.start_line.to_le_bytes());
+        hasher.update(symbol.end_line.to_le_bytes());
     }
     format!("graph-{:x}", hasher.finalize())[..16].to_string()
 }
@@ -111,6 +271,16 @@ pub fn load_scip_symbols(project_dir: &Path) -> Result<Option<ScipSymbolsIndex>>
     let parsed: ScipSymbolsIndex =
         serde_json::from_str(&body).context("parse scip symbols index json")?;
     Ok(Some(parsed))
+}
+
+pub(crate) fn load_fresh_scip_symbols(
+    project_dir: &Path,
+    expected_revision: &str,
+) -> Result<Option<ScipSymbolsIndex>> {
+    let Some(index) = load_scip_symbols(project_dir)? else {
+        return Ok(None);
+    };
+    Ok(index.is_fresh_for(expected_revision).then_some(index))
 }
 
 #[cfg(test)]
@@ -186,6 +356,12 @@ mod tests {
             .expect("load scip")
             .expect("symbols");
 
+        assert_eq!(
+            symbols.contract.evidence_source,
+            SCIP_GRAPH_PROJECTION_PROVENANCE
+        );
+        assert_eq!(symbols.contract.freshness, "fresh");
+        assert_eq!(symbols.proofs.len(), symbols.symbols.len());
         assert!(
             symbols.symbols.len() >= 4_100,
             "SCIP emit should not truncate at the old 4096-symbol smoke cap"
