@@ -3941,6 +3941,7 @@ mod tests {
     use crate::agent::eval_probes::{
         EVAL_PROBES_ENV, pop_eval_probes_test_override, push_eval_probes_test_override,
     };
+    use crate::agent::packet_batch::packet_anchor_probe_limit;
     use crate::agent::profiles::ResolvedProfile;
 
     struct EvalProbesGuard;
@@ -4258,7 +4259,7 @@ mod tests {
         );
         let reduced = packet_anchor_probe_queries(&plan)
             .into_iter()
-            .take(14)
+            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
             .collect::<Vec<_>>();
 
         for expected in [
@@ -8566,11 +8567,11 @@ mod tests {
         };
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, budget, 5_500),
-            14
+            6
         );
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, budget, 8_000),
-            7
+            3
         );
     }
 

@@ -470,7 +470,7 @@ pub(crate) fn run_packet_anchor_expansion(
 pub(crate) fn packet_anchor_probe_limit(budget: PacketBudgetModeDto) -> usize {
     match budget {
         PacketBudgetModeDto::Tiny => 0,
-        PacketBudgetModeDto::Compact => 28,
+        PacketBudgetModeDto::Compact => 12,
         PacketBudgetModeDto::Standard => 40,
         PacketBudgetModeDto::Deep => 40,
     }
@@ -528,7 +528,13 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
                 || is_packet_code_like_term(&query.query)
         })
         .collect::<Vec<_>>();
-    ranked.sort_by_key(|(index, query)| (packet_anchor_probe_priority(query), *index));
+    ranked.sort_by_key(|(index, query)| {
+        (
+            packet_anchor_probe_priority(query),
+            packet_anchor_probe_flow_hint_priority(&query.query),
+            *index,
+        )
+    });
     ranked
         .into_iter()
         .map(|(_, query)| query.query.clone())
@@ -545,6 +551,44 @@ fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
     } else {
         3
     }
+}
+
+fn packet_anchor_probe_flow_hint_priority(query: &str) -> u8 {
+    if packet_anchor_probe_is_required_flow_hint(query) {
+        0
+    } else if packet_anchor_probe_has_strong_code_shape(query) {
+        1
+    } else {
+        2
+    }
+}
+
+fn packet_anchor_probe_is_required_flow_hint(query: &str) -> bool {
+    matches!(
+        normalize_identifier(query).as_str(),
+        "execruntime"
+            | "execsession"
+            | "execcli"
+            | "jsoneventoutput"
+            | "jsonleventoutput"
+            | "eventoutputprocessor"
+            | "threadstart"
+            | "startthread"
+            | "eventloop"
+            | "eventdispatch"
+            | "networkinput"
+            | "commanddispatch"
+            | "commandhandler"
+            | "requestdispatch"
+            | "routehandler"
+            | "transportsend"
+            | "requestfinalization"
+            | "responsematerialization"
+            | "customvalidation"
+            | "customerrorrendering"
+            | "submitpreventdefault"
+            | "submitinvalidguard"
+    )
 }
 
 fn packet_task_seed_anchor_probe(query: &str) -> bool {
@@ -751,6 +795,32 @@ mod tests {
                 "exec_events.rs".to_string(),
                 "workspace/app/src/lib.rs".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn compact_packet_anchor_probe_limit_stays_bounded() {
+        assert_eq!(packet_anchor_probe_limit(PacketBudgetModeDto::Compact), 12);
+        assert_eq!(
+            packet_anchor_probe_limit_for_budget(
+                PacketBudgetModeDto::Compact,
+                PacketLatencyBudget::new(None),
+                0,
+            ),
+            12
+        );
+    }
+
+    #[test]
+    fn compact_packet_anchor_probe_limit_tapers_under_budget_pressure() {
+        let latency = PacketLatencyBudget::new(Some(18_000));
+        assert_eq!(
+            packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 9_000,),
+            6
+        );
+        assert_eq!(
+            packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 13_500,),
+            3
         );
     }
 
