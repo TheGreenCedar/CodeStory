@@ -536,7 +536,7 @@ static SYMBOL_SUMMARY_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory search results DTO.",
+    "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
     &[
         SchemaProperty::string("query", "Search query."),
         SchemaProperty::object("retrieval", "Retrieval state DTO."),
@@ -751,7 +751,7 @@ static CONTEXT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory broad task packet DTO.",
+    "CodeStory broad task packet DTO with graph/sidecar evidence, budget truncation, unsafe-to-claim gaps, and follow-up commands.",
     &[
         SchemaProperty::string("packet_id", "Stable packet id."),
         SchemaProperty::string("question", "Packet question."),
@@ -979,14 +979,14 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "packet",
-        description: "Build a broad task packet with a sufficiency contract.",
+        description: "Answer broad structural questions with graph/sidecar evidence, sufficiency, truncation, and follow-up commands before source snippets.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
         name: "search",
-        description: "Search indexed symbols and repo text.",
+        description: "Discover candidate symbols and sidecar hits; for broad structural questions call packet before snippet/source reads.",
         input_schema: SEARCH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SEARCH_RESULTS_SCHEMA)),
         safety: SafetyMetadata::read_only(),
@@ -1056,14 +1056,14 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "snippet",
-        description: "Return a focused source snippet for a symbol id or query.",
+        description: "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
         input_schema: TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
         name: "context",
-        description: "Build a deep evidence packet for one concrete retrieval target; not question answering.",
+        description: "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
         input_schema: CONTEXT_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(CONTEXT_PACKET_SCHEMA)),
         safety: SafetyMetadata::read_only(),

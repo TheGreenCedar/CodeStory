@@ -736,6 +736,32 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
                 .any(|name| matches!(*name, "files" | "affected")),
         "stdio tool names should stay agent-facing and avoid shell/file mutation surfaces: {tool_names:?}"
     );
+    let packet_description = tool_by_name(&tools, "packet")["description"]
+        .as_str()
+        .expect("packet description");
+    assert!(
+        packet_description.contains("broad structural questions")
+            && packet_description.contains("graph/sidecar evidence")
+            && packet_description.contains("truncation")
+            && packet_description.contains("follow-up commands")
+            && packet_description.contains("before source snippets"),
+        "packet description should route broad questions to proof-bearing packet evidence first: {packet_description}"
+    );
+    let search_description = tool_by_name(&tools, "search")["description"]
+        .as_str()
+        .expect("search description");
+    assert!(
+        search_description.contains("Discover candidate")
+            && search_description.contains("packet before snippet/source reads"),
+        "search description should label discovery before source proof reads: {search_description}"
+    );
+    let snippet_description = tool_by_name(&tools, "snippet")["description"]
+        .as_str()
+        .expect("snippet description");
+    assert!(
+        snippet_description.contains("after packet, search, or graph evidence"),
+        "snippet description should not be the first stop for broad structural questions: {snippet_description}"
+    );
 
     for tool in tools["tools"].as_array().expect("tools array") {
         assert_read_only_tool_metadata(tool);
@@ -1526,6 +1552,15 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "agent guide should treat repo-text hits as navigation clues: {guide}"
     );
     assert!(
+        guide_text.contains("search hits as discovery clues")
+            && guide_text.contains("proof-bearing sidecar, graph, or source evidence"),
+        "agent guide should distinguish discovery clues from proof-bearing evidence: {guide}"
+    );
+    assert!(
+        guide_text.contains("unsafe to claim") && guide_text.contains("follow_up_commands"),
+        "agent guide should name unsafe-to-claim and follow-up states: {guide}"
+    );
+    assert!(
         !guide_text.contains("repo-text hits as evidence"),
         "agent guide should not present repo-text hits as evidence: {guide}"
     );
@@ -1851,6 +1886,20 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
         text.contains("packet_id:") && text.contains("sufficiency:"),
         "stdio packet text should summarize packet identity and sufficiency: {text}"
     );
+    for expected in [
+        "budget:",
+        "truncated:",
+        "unsafe_to_claim:",
+        "pagination:",
+        "gaps:",
+        "open_next:",
+        "follow_up_commands:",
+    ] {
+        assert!(
+            text.contains(expected),
+            "stdio packet text should name {expected}: {text}"
+        );
+    }
     assert!(
         !text.trim_start().starts_with('{'),
         "stdio packet text should be a digest, not duplicated JSON: {text}"
