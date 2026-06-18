@@ -273,6 +273,36 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
             .pointer("/sufficiency/status")
             .and_then(|value| value.as_str()),
     );
+    append_packet_text_field(
+        &mut text,
+        "budget",
+        packet
+            .pointer("/budget/requested")
+            .and_then(|value| value.as_str()),
+    );
+    append_packet_bool_field(
+        &mut text,
+        "truncated",
+        packet
+            .pointer("/budget/truncated")
+            .and_then(|value| value.as_bool()),
+    );
+    if let Some(status) = packet
+        .pointer("/sufficiency/status")
+        .and_then(|value| value.as_str())
+    {
+        let unsafe_to_claim = if status == "sufficient" {
+            "false"
+        } else {
+            "true - resolve gaps, open_next, or follow_up_commands before proof claims"
+        };
+        append_packet_text_field(&mut text, "unsafe_to_claim", Some(unsafe_to_claim));
+    }
+    append_packet_text_field(
+        &mut text,
+        "pagination",
+        Some("structuredContent keeps full arrays; compact text lists first 8"),
+    );
 
     for section in packet
         .pointer("/answer/sections")
@@ -304,16 +334,29 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
         }
     }
 
-    append_packet_string_array(&mut text, "gaps", packet.pointer("/sufficiency/gaps"));
+    append_packet_string_array(
+        &mut text,
+        "omitted_sections",
+        packet.pointer("/budget/omitted_sections"),
+        None,
+    );
+    append_packet_string_array(
+        &mut text,
+        "gaps",
+        packet.pointer("/sufficiency/gaps"),
+        Some("none"),
+    );
     append_packet_string_array(
         &mut text,
         "open_next",
         packet.pointer("/sufficiency/open_next"),
+        Some("none"),
     );
     append_packet_string_array(
         &mut text,
         "follow_up_commands",
         packet.pointer("/sufficiency/follow_up_commands"),
+        Some("none"),
     );
 
     if text.trim().is_empty() {
@@ -333,11 +376,30 @@ fn append_packet_text_field(text: &mut String, label: &str, value: Option<&str>)
     text.push('\n');
 }
 
-fn append_packet_string_array(text: &mut String, title: &str, value: Option<&serde_json::Value>) {
+fn append_packet_bool_field(text: &mut String, label: &str, value: Option<bool>) {
+    let Some(value) = value else {
+        return;
+    };
+    append_packet_text_field(text, label, Some(if value { "true" } else { "false" }));
+}
+
+fn append_packet_string_array(
+    text: &mut String,
+    title: &str,
+    value: Option<&serde_json::Value>,
+    empty_text: Option<&str>,
+) {
     let Some(items) = value.and_then(|value| value.as_array()) else {
         return;
     };
     if items.is_empty() {
+        if let Some(empty_text) = empty_text {
+            text.push('\n');
+            text.push_str(title);
+            text.push_str(": ");
+            text.push_str(empty_text);
+            text.push('\n');
+        }
         return;
     }
     text.push('\n');
@@ -1647,10 +1709,11 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
         ],
         "safety_notes": [
             "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
-            "Use packet for broad task questions; use context only after selecting one concrete target.",
+            "Use packet for broad task questions before snippet/source reads; use context only after selecting one concrete target.",
+            "Treat packet status other than sufficient as unsafe to claim until gaps, open_next, and follow_up_commands are resolved.",
             "Use continuation links from search or definition results before broadening retrieval.",
             "Keep search limits bounded; stdio search clamps limit to 1..50.",
-            "Treat repo-text hits as navigation clues until backed by resolvable sidecar or source evidence."
+            "Treat repo-text hits as navigation clues and search hits as discovery clues until backed by proof-bearing sidecar, graph, or source evidence."
         ]
     })
 }
