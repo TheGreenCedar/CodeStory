@@ -703,10 +703,10 @@ fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
         "sessionrequestcreation"
         | "requestobjectcreation"
         | "requestresumedispatch"
-        | "datarequestvalidation"
         | "requestvalidationpipeline"
         | "delegatecallbackhandling"
         | "urlsessioncallbackboundary" => Some(2),
+        normalized if normalized.ends_with("requestvalidation") => Some(2),
         "serverbootstrap"
         | "commandserverentrypoint"
         | "eventloopsource"

@@ -4231,16 +4231,16 @@ fn packet_has_sufficiency_blocking_budget_omission(
 }
 
 fn packet_missing_probe_requires_compact_proof(query: &str) -> bool {
+    let normalized = normalize_identifier(query);
     matches!(
-        normalize_identifier(query).as_str(),
+        normalized.as_str(),
         "sourcereadbuffer"
             | "sinkwritebuffer"
             | "requestresumedispatch"
             | "requestvalidationpipeline"
-            | "datarequestvalidation"
             | "delegatecallbackhandling"
             | "urlsessioncallbackboundary"
-    )
+    ) || normalized.ends_with("requestvalidation")
 }
 
 pub(crate) fn packet_budget_exceeded_hard_output_cap(budget: &PacketBudgetDto) -> bool {
