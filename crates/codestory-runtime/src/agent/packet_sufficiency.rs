@@ -24,7 +24,7 @@ use codestory_contracts::api::{
     PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
     PacketEvidenceTierDto, PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 pub(crate) const PACKET_MARKDOWN_TRUNCATION_SUFFIX: &str =
@@ -894,13 +894,44 @@ fn packet_coverage_report(
     let budget_omitted = has_sufficiency_blocking_budget_omission
         .then(|| budget.omitted_sections.clone())
         .unwrap_or_default();
+    let provenance_counts = packet_provenance_counts(supported_claims);
+    let provenance_labels = provenance_counts.keys().cloned().collect::<Vec<_>>();
     PacketCoverageReportDto {
         covered,
+        provenance_labels,
+        provenance_counts,
         missing,
         ineligible,
         unresolved: unresolved_sidecar_queries.to_vec(),
         budget_omitted,
     }
+}
+
+fn packet_provenance_counts(claims: &[PacketClaimDto]) -> BTreeMap<String, u32> {
+    let mut counts = BTreeMap::new();
+    for citation in claims.iter().flat_map(|claim| &claim.citations) {
+        let mut labels = citation
+            .retrieval_score_breakdown
+            .as_ref()
+            .map(|breakdown| {
+                breakdown
+                    .provenance
+                    .iter()
+                    .filter(|label| !label.is_empty())
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if labels.is_empty()
+            && let Some(tier) = citation.evidence_tier
+        {
+            labels.insert(packet_evidence_provenance_label(tier).to_string());
+        }
+        for label in labels {
+            *counts.entry(label).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn packet_claim_coverage_label(claim: &PacketClaimDto) -> Option<String> {
@@ -959,6 +990,19 @@ fn packet_evidence_tier_label(tier: PacketEvidenceTierDto) -> &'static str {
         PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
         PacketEvidenceTierDto::ComponentReport => "component_report",
         PacketEvidenceTierDto::DenseSemantic => "dense_semantic",
+        PacketEvidenceTierDto::SyntheticSourceScan => "synthetic_source_scan",
+        PacketEvidenceTierDto::GeneratedSummary => "generated_summary",
+    }
+}
+
+fn packet_evidence_provenance_label(tier: PacketEvidenceTierDto) -> &'static str {
+    match tier {
+        PacketEvidenceTierDto::ExactSource => "exact",
+        PacketEvidenceTierDto::ResolvedGraph => "graph_neighbor",
+        PacketEvidenceTierDto::LexicalSource => "lexical_source",
+        PacketEvidenceTierDto::SymbolDoc => "symbol_doc",
+        PacketEvidenceTierDto::ComponentReport => "component_report",
+        PacketEvidenceTierDto::DenseSemantic => "dense_anchor",
         PacketEvidenceTierDto::SyntheticSourceScan => "synthetic_source_scan",
         PacketEvidenceTierDto::GeneratedSummary => "generated_summary",
     }
@@ -2089,7 +2133,7 @@ mod tests {
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
         NodeKind, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
         PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto,
-        SearchHitOrigin,
+        RetrievalScoreBreakdownDto, SearchHitOrigin,
     };
     use std::path::Path;
 
@@ -3127,6 +3171,99 @@ mod tests {
         let report = sufficiency.coverage_report.as_ref().unwrap();
         assert!(report.missing.is_empty());
         assert!(report.budget_omitted.is_empty());
+    }
+
+    #[test]
+    fn compact_truncated_packet_retains_proof_provenance_counts() {
+        let question = "Explain compact packet provenance.";
+        let answer = answer_fixture(question);
+        let budget = compact_truncated_budget(question, vec!["citations", "markdown_blocks"]);
+        let tier_cases = [
+            ("exact", PacketEvidenceTierDto::ExactSource),
+            ("lexical_source", PacketEvidenceTierDto::LexicalSource),
+            ("symbol_doc", PacketEvidenceTierDto::SymbolDoc),
+            ("graph_neighbor", PacketEvidenceTierDto::ResolvedGraph),
+            ("component_report", PacketEvidenceTierDto::ComponentReport),
+            ("dense_anchor", PacketEvidenceTierDto::DenseSemantic),
+        ];
+        let mut claims = tier_cases
+            .iter()
+            .map(|(label, tier)| {
+                let text = format!("{label} proves provenance.");
+                let path = format!("src/{label}.rs");
+                cited_claim(
+                    &text,
+                    None,
+                    cited_anchor_with_tier(label, &path, *tier, Some(true)),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut future_precise_import = cited_anchor_with_tier(
+            "precise_semantic_import",
+            "src/imports.rs",
+            PacketEvidenceTierDto::DenseSemantic,
+            Some(true),
+        );
+        future_precise_import.retrieval_score_breakdown = Some(RetrievalScoreBreakdownDto {
+            lexical: 0.0,
+            semantic: 1.0,
+            graph: 0.0,
+            total: 1.0,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: vec!["precise_semantic_import".to_string()],
+        });
+        claims.push(cited_claim(
+            "Future precise semantic import provenance passes through.",
+            None,
+            future_precise_import,
+            None,
+        ));
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/project"),
+            question,
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.covered_claims.len(), 7);
+        assert!(!sufficiency.follow_up_commands.is_empty());
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        let expected_labels = [
+            "component_report",
+            "dense_anchor",
+            "exact",
+            "graph_neighbor",
+            "lexical_source",
+            "precise_semantic_import",
+            "symbol_doc",
+        ];
+        assert_eq!(
+            report.provenance_labels,
+            expected_labels
+                .iter()
+                .map(|label| (*label).to_string())
+                .collect::<Vec<_>>()
+        );
+        for label in expected_labels {
+            assert_eq!(report.provenance_counts.get(label), Some(&1));
+        }
+        assert!(
+            budget.truncated
+                && budget
+                    .omitted_sections
+                    .iter()
+                    .any(|item| item == "citations"),
+            "compact truncation state should remain visible beside provenance"
+        );
     }
 
     #[test]
