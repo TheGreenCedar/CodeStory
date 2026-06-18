@@ -498,13 +498,13 @@ pub(crate) struct CacheRehydrateCommand {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Existing worktree whose CodeStory cache should be reused."
+        help = "Existing worktree whose CodeStory cache shell should be checked and copied."
     )]
     pub(crate) from_project: PathBuf,
     #[arg(
         long,
         value_name = "PATH",
-        help = "Source cache directory to copy. If omitted, the normal cache location for --from-project is used."
+        help = "Source cache directory to snapshot. If omitted, the normal cache location for --from-project is used."
     )]
     pub(crate) from_cache_dir: Option<PathBuf>,
     #[arg(

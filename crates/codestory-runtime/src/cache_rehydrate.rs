@@ -31,6 +31,8 @@ pub struct CacheRehydrateOutput {
     pub copied: bool,
     pub dry_run: bool,
     pub invalidated_retrieval_manifests: usize,
+    pub invalidated_path_bound_rows: usize,
+    pub preserved_scope: String,
     pub retrieval: String,
     pub next_commands: Vec<String>,
 }
@@ -129,18 +131,22 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         )?;
     }
     let mut invalidated_retrieval_manifests = 0;
+    let mut invalidated_path_bound_rows = 0;
     if !request.dry_run {
         let mut storage = Store::open(&target_db).context("open copied target cache")?;
         invalidated_retrieval_manifests = storage
             .clear_retrieval_index_manifests()
             .context("invalidate copied retrieval manifests")?;
+        invalidated_path_bound_rows = storage
+            .clear_rehydrated_path_bound_cache()
+            .context("clear copied path-bound cache rows")?;
     }
 
     Ok(CacheRehydrateOutput {
         status: if request.dry_run {
-            "would_reuse".into()
+            "would_prepare".into()
         } else {
-            "reused".into()
+            "prepared".into()
         },
         reason: None,
         source_project: display_path(request.source_project),
@@ -156,7 +162,9 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         copied: !request.dry_run,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests,
-        retrieval: "sidecar manifests invalidated; run retrieval index to rebuild under the target worktree id".into(),
+        invalidated_path_bound_rows,
+        preserved_scope: "schema_and_path_independent_rows_only".into(),
+        retrieval: "path-bound index/search/doc/artifact rows cleared; run full index and retrieval index under the target worktree identity".into(),
         next_commands: reuse_next_commands(request.target_project),
     })
 }
@@ -257,7 +265,9 @@ fn skipped(
         copied: false,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests: 0,
-        retrieval: "not reused; normal index/retrieval rebuild required".into(),
+        invalidated_path_bound_rows: 0,
+        preserved_scope: "none".into(),
+        retrieval: "not prepared; normal index/retrieval rebuild required".into(),
         next_commands,
     }
 }
@@ -311,8 +321,7 @@ fn rebuild_commands(project: &Path) -> Vec<String> {
 fn reuse_next_commands(project: &Path) -> Vec<String> {
     let project = quote_path(project);
     vec![
-        format!("codestory-cli doctor --project {project}"),
-        format!("codestory-cli index --project {project} --refresh incremental"),
+        format!("codestory-cli index --project {project} --refresh full"),
         format!("codestory-cli retrieval index --project {project} --refresh full"),
         format!("codestory-cli doctor --project {project}"),
     ]
@@ -339,7 +348,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn rehydrate_copies_cache_and_invalidates_retrieval_manifest() {
+    fn rehydrate_copies_cache_shell_and_clears_path_bound_rows() {
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -358,9 +367,14 @@ mod tests {
         })
         .expect("rehydrate");
 
-        assert_eq!(output.status, "reused");
+        assert_eq!(output.status, "prepared");
         assert!(target_cache_path.join("codestory.db").is_file());
         assert_eq!(output.invalidated_retrieval_manifests, 1);
+        assert!(output.invalidated_path_bound_rows > 0);
+        assert_eq!(
+            output.preserved_scope,
+            "schema_and_path_independent_rows_only"
+        );
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
             storage
@@ -368,6 +382,15 @@ mod tests {
                 .expect("list manifests")
                 .is_empty()
         );
+        let source_root = source_project.path().to_string_lossy();
+        assert_eq!(
+            storage
+                .path_bound_text_match_count(&source_root)
+                .expect("source root scan"),
+            0,
+            "rehydrated target DB must not retain source-worktree absolute paths"
+        );
+        assert_eq!(storage.get_stats().expect("stats").file_count, 0);
     }
 
     #[test]
@@ -450,18 +473,32 @@ mod tests {
 
     fn seed_cache(path: &Path, project: &Path) {
         let mut storage = Store::open(path).expect("open storage");
+        let absolute_source = project.join("src.rs");
+        let absolute_source_text = absolute_source.to_string_lossy().to_string();
         storage
-            .insert_nodes_batch(&[Node {
-                id: NodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "src.rs".into(),
-                ..Default::default()
-            }])
+            .insert_nodes_batch(&[
+                Node {
+                    id: NodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: absolute_source_text.clone(),
+                    ..Default::default()
+                },
+                Node {
+                    id: NodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("{absolute_source_text}::run"),
+                    qualified_name: Some(format!("{absolute_source_text}::run")),
+                    file_node_id: Some(NodeId(1)),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    ..Default::default()
+                },
+            ])
             .expect("node");
         storage
             .insert_file(&codestory_store::FileInfo {
                 id: 1,
-                path: PathBuf::from("src.rs"),
+                path: PathBuf::from(&absolute_source_text),
                 language: "rust".into(),
                 modification_time: 1,
                 indexed: true,
@@ -470,6 +507,52 @@ mod tests {
                 file_role: codestory_store::FileRole::Source,
             })
             .expect("file");
+        storage
+            .rebuild_search_symbol_projection_from_node_table()
+            .expect("projection");
+        storage
+            .upsert_symbol_search_docs_batch(&[codestory_store::SymbolSearchDoc {
+                node_id: NodeId(2),
+                file_node_id: Some(NodeId(1)),
+                kind: NodeKind::FUNCTION,
+                display_name: format!("{absolute_source_text}::run"),
+                qualified_name: Some(format!("{absolute_source_text}::run")),
+                file_path: Some(absolute_source_text.clone()),
+                start_line: Some(1),
+                doc_text: format!("source file: {absolute_source_text}"),
+                doc_version: 1,
+                doc_hash: "symbol-doc-hash".into(),
+                policy_version: "test".into(),
+                source_provenance: absolute_source_text.clone(),
+                updated_at_epoch_ms: 1,
+            }])
+            .expect("symbol docs");
+        storage
+            .upsert_llm_symbol_docs_batch(&[codestory_store::LlmSymbolDoc {
+                node_id: NodeId(2),
+                file_node_id: Some(NodeId(1)),
+                kind: NodeKind::FUNCTION,
+                display_name: format!("{absolute_source_text}::run"),
+                qualified_name: Some(format!("{absolute_source_text}::run")),
+                file_path: Some(absolute_source_text.clone()),
+                start_line: Some(1),
+                doc_text: format!("llm source file: {absolute_source_text}"),
+                doc_version: 1,
+                doc_hash: "llm-doc-hash".into(),
+                embedding_profile: None,
+                embedding_model: "test".into(),
+                embedding_backend: None,
+                embedding_dim: 1,
+                doc_shape: None,
+                semantic_policy_version: None,
+                dense_reason: None,
+                embedding: vec![1.0],
+                updated_at_epoch_ms: 1,
+            }])
+            .expect("llm docs");
+        storage
+            .upsert_index_artifact_cache(&absolute_source, "artifact-cache-key", b"artifact")
+            .expect("artifact");
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: codestory_retrieval::project_id_for_root(project),

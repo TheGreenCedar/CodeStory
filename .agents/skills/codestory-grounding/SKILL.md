@@ -95,7 +95,7 @@ needed, load only the relevant command reference below.
 Detailed argument tables, output examples, and usage patterns for each command:
 
 - [index](references/index.md) - Build or refresh the symbol index
-- [cache](references/cache.md) - Reuse compatible CodeStory caches across worktrees
+- [cache](references/cache.md) - Prepare compatible CodeStory cache shells across worktrees
 - [ground](references/ground.md) - Compact codebase context snapshot
 - [doctor](references/doctor.md) - Read-only project/cache/index/retrieval health check
 - [packet](references/packet.md) - Broad task packet with sufficiency contract

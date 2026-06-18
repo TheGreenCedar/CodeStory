@@ -120,7 +120,7 @@ Read these pages first:
 - explicit `--cache-dir`: use the exact directory you passed
 - `cache identity`: reports the root-derived project id, canonical repository id, Git remote/tree freshness input, cache schema version, and portable-reuse eligibility without changing cache files
 - Child worktree reuse: run `codestory-cli cache rehydrate --from-project <main-or-parent-worktree> --project <child-worktree>` before the first child-thread index. The command copies the source CodeStory cache only when both worktrees are clean, share the same `origin` URL, have the same Git tree, the source SQLite schema matches the running CLI, and the target cache directory is empty.
-- Rehydrated caches reuse the core SQLite grounding/index/search-doc data, then invalidate copied retrieval manifests. Run `codestory-cli retrieval index --project <child-worktree> --refresh full` so sidecar artifacts rebuild under the child worktree identity.
+- Rehydrated caches reuse path-bound SQLite graph/search/doc rows under the child worktree path, then invalidate copied index artifact cache rows and retrieval manifests. Run the printed `index --refresh full` and `retrieval index --refresh full` commands so those surfaces rebuild under the child worktree identity.
 - If `cache rehydrate` reports `skipped`, use the printed rebuild commands. This is CodeStory cache reuse only; it does not configure Rust compilation caching such as `sccache`.
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
 - `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`

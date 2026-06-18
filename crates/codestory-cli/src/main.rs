@@ -311,10 +311,16 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
         let _ = writeln!(markdown, "source_files: `{source_file_count}`");
     }
     let _ = writeln!(markdown, "copied: `{}`", output.copied);
+    let _ = writeln!(markdown, "preserved_scope: `{}`", output.preserved_scope);
     let _ = writeln!(
         markdown,
         "invalidated_retrieval_manifests: `{}`",
         output.invalidated_retrieval_manifests
+    );
+    let _ = writeln!(
+        markdown,
+        "invalidated_path_bound_rows: `{}`",
+        output.invalidated_path_bound_rows
     );
     let _ = writeln!(markdown, "retrieval: {}", output.retrieval);
     if !output.next_commands.is_empty() {

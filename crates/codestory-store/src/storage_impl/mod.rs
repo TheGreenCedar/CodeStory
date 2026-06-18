@@ -1623,6 +1623,92 @@ impl Storage {
         Ok(())
     }
 
+    pub fn clear_rehydrated_path_bound_cache(&mut self) -> Result<usize, StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut removed = 0usize;
+        for statement in [
+            "DELETE FROM callable_projection_state",
+            "DELETE FROM occurrence",
+            "DELETE FROM edge",
+            "DELETE FROM llm_symbol_doc",
+            "DELETE FROM symbol_search_doc",
+            "DELETE FROM symbol_summary",
+            "DELETE FROM search_symbol_projection",
+            "DELETE FROM component_access",
+            "DELETE FROM bookmark_node",
+            "DELETE FROM local_symbol",
+            "DELETE FROM error",
+            "DELETE FROM node",
+            "DELETE FROM file",
+            "DELETE FROM grounding_repo_stats_snapshot",
+            "DELETE FROM grounding_file_snapshot",
+            "DELETE FROM grounding_node_snapshot",
+            "DELETE FROM grounding_node_summary_snapshot",
+            "DELETE FROM grounding_node_edge_digest_snapshot",
+            "DELETE FROM resolution_support_snapshot",
+            "DELETE FROM retrieval_index_manifest",
+            "DELETE FROM index_artifact_cache",
+        ] {
+            removed = removed.saturating_add(tx.execute(statement, [])?);
+        }
+        tx.execute(
+            "INSERT INTO grounding_snapshot_meta (
+                id,
+                snapshot_version,
+                summary_state,
+                detail_state,
+                summary_built_at_epoch_ms,
+                detail_built_at_epoch_ms
+             )
+             VALUES (1, ?1, ?2, ?2, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+                snapshot_version = excluded.snapshot_version,
+                summary_state = excluded.summary_state,
+                detail_state = excluded.detail_state,
+                summary_built_at_epoch_ms = NULL,
+                detail_built_at_epoch_ms = NULL",
+            params![
+                GROUNDING_SNAPSHOT_VERSION,
+                GroundingSnapshotState::Dirty.db_value()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO resolution_support_snapshot (
+                id,
+                snapshot_version,
+                state,
+                snapshot_blob,
+                built_at_epoch_ms
+             )
+             VALUES (1, 0, ?1, NULL, NULL)",
+            params![GroundingSnapshotState::Dirty.db_value()],
+        )?;
+        tx.commit()?;
+        self.cache.nodes.write().clear();
+        Ok(removed)
+    }
+
+    pub fn path_bound_text_match_count(&self, prefix: &str) -> Result<usize, StorageError> {
+        let pattern = format!("%{prefix}%");
+        let mut count = 0usize;
+        for sql in [
+            "SELECT COUNT(*) FROM file WHERE path LIKE ?1",
+            "SELECT COUNT(*) FROM node WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1",
+            "SELECT COUNT(*) FROM llm_symbol_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1",
+            "SELECT COUNT(*) FROM symbol_search_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1 OR source_provenance LIKE ?1",
+            "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
+            "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
+            "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
+            "SELECT COUNT(*) FROM index_artifact_cache WHERE file_path LIKE ?1 OR cache_key LIKE ?1",
+        ] {
+            let matched: i64 = self
+                .conn
+                .query_row(sql, params![pattern], |row| row.get(0))?;
+            count = count.saturating_add(matched.max(0) as usize);
+        }
+        Ok(count)
+    }
+
     pub fn finalize_staged_snapshot(&self) -> Result<(), StorageError> {
         self.refresh_grounding_summary_snapshots()?;
         if self.deferred_secondary_indexes {
