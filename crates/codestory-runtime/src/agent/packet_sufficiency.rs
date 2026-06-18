@@ -910,28 +910,58 @@ fn packet_coverage_report(
 fn packet_provenance_counts(claims: &[PacketClaimDto]) -> BTreeMap<String, u32> {
     let mut counts = BTreeMap::new();
     for citation in claims.iter().flat_map(|claim| &claim.citations) {
-        let mut labels = citation
-            .retrieval_score_breakdown
-            .as_ref()
-            .map(|breakdown| {
-                breakdown
-                    .provenance
-                    .iter()
-                    .filter(|label| !label.is_empty())
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        if labels.is_empty()
-            && let Some(tier) = citation.evidence_tier
-        {
-            labels.insert(packet_evidence_provenance_label(tier).to_string());
-        }
+        let labels = packet_citation_provenance_labels(citation);
         for label in labels {
             *counts.entry(label).or_insert(0) += 1;
         }
     }
     counts
+}
+
+fn packet_citation_provenance_labels(citation: &AgentCitationDto) -> BTreeSet<String> {
+    let mut labels = citation
+        .retrieval_score_breakdown
+        .as_ref()
+        .map(|breakdown| {
+            breakdown
+                .provenance
+                .iter()
+                .filter(|label| packet_pass_through_provenance_label(label))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(tier) = citation.evidence_tier {
+        if labels.is_empty() {
+            labels.insert(packet_evidence_provenance_label(tier).to_string());
+        }
+    } else if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
+        labels.extend(
+            breakdown
+                .provenance
+                .iter()
+                .filter(|label| packet_public_provenance_label(label))
+                .cloned(),
+        );
+    }
+    labels
+}
+
+fn packet_pass_through_provenance_label(label: &str) -> bool {
+    matches!(label, "precise_semantic_import")
+}
+
+fn packet_public_provenance_label(label: &str) -> bool {
+    packet_pass_through_provenance_label(label)
+        || matches!(
+            label,
+            "exact"
+                | "lexical_source"
+                | "symbol_doc"
+                | "graph_neighbor"
+                | "component_report"
+                | "dense_anchor"
+        )
 }
 
 fn packet_claim_coverage_label(claim: &PacketClaimDto) -> Option<String> {
@@ -3178,6 +3208,17 @@ mod tests {
         let question = "Explain compact packet provenance.";
         let answer = answer_fixture(question);
         let budget = compact_truncated_budget(question, vec!["citations", "markdown_blocks"]);
+        let score_breakdown = |provenance: Vec<&str>| RetrievalScoreBreakdownDto {
+            lexical: 0.0,
+            semantic: 1.0,
+            graph: 0.0,
+            total: 1.0,
+            tier_cap: None,
+            boosts: Vec::new(),
+            dampening: Vec::new(),
+            final_rank_reason: None,
+            provenance: provenance.into_iter().map(str::to_string).collect(),
+        };
         let tier_cases = [
             ("exact", PacketEvidenceTierDto::ExactSource),
             ("lexical_source", PacketEvidenceTierDto::LexicalSource),
@@ -3191,12 +3232,13 @@ mod tests {
             .map(|(label, tier)| {
                 let text = format!("{label} proves provenance.");
                 let path = format!("src/{label}.rs");
-                cited_claim(
-                    &text,
-                    None,
-                    cited_anchor_with_tier(label, &path, *tier, Some(true)),
-                    None,
-                )
+                let mut citation = cited_anchor_with_tier(label, &path, *tier, Some(true));
+                if *label == "lexical_source" {
+                    citation.retrieval_score_breakdown = Some(score_breakdown(vec![
+                        "packet_required_file_scoped_source_probe",
+                    ]));
+                }
+                cited_claim(&text, None, citation, None)
             })
             .collect::<Vec<_>>();
         let mut future_precise_import = cited_anchor_with_tier(
@@ -3205,17 +3247,8 @@ mod tests {
             PacketEvidenceTierDto::DenseSemantic,
             Some(true),
         );
-        future_precise_import.retrieval_score_breakdown = Some(RetrievalScoreBreakdownDto {
-            lexical: 0.0,
-            semantic: 1.0,
-            graph: 0.0,
-            total: 1.0,
-            tier_cap: None,
-            boosts: Vec::new(),
-            dampening: Vec::new(),
-            final_rank_reason: None,
-            provenance: vec!["precise_semantic_import".to_string()],
-        });
+        future_precise_import.retrieval_score_breakdown =
+            Some(score_breakdown(vec!["precise_semantic_import"]));
         claims.push(cited_claim(
             "Future precise semantic import provenance passes through.",
             None,
@@ -3256,6 +3289,11 @@ mod tests {
         for label in expected_labels {
             assert_eq!(report.provenance_counts.get(label), Some(&1));
         }
+        assert!(
+            !report
+                .provenance_counts
+                .contains_key("packet_required_file_scoped_source_probe")
+        );
         assert!(
             budget.truncated
                 && budget
