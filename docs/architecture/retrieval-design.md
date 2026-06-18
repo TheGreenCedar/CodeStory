@@ -104,6 +104,33 @@ and may be dense anchors with reason `component_report`.
 - Broad packet/search results must preserve provenance and mark weak evidence.
 - Search plans and repo-text diagnostics are discovery aids, not final proof.
 - Promotion metrics must come from one coherent fresh artifact run.
+- `retrieval_mode=full` is necessary infrastructure readiness. It is not enough
+  to promote answer quality or language quality without packet-runtime or drill
+  evidence at the matching proof tier.
+
+Packet citations may expose optional JSON fields: `evidence_tier`,
+`evidence_producer`, `resolution_status`, `coverage_role`, and
+`eligible_for_sufficiency`. Sufficiency is role-bearing: a citation can help
+prove a packet claim only when the evidence tier, resolved/source-range status,
+and coverage role match the claim being covered.
+
+| Evidence tier | Proof role | Sufficiency rule |
+| --- | --- | --- |
+| `exact_source` | Source line/range that directly covers the claim role. | Proof-bearing when source-range or resolved metadata is role-aligned. |
+| `resolved_graph` | Typed graph symbol, edge, route, receiver, or dependency evidence. | Proof-bearing when resolved and aligned to the required role. |
+| `lexical_source` | Lexical source hit from the manifest generation. | Proof-bearing only when the source range and role identify the needed behavior or shape. |
+| `symbol_doc` | Generated graph-native symbol document. | Proof-bearing when it points back to resolved symbol/source provenance for the required role. |
+| `component_report` | Deterministic graph component artifact. | Proof-bearing for ownership or component-shape claims when backed by graph/source provenance. |
+| `dense_semantic` | Dense-anchor recall signal. | Diagnostic unless another proof-bearing citation covers the role. |
+| `generated_summary` | Generated explanation or summary. | Diagnostic only. |
+| `synthetic_source_scan` | Generic source scan, repo-text, or synthetic probe. | Diagnostic unless runtime policy admits a specific structural/source-shape role. |
+
+Generic `source evidence` is not proof by itself. Proof-bearing roles need
+resolved or role-aligned source, graph, lexical, symbol-doc, or component
+evidence. Dense semantic hits, generated summaries, repo-text, and generic
+synthetic source scans can explain where to look, but they must not carry
+sufficiency unless a runtime policy explicitly admits their structural/source
+shape for that role.
 
 ## Cost Envelope
 

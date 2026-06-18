@@ -4,8 +4,9 @@ Local Zoekt, Qdrant, SCIP, and llama.cpp processes for agent `packet` and
 `search`. Data dirs live under the user cache; default ports are 6070 (Zoekt)
 and 6333 (Qdrant).
 
-Required for `agent_packet_search` readiness (`retrieval_mode=full`). A healthy
-SQLite cache alone does not satisfy that lane.
+Required for `agent_packet_search` infrastructure readiness
+(`retrieval_mode=full`). A healthy SQLite cache alone does not satisfy that
+lane, and full sidecars do not by themselves promote answer quality.
 
 Design: [`retrieval-design.md`](../architecture/retrieval-design.md).
 Promotion checks: [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
@@ -45,11 +46,12 @@ The `--project .` is intentional here. For another repo, pass that repo path to
 
 Plain `codestory-cli index` builds the core SQLite code index only. It can make
 the local navigation lane usable, but it does not generate sidecar artifacts or
-prove agent packet/search readiness. Use
+prove agent packet/search infrastructure readiness. Use
 `codestory-cli retrieval index --project <repo>` to generate Zoekt, Qdrant, and
 SCIP sidecar artifacts, then use `codestory-cli retrieval status --project
 <repo> --format json` to verify `retrieval_mode: "full"` before using
-agent-facing packet/search evidence.
+agent-facing packet/search evidence. Packet answer quality still requires the
+matching packet-runtime or drill evidence tier.
 
 First-run evidence path:
 

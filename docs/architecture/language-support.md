@@ -17,6 +17,9 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
 | Structural collector | Dedicated extractor emits structural entities. | Parser-backed code navigation. |
 | Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
+| Packet proof gate | A packet-runtime artifact proves the current packet citation and sufficiency contract for the measured tasks. | Public product-grade language quality. |
+| Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
+| Development comparison | A reused-baseline or local-real artifact informs tuning and diagnosis. | Fresh publishable promotion proof. |
 
 ## Current Runtime Claims
 
@@ -30,7 +33,24 @@ report is not blanket promotion proof for every parser-backed language.
 
 ## Latest Agent-Facing Evidence
 
-The latest language-expansion comparison artifact was built on 2026-06-17:
+The current publishable packet-runtime proof gate is the June 18 packet-runtime
+status. It is blocked:
+
+| Measure | Status | Read |
+| --- | ---: | --- |
+| Runs | `108/108` success | Runtime completed all measured tasks. |
+| Quality | `106/108` pass | Two rows still miss the quality bar. |
+| Sufficiency | `107/108` sufficient, `1` partial | One packet is not proof-complete. |
+| Cold SLA | `8` misses | Cold latency still blocks publishable promotion. |
+
+Safe wording: packet-runtime is implemented and completing the suite, but
+publishable agent-facing packet quality is not promoted until a coherent run has
+all quality, sufficiency, and cold-SLA gates green. This evidence is a
+development/proof-gate signal, not public product-grade proof for every
+parser-backed language. HTML, CSS, and SQL remain structural collectors.
+
+Older development comparison: the language-expansion comparison artifact built
+on 2026-06-17:
 `target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.md`.
 
 It is an offline reused-baseline composite. It combines the fixed no-CodeStory
@@ -40,8 +60,8 @@ with the CodeStory-only confirmation at
 No harness arm was executed to create the composite, and no no-CodeStory rows
 were rerun.
 
-That artifact is the current development-quality read, not a final public
-promotion claim:
+That artifact is a development-quality read, not a final public promotion
+claim:
 
 | Measure | With CodeStory | Without CodeStory | Read |
 | --- | ---: | ---: | --- |
@@ -53,7 +73,7 @@ promotion claim:
 | Commands | `54` | `471` | CodeStory kept exploration bounded. |
 | Source reads | `0` | `417` | The CodeStory arm stayed packet-first. |
 
-Safe wording: on the current fixed-baseline development comparison, CodeStory is
+Safe wording: on the fixed-baseline development comparison, CodeStory is
 quality-equal or better on every measured language task and materially cheaper
 overall. Do not describe this as product-grade proof for every supported
 language or framework until repeat, freshness, breadth, and promotion metadata

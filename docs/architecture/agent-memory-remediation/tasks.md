@@ -22,7 +22,7 @@
   - [x] 3.1 Mark `source evidence` and adjacent-ownership claims ineligible unless they carry a required coverage role.
   - [x] 3.2 Populate `coverage_report.ineligible` with claim id or text, role, tier, and reason.
   - [x] 3.3 Add regressions for the HTML false-sufficient row and SQL false-partial row.
-  - _Requirements: 1.2, 2.1, 2.2, 3.2_
+  - _Requirements: 1.2, 1.4, 2.1, 2.2, 3.2_
 
 ## Phase 3: Add Structural Language Policy
 
@@ -55,8 +55,15 @@
   - [x] 7.1 Expand `scripts/lint-retrieval-generalization.mjs` to scan production packet modules for manifest-derived repo slugs, paths, symbols, and exact expected claims.
   - [x] 7.2 Add a fixture that proves a generic role rule can satisfy a synthetic non-benchmark repo prompt.
   - [x] 7.3 Run the 7-task subset before the full gate.
-  - [ ] 7.4 Run the full `language-expansion-holdout` packet-runtime publishable gate with `--jobs 4` after subset pass.
-  - _Requirements: 6.1, 6.2, 6.3_
+  - [ ] 7.4 Pass the full `language-expansion-holdout` packet-runtime publishable gate with `--jobs 4` after subset pass.
+  - _Requirements: 6.1, 6.2, 6.3, 6.4_
+
+## Current Evidence
+
+- Current branch: `codex/packet-answer-quality-hardening-review`.
+- Full non-publishable packet-runtime proof artifact: `target/agent-benchmark/language-expansion-proof-full-form-command-shapes/packet-runtime-summary.md`, generated `2026-06-18T12:03:23.059Z`. Totals: 108 runs, 108 success, 108 quality, 108 sufficient, 9 cold SLA misses. This is not publishable proof because cold SLA misses remain.
+- Latest publishable attempt artifact: `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes/packet-runtime-summary.md`, generated `2026-06-18T12:23:54.418Z`. Totals: 108 runs, 108 success, 106 quality, 107 sufficient, 1 partial, 8 cold SLA misses.
+- Latest publishable blockers: `apache-commons-lang` cold SLA 3/3; `redis` cold SLA 3/3; `AutoMapper` cold SLA 1/3; `dart-http` cold SLA 1/3; `square-okio` cold quality 2/3; `Alamofire` cold quality 2/3 and 1 partial sufficiency.
 
 ## Verification Gates
 
@@ -64,7 +71,7 @@
 - `node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs`
 - `node --test scripts/tests/codestory-benchmark-contract.test.mjs`
 - `cargo test -p codestory-runtime --test retrieval_generalization_guard`
-- `cargo test -p codestory-runtime --lib`
+- `cargo test -p codestory-runtime --lib` - required, unconfirmed; do not claim passed.
 - `cargo test -p codestory-retrieval`
 - targeted 7-task packet-runtime subset from the research note
-- full `language-expansion-holdout` packet-runtime publishable gate with `--jobs 4 --prepare-codestory-jobs 1`
+- full `language-expansion-holdout` packet-runtime publishable gate with `--jobs 4 --prepare-codestory-jobs 2`

@@ -12,6 +12,23 @@ env vars, CI smoke), [`../architecture/retrieval-design.md`](../architecture/ret
 
 ---
 
+## Role-Bearing Packet Sufficiency Contract
+
+Packet sufficiency is claim-role based, not citation-count based. Packet
+citations may expose `evidence_tier`, `evidence_producer`,
+`resolution_status`, `coverage_role`, and `eligible_for_sufficiency`; only
+role-aligned citations can close the matching coverage role.
+
+Proof-bearing packet roles require resolved or role-aligned source, graph,
+lexical, symbol-doc, or component evidence. Dense semantic hits, generated
+summaries, repo-text, and generic synthetic source scans are diagnostic unless a
+runtime policy admits a specific structural/source-shape role. Generic `source
+evidence` is not enough to mark a packet sufficient.
+
+`retrieval_mode=full` is mandatory infrastructure readiness for product packet
+paths. It does not promote answer quality, agent usefulness, or public language
+quality without the packet-runtime or drill evidence required by the proof tier.
+
 ## Implemented Stack
 
 | Layer | Location | Role |
@@ -110,6 +127,7 @@ test-only eval probe module.
 ## Required Checks
 
 ```sh
+cargo test -p codestory-retrieval
 cargo test -p codestory-runtime --test retrieval_generalization_guard
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 ```
@@ -117,7 +135,6 @@ node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 Optional broader lane:
 
 ```sh
-cargo test -p codestory-retrieval
 cargo test -p codestory-runtime
 node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 ```

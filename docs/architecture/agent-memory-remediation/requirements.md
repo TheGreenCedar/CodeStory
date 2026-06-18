@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This document defines the remaining remediation requirements for packet-runtime promotion after commit `1518da56 harden packet evidence`.
+This document defines the current remediation requirements for packet-runtime promotion on branch `codex/packet-answer-quality-hardening-review` after commit `34aa184c harden generic packet proof roles`.
 
 ## Glossary
 
@@ -24,6 +24,7 @@ This document defines the remaining remediation requirements for packet-runtime 
 1. WHEN a packet is scored, THE **CoverageReportBuilder** SHALL compute missing coverage from `FlowRequirementEngine` role ids and coverage modes.
 2. WHEN a claim only points at evidence without explaining a required role, THE **CoverageReportBuilder** SHALL mark it diagnostic and exclude it from sufficiency.
 3. WHEN required role coverage is present through eligible citations, THE **CoverageReportBuilder** SHALL NOT block sufficiency only because a planned probe query string was not repeated verbatim.
+4. WHEN sidecar candidates are unresolved or not tied to an eligible proof role, THE **CoverageReportBuilder** SHALL report them as diagnostic navigation candidates only and SHALL NOT count them toward sufficiency.
 
 ### Requirement 2: Structural Language Proof Eligibility
 
@@ -44,6 +45,7 @@ This document defines the remaining remediation requirements for packet-runtime 
 1. WHEN JavaScript prototype or object-assignment methods are cited, THE **PacketAnswerSynthesizer** SHALL preserve source-defined aliases such as receiver method names when available.
 2. WHEN a route or dispatch packet cites only nearby files but misses entrypoint or dispatch symbols, THE **PacketAnswerSynthesizer** SHALL leave a specific gap instead of emitting unrelated source-evidence claims.
 3. WHEN benchmark expected claims are needed for scoring, THE **PacketAnswerSynthesizer** SHALL NOT contain those exact expected claim strings in production code.
+4. WHEN a shell install or dispatch packet is scored, THE **FlowRequirementEngine** SHALL require generic shell install and dispatch roles derived from command/source shape, not benchmark repository identity.
 
 ### Requirement 4: Compact Budget Retains Proof First
 
@@ -74,3 +76,4 @@ This document defines the remaining remediation requirements for packet-runtime 
 1. WHEN production packet modules are scanned, THE **BenchmarkProvenanceGate** SHALL fail if manifest repo slugs, expected paths, expected symbols, or expected claim phrases appear outside eval/test boundaries.
 2. WHEN targeted language regressions pass, THE **BenchmarkProvenanceGate** SHALL still require the publishable language-expansion packet-runtime gate before promotion.
 3. WHEN a new role rule is added, THE **FlowRequirementEngine** SHALL express it as a generic source shape, not a repository or product-specific rule.
+4. WHEN benchmark contract fingerprints or eval-probe catalogs are present, THE **BenchmarkProvenanceGate** SHALL keep them behind non-publishable eval/test boundaries and SHALL NOT treat them as publishable packet proof.

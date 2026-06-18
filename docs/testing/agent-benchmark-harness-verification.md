@@ -50,15 +50,22 @@ candidate files for verification, not as final answer support.
 Keep `node ./scripts/codestory-agent-ab-benchmark.mjs --list` as the cheapest
 configuration smoke check.
 
-The language-support A/B suite is:
+The language-support promotion packet-runtime suite is:
 
 ```powershell
+cargo build --release -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs `
+  --packet-runtime `
+  --packet-runtime-mode both `
   --task-suite language-expansion-holdout `
-  --arms without_codestory,with_codestory `
-  --repeats 3 --materialize-repos --prepare-codestory-cache `
-  --out-dir target/agent-benchmark/language-expansion-holdout `
-  --timeout-ms 600000
+  --repeats 3 `
+  --materialize-repos `
+  --jobs 4 `
+  --prepare-codestory-jobs 2 `
+  --codestory-cli target/release/codestory-cli.exe `
+  --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes `
+  --timeout-ms 180000 `
+  --publishable
 ```
 
 The run ledger records per-run `wall_ms`, token usage, estimated cost when
@@ -147,29 +154,48 @@ For anti-overfit language work, run packet probes with production defaults and
 keep exact benchmark probes behind manifests, explicit request probes, or
 `CODESTORY_EVAL_PROBES=1` diagnostics only. Do not treat general
 framework/domain semantics as overfit when they apply to real projects.
-The current clean serial packet runtime scores `12/18` manifest-quality passes
-without sidecar failures, with `9/18` rows packet-sufficient without follow-up
-commands and Java, Redis, and Okio still missing the retrieval latency SLA. The
-matching packet-gated A/B slice is useful for cost/time/tool-call accounting
-(`9/9` CodeStory quality versus `6/9` baseline), but it is not promotion
-evidence for all public language-support profiles because the slice is selected
-from rows that are useful to compare today.
+The current June 18 packet-runtime proof is split:
+
+- Non-publishable diagnostic artifact:
+  `target/agent-benchmark/language-expansion-proof-full-form-command-shapes`,
+  generated `2026-06-18T12:03:23.059Z`. It has `108/108` success, `108/108`
+  quality, and `108/108` sufficiency, but `9` cold SLA misses. Use it only as
+  development proof.
+- Publishable artifact:
+  `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`,
+  generated `2026-06-18T12:23:54.418Z`. It has `108/108` success, `106/108`
+  quality, `107/108` sufficiency, `1` partial, and `8` cold SLA misses.
+  Promotion is blocked.
+
+Current blockers are apache-commons-lang cold SLA `3/3`, redis cold SLA `3/3`,
+AutoMapper cold SLA `1/3`, dart-http cold SLA `1/3`, square-okio cold quality
+`2/3`, and Alamofire cold quality `2/3` plus `1` partial sufficiency.
+The older packet-gated A/B slice remains useful for cost/time/tool-call
+accounting, but it is diagnostic and selected from rows that were useful to
+compare at the time.
 
 The lower-level packet runtime mode can also be run directly with row-level
 parallelism:
 
 ```powershell
 node scripts\codestory-agent-ab-benchmark.mjs `
-  --packet-runtime --packet-runtime-mode cold-cli `
-  --task-ids <comma-separated-task-ids> `
+  --packet-runtime --packet-runtime-mode both `
+  --task-suite language-expansion-holdout `
+  --repeats 3 `
+  --materialize-repos `
   --jobs 4 --prepare-codestory-jobs 2 `
-  --out-dir target\agent-benchmark\<run-name>
+  --codestory-cli target\release\codestory-cli.exe `
+  --out-dir target\agent-benchmark\<run-name> `
+  --timeout-ms 180000 `
+  --publishable
 ```
 
 This mode runs only CodeStory packet probes and does not start nested agents.
-Keep `--prepare-codestory-jobs` lower than packet row concurrency; `2` to `4`
-is usually the practical cap before local indexing, embedding, or Qdrant work
-starts contending with itself.
+For the language-expansion eval lane, `--jobs 4` is valid row concurrency.
+Keep `--prepare-codestory-jobs` lower than packet row concurrency; use `2` for
+examples unless a file already has `1` for serial prep.
+Add `--task-ids <comma-separated-task-ids>` only for targeted diagnostics; a
+task-filtered run is not the full-suite promotion shape.
 
 Nested A/B runs can use `--jobs N` too, but the harness parallelizes only
 independent repo groups. Arms, repeats, and multiple tasks for the same repo
@@ -190,8 +216,11 @@ Baseline reuse is strict. The benchmark reuses only `without_codestory` rows
 whose repo, task id, repeat, and task manifest snapshot match the current run.
 It reanalyzes the old raw row with the current analyzer, copies stdout/stderr
 and baseline-context artifacts into the new output directory, and annotates the
-row with `reused_from`. Do not reuse baselines across manifest or scorer
-changes; rerun the no-CodeStory arm in those cases.
+row with `reused_from`. Stale `--reuse-baseline-from` or fixed no-CodeStory
+comparisons are development diagnostics unless the current harness accepts
+matching fingerprints, and they are never enough for packet-runtime promotion
+by themselves. Do not reuse baselines across manifest or scorer changes; rerun
+the no-CodeStory arm in those cases.
 
 Web search, browser tools, remote URLs, and upstream mirrors are not allowed in
 local pinned-repo A/B runs. Publishable gating reports external web/search tool

@@ -1,53 +1,20 @@
 # Validation Report
 
-## 1. Requirements to Tasks Traceability Matrix
+## Current Status
 
-| Requirement | Acceptance Criterion | Implementing Task(s) | Status |
-|---|---|---|---|
-| 1 | 1.1 | Task 2 | Covered |
-| 1 | 1.2 | Task 3 | Covered |
-| 1 | 1.3 | Task 2 | Covered |
-| 2 | 2.1 | Task 3, Task 4 | Covered |
-| 2 | 2.2 | Task 3, Task 4 | Covered |
-| 2 | 2.3 | Task 4 | Covered |
-| 3 | 3.1 | Task 5 | Covered |
-| 3 | 3.2 | Task 3, Task 5 | Covered |
-| 3 | 3.3 | Task 5 | Covered |
-| 4 | 4.1 | Task 6 | Covered |
-| 4 | 4.2 | Task 6 | Covered |
-| 4 | 4.3 | Task 6 | Covered |
-| 5 | 5.1 | Task 1 | Covered |
-| 5 | 5.2 | Task 1 | Covered |
-| 5 | 5.3 | Task 1 | Covered |
-| 6 | 6.1 | Task 5, Task 7 | Covered |
-| 6 | 6.2 | Task 7 | Covered |
-| 6 | 6.3 | Task 2, Task 7 | Covered |
+- Branch: `codex/packet-answer-quality-hardening-review`.
+- Task traceability is implemented through task 7.3.
+- Task 7 remains unchecked because 7.4 remains open.
+- `docs/architecture/agent-memory-remediation-plan.md` is absent and was not recreated.
 
-## 2. Coverage Analysis
+## Gate Evidence
 
-### Summary
+| Gate | Artifact | Status |
+|---|---|---|
+| Full packet-runtime proof | `target/agent-benchmark/language-expansion-proof-full-form-command-shapes/packet-runtime-summary.md` | Non-publishable: 108/108 success, quality, and sufficiency, but 9 cold SLA misses remain. |
+| Publishable packet-runtime gate | `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes/packet-runtime-summary.md` | Failed: 108 success, 106 quality, 107 sufficient, 1 partial, and 8 cold SLA misses. |
+| Runtime library tests | `cargo test -p codestory-runtime --lib` | Required but unconfirmed; do not claim passed. |
 
-- **Total Acceptance Criteria**: 18
-- **Criteria Covered by Tasks**: 18
-- **Coverage Percentage**: 100%
+## Open Validation Work
 
-### Detailed Status
-
-- **Covered Criteria**: 1.1, 1.2, 1.3, 2.1, 2.2, 2.3, 3.1, 3.2, 3.3, 4.1, 4.2, 4.3, 5.1, 5.2, 5.3, 6.1, 6.2, 6.3
-- **Missing Criteria**: None
-- **Invalid References**: None
-
-## 3. Final Validation
-
-## 3. Research Evidence Validation
-
-- **Total Sources**: 8
-- **Total Citations**: 14
-- **Research Validation**: Passed
-- **Traceability Validator Exit Code**: 0
-
-The validator's naive uncited-claim detector reported fragments from prose and tables, but did not fail validation. The cited recommendation table is the evidence-backed research surface for implementation decisions.
-
-## 4. Final Validation
-
-All 18 acceptance criteria are traced to implementation tasks. The plan is ready for execution after review.
+Pass task 7.4 before promotion. Current blockers are cold SLA misses for `apache-commons-lang`, `redis`, `AutoMapper`, and `dart-http`; cold quality misses for `square-okio` and `Alamofire`; and one cold `Alamofire` partial sufficiency row.

@@ -26,13 +26,26 @@ The committed remediation made packet evidence typed and non-benchmark-shaped, b
 - [7] https://code-rag-bench.github.io/ - CodeRAG-Bench benchmark goals and retrieval findings.
 - [8] https://www.swebench.com/original.html - SWE-bench evaluation contract.
 
-## 4. Local Evidence From 2026-06-17 Targeted Subset
+## 4. Current Local Evidence From 2026-06-18
+
+Current HEAD/worktree branch is `codex/packet-answer-quality-hardening-review`. The stale cache-provenance issue from the June 17 subset is fixed or superseded; it is not the active blocker.
+
+| Artifact | Generated | Result | Publishable status |
+|---|---:|---|---|
+| `target/agent-benchmark/language-expansion-proof-full-form-command-shapes/packet-runtime-summary.md` | `2026-06-18T12:03:23.059Z` | 108 runs, 108 success, 108 quality, 108 sufficient, 9 cold SLA misses. | Not publishable because cold SLA misses remain. |
+| `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes/packet-runtime-summary.md` | `2026-06-18T12:23:54.418Z` | 108 runs, 108 success, 106 quality, 107 sufficient, 1 partial, 8 cold SLA misses. | Failed publishable gate. |
+
+Latest publishable blockers: `apache-commons-lang` cold SLA 3/3; `redis` cold SLA 3/3; `AutoMapper` cold SLA 1/3; `dart-http` cold SLA 1/3; `square-okio` cold quality 2/3; `Alamofire` cold quality 2/3 and 1 partial sufficiency.
+
+`cargo test -p codestory-runtime --lib` is still required verification, but it is not confirmed passed and must not be claimed as passed.
+
+## 5. Superseded Local Evidence From 2026-06-17 Targeted Subset
 
 The targeted rerun used the committed branch with seven failure-cluster tasks, cold and warm packet modes, `--jobs 4`, serial sidecar prep, and artifacts under `C:\Users\alber\.codex\tmp\deep-research\20260617-110319-codestory-packet-promotion-gaps\deliverables\failure-subset-packet-runtime`.
 
 | Cluster | Evidence | Implication |
 |---|---|---|
-| Harness provenance | All 14 rows reported retrieval `full`, freshness `fresh`, indexed `true`, and retrieval shadow `full`, but `cache_policy` was `unprepared-cache-blocked`. | Packet-runtime cold/warm paths do not pass prepared-cache state into `codestoryCacheProvenance`; fix the harness before trusting publishable cache blockers. |
+| Harness provenance | All 14 rows reported retrieval `full`, freshness `fresh`, indexed `true`, and retrieval shadow `full`, but `cache_policy` was `unprepared-cache-blocked`. | Superseded by the June 18 artifacts; cache provenance is no longer the active publishable blocker. |
 | Express quality | Express found all expected files but only `app.route` among six expected symbols and no expected claims. | JavaScript prototype/assignment symbols and route response claims need generic source-backed alias handling, not benchmark strings. |
 | HTML false sufficient | HTML sufficiency was `sufficient` while quality found only 50% of expected files, 50% of symbols, and 25% of claims. | Generic `source evidence`, `event loop`, and unrelated role claims are too eligible for structural HTML sufficiency. |
 | SQL false partial | SQL quality was 100% across files, symbols, claims, and citations, but sufficiency was `partial` because synthetic SQL source-scan citations could not satisfy role-backed claims. | Structural source scans must be eligible for declared structural roles such as table definitions and foreign keys. |

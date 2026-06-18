@@ -3,11 +3,11 @@
 This page is the current benchmark scorecard. It should answer a reader's first
 question quickly: did CodeStory help, hurt, or still need proof?
 
-Short answer: the June 17, 2026 fixed-baseline comparison is a strong
-development win, but it is still not a general public answer-quality claim.
-CodeStory is quality-equal or better on every measured language task, reduces
-wall time, tokens, commands, and direct source reads, and keeps the
-no-CodeStory arm as a fixed control artifact instead of rerunning it.
+Short answer: the June 18, 2026 packet-runtime proof is the current scorecard.
+The diagnostic full form+command run passed `108/108` success, quality, and
+sufficiency gates but missed `9` cold SLAs. The publishable full run passed
+`108/108` success, `106/108` quality, and `107/108` sufficiency, with one
+partial row and `8` cold SLA misses. Promotion is blocked.
 
 ## Plain English
 
@@ -24,34 +24,38 @@ no-CodeStory arm as a fixed control artifact instead of rerunning it.
 
 | Question | Answer |
 | --- | --- |
-| Is there benchmark data from this week? | Yes: a fixed no-CodeStory baseline, a full CodeStory-only confirmation, and an offline reused-baseline composite with three repeats per language task. |
-| Does the fresh data show CodeStory can be useful? | Yes. In the current composite, CodeStory succeeded on `54/54` rows, quality-passed `54/54`, used `0.426x` all-in wall time, `0.221x` tokens, `54` commands instead of `471`, and `0` source reads instead of `417`. |
-| Can we claim general answer-quality superiority yet? | Not as a public promotion claim. The current evidence is an offline composite over the fixed control and still needs repeat, freshness, breadth, and promotion metadata before broad language/framework claims. The fixed control does not need to be rerun for those loops. |
+| Is there benchmark data from this week? | Yes: two June 18 full packet-runtime artifacts over `language-expansion-holdout`, cold and warm packet shapes, and three repeats. |
+| Does the fresh data show CodeStory can be useful? | Yes. The diagnostic artifact completed `108/108` rows with full quality and sufficiency. The publishable artifact completed `108/108` rows but exposed the remaining promotion blockers. |
+| Can we claim general answer-quality superiority yet? | Not as a public promotion claim. The current publishable artifact still has quality misses, a sufficiency gap, and cold SLA misses. Older fixed-baseline comparisons remain development diagnostics. |
 
 ## Current Evidence At A Glance
 
 ```mermaid
 flowchart LR
-    run["June 17 reused-baseline composite<br/>18 tasks x 3 repeats"]
-    cs["with CodeStory<br/>54/54 quality"]
-    base["fixed no-CodeStory<br/>24/54 quality"]
-    ops["lower wall, tokens,<br/>commands, source reads"]
-    quality["quality equal or better<br/>on every measured row"]
-    run --> cs
-    run --> base
-    cs --> ops
-    cs --> quality
+    run["June 18 packet-runtime proof<br/>108 rows"]
+    diag["diagnostic artifact<br/>108/108 quality + sufficient"]
+    pub["publishable artifact<br/>106/108 quality<br/>107/108 sufficient"]
+    block["promotion blocked<br/>8 cold SLA misses<br/>2 quality misses<br/>1 partial"]
+    old["June 17 reused baseline<br/>older diagnostic comparison"]
+    run --> diag
+    run --> pub
+    pub --> block
+    old -. diagnostic .-> run
 ```
 
-| Lane | Fresh result | What it means | Claim status |
+| Lane | Current result | What it means | Claim status |
 | --- | --- | --- | --- |
-| Fixed-baseline language comparison | With CodeStory: `54/54` success, `54/54` quality, `3,383,687 ms` all-in wall, `2,141,124` tokens, `54` commands, `0` source reads. Without CodeStory: `54/54` success, `24/54` quality, `7,943,578 ms`, `9,692,559` tokens, `471` commands, `417` source reads. | CodeStory materially reduced operating cost, stayed packet-first, and is quality-equal or better on every measured language task. | Current development comparison; offline reused-baseline composite, not final public promotion proof. |
-| 18-language packet-runtime diagnostic | `18/18` answer bundles completed; `12/18` passed full quality; `17/18` found all expected files; median elapsed time was `11.14s`. | CodeStory usually found the right files, but explanation quality was uneven even before the paired run. | Runtime and coverage evidence, not a comparison-run savings claim. |
+| Publishable full packet-runtime proof | `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`, generated `2026-06-18T12:23:54.418Z`: `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `8` cold SLA misses. | CodeStory is close to promotion readiness, but the current publishable artifact still exposes blocker rows. | Current scorecard; promotion blocked. |
+| Diagnostic full packet-runtime proof | `target/agent-benchmark/language-expansion-proof-full-form-command-shapes`, generated `2026-06-18T12:03:23.059Z`: `108/108` success, `108/108` quality, `108/108` sufficient, `9` cold SLA misses. | Packet shape and command coverage work across the full suite, but latency is not promotion-clean. | Development proof only; non-publishable. |
+| Older fixed-baseline language comparison | With CodeStory: `54/54` success, `54/54` quality, `3,383,687 ms` all-in wall, `2,141,124` tokens, `54` commands, `0` source reads. Without CodeStory: `54/54` success, `24/54` quality, `7,943,578 ms`, `9,692,559` tokens, `471` commands, `417` source reads. | CodeStory materially reduced operating cost, stayed packet-first, and was quality-equal or better on every measured language task in that comparison. | Older development comparison. Reused-baseline or fixed no-CodeStory comparisons are diagnostic unless fingerprints match, and are never enough for packet-runtime promotion by themselves. |
 | TypeScript React library comparison | With CodeStory: `32,168` tokens, `42.67s` elapsed including setup check, `1` command, `0` source files opened, quality `1/1`. Without CodeStory: `535,632` tokens, `201.38s`, `35` commands, `30` source files opened, quality `0/1`. | CodeStory was clearly useful on this task. | Strong historical single-task evidence, not a general savings claim. |
 
-## Current Full A/B By Language
+## Older Full A/B By Language
 
 Source: `target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.md`
+
+This June 17 reused-baseline composite is older development evidence. It is not
+the current scorecard and cannot prove packet-runtime promotion readiness.
 
 | Language | Example project | With CodeStory quality | Baseline quality | Read |
 | --- | --- | ---: | ---: | --- |
@@ -76,9 +80,26 @@ Source: `target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseli
 
 ## Packet Runtime Performance By Language
 
-This older packet-runtime diagnostic remains useful for packet composition and
-claim-quality work, but the June 17 fixed-baseline composite is the current
-development comparison source.
+The current packet-runtime scorecard is the June 18 full form+command pair:
+
+| Artifact | Generated | Success | Quality | Sufficiency | Cold SLA | Promotion status |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `target/agent-benchmark/language-expansion-proof-full-form-command-shapes` | `2026-06-18T12:03:23.059Z` | `108/108` | `108/108` | `108/108` | `9` misses | Diagnostic/development proof only. |
+| `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes` | `2026-06-18T12:23:54.418Z` | `108/108` | `106/108` | `107/108`, `1` partial | `8` misses | Promotion blocked. |
+
+Current blockers:
+
+| Row | Blocker |
+| --- | --- |
+| apache-commons-lang | Cold SLA `3/3`. |
+| redis | Cold SLA `3/3`. |
+| AutoMapper | Cold SLA `1/3`. |
+| dart-http | Cold SLA `1/3`. |
+| square-okio | Cold quality `2/3`. |
+| Alamofire | Cold quality `2/3` plus `1` partial sufficiency. |
+
+The older packet-runtime diagnostic below remains useful for packet composition
+and claim-quality archaeology only.
 
 Source: `target/agent-benchmark/language-expansion-packet-runtime-current-after-claim-fixes/packet-runtime-summary.json`
 
@@ -125,7 +146,7 @@ time.
 
 | Framework / domain kind | Examples | Quality pass | Median elapsed | What it tells us |
 | --- | --- | ---: | ---: | --- |
-| Web routing and data fetching | Express, Gin, SWR | `3/3` | `7.71s` | Strong current lane: fast, complete file coverage, complete explanation coverage. |
+| Web routing and data fetching | Express, Gin, SWR | `3/3` | `7.71s` | Historically strong lane: fast, complete file coverage, complete explanation coverage. |
 | Systems and data engines | ripgrep, Redis, Chinook SQL | `3/3` | `13.07s` | Quality passed; Redis still missed one expected file and was slow. |
 | Text and formatting utilities | Commons Lang, fmt | `2/2` | `22.45s` | Quality passed, but Java was one of the slow rows. |
 | HTTP client libraries | requests, Alamofire, Dart http | `2/3` | `12.89s` | Swift and Dart passed; Python found files but failed explanation points. |
@@ -156,42 +177,43 @@ Why this matters:
 
 ## What Is Solid
 
-- The full 18-language with-CodeStory arm completed `54/54` attempted rows.
-- The current fixed-baseline composite lowered all-in wall time, total tokens, commands, and
-  direct source reads overall.
-- The current with-CodeStory arm stayed packet-first: `54` commands and `0`
+- The June 18 diagnostic full form+command packet-runtime artifact completed
+  `108/108` rows with full success, quality, and sufficiency.
+- The June 18 publishable artifact completed `108/108` rows and precisely names
+  the remaining blockers: `106/108` quality, `107/108` sufficiency, one
+  partial row, and `8` cold SLA misses.
+- The older June 17 fixed-baseline composite lowered all-in wall time, total
+  tokens, commands, and direct source reads overall.
+- The older with-CodeStory arm stayed packet-first: `54` commands and `0`
   direct source reads across the full suite.
-- CodeStory quality-passed every measured language task in the current
-  composite. Rows where baseline also passed are still operational wins because
-  CodeStory used fewer commands, fewer tokens, lower wall time, and zero source
-  reads.
 
 ## What Is Not Claimed
 
 - No general public savings claim beyond the measured fixed-baseline artifacts.
 - No universal language-support or answer-quality claim yet.
-- No publishable public benchmark claim yet: the June 17 composite is an
-  offline reused-baseline artifact, and the June 13 TypeScript row is a
-  non-publishable single task.
+- No publishable public benchmark claim yet: the June 18 publishable
+  packet-runtime artifact is blocked, the June 17 composite is an offline
+  reused-baseline artifact, and the June 13 TypeScript row is a non-publishable
+  single task.
 - No claim that the holdout suite alone proves every supported framework or
-  domain surface. Broader language/framework claims still need repeat,
-  freshness, breadth, and promotion metadata.
+  domain surface. Broader language/framework claims still need a promotion-clean
+  packet-runtime run and breadth beyond the measured holdout tasks.
 
 ## Next Runs Needed
 
 Run these before promoting the current story beyond "promising current
 evidence":
 
-1. Keep the no-CodeStory arm as the fixed control artifact for this harness
-   context. Do not rerun it for freshness or promotion loops; generate a new
-   control artifact only if the task suite, pinned repo state, harness contract,
-   or scorer boundary changes with explicit approval.
-2. Add breadth evidence beyond the current holdout repos: at minimum, run
-   CodeStory-only packet/runtime slices against additional supported
-   language/framework surfaces and compare them to the fixed control where
-   applicable.
-3. Record promotion metadata for repeat/freshness/breadth before turning the
-   development comparison into a public claim.
+1. Clear the June 18 publishable packet-runtime blockers: apache-commons-lang,
+   redis, AutoMapper, and dart-http cold SLA; square-okio and Alamofire cold
+   quality; and Alamofire partial sufficiency.
+2. Rerun the promotion-eligible shape: full `language-expansion-holdout`
+   packet-runtime, cold and warm modes, repeats `3`, `--jobs 4`, prepared
+   sidecars, `--publishable`, no `--allow-failures`, full sidecar provenance,
+   no quality misses, no sufficiency gaps, and no SLA misses.
+3. Treat stale `--reuse-baseline-from` and fixed no-CodeStory comparisons as
+   diagnostic unless fingerprints are compatible; never use them alone for
+   packet-runtime promotion.
 
 ## How To Rerun
 
@@ -202,13 +224,24 @@ node ./scripts/codestory-agent-ab-benchmark.mjs --list
 node ./scripts/codestory-agent-ab-benchmark.mjs --task-suite language-expansion-holdout --list
 ```
 
-Language answer-bundle run:
+Promotion-eligible language packet-runtime run:
 
 ```sh
-node ./scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite language-expansion-holdout --repeats 1 --packet-runtime-mode cold-cli --codestory-cli ./target/release/codestory-cli --out-dir target/agent-benchmark/language-expansion-packet-runtime-current --timeout-ms 120000
+node ./scripts/codestory-agent-ab-benchmark.mjs \
+  --packet-runtime \
+  --packet-runtime-mode both \
+  --task-suite language-expansion-holdout \
+  --repeats 3 \
+  --materialize-repos \
+  --jobs 4 \
+  --prepare-codestory-jobs 2 \
+  --codestory-cli ./target/release/codestory-cli \
+  --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes \
+  --timeout-ms 180000 \
+  --publishable
 ```
 
-Full language comparison with fixed baseline reuse:
+Diagnostic language comparison with fixed baseline reuse:
 
 ```sh
 node ./scripts/codestory-agent-ab-benchmark.mjs \
@@ -222,11 +255,12 @@ node ./scripts/codestory-agent-ab-benchmark.mjs \
   --timeout-ms 600000
 ```
 
-Do not rerun the no-CodeStory arm for the current harness context. With
-`--reuse-baseline-from`, matching without-CodeStory rows are reused from the
-fixed artifact rather than executed. A new no-CodeStory control artifact is
-only justified when the task suite, pinned repo state, harness contract, or
-scorer boundary changes with explicit approval.
+With `--reuse-baseline-from`, matching without-CodeStory rows are reused from
+the fixed artifact rather than executed. This is diagnostic unless the current
+harness accepts matching fingerprints, and it is never enough for packet-runtime
+promotion by itself. A new no-CodeStory control artifact is only justified when
+the task suite, pinned repo state, harness contract, or scorer boundary changes
+with explicit approval.
 
 Publishable TypeScript React comparison target:
 
@@ -254,6 +288,12 @@ Use `--publishable` only when:
 - CodeStory cache provenance is recorded,
 - the with-CodeStory arm runs an answer bundle first, and
 - post-bundle source reads stay inside the explicit budget.
+
+For packet-runtime promotion, use `--packet-runtime`,
+`--packet-runtime-mode both`, `--repeats 3`, `--jobs 4`, and `--publishable`
+with prepared sidecars and no `--allow-failures`. The artifact must have full
+sidecar provenance, zero quality misses, zero sufficiency gaps, and zero SLA
+misses.
 
 Cold repo-scale timings are owned by
 [codestory-e2e-stats-log.md](codestory-e2e-stats-log.md). Warm stdio loop
