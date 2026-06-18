@@ -859,7 +859,10 @@ test("counts modern Codex JSONL tool categories including web search", () => {
     {
       status: "pass",
       arm: "without_codestory",
+      wall_ms: 1,
       usage: { total_tokens: 1 },
+      tool_calls_observed: 1,
+      quality: { pass: true },
       transcript_analysis: analysis,
     },
   ]);
@@ -1411,8 +1414,25 @@ test("packet manifest completion is gated by packet quality evidence", () => {
     packetPreludeManifestComplete({
       packet_manifest_quality: quality,
       packet_composition: packetComposition(packet, task),
+      packet_sufficiency: { status: "sufficient", follow_up_commands_count: 0 },
     }),
     true,
+  );
+  assert.equal(
+    packetPreludeManifestComplete({
+      packet_manifest_quality: quality,
+      packet_composition: packetComposition(packet, task),
+      packet_sufficiency: { status: "sufficient", follow_up_commands_count: 1 },
+    }),
+    false,
+  );
+  assert.equal(
+    packetPreludeManifestComplete({
+      packet_manifest_quality: quality,
+      packet_composition: packetComposition(packet, task),
+      packet_sufficiency: { status: "partial", follow_up_commands_count: 0 },
+    }),
+    false,
   );
 
   const incompleteQuality = packetManifestQualitySummary(
@@ -1734,20 +1754,12 @@ function publishablePacketRuntimeResult(overrides = {}) {
 test("publishable gate blocks avoidable source reads after packet", () => {
   const blockers = agentPublishableBlockers(
     [
-      {
-        repo: "codestory",
-        task_id: "codestory-indexing-flow",
-        arm: "with_codestory",
-        repeat: 1,
-        status: "pass",
-        usage: { total_tokens: 100 },
-        packet_first_required: true,
-        packet_first_pass: true,
-        quality: { pass: true },
+      publishableWithCodeStoryResult({
         transcript_analysis: {
+          command_count: 1,
           ordinary_source_reads_after_first_packet: 1,
         },
-      },
+      }),
     ],
     { maxSourceReadsAfterPacket: 0 },
   );
@@ -1779,6 +1791,39 @@ test("publishable gate requires explicit post-packet source-read budget", () => 
   assert.match(blockers[0].reasons.join("\n"), /missing explicit post-packet source-read budget/);
 });
 
+test("publishable gate treats baseline prelude warnings as harness-contract blockers", () => {
+  const blockers = agentPublishableBlockers(
+    [
+      {
+        repo: "codestory",
+        task_id: "codestory-indexing-flow",
+        arm: "without_codestory",
+        repeat: 1,
+        status: "pass",
+        wall_ms: 10,
+        usage: { total_tokens: 100 },
+        tool_calls_observed: 1,
+        packet_first_required: false,
+        packet_first_pass: true,
+        quality: { pass: true },
+        transcript_analysis: {
+          command_count: 1,
+          external_context_tool_calls: 0,
+        },
+        baseline_harness_prelude: {
+          status: "pass_with_warnings",
+        },
+        repo_provenance: pinnedRepoProvenance(),
+      },
+    ],
+    { publishable: true, maxSourceReadsAfterPacket: 0 },
+  );
+
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].category, "harness-contract");
+  assert.match(blockers[0].reasons.join("\n"), /baseline prelude status=pass_with_warnings; expected pass/);
+});
+
 test("publishable gate rejects diagnostic packet probes", () => {
   const blockers = agentPublishableBlockers(
     [
@@ -1799,20 +1844,15 @@ test("publishable gate rejects diagnostic packet probes", () => {
 test("publishable gate requires packet before ordinary context exploration", () => {
   const blockers = agentPublishableBlockers(
     [
-      {
+      publishableWithCodeStoryResult({
         repo: "vite",
         task_id: "vite-dev-server-architecture",
-        arm: "with_codestory",
-        repeat: 1,
-        status: "pass",
-        usage: { total_tokens: 100 },
-        packet_first_required: true,
         packet_first_pass: false,
-        quality: { pass: true },
         transcript_analysis: {
+          command_count: 1,
           ordinary_source_reads_after_first_packet: 0,
         },
-      },
+      }),
     ],
     { maxSourceReadsAfterPacket: 0 },
   );
@@ -2047,11 +2087,14 @@ test("publishable provenance requires full-SHA clean manifest checkout", () => {
         arm: "with_codestory",
         repeat: 1,
         status: "pass",
+        wall_ms: 10,
         usage: { total_tokens: 100 },
+        tool_calls_observed: 1,
         packet_first_required: true,
         packet_first_pass: true,
         quality: { pass: true },
         transcript_analysis: {
+          command_count: 1,
           ordinary_source_reads_after_first_packet: 0,
         },
         repo_provenance: {
@@ -2205,24 +2248,68 @@ test("packet runtime publishable gate rejects diagnostic packet probes", () => {
   assert.match(blockers[0].reasons.join("\n"), /diagnostic packet extra probes used/);
 });
 
-test("packet runtime publishable gate separates product and harness blockers", () => {
+test("packet runtime publishable gate blocks unresolved packet diagnostics as product blockers", () => {
   const blockers = packetRuntimePublishableBlockers(
     [
       publishablePacketRuntimeResult({
-        quality: { pass: false },
-        codestory_cache_provenance: localCacheProvenance({
-          cache_policy: "unprepared-cache-blocked",
-          retrieval_mode: "full",
-        }),
+        sufficiency: {
+          status: "sufficient",
+          follow_up_commands_count: 0,
+          unresolved_candidate_count: 2,
+          coverage_unresolved_count: 1,
+          coverage_unresolved_blocking_count: 1,
+        },
       }),
     ],
     { publishable: true },
   );
 
-  assert.equal(blockers.length, 2);
-  assert.deepEqual(blockers.map((blocker) => blocker.category), ["product", "harness-contract"]);
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].category, "product");
+  assert.match(blockers[0].reasons.join("\n"), /packet unresolved retrieval candidates=2; expected 0/);
+  assert.match(blockers[0].reasons.join("\n"), /packet unresolved coverage diagnostics=1; expected 0/);
+});
+
+test("packet runtime publishable gate allows explicitly diagnostic-only unresolved diagnostics", () => {
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        sufficiency: {
+          status: "sufficient",
+          follow_up_commands_count: 0,
+          unresolved_candidate_count: 2,
+          unresolved_candidate_diagnostic_only: true,
+          coverage_unresolved_count: 2,
+          coverage_unresolved_blocking_count: 0,
+        },
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.deepEqual(blockers, []);
+});
+
+test("packet runtime publishable gate separates product, harness, and environment blockers", () => {
+  const blockers = packetRuntimePublishableBlockers(
+    [
+      publishablePacketRuntimeResult({
+        quality: { pass: false },
+        packet_extra_probe_strategy: "diagnostic_manifest_expected_anchors",
+        packet_latency: {
+          sla_missed: false,
+          retrieval_shadow: { retrieval_mode: "degraded" },
+        },
+      }),
+    ],
+    { publishable: true },
+  );
+
+  assert.equal(blockers.length, 3);
+  assert.deepEqual(blockers.map((blocker) => blocker.category), ["product", "harness-contract", "environment"]);
   assert.match(blockers[0].reasons.join("\n"), /manifest quality failed/);
-  assert.match(blockers[1].reasons.join("\n"), /CodeStory sidecar cache was not prepared/);
+  assert.match(blockers[1].reasons.join("\n"), /diagnostic packet extra probes used/);
+  assert.match(blockers[2].reasons.join("\n"), /packet retrieval shadow mode=degraded; expected full/);
 });
 
 test("holdout packet runtime requires quality gate unless failures are allowed", () => {

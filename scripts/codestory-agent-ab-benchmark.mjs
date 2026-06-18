@@ -1273,6 +1273,17 @@ function packetPreludeManifestComplete(publicPrelude) {
   if (!quality?.pass) {
     return false;
   }
+  const sufficiency = publicPrelude?.packet_sufficiency;
+  const followUps = presentFiniteNumber(
+    sufficiency?.follow_up_commands_count ?? sufficiency?.follow_up_commands?.length,
+  );
+  if (
+    !sufficiency ||
+    sufficiency.status !== "sufficient" ||
+    followUps !== 0
+  ) {
+    return false;
+  }
   const composition = publicPrelude?.packet_composition;
   return (
     !composition ||
@@ -3886,20 +3897,48 @@ function packetRetrievalShadow(packet) {
   );
 }
 
-function packetCoverageUnresolvedCount(packet) {
+function packetDiagnosticIsDiagnosticOnly(value) {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const classification = String(
+    value.classification ?? value.kind ?? value.tier ?? value.status ?? "",
+  ).toLowerCase();
+  return (
+    value.diagnostic_only === true ||
+    value.diagnosticOnly === true ||
+    classification === "diagnostic_only" ||
+    classification === "diagnostic-only"
+  );
+}
+
+function packetCoverageUnresolvedCounts(packet) {
   const unresolved =
     packet?.coverage_report?.unresolved ??
     packet?.answer?.coverage_report?.unresolved ??
     packet?.sufficiency?.coverage_report?.unresolved ??
     null;
   if (Array.isArray(unresolved)) {
-    return unresolved.length;
+    return {
+      total: unresolved.length,
+      blocking: unresolved.filter((entry) => !packetDiagnosticIsDiagnosticOnly(entry)).length,
+    };
   }
   const number = finiteNumber(unresolved);
   if (number != null) {
-    return number;
+    return { total: number, blocking: number };
   }
-  return unresolved && typeof unresolved === "object" ? Object.keys(unresolved).length : null;
+  if (unresolved && typeof unresolved === "object") {
+    if (packetDiagnosticIsDiagnosticOnly(unresolved)) {
+      return { total: 1, blocking: 0 };
+    }
+    const values = Object.values(unresolved);
+    return {
+      total: values.length,
+      blocking: values.filter((entry) => !packetDiagnosticIsDiagnosticOnly(entry)).length,
+    };
+  }
+  return { total: null, blocking: null };
 }
 
 function packetShape(packet) {
@@ -3929,6 +3968,7 @@ function packetSufficiencyTelemetry(packet, quality) {
   const openNext = cappedStringArray(packet.sufficiency?.open_next, 6);
   const followUpCommands = cappedStringArray(packet.sufficiency?.follow_up_commands, 6);
   const retrievalShadow = packetRetrievalShadow(packet);
+  const unresolvedCoverage = packetCoverageUnresolvedCounts(packet);
   return {
     status,
     covered_claims_count: packet.sufficiency?.covered_claims?.length ?? 0,
@@ -3942,7 +3982,9 @@ function packetSufficiencyTelemetry(packet, quality) {
     retrieval_mode: retrievalShadow?.retrieval_mode ?? null,
     degraded_reason: retrievalShadow?.degraded_reason ?? null,
     unresolved_candidate_count: finiteNumber(retrievalShadow?.unresolved_candidate_count),
-    coverage_unresolved_count: packetCoverageUnresolvedCount(packet),
+    unresolved_candidate_diagnostic_only: packetDiagnosticIsDiagnosticOnly(retrievalShadow),
+    coverage_unresolved_count: unresolvedCoverage.total,
+    coverage_unresolved_blocking_count: unresolvedCoverage.blocking,
     sufficient_quality_mismatch: status === "sufficient" && qualityPass === false,
   };
 }
@@ -4692,12 +4734,14 @@ function addPacketSufficiencyPublishableReasons(sufficiency, productReasons, har
     productReasons.push(`${label} sufficiency gaps=${gaps}; expected 0`);
   }
   const unresolvedCandidates = presentFiniteNumber(sufficiency.unresolved_candidate_count);
-  if (unresolvedCandidates > 0) {
-    harnessReasons.push(`${label} unresolved retrieval candidates=${unresolvedCandidates}; expected 0`);
+  if (unresolvedCandidates > 0 && sufficiency.unresolved_candidate_diagnostic_only !== true) {
+    productReasons.push(`${label} unresolved retrieval candidates=${unresolvedCandidates}; expected 0`);
   }
-  const unresolvedCoverage = presentFiniteNumber(sufficiency.coverage_unresolved_count);
+  const unresolvedCoverage = presentFiniteNumber(
+    sufficiency.coverage_unresolved_blocking_count ?? sufficiency.coverage_unresolved_count,
+  );
   if (unresolvedCoverage > 0) {
-    harnessReasons.push(`${label} unresolved coverage diagnostics=${unresolvedCoverage}; expected 0`);
+    productReasons.push(`${label} unresolved coverage diagnostics=${unresolvedCoverage}; expected 0`);
   }
 }
 
@@ -5444,7 +5488,7 @@ function agentPublishableBlockers(results, opts = {}) {
             prelude.packet_latency?.retrieval_shadow?.unresolved_candidate_count,
           );
           if (unresolvedCandidates > 0) {
-            harnessReasons.push(
+            productReasons.push(
               `${label} prelude packet unresolved retrieval candidates=${unresolvedCandidates}; expected 0`,
             );
           }
@@ -5758,6 +5802,7 @@ function runSelfTest() {
   assert.equal(weakPacketTelemetry.follow_up_commands_count, 1);
   assert.equal(weakPacketTelemetry.unresolved_candidate_count, 2);
   assert.equal(weakPacketTelemetry.coverage_unresolved_count, 1);
+  assert.equal(weakPacketTelemetry.coverage_unresolved_blocking_count, 1);
   assert.deepEqual(
     packetRuntimePublishableBlockers([
       { status: "pass", quality: { pass: true } },
@@ -5794,7 +5839,7 @@ function runSelfTest() {
       ],
       { enforcePacketRuntimeTelemetry: true },
     ).map((blocker) => blocker.category),
-    ["product", "harness-contract"],
+    ["product"],
   );
   assert.deepEqual(
     agentPublishableBlockers([
