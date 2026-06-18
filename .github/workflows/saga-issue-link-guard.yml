@@ -1,0 +1,71 @@
+name: saga issue link guard
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  require-closing-issue-link:
+    name: require closing issue link
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR issue relationship
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import sys
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+
+          pr = event["pull_request"]
+          title = pr.get("title") or ""
+          body = pr.get("body") or ""
+          head_ref = pr.get("head", {}).get("ref") or ""
+          labels = {label.get("name", "") for label in pr.get("labels", [])}
+
+          guarded = (
+              head_ref.startswith("codex/")
+              or title.startswith("[codex]")
+              or "saga:codestory-intelligence" in labels
+          )
+
+          if not guarded:
+              print("PR is not a Codex/saga PR; issue-link guard skipped.")
+              sys.exit(0)
+
+          closing_keyword = re.compile(
+              r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+              r"(?:https://github\.com/TheGreenCedar/CodeStory/issues/)?#?\d+\b"
+          )
+
+          if closing_keyword.search(body):
+              print("Found a closing issue reference; GitHub Projects can link this PR.")
+              sys.exit(0)
+
+          plain_reference = re.compile(
+              r"(?im)\b(?:refs?|references?)\s+"
+              r"(?:https://github\.com/TheGreenCedar/CodeStory/issues/)?#?\d+\b"
+          )
+
+          if plain_reference.search(body):
+              print(
+                  "::error::This PR only uses a non-closing issue reference. "
+                  "GitHub Projects does not populate the Linked pull requests field from "
+                  "`Refs #...`. Use `Closes #...`, `Fixes #...`, or `Resolves #...` "
+                  "for the PR-sized issue, and mention any broader parent separately."
+              )
+          else:
+              print(
+                  "::error::Codex/saga PRs must include a closing issue reference such as "
+                  "`Closes #123` so the project board links the PR to its issue. "
+                  "If the work is partial, create a PR-sized issue for this slice and close that."
+              )
+
+          sys.exit(1)
