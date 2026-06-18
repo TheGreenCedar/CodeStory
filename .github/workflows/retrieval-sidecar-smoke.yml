@@ -34,13 +34,14 @@ on:
 jobs:
   linux-contracts:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "24"
+          package-manager-cache: false
 
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
@@ -52,7 +53,7 @@ jobs:
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: |
@@ -80,7 +81,7 @@ jobs:
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: |
@@ -91,9 +92,9 @@ jobs:
 
   windows-manifest-missing:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust stable
         run: |
@@ -102,7 +103,7 @@ jobs:
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         continue-on-error: true
         with:
           path: |
@@ -118,7 +119,7 @@ jobs:
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: |
