@@ -338,12 +338,14 @@ count is zero, Qdrant reuse is skipped explicitly and cannot mask stale graph/le
 ## Preflight smoke contract
 
 Use the full sequence locally before index/query changes. The CI job
-`retrieval-sidecar-smoke` splits fast PR checks across Linux and Windows because
-full index/query on the monorepo can exceed runner budgets and CI does not fetch
-the GGUF embedding model. Linux carries the generic lint/runtime/search/retrieval
-contract slices. Windows keeps the path-sensitive manifest-missing
-bootstrap/status shape. Superseded PR runs are canceled automatically so a new
-push does not leave an older smoke run burning runner time.
+`retrieval-sidecar-smoke` keeps default PR feedback on the fast Linux contract
+lane because full index/query on the monorepo can exceed runner budgets and CI
+does not fetch the GGUF embedding model. Linux carries the generic
+lint/runtime/search/retrieval contract slices. Windows keeps the path-sensitive
+manifest-missing bootstrap/status shape, but it runs only on `workflow_dispatch`
+or when a PR has the `ci:windows-smoke` label. Superseded PR runs are canceled
+automatically so a new push does not leave an older smoke run burning runner
+time.
 
 **Local full sequence:**
 
@@ -369,7 +371,7 @@ Linux `linux-contracts`:
 4. `cargo test -p codestory-cli --test search_json_output` - exit 0 for non-live fail-closed search contracts
 5. `cargo test -p codestory-retrieval` - exit 0
 
-Windows `windows-manifest-missing`:
+Windows `windows-manifest-missing` (manual or `ci:windows-smoke` label):
 
 1. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` - exit 0;
    this integration suite runs the clean pre-index bootstrap/status shape and
@@ -378,8 +380,8 @@ Windows `windows-manifest-missing`:
 
 The reduced CI sequence is not a full sidecar smoke and it is not a full runtime
 library sweep. It verifies generic runtime/stdio/search/retrieval contract slices
-on Linux, and it creates local cache/state directories plus verifies
-manifest-missing status JSON on Windows. It does not start sidecars, fetch
+on Linux. When the optional Windows lane runs, it creates local cache/state
+directories plus verifies manifest-missing status JSON on Windows. It does not start sidecars, fetch
 `bge-base-en-v1.5.Q8_0.gguf`, build the project manifest required for
 `retrieval_mode=full`, or run every `codestory-runtime --lib` test. The included
 `retrieval_bootstrap_contracts` suite builds the CLI through Cargo's
@@ -431,8 +433,8 @@ retrieval/stdio sources (`retrieval.rs`, `main.rs`, `args.rs`, `runtime.rs`, `st
 4. `cargo test -p codestory-cli --test stdio_protocol_contracts` exits 0.
 5. `cargo test -p codestory-cli --test search_json_output` exits 0 for non-live fail-closed search contracts.
 6. `cargo test -p codestory-retrieval` exits 0.
-7. Windows Rust cache restore/save completes or gracefully misses without masking later failures.
-8. `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and non-`full` mode on a clean temp project before indexing.
+7. If the Windows lane is requested, Windows Rust cache restore/save completes or gracefully misses without masking later failures.
+8. If the Windows lane is requested, `cargo test -p codestory-cli --test retrieval_bootstrap_contracts` exits 0, including the bootstrap/status assertion that reports `degraded_reason == "retrieval_manifest_missing"` and non-`full` mode on a clean temp project before indexing.
 
 Both jobs restore a Rust build cache before Cargo steps; a new cache key may
 still pay one cold compile, but later pushes should reuse warmed target and Cargo

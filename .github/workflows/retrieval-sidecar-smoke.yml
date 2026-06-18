@@ -97,6 +97,7 @@ jobs:
           key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
 
   windows-manifest-missing:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:windows-smoke')
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
