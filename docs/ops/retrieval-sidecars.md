@@ -75,6 +75,14 @@ vector contract (`manifest_vector_embedding_backend`), and stored dense-anchor
 producer (`stored_doc_vector_producer_backend`). Under `graph_first_v1`, a
 generation can be full with zero dense anchors; in that case status reports the
 Qdrant component as policy-skipped rather than querying a missing collection.
+When a retrieval manifest exists, status also includes `manifest_contract`: a
+derived proof envelope, not a new persisted manifest. It names `source_root`,
+`input_hash`, `generation`, `schema_version`, `graph_hash`,
+`symbol_doc_count`, `dense_anchor_count`, degraded modes, and compact lane
+provenance for `lexical`, `symbol_docs`, `semantic_dense`, and `graph`. If the
+manifest is missing, obsolete, stale, or partial, strict status remains
+non-`full`; stale/partial reports keep the contract fields visible for
+diagnosis, while manifest-missing reports have no `manifest_contract`.
 
 Status after bootstrap:
 

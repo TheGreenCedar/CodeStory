@@ -28,6 +28,11 @@ evidence` is not enough to mark a packet sufficient.
 `retrieval_mode=full` is mandatory infrastructure readiness for product packet
 paths. It does not promote answer quality, agent usefulness, or public language
 quality without the packet-runtime or drill evidence required by the proof tier.
+`retrieval status --format json` may include `manifest_contract`; that contract
+proves the sidecar manifest's source root, input hash, generation, schema,
+counts, degraded modes, and lane provenance. It is readiness/freshness evidence
+only. Packet-quality promotion still needs role-bearing packet sufficiency plus
+the matching drill or benchmark tier.
 
 ## Implemented Stack
 
@@ -35,7 +40,7 @@ quality without the packet-runtime or drill evidence required by the proof tier.
 |-------|----------|------|
 | Sidecar clients | `crates/codestory-retrieval/` (`zoekt_client`, `qdrant_client`, `scip_client`, `health`) | HTTP probes, staged search, timeouts |
 | Planner / executor / ranker | `codestory-retrieval` (`planner`, `executor`, `ranker`, `query_features`, `mode`) | Repo-agnostic staged plan, deadlines, degraded modes |
-| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, and mandatory real sidecar artifact paths |
+| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, mandatory real sidecar artifact paths, and derived status `manifest_contract` provenance |
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |

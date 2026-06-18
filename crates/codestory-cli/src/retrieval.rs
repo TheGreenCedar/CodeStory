@@ -336,8 +336,24 @@ fn emit_retrieval_status(
         .stored_doc_vector_producer_backend
         .as_deref()
         .unwrap_or("<none>");
+    let manifest_contract_note = report
+        .manifest_contract
+        .as_ref()
+        .map(|contract| {
+            let lanes = contract
+                .lanes
+                .iter()
+                .map(|lane| format!("{}:{}:{}", lane.lane, lane.producer, lane.status))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "- manifest_contract: generation={:?} input_hash={:?} lanes=`{}`\n",
+                contract.generation, contract.input_hash, lanes
+            )
+        })
+        .unwrap_or_default();
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -346,6 +362,7 @@ fn emit_retrieval_status(
         stored_doc_backend,
         report.stored_doc_vector_dim,
         report.stored_doc_vector_mixed_backends,
+        manifest_contract_note,
         report.zoekt.status,
         report.zoekt.detail,
         report.zoekt.capabilities.lexical,

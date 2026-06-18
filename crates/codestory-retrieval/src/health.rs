@@ -31,6 +31,32 @@ pub struct ComponentHealth {
     pub capabilities: SidecarCapabilities,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalManifestLaneProvenance {
+    pub lane: String,
+    pub producer: String,
+    pub provenance: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<i64>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalManifestContractReport {
+    pub source_root: String,
+    pub project_id: String,
+    pub input_hash: Option<String>,
+    pub generation: Option<String>,
+    pub schema_version: Option<i32>,
+    pub graph_hash: Option<String>,
+    pub symbol_doc_count: Option<i64>,
+    pub dense_anchor_count: Option<i64>,
+    pub degraded_modes: Vec<String>,
+    pub retrieval_mode: String,
+    pub degraded_reason: Option<String>,
+    pub lanes: Vec<RetrievalManifestLaneProvenance>,
+}
+
 fn capabilities_are_empty(cap: &SidecarCapabilities) -> bool {
     !cap.lexical && !cap.semantic && !cap.graph
 }
@@ -55,7 +81,116 @@ pub struct RetrievalStatusReport {
     pub qdrant: ComponentHealth,
     pub scip: ComponentHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_contract: Option<RetrievalManifestContractReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<codestory_store::RetrievalIndexManifest>,
+}
+
+pub fn attach_manifest_contract(
+    mut report: RetrievalStatusReport,
+    source_root: &Path,
+) -> RetrievalStatusReport {
+    report.manifest_contract = report
+        .manifest
+        .as_ref()
+        .map(|manifest| manifest_contract_report(source_root, &report, manifest));
+    report
+}
+
+fn manifest_contract_report(
+    source_root: &Path,
+    report: &RetrievalStatusReport,
+    manifest: &codestory_store::RetrievalIndexManifest,
+) -> RetrievalManifestContractReport {
+    let generation = manifest
+        .sidecar_generation
+        .clone()
+        .unwrap_or_else(|| "generation_missing".into());
+    let input_hash = manifest
+        .sidecar_input_hash
+        .clone()
+        .unwrap_or_else(|| "input_hash_missing".into());
+    RetrievalManifestContractReport {
+        source_root: source_root.display().to_string(),
+        project_id: manifest.project_id.clone(),
+        input_hash: manifest.sidecar_input_hash.clone(),
+        generation: manifest.sidecar_generation.clone(),
+        schema_version: manifest.sidecar_schema_version,
+        graph_hash: manifest.graph_artifact_hash.clone(),
+        symbol_doc_count: manifest.symbol_doc_count,
+        dense_anchor_count: manifest.dense_projection_count,
+        degraded_modes: parse_degraded_modes(manifest),
+        retrieval_mode: report.retrieval_mode.clone(),
+        degraded_reason: report.degraded_reason.clone(),
+        lanes: vec![
+            RetrievalManifestLaneProvenance {
+                lane: "lexical".into(),
+                producer: manifest.zoekt_version.clone(),
+                provenance: format!("sidecar_generation:{generation}"),
+                count: None,
+                status: component_status_label(&report.zoekt),
+            },
+            RetrievalManifestLaneProvenance {
+                lane: "symbol_docs".into(),
+                producer: "codestory-symbol-doc".into(),
+                provenance: format!("sidecar_input_hash:{input_hash}"),
+                count: manifest.symbol_doc_count,
+                status: count_contract_status(manifest.symbol_doc_count),
+            },
+            RetrievalManifestLaneProvenance {
+                lane: "semantic_dense".into(),
+                producer: manifest
+                    .embedding_backend
+                    .clone()
+                    .unwrap_or_else(|| "embedding_backend_missing".into()),
+                provenance: format!("qdrant_collection:{}", manifest.qdrant_collection),
+                count: manifest.dense_projection_count,
+                status: component_status_label(&report.qdrant),
+            },
+            RetrievalManifestLaneProvenance {
+                lane: "graph".into(),
+                producer: manifest
+                    .scip_revision
+                    .clone()
+                    .unwrap_or_else(|| "scip_revision_missing".into()),
+                provenance: format!("graph_artifact_hash:{}", graph_hash_label(manifest)),
+                count: None,
+                status: component_status_label(&report.scip),
+            },
+        ],
+    }
+}
+
+fn parse_degraded_modes(manifest: &codestory_store::RetrievalIndexManifest) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(&manifest.degraded_modes_json)
+        .unwrap_or_else(|_| vec!["degraded_modes_json_invalid".into()])
+}
+
+fn component_status_label(component: &ComponentHealth) -> String {
+    if let Some(reason) = component.degraded_reason.as_ref() {
+        return reason.clone();
+    }
+    match component.status {
+        ComponentStatus::Healthy => "ready",
+        ComponentStatus::Degraded => "degraded",
+        ComponentStatus::Unavailable => "unavailable",
+    }
+    .into()
+}
+
+fn count_contract_status(count: Option<i64>) -> String {
+    if count.is_some() {
+        "ready".into()
+    } else {
+        "missing_contract".into()
+    }
+}
+
+fn graph_hash_label(manifest: &codestory_store::RetrievalIndexManifest) -> String {
+    manifest
+        .graph_artifact_hash
+        .clone()
+        .unwrap_or_else(|| "graph_hash_missing".into())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +237,7 @@ pub fn unavailable_status_report(
         zoekt: unavailable_component("zoekt", &reason),
         qdrant: unavailable_component("qdrant", &reason),
         scip: unavailable_component("scip", &reason),
+        manifest_contract: None,
         manifest,
     }
 }
@@ -366,6 +502,7 @@ pub fn probe_sidecar_health(
         zoekt,
         qdrant,
         scip,
+        manifest_contract: None,
         manifest: Some(manifest),
     }
 }
@@ -451,5 +588,113 @@ mod tests {
             qdrant_capabilities(&layout, "codestory_test", &probe, Some(10), true, false);
 
         assert_eq!(capabilities, SidecarCapabilities::NONE);
+    }
+
+    #[test]
+    fn manifest_contract_reports_core_fields_and_lane_provenance() {
+        let manifest = codestory_store::RetrievalIndexManifest {
+            project_id: "testproject".into(),
+            zoekt_version: "zoekt-real-v1".into(),
+            qdrant_collection: "codestory_testproject_hash".into(),
+            scip_revision: Some("graph-test".into()),
+            built_at_epoch_ms: 1,
+            disk_bytes: Some(42),
+            degraded_modes_json: r#"["qdrant_hash_vectors_only"]"#.into(),
+            embedding_backend: Some("llamacpp:bge-base-en-v1.5".into()),
+            embedding_dim: Some(768),
+            sidecar_schema_version: Some(crate::generation::SIDECAR_SCHEMA_VERSION),
+            sidecar_input_hash: Some("input-hash".into()),
+            sidecar_generation: Some("testproject-input".into()),
+            projection_count: Some(12),
+            symbol_doc_count: Some(9),
+            dense_projection_count: Some(3),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph-hash".into()),
+            dense_reason_counts_json: Some(r#"{"public_api":3}"#.into()),
+        };
+        let report = RetrievalStatusReport {
+            retrieval_mode: "full".into(),
+            degraded_reason: None,
+            query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
+            manifest_vector_embedding_backend: manifest.embedding_backend.clone(),
+            manifest_vector_embedding_dim: manifest.embedding_dim,
+            stored_doc_vector_producer_backend: None,
+            stored_doc_vector_dim: None,
+            stored_doc_vector_mixed_backends: None,
+            zoekt: ComponentHealth {
+                name: "zoekt".into(),
+                status: ComponentStatus::Healthy,
+                latency_ms: Some(1),
+                detail: "ok".into(),
+                degraded_reason: None,
+                capabilities: SidecarCapabilities {
+                    lexical: true,
+                    semantic: false,
+                    graph: false,
+                },
+            },
+            qdrant: ComponentHealth {
+                name: "qdrant".into(),
+                status: ComponentStatus::Healthy,
+                latency_ms: Some(1),
+                detail: "ok".into(),
+                degraded_reason: None,
+                capabilities: SidecarCapabilities {
+                    lexical: false,
+                    semantic: true,
+                    graph: false,
+                },
+            },
+            scip: ComponentHealth {
+                name: "scip".into(),
+                status: ComponentStatus::Healthy,
+                latency_ms: None,
+                detail: "ok".into(),
+                degraded_reason: None,
+                capabilities: SidecarCapabilities {
+                    lexical: false,
+                    semantic: false,
+                    graph: true,
+                },
+            },
+            manifest_contract: None,
+            manifest: Some(manifest),
+        };
+        let source_root = std::env::current_dir().expect("current dir");
+
+        let report = attach_manifest_contract(report, &source_root);
+        let contract = report
+            .manifest_contract
+            .expect("manifest contract should be derived");
+
+        assert_eq!(contract.source_root, source_root.display().to_string());
+        assert_eq!(contract.project_id, "testproject");
+        assert_eq!(contract.input_hash.as_deref(), Some("input-hash"));
+        assert_eq!(contract.generation.as_deref(), Some("testproject-input"));
+        assert_eq!(
+            contract.schema_version,
+            Some(crate::generation::SIDECAR_SCHEMA_VERSION)
+        );
+        assert_eq!(contract.graph_hash.as_deref(), Some("graph-hash"));
+        assert_eq!(contract.symbol_doc_count, Some(9));
+        assert_eq!(contract.dense_anchor_count, Some(3));
+        assert_eq!(contract.degraded_modes, vec!["qdrant_hash_vectors_only"]);
+        assert_eq!(contract.lanes.len(), 4);
+        assert!(contract.lanes.iter().any(|lane| {
+            lane.lane == "lexical"
+                && lane.producer == "zoekt-real-v1"
+                && lane.provenance == "sidecar_generation:testproject-input"
+        }));
+        assert!(contract.lanes.iter().any(|lane| {
+            lane.lane == "semantic_dense"
+                && lane.producer == "llamacpp:bge-base-en-v1.5"
+                && lane.provenance == "qdrant_collection:codestory_testproject_hash"
+                && lane.count == Some(3)
+        }));
+        assert!(contract.lanes.iter().any(|lane| {
+            lane.lane == "graph"
+                && lane.producer == "graph-test"
+                && lane.provenance == "graph_artifact_hash:graph-hash"
+        }));
     }
 }

@@ -136,6 +136,10 @@ fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
         Some("full"),
         "manifest-missing status must not report full mode before retrieval index: {status}"
     );
+    assert!(
+        status["manifest_contract"].is_null(),
+        "manifest-missing status must not derive a manifest contract: {status}"
+    );
 }
 
 #[test]
