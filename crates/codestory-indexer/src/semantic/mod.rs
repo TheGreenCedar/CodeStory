@@ -278,7 +278,6 @@ impl SemanticCandidateIndex {
 }
 
 pub trait SemanticResolver: Send + Sync {
-    fn language(&self) -> &'static str;
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

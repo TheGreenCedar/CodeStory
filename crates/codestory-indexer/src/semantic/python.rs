@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct PythonSemanticResolver;
 
 impl SemanticResolver for PythonSemanticResolver {
-    fn language(&self) -> &'static str {
-        "python"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

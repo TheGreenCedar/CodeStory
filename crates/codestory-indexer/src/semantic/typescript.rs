@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct TypeScriptSemanticResolver;
 
 impl SemanticResolver for TypeScriptSemanticResolver {
-    fn language(&self) -> &'static str {
-        "typescript"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

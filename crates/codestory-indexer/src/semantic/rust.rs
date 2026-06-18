@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct RustSemanticResolver;
 
 impl SemanticResolver for RustSemanticResolver {
-    fn language(&self) -> &'static str {
-        "rust"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

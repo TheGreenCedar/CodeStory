@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct CSharpSemanticResolver;
 
 impl SemanticResolver for CSharpSemanticResolver {
-    fn language(&self) -> &'static str {
-        "csharp"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,

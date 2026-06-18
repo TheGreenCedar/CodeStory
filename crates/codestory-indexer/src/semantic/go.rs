@@ -9,10 +9,6 @@ use codestory_contracts::graph::{EdgeKind, NodeKind};
 pub struct GoSemanticResolver;
 
 impl SemanticResolver for GoSemanticResolver {
-    fn language(&self) -> &'static str {
-        "go"
-    }
-
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,
