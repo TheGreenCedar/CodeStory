@@ -1,8 +1,8 @@
 # `cache` - Worktree Cache Bootstrap
 
 Checks whether a parent worktree cache is compatible with a child worktree,
-snapshots the SQLite cache, and rebases path-bound SQLite grounding/index/search
-rows so the child can use them under its own worktree path.
+snapshots the SQLite cache, and rebases path-bound SQLite graph/search/doc rows
+so the child can use them under its own worktree path.
 
 ## Usage
 
@@ -30,7 +30,8 @@ rows so the child can use them under its own worktree path.
 3. Run the printed `retrieval index --refresh full` command before using
    packet/search as agent-facing sidecar evidence. Retrieval manifests are
    invalidated because sidecar generation ids are currently project-root
-   derived.
+   derived. Index artifact cache rows are invalidated because their cache keys
+   include absolute source paths.
 4. If status is `skipped`, use the printed normal rebuild commands.
 
 ## Safety Contract
@@ -38,6 +39,6 @@ rows so the child can use them under its own worktree path.
 Rehydrate requires clean source and target worktrees, matching `origin` URLs,
 matching Git tree ids, a source SQLite schema matching the running CLI, at
 least one indexed source file, and an empty target cache directory. This command
-preserves and rebases SQLite grounding/index/search rows, but it does not reuse
-retrieval sidecars across worktree-root-derived project ids yet. It also does
-not configure Rust compilation cache such as `sccache`.
+preserves and rebases SQLite graph/search/doc rows, but it does not reuse index
+artifact cache rows or retrieval sidecars across worktree-root-derived project
+ids yet. It also does not configure Rust compilation cache such as `sccache`.

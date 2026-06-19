@@ -31,6 +31,7 @@ pub struct CacheRehydrateOutput {
     pub copied: bool,
     pub dry_run: bool,
     pub invalidated_retrieval_manifests: usize,
+    pub invalidated_index_artifact_rows: usize,
     pub rebased_path_bound_rows: usize,
     pub preserved_scope: String,
     pub retrieval: String,
@@ -131,15 +132,18 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         )?;
     }
     let mut invalidated_retrieval_manifests = 0;
+    let mut invalidated_index_artifact_rows = 0;
     let mut rebased_path_bound_rows = 0;
     if !request.dry_run {
         let mut storage = Store::open(&target_db).context("open copied target cache")?;
         invalidated_retrieval_manifests = storage
             .clear_retrieval_index_manifests()
             .context("invalidate copied retrieval manifests")?;
-        rebased_path_bound_rows = storage
+        let (rebased_rows, invalidated_artifacts) = storage
             .rebase_rehydrated_path_bound_cache(request.source_project, request.target_project)
             .context("rebase copied path-bound cache rows")?;
+        rebased_path_bound_rows = rebased_rows;
+        invalidated_index_artifact_rows = invalidated_artifacts;
     }
 
     Ok(CacheRehydrateOutput {
@@ -162,9 +166,10 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         copied: !request.dry_run,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests,
+        invalidated_index_artifact_rows,
         rebased_path_bound_rows,
-        preserved_scope: "grounding_index_search_docs_rebased".into(),
-        retrieval: "path-bound SQLite rows rebased; retrieval manifests invalidated because sidecar generations are project-root derived".into(),
+        preserved_scope: "sqlite_graph_search_docs_rebased".into(),
+        retrieval: "path-bound SQLite graph/search/doc rows rebased; index artifact cache and retrieval manifests invalidated because their keys are path/root derived".into(),
         next_commands: rehydrate_next_commands(request.target_project),
     })
 }
@@ -265,6 +270,7 @@ fn skipped(
         copied: false,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests: 0,
+        invalidated_index_artifact_rows: 0,
         rebased_path_bound_rows: 0,
         preserved_scope: "none".into(),
         retrieval: "not rehydrated; normal index/retrieval rebuild required".into(),
@@ -370,11 +376,9 @@ mod tests {
         assert_eq!(output.status, "rehydrated");
         assert!(target_cache_path.join("codestory.db").is_file());
         assert_eq!(output.invalidated_retrieval_manifests, 1);
+        assert_eq!(output.invalidated_index_artifact_rows, 1);
         assert!(output.rebased_path_bound_rows > 0);
-        assert_eq!(
-            output.preserved_scope,
-            "grounding_index_search_docs_rebased"
-        );
+        assert_eq!(output.preserved_scope, "sqlite_graph_search_docs_rebased");
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
             storage
@@ -400,12 +404,13 @@ mod tests {
         );
         assert_eq!(storage.get_stats().expect("stats").file_count, 1);
         let target_source = target_project.path().join("src.rs");
+        let target_cache_key = test_artifact_cache_key(&target_source);
         assert!(
             storage
-                .get_index_artifact_cache(&target_source, "artifact-cache-key")
-                .expect("artifact cache lookup")
-                .is_some(),
-            "rehydrated target DB should retain rebased artifact cache rows"
+                .get_index_artifact_cache(&target_source, &target_cache_key)
+                .expect("target artifact cache lookup")
+                .is_none(),
+            "rehydrated target DB must not claim copied path-bound artifact cache hits"
         );
     }
 
@@ -569,7 +574,7 @@ mod tests {
         storage
             .upsert_index_artifact_cache(
                 &absolute_source,
-                "artifact-cache-key",
+                &test_artifact_cache_key(&absolute_source),
                 format!("artifact from {absolute_source_text}").as_bytes(),
             )
             .expect("artifact");
@@ -595,5 +600,9 @@ mod tests {
                 dense_reason_counts_json: None,
             })
             .expect("manifest");
+    }
+
+    fn test_artifact_cache_key(path: &Path) -> String {
+        format!("v1:path-bound:{}", path.to_string_lossy())
     }
 }

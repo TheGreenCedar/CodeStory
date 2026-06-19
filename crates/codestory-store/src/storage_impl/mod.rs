@@ -1627,15 +1627,14 @@ impl Storage {
         &mut self,
         source_root: &Path,
         target_root: &Path,
-    ) -> Result<usize, StorageError> {
+    ) -> Result<(usize, usize), StorageError> {
         let source_root = source_root.to_string_lossy().to_string();
         let target_root = target_root.to_string_lossy().to_string();
         let mut updated = self.rebase_path_bound_text_columns(&source_root, &target_root)?;
-        updated = updated
-            .saturating_add(self.rebase_index_artifact_cache_blobs(&source_root, &target_root)?);
         updated = updated.saturating_add(self.refresh_rebased_file_metadata()?);
+        let invalidated_artifacts = self.clear_index_artifact_cache()?;
         self.cache.nodes.write().clear();
-        Ok(updated)
+        Ok((updated, invalidated_artifacts))
     }
 
     fn rebase_path_bound_text_columns(
@@ -1706,9 +1705,6 @@ impl Storage {
                 OR instr(COALESCE(canonical_id, ''), ?1) > 0
                 OR instr(display_name, ?1) > 0
                 OR instr(COALESCE(file_path, ''), ?1) > 0",
-            "UPDATE index_artifact_cache
-             SET file_path = replace(file_path, ?1, ?2)
-             WHERE instr(file_path, ?1) > 0",
         ] {
             updated =
                 updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
@@ -1717,43 +1713,8 @@ impl Storage {
         Ok(updated)
     }
 
-    fn rebase_index_artifact_cache_blobs(
-        &self,
-        source_root: &str,
-        target_root: &str,
-    ) -> Result<usize, StorageError> {
-        let mut rows = Vec::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT file_path, artifact_blob
-                 FROM index_artifact_cache
-                 WHERE instr(CAST(artifact_blob AS TEXT), ?1) > 0",
-            )?;
-            let mut query = stmt.query(params![source_root])?;
-            while let Some(row) = query.next()? {
-                rows.push((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?));
-            }
-        }
-
-        let tx = self.conn.unchecked_transaction()?;
-        let mut updated = 0usize;
-        for (file_path, blob) in rows {
-            let Ok(text) = String::from_utf8(blob) else {
-                continue;
-            };
-            if !text.contains(source_root) {
-                continue;
-            }
-            let rebased = text.replace(source_root, target_root);
-            updated = updated.saturating_add(tx.execute(
-                "UPDATE index_artifact_cache
-                 SET artifact_blob = ?2
-                 WHERE file_path = ?1",
-                params![file_path, rebased.into_bytes()],
-            )?);
-        }
-        tx.commit()?;
-        Ok(updated)
+    fn clear_index_artifact_cache(&self) -> Result<usize, StorageError> {
+        Ok(self.conn.execute("DELETE FROM index_artifact_cache", [])?)
     }
 
     fn refresh_rebased_file_metadata(&self) -> Result<usize, StorageError> {
@@ -1796,7 +1757,6 @@ impl Storage {
             "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
             "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
             "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
-            "SELECT COUNT(*) FROM index_artifact_cache WHERE file_path LIKE ?1 OR cache_key LIKE ?1 OR CAST(artifact_blob AS TEXT) LIKE ?1",
         ] {
             let matched: i64 = self
                 .conn

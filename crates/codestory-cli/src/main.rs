@@ -319,6 +319,11 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
     );
     let _ = writeln!(
         markdown,
+        "invalidated_index_artifact_rows: `{}`",
+        output.invalidated_index_artifact_rows
+    );
+    let _ = writeln!(
+        markdown,
         "rebased_path_bound_rows: `{}`",
         output.rebased_path_bound_rows
     );
