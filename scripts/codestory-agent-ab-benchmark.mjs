@@ -60,6 +60,16 @@ const TOOL_ACCOUNTING_CATEGORIES = [
   "tool_call",
   "other",
 ];
+const PACKET_RUNTIME_DELTA_FIELDS = [
+  "packet_sla_missed_runs",
+  "median_e2e_wall_ms",
+  "median_trace_sla_retrieval_ms",
+  "median_trace_accounted_ms",
+  "median_packet_unaccounted_ms",
+  "median_warm_first_hit_wall_ms",
+  "median_warm_cache_hit_wall_ms",
+  "median_packet_batch_overhead_ms",
+];
 
 const PUBLIC_REPOS = {
   codestory: {
@@ -4578,6 +4588,12 @@ function summarizePacketRuntimeRuns(results) {
       .map((row) => row.packet_latency?.retrieval_shadow)
       .filter((shadow) => shadow && typeof shadow === "object");
     const compositionRows = successful.filter((row) => row.packet_composition);
+    const warmFirstHitRows = successful.filter((row) =>
+      mode === "warm_stdio_packet" && row.warm_stdio_packet_cache_hit !== true
+    );
+    const warmCacheHitRows = successful.filter((row) =>
+      mode === "warm_stdio_packet" && row.warm_stdio_packet_cache_hit === true
+    );
     const topLatencyRow = latencyRows
       .filter((row) => Number.isFinite(Number(row.packet_latency?.top_step_duration_ms)))
       .sort((left, right) =>
@@ -4598,14 +4614,19 @@ function summarizePacketRuntimeRuns(results) {
       sufficiency_status_counts: sufficiencyStatusCounts,
       sufficient_quality_mismatch_runs: sufficiencyRows.filter((row) => row.sufficiency?.sufficient_quality_mismatch).length,
       median_wall_ms: median(successful.map((row) => row.wall_ms)),
+      median_e2e_wall_ms: median(successful.map((row) => row.wall_ms)),
       median_response_bytes: median(successful.map((row) => row.response_bytes)),
       median_packet_bytes: median(shapeRows.map((row) => row.packet_shape?.packet_bytes)),
       median_packet_graph_bytes: median(shapeRows.map((row) => row.packet_shape?.graph_bytes)),
       median_budget_used_output_bytes: median(shapeRows.map((row) => row.packet_shape?.budget_used_output_bytes)),
       median_packet_freshness_ms: median(latencyRows.map((row) => row.packet_latency?.freshness_ms)),
       median_packet_retrieval_total_ms: median(latencyRows.map((row) => row.packet_latency?.retrieval_total_ms)),
+      median_trace_sla_retrieval_ms: median(latencyRows.map((row) => row.packet_latency?.retrieval_total_ms)),
       median_packet_accounted_trace_ms: median(latencyRows.map((row) => row.packet_latency?.accounted_trace_ms)),
+      median_trace_accounted_ms: median(latencyRows.map((row) => row.packet_latency?.accounted_trace_ms)),
       median_packet_unaccounted_ms: median(latencyRows.map((row) => row.packet_latency?.unaccounted_ms)),
+      median_warm_first_hit_wall_ms: median(warmFirstHitRows.map((row) => row.wall_ms)),
+      median_warm_cache_hit_wall_ms: median(warmCacheHitRows.map((row) => row.wall_ms)),
       median_packet_batch_total_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_total_ms)),
       median_packet_batch_attributed_query_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_attributed_query_ms)),
       median_packet_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_overhead_ms)),
@@ -4651,12 +4672,81 @@ function summarizePacketRuntimeRuns(results) {
   });
 }
 
+function packetRuntimeTaskKey(row) {
+  return `${row.repo}\t${row.task_id}\t${row.mode}`;
+}
+
+function roundPacketRuntimeNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return null;
+  }
+  return Math.round(number * 1000) / 1000;
+}
+
+function pickPacketRuntimeMetrics(row) {
+  return Object.fromEntries(
+    PACKET_RUNTIME_DELTA_FIELDS
+      .map((field) => [field, roundPacketRuntimeNumber(row?.[field])])
+      .filter(([, value]) => value != null),
+  );
+}
+
+function buildPacketRuntimeDeltas(currentRows, baselineRows, opts = {}) {
+  const baselineByKey = new Map(baselineRows.map((row) => [packetRuntimeTaskKey(row), row]));
+  return {
+    baseline_summary: opts.baselinePath ?? null,
+    current_summary: opts.currentPath ?? null,
+    fields: PACKET_RUNTIME_DELTA_FIELDS,
+    tasks: currentRows.map((row) => {
+      const baseline = baselineByKey.get(packetRuntimeTaskKey(row));
+      const current = pickPacketRuntimeMetrics(row);
+      const deltas = {};
+      if (baseline) {
+        for (const field of PACKET_RUNTIME_DELTA_FIELDS) {
+          const currentValue = roundPacketRuntimeNumber(row?.[field]);
+          const baselineValue = roundPacketRuntimeNumber(baseline?.[field]);
+          if (currentValue != null && baselineValue != null) {
+            deltas[field] = {
+              baseline: baselineValue,
+              current: currentValue,
+              delta: roundPacketRuntimeNumber(currentValue - baselineValue),
+            };
+          }
+        }
+      }
+      return {
+        repo: row.repo ?? null,
+        task_id: row.task_id ?? null,
+        mode: row.mode ?? null,
+        baseline: baseline ? pickPacketRuntimeMetrics(baseline) : null,
+        current,
+        deltas: baseline ? deltas : null,
+      };
+    }),
+  };
+}
+
+function packetRuntimeArtifactManifest({ outDir, benchmarkId, artifactPaths }) {
+  const stableDir = path.join("target", "agent-benchmark", benchmarkId).replaceAll(path.sep, "/");
+  return {
+    output_dir: outDir,
+    benchmark_run_id: benchmarkId,
+    artifacts: artifactPaths,
+    durable_copy_convention: {
+      suggested_stable_directory: stableDir,
+      note:
+        "Before linking focused packet-runtime evidence from a temporary worktree, copy the full run directory to a stable checkout path or attach these artifacts to the PR/issue.",
+    },
+  };
+}
+
 function packetRuntimeMarkdown(summary) {
   const lines = [
     "# Packet Runtime Benchmark",
     "",
-    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | DTO ms median | Output budget ms median | Sufficiency ms median | Stdio req JSON ms median | Stdio req write ms median | Stdio resp wait ms median | Server output ms median | Server serialize ms median | Server newline ms median | Server flush ms median | Stdio resp parse ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | E2E wall ms median | Trace SLA retrieval ms median | Trace accounted ms median | Freshness ms median | Non-trace wall ms median | Warm first-hit wall ms median | Warm cache-hit wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | DTO ms median | Output budget ms median | Sufficiency ms median | Stdio req JSON ms median | Stdio req write ms median | Stdio resp wait ms median | Server output ms median | Server serialize ms median | Server newline ms median | Server flush ms median | Stdio resp parse ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(packetRuntimeMarkdownRow(row));
@@ -4677,10 +4767,13 @@ function packetRuntimeMarkdownRow(row) {
     row.quality_pass_runs,
     sufficiency,
     formatValue(row.sufficient_quality_mismatch_runs),
-    formatValue(row.median_wall_ms),
-    formatValue(row.median_packet_retrieval_total_ms),
+    formatValue(row.median_e2e_wall_ms),
+    formatValue(row.median_trace_sla_retrieval_ms),
+    formatValue(row.median_trace_accounted_ms),
     formatValue(row.median_packet_freshness_ms),
     formatValue(row.median_packet_unaccounted_ms),
+    formatValue(row.median_warm_first_hit_wall_ms),
+    formatValue(row.median_warm_cache_hit_wall_ms),
     formatValue(row.median_packet_non_trace_phase_total_ms),
     formatValue(row.median_packet_stdio_phase_total_ms),
     formatValue(row.median_packet_budget_ms),
@@ -5246,11 +5339,23 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
   };
   const packetRuntimeSummaryPath = path.join(outDir, "packet-runtime-summary.json");
   await writeFile(packetRuntimeSummaryPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  await writeFile(path.join(outDir, "packet-runtime-summary.md"), packetRuntimeMarkdown(summary), "utf8");
+  const packetRuntimeMarkdownPath = path.join(outDir, "packet-runtime-summary.md");
+  await writeFile(packetRuntimeMarkdownPath, packetRuntimeMarkdown(summary), "utf8");
   const baselinePacketSummaryPath = discoverPreviousPacketSummary(packetRuntimeSummaryPath, repoRoot);
   const baselinePacketSummary = baselinePacketSummaryPath
     ? JSON.parse(await readFile(baselinePacketSummaryPath, "utf8"))
     : null;
+  const packetRuntimeDeltas = buildPacketRuntimeDeltas(
+    summary,
+    Array.isArray(baselinePacketSummary?.summary) ? baselinePacketSummary.summary : [],
+    {
+      currentPath: packetRuntimeSummaryPath,
+      baselinePath: baselinePacketSummaryPath,
+    },
+  );
+  const packetRuntimeDeltasPath = path.join(outDir, "packet-runtime-deltas.json");
+  await writeFile(packetRuntimeDeltasPath, `${JSON.stringify(packetRuntimeDeltas, null, 2)}\n`, "utf8");
+  console.log(`ARTIFACT packet_runtime_deltas=${packetRuntimeDeltasPath}`);
   const packetQualityDeltas = buildPacketQualityDeltas(
     summary,
     Array.isArray(baselinePacketSummary?.summary) ? baselinePacketSummary.summary : [],
@@ -5285,6 +5390,28 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
       "utf8",
     );
   }
+  const packetRuntimeArtifactManifestPath = path.join(outDir, "packet-runtime-artifacts.json");
+  await writeFile(
+    packetRuntimeArtifactManifestPath,
+    `${JSON.stringify(
+      packetRuntimeArtifactManifest({
+        outDir,
+        benchmarkId,
+        artifactPaths: {
+          summary_json: packetRuntimeSummaryPath,
+          summary_markdown: packetRuntimeMarkdownPath,
+          runs_jsonl: path.join(outDir, "packet-runtime-runs.jsonl"),
+          runtime_deltas_json: packetRuntimeDeltasPath,
+          quality_deltas_json: packetQualityDeltasPath,
+          quality_debug_json: qualityDebugPath,
+        },
+      }),
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  console.log(`ARTIFACT packet_runtime_artifacts=${packetRuntimeArtifactManifestPath}`);
 
   const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
@@ -6117,6 +6244,65 @@ function runSelfTest() {
   assert.equal(packetLatency.packet_stdio_phase_total_ms, 7);
   assert.equal(packetLatency.packet_stdio_text_materialization_ms, 3);
   assert.equal(packetLatency.packet_stdio_tool_response_materialization_ms, 4);
+  const reviewerRuntimeSummary = summarizePacketRuntimeRuns([
+    {
+      repo: "repo",
+      task_id: "task",
+      mode: "warm_stdio_packet",
+      status: "pass",
+      wall_ms: 120,
+      warm_stdio_packet_cache_hit: false,
+      packet_latency: {
+        retrieval_total_ms: 80,
+        accounted_trace_ms: 90,
+        unaccounted_ms: 30,
+        packet_batch_overhead_ms: 12,
+        sla_missed: false,
+      },
+    },
+    {
+      repo: "repo",
+      task_id: "task",
+      mode: "warm_stdio_packet",
+      status: "pass",
+      wall_ms: 30,
+      warm_stdio_packet_cache_hit: true,
+      packet_latency: {
+        retrieval_total_ms: 8,
+        accounted_trace_ms: 10,
+        unaccounted_ms: 20,
+        packet_batch_overhead_ms: 2,
+        sla_missed: false,
+      },
+    },
+  ])[0];
+  assert.equal(reviewerRuntimeSummary.median_e2e_wall_ms, 75);
+  assert.equal(reviewerRuntimeSummary.median_trace_sla_retrieval_ms, 44);
+  assert.equal(reviewerRuntimeSummary.median_warm_first_hit_wall_ms, 120);
+  assert.equal(reviewerRuntimeSummary.median_warm_cache_hit_wall_ms, 30);
+  const runtimeDeltas = buildPacketRuntimeDeltas([reviewerRuntimeSummary], [
+    {
+      ...reviewerRuntimeSummary,
+      median_e2e_wall_ms: 100,
+      median_trace_sla_retrieval_ms: 60,
+      packet_sla_missed_runs: 1,
+      median_packet_unaccounted_ms: 40,
+      median_warm_first_hit_wall_ms: 150,
+      median_warm_cache_hit_wall_ms: 45,
+      median_packet_batch_overhead_ms: 20,
+    },
+  ]);
+  assert.equal(runtimeDeltas.tasks[0].deltas.packet_sla_missed_runs.delta, -1);
+  assert.equal(runtimeDeltas.tasks[0].deltas.median_trace_sla_retrieval_ms.delta, -16);
+  assert.equal(runtimeDeltas.tasks[0].deltas.median_warm_cache_hit_wall_ms.delta, -15);
+  assert.equal(
+    packetRuntimeArtifactManifest({
+      outDir: "target/agent-benchmark/focused-run",
+      benchmarkId: "focused-run",
+      artifactPaths: { summary: "packet-runtime-summary.json" },
+    }).durable_copy_convention.suggested_stable_directory,
+    "target/agent-benchmark/focused-run",
+  );
   const serverPhase = parseStdioServerPhaseLine(
     'packet_stdio_server_phase request_id="java-commons-lang-string-utils-1" label=response_serialization duration_ms=12',
   );
