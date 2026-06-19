@@ -4340,6 +4340,7 @@ mod tests {
                 unresolved_candidate_count: 0,
                 diagnostic_only: false,
                 candidate_resolution_counts: Vec::new(),
+                diagnostic_only: false,
             }),
             freshness: None,
             limit_per_source: 1,
