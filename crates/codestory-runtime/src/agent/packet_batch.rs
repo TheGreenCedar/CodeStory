@@ -618,6 +618,9 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
     ranked
         .into_iter()
         .filter_map(|(_, query)| {
+            if is_packet_path_like_query(&query.query) {
+                return Some(query.query.clone());
+            }
             let key = normalize_identifier(&query.query);
             if key.len() < 2 || seen.insert(key) {
                 Some(query.query.clone())
@@ -960,6 +963,34 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(limited, ["parseToken", "writeBuffer", "openSocket"]);
+    }
+
+    #[test]
+    fn packet_anchor_probe_limit_keeps_path_like_normalized_matches() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Explain library entrypoints".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "src/lib.rs".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "src_lib_rs".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+            ],
+            trace: Vec::new(),
+        };
+
+        let queries = packet_anchor_probe_queries(&plan);
+
+        assert_eq!(queries, ["src/lib.rs", "src_lib_rs"]);
     }
 
     #[test]
