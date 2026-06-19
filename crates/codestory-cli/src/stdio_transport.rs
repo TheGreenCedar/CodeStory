@@ -241,16 +241,16 @@ fn stdio_jsonrpc_tool_call_from_legacy(
     stdio_jsonrpc_success(id, stdio_tool_call_success(response))
 }
 
-fn stdio_tool_call_success(mut structured_content: serde_json::Value) -> serde_json::Value {
+fn stdio_tool_call_success(structured_content: serde_json::Value) -> serde_json::Value {
     let is_packet = stdio_is_packet(&structured_content);
+    let mut stdio_phases = Vec::new();
     let text_started = Instant::now();
     let text = stdio_tool_text(&structured_content);
     if is_packet {
-        append_stdio_packet_phase(
-            &mut structured_content,
+        stdio_phases.push(stdio_packet_phase(
             "text_materialization",
             stdio_elapsed_ms(text_started),
-        );
+        ));
     }
 
     let response_started = Instant::now();
@@ -263,12 +263,17 @@ fn stdio_tool_call_success(mut structured_content: serde_json::Value) -> serde_j
         ],
         "structuredContent": structured_content
     });
-    if is_packet && let Some(structured_content) = response.get_mut("structuredContent") {
-        append_stdio_packet_phase(
-            structured_content,
+    if is_packet {
+        stdio_phases.push(stdio_packet_phase(
             "tool_response_materialization",
             stdio_elapsed_ms(response_started),
-        );
+        ));
+        if let Some(response) = response.as_object_mut() {
+            response.insert(
+                "_meta".to_string(),
+                serde_json::json!({ "codestory_stdio_phases": stdio_phases }),
+            );
+        }
     }
     response
 }
@@ -284,15 +289,10 @@ fn stdio_is_packet(value: &serde_json::Value) -> bool {
     value.get("packet_id").is_some() && value.get("answer").is_some()
 }
 
-fn append_stdio_packet_phase(packet: &mut serde_json::Value, label: &str, duration_ms: u32) {
-    if let Some(annotations) = packet
-        .pointer_mut("/answer/retrieval_trace/annotations")
-        .and_then(|value| value.as_array_mut())
-    {
-        annotations.push(serde_json::Value::String(format!(
-            "packet_stdio_phase label={label} duration_ms={duration_ms}"
-        )));
-    }
+fn stdio_packet_phase(label: &str, duration_ms: u32) -> serde_json::Value {
+    serde_json::Value::String(format!(
+        "packet_stdio_phase label={label} duration_ms={duration_ms}"
+    ))
 }
 
 fn stdio_elapsed_ms(started_at: Instant) -> u32 {
@@ -1911,19 +1911,66 @@ mod tests {
     }
 
     #[test]
-    fn stdio_tool_call_success_times_packet_materialization() {
-        let response = stdio_tool_call_success(json!({
+    fn stdio_tool_call_success_keeps_packet_timing_out_of_structured_content() {
+        let mut packet = json!({
             "packet_id": "packet-1",
             "answer": {
                 "retrieval_trace": {
                     "annotations": []
                 }
+            },
+            "budget": {
+                "limits": {
+                    "max_output_bytes": 0
+                },
+                "used": {
+                    "output_bytes": 0
+                }
             }
-        }));
+        });
+        for _ in 0..4 {
+            let len = serde_json::to_vec(&packet).expect("serialize packet").len();
+            packet["budget"]["limits"]["max_output_bytes"] = json!(len);
+            packet["budget"]["used"]["output_bytes"] = json!(len);
+        }
+
+        let response = stdio_tool_call_success(packet);
         let annotations = response
             .pointer("/structuredContent/answer/retrieval_trace/annotations")
             .and_then(|value| value.as_array())
             .expect("packet annotations");
+        assert!(
+            annotations.is_empty(),
+            "stdio timings should not mutate budgeted packet content: {annotations:?}"
+        );
+
+        let packet = response
+            .get("structuredContent")
+            .expect("structured packet content");
+        let packet_bytes = serde_json::to_vec(packet)
+            .expect("serialize structured packet")
+            .len();
+        let max_output_bytes = packet
+            .pointer("/budget/limits/max_output_bytes")
+            .and_then(|value| value.as_u64())
+            .expect("packet max output bytes") as usize;
+        let used_output_bytes = packet
+            .pointer("/budget/used/output_bytes")
+            .and_then(|value| value.as_u64())
+            .expect("packet used output bytes") as usize;
+        assert_eq!(
+            used_output_bytes, packet_bytes,
+            "stdio packet content should not make output byte telemetry stale"
+        );
+        assert!(
+            packet_bytes <= max_output_bytes,
+            "stdio packet content should stay inside the enforced budget: {packet_bytes} > {max_output_bytes}"
+        );
+
+        let annotations = response
+            .pointer("/_meta/codestory_stdio_phases")
+            .and_then(|value| value.as_array())
+            .expect("stdio phases");
 
         assert!(annotations.iter().any(|annotation| {
             annotation.as_str().is_some_and(|value| {
