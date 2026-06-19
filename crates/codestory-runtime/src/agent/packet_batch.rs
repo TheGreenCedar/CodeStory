@@ -13,6 +13,7 @@ use super::packet_trace::{
 };
 use super::planning::packet_subquery_hybrid_weights;
 use super::trace::field;
+use crate::agent::retrieval_primary::SidecarPacketBatchTiming;
 use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentHybridWeightsDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
@@ -155,11 +156,13 @@ pub(crate) fn run_packet_planned_subqueries(
                     .extend(outcome.sidecar_diagnostics.clone());
                 let results = outcome.results;
                 let diagnostics = outcome.sidecar_diagnostics;
+                let timing = outcome.sidecar_batch_timing;
                 annotate_packet_batch_timing(
                     answer,
                     "packet_lexical_subquery_batch",
                     duration_ms,
                     &diagnostics,
+                    timing.as_ref(),
                 );
                 merge_packet_lexical_subquery_batch(
                     answer,
@@ -212,12 +215,14 @@ pub(crate) fn run_packet_planned_subqueries(
                                 .packet_sidecar_diagnostics
                                 .extend(outcome.sidecar_diagnostics.clone());
                             let diagnostics = outcome.sidecar_diagnostics;
+                            let timing = outcome.sidecar_batch_timing;
                             record_semantic_fallbacks(answer, &outcome.fallbacks);
                             annotate_packet_batch_timing(
                                 answer,
                                 "packet_lexical_subquery_hybrid_retry_batch",
                                 retry_duration_ms,
                                 &diagnostics,
+                                timing.as_ref(),
                             );
                             merge_packet_semantic_subquery_batch(
                                 answer,
@@ -282,12 +287,14 @@ pub(crate) fn run_packet_planned_subqueries(
                         .packet_sidecar_diagnostics
                         .extend(outcome.sidecar_diagnostics.clone());
                     let diagnostics = outcome.sidecar_diagnostics;
+                    let timing = outcome.sidecar_batch_timing;
                     record_semantic_fallbacks(answer, &outcome.fallbacks);
                     annotate_packet_batch_timing(
                         answer,
                         "packet_semantic_subquery_batch",
                         duration_ms,
                         &diagnostics,
+                        timing.as_ref(),
                     );
                     merge_packet_semantic_subquery_batch(
                         answer,
@@ -349,6 +356,7 @@ fn annotate_packet_batch_timing(
     label: &str,
     duration_ms: u32,
     diagnostics: &[PacketSidecarQueryDiagnosticDto],
+    timing: Option<&SidecarPacketBatchTiming>,
 ) {
     let attributed_ms = diagnostics
         .iter()
@@ -362,6 +370,25 @@ fn annotate_packet_batch_timing(
         overhead_ms,
         diagnostics.len()
     ));
+    if let Some(timing) = timing {
+        let measured_internal_ms = timing
+            .prepare_ms
+            .saturating_add(timing.query_loop_wall_ms)
+            .saturating_add(timing.result_build_ms);
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_sidecar_batch_timing label={} query_count={} batch_wall_ms={} prepare_ms={} query_loop_wall_ms={} sum_query_total_elapsed_ms={} sum_sidecar_query_ms={} sum_candidate_resolution_ms={} result_build_ms={} unattributed_batch_gap_ms={}",
+            label,
+            diagnostics.len(),
+            duration_ms,
+            timing.prepare_ms,
+            timing.query_loop_wall_ms,
+            timing.sum_query_total_elapsed_ms,
+            timing.sum_sidecar_query_ms,
+            timing.sum_candidate_resolution_ms,
+            timing.result_build_ms,
+            duration_ms.saturating_sub(measured_internal_ms)
+        ));
+    }
 }
 
 fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
@@ -466,11 +493,13 @@ pub(crate) fn run_packet_anchor_expansion(
                 .packet_sidecar_diagnostics
                 .extend(outcome.sidecar_diagnostics.clone());
             let diagnostics = outcome.sidecar_diagnostics;
+            let timing = outcome.sidecar_batch_timing;
             annotate_packet_batch_timing(
                 answer,
                 "packet_anchor_probe_batch",
                 duration_ms,
                 &diagnostics,
+                timing.as_ref(),
             );
             let results = outcome.results;
             let per_step_duration = duration_ms / results.len().max(1) as u32;
@@ -1030,6 +1059,81 @@ mod tests {
         assert!(queries.contains(&"run".to_string()));
         assert!(queries.contains(&"entrypoint".to_string()));
         assert!(!queries.contains(&"architecture entrypoint".to_string()));
+    }
+
+    #[test]
+    fn packet_lexical_subquery_batch_timing_annotation_includes_gap_fields() {
+        let mut answer = AgentAnswerDto {
+            answer_id: "answer".to_string(),
+            prompt: "trace request handling".to_string(),
+            summary: "summary".to_string(),
+            freshness: None,
+            sections: Vec::new(),
+            citations: Vec::new(),
+            subgraph_ids: Vec::new(),
+            retrieval_version: "hybrid-v1".to_string(),
+            graphs: Vec::new(),
+            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
+                request_id: "request".to_string(),
+                resolved_profile: codestory_contracts::api::AgentRetrievalPresetDto::Architecture,
+                policy_mode: codestory_contracts::api::AgentRetrievalPolicyModeDto::LatencyFirst,
+                total_latency_ms: 0,
+                sla_target_ms: None,
+                sla_missed: false,
+                semantic_fallback_count: 0,
+                semantic_fallbacks: Vec::new(),
+                annotations: Vec::new(),
+                steps: Vec::new(),
+                packet_sidecar_diagnostics: Vec::new(),
+                retrieval_shadow: None,
+            },
+        };
+        let diagnostics = vec![PacketSidecarQueryDiagnosticDto {
+            query: "dispatchRequest".to_string(),
+            retrieval_mode: "full".to_string(),
+            sidecar_query_ms: Some(7),
+            candidate_resolution_ms: Some(3),
+            total_elapsed_ms: Some(10),
+            sidecar_stage_count: 0,
+            sidecar_stage_total_ms: None,
+            candidate_count: 1,
+            resolved_hit_count: 1,
+            unresolved_candidate_count: 0,
+            diagnostic: None,
+        }];
+        let timing = SidecarPacketBatchTiming {
+            prepare_ms: 2,
+            query_loop_wall_ms: 11,
+            sum_query_total_elapsed_ms: 10,
+            sum_sidecar_query_ms: 7,
+            sum_candidate_resolution_ms: 3,
+            result_build_ms: 4,
+        };
+
+        annotate_packet_batch_timing(
+            &mut answer,
+            "packet_lexical_subquery_batch",
+            25,
+            &diagnostics,
+            Some(&timing),
+        );
+
+        let annotation = answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .find(|entry| entry.starts_with("packet_sidecar_batch_timing "))
+            .expect("packet sidecar batch timing annotation");
+        assert!(annotation.contains("label=packet_lexical_subquery_batch"));
+        assert!(annotation.contains("query_count=1"));
+        assert!(annotation.contains("batch_wall_ms=25"));
+        assert!(annotation.contains("prepare_ms=2"));
+        assert!(annotation.contains("query_loop_wall_ms=11"));
+        assert!(annotation.contains("sum_query_total_elapsed_ms=10"));
+        assert!(annotation.contains("sum_sidecar_query_ms=7"));
+        assert!(annotation.contains("sum_candidate_resolution_ms=3"));
+        assert!(annotation.contains("result_build_ms=4"));
+        assert!(annotation.contains("unattributed_batch_gap_ms=8"));
     }
 }
 

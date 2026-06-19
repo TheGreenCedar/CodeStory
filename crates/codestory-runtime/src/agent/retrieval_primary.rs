@@ -529,6 +529,17 @@ pub(crate) fn search_sidecar_packet_batch(
 pub(crate) struct SidecarPacketBatchOutcome {
     pub results: Vec<(String, Vec<SearchHit>)>,
     pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+    pub timing: SidecarPacketBatchTiming,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidecarPacketBatchTiming {
+    pub prepare_ms: u32,
+    pub query_loop_wall_ms: u32,
+    pub sum_query_total_elapsed_ms: u32,
+    pub sum_sidecar_query_ms: u32,
+    pub sum_candidate_resolution_ms: u32,
+    pub result_build_ms: u32,
 }
 
 struct SidecarCandidateResolutionOutcome {
@@ -588,6 +599,7 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         &[(String, u64)],
     ) -> Result<Vec<QueryResult>, AnyhowError>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
+    let prepare_started_at = Instant::now();
     let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
         .checked_div(queries.len().max(1) as u64)
         .unwrap_or(100)
@@ -596,12 +608,15 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         .iter()
         .map(|(query, _)| (query.clone(), per_query_budget))
         .collect::<Vec<_>>();
+    let prepare_ms = clamp_elapsed_ms(prepare_started_at);
+    let query_loop_started_at = Instant::now();
     let query_results = run_query_batch(controller, &batch_queries).map_err(|error| {
         sidecar_retrieval_unavailable_error(
             controller,
             format!("sidecar retrieval batch query failed: {error}"),
         )
     })?;
+    let query_loop_wall_ms = clamp_elapsed_ms(query_loop_started_at);
     if query_results.len() != queries.len() {
         return Err(sidecar_retrieval_unavailable_error(
             controller,
@@ -612,8 +627,12 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
             ),
         ));
     }
+    let result_build_started_at = Instant::now();
     let mut results = Vec::with_capacity(queries.len());
     let mut diagnostics = Vec::with_capacity(queries.len());
+    let mut sum_sidecar_query_ms = 0_u32;
+    let mut sum_candidate_resolution_ms = 0_u32;
+    let mut sum_query_total_elapsed_ms = 0_u32;
     for ((query, max_results), query_result) in queries.iter().zip(query_results) {
         if query_result.query != *query {
             return Err(sidecar_retrieval_unavailable_error(
@@ -639,6 +658,11 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
                     )
                 })?;
         let candidate_resolution_ms = clamp_elapsed_ms(resolution_started_at);
+        sum_sidecar_query_ms = sum_sidecar_query_ms.saturating_add(sidecar_query_ms);
+        sum_candidate_resolution_ms =
+            sum_candidate_resolution_ms.saturating_add(candidate_resolution_ms);
+        sum_query_total_elapsed_ms = sum_query_total_elapsed_ms
+            .saturating_add(sidecar_query_ms.saturating_add(candidate_resolution_ms));
         diagnostics.push(packet_sidecar_query_diagnostic(
             &query_result,
             &resolution,
@@ -658,9 +682,18 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         }
         results.push((query.clone(), resolved_hits));
     }
+    let result_build_ms = clamp_elapsed_ms(result_build_started_at);
     Ok(SidecarPacketBatchOutcome {
         results,
         diagnostics,
+        timing: SidecarPacketBatchTiming {
+            prepare_ms,
+            query_loop_wall_ms,
+            sum_query_total_elapsed_ms,
+            sum_sidecar_query_ms,
+            sum_candidate_resolution_ms,
+            result_build_ms,
+        },
     })
 }
 
@@ -2629,6 +2662,14 @@ mod tests {
         assert_eq!(outcome.results.len(), queries.len());
         assert_eq!(batch_call_count, 1);
         assert_eq!(observed_budgets, vec![4_500, 4_500, 4_500, 4_500]);
+        assert_eq!(outcome.timing.sum_sidecar_query_ms, 4);
+        assert_eq!(
+            outcome.timing.sum_query_total_elapsed_ms,
+            outcome
+                .timing
+                .sum_sidecar_query_ms
+                .saturating_add(outcome.timing.sum_candidate_resolution_ms)
+        );
     }
 
     #[test]

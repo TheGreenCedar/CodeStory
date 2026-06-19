@@ -1,7 +1,7 @@
 //! AppController batch search paths for packet retrieval.
 
 use crate::agent::retrieval_primary::{
-    packet_batch_should_use_sidecar, search_sidecar_packet_batch,
+    SidecarPacketBatchTiming, packet_batch_should_use_sidecar, search_sidecar_packet_batch,
     sidecar_retrieval_unavailable_error, sidecar_retrieval_unavailable_reason,
 };
 use crate::{AppController, HybridSearchScoredHit};
@@ -14,11 +14,13 @@ pub(crate) struct SemanticHybridBatchOutcome {
     pub results: Vec<(String, Vec<HybridSearchScoredHit>)>,
     pub fallbacks: Vec<SemanticFallbackRecordDto>,
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+    pub sidecar_batch_timing: Option<SidecarPacketBatchTiming>,
 }
 
 pub(crate) struct LexicalBatchOutcome {
     pub results: Vec<(String, Vec<SearchHit>)>,
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
+    pub sidecar_batch_timing: Option<SidecarPacketBatchTiming>,
 }
 
 impl AppController {
@@ -44,6 +46,7 @@ impl AppController {
             return Ok(LexicalBatchOutcome {
                 results: Vec::new(),
                 sidecar_diagnostics: Vec::new(),
+                sidecar_batch_timing: None,
             });
         }
         if packet_batch_should_use_sidecar(self) {
@@ -52,6 +55,7 @@ impl AppController {
                     return Ok(LexicalBatchOutcome {
                         results: outcome.results,
                         sidecar_diagnostics: outcome.diagnostics,
+                        sidecar_batch_timing: Some(outcome.timing),
                     });
                 }
                 Err(error) => {
@@ -87,6 +91,7 @@ impl AppController {
                 results: Vec::new(),
                 fallbacks: Vec::new(),
                 sidecar_diagnostics: Vec::new(),
+                sidecar_batch_timing: None,
             });
         }
         if packet_batch_should_use_sidecar(self) {
@@ -117,6 +122,7 @@ impl AppController {
                             .collect(),
                         fallbacks: Vec::new(),
                         sidecar_diagnostics: outcome.diagnostics,
+                        sidecar_batch_timing: Some(outcome.timing),
                     });
                 }
                 Err(error) => {
