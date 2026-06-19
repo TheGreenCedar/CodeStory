@@ -1,13 +1,12 @@
 # CodeStory Benchmark Ledger
 
-This page is the current benchmark scorecard. It should answer a reader's first
-question quickly: did CodeStory help, hurt, or still need proof?
+This page is the benchmark ledger. It should answer a reader's first question
+quickly: did CodeStory help, hurt, or still need proof?
 
-Short answer: the June 18, 2026 packet-runtime proof is the current scorecard.
-The diagnostic full form+command run passed `108/108` success, quality, and
-sufficiency gates but missed `9` cold SLAs. The publishable full run passed
-`108/108` success, `106/108` quality, and `107/108` sufficiency, with one
-partial row and `8` cold SLA misses. Promotion is blocked.
+Short answer: the #72 promotion audit is the authoritative release-readiness
+gate. It records `108/108` success, `106/108` quality, `107/108` sufficiency,
+one partial row, `108` rows with unresolved retrieval candidates, and `21`
+packet retrieval SLA misses. Promotion is blocked.
 
 ## Plain English
 
@@ -20,22 +19,22 @@ partial row and `8` cold SLA misses. Promotion is blocked.
 | Follow-up needed | Extra commands CodeStory said a user should run because the answer bundle was incomplete. |
 | Comparison run | The same task run twice: once without CodeStory and once with CodeStory. |
 
-## Current Answer
+## Release Answer
 
 | Question | Answer |
 | --- | --- |
-| Is there benchmark data from this week? | Yes: two June 18 full packet-runtime artifacts over `language-expansion-holdout`, cold and warm packet shapes, and three repeats. |
-| Does the fresh data show CodeStory can be useful? | Yes. The diagnostic artifact completed `108/108` rows with full quality and sufficiency. The publishable artifact completed `108/108` rows but exposed the remaining promotion blockers. |
-| Can we claim general answer-quality superiority yet? | Not as a public promotion claim. The current publishable artifact still has quality misses, a sufficiency gap, and cold SLA misses. Older fixed-baseline comparisons remain development diagnostics. |
+| Is there benchmark data from this week? | Yes: the #72 promotion audit records the final publishable review over `language-expansion-holdout`, cold and warm packet shapes, and three repeats. |
+| Does the fresh data show CodeStory can be useful? | Yes. The earlier diagnostic artifact completed `108/108` rows with full quality and sufficiency. The final publishable audit completed `108/108` rows but exposed the remaining promotion blockers. |
+| Can we claim general answer-quality superiority yet? | Not as a public promotion claim. The final publishable audit still has quality misses, a sufficiency gap, unresolved candidates, and packet retrieval SLA misses. Older fixed-baseline comparisons remain development diagnostics. |
 
-## Current Evidence At A Glance
+## Release Evidence At A Glance
 
 ```mermaid
 flowchart LR
-    run["June 18 packet-runtime proof<br/>108 rows"]
+    run["#72 promotion audit<br/>108 rows"]
     diag["diagnostic artifact<br/>108/108 quality + sufficient"]
-    pub["publishable artifact<br/>106/108 quality<br/>107/108 sufficient"]
-    block["promotion blocked<br/>8 cold SLA misses<br/>2 quality misses<br/>1 partial"]
+    pub["final publishable review<br/>106/108 quality<br/>107/108 sufficient"]
+    block["promotion blocked<br/>21 SLA misses<br/>2 quality misses<br/>1 partial<br/>108 unresolved"]
     old["June 17 reused baseline<br/>older diagnostic comparison"]
     run --> diag
     run --> pub
@@ -43,10 +42,11 @@ flowchart LR
     old -. diagnostic .-> run
 ```
 
-| Lane | Current result | What it means | Claim status |
+| Lane | Recorded result | What it means | Claim status |
 | --- | --- | --- | --- |
-| Publishable full packet-runtime proof | `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`, generated `2026-06-18T12:23:54.418Z`: `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `8` cold SLA misses. | CodeStory is close to promotion readiness, but the current publishable artifact still exposes blocker rows. | Current scorecard; promotion blocked. |
-| Diagnostic full packet-runtime proof | `target/agent-benchmark/language-expansion-proof-full-form-command-shapes`, generated `2026-06-18T12:03:23.059Z`: `108/108` success, `108/108` quality, `108/108` sufficient, `9` cold SLA misses. | Packet shape and command coverage work across the full suite, but latency is not promotion-clean. | Development proof only; non-publishable. |
+| #72 promotion audit | `docs/testing/issue-72-promotion-audit-2026-06-18-f61e6717cbbf.md` and `target/agent-benchmark/language-expansion-publishable-final-review`: `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `108` rows with unresolved retrieval candidates, and `21` packet retrieval SLA misses. | CodeStory is close to promotion readiness, but the final publishable review still exposes blocker rows. | Authoritative release-readiness gate; promotion blocked. |
+| Historical publishable full packet-runtime proof | `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`, generated `2026-06-18T12:23:54.418Z`: `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `8` cold SLA misses. | Useful historical packet-runtime proof, superseded by the #72 promotion audit for release-readiness decisions. | Historical scorecard. |
+| Historical diagnostic full packet-runtime proof | `target/agent-benchmark/language-expansion-proof-full-form-command-shapes`, generated `2026-06-18T12:03:23.059Z`: `108/108` success, `108/108` quality, `108/108` sufficient, `9` cold SLA misses. | Packet shape and command coverage work across the full suite, but latency is not promotion-clean. | Development proof only; non-publishable. |
 | Older fixed-baseline language comparison | With CodeStory: `54/54` success, `54/54` quality, `3,383,687 ms` all-in wall, `2,141,124` tokens, `54` commands, `0` source reads. Without CodeStory: `54/54` success, `24/54` quality, `7,943,578 ms`, `9,692,559` tokens, `471` commands, `417` source reads. | CodeStory materially reduced operating cost, stayed packet-first, and was quality-equal or better on every measured language task in that comparison. | Older development comparison. Reused-baseline or fixed no-CodeStory comparisons are diagnostic unless fingerprints match, and are never enough for packet-runtime promotion by themselves. |
 | TypeScript React library comparison | With CodeStory: `32,168` tokens, `42.67s` elapsed including setup check, `1` command, `0` source files opened, quality `1/1`. Without CodeStory: `535,632` tokens, `201.38s`, `35` commands, `30` source files opened, quality `0/1`. | CodeStory was clearly useful on this task. | Strong historical single-task evidence, not a general savings claim. |
 
@@ -55,7 +55,7 @@ flowchart LR
 Source: `target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.md`
 
 This June 17 reused-baseline composite is older development evidence. It is not
-the current scorecard and cannot prove packet-runtime promotion readiness.
+the release-readiness gate and cannot prove packet-runtime promotion readiness.
 
 | Language | Example project | With CodeStory quality | Baseline quality | Read |
 | --- | --- | ---: | ---: | --- |
