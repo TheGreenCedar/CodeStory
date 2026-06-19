@@ -3694,6 +3694,27 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    fn test_search_hit_defaults() -> SearchHit {
+        SearchHit {
+            node_id: NodeId(String::new()),
+            display_name: String::new(),
+            kind: NodeKind::UNKNOWN,
+            file_path: None,
+            line: None,
+            score: 0.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            score_breakdown: None,
+        }
+    }
+
     fn assert_evidence_packet_shape(markdown: &str, intro_labels: &[&str]) {
         let lower = markdown.to_ascii_lowercase();
         let mut missing = Vec::new();
@@ -3946,6 +3967,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             alternatives: Vec::new(),
         }
@@ -4140,6 +4162,10 @@ mod tests {
                 semantic: 0.1,
                 graph: 0.11,
                 total: 0.91,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
             duplicate_of: None,
@@ -4184,6 +4210,12 @@ mod tests {
                 subgraph_id: None,
                 evidence_edge_ids: Vec::new(),
                 retrieval_score_breakdown: None,
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             }],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),
@@ -4479,8 +4511,18 @@ mod tests {
                     semantic: 0.06,
                     graph: 0.05,
                     total: 0.21,
+                    tier_cap: None,
+                    boosts: Vec::new(),
+                    dampening: Vec::new(),
+                    final_rank_reason: None,
                     provenance: Vec::new(),
                 }),
+                evidence_tier: None,
+                evidence_producer: None,
+                resolution_status: None,
+                loss_reason: None,
+                coverage_role: None,
+                eligible_for_sufficiency: None,
             }],
             subgraph_ids: Vec::new(),
             retrieval_version: "test".to_string(),

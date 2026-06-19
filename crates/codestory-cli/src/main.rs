@@ -9855,6 +9855,27 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
+    fn test_search_hit_defaults() -> SearchHit {
+        SearchHit {
+            node_id: NodeId(String::new()),
+            display_name: String::new(),
+            kind: NodeKind::UNKNOWN,
+            file_path: None,
+            line: None,
+            score: 0.0,
+            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            score_breakdown: None,
+        }
+    }
+
     #[test]
     fn packet_markdown_labels_use_public_wire_values() {
         assert_eq!(
@@ -10317,6 +10338,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             }
         }
 
@@ -10770,6 +10792,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         };
         let queries = drill_native_related_queries("SourceGroupCxxCdb", &source_group);
         assert!(
@@ -10804,6 +10827,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         };
         assert!(drill_native_related_query_matches(
             &method_hit,
@@ -11091,6 +11115,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
         let repo_text_hits = vec![SearchHit {
             node_id: NodeId("repo-text".to_string()),
@@ -11103,6 +11128,7 @@ mod tests {
             match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
             resolvable: false,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
 
         let output = build_search_output(SearchOutputParts {
@@ -11152,6 +11178,7 @@ mod tests {
             match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
             resolvable: false,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
 
         let output = build_search_output(SearchOutputParts {
@@ -11284,6 +11311,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
 
         let output = build_search_output(SearchOutputParts {
@@ -11327,6 +11355,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
         let mut occurrences = HashMap::new();
         occurrences.insert(
@@ -11490,6 +11519,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
         let repo_text_hits = vec![SearchHit {
             node_id: NodeId("text-1".to_string()),
@@ -11502,6 +11532,7 @@ mod tests {
             match_quality: Some(codestory_contracts::api::SearchMatchQualityDto::RepoText),
             resolvable: false,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }];
 
         let output = build_search_output(SearchOutputParts {
@@ -11688,8 +11719,13 @@ mod tests {
                 semantic: 0.2,
                 graph: 0.1,
                 total: 0.9,
+                tier_cap: None,
+                boosts: Vec::new(),
+                dampening: Vec::new(),
+                final_rank_reason: None,
                 provenance: Vec::new(),
             }),
+            ..test_search_hit_defaults()
         }];
 
         let output = build_search_output(SearchOutputParts {
@@ -13025,6 +13061,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             SearchHit {
                 node_id: NodeId("1".to_string()),
@@ -13037,6 +13074,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
         ];
 
@@ -13067,6 +13105,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             SearchHit {
                 node_id: NodeId("1".to_string()),
@@ -13079,6 +13118,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
         ];
 
@@ -13102,6 +13142,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             SearchHit {
                 node_id: NodeId("1".to_string()),
@@ -13114,6 +13155,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
         ];
 
@@ -13146,6 +13188,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             SearchHit {
                 node_id: NodeId("implementation".to_string()),
@@ -13158,6 +13201,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
         ];
 
@@ -13194,6 +13238,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             SearchHit {
                 node_id: NodeId("implementation".to_string()),
@@ -13206,6 +13251,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
         ];
 
@@ -13238,6 +13284,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
             SearchHit {
                 node_id: NodeId("implementation".to_string()),
@@ -13250,6 +13297,7 @@ mod tests {
                 match_quality: None,
                 resolvable: true,
                 score_breakdown: None,
+                ..test_search_hit_defaults()
             },
         ];
 
@@ -13275,6 +13323,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }
     }
 
