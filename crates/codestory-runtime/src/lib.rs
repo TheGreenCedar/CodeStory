@@ -64,6 +64,7 @@ mod grounding;
 mod mermaid;
 mod path_resolution;
 mod query_language;
+mod repository_identity;
 mod search;
 mod search_runtime;
 mod semantic_doc_text;
@@ -77,6 +78,9 @@ pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
 pub use query_language::{GraphQueryParseError, parse_graph_query};
+pub use repository_identity::{
+    REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
+};
 pub(crate) use search_runtime::SearchEngine;
 
 #[cfg(test)]

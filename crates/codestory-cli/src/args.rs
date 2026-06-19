@@ -53,6 +53,8 @@ pub(crate) enum Command {
     Ready(ReadyCommand),
     #[command(about = "Install or check local setup assets.")]
     Setup(SetupCommand),
+    #[command(about = "Inspect portable cache identity contracts.")]
+    Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
     Search(SearchCommand),
     #[command(about = "Run a repeatable grounding quality check.")]
@@ -451,6 +453,32 @@ pub(crate) struct ReadyCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long, value_enum)]
     pub(crate) goal: Option<ReadyGoal>,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheCommand {
+    #[command(subcommand)]
+    pub(crate) action: CacheAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum CacheAction {
+    #[command(about = "Report canonical repository identity inputs.")]
+    Identity(CacheIdentityCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheIdentityCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
