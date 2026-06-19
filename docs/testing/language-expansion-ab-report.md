@@ -4,9 +4,11 @@ Date: 2026-06-18
 
 ## Verdict
 
-The language-expansion work now has full packet-runtime proof over the holdout
-suite, but the current publishable artifact is still promotion-blocked by cold
-SLA misses, two quality misses, and one partial sufficiency row.
+The language-expansion work has full packet-runtime proof over the holdout
+suite, but release-readiness now uses the #72 promotion audit as the
+authoritative gate. Earlier publishable artifacts are historical because the
+final audit recorded unresolved candidates, quality/sufficiency gaps, and
+packet retrieval SLA misses.
 
 The corrected frame is:
 
@@ -20,18 +22,27 @@ The corrected frame is:
 - Parser-backed language support is not the same thing as first-class
   framework/domain support.
 
-Current packet-runtime evidence:
+Authoritative release-readiness evidence:
 
+- Final #72 promotion audit:
+  `docs/testing/issue-72-promotion-audit-2026-06-18-f61e6717cbbf.md`,
+  with artifacts under
+  `target/agent-benchmark/language-expansion-publishable-final-review`. It
+  completed `108/108` rows with `108/108` success, `106/108` quality,
+  `107/108` packet sufficiency, `1` partial row, `108` rows with unresolved
+  retrieval candidates, and `21` packet retrieval SLA misses. Promotion is
+  blocked.
+- Historical publishable full artifact:
+  `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`,
+  generated `2026-06-18T12:23:54.418Z`. It completed `108/108` rows with
+  `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial,
+  and `8` cold SLA misses. This artifact is superseded by the #72 promotion
+  audit for release-readiness decisions.
 - Diagnostic full form+command artifact:
   `target/agent-benchmark/language-expansion-proof-full-form-command-shapes`,
   generated `2026-06-18T12:03:23.059Z`. It completed `108/108` rows with
   `108/108` success, `108/108` quality, and `108/108` packet sufficiency, but
   it had `9` cold SLA misses. This is non-publishable development proof only.
-- Publishable full artifact:
-  `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`,
-  generated `2026-06-18T12:23:54.418Z`. It completed `108/108` rows with
-  `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial,
-  and `8` cold SLA misses. Promotion is blocked.
 
 The older June 17 reused-baseline composite remains useful development
 comparison evidence, but it is diagnostic unless the reused baseline is
@@ -42,8 +53,9 @@ itself.
 
 | Slice | Raw evidence | Result | Use it for |
 | --- | --- | --- | --- |
-| Current publishable full packet-runtime proof | `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes` | Generated `2026-06-18T12:23:54.418Z`; `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `8` cold SLA misses. | Current scorecard. Promotion blocked until quality, sufficiency, and cold SLA gaps are all zero. |
-| Current diagnostic full packet-runtime proof | `target/agent-benchmark/language-expansion-proof-full-form-command-shapes` | Generated `2026-06-18T12:03:23.059Z`; `108/108` success, `108/108` quality, `108/108` sufficient, `9` cold SLA misses. | Development proof for packet shape and command coverage. Non-publishable because cold SLA misses remain. |
+| Authoritative #72 promotion audit | `docs/testing/issue-72-promotion-audit-2026-06-18-f61e6717cbbf.md` and `target/agent-benchmark/language-expansion-publishable-final-review` | Final publishable review: `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `108` rows with unresolved retrieval candidates, and `21` packet retrieval SLA misses. | Release-readiness gate. Promotion blocked until quality, sufficiency, unresolved-candidate, and SLA gaps are all zero. |
+| Historical publishable full packet-runtime proof | `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes` | Generated `2026-06-18T12:23:54.418Z`; `108/108` success, `106/108` quality, `107/108` sufficient, `1` partial, `8` cold SLA misses. | Historical scorecard superseded by the #72 promotion audit. |
+| Historical diagnostic full packet-runtime proof | `target/agent-benchmark/language-expansion-proof-full-form-command-shapes` | Generated `2026-06-18T12:03:23.059Z`; `108/108` success, `108/108` quality, `108/108` sufficient, `9` cold SLA misses. | Development proof for packet shape and command coverage. Non-publishable because cold SLA misses remain. |
 | Older fixed-baseline comparison | `target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.json` and `.md` | CodeStory success `54/54` vs baseline `54/54`; CodeStory quality `54/54` vs baseline `24/54`. CodeStory used `3,383,687 ms` all-in wall vs `7,943,578 ms`, `2,141,124` tokens vs `9,692,559`, `54` commands vs `471`, and `0` source reads vs `417`. | Development comparison only. Stale reused-baseline and fixed no-CodeStory comparisons are diagnostic unless fingerprints match, and they cannot promote packet-runtime readiness by themselves. |
 | Superseded 2026-06-16 full paired A/B | `target/agent-benchmark/language-expansion-holdout-20260616-0.8.0-retry/reanalyzed-summary.json` and `.md` | CodeStory success `54/54` vs baseline `51/54`; CodeStory quality `16/54` vs baseline quality `19/51` successful rows. CodeStory used `6,411,835 ms` all-in wall vs `7,523,716 ms`, `7,859,161` tokens vs `9,087,330`, `54` commands vs `471`, and `0` source reads vs `417`. Baseline failed all Ruby/Jekyll repeats. | Historical diagnostic evidence. Superseded by later fixed-baseline and packet-runtime artifacts. |
 | First 2026-06-16 full-suite attempt | `target/agent-benchmark/language-expansion-holdout-20260616-0.8.0` | Cache preparation failed on a transient `zoekt_unreachable` status for `BurntSushi-ripgrep`. A direct retrieval status check reported full mode afterward; `retrieval up` preceded the successful retry. | Sidecar startup-race context only; not a scored A/B result. |
@@ -54,9 +66,9 @@ itself.
 | Two-row product-claim semantics fix slice | `target/agent-benchmark/language-expansion-packet-runtime-claim-semantics-fix/packet-runtime-summary.md` and `quality-debug.json` | Express and Swift/URLSession both passed manifest quality after source-derived product claims replaced generic "supports/inspect" wording. Both remain packet-partial. | Regression evidence for production framework/domain semantics without enabling eval-only probes. |
 | Historical 18-row packet runtime after early fixes | `target/agent-benchmark/language-expansion-packet-runtime-current-after-claim-fixes/packet-runtime-summary.json`, `.md`, `packet-composition.md`, and `quality-debug.json` | `18/18` command pass, `18/18` scored, `12/18` manifest-quality pass, `9/18` packet sufficient, `9/18` packet partial. Packet retrieval SLA misses remained on Java (`30,931 ms`), Redis (`30,313 ms`), and Okio (`20,799 ms`). | Historical packet-composition diagnostic, superseded by the June 18 full packet-runtime artifacts. |
 
-The June 18 publishable artifact is the current scorecard. The June 17
-fixed-baseline comparison supersedes the June 16 paired A/B row only as older
-development comparison evidence.
+The #72 promotion audit supersedes the earlier June 18 publishable artifact for
+release-readiness decisions. The June 17 fixed-baseline comparison supersedes
+the June 16 paired A/B row only as older development comparison evidence.
 
 ## Product Semantics vs Benchmark Overfit
 
@@ -178,7 +190,7 @@ gaps, and no SLA misses.
 ## Older Fixed-Baseline Read
 
 The June 17 reused-baseline comparison is now older development evidence, not
-the current scorecard.
+the release-readiness gate.
 
 ### Older Quality Snapshot
 
