@@ -4,7 +4,9 @@ use codestory_contracts::graph::{
     TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
 use parking_lot::RwLock;
-use rusqlite::{Connection, MAIN_DB, Result, Row, params, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, MAIN_DB, OpenFlags, Result, Row, params, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -841,6 +843,29 @@ impl Storage {
         Ok(storage)
     }
 
+    pub fn database_schema_version(path: &Path) -> Result<u32, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok(version.max(0) as u32)
+    }
+
+    pub fn copy_database_snapshot(
+        source_path: &Path,
+        target_path: &Path,
+    ) -> Result<(), StorageError> {
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                StorageError::Other(format!(
+                    "Failed to create SQLite snapshot target dir {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        source.backup(MAIN_DB, target_path, None::<fn(rusqlite::backup::Progress)>)?;
+        Ok(())
+    }
+
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -1596,6 +1621,154 @@ impl Storage {
 
         self.cache.nodes.write().clear();
         Ok(())
+    }
+
+    pub fn rebase_rehydrated_path_bound_cache(
+        &mut self,
+        source_root: &Path,
+        target_root: &Path,
+    ) -> Result<(usize, usize), StorageError> {
+        let source_root = source_root.to_string_lossy().to_string();
+        let target_root = target_root.to_string_lossy().to_string();
+        let mut updated = self.rebase_path_bound_text_columns(&source_root, &target_root)?;
+        updated = updated.saturating_add(self.refresh_rebased_file_metadata()?);
+        let invalidated_artifacts = self.clear_legacy_index_artifact_cache()?;
+        self.cache.nodes.write().clear();
+        Ok((updated, invalidated_artifacts))
+    }
+
+    fn rebase_path_bound_text_columns(
+        &self,
+        source_root: &str,
+        target_root: &str,
+    ) -> Result<usize, StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0usize;
+        for statement in [
+            "UPDATE file
+             SET path = replace(path, ?1, ?2)
+             WHERE instr(path, ?1) > 0",
+            "UPDATE node
+             SET
+                serialized_name = replace(serialized_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                canonical_id = replace(canonical_id, ?1, ?2)
+             WHERE instr(serialized_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(canonical_id, ''), ?1) > 0",
+            "UPDATE edge
+             SET callsite_identity = replace(callsite_identity, ?1, ?2)
+             WHERE instr(COALESCE(callsite_identity, ''), ?1) > 0",
+            "UPDATE callable_projection_state
+             SET symbol_key = replace(symbol_key, ?1, ?2)
+             WHERE instr(symbol_key, ?1) > 0",
+            "UPDATE error
+             SET message = replace(message, ?1, ?2)
+             WHERE instr(message, ?1) > 0",
+            "UPDATE llm_symbol_doc
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                doc_text = replace(doc_text, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(doc_text, ?1) > 0",
+            "UPDATE symbol_search_doc
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                doc_text = replace(doc_text, ?1, ?2),
+                source_provenance = replace(source_provenance, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(doc_text, ?1) > 0
+                OR instr(source_provenance, ?1) > 0",
+            "UPDATE search_symbol_projection
+             SET display_name = replace(display_name, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0",
+            "UPDATE grounding_file_snapshot
+             SET path = replace(path, ?1, ?2)
+             WHERE instr(path, ?1) > 0",
+            "UPDATE grounding_node_snapshot
+             SET
+                serialized_name = replace(serialized_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                canonical_id = replace(canonical_id, ?1, ?2),
+                display_name = replace(display_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2)
+             WHERE instr(serialized_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(canonical_id, ''), ?1) > 0
+                OR instr(display_name, ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0",
+        ] {
+            updated =
+                updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    fn clear_legacy_index_artifact_cache(&self) -> Result<usize, StorageError> {
+        // ponytail: v2 artifact keys are root-portable; older rows predate that contract.
+        Ok(self.conn.execute(
+            "DELETE FROM index_artifact_cache
+             WHERE cache_key NOT LIKE 'v2:%'",
+            [],
+        )?)
+    }
+
+    fn refresh_rebased_file_metadata(&self) -> Result<usize, StorageError> {
+        let files = self.get_files()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0usize;
+        for file in files {
+            let Ok(metadata) = fs::metadata(&file.path) else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+                continue;
+            };
+            let modification_time = duration.as_millis().min(i64::MAX as u128) as i64;
+            updated = updated.saturating_add(tx.execute(
+                "UPDATE file
+                 SET modification_time = ?2
+                 WHERE id = ?1",
+                params![file.id, modification_time],
+            )?);
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    pub fn path_bound_text_match_count(&self, prefix: &str) -> Result<usize, StorageError> {
+        let pattern = format!("%{prefix}%");
+        let mut count = 0usize;
+        for sql in [
+            "SELECT COUNT(*) FROM file WHERE path LIKE ?1",
+            "SELECT COUNT(*) FROM node WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1",
+            "SELECT COUNT(*) FROM edge WHERE callsite_identity LIKE ?1",
+            "SELECT COUNT(*) FROM callable_projection_state WHERE symbol_key LIKE ?1",
+            "SELECT COUNT(*) FROM error WHERE message LIKE ?1",
+            "SELECT COUNT(*) FROM llm_symbol_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1",
+            "SELECT COUNT(*) FROM symbol_search_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1 OR source_provenance LIKE ?1",
+            "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
+            "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
+            "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
+        ] {
+            let matched: i64 = self
+                .conn
+                .query_row(sql, params![pattern], |row| row.get(0))?;
+            count = count.saturating_add(matched.max(0) as usize);
+        }
+        Ok(count)
     }
 
     pub fn finalize_staged_snapshot(&self) -> Result<(), StorageError> {

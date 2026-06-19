@@ -281,7 +281,7 @@ fn top_level_help_names_command_purposes() {
         ),
         ("doctor", "Check cache, index, and retrieval health."),
         ("setup", "Install or check local setup assets."),
-        ("cache", "Inspect portable cache identity contracts."),
+        ("cache", "Prepare or inspect local cache artifacts."),
         ("symbol", "Inspect a symbol by query or id."),
         (
             "explore",

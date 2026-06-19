@@ -163,6 +163,13 @@ impl Storage {
         Ok(collections)
     }
 
+    pub fn clear_retrieval_index_manifests(&mut self) -> Result<usize, StorageError> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM retrieval_index_manifest", [])?;
+        Ok(removed)
+    }
+
     /// Latest manifest `built_at_epoch_ms` per Qdrant collection (for retention ranking).
     pub fn list_retrieval_qdrant_collections_with_recency(
         &self,
