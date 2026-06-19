@@ -337,14 +337,7 @@ fn should_skip_zero_dense_stage(
 }
 
 fn annotate_stage_provenance(stage: &PlannedStage, hits: &mut [CandidateHit]) {
-    let label = match stage.kind {
-        RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
-        RetrievalStageKind::Stage1ZoektLexical => None,
-        RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
-        RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
-        RetrievalStageKind::Stage3RepoTextFallback => None,
-    };
-    if let Some(label) = label {
+    if let Some(label) = stage.kind.provenance_label() {
         for hit in hits {
             hit.add_provenance(label);
         }

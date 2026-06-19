@@ -13,6 +13,38 @@ pub enum RetrievalStageKind {
     Stage3RepoTextFallback,
 }
 
+impl RetrievalStageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RetrievalStageKind::Stage0ScipAnchor => "stage0_scip_anchor",
+            RetrievalStageKind::Stage1ZoektLexical => "stage1_zoekt_lexical",
+            RetrievalStageKind::Stage1bQdrantSemantic => "stage1b_qdrant_semantic",
+            RetrievalStageKind::Stage2ScipExpand => "stage2_scip_expand",
+            RetrievalStageKind::Stage3RepoTextFallback => "stage3_repo_text_fallback",
+        }
+    }
+
+    pub fn provenance_label(self) -> Option<&'static str> {
+        match self {
+            RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
+            RetrievalStageKind::Stage1ZoektLexical => None,
+            RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
+            RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
+            RetrievalStageKind::Stage3RepoTextFallback => None,
+        }
+    }
+
+    pub fn sidecar_latency_ms(self, elapsed_ms: u64) -> Option<u32> {
+        match self {
+            RetrievalStageKind::Stage0ScipAnchor
+            | RetrievalStageKind::Stage1ZoektLexical
+            | RetrievalStageKind::Stage1bQdrantSemantic
+            | RetrievalStageKind::Stage2ScipExpand => u32::try_from(elapsed_ms).ok(),
+            RetrievalStageKind::Stage3RepoTextFallback => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedStage {
     pub kind: RetrievalStageKind,
@@ -166,6 +198,44 @@ mod tests {
                     .iter()
                     .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
         );
+    }
+
+    #[test]
+    fn stage_kind_metadata_matches_sidecar_stage_contract() {
+        let cases = [
+            (RetrievalStageKind::Stage0ScipAnchor, Some("exact"), true),
+            (RetrievalStageKind::Stage1ZoektLexical, None, true),
+            (
+                RetrievalStageKind::Stage1bQdrantSemantic,
+                Some("dense_anchor"),
+                true,
+            ),
+            (
+                RetrievalStageKind::Stage2ScipExpand,
+                Some("graph_neighbor"),
+                true,
+            ),
+            (RetrievalStageKind::Stage3RepoTextFallback, None, false),
+        ];
+
+        assert_eq!(cases.len(), 5);
+        for (kind, expected_provenance, has_sidecar_latency) in cases {
+            let serde_label = serde_json::to_value(kind).expect("stage kind serializes");
+
+            assert_eq!(
+                kind.label(),
+                serde_label
+                    .as_str()
+                    .expect("stage kind serializes as a string")
+            );
+            assert_eq!(kind.provenance_label(), expected_provenance);
+            assert_eq!(kind.sidecar_latency_ms(0), has_sidecar_latency.then_some(0));
+            assert_eq!(
+                kind.sidecar_latency_ms(u32::MAX.into()),
+                has_sidecar_latency.then_some(u32::MAX)
+            );
+            assert_eq!(kind.sidecar_latency_ms(u64::from(u32::MAX) + 1), None);
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, QueryRequest, QueryResult, QueryTrace, RetrievalStageKind,
+    CandidateHit, CandidateSource, QueryRequest, QueryResult, QueryTrace,
     execute_retrieval_query_with_cache, is_phantom_sidecar_hit, project_id_for_root,
     strict_sidecar_status,
 };
@@ -748,7 +748,7 @@ pub(crate) fn sidecar_rejection_diagnostic(
                 .unwrap_or_default();
             format!(
                 "{} added={} elapsed_ms={}{}",
-                stage_kind_label(stage.stage),
+                stage.stage.label(),
                 stage.candidates_added,
                 stage.elapsed_ms,
                 cancel,
@@ -1051,25 +1051,18 @@ fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
         .stages
         .iter()
         .map(|stage| RetrievalStageTimingDto {
-            stage: stage_kind_label(stage.stage),
+            stage: stage.stage.label().to_string(),
             deadline_ms: u32::try_from(stage.budget_ms).ok(),
             elapsed_ms: u32::try_from(stage.elapsed_ms).unwrap_or(u32::MAX),
             candidates_added: u32::try_from(stage.candidates_added).unwrap_or(u32::MAX),
             marginal_gain: stage.marginal_gain,
             cancel_reason: stage.cancel_reason.clone(),
             cache_hit: stage.cache_hit,
-            sidecar_latency_ms: sidecar_stage_latency_ms(stage.stage, stage.elapsed_ms),
+            sidecar_latency_ms: stage.stage.sidecar_latency_ms(stage.elapsed_ms),
             degraded: stage.degraded,
             stub_reason: stage.stub_reason.clone(),
         })
         .collect()
-}
-
-fn stage_kind_label(kind: RetrievalStageKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{kind:?}"))
 }
 
 fn candidate_source_label(source: CandidateSource) -> String {
@@ -1077,16 +1070,6 @@ fn candidate_source_label(source: CandidateSource) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{source:?}"))
-}
-
-fn sidecar_stage_latency_ms(kind: RetrievalStageKind, elapsed_ms: u64) -> Option<u32> {
-    match kind {
-        RetrievalStageKind::Stage0ScipAnchor
-        | RetrievalStageKind::Stage1ZoektLexical
-        | RetrievalStageKind::Stage1bQdrantSemantic
-        | RetrievalStageKind::Stage2ScipExpand => u32::try_from(elapsed_ms).ok(),
-        RetrievalStageKind::Stage3RepoTextFallback => None,
-    }
 }
 
 fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
