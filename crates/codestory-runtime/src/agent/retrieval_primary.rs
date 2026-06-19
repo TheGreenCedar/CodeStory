@@ -714,8 +714,20 @@ fn sidecar_packet_batch_rejection_reason(
     None
 }
 
-pub(crate) fn packet_batch_should_use_sidecar(controller: &AppController) -> bool {
-    sidecar_retrieval_primary_enabled(controller)
+pub(crate) fn packet_batch_should_use_sidecar(_controller: &AppController) -> bool {
+    if let Some(env) = unsupported_deprecated_env() {
+        tracing::error!(
+            env,
+            "unsupported retrieval env alias; sidecar retrieval aliases are dead"
+        );
+        return false;
+    }
+    if retrieval_env_override() == Some(false) {
+        tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory");
+        return false;
+    }
+    // ponytail: strict batch execution validates full mode; avoid repeating the slow status probe.
+    true
 }
 
 pub(crate) fn maybe_log_rollback_after_packet(
@@ -2813,5 +2825,23 @@ mod tests {
         unsafe {
             std::env::remove_var(RETRIEVAL_SHADOW_ENV_DEPRECATED);
         }
+    }
+
+    #[test]
+    fn packet_batch_attempt_skips_redundant_full_mode_preflight() {
+        let _lock = env_test_lock();
+        // SAFETY: test-only env cleanup; no concurrent tests rely on these variables.
+        unsafe {
+            std::env::remove_var(RETRIEVAL_ENV);
+            std::env::remove_var(RETRIEVAL_ENV_DEPRECATED);
+            std::env::remove_var(RETRIEVAL_SHADOW_ENV_DEPRECATED);
+        }
+
+        let controller = AppController::new();
+
+        assert!(
+            packet_batch_should_use_sidecar(&controller),
+            "packet batches should attempt strict execution and let that path validate full mode"
+        );
     }
 }

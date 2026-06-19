@@ -203,8 +203,16 @@ mod tests {
     #[test]
     fn packet_subquery_warmup_fails_closed_without_sidecar_primary() {
         let _lock = crate::process_env_test_lock();
-        let _retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL");
+        let _retrieval_env = EnvVarGuard {
+            key: "CODESTORY_RETRIEVAL",
+            previous: std::env::var_os("CODESTORY_RETRIEVAL"),
+        };
         let _deprecated_retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL_V2");
+        let _deprecated_shadow_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL_V2_SHADOW");
+        // SAFETY: test-only env mutation under the shared process env lock.
+        unsafe {
+            std::env::set_var("CODESTORY_RETRIEVAL", "0");
+        }
         let controller = AppController::new();
 
         let error = controller
@@ -214,7 +222,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("sidecar retrieval primary requires an open project"),
+                .contains("CODESTORY_RETRIEVAL=0 is unsupported"),
             "warmup should report the mandatory sidecar gate, got: {}",
             error.message
         );
