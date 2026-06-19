@@ -4,7 +4,7 @@ use crate::generation::{
     manifest_staleness_reason, manifest_unavailable_reason,
 };
 use crate::health::{RetrievalStatusReport, attach_manifest_contract, probe_sidecar_health};
-use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
+use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_root};
 use anyhow::{Context, Result};
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
@@ -70,7 +70,7 @@ fn sidecar_status_inner(
     strict: bool,
 ) -> Result<RetrievalStatusReport> {
     let layout = SidecarLayout::from_env();
-    let project_id = project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_root(project_root);
     let manifest = if let Some(path) = storage_path.filter(|path| path.exists()) {
         let storage = Store::open(path).context("open storage for manifest")?;
         let manifest = storage
@@ -140,7 +140,7 @@ pub(crate) fn validate_strict_sidecar_readiness(
     storage_path: &Path,
     storage: &Store,
 ) -> Result<()> {
-    let project_id = project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_root(project_root);
     let Some(manifest) = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load retrieval manifest for strict readiness")?
@@ -277,7 +277,7 @@ mod tests {
     use crate::generation::{
         SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_qdrant_collection,
     };
-    use crate::index::compute_sidecar_input_fingerprint;
+    use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
     use crate::test_support::retrieval_manifest_fixture;
     use codestory_store::{FileInfo, FileRole};
     use tempfile::TempDir;

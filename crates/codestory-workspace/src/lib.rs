@@ -10,6 +10,12 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
+mod repository_identity;
+pub use repository_identity::{
+    REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentity, SidecarProjectIdentity,
+    inspect_repository_identity, sidecar_project_identity,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Language {
     Cxx,

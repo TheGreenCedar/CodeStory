@@ -68,6 +68,11 @@ pub fn project_id_for_root(project_root: &Path) -> String {
     fnv1a_hex(canonical.to_string_lossy().as_bytes())
 }
 
+pub fn sidecar_project_id_for_root(project_root: &Path) -> String {
+    codestory_workspace::sidecar_project_identity(project_root, project_id_for_root(project_root))
+        .project_id
+}
+
 pub fn repair_project_qdrant_collection(
     project_root: &Path,
     storage_path: &Path,
@@ -76,7 +81,7 @@ pub fn repair_project_qdrant_collection(
         return Ok(None);
     }
 
-    let project_id = project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_root(project_root);
     let storage = Store::open(storage_path).context("open storage for qdrant project repair")?;
     let Some(manifest) = storage
         .get_retrieval_index_manifest(&project_id)
@@ -174,7 +179,7 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
     let layout = SidecarLayout::from_env();
     layout.ensure_data_dirs()?;
 
-    let project_id = project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_root(project_root);
     let degraded_modes = Vec::new();
     let zoekt_stubbed = false;
     let qdrant_stubbed = false;
@@ -1178,6 +1183,70 @@ mod tests {
     }
 
     #[test]
+    fn canonical_sidecar_generation_is_stable_across_clean_roots_with_same_input() {
+        let Some(first_project) = git_project() else {
+            return;
+        };
+        let Some(second_project) = git_project() else {
+            return;
+        };
+        let first_storage_dir = TempDir::new().expect("first storage dir");
+        let second_storage_dir = TempDir::new().expect("second storage dir");
+        let first_storage_path = first_storage_dir.path().join("codestory.db");
+        let second_storage_path = second_storage_dir.path().join("codestory.db");
+        let mut first_storage = Store::open(&first_storage_path).expect("first store");
+        let mut second_storage = Store::open(&second_storage_path).expect("second store");
+        insert_matching_semantic_doc(&mut first_storage, first_project.path());
+        insert_matching_semantic_doc(&mut second_storage, second_project.path());
+
+        let first_project_id = sidecar_project_id_for_root(first_project.path());
+        let second_project_id = sidecar_project_id_for_root(second_project.path());
+        assert_eq!(first_project_id, second_project_id);
+        assert_ne!(
+            project_id_for_root(first_project.path()),
+            project_id_for_root(second_project.path())
+        );
+
+        let first_input = compute_sidecar_input_fingerprint(
+            &first_storage,
+            &first_storage_path,
+            first_project.path(),
+            &first_project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+        )
+        .expect("first input");
+        let second_input = compute_sidecar_input_fingerprint(
+            &second_storage,
+            &second_storage_path,
+            second_project.path(),
+            &second_project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+        )
+        .expect("second input");
+
+        assert_eq!(first_input.hash, second_input.hash);
+        assert_eq!(
+            sidecar_generation_id(&first_project_id, &first_input.hash),
+            sidecar_generation_id(&second_project_id, &second_input.hash)
+        );
+    }
+
+    #[test]
+    fn dirty_canonical_repo_falls_back_to_root_sidecar_project_id() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        let clean = sidecar_project_id_for_root(project.path());
+        std::fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n").expect("dirty source");
+        let dirty = sidecar_project_id_for_root(project.path());
+
+        assert_ne!(clean, dirty);
+        assert_eq!(dirty, project_id_for_root(project.path()));
+    }
+
+    #[test]
     fn sidecar_input_hash_changes_when_embedding_values_change() {
         let project = TempDir::new().expect("project dir");
         std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
@@ -1245,5 +1314,85 @@ mod tests {
         assert_eq!(first.dense_projection_count, 1);
         assert_eq!(first.dense_reason_counts_json, "{\"public_api\":1}");
         assert_ne!(first.hash, second.hash);
+    }
+
+    fn insert_matching_semantic_doc(storage: &mut Store, project_root: &Path) {
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "do_work".into(),
+                ..Default::default()
+            }])
+            .expect("node");
+        storage
+            .upsert_llm_symbol_docs_batch(&[LlmSymbolDoc {
+                node_id: NodeId(1),
+                file_node_id: None,
+                kind: NodeKind::FUNCTION,
+                display_name: "do_work".into(),
+                qualified_name: Some("pkg::do_work".into()),
+                file_path: Some(project_root.join("lib.rs").display().to_string()),
+                start_line: Some(1),
+                doc_text: "semantic doc".into(),
+                doc_version: 4,
+                doc_hash: "hash".into(),
+                embedding_profile: Some("bge-base-en-v1.5".into()),
+                embedding_model: "BAAI/bge-base-en-v1.5-local|backend=onnx".into(),
+                embedding_backend: Some("onnx".into()),
+                embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+                doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
+                semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+                dense_reason: Some("public_api".into()),
+                embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
+                updated_at_epoch_ms: 123,
+            }])
+            .expect("semantic doc");
+    }
+
+    fn git_project() -> Option<TempDir> {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return None;
+        }
+        let project = TempDir::new().expect("project");
+        git(project.path(), &["init"]);
+        git(
+            project.path(),
+            &["config", "user.email", "codestory@example.invalid"],
+        );
+        git(project.path(), &["config", "user.name", "CodeStory Test"]);
+        git(
+            project.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/TheGreenCedar/CodeStory.git",
+            ],
+        );
+        std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
+            .expect("write source");
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "-m", "init"]);
+        Some(project)
+    }
+
+    fn git(project: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
