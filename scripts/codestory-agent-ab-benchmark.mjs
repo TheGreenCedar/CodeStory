@@ -4184,6 +4184,8 @@ function packetLatencyTelemetry(packet, wallMs) {
     packet_evidence_sections_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "evidence_sections"),
     packet_sufficiency_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "sufficiency"),
     packet_trace_summary_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "trace_summary"),
+    packet_dto_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "packet_dto"),
+    packet_output_budget_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "output_budget"),
     packet_stdio_phase_timings: stdioPhaseTimings,
     packet_stdio_phase_total_ms: stdioPhaseTimings.reduce((sum, timing) => sum + timing.duration_ms, 0),
     packet_stdio_text_materialization_ms: packetStdioPhaseTiming(stdioPhaseTimings, "text_materialization"),
@@ -4284,7 +4286,13 @@ function createStdioClient(command, args, opts) {
       }
       const waiter = pending.shift();
       if (waiter) {
-        waiter.resolve(line);
+        waiter.resolve({
+          line,
+          timings: {
+            ...waiter.timings,
+            stdio_response_wait_ms: Math.round((performance.now() - waiter.responseWaitStarted) * 1000) / 1000,
+          },
+        });
       }
     }
   });
@@ -4306,6 +4314,9 @@ function createStdioClient(command, args, opts) {
     child,
     stderr: () => stderr,
     request(payload) {
+      return this.requestWithTimings(payload).then((result) => result.line);
+    },
+    requestWithTimings(payload) {
       return new Promise((resolve, reject) => {
         if (closedError) {
           reject(closedError);
@@ -4319,7 +4330,14 @@ function createStdioClient(command, args, opts) {
           }
           reject(new Error(`stdio request timed out after ${opts.timeoutMs}ms: ${stderr}`));
         }, opts.timeoutMs);
+        const stringifyStarted = performance.now();
+        const requestLine = `${JSON.stringify(payload)}\n`;
+        const timings = {
+          stdio_request_json_ms: Math.round((performance.now() - stringifyStarted) * 1000) / 1000,
+        };
         waiter = {
+          timings,
+          responseWaitStarted: performance.now(),
           resolve: (line) => {
             clearTimeout(timer);
             resolve(line);
@@ -4330,7 +4348,9 @@ function createStdioClient(command, args, opts) {
           },
         };
         pending.push(waiter);
-        child.stdin.write(`${JSON.stringify(payload)}\n`);
+        const writeStarted = performance.now();
+        child.stdin.write(requestLine);
+        waiter.timings.stdio_request_write_ms = Math.round((performance.now() - writeStarted) * 1000) / 1000;
       });
     },
     close() {
@@ -4366,7 +4386,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
     for (const task of tasks) {
       for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
         const started = performance.now();
-        const responseLine = await client.request({
+        const responseResult = await client.requestWithTimings({
           jsonrpc: "2.0",
           id: `${task.id}-${repeat}`,
           method: "tools/call",
@@ -4380,7 +4400,13 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           },
         });
         const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+        const responseLine = responseResult.line;
+        const parseStarted = performance.now();
         const response = JSON.parse(responseLine);
+        const stdioTransport = {
+          ...responseResult.timings,
+          stdio_response_parse_ms: Math.round((performance.now() - parseStarted) * 1000) / 1000,
+        };
         const packet = response.result?.structuredContent ?? null;
         const isError = response.result?.isError === true || response.error;
         const packetFingerprint = packet && !isError ? JSON.stringify(packet) : null;
@@ -4418,6 +4444,7 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
           error: response.error?.message ?? (isError ? response.result?.content?.[0]?.text : null),
           wall_ms: wallMs,
           response_bytes: Buffer.byteLength(responseLine, "utf8"),
+          stdio_transport: stdioTransport,
           warm_stdio_packet_cache_hit: warmStdioPacketCacheHit,
           warm_stdio_packet_cache_reference_repeat: warmStdioPacketCacheHit ? previousPacket.repeat : null,
           warm_stdio_packet_cache_reference_wall_ms: warmStdioPacketCacheHit ? previousPacket.wallMs : null,
@@ -4495,12 +4522,18 @@ function summarizePacketRuntimeRuns(results) {
       median_packet_rank_and_window_ms: median(latencyRows.map((row) => row.packet_latency?.packet_rank_and_window_ms)),
       median_packet_shadow_and_trace_ms: median(latencyRows.map((row) => row.packet_latency?.packet_shadow_and_trace_ms)),
       median_packet_budget_ms: median(latencyRows.map((row) => row.packet_latency?.packet_budget_ms)),
+      median_packet_dto_ms: median(latencyRows.map((row) => row.packet_latency?.packet_dto_ms)),
+      median_packet_output_budget_ms: median(latencyRows.map((row) => row.packet_latency?.packet_output_budget_ms)),
       median_packet_evidence_sections_ms: median(latencyRows.map((row) => row.packet_latency?.packet_evidence_sections_ms)),
       median_packet_sufficiency_ms: median(latencyRows.map((row) => row.packet_latency?.packet_sufficiency_ms)),
       median_packet_trace_summary_ms: median(latencyRows.map((row) => row.packet_latency?.packet_trace_summary_ms)),
       median_packet_stdio_phase_total_ms: median(latencyRows.map((row) => row.packet_latency?.packet_stdio_phase_total_ms)),
       median_packet_stdio_text_materialization_ms: median(latencyRows.map((row) => row.packet_latency?.packet_stdio_text_materialization_ms)),
       median_packet_stdio_tool_response_materialization_ms: median(latencyRows.map((row) => row.packet_latency?.packet_stdio_tool_response_materialization_ms)),
+      median_stdio_request_json_ms: median(successful.map((row) => row.stdio_transport?.stdio_request_json_ms)),
+      median_stdio_request_write_ms: median(successful.map((row) => row.stdio_transport?.stdio_request_write_ms)),
+      median_stdio_response_wait_ms: median(successful.map((row) => row.stdio_transport?.stdio_response_wait_ms)),
+      median_stdio_response_parse_ms: median(successful.map((row) => row.stdio_transport?.stdio_response_parse_ms)),
       packet_sla_missed_runs: latencyRows.filter((row) => row.packet_latency?.sla_missed === true).length,
       warm_stdio_packet_cache_hit_runs: successful.filter((row) => row.warm_stdio_packet_cache_hit === true).length,
       retrieval_shadow_cache_hit_runs: shadowRows.filter((shadow) => shadow.cache_hit === true).length,
@@ -4525,8 +4558,8 @@ function packetRuntimeMarkdown(summary) {
   const lines = [
     "# Packet Runtime Benchmark",
     "",
-    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | Sufficiency ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | DTO ms median | Output budget ms median | Sufficiency ms median | Stdio req JSON ms median | Stdio req write ms median | Stdio resp wait ms median | Stdio resp parse ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(packetRuntimeMarkdownRow(row));
@@ -4554,7 +4587,13 @@ function packetRuntimeMarkdownRow(row) {
     formatValue(row.median_packet_non_trace_phase_total_ms),
     formatValue(row.median_packet_stdio_phase_total_ms),
     formatValue(row.median_packet_budget_ms),
+    formatValue(row.median_packet_dto_ms),
+    formatValue(row.median_packet_output_budget_ms),
     formatValue(row.median_packet_sufficiency_ms),
+    formatValue(row.median_stdio_request_json_ms),
+    formatValue(row.median_stdio_request_write_ms),
+    formatValue(row.median_stdio_response_wait_ms),
+    formatValue(row.median_stdio_response_parse_ms),
     formatValue(row.median_packet_batch_total_ms),
     formatValue(row.median_packet_batch_attributed_query_ms),
     formatValue(row.median_packet_batch_overhead_ms),
@@ -5945,6 +5984,8 @@ function runSelfTest() {
           "packet_lexical_subquery_batch total_ms=40 attributed_query_ms=31 overhead_ms=9 queries=3",
           "packet_non_trace_phase label=budget duration_ms=7",
           "packet_non_trace_phase label=sufficiency duration_ms=11",
+          "packet_non_trace_phase label=packet_dto duration_ms=2",
+          "packet_non_trace_phase label=output_budget duration_ms=5",
           "packet_stdio_phase label=text_materialization duration_ms=3",
           "packet_stdio_phase label=tool_response_materialization duration_ms=4",
         ],
@@ -5967,9 +6008,11 @@ function runSelfTest() {
   assert.equal(packetLatency.packet_batch_overhead_ms, 14);
   assert.equal(packetLatency.packet_anchor_probe_batch_overhead_ms, 5);
   assert.equal(packetLatency.packet_lexical_subquery_batch_overhead_ms, 9);
-  assert.equal(packetLatency.packet_non_trace_phase_total_ms, 18);
+  assert.equal(packetLatency.packet_non_trace_phase_total_ms, 25);
   assert.equal(packetLatency.packet_budget_ms, 7);
   assert.equal(packetLatency.packet_sufficiency_ms, 11);
+  assert.equal(packetLatency.packet_dto_ms, 2);
+  assert.equal(packetLatency.packet_output_budget_ms, 5);
   assert.equal(packetLatency.packet_stdio_phase_total_ms, 7);
   assert.equal(packetLatency.packet_stdio_text_materialization_ms, 3);
   assert.equal(packetLatency.packet_stdio_tool_response_materialization_ms, 4);

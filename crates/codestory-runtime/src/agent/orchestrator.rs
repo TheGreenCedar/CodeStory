@@ -496,6 +496,7 @@ pub(crate) fn agent_packet(
     let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
     append_packet_non_trace_phase(&mut answer, "trace_summary", phase_started);
 
+    let phase_started = Instant::now();
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
         question,
@@ -506,11 +507,20 @@ pub(crate) fn agent_packet(
         sufficiency,
         retrieval_trace_summary,
     };
+    append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
+    let phase_started = Instant::now();
     enforce_packet_output_budget(&project_root, &mut packet);
+    append_packet_non_trace_phase(&mut packet.answer, "output_budget", phase_started);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
         packet.answer.retrieval_trace.annotations.push(diagnostic);
+        let phase_started = Instant::now();
         enforce_packet_output_budget(&project_root, &mut packet);
+        append_packet_non_trace_phase(
+            &mut packet.answer,
+            "trace_artifact_output_budget",
+            phase_started,
+        );
     }
 
     Ok(packet)

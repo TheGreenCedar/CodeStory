@@ -39,7 +39,8 @@ pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
             continue;
         }
         if let Some(response) = handle_stdio_message(&runtime, &mut state, &line) {
-            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            serde_json::to_writer(&mut stdout, &response)?;
+            stdout.write_all(b"\n")?;
             stdout.flush()?;
         }
     }
@@ -1884,6 +1885,35 @@ mod tests {
             storage_fingerprint: storage_fingerprint.to_string(),
             ..base_packet_cache_key_input(question)
         })
+    }
+
+    #[test]
+    fn stdio_tool_call_success_times_packet_materialization() {
+        let response = stdio_tool_call_success(json!({
+            "packet_id": "packet-1",
+            "answer": {
+                "retrieval_trace": {
+                    "annotations": []
+                }
+            }
+        }));
+        let annotations = response
+            .pointer("/structuredContent/answer/retrieval_trace/annotations")
+            .and_then(|value| value.as_array())
+            .expect("packet annotations");
+
+        assert!(annotations.iter().any(|annotation| {
+            annotation.as_str().is_some_and(|value| {
+                value.starts_with("packet_stdio_phase label=text_materialization duration_ms=")
+            })
+        }));
+        assert!(annotations.iter().any(|annotation| {
+            annotation.as_str().is_some_and(|value| {
+                value.starts_with(
+                    "packet_stdio_phase label=tool_response_materialization duration_ms=",
+                )
+            })
+        }));
     }
 
     #[test]
