@@ -1632,7 +1632,7 @@ impl Storage {
         let target_root = target_root.to_string_lossy().to_string();
         let mut updated = self.rebase_path_bound_text_columns(&source_root, &target_root)?;
         updated = updated.saturating_add(self.refresh_rebased_file_metadata()?);
-        let invalidated_artifacts = self.clear_index_artifact_cache()?;
+        let invalidated_artifacts = self.clear_legacy_index_artifact_cache()?;
         self.cache.nodes.write().clear();
         Ok((updated, invalidated_artifacts))
     }
@@ -1713,8 +1713,13 @@ impl Storage {
         Ok(updated)
     }
 
-    fn clear_index_artifact_cache(&self) -> Result<usize, StorageError> {
-        Ok(self.conn.execute("DELETE FROM index_artifact_cache", [])?)
+    fn clear_legacy_index_artifact_cache(&self) -> Result<usize, StorageError> {
+        // ponytail: v2 artifact keys are root-portable; older rows predate that contract.
+        Ok(self.conn.execute(
+            "DELETE FROM index_artifact_cache
+             WHERE cache_key NOT LIKE 'v2:%'",
+            [],
+        )?)
     }
 
     fn refresh_rebased_file_metadata(&self) -> Result<usize, StorageError> {

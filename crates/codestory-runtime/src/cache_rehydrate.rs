@@ -175,8 +175,8 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         invalidated_retrieval_manifests,
         invalidated_index_artifact_rows,
         rebased_path_bound_rows,
-        preserved_scope: "sqlite_graph_search_docs_rebased".into(),
-        retrieval: "path-bound SQLite graph/search/doc rows rebased; index artifact cache and retrieval manifests invalidated because their keys are path/root derived".into(),
+        preserved_scope: "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved".into(),
+        retrieval: "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests invalidated because sidecar identities are root derived".into(),
         next_commands: rehydrate_next_commands(request.target_project),
     })
 }
@@ -448,7 +448,10 @@ mod tests {
         assert_eq!(output.invalidated_retrieval_manifests, 1);
         assert_eq!(output.invalidated_index_artifact_rows, 1);
         assert!(output.rebased_path_bound_rows > 0);
-        assert_eq!(output.preserved_scope, "sqlite_graph_search_docs_rebased");
+        assert_eq!(
+            output.preserved_scope,
+            "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved"
+        );
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
             storage
@@ -473,14 +476,18 @@ mod tests {
             "rehydrated target DB should retain rebased target-worktree paths"
         );
         assert_eq!(storage.get_stats().expect("stats").file_count, 1);
-        let target_source = target_project.path().join("src.rs");
-        let target_cache_key = test_artifact_cache_key(&target_source);
+        let target_cache_key = test_artifact_cache_key();
+        assert_eq!(
+            storage
+                .get_index_artifact_cache(Path::new("src.rs"), &target_cache_key)
+                .expect("target artifact cache lookup"),
+            Some(b"portable artifact".to_vec())
+        );
         assert!(
             storage
-                .get_index_artifact_cache(&target_source, &target_cache_key)
-                .expect("target artifact cache lookup")
-                .is_none(),
-            "rehydrated target DB must not claim copied path-bound artifact cache hits"
+                .get_index_artifact_cache(Path::new("legacy.rs"), "v1:path-bound:legacy")
+                .expect("legacy artifact cache lookup")
+                .is_none()
         );
     }
 
@@ -670,11 +677,18 @@ mod tests {
             .expect("llm docs");
         storage
             .upsert_index_artifact_cache(
-                &absolute_source,
-                &test_artifact_cache_key(&absolute_source),
-                format!("artifact from {absolute_source_text}").as_bytes(),
+                Path::new("src.rs"),
+                &test_artifact_cache_key(),
+                b"portable artifact",
             )
             .expect("artifact");
+        storage
+            .upsert_index_artifact_cache(
+                Path::new("legacy.rs"),
+                "v1:path-bound:legacy",
+                b"legacy artifact",
+            )
+            .expect("legacy artifact");
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: codestory_retrieval::project_id_for_root(project),
@@ -699,7 +713,7 @@ mod tests {
             .expect("manifest");
     }
 
-    fn test_artifact_cache_key(path: &Path) -> String {
-        format!("v1:path-bound:{}", path.to_string_lossy())
+    fn test_artifact_cache_key() -> String {
+        "v2:portable-test".into()
     }
 }
