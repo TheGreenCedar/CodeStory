@@ -12,8 +12,9 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, QueryRequest, QueryResult, QueryTrace, RetrievalStageKind,
-    execute_retrieval_query_with_cache, is_phantom_sidecar_hit, project_id_for_root,
+    CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
+    QueryTrace, RetrievalStageKind, execute_retrieval_query_with_cache,
+    execute_strict_retrieval_query_batch_with_cache, is_phantom_sidecar_hit, project_id_for_root,
     strict_sidecar_status,
 };
 use codestory_store::Store;
@@ -338,6 +339,35 @@ pub(crate) fn run_sidecar_query(
     )
 }
 
+pub(crate) fn run_sidecar_query_batch(
+    controller: &AppController,
+    queries: &[(String, u64)],
+) -> Result<Vec<QueryResult>, AnyhowError> {
+    let project_root = controller
+        .require_project_root()
+        .map_err(|error| anyhow::anyhow!("project root required: {}", error.message))?;
+    let storage_path = controller
+        .require_storage_path()
+        .map_err(|error| anyhow::anyhow!("storage path required: {}", error.message))?;
+    let batch_items = queries
+        .iter()
+        .map(|(query, budget_ms)| QueryBatchItem {
+            query,
+            budget_ms: Some(*budget_ms),
+        })
+        .collect::<Vec<_>>();
+    let mut cache = controller.sidecar_query_cache.lock();
+    execute_strict_retrieval_query_batch_with_cache(
+        QueryBatchRequest {
+            project_root: &project_root,
+            storage_path: &storage_path,
+            queries: &batch_items,
+            cancelled: None,
+        },
+        &mut cache,
+    )
+}
+
 pub(crate) fn maybe_run_retrieval_shadow(
     controller: &AppController,
     question: &str,
@@ -540,36 +570,60 @@ fn search_sidecar_packet_batch_inner(
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
-    search_sidecar_packet_batch_inner_with_query(
+    search_sidecar_packet_batch_inner_with_query_batch(
         controller,
         queries,
         latency_budget_ms,
-        run_sidecar_query,
+        run_sidecar_query_batch,
     )
 }
 
-fn search_sidecar_packet_batch_inner_with_query(
+fn search_sidecar_packet_batch_inner_with_query_batch(
     controller: &AppController,
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
-    mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
+    mut run_query_batch: impl FnMut(
+        &AppController,
+        &[(String, u64)],
+    ) -> Result<Vec<QueryResult>, AnyhowError>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
     let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
         .checked_div(queries.len().max(1) as u64)
         .unwrap_or(100)
         .max(100);
+    let batch_queries = queries
+        .iter()
+        .map(|(query, _)| (query.clone(), per_query_budget))
+        .collect::<Vec<_>>();
+    let query_results = run_query_batch(controller, &batch_queries).map_err(|error| {
+        sidecar_retrieval_unavailable_error(
+            controller,
+            format!("sidecar retrieval batch query failed: {error}"),
+        )
+    })?;
+    if query_results.len() != queries.len() {
+        return Err(sidecar_retrieval_unavailable_error(
+            controller,
+            format!(
+                "sidecar retrieval batch returned {} results for {} queries",
+                query_results.len(),
+                queries.len()
+            ),
+        ));
+    }
     let mut results = Vec::with_capacity(queries.len());
     let mut diagnostics = Vec::with_capacity(queries.len());
-    for (query, max_results) in queries {
-        let query_started_at = Instant::now();
-        let query_result =
-            run_query(controller, query, Some(per_query_budget as u32)).map_err(|error| {
-                sidecar_retrieval_unavailable_error(
-                    controller,
-                    format!("sidecar retrieval batch query failed: {error}"),
-                )
-            })?;
-        let sidecar_query_ms = clamp_elapsed_ms(query_started_at);
+    for ((query, max_results), query_result) in queries.iter().zip(query_results) {
+        if query_result.query != *query {
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "sidecar retrieval batch query mismatch expected `{}` got `{}`",
+                    query, query_result.query
+                ),
+            ));
+        }
+        let sidecar_query_ms = u32::try_from(query_result.trace.elapsed_ms).unwrap_or(u32::MAX);
         let max_results = (*max_results).clamp(1, 50);
         let resolution_started_at = Instant::now();
         let resolution =
@@ -2157,12 +2211,13 @@ mod tests {
             .expect("open project");
 
         let queries = vec![("helpers".to_string(), 5)];
-        let outcome = search_sidecar_packet_batch_inner_with_query(
+        let outcome = search_sidecar_packet_batch_inner_with_query_batch(
             &controller,
             &queries,
             Some(500),
-            |_, _, _| {
-                Ok(QueryResult {
+            |_, batch| {
+                assert_eq!(batch, &[("helpers".to_string(), 500)]);
+                Ok(vec![QueryResult {
                     query: "helpers".into(),
                     features: classify_query("helpers"),
                     hits: vec![CandidateHit::with_source(
@@ -2180,7 +2235,7 @@ mod tests {
                         cache_hit: false,
                         stages: Vec::new(),
                     },
-                })
+                }])
             },
         )
         .expect("full-mode unresolved candidates should not reject packet batch");
@@ -2227,35 +2282,38 @@ mod tests {
             ("search projection".to_string(), 5),
         ];
         let mut observed_budgets = Vec::new();
-        let outcome = search_sidecar_packet_batch_inner_with_query(
+        let mut batch_call_count = 0;
+        let outcome = search_sidecar_packet_batch_inner_with_query_batch(
             &controller,
             &queries,
             Some(18_000),
-            |_, query, budget| {
-                observed_budgets.push(budget);
-                Ok(QueryResult {
-                    query: query.to_string(),
-                    features: classify_query(query),
-                    hits: Vec::new(),
-                    trace: QueryTrace {
-                        retrieval_mode: "full".into(),
-                        degraded_reason: None,
-                        total_budget_ms: u64::from(budget.unwrap_or_default()),
-                        elapsed_ms: 1,
-                        cancel_reason: None,
-                        cache_hit: false,
-                        stages: Vec::new(),
-                    },
-                })
+            |_, batch| {
+                batch_call_count += 1;
+                observed_budgets.extend(batch.iter().map(|(_, budget)| *budget));
+                Ok(batch
+                    .iter()
+                    .map(|(query, budget)| QueryResult {
+                        query: query.to_string(),
+                        features: classify_query(query),
+                        hits: Vec::new(),
+                        trace: QueryTrace {
+                            retrieval_mode: "full".into(),
+                            degraded_reason: None,
+                            total_budget_ms: *budget,
+                            elapsed_ms: 1,
+                            cancel_reason: None,
+                            cache_hit: false,
+                            stages: Vec::new(),
+                        },
+                    })
+                    .collect())
             },
         )
         .expect("empty full-mode packet query results should not reject");
 
         assert_eq!(outcome.results.len(), queries.len());
-        assert_eq!(
-            observed_budgets,
-            vec![Some(4_500), Some(4_500), Some(4_500), Some(4_500)]
-        );
+        assert_eq!(batch_call_count, 1);
+        assert_eq!(observed_budgets, vec![4_500, 4_500, 4_500, 4_500]);
     }
 
     #[test]
@@ -2272,12 +2330,13 @@ mod tests {
             .expect("remove storage parent");
 
         let queries = vec![("handler".to_string(), 5)];
-        let result = search_sidecar_packet_batch_inner_with_query(
+        let result = search_sidecar_packet_batch_inner_with_query_batch(
             &controller,
             &queries,
             Some(500),
-            |_, _, _| {
-                Ok(QueryResult {
+            |_, batch| {
+                assert_eq!(batch, &[("handler".to_string(), 500)]);
+                Ok(vec![QueryResult {
                     query: "handler".into(),
                     features: classify_query("handler"),
                     hits: vec![CandidateHit::with_source(
@@ -2295,7 +2354,7 @@ mod tests {
                         cache_hit: false,
                         stages: Vec::new(),
                     },
-                })
+                }])
             },
         );
 
