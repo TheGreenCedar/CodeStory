@@ -4014,6 +4014,57 @@ function packetRetrievalShadowTelemetry(shadow) {
   };
 }
 
+function packetTraceField(fields, key) {
+  if (!Array.isArray(fields)) {
+    return null;
+  }
+  const found = fields.find((field) => field?.key === key);
+  return found ? found.value : null;
+}
+
+function packetTraceNumber(fields, key) {
+  return finiteNumber(packetTraceField(fields, key));
+}
+
+function packetSearchStepTelemetry(steps) {
+  return steps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => String(step?.kind ?? "").toLowerCase() === "search")
+    .filter(({ step }) => String(step?.status ?? "").toLowerCase() !== "skipped")
+    .map(({ step, index }) => ({
+      step_index: index,
+      query: packetTraceField(step.input, "query"),
+      mode: packetTraceField(step.output, "mode") ?? "unclassified_search",
+      duration_ms: finiteNumber(step.duration_ms),
+      hits: packetTraceNumber(step.output, "hits"),
+      sidecar_query_ms: packetTraceNumber(step.output, "sidecar_query_ms"),
+      candidate_resolution_ms: packetTraceNumber(step.output, "candidate_resolution_ms"),
+      sidecar_total_ms: packetTraceNumber(step.output, "sidecar_total_ms"),
+      sidecar_stage_count: packetTraceNumber(step.output, "sidecar_stage_count"),
+      sidecar_stage_total_ms: packetTraceNumber(step.output, "sidecar_stage_total_ms"),
+      message: step.message ?? null,
+    }));
+}
+
+function packetSearchPhaseTotal(searchSteps, mode) {
+  const total = searchSteps
+    .filter((step) => step.mode === mode)
+    .reduce((sum, step) => sum + (finiteNumber(step.duration_ms) ?? 0), 0);
+  return Number.isFinite(total) ? total : null;
+}
+
+function topPacketSearchQueries(searchSteps, limit = 8) {
+  return [...searchSteps]
+    .sort((left, right) => {
+      const duration = (right.duration_ms ?? -1) - (left.duration_ms ?? -1);
+      if (duration !== 0) {
+        return duration;
+      }
+      return String(left.query ?? "").localeCompare(String(right.query ?? ""));
+    })
+    .slice(0, limit);
+}
+
 function packetLatencyTelemetry(packet, wallMs) {
   if (!packet || typeof packet !== "object") {
     return null;
@@ -4023,6 +4074,7 @@ function packetLatencyTelemetry(packet, wallMs) {
   const freshness = packet.answer?.freshness ?? null;
   const steps = Array.isArray(retrievalTrace?.steps) ? retrievalTrace.steps : [];
   const topStep = [...steps].sort((left, right) => (right.duration_ms ?? 0) - (left.duration_ms ?? 0))[0] ?? null;
+  const searchSteps = packetSearchStepTelemetry(steps);
   const retrievalTotalMs = finiteNumber(retrievalTrace?.total_latency_ms);
   const freshnessMs = finiteNumber(freshness?.duration_ms);
   const unaccountedMs =
@@ -4040,6 +4092,12 @@ function packetLatencyTelemetry(packet, wallMs) {
     top_step_duration_ms: finiteNumber(topStep?.duration_ms),
     top_step_message: topStep?.message ?? null,
     retrieval_step_count: steps.length,
+    packet_search_total_ms: searchSteps.reduce((sum, step) => sum + (finiteNumber(step.duration_ms) ?? 0), 0),
+    packet_initial_sidecar_query_ms: packetSearchPhaseTotal(searchSteps, "packet_initial_sidecar_query"),
+    packet_anchor_probe_search_total_ms: packetSearchPhaseTotal(searchSteps, "symbolic_packet_anchor_probe"),
+    packet_lexical_subquery_search_total_ms: packetSearchPhaseTotal(searchSteps, "packet_lexical_batch"),
+    packet_semantic_subquery_search_total_ms: packetSearchPhaseTotal(searchSteps, "packet_semantic_batch"),
+    packet_search_queries: topPacketSearchQueries(searchSteps),
     retrieval_shadow: retrievalShadow,
   };
 }

@@ -3127,7 +3127,7 @@ fn execute_retrieval(
                     field("retrieval_path", "sidecar"),
                 ],
             );
-            trace.finish_ok(
+            trace.finish_ok_with_duration_ms(
                 search_step,
                 vec![
                     field("hits", hits.len().to_string()),
@@ -3139,7 +3139,10 @@ fn execute_retrieval(
                     field("accepted_hits", hits.len().to_string()),
                     field("max_results", max_results.to_string()),
                     field("repo_text", "off_initial"),
+                    field("mode", "packet_initial_sidecar_query"),
+                    field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
                 ],
+                shadow.retrieval_total_ms,
             );
             let semantic_query_step = trace.start_step(
                 AgentRetrievalStepKindDto::SemanticQueryEmbedding,
@@ -5414,6 +5417,11 @@ mod tests {
             .push(PacketSidecarQueryDiagnosticDto {
                 query: "sidecar batch".to_string(),
                 retrieval_mode: "full".to_string(),
+                sidecar_query_ms: None,
+                candidate_resolution_ms: None,
+                total_elapsed_ms: None,
+                sidecar_stage_count: 0,
+                sidecar_stage_total_ms: None,
                 candidate_count: 1,
                 resolved_hit_count: 0,
                 unresolved_candidate_count: 1,
@@ -5427,6 +5435,11 @@ mod tests {
             .push(PacketSidecarQueryDiagnosticDto {
                 query: "sidecar batch".to_string(),
                 retrieval_mode: "full".to_string(),
+                sidecar_query_ms: None,
+                candidate_resolution_ms: None,
+                total_elapsed_ms: None,
+                sidecar_stage_count: 0,
+                sidecar_stage_total_ms: None,
                 candidate_count: 1,
                 resolved_hit_count: 0,
                 unresolved_candidate_count: 1,

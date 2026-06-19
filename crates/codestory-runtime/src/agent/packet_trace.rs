@@ -9,8 +9,8 @@ use super::trace::field;
 use crate::HybridSearchScoredHit;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentResponseBlockDto, AgentResponseSectionDto, AgentRetrievalStepDto,
-    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, PacketBudgetModeDto,
-    PacketPlanQueryDto, SearchHit,
+    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, AgentRetrievalSummaryFieldDto,
+    PacketBudgetModeDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -36,6 +36,7 @@ pub(crate) fn merge_packet_lexical_subquery_batch(
     pending: &[(usize, &PacketPlanQueryDto)],
     results: &[(String, Vec<SearchHit>)],
     duration_ms: u32,
+    diagnostics: &[PacketSidecarQueryDiagnosticDto],
     include_evidence: bool,
     rank_terms: &[String],
     stage_carry_limit: usize,
@@ -45,10 +46,14 @@ pub(crate) fn merge_packet_lexical_subquery_batch(
         .iter()
         .map(packet_citation_key)
         .collect::<HashSet<_>>();
-    let per_step_duration = duration_ms / pending.len().max(1) as u32;
 
-    for ((plan_index, query), (result_query, hits)) in pending.iter().zip(results.iter()) {
+    for (diagnostic_index, ((plan_index, query), (result_query, hits))) in
+        pending.iter().zip(results.iter()).enumerate()
+    {
         debug_assert_eq!(query.query, *result_query);
+        let diagnostic = packet_query_diagnostic(diagnostics, diagnostic_index, result_query);
+        let step_duration = packet_query_duration_ms(diagnostic)
+            .unwrap_or(duration_ms / pending.len().max(1) as u32);
         let mut added = 0usize;
         let mut citations = hits
             .iter()
@@ -65,25 +70,29 @@ pub(crate) fn merge_packet_lexical_subquery_batch(
                 added = added.saturating_add(1);
             }
         }
+        let mut output = vec![
+            field("hits", hits.len().to_string()),
+            field("citations_added", added.to_string()),
+            field("mode", "packet_lexical_batch".to_string()),
+        ];
+        append_packet_query_timing_fields(&mut output, diagnostic);
         answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
             kind: AgentRetrievalStepKindDto::Search,
             status: AgentRetrievalStepStatusDto::Ok,
-            duration_ms: per_step_duration,
+            duration_ms: step_duration,
             input: vec![field("query", query.query.clone())],
-            output: vec![
-                field("hits", hits.len().to_string()),
-                field("citations_added", added.to_string()),
-                field("mode", "packet_lexical_batch".to_string()),
-            ],
+            output,
             message: Some(format!("packet subquery `{}`", query.purpose)),
         });
+        let timing_note = packet_query_timing_annotation(diagnostic);
         answer.retrieval_trace.annotations.push(format!(
-            "packet_lexical_subquery index={} query=`{}` purpose=`{}` hits={} citations_added={}",
+            "packet_lexical_subquery index={} query=`{}` purpose=`{}` hits={} citations_added={}{}",
             plan_index,
             query.query.replace('`', "'"),
             query.purpose.replace('`', "'"),
             hits.len(),
-            added
+            added,
+            timing_note
         ));
         answer.sections.push(AgentResponseSectionDto {
             id: format!("packet-subquery-{}", sanitize_section_id(&query.query)),
@@ -105,6 +114,7 @@ pub(crate) fn merge_packet_semantic_subquery_batch(
     pending: &[(usize, &PacketPlanQueryDto)],
     results: &[(String, Vec<HybridSearchScoredHit>)],
     duration_ms: u32,
+    diagnostics: &[PacketSidecarQueryDiagnosticDto],
     include_evidence: bool,
     rank_terms: &[String],
     budget: PacketBudgetModeDto,
@@ -115,10 +125,14 @@ pub(crate) fn merge_packet_semantic_subquery_batch(
         .iter()
         .map(packet_citation_key)
         .collect::<HashSet<_>>();
-    let per_step_duration = duration_ms / pending.len().max(1) as u32;
 
-    for ((plan_index, query), (result_query, scored_hits)) in pending.iter().zip(results.iter()) {
+    for (diagnostic_index, ((plan_index, query), (result_query, scored_hits))) in
+        pending.iter().zip(results.iter()).enumerate()
+    {
         debug_assert_eq!(query.query, *result_query);
+        let diagnostic = packet_query_diagnostic(diagnostics, diagnostic_index, result_query);
+        let step_duration = packet_query_duration_ms(diagnostic)
+            .unwrap_or(duration_ms / pending.len().max(1) as u32);
         let mut added = 0usize;
         let mut citations = scored_hits
             .iter()
@@ -135,24 +149,28 @@ pub(crate) fn merge_packet_semantic_subquery_batch(
                 added = added.saturating_add(1);
             }
         }
+        let mut output = vec![
+            field("hits", scored_hits.len().to_string()),
+            field("citations_added", added.to_string()),
+            field("mode", "packet_semantic_batch".to_string()),
+        ];
+        append_packet_query_timing_fields(&mut output, diagnostic);
         answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
             kind: AgentRetrievalStepKindDto::Search,
             status: AgentRetrievalStepStatusDto::Ok,
-            duration_ms: per_step_duration,
+            duration_ms: step_duration,
             input: vec![field("query", query.query.clone())],
-            output: vec![
-                field("hits", scored_hits.len().to_string()),
-                field("citations_added", added.to_string()),
-                field("mode", "packet_semantic_batch".to_string()),
-            ],
+            output,
             message: Some(format!("packet semantic subquery `{}`", query.purpose)),
         });
+        let timing_note = packet_query_timing_annotation(diagnostic);
         answer.retrieval_trace.annotations.push(format!(
-            "packet_semantic_subquery index={} query=`{}` hits={} citations_added={}",
+            "packet_semantic_subquery index={} query=`{}` hits={} citations_added={}{}",
             plan_index,
             query.query.replace('`', "'"),
             scored_hits.len(),
-            added
+            added,
+            timing_note
         ));
         let hybrid_weights = packet_subquery_hybrid_weights(budget, query);
         let semantic_note = hybrid_weights
@@ -170,6 +188,70 @@ pub(crate) fn merge_packet_semantic_subquery_batch(
                 ),
             }],
         });
+    }
+}
+
+pub(crate) fn packet_query_diagnostic<'a>(
+    diagnostics: &'a [PacketSidecarQueryDiagnosticDto],
+    index: usize,
+    query: &str,
+) -> Option<&'a PacketSidecarQueryDiagnosticDto> {
+    diagnostics
+        .get(index)
+        .filter(|diagnostic| diagnostic.query == query)
+        .or_else(|| {
+            diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.query == query)
+        })
+}
+
+pub(crate) fn packet_query_duration_ms(
+    diagnostic: Option<&PacketSidecarQueryDiagnosticDto>,
+) -> Option<u32> {
+    diagnostic.and_then(|diagnostic| diagnostic.total_elapsed_ms.or(diagnostic.sidecar_query_ms))
+}
+
+pub(crate) fn append_packet_query_timing_fields(
+    output: &mut Vec<AgentRetrievalSummaryFieldDto>,
+    diagnostic: Option<&PacketSidecarQueryDiagnosticDto>,
+) {
+    let Some(diagnostic) = diagnostic else {
+        return;
+    };
+    if let Some(value) = diagnostic.sidecar_query_ms {
+        output.push(field("sidecar_query_ms", value.to_string()));
+    }
+    if let Some(value) = diagnostic.candidate_resolution_ms {
+        output.push(field("candidate_resolution_ms", value.to_string()));
+    }
+    if let Some(value) = diagnostic.total_elapsed_ms {
+        output.push(field("sidecar_total_ms", value.to_string()));
+    }
+    output.push(field(
+        "sidecar_stage_count",
+        diagnostic.sidecar_stage_count.to_string(),
+    ));
+    if let Some(value) = diagnostic.sidecar_stage_total_ms {
+        output.push(field("sidecar_stage_total_ms", value.to_string()));
+    }
+}
+
+fn packet_query_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
+    let Some(diagnostic) = diagnostic else {
+        return String::new();
+    };
+    match (
+        diagnostic.sidecar_query_ms,
+        diagnostic.candidate_resolution_ms,
+        diagnostic.total_elapsed_ms,
+    ) {
+        (Some(query_ms), Some(resolution_ms), Some(total_ms)) => format!(
+            " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={}",
+            query_ms, resolution_ms, total_ms
+        ),
+        (_, _, Some(total_ms)) => format!(" total_elapsed_ms={total_ms}"),
+        _ => String::new(),
     }
 }
 
@@ -208,6 +290,19 @@ mod golden_tests {
             score_breakdown: None,
         };
         let results = vec![("exec_events".to_string(), vec![hit])];
+        let diagnostics = vec![PacketSidecarQueryDiagnosticDto {
+            query: "exec_events".to_string(),
+            retrieval_mode: "full".to_string(),
+            sidecar_query_ms: Some(9),
+            candidate_resolution_ms: Some(3),
+            total_elapsed_ms: Some(12),
+            sidecar_stage_count: 0,
+            sidecar_stage_total_ms: None,
+            candidate_count: 1,
+            resolved_hit_count: 1,
+            unresolved_candidate_count: 0,
+            diagnostic: None,
+        }];
         let rank_terms = vec!["exec".to_string(), "events".to_string()];
         let mut answer = AgentAnswerDto {
             answer_id: "golden".to_string(),
@@ -240,6 +335,7 @@ mod golden_tests {
             &pending,
             &results,
             12,
+            &diagnostics,
             false,
             &rank_terms,
             6,
@@ -254,6 +350,15 @@ mod golden_tests {
                 .find(|field| field.key == "mode")
                 .map(|field| field.value.as_str()),
             Some("packet_lexical_batch")
+        );
+        assert_eq!(answer.retrieval_trace.steps[0].duration_ms, 12);
+        assert_eq!(
+            answer.retrieval_trace.steps[0]
+                .output
+                .iter()
+                .find(|field| field.key == "sidecar_query_ms")
+                .map(|field| field.value.as_str()),
+            Some("9")
         );
         let citation = to_citation_from_hit(&results[0].1[0], None, None, false);
         assert_eq!(answer.citations[0].display_name, citation.display_name);
