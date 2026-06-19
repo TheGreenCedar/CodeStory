@@ -473,7 +473,7 @@ pub(crate) struct CacheCommand {
 pub(crate) enum CacheAction {
     #[command(about = "Report canonical repository identity inputs.")]
     Identity(CacheIdentityCommand),
-    #[command(about = "Copy a compatible CodeStory cache from another worktree.")]
+    #[command(about = "Rehydrate a compatible cache from another worktree.")]
     Rehydrate(CacheRehydrateCommand),
 }
 
@@ -498,13 +498,13 @@ pub(crate) struct CacheRehydrateCommand {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Existing worktree whose CodeStory cache shell should be checked and copied."
+        help = "Existing worktree whose CodeStory cache should be checked and copied."
     )]
     pub(crate) from_project: PathBuf,
     #[arg(
         long,
         value_name = "PATH",
-        help = "Source cache directory to snapshot. If omitted, the normal cache location for --from-project is used."
+        help = "Source cache directory to rehydrate. If omitted, the normal cache location for --from-project is used."
     )]
     pub(crate) from_cache_dir: Option<PathBuf>,
     #[arg(

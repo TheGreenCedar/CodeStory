@@ -31,7 +31,7 @@ pub struct CacheRehydrateOutput {
     pub copied: bool,
     pub dry_run: bool,
     pub invalidated_retrieval_manifests: usize,
-    pub invalidated_path_bound_rows: usize,
+    pub rebased_path_bound_rows: usize,
     pub preserved_scope: String,
     pub retrieval: String,
     pub next_commands: Vec<String>,
@@ -131,22 +131,22 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         )?;
     }
     let mut invalidated_retrieval_manifests = 0;
-    let mut invalidated_path_bound_rows = 0;
+    let mut rebased_path_bound_rows = 0;
     if !request.dry_run {
         let mut storage = Store::open(&target_db).context("open copied target cache")?;
         invalidated_retrieval_manifests = storage
             .clear_retrieval_index_manifests()
             .context("invalidate copied retrieval manifests")?;
-        invalidated_path_bound_rows = storage
-            .clear_rehydrated_path_bound_cache()
-            .context("clear copied path-bound cache rows")?;
+        rebased_path_bound_rows = storage
+            .rebase_rehydrated_path_bound_cache(request.source_project, request.target_project)
+            .context("rebase copied path-bound cache rows")?;
     }
 
     Ok(CacheRehydrateOutput {
         status: if request.dry_run {
-            "would_prepare".into()
+            "would_rehydrate".into()
         } else {
-            "prepared".into()
+            "rehydrated".into()
         },
         reason: None,
         source_project: display_path(request.source_project),
@@ -162,10 +162,10 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         copied: !request.dry_run,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests,
-        invalidated_path_bound_rows,
-        preserved_scope: "schema_and_path_independent_rows_only".into(),
-        retrieval: "path-bound index/search/doc/artifact rows cleared; run full index and retrieval index under the target worktree identity".into(),
-        next_commands: reuse_next_commands(request.target_project),
+        rebased_path_bound_rows,
+        preserved_scope: "grounding_index_search_docs_rebased".into(),
+        retrieval: "path-bound SQLite rows rebased; retrieval manifests invalidated because sidecar generations are project-root derived".into(),
+        next_commands: rehydrate_next_commands(request.target_project),
     })
 }
 
@@ -235,7 +235,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
             entry.file_name().to_string_lossy().as_ref(),
             "codestory.db-wal" | "codestory.db-shm"
         ) {
-            // ponytail: SQLite backup snapshots the DB; copying WAL/SHM would reintroduce live-path state.
+            // SQLite backup snapshots the DB; copying WAL/SHM would reintroduce live state.
             continue;
         } else {
             fs::copy(&source_path, &target_path)?;
@@ -265,9 +265,9 @@ fn skipped(
         copied: false,
         dry_run: request.dry_run,
         invalidated_retrieval_manifests: 0,
-        invalidated_path_bound_rows: 0,
+        rebased_path_bound_rows: 0,
         preserved_scope: "none".into(),
-        retrieval: "not prepared; normal index/retrieval rebuild required".into(),
+        retrieval: "not rehydrated; normal index/retrieval rebuild required".into(),
         next_commands,
     }
 }
@@ -318,10 +318,10 @@ fn rebuild_commands(project: &Path) -> Vec<String> {
     ]
 }
 
-fn reuse_next_commands(project: &Path) -> Vec<String> {
+fn rehydrate_next_commands(project: &Path) -> Vec<String> {
     let project = quote_path(project);
     vec![
-        format!("codestory-cli index --project {project} --refresh full"),
+        format!("codestory-cli doctor --project {project}"),
         format!("codestory-cli retrieval index --project {project} --refresh full"),
         format!("codestory-cli doctor --project {project}"),
     ]
@@ -348,7 +348,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn rehydrate_copies_cache_shell_and_clears_path_bound_rows() {
+    fn rehydrate_rebases_path_bound_rows_without_source_root_leakage() {
         let Some((source_project, target_project)) = matching_git_projects() else {
             return;
         };
@@ -367,13 +367,13 @@ mod tests {
         })
         .expect("rehydrate");
 
-        assert_eq!(output.status, "prepared");
+        assert_eq!(output.status, "rehydrated");
         assert!(target_cache_path.join("codestory.db").is_file());
         assert_eq!(output.invalidated_retrieval_manifests, 1);
-        assert!(output.invalidated_path_bound_rows > 0);
+        assert!(output.rebased_path_bound_rows > 0);
         assert_eq!(
             output.preserved_scope,
-            "schema_and_path_independent_rows_only"
+            "grounding_index_search_docs_rebased"
         );
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
@@ -390,7 +390,23 @@ mod tests {
             0,
             "rehydrated target DB must not retain source-worktree absolute paths"
         );
-        assert_eq!(storage.get_stats().expect("stats").file_count, 0);
+        let target_root = target_project.path().to_string_lossy();
+        assert!(
+            storage
+                .path_bound_text_match_count(&target_root)
+                .expect("target root scan")
+                > 0,
+            "rehydrated target DB should retain rebased target-worktree paths"
+        );
+        assert_eq!(storage.get_stats().expect("stats").file_count, 1);
+        let target_source = target_project.path().join("src.rs");
+        assert!(
+            storage
+                .get_index_artifact_cache(&target_source, "artifact-cache-key")
+                .expect("artifact cache lookup")
+                .is_some(),
+            "rehydrated target DB should retain rebased artifact cache rows"
+        );
     }
 
     #[test]
@@ -551,7 +567,11 @@ mod tests {
             }])
             .expect("llm docs");
         storage
-            .upsert_index_artifact_cache(&absolute_source, "artifact-cache-key", b"artifact")
+            .upsert_index_artifact_cache(
+                &absolute_source,
+                "artifact-cache-key",
+                format!("artifact from {absolute_source_text}").as_bytes(),
+            )
             .expect("artifact");
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {

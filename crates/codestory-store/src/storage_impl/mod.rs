@@ -1623,69 +1623,163 @@ impl Storage {
         Ok(())
     }
 
-    pub fn clear_rehydrated_path_bound_cache(&mut self) -> Result<usize, StorageError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut removed = 0usize;
-        for statement in [
-            "DELETE FROM callable_projection_state",
-            "DELETE FROM occurrence",
-            "DELETE FROM edge",
-            "DELETE FROM llm_symbol_doc",
-            "DELETE FROM symbol_search_doc",
-            "DELETE FROM symbol_summary",
-            "DELETE FROM search_symbol_projection",
-            "DELETE FROM component_access",
-            "DELETE FROM bookmark_node",
-            "DELETE FROM local_symbol",
-            "DELETE FROM error",
-            "DELETE FROM node",
-            "DELETE FROM file",
-            "DELETE FROM grounding_repo_stats_snapshot",
-            "DELETE FROM grounding_file_snapshot",
-            "DELETE FROM grounding_node_snapshot",
-            "DELETE FROM grounding_node_summary_snapshot",
-            "DELETE FROM grounding_node_edge_digest_snapshot",
-            "DELETE FROM resolution_support_snapshot",
-            "DELETE FROM retrieval_index_manifest",
-            "DELETE FROM index_artifact_cache",
-        ] {
-            removed = removed.saturating_add(tx.execute(statement, [])?);
-        }
-        tx.execute(
-            "INSERT INTO grounding_snapshot_meta (
-                id,
-                snapshot_version,
-                summary_state,
-                detail_state,
-                summary_built_at_epoch_ms,
-                detail_built_at_epoch_ms
-             )
-             VALUES (1, ?1, ?2, ?2, NULL, NULL)
-             ON CONFLICT(id) DO UPDATE SET
-                snapshot_version = excluded.snapshot_version,
-                summary_state = excluded.summary_state,
-                detail_state = excluded.detail_state,
-                summary_built_at_epoch_ms = NULL,
-                detail_built_at_epoch_ms = NULL",
-            params![
-                GROUNDING_SNAPSHOT_VERSION,
-                GroundingSnapshotState::Dirty.db_value()
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO resolution_support_snapshot (
-                id,
-                snapshot_version,
-                state,
-                snapshot_blob,
-                built_at_epoch_ms
-             )
-             VALUES (1, 0, ?1, NULL, NULL)",
-            params![GroundingSnapshotState::Dirty.db_value()],
-        )?;
-        tx.commit()?;
+    pub fn rebase_rehydrated_path_bound_cache(
+        &mut self,
+        source_root: &Path,
+        target_root: &Path,
+    ) -> Result<usize, StorageError> {
+        let source_root = source_root.to_string_lossy().to_string();
+        let target_root = target_root.to_string_lossy().to_string();
+        let mut updated = self.rebase_path_bound_text_columns(&source_root, &target_root)?;
+        updated = updated
+            .saturating_add(self.rebase_index_artifact_cache_blobs(&source_root, &target_root)?);
+        updated = updated.saturating_add(self.refresh_rebased_file_metadata()?);
         self.cache.nodes.write().clear();
-        Ok(removed)
+        Ok(updated)
+    }
+
+    fn rebase_path_bound_text_columns(
+        &self,
+        source_root: &str,
+        target_root: &str,
+    ) -> Result<usize, StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0usize;
+        for statement in [
+            "UPDATE file
+             SET path = replace(path, ?1, ?2)
+             WHERE instr(path, ?1) > 0",
+            "UPDATE node
+             SET
+                serialized_name = replace(serialized_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                canonical_id = replace(canonical_id, ?1, ?2)
+             WHERE instr(serialized_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(canonical_id, ''), ?1) > 0",
+            "UPDATE edge
+             SET callsite_identity = replace(callsite_identity, ?1, ?2)
+             WHERE instr(COALESCE(callsite_identity, ''), ?1) > 0",
+            "UPDATE callable_projection_state
+             SET symbol_key = replace(symbol_key, ?1, ?2)
+             WHERE instr(symbol_key, ?1) > 0",
+            "UPDATE error
+             SET message = replace(message, ?1, ?2)
+             WHERE instr(message, ?1) > 0",
+            "UPDATE llm_symbol_doc
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                doc_text = replace(doc_text, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(doc_text, ?1) > 0",
+            "UPDATE symbol_search_doc
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                doc_text = replace(doc_text, ?1, ?2),
+                source_provenance = replace(source_provenance, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(doc_text, ?1) > 0
+                OR instr(source_provenance, ?1) > 0",
+            "UPDATE search_symbol_projection
+             SET display_name = replace(display_name, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0",
+            "UPDATE grounding_file_snapshot
+             SET path = replace(path, ?1, ?2)
+             WHERE instr(path, ?1) > 0",
+            "UPDATE grounding_node_snapshot
+             SET
+                serialized_name = replace(serialized_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                canonical_id = replace(canonical_id, ?1, ?2),
+                display_name = replace(display_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2)
+             WHERE instr(serialized_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(canonical_id, ''), ?1) > 0
+                OR instr(display_name, ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0",
+            "UPDATE index_artifact_cache
+             SET file_path = replace(file_path, ?1, ?2)
+             WHERE instr(file_path, ?1) > 0",
+        ] {
+            updated =
+                updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    fn rebase_index_artifact_cache_blobs(
+        &self,
+        source_root: &str,
+        target_root: &str,
+    ) -> Result<usize, StorageError> {
+        let mut rows = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT file_path, artifact_blob
+                 FROM index_artifact_cache
+                 WHERE instr(CAST(artifact_blob AS TEXT), ?1) > 0",
+            )?;
+            let mut query = stmt.query(params![source_root])?;
+            while let Some(row) = query.next()? {
+                rows.push((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?));
+            }
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0usize;
+        for (file_path, blob) in rows {
+            let Ok(text) = String::from_utf8(blob) else {
+                continue;
+            };
+            if !text.contains(source_root) {
+                continue;
+            }
+            let rebased = text.replace(source_root, target_root);
+            updated = updated.saturating_add(tx.execute(
+                "UPDATE index_artifact_cache
+                 SET artifact_blob = ?2
+                 WHERE file_path = ?1",
+                params![file_path, rebased.into_bytes()],
+            )?);
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    fn refresh_rebased_file_metadata(&self) -> Result<usize, StorageError> {
+        let files = self.get_files()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0usize;
+        for file in files {
+            let Ok(metadata) = fs::metadata(&file.path) else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+                continue;
+            };
+            let modification_time = duration.as_millis().min(i64::MAX as u128) as i64;
+            updated = updated.saturating_add(tx.execute(
+                "UPDATE file
+                 SET modification_time = ?2
+                 WHERE id = ?1",
+                params![file.id, modification_time],
+            )?);
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn path_bound_text_match_count(&self, prefix: &str) -> Result<usize, StorageError> {
@@ -1694,12 +1788,15 @@ impl Storage {
         for sql in [
             "SELECT COUNT(*) FROM file WHERE path LIKE ?1",
             "SELECT COUNT(*) FROM node WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1",
+            "SELECT COUNT(*) FROM edge WHERE callsite_identity LIKE ?1",
+            "SELECT COUNT(*) FROM callable_projection_state WHERE symbol_key LIKE ?1",
+            "SELECT COUNT(*) FROM error WHERE message LIKE ?1",
             "SELECT COUNT(*) FROM llm_symbol_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1",
             "SELECT COUNT(*) FROM symbol_search_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1 OR source_provenance LIKE ?1",
             "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
             "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
             "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
-            "SELECT COUNT(*) FROM index_artifact_cache WHERE file_path LIKE ?1 OR cache_key LIKE ?1",
+            "SELECT COUNT(*) FROM index_artifact_cache WHERE file_path LIKE ?1 OR cache_key LIKE ?1 OR CAST(artifact_blob AS TEXT) LIKE ?1",
         ] {
             let matched: i64 = self
                 .conn

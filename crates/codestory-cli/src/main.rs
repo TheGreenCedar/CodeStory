@@ -319,8 +319,8 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
     );
     let _ = writeln!(
         markdown,
-        "invalidated_path_bound_rows: `{}`",
-        output.invalidated_path_bound_rows
+        "rebased_path_bound_rows: `{}`",
+        output.rebased_path_bound_rows
     );
     let _ = writeln!(markdown, "retrieval: {}", output.retrieval);
     if !output.next_commands.is_empty() {
