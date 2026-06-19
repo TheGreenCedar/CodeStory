@@ -4110,6 +4110,48 @@ function packetStdioPhaseTiming(timings, label) {
   return finiteNumber(timings.find((timing) => timing.label === label)?.duration_ms);
 }
 
+function stdioRequestIdKey(value) {
+  return JSON.stringify(value ?? null);
+}
+
+function parseStdioServerPhaseLine(line) {
+  const match = /^packet_stdio_server_phase request_id=(\S+) label=([a-z_]+) duration_ms=(\d+)$/.exec(String(line ?? ""));
+  if (!match) {
+    return null;
+  }
+  let requestId = match[1];
+  try {
+    requestId = stdioRequestIdKey(JSON.parse(requestId));
+  } catch {
+    // ponytail: raw key is fine if a future diagnostic id is not JSON.
+  }
+  return {
+    request_id: requestId,
+    label: match[2],
+    duration_ms: Number(match[3]),
+  };
+}
+
+function stdioServerPhaseTiming(timings, label) {
+  return finiteNumber(timings.find((timing) => timing.label === label)?.duration_ms);
+}
+
+function stdioServerPhaseTransportTimings(timings) {
+  const serializationMs = stdioServerPhaseTiming(timings, "response_serialization");
+  const newlineWriteMs = stdioServerPhaseTiming(timings, "newline_write");
+  const flushMs = stdioServerPhaseTiming(timings, "flush");
+  const phases = [serializationMs, newlineWriteMs, flushMs];
+  return {
+    stdio_server_phase_timings: timings,
+    stdio_server_output_total_ms: phases.every(Number.isFinite)
+      ? phases.reduce((sum, durationMs) => sum + durationMs, 0)
+      : null,
+    stdio_server_response_serialization_ms: serializationMs,
+    stdio_server_newline_write_ms: newlineWriteMs,
+    stdio_server_flush_ms: flushMs,
+  };
+}
+
 function topPacketSearchQueries(searchSteps, limit = 8) {
   return [...searchSteps]
     .sort((left, right) => {
@@ -4264,8 +4306,39 @@ function createStdioClient(command, args, opts) {
   });
   let buffer = "";
   let stderr = "";
+  let stderrBuffer = "";
+  const serverPhaseTimingsByRequestId = new Map();
   const pending = [];
   let closedError = null;
+  function recordStderr(chunk) {
+    stderr += chunk;
+    stderrBuffer += chunk;
+    for (;;) {
+      const newline = stderrBuffer.indexOf("\n");
+      if (newline < 0) {
+        break;
+      }
+      const line = stderrBuffer.slice(0, newline).trim();
+      stderrBuffer = stderrBuffer.slice(newline + 1);
+      const serverPhase = parseStdioServerPhaseLine(line);
+      if (!serverPhase) {
+        continue;
+      }
+      const timings = serverPhaseTimingsByRequestId.get(serverPhase.request_id) ?? [];
+      timings.push({
+        label: serverPhase.label,
+        duration_ms: serverPhase.duration_ms,
+      });
+      serverPhaseTimingsByRequestId.set(serverPhase.request_id, timings);
+    }
+  }
+  function serverPhaseTimingsForRequest(requestIdKey) {
+    return [...(serverPhaseTimingsByRequestId.get(requestIdKey) ?? [])];
+  }
+  function hasAllServerPhaseTimings(requestIdKey) {
+    const labels = new Set(serverPhaseTimingsForRequest(requestIdKey).map((timing) => timing.label));
+    return ["response_serialization", "newline_write", "flush"].every((label) => labels.has(label));
+  }
   function rejectPending(error) {
     while (pending.length) {
       const waiter = pending.shift();
@@ -4297,7 +4370,7 @@ function createStdioClient(command, args, opts) {
     }
   });
   child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString();
+    recordStderr(chunk.toString());
   });
   child.on("error", (error) => {
     closedError = error;
@@ -4332,15 +4405,20 @@ function createStdioClient(command, args, opts) {
         }, opts.timeoutMs);
         const stringifyStarted = performance.now();
         const requestLine = `${JSON.stringify(payload)}\n`;
+        const requestIdKey = stdioRequestIdKey(payload?.id);
         const timings = {
           stdio_request_json_ms: Math.round((performance.now() - stringifyStarted) * 1000) / 1000,
         };
         waiter = {
+          requestIdKey,
           timings,
           responseWaitStarted: performance.now(),
           resolve: (line) => {
             clearTimeout(timer);
-            resolve(line);
+            resolve({
+              ...line,
+              requestIdKey,
+            });
           },
           reject: (error) => {
             clearTimeout(timer);
@@ -4351,6 +4429,19 @@ function createStdioClient(command, args, opts) {
         const writeStarted = performance.now();
         child.stdin.write(requestLine);
         waiter.timings.stdio_request_write_ms = Math.round((performance.now() - writeStarted) * 1000) / 1000;
+      });
+    },
+    waitForServerPhaseTimings(requestIdKey, timeoutMs = 250) {
+      const started = performance.now();
+      return new Promise((resolve) => {
+        const poll = () => {
+          if (hasAllServerPhaseTimings(requestIdKey) || performance.now() - started >= timeoutMs) {
+            resolve(serverPhaseTimingsForRequest(requestIdKey));
+            return;
+          }
+          setTimeout(poll, 5);
+        };
+        poll();
       });
     },
     close() {
@@ -4401,10 +4492,12 @@ async function runWarmPacketRuntimeGroup(opts, repoName, tasks, outDir) {
         });
         const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
         const responseLine = responseResult.line;
+        const serverPhaseTimings = await client.waitForServerPhaseTimings(responseResult.requestIdKey);
         const parseStarted = performance.now();
         const response = JSON.parse(responseLine);
         const stdioTransport = {
           ...responseResult.timings,
+          ...stdioServerPhaseTransportTimings(serverPhaseTimings),
           stdio_response_parse_ms: Math.round((performance.now() - parseStarted) * 1000) / 1000,
         };
         const packet = response.result?.structuredContent ?? null;
@@ -4533,6 +4626,10 @@ function summarizePacketRuntimeRuns(results) {
       median_stdio_request_json_ms: median(successful.map((row) => row.stdio_transport?.stdio_request_json_ms)),
       median_stdio_request_write_ms: median(successful.map((row) => row.stdio_transport?.stdio_request_write_ms)),
       median_stdio_response_wait_ms: median(successful.map((row) => row.stdio_transport?.stdio_response_wait_ms)),
+      median_stdio_server_output_total_ms: median(successful.map((row) => row.stdio_transport?.stdio_server_output_total_ms)),
+      median_stdio_server_response_serialization_ms: median(successful.map((row) => row.stdio_transport?.stdio_server_response_serialization_ms)),
+      median_stdio_server_newline_write_ms: median(successful.map((row) => row.stdio_transport?.stdio_server_newline_write_ms)),
+      median_stdio_server_flush_ms: median(successful.map((row) => row.stdio_transport?.stdio_server_flush_ms)),
       median_stdio_response_parse_ms: median(successful.map((row) => row.stdio_transport?.stdio_response_parse_ms)),
       packet_sla_missed_runs: latencyRows.filter((row) => row.packet_latency?.sla_missed === true).length,
       warm_stdio_packet_cache_hit_runs: successful.filter((row) => row.warm_stdio_packet_cache_hit === true).length,
@@ -4558,8 +4655,8 @@ function packetRuntimeMarkdown(summary) {
   const lines = [
     "# Packet Runtime Benchmark",
     "",
-    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | DTO ms median | Output budget ms median | Sufficiency ms median | Stdio req JSON ms median | Stdio req write ms median | Stdio resp wait ms median | Stdio resp parse ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | DTO ms median | Output budget ms median | Sufficiency ms median | Stdio req JSON ms median | Stdio req write ms median | Stdio resp wait ms median | Server output ms median | Server serialize ms median | Server newline ms median | Server flush ms median | Stdio resp parse ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(packetRuntimeMarkdownRow(row));
@@ -4593,6 +4690,10 @@ function packetRuntimeMarkdownRow(row) {
     formatValue(row.median_stdio_request_json_ms),
     formatValue(row.median_stdio_request_write_ms),
     formatValue(row.median_stdio_response_wait_ms),
+    formatValue(row.median_stdio_server_output_total_ms),
+    formatValue(row.median_stdio_server_response_serialization_ms),
+    formatValue(row.median_stdio_server_newline_write_ms),
+    formatValue(row.median_stdio_server_flush_ms),
     formatValue(row.median_stdio_response_parse_ms),
     formatValue(row.median_packet_batch_total_ms),
     formatValue(row.median_packet_batch_attributed_query_ms),
@@ -6016,6 +6117,23 @@ function runSelfTest() {
   assert.equal(packetLatency.packet_stdio_phase_total_ms, 7);
   assert.equal(packetLatency.packet_stdio_text_materialization_ms, 3);
   assert.equal(packetLatency.packet_stdio_tool_response_materialization_ms, 4);
+  const serverPhase = parseStdioServerPhaseLine(
+    'packet_stdio_server_phase request_id="java-commons-lang-string-utils-1" label=response_serialization duration_ms=12',
+  );
+  assert.deepEqual(serverPhase, {
+    request_id: '"java-commons-lang-string-utils-1"',
+    label: "response_serialization",
+    duration_ms: 12,
+  });
+  const serverTransport = stdioServerPhaseTransportTimings([
+    { label: "response_serialization", duration_ms: 12 },
+    { label: "newline_write", duration_ms: 1 },
+    { label: "flush", duration_ms: 2 },
+  ]);
+  assert.equal(serverTransport.stdio_server_output_total_ms, 15);
+  assert.equal(serverTransport.stdio_server_response_serialization_ms, 12);
+  assert.equal(serverTransport.stdio_server_newline_write_ms, 1);
+  assert.equal(serverTransport.stdio_server_flush_ms, 2);
   assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }), true);
   assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }, { publishable: true }), false);
   const weakPacketTelemetry = packetSufficiencyTelemetry(

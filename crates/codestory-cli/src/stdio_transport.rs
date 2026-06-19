@@ -39,9 +39,19 @@ pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
             continue;
         }
         if let Some(response) = handle_stdio_message(&runtime, &mut state, &line) {
+            let response_id = stdio_response_id_label(&response);
+            let serialize_started = Instant::now();
             serde_json::to_writer(&mut stdout, &response)?;
+            let serialization_ms = stdio_elapsed_ms(serialize_started);
+            let newline_started = Instant::now();
             stdout.write_all(b"\n")?;
+            let newline_write_ms = stdio_elapsed_ms(newline_started);
+            let flush_started = Instant::now();
             stdout.flush()?;
+            let flush_ms = stdio_elapsed_ms(flush_started);
+            report_stdio_server_phase(&response_id, "response_serialization", serialization_ms);
+            report_stdio_server_phase(&response_id, "newline_write", newline_write_ms);
+            report_stdio_server_phase(&response_id, "flush", flush_ms);
         }
     }
     Ok(())
@@ -287,6 +297,19 @@ fn append_stdio_packet_phase(packet: &mut serde_json::Value, label: &str, durati
 
 fn stdio_elapsed_ms(started_at: Instant) -> u32 {
     started_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+}
+
+fn stdio_response_id_label(response: &serde_json::Value) -> String {
+    response
+        .get("id")
+        .map(stdio_json_text)
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn report_stdio_server_phase(request_id: &str, label: &str, duration_ms: u32) {
+    eprintln!(
+        "packet_stdio_server_phase request_id={request_id} label={label} duration_ms={duration_ms}"
+    );
 }
 
 fn stdio_packet_text(packet: &serde_json::Value) -> String {
