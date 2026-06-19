@@ -1,9 +1,13 @@
 use anyhow::Result;
 use codestory_contracts::graph::EdgeKind;
+use codestory_contracts::language_support::{
+    is_structural_language_name, language_name_for_path, parser_backed_language_name_for_path,
+};
 use enum_dispatch::enum_dispatch;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 mod c;
 mod cpp;
@@ -330,43 +334,14 @@ impl SemanticResolverRegistry {
 
 pub(crate) fn detect_language(path: Option<&str>) -> Option<&'static str> {
     let path = path?;
-    let ext = path
-        .rsplit('.')
-        .next()?
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "c" => Some("c"),
-        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => Some("cpp"),
-        "h" => Some("c"),
-        "java" => Some("java"),
-        "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
-        "py" | "pyi" => Some("python"),
-        "rs" => Some("rust"),
-        "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
-        "vue" => Some("vue"),
-        "svelte" => Some("svelte"),
-        "astro" => Some("astro"),
-        "go" => Some("go"),
-        "rb" => Some("ruby"),
-        "php" => Some("php"),
-        "cs" => Some("csharp"),
-        "kt" | "kts" => Some("kotlin"),
-        "swift" => Some("swift"),
-        "dart" => Some("dart"),
-        "sh" | "bash" => Some("bash"),
-        "html" | "htm" => Some("html"),
-        "css" => Some("css"),
-        "sql" => Some("sql"),
-        _ => None,
-    }
+    crate::template_pipeline::template_surface_language(Path::new(path))
+        .or_else(|| language_name_for_path(Some(path)))
 }
 
 pub(crate) fn detect_resolver_language(path: Option<&str>) -> Option<&'static str> {
-    match detect_language(path)? {
-        "html" | "css" | "sql" => None,
-        language => Some(language),
-    }
+    let path = path?;
+    parser_backed_language_name_for_path(Some(path))
+        .or_else(|| crate::template_pipeline::template_surface_language(Path::new(path)))
 }
 
 fn semantic_resolver_for_path(path: Option<&str>) -> Option<SemanticResolverKind> {
@@ -568,7 +543,7 @@ fn language_family_bucket(language: &'static str) -> &'static str {
         "swift" => "swift",
         "dart" => "dart",
         "bash" => "bash",
-        "html" | "css" | "sql" => "structural",
+        language if is_structural_language_name(language) => "structural",
         _ => language,
     }
 }

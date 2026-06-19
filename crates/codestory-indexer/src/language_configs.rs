@@ -5,26 +5,34 @@ use super::{
     RUST_TAGS_QUERY, SWIFT_GRAPH_QUERY, TSX_GRAPH_QUERY, TSX_TAGS_QUERY, TYPESCRIPT_GRAPH_QUERY,
     TYPESCRIPT_TAGS_QUERY, make_language_config,
 };
+use codestory_contracts::language_support::{
+    LanguageSupportMode, language_support_profile_for_ext, normalize_extension,
+};
 
 pub(super) fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
-    let ext = codestory_contracts::language_support::normalize_extension(ext);
-    match ext.as_str() {
-        "py" | "pyi" => Some(python()),
-        "java" => Some(java()),
-        "rs" => Some(rust()),
-        "js" | "jsx" | "mjs" | "cjs" => Some(javascript()),
-        "ts" | "mts" | "cts" => Some(typescript()),
-        "tsx" => Some(tsx()),
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(cpp()),
-        "c" | "h" => Some(c()),
-        "go" => Some(go()),
-        "rb" => Some(ruby()),
-        "php" => Some(php()),
-        "cs" => Some(csharp()),
-        "kt" | "kts" => Some(kotlin()),
-        "swift" => Some(swift()),
-        "dart" => Some(dart()),
-        "sh" | "bash" => Some(bash()),
+    let ext = normalize_extension(ext);
+    let profile = language_support_profile_for_ext(&ext)?;
+    if profile.support_mode != LanguageSupportMode::ParserBackedGraph {
+        return None;
+    }
+
+    match (profile.language_name, ext.as_str()) {
+        ("python", _) => Some(python()),
+        ("java", _) => Some(java()),
+        ("rust", _) => Some(rust()),
+        ("javascript", _) => Some(javascript()),
+        ("typescript", "tsx") => Some(tsx()),
+        ("typescript", _) => Some(typescript()),
+        ("cpp", _) => Some(cpp()),
+        ("c", _) => Some(c()),
+        ("go", _) => Some(go()),
+        ("ruby", _) => Some(ruby()),
+        ("php", _) => Some(php()),
+        ("csharp", _) => Some(csharp()),
+        ("kotlin", _) => Some(kotlin()),
+        ("swift", _) => Some(swift()),
+        ("dart", _) => Some(dart()),
+        ("bash", _) => Some(bash()),
         _ => None,
     }
 }

@@ -3,25 +3,17 @@ use codestory_contracts::graph::{
     AccessKind, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, Occurrence, OccurrenceKind,
     ResolutionCertainty, SourceLocation,
 };
-use codestory_contracts::language_support::is_github_actions_workflow_path;
+use codestory_contracts::language_support::{
+    is_github_actions_workflow_path, structural_language_name_for_path,
+};
 use std::path::Path;
 
 pub(crate) fn structural_language_name(path: &Path) -> &'static str {
-    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+    let path = path.to_string_lossy();
+    if is_github_actions_workflow_path(path.as_ref()) {
         return "github_actions_workflow";
     }
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "html" | "htm" => "html",
-        "css" => "css",
-        "sql" => "sql",
-        _ => "structural",
-    }
+    structural_language_name_for_path(Some(path.as_ref())).unwrap_or("structural")
 }
 
 pub(crate) fn push_member_edge(
