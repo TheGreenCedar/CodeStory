@@ -4,7 +4,9 @@ use codestory_contracts::api::{
     AgentCitationDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHit,
     SearchHitOrigin,
 };
-use codestory_contracts::language_support::is_github_actions_workflow_path;
+use codestory_contracts::language_support::{
+    is_docker_compose_path, is_github_actions_workflow_path,
+};
 
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
 pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
@@ -66,8 +68,11 @@ pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &
     if citation_is_structural_source_proof(citation) {
         citation.evidence_tier = Some(PacketEvidenceTier::ExactSource);
         citation.resolution_status = Some(evidence_resolution_for_citation(citation));
-        citation.evidence_producer =
-            Some("structural_github_actions_workflow_collector".to_string());
+        citation.evidence_producer = Some(
+            structural_source_proof_producer(citation.file_path.as_deref())
+                .unwrap_or("structural_source_proof_collector")
+                .to_string(),
+        );
         citation.eligible_for_sufficiency = Some(false);
         return;
     }
@@ -165,8 +170,8 @@ pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceReso
 }
 
 pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
-    if hit_is_structural_source_proof(hit) {
-        return "structural_github_actions_workflow_collector".to_string();
+    if let Some(producer) = structural_source_proof_producer(hit.file_path.as_deref()) {
+        return producer.to_string();
     }
     if let Some(producer) = hit.evidence_producer.as_ref() {
         return producer.clone();
@@ -228,16 +233,22 @@ fn evidence_resolution_for_citation(citation: &AgentCitationDto) -> PacketEviden
 }
 
 fn hit_is_structural_source_proof(hit: &SearchHit) -> bool {
-    hit.file_path
-        .as_deref()
-        .is_some_and(is_github_actions_workflow_path)
+    structural_source_proof_producer(hit.file_path.as_deref()).is_some()
 }
 
 fn citation_is_structural_source_proof(citation: &AgentCitationDto) -> bool {
-    citation
-        .file_path
-        .as_deref()
-        .is_some_and(is_github_actions_workflow_path)
+    structural_source_proof_producer(citation.file_path.as_deref()).is_some()
+}
+
+fn structural_source_proof_producer(path: Option<&str>) -> Option<&'static str> {
+    let path = path?;
+    if is_github_actions_workflow_path(path) {
+        return Some("structural_github_actions_workflow_collector");
+    }
+    if is_docker_compose_path(path) {
+        return Some("structural_docker_compose_collector");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -290,6 +301,28 @@ mod tests {
         assert_eq!(
             hit.evidence_producer.as_deref(),
             Some("structural_github_actions_workflow_collector")
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn docker_compose_structural_hit_is_exact_source_diagnostic() {
+        let mut hit = workflow_hit();
+        hit.node_id = NodeId("compose-qdrant".to_string());
+        hit.display_name = "qdrant".to_string();
+        hit.file_path = Some("docker/retrieval-compose.yml".to_string());
+        hit.line = Some(4);
+
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_docker_compose_collector")
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }

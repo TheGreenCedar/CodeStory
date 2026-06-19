@@ -26,7 +26,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows | structural collector tests | exact-source structural anchors |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests | structural collector tests | exact-source structural anchors |
 
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
@@ -71,12 +71,23 @@ the collector does not validate GitHub Actions execution semantics. Packet
 evidence treats these anchors as diagnostic unless a future structural role
 explicitly admits them; they must not satisfy semantic proof roles.
 
+Docker Compose support is path-scoped to `compose.yml`, `compose.yaml`,
+`docker-compose.yml`, `docker-compose.yaml`, and repo-local
+`docker/*-compose.{yml,yaml}` manifests. The collector emits stack, service,
+image/build, ports, environment-key, and volume anchors with `exact_source` /
+`source_range_only` evidence. Unsupported shapes stay explicit: YAML anchors,
+merge keys, includes, interpolation, profiles, healthchecks, dependency
+behavior, startup order, and container runtime behavior are not semantically
+resolved. Packet evidence treats these anchors as diagnostic unless a future
+structural role explicitly admits them; they must not satisfy semantic proof
+roles.
+
 Safe wording: packet-runtime is implemented and completing the suite, but
 publishable agent-facing packet quality is not promoted until a coherent run has
 all quality, sufficiency, and cold-SLA gates green. This evidence is a
 development/proof-gate signal, not public product-grade proof for every
-parser-backed language. HTML, CSS, SQL, and GitHub Actions workflows remain
-structural source-proof collectors.
+parser-backed language. HTML, CSS, SQL, GitHub Actions workflows, and Docker
+Compose manifests remain structural source-proof collectors.
 
 Older development comparison: the language-expansion comparison artifact built
 on 2026-06-17:
@@ -146,8 +157,8 @@ Workspace parser policy:
 
 Validation: each listed candidate passed an isolated `cargo check` probe with
 the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,
-and GitHub Actions workflows remain structural runtime paths, not parser-backed
-runtime claims.
+GitHub Actions workflows, and Docker Compose manifests remain structural runtime
+paths, not parser-backed runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |
 | --- | --- | ---: | --- |

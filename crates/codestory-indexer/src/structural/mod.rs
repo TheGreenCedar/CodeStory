@@ -3,6 +3,7 @@
 mod blanking;
 mod common;
 pub(crate) mod css;
+mod docker_compose;
 mod github_actions;
 mod html;
 mod sql;
@@ -18,11 +19,16 @@ pub fn structural_language_name(path: &Path) -> &'static str {
 use crate::intermediate_storage::IntermediateStorage;
 use anyhow::Result;
 use codestory_contracts::graph::NodeId;
-use codestory_contracts::language_support::is_github_actions_workflow_path;
+use codestory_contracts::language_support::{
+    is_docker_compose_path, is_github_actions_workflow_path,
+};
 use std::path::Path;
 
 pub fn is_structural_candidate_path(path: &Path) -> bool {
-    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+    let path_text = path.to_string_lossy();
+    if is_github_actions_workflow_path(path_text.as_ref())
+        || is_docker_compose_path(path_text.as_ref())
+    {
         return true;
     }
     matches!(
@@ -61,13 +67,16 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
     });
     storage.nodes.push(file_node);
 
-    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+    let path_text = path.to_string_lossy();
+    if is_github_actions_workflow_path(path_text.as_ref()) {
         github_actions::collect_github_actions_workflow_entities(
             path,
             source,
             file_id,
             &mut storage,
         );
+    } else if is_docker_compose_path(path_text.as_ref()) {
+        docker_compose::collect_docker_compose_entities(path, source, file_id, &mut storage);
     } else {
         match structural_extension(path).as_deref() {
             Some("html" | "htm") => {
@@ -185,6 +194,96 @@ jobs:
     }
 
     #[test]
+    fn indexes_docker_compose_services_as_structural_source_proof() {
+        let compose = r#"name: codestory-retrieval
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    ports:
+      - "127.0.0.1:${CODESTORY_QDRANT_HTTP_PORT:-6333}:6333"
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+    volumes:
+      - type: bind
+        source: ${CODESTORY_QDRANT_DATA_DIR:?set CODESTORY_QDRANT_DATA_DIR}
+        target: /qdrant/storage
+  api:
+    build: .
+    environment:
+      - RUST_LOG=info
+"#;
+
+        let storage = index_structural_source(Path::new("docker/retrieval-compose.yml"), compose)
+            .expect("index compose");
+
+        assert_eq!(storage.files[0].language, "docker_compose");
+        assert!(
+            storage.nodes.iter().any(|node| {
+                node.kind == NodeKind::MODULE
+                    && node.serialized_name == "codestory-retrieval"
+                    && node.start_line == Some(1)
+                    && node.start_col == Some(7)
+            }),
+            "compose stack name should be an exact source-span node"
+        );
+        let qdrant = storage
+            .nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node.serialized_name == "qdrant"
+                    && node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(|value| value.contains("docker-compose:service:"))
+            })
+            .expect("qdrant service node");
+        assert_eq!(qdrant.start_line, Some(4));
+        assert_eq!(qdrant.start_col, Some(3));
+        assert_exact_compose_anchor(&storage, "image: qdrant/qdrant:v1.12.5", 5, 5);
+        assert_exact_compose_anchor(
+            &storage,
+            r#"- "127.0.0.1:${CODESTORY_QDRANT_HTTP_PORT:-6333}:6333""#,
+            7,
+            7,
+        );
+        assert_exact_compose_anchor(&storage, "QDRANT__LOG_LEVEL", 9, 7);
+        assert_exact_compose_anchor(&storage, "- type: bind", 11, 7);
+        assert_exact_compose_anchor(&storage, "build: .", 15, 5);
+        assert_exact_compose_anchor(&storage, "RUST_LOG", 17, 9);
+        assert!(
+            storage
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::MEMBER)
+        );
+    }
+
+    #[test]
+    fn docker_compose_admission_is_path_scoped_not_generic_yaml() {
+        assert!(is_structural_candidate_path(Path::new(
+            "docker/retrieval-compose.yml"
+        )));
+        assert!(is_structural_candidate_path(Path::new("compose.yaml")));
+        assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
+        assert!(!is_structural_candidate_path(Path::new("docs/config.yml")));
+
+        let storage = index_structural_source(Path::new("compose.yml"), "openapi: 3.1.0\n")
+            .expect("index unsupported compose-shaped yaml");
+        assert!(
+            storage.nodes.iter().all(|node| {
+                !node
+                    .canonical_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("docker-compose:")
+            }),
+            "unsupported compose-shaped yaml should not invent compose anchors"
+        );
+    }
+
+    #[test]
     fn unnamed_github_actions_workflow_uses_jobs_source_anchor() {
         let yaml = r#"on:
   push:
@@ -279,6 +378,26 @@ jobs:
             node.end_col,
             Some(col + source_anchor.len() as u32 - 1),
             "step span must cover only source text"
+        );
+    }
+
+    fn assert_exact_compose_anchor(
+        storage: &IntermediateStorage,
+        source_anchor: &str,
+        line: u32,
+        col: u32,
+    ) {
+        let node = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::ANNOTATION && node.serialized_name == source_anchor)
+            .unwrap_or_else(|| panic!("missing exact compose anchor {source_anchor}"));
+        assert_eq!(node.start_line, Some(line));
+        assert_eq!(node.start_col, Some(col));
+        assert_eq!(
+            node.end_col,
+            Some(col + source_anchor.len() as u32 - 1),
+            "compose span must cover only source text"
         );
     }
 
