@@ -13,6 +13,7 @@ codestory-contracts = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
+enum_dispatch = "0.3.13"
 ignore = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
