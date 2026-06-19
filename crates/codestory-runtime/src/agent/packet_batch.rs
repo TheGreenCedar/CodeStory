@@ -614,9 +614,17 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
             *index,
         )
     });
+    let mut seen = HashSet::<String>::new();
     ranked
         .into_iter()
-        .map(|(_, query)| query.query.clone())
+        .filter_map(|(_, query)| {
+            let key = normalize_identifier(&query.query);
+            if key.len() < 2 || seen.insert(key) {
+                Some(query.query.clone())
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -905,6 +913,53 @@ mod tests {
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 13_500,),
             3
         );
+    }
+
+    #[test]
+    fn packet_anchor_probe_limit_counts_normalized_probe_variants_once() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Explain predicate helpers".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "parseToken".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "parse_token".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "writeBuffer".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "write_buffer".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "openSocket".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "open_socket".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+            ],
+            trace: Vec::new(),
+        };
+
+        let limited = packet_anchor_probe_queries(&plan)
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+
+        assert_eq!(limited, ["parseToken", "writeBuffer", "openSocket"]);
     }
 
     #[test]
