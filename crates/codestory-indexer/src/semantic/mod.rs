@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codestory_contracts::graph::EdgeKind;
+use enum_dispatch::enum_dispatch;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -277,6 +278,7 @@ impl SemanticCandidateIndex {
     }
 }
 
+#[enum_dispatch]
 pub trait SemanticResolver: Send + Sync {
     fn resolve(
         &self,
@@ -285,45 +287,29 @@ pub trait SemanticResolver: Send + Sync {
     ) -> Result<Vec<SemanticResolutionCandidate>>;
 }
 
+#[enum_dispatch(SemanticResolver)]
+enum SemanticResolverKind {
+    C(CSemanticResolver),
+    Cpp(CppSemanticResolver),
+    JavaScript(JavaScriptSemanticResolver),
+    Python(PythonSemanticResolver),
+    Rust(RustSemanticResolver),
+    TypeScript(TypeScriptSemanticResolver),
+    Java(JavaSemanticResolver),
+    Go(GoSemanticResolver),
+    Ruby(RubySemanticResolver),
+    Php(PhpSemanticResolver),
+    CSharp(CSharpSemanticResolver),
+    Generic(GenericSemanticResolver),
+}
+
 pub struct SemanticResolverRegistry {
     enabled: bool,
-    c: CSemanticResolver,
-    cpp: CppSemanticResolver,
-    javascript: JavaScriptSemanticResolver,
-    python: PythonSemanticResolver,
-    rust: RustSemanticResolver,
-    ts: TypeScriptSemanticResolver,
-    java: JavaSemanticResolver,
-    go: GoSemanticResolver,
-    ruby: RubySemanticResolver,
-    php: PhpSemanticResolver,
-    csharp: CSharpSemanticResolver,
-    kotlin: GenericSemanticResolver,
-    swift: GenericSemanticResolver,
-    dart: GenericSemanticResolver,
-    bash: GenericSemanticResolver,
 }
 
 impl SemanticResolverRegistry {
     pub fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            c: CSemanticResolver,
-            cpp: CppSemanticResolver,
-            javascript: JavaScriptSemanticResolver,
-            python: PythonSemanticResolver,
-            rust: RustSemanticResolver,
-            ts: TypeScriptSemanticResolver,
-            java: JavaSemanticResolver,
-            go: GoSemanticResolver,
-            ruby: RubySemanticResolver,
-            php: PhpSemanticResolver,
-            csharp: CSharpSemanticResolver,
-            kotlin: GenericSemanticResolver::new("kotlin"),
-            swift: GenericSemanticResolver::new("swift"),
-            dart: GenericSemanticResolver::new("dart"),
-            bash: GenericSemanticResolver::new("bash"),
-        }
+        Self { enabled }
     }
 
     pub fn resolve(
@@ -335,26 +321,10 @@ impl SemanticResolverRegistry {
             return Ok(Vec::new());
         }
 
-        match detect_resolver_language(request.file_path.as_deref()) {
-            Some("c") => self.c.resolve(index, request),
-            Some("cpp") => self.cpp.resolve(index, request),
-            Some("javascript") | Some("vue") | Some("svelte") | Some("astro") => {
-                self.javascript.resolve(index, request)
-            }
-            Some("python") => self.python.resolve(index, request),
-            Some("rust") => self.rust.resolve(index, request),
-            Some("typescript") => self.ts.resolve(index, request),
-            Some("java") => self.java.resolve(index, request),
-            Some("go") => self.go.resolve(index, request),
-            Some("ruby") => self.ruby.resolve(index, request),
-            Some("php") => self.php.resolve(index, request),
-            Some("csharp") => self.csharp.resolve(index, request),
-            Some("kotlin") => self.kotlin.resolve(index, request),
-            Some("swift") => self.swift.resolve(index, request),
-            Some("dart") => self.dart.resolve(index, request),
-            Some("bash") => self.bash.resolve(index, request),
-            _ => Ok(Vec::new()),
-        }
+        let Some(resolver) = semantic_resolver_for_path(request.file_path.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        resolver.resolve(index, request)
     }
 }
 
@@ -396,6 +366,27 @@ pub(crate) fn detect_resolver_language(path: Option<&str>) -> Option<&'static st
     match detect_language(path)? {
         "html" | "css" | "sql" => None,
         language => Some(language),
+    }
+}
+
+fn semantic_resolver_for_path(path: Option<&str>) -> Option<SemanticResolverKind> {
+    match detect_resolver_language(path)? {
+        "c" => Some(CSemanticResolver.into()),
+        "cpp" => Some(CppSemanticResolver.into()),
+        "javascript" | "vue" | "svelte" | "astro" => Some(JavaScriptSemanticResolver.into()),
+        "python" => Some(PythonSemanticResolver.into()),
+        "rust" => Some(RustSemanticResolver.into()),
+        "typescript" => Some(TypeScriptSemanticResolver.into()),
+        "java" => Some(JavaSemanticResolver.into()),
+        "go" => Some(GoSemanticResolver.into()),
+        "ruby" => Some(RubySemanticResolver.into()),
+        "php" => Some(PhpSemanticResolver.into()),
+        "csharp" => Some(CSharpSemanticResolver.into()),
+        "kotlin" => Some(GenericSemanticResolver::new("kotlin").into()),
+        "swift" => Some(GenericSemanticResolver::new("swift").into()),
+        "dart" => Some(GenericSemanticResolver::new("dart").into()),
+        "bash" => Some(GenericSemanticResolver::new("bash").into()),
+        _ => None,
     }
 }
 
