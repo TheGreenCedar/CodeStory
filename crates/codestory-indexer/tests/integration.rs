@@ -292,6 +292,10 @@ fn test_index_artifact_cache_copies_across_compatible_roots() -> anyhow::Result<
     let first_stats =
         run_incremental_indexing(&source_root, &mut source_storage, vec![source_file])?;
     assert_eq!(first_stats.artifact_cache_writes, 1);
+    let source_file_id = source_storage
+        .get_file_by_path(&source_root.join("src/main.rs"))?
+        .map(|file| file.id)
+        .ok_or_else(|| anyhow::anyhow!("missing source file"))?;
     drop(source_storage);
 
     let mut target_storage = Storage::open(&target_db)?;
@@ -305,6 +309,10 @@ fn test_index_artifact_cache_copies_across_compatible_roots() -> anyhow::Result<
     assert_eq!(target_stats.artifact_cache_misses, 0);
 
     let source_root_text = source_root.to_string_lossy();
+    let target_file_id = target_storage
+        .get_file_by_path(&target_file)?
+        .map(|file| file.id)
+        .ok_or_else(|| anyhow::anyhow!("missing target file"))?;
     for node in target_storage.get_nodes()? {
         assert!(!node.serialized_name.contains(source_root_text.as_ref()));
         assert!(
@@ -314,6 +322,22 @@ fn test_index_artifact_cache_copies_across_compatible_roots() -> anyhow::Result<
                 .unwrap_or_default()
                 .contains(source_root_text.as_ref())
         );
+    }
+    for edge in target_storage.get_edges()? {
+        if edge.kind == EdgeKind::CALL {
+            let identity = edge
+                .callsite_identity
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing callsite identity"))?;
+            assert!(
+                identity.starts_with(&format!("{target_file_id}:")),
+                "callsite identity should use target file id: {identity}"
+            );
+            assert!(
+                !identity.starts_with(&format!("{source_file_id}:")),
+                "callsite identity should not retain source file id: {identity}"
+            );
+        }
     }
     assert_eq!(
         target_storage

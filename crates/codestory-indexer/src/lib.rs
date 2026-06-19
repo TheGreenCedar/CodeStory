@@ -13530,7 +13530,7 @@ fn remap_edges(
         }
         edge.file_node_id = Some(new_file_id);
         if !flags.legacy_edge_identity {
-            ensure_callsite_identity(edge, None);
+            refresh_callsite_identity(edge);
         }
         edge.id = EdgeId(generate_edge_id_for_edge(edge, flags));
     }
@@ -18335,6 +18335,25 @@ fn ensure_callsite_identity(edge: &mut Edge, col: Option<u32>) {
     }
     edge.callsite_identity =
         canonical_callsite_identity(edge.file_node_id, edge.line, col, edge.target);
+}
+
+fn refresh_callsite_identity(edge: &mut Edge) {
+    if edge.kind != EdgeKind::CALL {
+        return;
+    }
+    let existing = edge.callsite_identity.take();
+    let col = existing.as_deref().and_then(callsite_identity_start_col);
+    let marker_parts = existing
+        .as_deref()
+        .into_iter()
+        .flat_map(|identity| identity.split('|').skip(1))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    edge.callsite_identity =
+        canonical_callsite_identity(edge.file_node_id, edge.line, col, edge.target);
+    for marker in marker_parts {
+        append_callsite_part(edge, &marker);
+    }
 }
 
 fn append_callsite_marker(edge: &mut Edge, marker: &'static str) {
