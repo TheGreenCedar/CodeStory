@@ -378,6 +378,24 @@ codestory-cli doctor --project <target-workspace>
 rm -rf "$backup"
 ```
 
+On Windows PowerShell:
+
+```powershell
+$cacheDir = "<project-cache-dir-from-doctor>"
+$cacheRoot = Join-Path $env:LOCALAPPDATA "codestory\cache"
+$resolvedCache = (Resolve-Path -LiteralPath $cacheDir).ProviderPath
+$resolvedRoot = (Resolve-Path -LiteralPath $cacheRoot).ProviderPath
+$rootPrefix = $resolvedRoot.TrimEnd("\", "/") + "\"
+if (-not $resolvedCache.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+  throw "Refusing to touch cache outside CodeStory cache root: $resolvedCache"
+}
+$backup = "$resolvedCache.bak-$(Get-Date -Format yyyyMMddHHmmss)"
+Move-Item -LiteralPath $resolvedCache -Destination $backup
+codestory-cli index --project <target-workspace> --refresh full
+codestory-cli doctor --project <target-workspace>
+Remove-Item -LiteralPath $backup -Recurse
+```
+
 Low-memory guidance:
 
 - Prefer `index --refresh incremental` over repeated full refreshes.
