@@ -29,7 +29,7 @@ pub mod semantic;
 pub mod structural;
 pub mod symbol_table;
 pub mod template_pipeline;
-use cache::{CachedIndexArtifact, build_index_artifact_cache_key};
+use cache::{CachedIndexArtifact, build_index_artifact_cache_key, index_artifact_cache_path};
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 use symbol_table::SymbolTable;
@@ -706,10 +706,11 @@ pub struct IncrementalIndexingStats {
 #[derive(Debug)]
 struct PreparedIndexInput {
     full_path: PathBuf,
+    artifact_cache_path: Option<PathBuf>,
     source: String,
     compilation_info: Option<compilation_database::CompilationInfo>,
     language_config: LanguageConfig,
-    artifact_cache_key: String,
+    artifact_cache_key: Option<String>,
 }
 
 enum PreparedIndexWork {
@@ -1430,21 +1431,54 @@ impl WorkspaceIndexer {
             language_config = upgraded;
         }
         let flags = index_feature_flags();
-        let artifact_cache_key = build_index_artifact_cache_key(
-            &full_path,
-            source.as_bytes(),
-            &language_config,
-            compilation_info.as_ref(),
-            flags.legacy_edge_identity,
-            flags.lazy_graph_execution,
-        );
+        let artifact_cache_path = index_artifact_cache_path(root, &full_path);
+        let artifact_cache_key = artifact_cache_path.as_ref().and_then(|cache_path| {
+            build_index_artifact_cache_key(
+                root,
+                cache_path,
+                source.as_bytes(),
+                &language_config,
+                compilation_info.as_ref(),
+                flags.legacy_edge_identity,
+                flags.lazy_graph_execution,
+            )
+        });
 
-        match storage.get_index_artifact_cache(&full_path, &artifact_cache_key) {
+        let Some(cache_path) = artifact_cache_path.as_ref() else {
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Parse(PreparedIndexInput {
+                full_path,
+                artifact_cache_path,
+                source,
+                compilation_info,
+                language_config,
+                artifact_cache_key,
+            }));
+        };
+        let Some(cache_key) = artifact_cache_key.as_ref() else {
+            stats.artifact_cache_misses += 1;
+            return Ok(PreparedIndexWork::Parse(PreparedIndexInput {
+                full_path,
+                artifact_cache_path,
+                source,
+                compilation_info,
+                language_config,
+                artifact_cache_key,
+            }));
+        };
+
+        match storage.get_index_artifact_cache(cache_path, cache_key) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
-                Ok(mut artifact) => {
+                Ok(artifact) => {
+                    let mut artifact = rebase_cached_index_artifact(
+                        artifact,
+                        &full_path,
+                        &source,
+                        language_config.language_name,
+                        flags,
+                    );
                     if let Some(file_info) = artifact.files.first_mut() {
                         file_info.modification_time = file_modification_time(&full_path);
-                        file_info.path = full_path.clone();
                     }
                     stats.artifact_cache_hits += 1;
                     if existing_projection_id.is_some() {
@@ -1478,6 +1512,7 @@ impl WorkspaceIndexer {
                     stats.artifact_cache_misses += 1;
                     Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                         full_path,
+                        artifact_cache_path,
                         source,
                         compilation_info,
                         language_config,
@@ -1489,6 +1524,7 @@ impl WorkspaceIndexer {
                 stats.artifact_cache_misses += 1;
                 Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                     full_path,
+                    artifact_cache_path,
                     source,
                     compilation_info,
                     language_config,
@@ -1499,6 +1535,7 @@ impl WorkspaceIndexer {
                 stats.artifact_cache_misses += 1;
                 Ok(PreparedIndexWork::Parse(PreparedIndexInput {
                     full_path,
+                    artifact_cache_path,
                     source,
                     compilation_info,
                     language_config,
@@ -1566,14 +1603,19 @@ impl WorkspaceIndexer {
         ) {
             Ok(index_result) => {
                 let artifact = CachedIndexArtifact::from_index_result(index_result);
-                let cache_write =
-                    serde_json::to_vec(&artifact)
-                        .ok()
-                        .map(|artifact_blob| ArtifactCacheWrite {
-                            path: prepared_input.full_path.clone(),
-                            cache_key: prepared_input.artifact_cache_key.clone(),
-                            artifact_blob,
-                        });
+                let cache_write = prepared_input
+                    .artifact_cache_path
+                    .as_ref()
+                    .zip(prepared_input.artifact_cache_key.as_ref())
+                    .and_then(|(path, cache_key)| {
+                        serde_json::to_vec(&artifact)
+                            .ok()
+                            .map(|artifact_blob| ArtifactCacheWrite {
+                                path: path.clone(),
+                                cache_key: cache_key.clone(),
+                                artifact_blob,
+                            })
+                    });
                 let local_storage = artifact.into_intermediate_storage();
                 PreparedIndexJobResult {
                     local_storage,
@@ -1673,6 +1715,64 @@ pub(crate) fn file_node_from_source(path: &Path, source: &str) -> (Node, String,
     };
 
     (file_node, file_name, file_id)
+}
+
+fn rebase_cached_index_artifact(
+    mut artifact: CachedIndexArtifact,
+    full_path: &Path,
+    source: &str,
+    language_name: &str,
+    flags: IndexFeatureFlags,
+) -> CachedIndexArtifact {
+    let file_name = full_path.to_string_lossy().to_string();
+    for node in &mut artifact.nodes {
+        if node.kind == NodeKind::FILE {
+            node.serialized_name = file_name.clone();
+            node.qualified_name = None;
+            node.canonical_id = None;
+        }
+    }
+
+    let old_file_id = artifact.files.first().map(|file| NodeId(file.id));
+    let (nodes, id_remap) = canonicalize_nodes(&file_name, artifact.nodes, &HashMap::new());
+    let fallback_file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(full_path));
+    let new_file_id = old_file_id
+        .and_then(|file_id| id_remap.get(&file_id).copied())
+        .unwrap_or(fallback_file_id);
+    let final_node_ids = nodes.iter().map(|node| node.id).collect::<HashSet<_>>();
+
+    artifact.nodes = nodes;
+    remap_file_affinity(&mut artifact.nodes, new_file_id);
+    remap_edges(&mut artifact.edges, new_file_id, &id_remap, flags);
+    remap_occurrences(&mut artifact.occurrences, &id_remap);
+    artifact.component_access = artifact
+        .component_access
+        .into_iter()
+        .filter_map(|(node_id, access)| {
+            let remapped = id_remap.get(&node_id).copied().unwrap_or(node_id);
+            final_node_ids
+                .contains(&remapped)
+                .then_some((remapped, access))
+        })
+        .collect();
+    artifact.impl_anchor_node_ids = artifact
+        .impl_anchor_node_ids
+        .into_iter()
+        .map(|node_id| id_remap.get(&node_id).copied().unwrap_or(node_id))
+        .filter(|node_id| final_node_ids.contains(node_id))
+        .collect();
+    artifact.impl_anchor_node_ids.sort_unstable();
+    artifact.impl_anchor_node_ids.dedup();
+
+    if let Some(file_info) = artifact.files.first_mut() {
+        file_info.id = new_file_id.0;
+        file_info.path = full_path.to_path_buf();
+        file_info.language = language_name.to_string();
+        file_info.line_count = source.lines().count() as u32;
+    }
+    artifact.callable_projection_states =
+        build_callable_projection_states(&artifact.nodes, &artifact.edges, &artifact.occurrences);
+    artifact
 }
 
 fn incomplete_file_storage(
@@ -13422,6 +13522,11 @@ fn remap_edges(
             && let Some(new_id) = id_remap.get(&resolved_target)
         {
             edge.resolved_target = Some(*new_id);
+        }
+        for candidate in &mut edge.candidate_targets {
+            if let Some(new_id) = id_remap.get(candidate) {
+                *candidate = *new_id;
+            }
         }
         edge.file_node_id = Some(new_file_id);
         if !flags.legacy_edge_identity {

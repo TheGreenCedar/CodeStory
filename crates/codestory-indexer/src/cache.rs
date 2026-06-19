@@ -5,9 +5,9 @@ use codestory_contracts::graph::{
 };
 use codestory_store::FileInfo;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 1;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 2;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -50,55 +50,83 @@ impl CachedIndexArtifact {
 }
 
 pub(crate) fn build_index_artifact_cache_key(
-    path: &Path,
+    root: &Path,
+    cache_path: &Path,
     source_bytes: &[u8],
     language_config: &LanguageConfig,
     compilation_info: Option<&CompilationInfo>,
     legacy_edge_identity: bool,
     lazy_graph_execution: bool,
-) -> String {
+) -> Option<String> {
     let mut state = FNV_OFFSET_BASIS;
     mix_str(&mut state, "index-artifact");
     mix_u32(&mut state, INDEX_ARTIFACT_CACHE_VERSION);
-    mix_str(&mut state, &path.to_string_lossy());
+    mix_path(&mut state, cache_path)?;
     mix_bytes(&mut state, source_bytes);
     mix_str(&mut state, language_config.language_name);
     mix_str(&mut state, language_config.graph_query);
     mix_optional_str(&mut state, language_config.tags_query);
     mix_bool(&mut state, legacy_edge_identity);
     mix_bool(&mut state, lazy_graph_execution);
-    mix_compilation_info(&mut state, compilation_info);
-    format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{state:016x}")
+    mix_compilation_info(&mut state, root, compilation_info)?;
+    Some(format!("v{INDEX_ARTIFACT_CACHE_VERSION}:{state:016x}"))
 }
 
-fn mix_compilation_info(state: &mut u64, compilation_info: Option<&CompilationInfo>) {
+pub(crate) fn index_artifact_cache_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).ok()?
+    } else {
+        path
+    };
+    let mut portable = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => portable.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if portable.as_os_str().is_empty() {
+        return Some(PathBuf::from("."));
+    }
+    Some(portable)
+}
+
+fn mix_compilation_info(
+    state: &mut u64,
+    root: &Path,
+    compilation_info: Option<&CompilationInfo>,
+) -> Option<()> {
     let Some(compilation_info) = compilation_info else {
         mix_bool(state, false);
-        return;
+        return Some(());
     };
     mix_bool(state, true);
-    mix_str(state, &compilation_info.file.to_string_lossy());
-    mix_str(state, &compilation_info.working_directory.to_string_lossy());
+    mix_path(state, &portable_compile_path(root, &compilation_info.file)?)?;
+    mix_path(
+        state,
+        &portable_compile_path(root, &compilation_info.working_directory)?,
+    )?;
     mix_optional_standard(state, compilation_info.standard);
 
     let mut include_paths = compilation_info
         .include_paths
         .iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+        .map(|path| portable_compile_path(root, path))
+        .collect::<Option<Vec<_>>>()?;
     include_paths.sort_unstable();
     for include_path in include_paths {
-        mix_str(state, &include_path);
+        mix_path(state, &include_path)?;
     }
 
     let mut system_include_paths = compilation_info
         .system_include_paths
         .iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+        .map(|path| portable_compile_path(root, path))
+        .collect::<Option<Vec<_>>>()?;
     system_include_paths.sort_unstable();
     for system_include_path in system_include_paths {
-        mix_str(state, &system_include_path);
+        mix_path(state, &system_include_path)?;
     }
 
     let mut defines = compilation_info
@@ -112,11 +140,42 @@ fn mix_compilation_info(state: &mut u64, compilation_info: Option<&CompilationIn
         mix_optional_string(state, value.as_ref());
     }
 
-    let mut other_flags = compilation_info.other_flags.clone();
+    let mut other_flags = compilation_info
+        .other_flags
+        .iter()
+        .map(|flag| portable_compile_flag(root, flag))
+        .collect::<Option<Vec<_>>>()?;
     other_flags.sort_unstable();
     for flag in other_flags {
         mix_str(state, &flag);
     }
+    Some(())
+}
+
+fn portable_compile_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return index_artifact_cache_path(root, path);
+    }
+    index_artifact_cache_path(root, path)
+}
+
+fn portable_compile_flag(root: &Path, flag: &str) -> Option<String> {
+    let path = Path::new(flag);
+    if path.is_absolute() {
+        return index_artifact_cache_path(root, path)
+            .map(|path| format!("path:{}", path.to_string_lossy()));
+    }
+    let root_text = root.to_string_lossy();
+    if !root_text.is_empty() && flag.contains(root_text.as_ref()) {
+        return None;
+    }
+    Some(format!("flag:{flag}"))
+}
+
+fn mix_path(state: &mut u64, path: &Path) -> Option<()> {
+    let token = index_artifact_cache_path(Path::new(""), path)?;
+    mix_str(state, &token.to_string_lossy().replace('\\', "/"));
+    Some(())
 }
 
 fn mix_optional_standard(state: &mut u64, standard: Option<CxxStandard>) {
@@ -169,5 +228,90 @@ fn mix_bytes(state: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *state ^= u64::from(*byte);
         *state = state.wrapping_mul(FNV_PRIME);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_artifact_cache_key_is_portable_across_roots() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root_a = temp.path().join("root-a");
+        let root_b = temp.path().join("root-b");
+        let config = crate::get_language_for_ext("cpp").expect("cpp config");
+        let source = b"int main() { return 0; }";
+        let cache_path = Path::new("src/main.cpp");
+
+        let key_a = build_index_artifact_cache_key(
+            &root_a,
+            cache_path,
+            source,
+            &config,
+            Some(&CompilationInfo {
+                file: root_a.join("src/main.cpp"),
+                working_directory: root_a.clone(),
+                include_paths: vec![root_a.join("include")],
+                system_include_paths: Vec::new(),
+                defines: HashMap::from([("FOO".to_string(), Some("1".to_string()))]),
+                standard: Some(CxxStandard::Cxx20),
+                other_flags: vec!["src/main.cpp".to_string()],
+            }),
+            false,
+            true,
+        )
+        .expect("portable source-root compile info");
+        let key_b = build_index_artifact_cache_key(
+            &root_b,
+            cache_path,
+            source,
+            &config,
+            Some(&CompilationInfo {
+                file: root_b.join("src/main.cpp"),
+                working_directory: root_b.clone(),
+                include_paths: vec![root_b.join("include")],
+                system_include_paths: Vec::new(),
+                defines: HashMap::from([("FOO".to_string(), Some("1".to_string()))]),
+                standard: Some(CxxStandard::Cxx20),
+                other_flags: vec!["src/main.cpp".to_string()],
+            }),
+            false,
+            true,
+        )
+        .expect("portable target-root compile info");
+
+        assert_eq!(key_a, key_b);
+        Ok(())
+    }
+
+    #[test]
+    fn test_artifact_cache_key_skips_unportable_compile_paths() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        let config = crate::get_language_for_ext("cpp").expect("cpp config");
+
+        let key = build_index_artifact_cache_key(
+            &root,
+            Path::new("src/main.cpp"),
+            b"int main() { return 0; }",
+            &config,
+            Some(&CompilationInfo {
+                file: root.join("src/main.cpp"),
+                working_directory: root.clone(),
+                include_paths: vec![outside.join("include")],
+                system_include_paths: Vec::new(),
+                defines: HashMap::new(),
+                standard: None,
+                other_flags: Vec::new(),
+            }),
+            false,
+            true,
+        );
+
+        assert!(key.is_none());
+        Ok(())
     }
 }

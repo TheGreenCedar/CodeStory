@@ -108,7 +108,7 @@ Files that disappeared from discovery are collected into `files_to_remove`.
 - it picks a parser-backed language configuration or structural collector for
   each file and skips unsupported files before any parse work
 
-Compilation metadata matters mostly for native-language parsing and is part of the artifact-cache key, so changes to compiler flags or include paths can invalidate cached artifacts.
+Compilation metadata matters mostly for native-language parsing and is part of the artifact-cache key, so changes to compiler flags or include paths can invalidate cached artifacts. Artifact-cache identity uses the root-relative file path so compatible clean worktrees can reuse copied artifact rows.
 
 ### 5. Artifact cache decides parse versus reuse
 
@@ -116,11 +116,11 @@ Compilation metadata matters mostly for native-language parsing and is part of t
 
 The cache key includes:
 
-- the file path
+- the root-relative file path
 - file bytes
 - language queries
 - feature-flag values that affect graph shape
-- compilation metadata when present
+- compilation metadata when present and root-relative enough to be portable
 
 A cache hit can reuse the serialized indexing artifact and turn it back into `IntermediateStorage`. A cache miss sends the file through parse and extract work.
 
@@ -241,7 +241,7 @@ compatibility records.
 
 ### How `compile_commands.json` participates
 
-`WorkspaceIndexer::new` looks for a compilation database near the workspace root. When present, parsed compilation info informs language configuration and becomes part of the artifact-cache key.
+`WorkspaceIndexer::new` looks for a compilation database near the workspace root. When present, parsed compilation info informs language configuration and becomes part of the artifact-cache key. If compile-command paths cannot be made relative to the workspace root, the indexer skips artifact-cache lookup/write for that file and rebuilds instead.
 
 ### Where artifact caching is used
 

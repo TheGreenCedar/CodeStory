@@ -274,6 +274,58 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
 }
 
 #[test]
+fn test_index_artifact_cache_copies_across_compatible_roots() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let source_root = dir.path().join("source");
+    let target_root = dir.path().join("target");
+    fs::create_dir_all(source_root.join("src"))?;
+    fs::create_dir_all(target_root.join("src"))?;
+    let source_file = source_root.join("src/main.rs");
+    let target_file = target_root.join("src/main.rs");
+    let source = "fn helper() {}\nfn run() { helper(); }\n";
+    fs::write(&source_file, source)?;
+    fs::write(&target_file, source)?;
+
+    let source_db = dir.path().join("source.db");
+    let target_db = dir.path().join("target.db");
+    let mut source_storage = Storage::open(&source_db)?;
+    let first_stats =
+        run_incremental_indexing(&source_root, &mut source_storage, vec![source_file])?;
+    assert_eq!(first_stats.artifact_cache_writes, 1);
+    drop(source_storage);
+
+    let mut target_storage = Storage::open(&target_db)?;
+    assert_eq!(
+        target_storage.copy_index_artifact_cache_from(&source_db)?,
+        1
+    );
+    let target_stats =
+        run_incremental_indexing(&target_root, &mut target_storage, vec![target_file.clone()])?;
+    assert_eq!(target_stats.artifact_cache_hits, 1);
+    assert_eq!(target_stats.artifact_cache_misses, 0);
+
+    let source_root_text = source_root.to_string_lossy();
+    for node in target_storage.get_nodes()? {
+        assert!(!node.serialized_name.contains(source_root_text.as_ref()));
+        assert!(
+            !node
+                .canonical_id
+                .as_deref()
+                .unwrap_or_default()
+                .contains(source_root_text.as_ref())
+        );
+    }
+    assert_eq!(
+        target_storage
+            .get_file_by_path(&target_file)?
+            .map(|file| file.path),
+        Some(target_file)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_incremental_indexing_body_only_change_updates_changed_callable_projection()
 -> anyhow::Result<()> {
     let dir = tempdir()?;
