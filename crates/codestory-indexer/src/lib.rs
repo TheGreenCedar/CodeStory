@@ -1550,6 +1550,9 @@ impl WorkspaceIndexer {
         &self,
         full_path: &Path,
     ) -> std::result::Result<Option<IntermediateStorage>, IntermediateStorage> {
+        if structural::is_structural_candidate_path(full_path) {
+            return Ok(None);
+        }
         if !is_openapi_candidate_path(full_path) {
             return Ok(None);
         }
@@ -21025,6 +21028,68 @@ function render() {
                 && edge.target == endpoint_id
                 && edge.certainty == Some(ResolutionCertainty::Certain)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn github_actions_workflow_with_openapi_keys_stays_structural() -> Result<()> {
+        let temp = tempdir()?;
+        let workflow_dir = temp.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflow_dir)?;
+        let workflow = workflow_dir.join("api.yml");
+        std::fs::write(
+            &workflow,
+            r#"name: API
+on:
+  push:
+openapi: 3.1.0
+paths:
+  /api/users:
+    get:
+      operationId: listUsers
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+"#,
+        )?;
+
+        let mut storage = Storage::new_in_memory()?;
+        let indexer = WorkspaceIndexer::new(temp.path().to_path_buf());
+        let bus = EventBus::new();
+        let refresh_info = codestory_workspace::RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![workflow.clone()],
+            files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
+        };
+
+        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        let files = storage.get_files()?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].language, "github_actions_workflow");
+        let nodes = storage.get_nodes()?;
+        assert!(
+            nodes.iter().any(|node| {
+                node.kind == NodeKind::FUNCTION
+                    && node.serialized_name == "build"
+                    && node
+                        .canonical_id
+                        .as_deref()
+                        .is_some_and(|value| value.contains("github-actions:job:"))
+            }),
+            "workflow job anchor should be indexed"
+        );
+        assert!(
+            nodes.iter().all(|node| !node
+                .canonical_id
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("openapi:")),
+            "workflow must not be indexed as OpenAPI"
+        );
         Ok(())
     }
 
