@@ -1630,6 +1630,8 @@ pub struct RetrievalShadowDto {
     pub resolved_hit_count: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub unresolved_candidate_count: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub diagnostic_only: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidate_resolution_counts: Vec<RetrievalCandidateResolutionCountDto>,
 }
@@ -1999,6 +2001,7 @@ mod packet_tests {
             candidate_count: 1,
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,
+            diagnostic_only: false,
             candidate_resolution_counts: vec![RetrievalCandidateResolutionCountDto {
                 resolution: "node_unresolved".to_string(),
                 count: 1,
@@ -2082,6 +2085,7 @@ mod packet_tests {
                 candidate_count: 0,
                 resolved_hit_count: 0,
                 unresolved_candidate_count: 0,
+                diagnostic_only: false,
                 candidate_resolution_counts: Vec::new(),
             }),
         };

@@ -396,6 +396,7 @@ pub(crate) fn maybe_run_retrieval_shadow(
             candidate_count: 0,
             resolved_hit_count: 0,
             unresolved_candidate_count: 0,
+            diagnostic_only: false,
             candidate_resolution_counts: Vec::new(),
         }),
     }
@@ -1081,6 +1082,11 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
             .filter(|label| label.as_str() != "resolved")
             .count()
     };
+    let diagnostic_only = unresolved_candidates_are_diagnostic_only(
+        &result.hits,
+        resolution_labels,
+        unresolved_candidate_count,
+    );
 
     RetrievalShadowDto {
         retrieval_mode: trace.retrieval_mode.clone(),
@@ -1096,8 +1102,39 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
         candidate_count: u32::try_from(effective_candidate_count).unwrap_or(u32::MAX),
         resolved_hit_count: u32::try_from(resolved_hit_count).unwrap_or(u32::MAX),
         unresolved_candidate_count: u32::try_from(unresolved_candidate_count).unwrap_or(u32::MAX),
+        diagnostic_only,
         candidate_resolution_counts,
     }
+}
+
+fn unresolved_candidates_are_diagnostic_only(
+    candidates: &[CandidateHit],
+    resolution_labels: &[String],
+    unresolved_candidate_count: usize,
+) -> bool {
+    unresolved_candidate_count > 0
+        && !resolution_labels.is_empty()
+        && candidates
+            .iter()
+            .zip(resolution_labels)
+            .filter(|(_, label)| label.as_str() != "resolved")
+            .all(|(candidate, label)| bare_dense_anchor_unresolved(candidate, label))
+}
+
+fn bare_dense_anchor_unresolved(candidate: &CandidateHit, resolution_label: &str) -> bool {
+    resolution_label == "path_unresolvable"
+        && candidate.source == CandidateSource::Qdrant
+        && bare_dense_anchor_path(candidate)
+}
+
+fn bare_dense_anchor_path(candidate: &CandidateHit) -> bool {
+    let file_path = candidate.file_path.trim();
+    !file_path.is_empty()
+        && !candidate_path_text_is_path_like(file_path)
+        && candidate
+            .symbol_name
+            .as_deref()
+            .is_some_and(|symbol| symbol.trim().eq_ignore_ascii_case(file_path))
 }
 
 fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
@@ -1130,11 +1167,17 @@ fn candidate_path_resolvable(project_root: &Path, file_path: &str) -> bool {
     let rel = normalize_repo_relative_path(project_root, file_path);
     let trimmed = rel.trim();
     !trimmed.is_empty()
-        && !trimmed.contains(':')
-        && (trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('.'))
+        && candidate_path_text_is_path_like(trimmed)
         && candidate_lookup_paths(project_root, &rel)
             .into_iter()
             .any(|path| path.exists())
+}
+
+fn candidate_path_text_is_path_like(path: &str) -> bool {
+    let trimmed = path.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains(':')
+        && (trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('.'))
 }
 
 fn normalize_repo_relative_path(project_root: &Path, file_path: &str) -> String {
@@ -1199,13 +1242,28 @@ fn normalize_storage_path_text(path: &str) -> String {
 
 fn candidate_lookup_paths(project_root: &Path, rel_path: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    push_unique_path(&mut paths, PathBuf::from(rel_path));
-    let joined = project_root.join(rel_path);
-    push_unique_path(&mut paths, joined.clone());
-    if let Ok(canonical) = std::fs::canonicalize(&joined) {
-        push_unique_path(&mut paths, canonical);
+    push_candidate_lookup_path(&mut paths, project_root, rel_path);
+    if let Some(source_rooted) = source_root_candidate_path(rel_path) {
+        push_candidate_lookup_path(&mut paths, project_root, &source_rooted);
     }
     paths
+}
+
+fn push_candidate_lookup_path(paths: &mut Vec<PathBuf>, project_root: &Path, rel_path: &str) {
+    push_unique_path(paths, PathBuf::from(rel_path));
+    let joined = project_root.join(rel_path);
+    push_unique_path(paths, joined.clone());
+    if let Ok(canonical) = std::fs::canonicalize(&joined) {
+        push_unique_path(paths, canonical);
+    }
+}
+
+fn source_root_candidate_path(rel_path: &str) -> Option<String> {
+    let rel = rel_path.trim_start_matches("./").trim_start_matches('/');
+    ["main/java/", "test/java/"]
+        .iter()
+        .any(|prefix| rel.starts_with(prefix))
+        .then(|| format!("src/{rel}"))
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1474,6 +1532,44 @@ mod tests {
     }
 
     #[test]
+    fn candidate_lookup_resolves_java_main_source_root_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_file = temp
+            .path()
+            .join("src/main/java/org/apache/commons/lang3/StringUtils.java");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("mkdir source parent");
+        std::fs::write(&source_file, "class StringUtils {}\n").expect("write source");
+
+        assert!(
+            candidate_path_resolvable(
+                temp.path(),
+                "main/java/org/apache/commons/lang3/StringUtils.java"
+            ),
+            "source-root path should resolve through src/main/java"
+        );
+    }
+
+    #[test]
+    fn candidate_lookup_resolves_java_test_source_root_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_file = temp
+            .path()
+            .join("src/test/java/org/apache/commons/lang3/StringUtilsTest.java");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("mkdir source parent");
+        std::fs::write(&source_file, "class StringUtilsTest {}\n").expect("write source");
+
+        assert!(
+            candidate_path_resolvable(
+                temp.path(),
+                "test/java/org/apache/commons/lang3/StringUtilsTest.java"
+            ),
+            "source-root path should resolve through src/test/java"
+        );
+    }
+
+    #[test]
     fn symbol_candidate_skips_unknown_callsite_and_resolves_definition() {
         use codestory_contracts::graph::{Occurrence, OccurrenceKind, SourceLocation};
         use codestory_store::{FileInfo, FileRole};
@@ -1705,6 +1801,69 @@ mod tests {
             "path_unresolvable"
         );
         assert_eq!(shadow.candidate_resolution_counts[0].count, 1);
+    }
+
+    #[test]
+    fn shadow_marks_only_bare_dense_anchors_as_diagnostic_only() {
+        let dense_anchor = QueryResult {
+            query: "apii".into(),
+            features: classify_query("apii"),
+            hits: vec![CandidateHit::with_source(
+                "apii",
+                Some("apii".to_string()),
+                0.5,
+                CandidateSource::Qdrant,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
+            dense_anchor,
+            1,
+            0,
+            &["path_unresolvable".to_string()],
+            &[],
+        );
+        let value = serde_json::to_value(&shadow).expect("serialize shadow");
+        assert_eq!(shadow.unresolved_candidate_count, 1);
+        assert_eq!(value["diagnostic_only"], true);
+
+        let missing_path = QueryResult {
+            query: "StringUtils".into(),
+            features: classify_query("StringUtils"),
+            hits: vec![CandidateHit::with_source(
+                "main/java/org/apache/commons/lang3/Missing.java",
+                Some("StringUtils".to_string()),
+                0.5,
+                CandidateSource::Qdrant,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 1,
+                cancel_reason: None,
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
+            missing_path,
+            1,
+            0,
+            &["path_unresolvable".to_string()],
+            &[],
+        );
+        let value = serde_json::to_value(&shadow).expect("serialize shadow");
+        assert_eq!(shadow.unresolved_candidate_count, 1);
+        assert_eq!(value.get("diagnostic_only"), None);
     }
 
     #[test]
