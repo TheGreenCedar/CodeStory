@@ -540,6 +540,7 @@ fn execute_retention_via_http(
 mod tests {
     use super::*;
     use crate::qdrant_client::QdrantClient;
+    use crate::test_support::retrieval_manifest_fixture;
     use codestory_store::RetrievalIndexManifest;
     use std::fs;
     use std::sync::Mutex;
@@ -573,6 +574,15 @@ mod tests {
         if with_config {
             fs::write(dir.join("config.json"), "{}").expect("write config");
         }
+    }
+
+    fn manifest_for_collection(
+        project_id: &str,
+        qdrant_collection: &str,
+    ) -> RetrievalIndexManifest {
+        let mut manifest = retrieval_manifest_fixture(project_id, "hash");
+        manifest.qdrant_collection = qdrant_collection.into();
+        manifest
     }
 
     #[test]
@@ -635,26 +645,10 @@ mod tests {
         let custom_db = custom_cache.path().join("codestory.db");
         let mut storage = Store::open(&custom_db).expect("open custom db");
         storage
-            .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
-                project_id: "custom".into(),
-                zoekt_version: "v1".into(),
-                qdrant_collection: "codestory_custom_flat".into(),
-                scip_revision: None,
-                built_at_epoch_ms: 42,
-                disk_bytes: None,
-                degraded_modes_json: "[]".into(),
-                embedding_backend: None,
-                embedding_dim: None,
-                sidecar_schema_version: None,
-                sidecar_input_hash: None,
-                sidecar_generation: None,
-                projection_count: None,
-                symbol_doc_count: None,
-                dense_projection_count: None,
-                semantic_policy_version: None,
-                graph_artifact_hash: None,
-                dense_reason_counts_json: None,
-            })
+            .upsert_retrieval_index_manifest(&manifest_for_collection(
+                "custom",
+                "codestory_custom_flat",
+            ))
             .expect("upsert");
 
         let scope = BootstrapStorageScope {
@@ -693,50 +687,12 @@ mod tests {
 
         let mut storage_a = Store::open(project_cache_a.join("codestory.db")).expect("open a");
         storage_a
-            .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
-                project_id: "a".into(),
-                zoekt_version: "v1".into(),
-                qdrant_collection: "codestory_from_a".into(),
-                scip_revision: None,
-                built_at_epoch_ms: 1,
-                disk_bytes: None,
-                degraded_modes_json: "[]".into(),
-                embedding_backend: None,
-                embedding_dim: None,
-                sidecar_schema_version: None,
-                sidecar_input_hash: None,
-                sidecar_generation: None,
-                projection_count: None,
-                symbol_doc_count: None,
-                dense_projection_count: None,
-                semantic_policy_version: None,
-                graph_artifact_hash: None,
-                dense_reason_counts_json: None,
-            })
+            .upsert_retrieval_index_manifest(&manifest_for_collection("a", "codestory_from_a"))
             .expect("manifest a");
 
         let mut storage_b = Store::open(project_cache_b.join("codestory.db")).expect("open b");
         storage_b
-            .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
-                project_id: "b".into(),
-                zoekt_version: "v1".into(),
-                qdrant_collection: "codestory_from_b".into(),
-                scip_revision: None,
-                built_at_epoch_ms: 1,
-                disk_bytes: None,
-                degraded_modes_json: "[]".into(),
-                embedding_backend: None,
-                embedding_dim: None,
-                sidecar_schema_version: None,
-                sidecar_input_hash: None,
-                sidecar_generation: None,
-                projection_count: None,
-                symbol_doc_count: None,
-                dense_projection_count: None,
-                semantic_policy_version: None,
-                graph_artifact_hash: None,
-                dense_reason_counts_json: None,
-            })
+            .upsert_retrieval_index_manifest(&manifest_for_collection("b", "codestory_from_b"))
             .expect("manifest b");
 
         let scope = BootstrapStorageScope {
@@ -779,26 +735,10 @@ mod tests {
         let flat_db = cache_root.path().join("codestory.db");
         let mut flat_storage = Store::open(&flat_db).expect("open flat db");
         flat_storage
-            .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
-                project_id: "flat".into(),
-                zoekt_version: "v1".into(),
-                qdrant_collection: "codestory_flat_layout".into(),
-                scip_revision: None,
-                built_at_epoch_ms: 1,
-                disk_bytes: None,
-                degraded_modes_json: "[]".into(),
-                embedding_backend: None,
-                embedding_dim: None,
-                sidecar_schema_version: None,
-                sidecar_input_hash: None,
-                sidecar_generation: None,
-                projection_count: None,
-                symbol_doc_count: None,
-                dense_projection_count: None,
-                semantic_policy_version: None,
-                graph_artifact_hash: None,
-                dense_reason_counts_json: None,
-            })
+            .upsert_retrieval_index_manifest(&manifest_for_collection(
+                "flat",
+                "codestory_flat_layout",
+            ))
             .expect("flat manifest");
 
         let hashed_dir = cache_root.path().join("bbbbbbbbbbbbbbbb");
@@ -806,26 +746,10 @@ mod tests {
         let mut hashed_storage =
             Store::open(hashed_dir.join("codestory.db")).expect("open hashed db");
         hashed_storage
-            .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
-                project_id: "hashed".into(),
-                zoekt_version: "v1".into(),
-                qdrant_collection: "codestory_hashed_layout".into(),
-                scip_revision: None,
-                built_at_epoch_ms: 1,
-                disk_bytes: None,
-                degraded_modes_json: "[]".into(),
-                embedding_backend: None,
-                embedding_dim: None,
-                sidecar_schema_version: None,
-                sidecar_input_hash: None,
-                sidecar_generation: None,
-                projection_count: None,
-                symbol_doc_count: None,
-                dense_projection_count: None,
-                semantic_policy_version: None,
-                graph_artifact_hash: None,
-                dense_reason_counts_json: None,
-            })
+            .upsert_retrieval_index_manifest(&manifest_for_collection(
+                "hashed",
+                "codestory_hashed_layout",
+            ))
             .expect("hashed manifest");
 
         let scope = BootstrapStorageScope {

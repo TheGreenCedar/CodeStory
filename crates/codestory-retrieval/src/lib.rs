@@ -24,6 +24,9 @@ mod sidecar_search;
 mod zoekt_client;
 mod zoekt_index;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use cache::{RetrievalCache, RetrievalCacheKey};
 pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};

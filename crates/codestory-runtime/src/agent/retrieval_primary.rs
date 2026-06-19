@@ -1374,6 +1374,7 @@ mod tests {
     use super::*;
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
+        test_support::retrieval_manifest_fixture,
     };
 
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1789,34 +1790,11 @@ mod tests {
         let storage_path = storage_dir.path().join("codestory.db");
         let project_id = project_id_for_root(project.path());
         let hash = "deadbeefcafebabe";
-        let generation = format!("{project_id}-{hash}");
-        let qdrant_collection = format!("codestory_{project_id}_{hash}");
-        let built_at_epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_millis() as i64;
         let mut storage = Store::open(&storage_path).expect("open storage");
+        let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+        manifest.embedding_backend = Some("stale-backend".into());
         storage
-            .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
-                project_id: project_id.clone(),
-                zoekt_version: "zoekt-real-v1".into(),
-                qdrant_collection,
-                scip_revision: Some("graph-test".into()),
-                built_at_epoch_ms,
-                disk_bytes: None,
-                degraded_modes_json: "[]".into(),
-                embedding_backend: Some("stale-backend".into()),
-                embedding_dim: Some(codestory_retrieval::RETRIEVAL_EMBEDDING_DIM as i32),
-                sidecar_schema_version: Some(codestory_retrieval::SIDECAR_SCHEMA_VERSION),
-                sidecar_input_hash: Some(hash.into()),
-                sidecar_generation: Some(generation),
-                projection_count: Some(0),
-                symbol_doc_count: Some(0),
-                dense_projection_count: Some(0),
-                semantic_policy_version: Some("graph_first_v1".into()),
-                graph_artifact_hash: Some("graph-test-hash".into()),
-                dense_reason_counts_json: Some("{}".into()),
-            })
+            .upsert_retrieval_index_manifest(&manifest)
             .expect("manifest");
 
         let status = sidecar_mode_status_for_project(project.path(), &storage_path);
