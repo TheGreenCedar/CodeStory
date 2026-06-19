@@ -169,7 +169,43 @@ fn portable_compile_flag(root: &Path, flag: &str) -> Option<String> {
     if !root_text.is_empty() && flag.contains(root_text.as_ref()) {
         return None;
     }
+    if has_unportable_embedded_absolute_path(flag) {
+        return None;
+    }
     Some(format!("flag:{flag}"))
+}
+
+fn has_unportable_embedded_absolute_path(flag: &str) -> bool {
+    if flag.contains("=/") || flag.contains("=\\") {
+        return true;
+    }
+    if flag.as_bytes().windows(3).any(|bytes| {
+        bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_path_separator(bytes[2])
+    }) {
+        return true;
+    }
+    ["-include", "-imacros", "-include-pch", "-isysroot"]
+        .iter()
+        .any(|prefix| {
+            flag.strip_prefix(prefix)
+                .is_some_and(|value| starts_with_absolute_path_like(value))
+        })
+}
+
+fn starts_with_absolute_path_like(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with('\\') || is_windows_absolute_path_like(value)
+}
+
+fn is_windows_absolute_path_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_path_separator(bytes[2])
+}
+
+fn is_path_separator(byte: u8) -> bool {
+    byte == b'/' || byte == b'\\'
 }
 
 fn mix_path(state: &mut u64, path: &Path) -> Option<()> {
@@ -312,6 +348,36 @@ mod tests {
         );
 
         assert!(key.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_artifact_cache_key_skips_unportable_raw_compile_flags() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("root");
+        let config = crate::get_language_for_ext("cpp").expect("cpp config");
+
+        for flag in ["--sysroot=/abs/sdk", "-include/abs/header.h"] {
+            let key = build_index_artifact_cache_key(
+                &root,
+                Path::new("src/main.cpp"),
+                b"int main() { return 0; }",
+                &config,
+                Some(&CompilationInfo {
+                    file: root.join("src/main.cpp"),
+                    working_directory: root.clone(),
+                    include_paths: Vec::new(),
+                    system_include_paths: Vec::new(),
+                    defines: HashMap::new(),
+                    standard: None,
+                    other_flags: vec![flag.to_string()],
+                }),
+                false,
+                true,
+            );
+
+            assert!(key.is_none(), "{flag} must fail closed");
+        }
         Ok(())
     }
 }
