@@ -76,23 +76,16 @@ fn canonical_repository_id(normalized_repository_identity: &str) -> String {
 }
 
 fn normalize_repository_identity(remote: &str) -> Option<String> {
-    let value = remote
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .replace('\\', "/");
+    let value = remote.trim().replace('\\', "/");
     if value.is_empty() {
         return None;
     }
 
-    let without_scheme = value
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(value.as_str());
-    let without_user = without_scheme
-        .split_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_scheme);
+    if let Some((_, rest)) = value.split_once("://") {
+        return normalize_url_repository_identity(rest);
+    }
+
+    let without_user = strip_userinfo(&value);
     let scp_like = without_user.find(':').is_some_and(|colon| {
         without_user[..colon].find('/').is_none() && without_user[colon + 1..].contains('/')
     });
@@ -101,11 +94,30 @@ fn normalize_repository_identity(remote: &str) -> Option<String> {
     } else {
         without_user.to_string()
     };
-    let normalized = normalized
+    normalize_repository_path(&normalized)
+}
+
+fn normalize_url_repository_identity(rest: &str) -> Option<String> {
+    let rest = strip_userinfo(rest);
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host);
+    normalize_repository_path(&format!("{host}/{path}"))
+}
+
+fn strip_userinfo(value: &str) -> &str {
+    value.split_once('@').map(|(_, rest)| rest).unwrap_or(value)
+}
+
+fn normalize_repository_path(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let normalized = lower
         .trim_start_matches('/')
         .trim_end_matches('/')
         .trim_end_matches(".git")
-        .to_ascii_lowercase();
+        .trim_end_matches('/')
+        .to_string();
     (!normalized.is_empty()).then_some(normalized)
 }
 
@@ -144,13 +156,54 @@ mod tests {
 
     #[test]
     fn normalizes_common_git_remote_forms() {
-        let https = normalize_repository_identity("https://github.com/TheGreenCedar/CodeStory.git")
-            .expect("https remote");
-        let ssh = normalize_repository_identity("git@github.com:TheGreenCedar/CodeStory.git")
-            .expect("ssh remote");
+        for (remote, expected) in [
+            (
+                "https://github.com/TheGreenCedar/CodeStory.git",
+                "github.com/thegreencedar/codestory",
+            ),
+            (
+                "ssh://git@github.com/TheGreenCedar/CodeStory.git",
+                "github.com/thegreencedar/codestory",
+            ),
+            (
+                "ssh://git@github.com:22/TheGreenCedar/CodeStory.git",
+                "github.com/thegreencedar/codestory",
+            ),
+            (
+                "git@github.com:TheGreenCedar/CodeStory.git",
+                "github.com/thegreencedar/codestory",
+            ),
+            (
+                "https://github.com/TheGreenCedar/CodeStory.git/",
+                "github.com/thegreencedar/codestory",
+            ),
+            (
+                "HTTPS://GITHUB.COM/TheGreenCedar/CodeStory.GIT",
+                "github.com/thegreencedar/codestory",
+            ),
+        ] {
+            assert_eq!(
+                normalize_repository_identity(remote).as_deref(),
+                Some(expected),
+                "remote: {remote}"
+            );
+        }
+    }
 
-        assert_eq!(https, "github.com/thegreencedar/codestory");
-        assert_eq!(https, ssh);
+    #[test]
+    fn portable_reuse_eligibility_fails_closed_without_identity_or_clean_tree() {
+        assert_eq!(
+            portable_reuse_status(None, Some("tree"), false),
+            (false, "git_remote_missing".into())
+        );
+        assert_eq!(
+            portable_reuse_status(Some("github.com/org/repo"), None, false),
+            (false, "git_tree_unavailable".into())
+        );
+        assert_eq!(
+            portable_reuse_status(Some("github.com/org/repo"), Some("tree"), true),
+            (false, "git_worktree_dirty".into())
+        );
     }
 
     #[test]
