@@ -65,7 +65,7 @@ pub fn execute_retrieval_query_with_cache(
         manifest,
         file_roles,
         cancelled,
-        mode_override: single_query_mode_override(),
+        mode_override: None,
     };
     executor.execute(request.query, request.budget_ms)
 }
@@ -232,10 +232,6 @@ fn strict_batch_worker_limit(query_count: usize) -> usize {
         .max(1)
 }
 
-fn single_query_mode_override() -> Option<RetrievalDegradedMode> {
-    None
-}
-
 struct QueryContext {
     layout: SidecarLayout,
     project_id: String,
@@ -334,11 +330,6 @@ mod tests {
         manifest.dense_projection_count = Some(projection_count);
         manifest.dense_reason_counts_json = Some(format!("{{\"public_api\":{projection_count}}}"));
         manifest
-    }
-
-    #[test]
-    fn single_query_mode_override_is_not_forced_by_packet_batch_strictness() {
-        assert_eq!(single_query_mode_override(), None);
     }
 
     #[test]
