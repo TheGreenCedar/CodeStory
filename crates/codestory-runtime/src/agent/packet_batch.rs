@@ -96,13 +96,7 @@ pub(crate) fn run_packet_planned_subqueries(
         return Ok(());
     }
 
-    let pending: Vec<(usize, &PacketPlanQueryDto)> = plan
-        .queries
-        .iter()
-        .enumerate()
-        .skip(1)
-        .take(limit)
-        .collect();
+    let pending = packet_planned_subqueries(plan, budget, limit);
     if pending.is_empty() {
         return Ok(());
     }
@@ -416,6 +410,34 @@ fn packet_subquery_limit(budget: PacketBudgetModeDto) -> usize {
         PacketBudgetModeDto::Standard => 4,
         PacketBudgetModeDto::Deep => 6,
     }
+}
+
+fn packet_planned_subqueries(
+    plan: &PacketPlanDto,
+    budget: PacketBudgetModeDto,
+    limit: usize,
+) -> Vec<(usize, &PacketPlanQueryDto)> {
+    plan.queries
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(limit)
+        .filter(|(_, query)| packet_subquery_should_run(budget, query))
+        .collect()
+}
+
+fn packet_subquery_should_run(budget: PacketBudgetModeDto, query: &PacketPlanQueryDto) -> bool {
+    if !packet_subquery_is_lexical_only(budget, query) {
+        return true;
+    }
+    if !query
+        .purpose
+        .contains("concrete symbol, file, route, or code term")
+    {
+        return true;
+    }
+    let trimmed = query.query.trim();
+    query_has_symbol_or_literal_signal(trimmed) || is_packet_code_like_term(trimmed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -863,6 +885,116 @@ mod tests {
                 query.query
             );
         }
+    }
+
+    #[test]
+    fn packet_planned_subqueries_drop_low_signal_concrete_terms_without_backfill() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::RouteTracing,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Trace how Redis initializes command routing".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Trace".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Redis".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "initializes".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "event loop".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+            ],
+            trace: Vec::new(),
+        };
+
+        let pending = packet_planned_subqueries(&plan, PacketBudgetModeDto::Compact, 3);
+
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn packet_planned_subqueries_keep_deep_semantic_concrete_terms() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::RouteTracing,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Trace how Redis initializes command routing".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Trace".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Redis".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "initializes".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+            ],
+            trace: Vec::new(),
+        };
+
+        let pending = packet_planned_subqueries(&plan, PacketBudgetModeDto::Deep, 3)
+            .into_iter()
+            .map(|(_, query)| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(pending, ["Trace", "Redis", "initializes"]);
+    }
+
+    #[test]
+    fn packet_planned_subqueries_keep_code_like_concrete_terms() {
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            inferred_task_class: false,
+            queries: vec![
+                PacketPlanQueryDto {
+                    query: "Explain string predicate helpers".to_string(),
+                    purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                        .to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "StringUtils".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "CharSequenceUtils".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "Commons".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
+                PacketPlanQueryDto {
+                    query: "isBlank".to_string(),
+                    purpose: "symbol probe expanded from task wording".to_string(),
+                },
+            ],
+            trace: Vec::new(),
+        };
+
+        let pending = packet_planned_subqueries(&plan, PacketBudgetModeDto::Compact, 3)
+            .into_iter()
+            .map(|(_, query)| query.query.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(pending, ["StringUtils", "CharSequenceUtils"]);
     }
 
     #[test]
