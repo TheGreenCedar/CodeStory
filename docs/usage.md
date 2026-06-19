@@ -373,9 +373,9 @@ case "$resolved_cache" in
 esac
 backup="${resolved_cache}.bak-$(date +%Y%m%d%H%M%S)"
 mv "$resolved_cache" "$backup"
-codestory-cli index --project <target-workspace> --refresh full
-codestory-cli doctor --project <target-workspace>
-rm -rf "$backup"
+codestory-cli index --project <target-workspace> --refresh full &&
+  codestory-cli doctor --project <target-workspace> &&
+  rm -rf "$backup"
 ```
 
 On Windows PowerShell:
@@ -392,7 +392,9 @@ if (-not $resolvedCache.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnor
 $backup = "$resolvedCache.bak-$(Get-Date -Format yyyyMMddHHmmss)"
 Move-Item -LiteralPath $resolvedCache -Destination $backup
 codestory-cli index --project <target-workspace> --refresh full
+if ($LASTEXITCODE -ne 0) { throw "Index rebuild failed; leaving backup at $backup" }
 codestory-cli doctor --project <target-workspace>
+if ($LASTEXITCODE -ne 0) { throw "Doctor check failed; leaving backup at $backup" }
 Remove-Item -LiteralPath $backup -Recurse
 ```
 
