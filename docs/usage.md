@@ -381,21 +381,22 @@ codestory-cli index --project <target-workspace> --refresh full &&
 On Windows PowerShell:
 
 ```powershell
+$ErrorActionPreference = "Stop"
 $cacheDir = "<project-cache-dir-from-doctor>"
 $cacheRoot = Join-Path $env:LOCALAPPDATA "codestory\cache"
-$resolvedCache = (Resolve-Path -LiteralPath $cacheDir).ProviderPath
-$resolvedRoot = (Resolve-Path -LiteralPath $cacheRoot).ProviderPath
+$resolvedCache = (Resolve-Path -LiteralPath $cacheDir -ErrorAction Stop).ProviderPath
+$resolvedRoot = (Resolve-Path -LiteralPath $cacheRoot -ErrorAction Stop).ProviderPath
 $rootPrefix = $resolvedRoot.TrimEnd("\", "/") + "\"
 if (-not $resolvedCache.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
   throw "Refusing to touch cache outside CodeStory cache root: $resolvedCache"
 }
 $backup = "$resolvedCache.bak-$(Get-Date -Format yyyyMMddHHmmss)"
-Move-Item -LiteralPath $resolvedCache -Destination $backup
+Move-Item -LiteralPath $resolvedCache -Destination $backup -ErrorAction Stop
 codestory-cli index --project <target-workspace> --refresh full
 if ($LASTEXITCODE -ne 0) { throw "Index rebuild failed; leaving backup at $backup" }
 codestory-cli doctor --project <target-workspace>
 if ($LASTEXITCODE -ne 0) { throw "Doctor check failed; leaving backup at $backup" }
-Remove-Item -LiteralPath $backup -Recurse
+Remove-Item -LiteralPath $backup -Recurse -ErrorAction Stop
 ```
 
 Low-memory guidance:
