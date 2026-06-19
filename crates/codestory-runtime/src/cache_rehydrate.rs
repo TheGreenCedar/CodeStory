@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use codestory_store::{CURRENT_SCHEMA_VERSION, Store};
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -54,6 +54,13 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         return Ok(skipped(
             request,
             "source cache has no codestory.db",
+            rebuild,
+        ));
+    }
+    if target_cache_nested_in_source(request.source_cache_dir, request.target_cache_dir)? {
+        return Ok(skipped(
+            request,
+            "target cache dir is inside source cache dir",
             rebuild,
         ));
     }
@@ -224,6 +231,69 @@ fn target_cache_has_contents(path: &Path) -> Result<bool> {
         .next()
         .transpose()?
         .is_some())
+}
+
+fn target_cache_nested_in_source(source: &Path, target: &Path) -> Result<bool> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("canonicalize source cache dir {}", source.display()))?;
+    let target = normalize_cache_target_path(target)
+        .with_context(|| format!("normalize target cache dir {}", target.display()))?;
+    Ok(target.starts_with(&source) && target != source)
+}
+
+fn normalize_cache_target_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", path.display()));
+    }
+
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        let Some(name) = current.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+
+    let mut normalized = if current.exists() {
+        current
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", current.display()))?
+    } else {
+        absolutize_lexical_path(current)?
+    };
+    for component in missing.iter().rev() {
+        normalized.push(component);
+    }
+    Ok(normalized)
+}
+
+fn absolutize_lexical_path(path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("read current dir for path normalization")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
@@ -446,6 +516,33 @@ mod tests {
         assert_eq!(output.status, "skipped");
         assert_eq!(output.reason.as_deref(), Some("git tree mismatch"));
         assert!(!target_cache.path().join("codestory.db").exists());
+    }
+
+    #[test]
+    fn rehydrate_skips_when_target_cache_is_inside_source_cache() {
+        let project = tempdir().expect("project");
+        let source_cache = tempdir().expect("source cache");
+        let target_cache_path = source_cache.path().join("nested-target");
+        seed_cache(&source_cache.path().join("codestory.db"), project.path());
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        assert_eq!(
+            output.reason.as_deref(),
+            Some("target cache dir is inside source cache dir")
+        );
+        assert!(
+            !target_cache_path.exists(),
+            "nested target should not be created before the guard skips"
+        );
     }
 
     fn matching_git_projects() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
