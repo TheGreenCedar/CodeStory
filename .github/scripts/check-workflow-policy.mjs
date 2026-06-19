@@ -6,6 +6,7 @@ const workflowRoot = path.join(".github", "workflows");
 const trustedOwners = new Set(["actions", "github"]);
 const shaPattern = /^[0-9a-f]{40}$/i;
 const violations = [];
+const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
 
 for (const file of fs
   .readdirSync(workflowRoot)
@@ -38,9 +39,35 @@ for (const file of fs
   });
 }
 
+if (fs.existsSync(sagaIssueLinkGuard)) {
+  const content = fs.readFileSync(sagaIssueLinkGuard, "utf8");
+  const closingRef =
+    /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:#\d+|https:\/\/github\.com\/TheGreenCedar\/CodeStory\/issues\/\d+)\b/im;
+
+  if (!content.includes("review/codestory-saga-")) {
+    violations.push("saga-issue-link-guard.yml must guard review/codestory-saga-* branches");
+  }
+
+  if (
+    !content.includes(
+      'r"(?:#\\d+|https://github\\.com/TheGreenCedar/CodeStory/issues/\\d+)\\b"',
+    )
+  ) {
+    violations.push("saga-issue-link-guard.yml closing refs must require # or a full issue URL");
+  }
+
+  if (
+    closingRef.test("Closes 123") ||
+    !closingRef.test("Closes #123") ||
+    !closingRef.test("Closes https://github.com/TheGreenCedar/CodeStory/issues/123")
+  ) {
+    violations.push("saga-issue-link-guard.yml closing ref policy must reject bare numbers and accept # or full issue URLs");
+  }
+}
+
 if (violations.length > 0) {
   console.error(violations.join("\n"));
   process.exit(1);
 }
 
-console.log("Workflow policy passed: third-party actions are SHA-pinned.");
+console.log("Workflow policy passed: third-party actions and saga issue-link guard are valid.");
