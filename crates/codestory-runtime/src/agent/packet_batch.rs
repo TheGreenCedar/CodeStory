@@ -117,9 +117,27 @@ pub(crate) fn run_packet_planned_subqueries(
             semantic_pending.push(*entry);
         }
     }
+    let lexical_before_pressure_cap = lexical_pending.len();
+    let consumed_after_anchors_ms = answer.retrieval_trace.total_latency_ms;
+    let skipped_broad_lexical = cap_compact_lexical_subqueries_under_pressure(
+        budget,
+        packet_latency,
+        consumed_after_anchors_ms,
+        &mut lexical_pending,
+    );
+    if !skipped_broad_lexical.is_empty() {
+        answer.retrieval_trace.annotations.push(format!(
+            "packet_lexical_subqueries capped reason=latency_pressure skipped_broad={} kept={} usage_pct={} skipped={}",
+            skipped_broad_lexical.len(),
+            lexical_pending.len(),
+            packet_latency.budget_usage_percent(consumed_after_anchors_ms),
+            skipped_packet_subqueries_annotation(&skipped_broad_lexical)
+        ));
+    }
 
-    let warm_queries = pending
+    let warm_queries = lexical_pending
         .iter()
+        .chain(semantic_pending.iter())
         .map(|(_, query)| query.query.clone())
         .collect::<Vec<_>>();
     if let Err(error) = controller.warm_packet_subquery_embeddings(&warm_queries) {
@@ -133,8 +151,14 @@ pub(crate) fn run_packet_planned_subqueries(
         "packet_subqueries lexical_batch={} semantic={} total={}",
         lexical_pending.len(),
         semantic_pending.len(),
-        pending.len()
+        lexical_pending.len().saturating_add(semantic_pending.len())
     ));
+    if lexical_pending.is_empty() && lexical_before_pressure_cap > 0 {
+        answer
+            .retrieval_trace
+            .annotations
+            .push("packet_lexical_subqueries skipped reason=latency_pressure".to_string());
+    }
 
     if !lexical_pending.is_empty() {
         let batch = lexical_pending
@@ -389,6 +413,70 @@ fn packet_subquery_limit(budget: PacketBudgetModeDto) -> usize {
         PacketBudgetModeDto::Standard => 4,
         PacketBudgetModeDto::Deep => 6,
     }
+}
+
+fn cap_compact_lexical_subqueries_under_pressure(
+    budget: PacketBudgetModeDto,
+    packet_latency: PacketLatencyBudget,
+    consumed_trace_ms: u32,
+    lexical_pending: &mut Vec<(usize, &PacketPlanQueryDto)>,
+) -> Vec<SkippedPacketSubquery> {
+    if budget != PacketBudgetModeDto::Compact
+        || lexical_pending.is_empty()
+        || packet_latency.budget_usage_percent(consumed_trace_ms) < 25
+    {
+        return Vec::new();
+    }
+
+    let mut skipped = Vec::new();
+    lexical_pending.retain(|(_, query)| {
+        if packet_broad_lexical_subquery(query) {
+            skipped.push(SkippedPacketSubquery {
+                query: query.query.clone(),
+                purpose: query.purpose.clone(),
+            });
+            false
+        } else {
+            true
+        }
+    });
+    skipped
+}
+
+struct SkippedPacketSubquery {
+    query: String,
+    purpose: String,
+}
+
+fn skipped_packet_subqueries_annotation(skipped: &[SkippedPacketSubquery]) -> String {
+    skipped
+        .iter()
+        .take(3)
+        .map(|entry| {
+            format!(
+                "`{}` purpose=`{}`",
+                packet_annotation_value(&entry.query),
+                packet_annotation_value(&entry.purpose)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn packet_annotation_value(value: &str) -> String {
+    value.replace('`', "'")
+}
+
+fn packet_broad_lexical_subquery(query: &PacketPlanQueryDto) -> bool {
+    let trimmed = query.query.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    !query_has_symbol_or_literal_signal(trimmed)
+        && !is_packet_code_like_term(trimmed)
+        && !packet_task_seed_anchor_probe(trimmed)
+        && !packet_anchor_probe_is_required_flow_hint(trimmed)
+        && (packet_query_stop_term(&lowered)
+            || packet_adjacent_query_stop_term(&lowered)
+            || !trimmed.contains(char::is_whitespace))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -823,6 +911,96 @@ mod tests {
                 query.query
             );
         }
+    }
+
+    #[test]
+    fn packet_lexical_subquery_caps_broad_terms_under_compact_pressure() {
+        let trace = PacketPlanQueryDto {
+            query: "Trace".to_string(),
+            purpose: "concrete symbol, file, route, or code term".to_string(),
+        };
+        let redis = PacketPlanQueryDto {
+            query: "Redis".to_string(),
+            purpose: "concrete symbol, file, route, or code term".to_string(),
+        };
+        let initializes = PacketPlanQueryDto {
+            query: "initializes".to_string(),
+            purpose: "concrete symbol, file, route, or code term".to_string(),
+        };
+        let mut pending = vec![(1, &trace), (2, &redis), (3, &initializes)];
+
+        let skipped = cap_compact_lexical_subqueries_under_pressure(
+            PacketBudgetModeDto::Compact,
+            PacketLatencyBudget::new(Some(18_000)),
+            4_500,
+            &mut pending,
+        );
+
+        assert_eq!(skipped.len(), 3);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn packet_lexical_subquery_reports_skipped_symbol_like_terms() {
+        let command = PacketPlanQueryDto {
+            query: "Command".to_string(),
+            purpose: "concrete symbol, file, route, or code term".to_string(),
+        };
+        let mut pending = vec![(1, &command)];
+
+        let skipped = cap_compact_lexical_subqueries_under_pressure(
+            PacketBudgetModeDto::Compact,
+            PacketLatencyBudget::new(Some(18_000)),
+            4_500,
+            &mut pending,
+        );
+
+        let annotation = skipped_packet_subqueries_annotation(&skipped);
+        assert!(pending.is_empty());
+        assert!(annotation.contains("`Command`"));
+        assert!(annotation.contains("purpose=`concrete symbol, file, route, or code term`"));
+    }
+
+    #[test]
+    fn packet_lexical_subquery_pressure_cap_keeps_code_terms() {
+        let init_server = PacketPlanQueryDto {
+            query: "initServer".to_string(),
+            purpose: "symbol probe expanded from task wording".to_string(),
+        };
+        let scoped_main = PacketPlanQueryDto {
+            query: "src/server.c main".to_string(),
+            purpose: "concrete symbol, file, route, or code term".to_string(),
+        };
+        let mut pending = vec![(1, &init_server), (2, &scoped_main)];
+
+        let skipped = cap_compact_lexical_subqueries_under_pressure(
+            PacketBudgetModeDto::Compact,
+            PacketLatencyBudget::new(Some(18_000)),
+            4_500,
+            &mut pending,
+        );
+
+        assert!(skipped.is_empty());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn packet_lexical_subquery_pressure_cap_skips_non_compact_budgets() {
+        let broad = PacketPlanQueryDto {
+            query: "Trace".to_string(),
+            purpose: "concrete symbol, file, route, or code term".to_string(),
+        };
+        let mut pending = vec![(1, &broad)];
+
+        let skipped = cap_compact_lexical_subqueries_under_pressure(
+            PacketBudgetModeDto::Standard,
+            PacketLatencyBudget::new(Some(18_000)),
+            4_500,
+            &mut pending,
+        );
+
+        assert!(skipped.is_empty());
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
