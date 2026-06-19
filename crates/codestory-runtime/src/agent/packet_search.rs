@@ -198,7 +198,6 @@ mod tests {
     fn packet_subquery_warmup_fails_closed_without_sidecar_primary() {
         let _lock = crate::process_env_test_lock();
         let _retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL");
-        let _deprecated_retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL_V2");
         let controller = AppController::new();
 
         let error = controller

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { parseArgs as parseNodeArgs } from "node:util";
 
 import {
   buildPacketQualityDeltas,
@@ -194,6 +195,46 @@ function commaSeparatedList(value) {
 }
 
 function parseArgs(argv) {
+  const { values } = parseNodeArgs({
+    args: argv,
+    allowPositionals: false,
+    strict: true,
+    options: {
+      help: { type: "boolean", short: "h" },
+      list: { type: "boolean" },
+      "self-test": { type: "boolean" },
+      "reanalyze-dir": { type: "string" },
+      quick: { type: "boolean" },
+      publishable: { type: "boolean" },
+      "allow-failures": { type: "boolean" },
+      "diagnostic-extra-probes-from-manifest": { type: "boolean" },
+      "include-local-repos": { type: "boolean" },
+      "materialize-repos": { type: "boolean" },
+      "packet-runtime": { type: "boolean" },
+      "packet-runtime-mode": { type: "string" },
+      "repo-cache-dir": { type: "string" },
+      "codestory-cli": { type: "string" },
+      repos: { type: "string" },
+      arms: { type: "string" },
+      "task-suite": { type: "string" },
+      "task-ids": { type: "string" },
+      "task-manifest": { type: "string" },
+      repeats: { type: "string" },
+      runner: { type: "string" },
+      model: { type: "string" },
+      sandbox: { type: "string" },
+      "out-dir": { type: "string" },
+      "benchmark-run-id": { type: "string" },
+      "timeout-ms": { type: "string" },
+      jobs: { type: "string" },
+      "reuse-baseline-from": { type: "string" },
+      "prepare-codestory-cache": { type: "boolean" },
+      "no-prepare-codestory-cache": { type: "boolean" },
+      "prepare-codestory-timeout-ms": { type: "string" },
+      "prepare-codestory-jobs": { type: "string" },
+      "max-source-reads-after-packet": { type: "string" },
+    },
+  });
   const opts = {
     list: false,
     selfTest: false,
@@ -229,142 +270,53 @@ function parseArgs(argv) {
     publishable: false,
   };
 
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === "--help" || arg === "-h") {
-      usage();
-      process.exit(0);
-    }
-    if (arg === "--list") {
-      opts.list = true;
-      continue;
-    }
-    if (arg === "--self-test") {
-      opts.selfTest = true;
-      continue;
-    }
-    if (arg === "--reanalyze-dir") {
-      opts.reanalyzeDir = argv[++i];
-      continue;
-    }
-    if (arg === "--quick") {
-      opts.quick = true;
-      continue;
-    }
-    if (arg === "--publishable") {
-      opts.publishable = true;
-      continue;
-    }
-    if (arg === "--allow-failures") {
-      opts.allowFailures = true;
-      continue;
-    }
-    if (arg === "--diagnostic-extra-probes-from-manifest") {
-      opts.diagnosticExtraProbesFromManifest = true;
-      continue;
-    }
-    if (arg === "--include-local-repos") {
-      opts.includeLocalRepos = true;
-      continue;
-    }
-    if (arg === "--materialize-repos") {
-      opts.materializeRepos = true;
-      continue;
-    }
-    if (arg === "--packet-runtime") {
-      opts.packetRuntime = true;
-      continue;
-    }
-    if (arg === "--packet-runtime-mode") {
-      opts.packetRuntimeMode = argv[++i];
-      continue;
-    }
-    if (arg === "--repo-cache-dir") {
-      opts.repoCacheDir = argv[++i];
-      continue;
-    }
-    if (arg === "--codestory-cli") {
-      opts.codestoryCli = argv[++i];
-      continue;
-    }
-    if (arg === "--repos") {
-      opts.repos = commaSeparatedList(argv[++i]);
-      continue;
-    }
-    if (arg === "--arms") {
-      opts.arms = commaSeparatedList(argv[++i]);
-      continue;
-    }
-    if (arg === "--task-suite") {
-      opts.taskSuite = argv[++i];
-      continue;
-    }
-    if (arg === "--task-ids") {
-      opts.taskIds = commaSeparatedList(argv[++i]);
-      continue;
-    }
-    if (arg === "--task-manifest") {
-      opts.taskManifest = argv[++i];
-      continue;
-    }
-    if (arg === "--repeats") {
-      opts.repeats = Number.parseInt(argv[++i], 10);
-      continue;
-    }
-    if (arg === "--runner") {
-      opts.runner = argv[++i];
-      continue;
-    }
-    if (arg === "--model") {
-      opts.model = argv[++i];
-      continue;
-    }
-    if (arg === "--sandbox") {
-      opts.sandbox = argv[++i];
-      continue;
-    }
-    if (arg === "--out-dir") {
-      opts.outDir = argv[++i];
-      continue;
-    }
-    if (arg === "--benchmark-run-id") {
-      opts.benchmarkRunId = argv[++i];
-      continue;
-    }
-    if (arg === "--timeout-ms") {
-      opts.timeoutMs = Number.parseInt(argv[++i], 10);
-      continue;
-    }
-    if (arg === "--jobs") {
-      opts.jobs = Number.parseInt(argv[++i], 10);
-      continue;
-    }
-    if (arg === "--reuse-baseline-from") {
-      opts.reuseBaselineFrom = argv[++i];
-      continue;
-    }
-    if (arg === "--prepare-codestory-cache") {
-      opts.prepareCodestoryCache = true;
-      continue;
-    }
-    if (arg === "--no-prepare-codestory-cache") {
-      throw new Error("--no-prepare-codestory-cache is unsupported; sidecar preparation is mandatory");
-      continue;
-    }
-    if (arg === "--prepare-codestory-timeout-ms") {
-      opts.prepareCodestoryTimeoutMs = Number.parseInt(argv[++i], 10);
-      continue;
-    }
-    if (arg === "--prepare-codestory-jobs") {
-      opts.prepareCodestoryJobs = Number.parseInt(argv[++i], 10);
-      continue;
-    }
-    if (arg === "--max-source-reads-after-packet") {
-      opts.maxSourceReadsAfterPacket = Number.parseInt(argv[++i], 10);
-      continue;
-    }
-    throw new Error(`Unknown argument: ${arg}`);
+  if (values.help) {
+    usage();
+    process.exit(0);
   }
+  if (values["no-prepare-codestory-cache"]) {
+    throw new Error("--no-prepare-codestory-cache is unsupported; sidecar preparation is mandatory");
+  }
+  opts.list = values.list === true;
+  opts.selfTest = values["self-test"] === true;
+  opts.reanalyzeDir = values["reanalyze-dir"] ?? null;
+  opts.quick = values.quick === true;
+  opts.publishable = values.publishable === true;
+  opts.allowFailures = values["allow-failures"] === true;
+  opts.diagnosticExtraProbesFromManifest = values["diagnostic-extra-probes-from-manifest"] === true;
+  opts.includeLocalRepos = values["include-local-repos"] === true;
+  opts.materializeRepos = values["materialize-repos"] === true;
+  opts.packetRuntime = values["packet-runtime"] === true;
+  opts.packetRuntimeMode = values["packet-runtime-mode"] ?? opts.packetRuntimeMode;
+  opts.repoCacheDir = values["repo-cache-dir"] ?? opts.repoCacheDir;
+  opts.codestoryCli = values["codestory-cli"] ?? opts.codestoryCli;
+  opts.repos = values.repos ? commaSeparatedList(values.repos) : null;
+  opts.arms = values.arms ? commaSeparatedList(values.arms) : null;
+  opts.taskSuite = values["task-suite"] ?? null;
+  opts.taskIds = values["task-ids"] ? commaSeparatedList(values["task-ids"]) : null;
+  opts.taskManifest = values["task-manifest"] ?? null;
+  opts.repeats = values.repeats == null ? null : Number.parseInt(values.repeats, 10);
+  opts.runner = values.runner ?? opts.runner;
+  opts.model = values.model ?? null;
+  opts.sandbox = values.sandbox ?? opts.sandbox;
+  opts.outDir = values["out-dir"] ?? null;
+  opts.benchmarkRunId = values["benchmark-run-id"] ?? null;
+  opts.timeoutMs = values["timeout-ms"] == null ? opts.timeoutMs : Number.parseInt(values["timeout-ms"], 10);
+  opts.jobs = values.jobs == null ? opts.jobs : Number.parseInt(values.jobs, 10);
+  opts.reuseBaselineFrom = values["reuse-baseline-from"] ?? null;
+  opts.prepareCodestoryCache = values["prepare-codestory-cache"] === true ? true : null;
+  opts.prepareCodestoryTimeoutMs =
+    values["prepare-codestory-timeout-ms"] == null
+      ? opts.prepareCodestoryTimeoutMs
+      : Number.parseInt(values["prepare-codestory-timeout-ms"], 10);
+  opts.prepareCodestoryJobs =
+    values["prepare-codestory-jobs"] == null
+      ? opts.prepareCodestoryJobs
+      : Number.parseInt(values["prepare-codestory-jobs"], 10);
+  opts.maxSourceReadsAfterPacket =
+    values["max-source-reads-after-packet"] == null
+      ? null
+      : Number.parseInt(values["max-source-reads-after-packet"], 10);
 
   if (opts.taskSuite && opts.taskManifest) {
     throw new Error("--task-suite and --task-manifest are mutually exclusive");

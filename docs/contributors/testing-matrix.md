@@ -255,18 +255,10 @@ cargo check -p codestory-bench --benches
 ```
 
 When changing embedding backends, model profiles, pooling, prefixes, batching,
-hardware-provider settings, generated symbol-doc text, or dense-anchor text, run the semantic-doc
-leakage check before trusting benchmark scores. It fails when production
-generated-doc concept phrases copy or closely overlap benchmark query text. Use
-`CODESTORY_EMBED_RESEARCH_QUERY_SPLIT=dev` for exploratory tuning and
-`CODESTORY_EMBED_RESEARCH_QUERY_SPLIT=holdout` for promotion evidence; dev-only
-rows have `promotion_eligible=false` and must not be promoted. Cache replay is
-blocked unless `CODESTORY_EMBED_RESEARCH_ALLOW_CACHE_REPLAY=1` is set, so stale
-generated-doc caches cannot silently seed a new benchmark lane. Queries that
-previously appeared in leaked production semantic-doc aliases are excluded by
-default; set `CODESTORY_EMBED_RESEARCH_INCLUDE_TAINTED_QUERIES=1` only when
-intentionally reproducing the invalidated historical slice. Also
-rerun the speed and retrieval-quality comparison described in
+hardware-provider settings, generated symbol-doc text, or dense-anchor text, run
+the semantic-doc leakage check before trusting benchmark scores. It fails when
+production generated-doc concept phrases copy or closely overlap benchmark query
+text. Also rerun the speed and retrieval-quality comparison described in
 [`embedding-backend-benchmarks.md`](../testing/embedding-backend-benchmarks.md).
 Start from the human summary in [`research.md`](../research.md). For new
 research lanes, keep the benchmark case shape, quality signal, speed signal,

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::agent::eval_probes::{
     eval_citation_shaped_claim, eval_flow_template_claims, eval_probes_enabled,
     eval_supporting_claim_flow_sentence,
@@ -71,12 +72,12 @@ pub(crate) fn append_flow_template_claims(
     packet_append_indexing_pipeline_flow_template_claims(prompt, citations, claims, seen);
     packet_append_source_derived_flow_claims(prompt, citations, claims, seen);
     packet_append_sql_schema_file_claims(prompt, citations, claims, seen);
-    if !eval_probes_enabled() {
-        return;
-    }
-    packet_append_indexing_storage_flow_template_claims(prompt, citations, claims, seen);
-    for (claim, citation) in eval_flow_template_claims(&normalized_prompt, citations) {
-        packet_push_flow_template_claim(claims, seen, &claim, Some(citation));
+    #[cfg(test)]
+    if eval_probes_enabled() {
+        packet_append_indexing_storage_flow_template_claims(prompt, citations, claims, seen);
+        for (claim, citation) in eval_flow_template_claims(&normalized_prompt, citations) {
+            packet_push_flow_template_claim(claims, seen, &claim, Some(citation));
+        }
     }
 }
 
@@ -429,6 +430,7 @@ fn packet_sql_schema_prompt_subject(prompt: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 fn packet_append_indexing_storage_flow_template_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
@@ -687,10 +689,14 @@ pub(crate) fn packet_claim_for_role(
 }
 
 fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
-    let normalized_prompt = normalize_identifier(prompt);
-    if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
-        return sentence;
+    #[cfg(test)]
+    {
+        let normalized_prompt = normalize_identifier(prompt);
+        if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
+            return sentence;
+        }
     }
+    let _ = prompt;
     format!("ties {focus} in this flow to cited definitions and adjacent ownership")
 }
 
@@ -719,12 +725,20 @@ fn packet_claim_flow_terms(rank_terms: &[String], citation: &AgentCitationDto) -
 }
 
 fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Option<String> {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    eval_citation_shaped_claim(citation, prompt, &path)
+    #[cfg(test)]
+    {
+        let path = citation
+            .file_path
+            .as_deref()
+            .map(packet_display_path)
+            .unwrap_or_default();
+        return eval_citation_shaped_claim(citation, prompt, &path);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (citation, prompt);
+        None
+    }
 }
 
 fn packet_append_source_definition_claims(

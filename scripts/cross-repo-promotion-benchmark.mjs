@@ -13,7 +13,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const isWindows = process.platform === "win32";
 const defaultCli = path.join(root, "target", "release", isWindows ? "codestory-cli.exe" : "codestory-cli");
-const cli = process.env.CODESTORY_CROSS_REPO_BIN ?? process.env.CODESTORY_EMBED_RESEARCH_BIN ?? defaultCli;
+const cli = process.env.CODESTORY_CROSS_REPO_BIN ?? defaultCli;
 const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
 const outDir =
   process.env.CODESTORY_CROSS_REPO_OUT_DIR ??
