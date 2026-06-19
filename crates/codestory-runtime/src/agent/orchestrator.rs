@@ -82,7 +82,7 @@ use crate::agent::retrieval_primary::{
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
 use crate::{
-    AppController, FocusedSourceContext, HybridSearchScoredHit,
+    AppController, FocusedSourceContext, HybridSearchScoredHit, clamp_u128_to_u32,
     fallback_mermaid as diagnostic_mermaid, hybrid_retrieval_enabled, mermaid_flowchart,
     mermaid_gantt, mermaid_sequence, query_mentions_non_primary_source,
 };
@@ -431,6 +431,7 @@ pub(crate) fn agent_packet(
         &rank_terms,
         &mut answer,
     )?;
+    let phase_started = Instant::now();
     maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
     maybe_append_generic_source_shape_citations(&project_root, &question, &mut answer);
     let file_scoped_source_probes =
@@ -442,10 +443,17 @@ pub(crate) fn agent_packet(
         &file_scoped_source_probes,
         &mut answer,
     );
+    append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
+    let phase_started = Instant::now();
     packet_latency.apply_to_trace(&mut answer);
+    append_packet_non_trace_phase(&mut answer, "trace_apply", phase_started);
+
+    let phase_started = Instant::now();
     rank_packet_evidence(&question, &mut answer);
     maybe_annotate_packet_candidate_window(&question, &limits, &mut answer);
+    append_packet_non_trace_phase(&mut answer, "rank_and_window", phase_started);
 
+    let phase_started = Instant::now();
     if answer.retrieval_trace.retrieval_shadow.is_none()
         && let Some(shadow) =
             maybe_run_retrieval_shadow(controller, &question, req.latency_budget_ms)
@@ -461,8 +469,10 @@ pub(crate) fn agent_packet(
     }
     maybe_log_rollback_after_packet(controller, answer.retrieval_trace.retrieval_shadow.as_ref());
     append_packet_step_trace_annotation(&mut answer);
+    append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
+    let phase_started = Instant::now();
     let budget = apply_packet_budget_with_extra(
         &project_root,
         &question,
@@ -472,7 +482,11 @@ pub(crate) fn agent_packet(
         &mut answer,
         &sufficiency_extra_probes,
     );
+    append_packet_non_trace_phase(&mut answer, "budget", phase_started);
+    let phase_started = Instant::now();
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
+    append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
+    let phase_started = Instant::now();
     let sufficiency = build_packet_sufficiency_with_extra(
         &project_root,
         &question,
@@ -481,8 +495,12 @@ pub(crate) fn agent_packet(
         &budget,
         &sufficiency_extra_probes,
     );
+    append_packet_non_trace_phase(&mut answer, "sufficiency", phase_started);
+    let phase_started = Instant::now();
     let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
+    append_packet_non_trace_phase(&mut answer, "trace_summary", phase_started);
 
+    let phase_started = Instant::now();
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
         question,
@@ -493,14 +511,39 @@ pub(crate) fn agent_packet(
         sufficiency,
         retrieval_trace_summary,
     };
+    append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
+    let phase_started = Instant::now();
+    enforce_packet_output_budget(&project_root, &mut packet);
+    append_packet_non_trace_phase(&mut packet.answer, "output_budget", phase_started);
     enforce_packet_output_budget(&project_root, &mut packet);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
         packet.answer.retrieval_trace.annotations.push(diagnostic);
+        let phase_started = Instant::now();
+        enforce_packet_output_budget(&project_root, &mut packet);
+        append_packet_non_trace_phase(
+            &mut packet.answer,
+            "trace_artifact_output_budget",
+            phase_started,
+        );
         enforce_packet_output_budget(&project_root, &mut packet);
     }
 
     Ok(packet)
+}
+
+fn append_packet_non_trace_phase(answer: &mut AgentAnswerDto, label: &str, started_at: Instant) {
+    answer
+        .retrieval_trace
+        .annotations
+        .push(packet_non_trace_phase_annotation(
+            label,
+            clamp_u128_to_u32(started_at.elapsed().as_millis()),
+        ));
+}
+
+fn packet_non_trace_phase_annotation(label: &str, duration_ms: u32) -> String {
+    format!("packet_non_trace_phase label={label} duration_ms={duration_ms}")
 }
 
 fn packet_plan_sufficiency_extra_probes(
@@ -9199,6 +9242,22 @@ mod tests {
     }
 
     #[test]
+    fn packet_non_trace_phase_annotation_is_machine_readable() {
+        assert_eq!(
+            packet_non_trace_phase_annotation("budget", 42),
+            "packet_non_trace_phase label=budget duration_ms=42"
+        );
+        assert_eq!(
+            packet_non_trace_phase_annotation("pre_rank_citations", 7),
+            "packet_non_trace_phase label=pre_rank_citations duration_ms=7"
+        );
+        assert_eq!(
+            packet_non_trace_phase_annotation("trace_apply", 3),
+            "packet_non_trace_phase label=trace_apply duration_ms=3"
+        );
+    }
+
+    #[test]
     fn packet_retrieval_trace_summary_keeps_counters_without_duplicating_full_trace() {
         let mut answer = packet_answer_fixture(
             "Explain the packet retrieval trace summary.",
@@ -9736,6 +9795,15 @@ mod tests {
             max_output_bytes
         );
         assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        append_packet_non_trace_phase(&mut packet.answer, "output_budget", Instant::now());
+        enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
+        let serialized_len = serde_json::to_vec(&packet)
+            .expect("serialize packet after output budget marker")
+            .len();
+        assert_eq!(
+            packet.budget.used.output_bytes as usize, serialized_len,
+            "final diagnostic marker must be included in packet output accounting"
+        );
         assert!(
             packet
                 .answer
