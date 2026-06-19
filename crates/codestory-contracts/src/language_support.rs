@@ -227,24 +227,50 @@ pub fn normalize_extension(ext: &str) -> String {
 }
 
 pub fn language_support_profile_for_ext(ext: &str) -> Option<&'static LanguageSupportProfile> {
-    let ext = normalize_extension(ext);
-    LANGUAGE_SUPPORT_PROFILES
-        .iter()
-        .find(|profile| profile.extensions.iter().any(|candidate| *candidate == ext))
+    let ext = ext.trim().trim_start_matches('.');
+    LANGUAGE_SUPPORT_PROFILES.iter().find(|profile| {
+        profile
+            .extensions
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+    })
 }
 
 pub fn language_support_profile_for_language_name(
     language_name: &str,
 ) -> Option<&'static LanguageSupportProfile> {
-    let language_name = language_name.trim().to_ascii_lowercase();
+    let language_name = language_name.trim();
     LANGUAGE_SUPPORT_PROFILES
         .iter()
-        .find(|profile| profile.language_name == language_name)
+        .find(|profile| profile.language_name.eq_ignore_ascii_case(language_name))
+}
+
+pub fn language_support_profile_for_path(
+    path: Option<&str>,
+) -> Option<&'static LanguageSupportProfile> {
+    let ext = path?.rsplit('.').next()?.trim_start_matches('.');
+    language_support_profile_for_ext(ext)
 }
 
 pub fn language_name_for_path(path: Option<&str>) -> Option<&'static str> {
-    let ext = path?.rsplit('.').next()?.trim_start_matches('.');
-    language_support_profile_for_ext(ext).map(|profile| profile.language_name)
+    language_support_profile_for_path(path).map(|profile| profile.language_name)
+}
+
+pub fn parser_backed_language_name_for_path(path: Option<&str>) -> Option<&'static str> {
+    language_support_profile_for_path(path)
+        .filter(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
+        .map(|profile| profile.language_name)
+}
+
+pub fn structural_language_name_for_path(path: Option<&str>) -> Option<&'static str> {
+    language_support_profile_for_path(path)
+        .filter(|profile| profile.support_mode == LanguageSupportMode::StructuralCollector)
+        .map(|profile| profile.language_name)
+}
+
+pub fn is_structural_language_name(language_name: &str) -> bool {
+    language_support_profile_for_language_name(language_name)
+        .is_some_and(|profile| profile.support_mode == LanguageSupportMode::StructuralCollector)
 }
 
 pub fn is_github_actions_workflow_path(path: &str) -> bool {
@@ -312,6 +338,21 @@ mod tests {
                 .evidence_tier,
             LanguageEvidenceTier::StructuralOnly
         );
+        assert_eq!(
+            language_support_profile_for_path(Some("src/lib.RS"))
+                .expect("rust path profile")
+                .language_name,
+            "rust"
+        );
+        assert_eq!(
+            parser_backed_language_name_for_path(Some("src/app.tsx")),
+            Some("typescript")
+        );
+        assert_eq!(
+            structural_language_name_for_path(Some("assets/site.CSS")),
+            Some("css")
+        );
+        assert!(is_structural_language_name(" SQL "));
         assert!(
             language_name_for_path(Some("src/app/Program.cshtml")).is_none(),
             "Razor .cshtml files are workspace-compatible, but not a public parser-backed C# claim"
