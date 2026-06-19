@@ -202,26 +202,40 @@ mod tests {
 
     #[test]
     fn stage_kind_metadata_matches_sidecar_stage_contract() {
-        assert_eq!(
-            RetrievalStageKind::Stage0ScipAnchor.label(),
-            "stage0_scip_anchor"
-        );
-        assert_eq!(
-            RetrievalStageKind::Stage1bQdrantSemantic.provenance_label(),
-            Some("dense_anchor")
-        );
-        assert_eq!(
-            RetrievalStageKind::Stage2ScipExpand.provenance_label(),
-            Some("graph_neighbor")
-        );
-        assert_eq!(
-            RetrievalStageKind::Stage1ZoektLexical.sidecar_latency_ms(42),
-            Some(42)
-        );
-        assert_eq!(
-            RetrievalStageKind::Stage3RepoTextFallback.sidecar_latency_ms(42),
-            None
-        );
+        let cases = [
+            (RetrievalStageKind::Stage0ScipAnchor, Some("exact"), true),
+            (RetrievalStageKind::Stage1ZoektLexical, None, true),
+            (
+                RetrievalStageKind::Stage1bQdrantSemantic,
+                Some("dense_anchor"),
+                true,
+            ),
+            (
+                RetrievalStageKind::Stage2ScipExpand,
+                Some("graph_neighbor"),
+                true,
+            ),
+            (RetrievalStageKind::Stage3RepoTextFallback, None, false),
+        ];
+
+        assert_eq!(cases.len(), 5);
+        for (kind, expected_provenance, has_sidecar_latency) in cases {
+            let serde_label = serde_json::to_value(kind).expect("stage kind serializes");
+
+            assert_eq!(
+                kind.label(),
+                serde_label
+                    .as_str()
+                    .expect("stage kind serializes as a string")
+            );
+            assert_eq!(kind.provenance_label(), expected_provenance);
+            assert_eq!(kind.sidecar_latency_ms(0), has_sidecar_latency.then_some(0));
+            assert_eq!(
+                kind.sidecar_latency_ms(u32::MAX.into()),
+                has_sidecar_latency.then_some(u32::MAX)
+            );
+            assert_eq!(kind.sidecar_latency_ms(u64::from(u32::MAX) + 1), None);
+        }
     }
 
     #[test]
