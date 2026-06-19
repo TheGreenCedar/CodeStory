@@ -2,11 +2,14 @@ use crate::cache::RetrievalCache;
 use crate::config::SidecarLayout;
 use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
 use crate::generation::manifest_unavailable_reason;
+use crate::health::probe_sidecar_health;
 use crate::index::sidecar_project_id_for_root;
+use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::sidecar::validate_strict_sidecar_readiness;
 use crate::sidecar_search::LiveSidecarSearch;
 use anyhow::{Context, Result, bail};
-use codestory_store::Store;
+use codestory_store::{FileRole, RetrievalIndexManifest, Store};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -20,6 +23,20 @@ pub struct QueryRequest<'a> {
     pub cancelled: Option<Arc<AtomicBool>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueryBatchItem<'a> {
+    pub query: &'a str,
+    pub budget_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryBatchRequest<'a> {
+    pub project_root: &'a Path,
+    pub storage_path: &'a Path,
+    pub queries: &'a [QueryBatchItem<'a>],
+    pub cancelled: Option<Arc<AtomicBool>>,
+}
+
 pub fn execute_retrieval_query(request: QueryRequest<'_>) -> Result<QueryResult> {
     let mut cache = RetrievalCache::new();
     execute_retrieval_query_with_cache(request, &mut cache)
@@ -29,19 +46,86 @@ pub fn execute_retrieval_query_with_cache(
     request: QueryRequest<'_>,
     cache: &mut RetrievalCache,
 ) -> Result<QueryResult> {
+    let QueryContext {
+        layout,
+        project_id,
+        manifest,
+        file_roles,
+    } = load_query_context(request.project_root, request.storage_path)?;
+    let sidecars = LiveSidecarSearch::new(layout, project_id, manifest.as_ref());
+    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    let mut executor = QueryExecutor {
+        sidecars: &sidecars,
+        cache,
+        manifest,
+        file_roles,
+        cancelled,
+        mode_override: single_query_mode_override(),
+    };
+    executor.execute(request.query, request.budget_ms)
+}
+
+pub fn execute_strict_retrieval_query_batch_with_cache(
+    request: QueryBatchRequest<'_>,
+    cache: &mut RetrievalCache,
+) -> Result<Vec<QueryResult>> {
+    if request.queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let QueryContext {
+        layout,
+        project_id,
+        manifest,
+        file_roles,
+    } = load_query_context(request.project_root, request.storage_path)?;
+    let sidecars = LiveSidecarSearch::new(layout, project_id, manifest.as_ref());
+    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    let (mode, degraded_reason) = resolve_batch_mode(&sidecars, manifest.as_ref());
+    if mode != RetrievalDegradedMode::Full {
+        bail!(
+            "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
+            mode.as_str(),
+            degraded_reason.as_deref().unwrap_or("unknown")
+        );
+    }
+    let mut executor = QueryExecutor {
+        sidecars: &sidecars,
+        cache,
+        manifest,
+        file_roles,
+        cancelled,
+        mode_override: Some(mode),
+    };
+    request
+        .queries
+        .iter()
+        .map(|query| executor.execute(query.query, query.budget_ms))
+        .collect()
+}
+
+fn single_query_mode_override() -> Option<RetrievalDegradedMode> {
+    None
+}
+
+struct QueryContext {
+    layout: SidecarLayout,
+    project_id: String,
+    manifest: Option<RetrievalIndexManifest>,
+    file_roles: HashMap<String, FileRole>,
+}
+
+fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryContext> {
     let layout = SidecarLayout::from_env();
-    let project_id = sidecar_project_id_for_root(request.project_root);
-    let (manifest, file_roles) = if request.storage_path.exists() {
-        let storage = Store::open(request.storage_path).context("open storage for query")?;
+    let project_id = sidecar_project_id_for_root(project_root);
+    let (manifest, file_roles) = if storage_path.exists() {
+        let storage = Store::open(storage_path).context("open storage for query")?;
         let manifest = storage
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
         if let Some(manifest) = manifest.as_ref() {
-            if let Err(error) = validate_strict_sidecar_readiness(
-                request.project_root,
-                request.storage_path,
-                &storage,
-            ) {
+            if let Err(error) =
+                validate_strict_sidecar_readiness(project_root, storage_path, &storage)
+            {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
                 );
@@ -70,17 +154,30 @@ pub fn execute_retrieval_query_with_cache(
         bail!("retrieval sidecar storage is missing; run retrieval index for project {project_id}");
     };
 
-    let sidecars = LiveSidecarSearch::new(layout, project_id, manifest.as_ref());
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
-    let mut executor = QueryExecutor {
-        sidecars: &sidecars,
-        cache,
+    Ok(QueryContext {
+        layout,
+        project_id,
         manifest,
         file_roles,
-        cancelled,
-        mode_override: None,
-    };
-    executor.execute(request.query, request.budget_ms)
+    })
+}
+
+fn resolve_batch_mode(
+    sidecars: &LiveSidecarSearch,
+    manifest: Option<&RetrievalIndexManifest>,
+) -> (RetrievalDegradedMode, Option<String>) {
+    if let Some(manifest) = manifest {
+        let report = probe_sidecar_health(
+            sidecars.layout(),
+            &manifest.project_id,
+            Some(manifest.clone()),
+        );
+        return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
+    }
+    (
+        RetrievalDegradedMode::LexicalOnly,
+        Some("manifest_missing".into()),
+    )
 }
 
 #[cfg(test)]
@@ -104,6 +201,32 @@ mod tests {
         manifest.dense_projection_count = Some(projection_count);
         manifest.dense_reason_counts_json = Some(format!("{{\"public_api\":{projection_count}}}"));
         manifest
+    }
+
+    #[test]
+    fn single_query_mode_override_is_not_forced_by_packet_batch_strictness() {
+        assert_eq!(single_query_mode_override(), None);
+    }
+
+    #[test]
+    fn empty_batch_query_does_not_require_storage() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("missing").join("codestory.db");
+        let mut cache = RetrievalCache::new();
+
+        let results = execute_strict_retrieval_query_batch_with_cache(
+            QueryBatchRequest {
+                project_root: project.path(),
+                storage_path: &storage_path,
+                queries: &[],
+                cancelled: None,
+            },
+            &mut cache,
+        )
+        .expect("empty batch should short-circuit before storage setup");
+
+        assert!(results.is_empty());
     }
 
     #[test]
