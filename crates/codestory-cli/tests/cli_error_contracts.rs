@@ -236,6 +236,16 @@ fn parse_stdout_json(output: &std::process::Output) -> Value {
     })
 }
 
+fn git(workspace: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert_success(&output, &format!("git {} failed", args.join(" ")));
+}
+
 fn json_string<'a>(value: &'a Value, pointer: &str) -> &'a str {
     value
         .pointer(pointer)
@@ -271,6 +281,7 @@ fn top_level_help_names_command_purposes() {
         ),
         ("doctor", "Check cache, index, and retrieval health."),
         ("setup", "Install or check local setup assets."),
+        ("cache", "Inspect portable cache identity contracts."),
         ("symbol", "Inspect a symbol by query or id."),
         (
             "explore",
@@ -284,6 +295,52 @@ fn top_level_help_names_command_purposes() {
             "top-level help should show {command:?} purpose {purpose:?}, not only command names:\n{help_text}"
         );
     }
+}
+
+#[test]
+fn cache_identity_json_reports_canonical_contract_fields() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    git(workspace.path(), &["init"]);
+    git(
+        workspace.path(),
+        &["config", "user.email", "codestory@example.invalid"],
+    );
+    git(workspace.path(), &["config", "user.name", "CodeStory Test"]);
+    git(
+        workspace.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:TheGreenCedar/CodeStory.git",
+        ],
+    );
+    git(workspace.path(), &["add", "."]);
+    git(workspace.path(), &["commit", "-m", "init"]);
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["cache", "identity", "--format", "json"],
+    );
+    assert_success(&output, "cache identity should succeed");
+    let json = parse_stdout_json(&output);
+
+    assert_eq!(
+        json["normalized_repository_identity"],
+        "github.com/thegreencedar/codestory"
+    );
+    assert_eq!(json["repository_identity_schema_version"], 1);
+    assert_eq!(json["portable_reuse_eligible"], true);
+    assert!(
+        json["canonical_repository_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("repo-v1-"))
+    );
+    assert!(json["root_derived_project_id"].as_str().is_some());
+    assert!(json["git_tree"].as_str().is_some());
 }
 
 #[test]

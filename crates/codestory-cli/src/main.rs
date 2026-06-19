@@ -47,26 +47,26 @@ mod stdio_transport;
 use args::{
     AffectedChangeSource, AffectedCommand, AffectedStdinFormat, BookmarkAction, BookmarkAddCommand,
     BookmarkAddOutput, BookmarkCommand, BookmarkListCommand, BookmarkListOutput, BookmarkOutput,
-    BookmarkRemoveCommand, BookmarkRemoveOutput, Cli, Command, CompletionShell, ContextCommand,
-    DoctorCheckOutput, DoctorCommand, DoctorOutput, DoctorSidecarStatusOutput,
-    DrillAnchorConsumerOutput, DrillAnchorConsumerSummaryOutput, DrillAnchorOutput,
-    DrillAnchorTextConsumerHintOutput, DrillAnchorTimingsOutput, DrillAnswerQualityContractOutput,
-    DrillBridgeEvidenceOutput, DrillBridgeGraphPathOutput, DrillBridgeOutput,
-    DrillClaimLedgerEntryOutput, DrillClaimLedgerOutput, DrillClaimLedgerScoringOutput,
-    DrillCommand, DrillCommandStatusOutput, DrillExecutionBoundaryOutput, DrillMechanicalOutput,
-    DrillOutput, DrillRuntimeTimingsOutput, DrillSuiteAnswerQualityOutput, DrillSuiteCommand,
-    DrillSuiteExpectationOutput, DrillSuiteLayerFindingOutput, DrillSuiteOutput,
-    DrillSuiteRepoOutput, DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput,
-    DrillSummaryAnchorsOutput, DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput,
-    DrillSummaryMechanicalOutput, DrillSummaryOpenGapsOutput, DrillSummaryOutput,
-    DrillSummarySourceTruthOutput, DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput,
-    DrillSummaryVerdictOutput, DrillVerificationChecklistItemOutput, FilesCommand,
-    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
-    PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
-    QuerySelectorOutput, ReadyCommand, ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput,
-    SearchOutput, ServeCommand, SetupAction, SetupCommand, SnippetCommand, SnippetJsonOutput,
-    SymbolCommand, SymbolJsonOutput, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
-    build_trail_request,
+    BookmarkRemoveCommand, BookmarkRemoveOutput, CacheAction, CacheCommand, Cli, Command,
+    CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand, DoctorOutput,
+    DoctorSidecarStatusOutput, DrillAnchorConsumerOutput, DrillAnchorConsumerSummaryOutput,
+    DrillAnchorOutput, DrillAnchorTextConsumerHintOutput, DrillAnchorTimingsOutput,
+    DrillAnswerQualityContractOutput, DrillBridgeEvidenceOutput, DrillBridgeGraphPathOutput,
+    DrillBridgeOutput, DrillClaimLedgerEntryOutput, DrillClaimLedgerOutput,
+    DrillClaimLedgerScoringOutput, DrillCommand, DrillCommandStatusOutput,
+    DrillExecutionBoundaryOutput, DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput,
+    DrillSuiteAnswerQualityOutput, DrillSuiteCommand, DrillSuiteExpectationOutput,
+    DrillSuiteLayerFindingOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
+    DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
+    DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
+    DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
+    DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
+    DrillVerificationChecklistItemOutput, FilesCommand, GenerateCompletionsCommand, GroundCommand,
+    IndexCommand, IndexDryRunOutput, IndexOutput, PacketCommand, ProjectArgs, QueryCommand,
+    QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadyCommand, ReadyOutput,
+    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
+    SetupCommand, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TrailCommand,
+    TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -171,6 +171,7 @@ fn main() -> Result<()> {
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Ready(cmd) => run_ready(cmd),
         Command::Setup(cmd) => run_setup(cmd),
+        Command::Cache(cmd) => run_cache(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Drill(cmd) => run_drill(cmd),
         Command::DrillSuite(cmd) => run_drill_suite(cmd),
@@ -186,6 +187,83 @@ fn main() -> Result<()> {
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
     }
+}
+
+fn run_cache(cmd: CacheCommand) -> Result<()> {
+    match cmd.action {
+        CacheAction::Identity(cmd) => run_cache_identity(cmd),
+    }
+}
+
+fn run_cache_identity(cmd: args::CacheIdentityCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "cache identity")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let output = codestory_runtime::inspect_repository_identity(&runtime.project_root);
+    let markdown = render_cache_identity_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentityReport) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Cache Identity");
+    let _ = writeln!(markdown, "project: `{}`", output.project);
+    let _ = writeln!(
+        markdown,
+        "root_derived_project_id: `{}`",
+        output.root_derived_project_id
+    );
+    let _ = writeln!(
+        markdown,
+        "canonical_repository_id: `{}`",
+        output
+            .canonical_repository_id
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        markdown,
+        "repository_identity_schema_version: `{}`",
+        output.repository_identity_schema_version
+    );
+    let _ = writeln!(
+        markdown,
+        "normalized_repository_identity: `{}`",
+        output
+            .normalized_repository_identity
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        markdown,
+        "git_remote: `{}`",
+        output.git_remote.as_deref().unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        markdown,
+        "git_tree: `{}`",
+        output.git_tree.as_deref().unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        markdown,
+        "cache_schema_version: `{}`",
+        output.cache_schema_version
+    );
+    let _ = writeln!(
+        markdown,
+        "portable_reuse_eligible: `{}`",
+        output.portable_reuse_eligible
+    );
+    let _ = writeln!(
+        markdown,
+        "portable_reuse_reason: `{}`",
+        output.portable_reuse_reason
+    );
+    let _ = writeln!(markdown, "freshness_inputs:");
+    for input in &output.freshness_inputs {
+        let _ = writeln!(markdown, "- `{input}`");
+    }
+    markdown
 }
 
 fn run_setup(cmd: SetupCommand) -> Result<()> {

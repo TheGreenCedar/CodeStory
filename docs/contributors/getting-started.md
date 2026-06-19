@@ -118,6 +118,7 @@ Read these pages first:
 
 - default cache layout: user cache root + hashed project path
 - explicit `--cache-dir`: use the exact directory you passed
+- `cache identity`: reports the root-derived project id, canonical repository id, Git remote/tree freshness input, cache schema version, and portable-reuse eligibility without changing cache files
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
 - `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
 - `drill`: defaults to `--refresh full` so report bundles are mechanically fresh
