@@ -3,6 +3,9 @@ name = "codestory-retrieval"
 version = "0.9.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }

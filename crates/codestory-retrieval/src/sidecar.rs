@@ -278,6 +278,7 @@ mod tests {
         SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_qdrant_collection,
     };
     use crate::index::compute_sidecar_input_fingerprint;
+    use crate::test_support::retrieval_manifest_fixture;
     use codestory_store::{FileInfo, FileRole};
     use tempfile::TempDir;
 
@@ -290,29 +291,13 @@ mod tests {
         let hash = "deadbeefcafebabe";
         {
             let mut storage = Store::open(&storage_path).expect("open db");
+            let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+            manifest.projection_count = Some(10);
+            manifest.symbol_doc_count = Some(10);
+            manifest.dense_projection_count = Some(10);
+            manifest.dense_reason_counts_json = Some("{\"public_api\":10}".into());
             storage
-                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
-                    project_id: project_id.clone(),
-                    zoekt_version: "zoekt-real-v1".into(),
-                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
-                    scip_revision: Some("graph-test".into()),
-                    built_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
-                    disk_bytes: None,
-                    degraded_modes_json: "[]".into(),
-                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-                    embedding_dim: Some(768),
-                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
-                    sidecar_input_hash: Some(hash.into()),
-                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
-                    projection_count: Some(10),
-                    symbol_doc_count: Some(10),
-                    dense_projection_count: Some(10),
-                    semantic_policy_version: Some(
-                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
-                    ),
-                    graph_artifact_hash: Some("graph-test-hash".into()),
-                    dense_reason_counts_json: Some("{\"public_api\":10}".into()),
-                })
+                .upsert_retrieval_index_manifest(&manifest)
                 .expect("manifest");
         }
 
@@ -355,29 +340,10 @@ mod tests {
                     file_role: FileRole::Source,
                 })
                 .expect("insert indexed file");
+            let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+            manifest.built_at_epoch_ms = indexed_mtime;
             storage
-                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
-                    project_id: project_id.clone(),
-                    zoekt_version: "zoekt-real-v1".into(),
-                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
-                    scip_revision: Some("graph-test".into()),
-                    built_at_epoch_ms: indexed_mtime,
-                    disk_bytes: None,
-                    degraded_modes_json: "[]".into(),
-                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-                    embedding_dim: Some(768),
-                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
-                    sidecar_input_hash: Some(hash.into()),
-                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
-                    projection_count: Some(0),
-                    symbol_doc_count: Some(0),
-                    dense_projection_count: Some(0),
-                    semantic_policy_version: Some(
-                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
-                    ),
-                    graph_artifact_hash: Some("graph-test-hash".into()),
-                    dense_reason_counts_json: Some("{}".into()),
-                })
+                .upsert_retrieval_index_manifest(&manifest)
                 .expect("manifest");
         }
 
@@ -435,29 +401,10 @@ mod tests {
                     file_role: FileRole::Source,
                 })
                 .expect("insert indexed file");
+            let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+            manifest.built_at_epoch_ms = indexed_mtime;
             storage
-                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
-                    project_id: project_id.clone(),
-                    zoekt_version: "zoekt-real-v1".into(),
-                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
-                    scip_revision: Some("graph-test".into()),
-                    built_at_epoch_ms: indexed_mtime,
-                    disk_bytes: None,
-                    degraded_modes_json: "[]".into(),
-                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-                    embedding_dim: Some(768),
-                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
-                    sidecar_input_hash: Some(hash.into()),
-                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
-                    projection_count: Some(0),
-                    symbol_doc_count: Some(0),
-                    dense_projection_count: Some(0),
-                    semantic_policy_version: Some(
-                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
-                    ),
-                    graph_artifact_hash: Some("graph-test-hash".into()),
-                    dense_reason_counts_json: Some("{}".into()),
-                })
+                .upsert_retrieval_index_manifest(&manifest)
                 .expect("manifest");
         }
 
@@ -516,29 +463,10 @@ mod tests {
                     file_role: FileRole::Source,
                 })
                 .expect("insert indexed file");
+            let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+            manifest.built_at_epoch_ms = indexed_mtime;
             storage
-                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
-                    project_id: project_id.clone(),
-                    zoekt_version: "zoekt-real-v1".into(),
-                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
-                    scip_revision: Some("graph-test".into()),
-                    built_at_epoch_ms: indexed_mtime,
-                    disk_bytes: None,
-                    degraded_modes_json: "[]".into(),
-                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-                    embedding_dim: Some(768),
-                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
-                    sidecar_input_hash: Some(hash.into()),
-                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
-                    projection_count: Some(0),
-                    symbol_doc_count: Some(0),
-                    dense_projection_count: Some(0),
-                    semantic_policy_version: Some(
-                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
-                    ),
-                    graph_artifact_hash: Some("graph-test-hash".into()),
-                    dense_reason_counts_json: Some("{}".into()),
-                })
+                .upsert_retrieval_index_manifest(&manifest)
                 .expect("manifest");
         }
 
@@ -588,29 +516,10 @@ mod tests {
                     file_role: FileRole::Source,
                 })
                 .expect("insert indexed file");
+            let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+            manifest.built_at_epoch_ms = indexed_mtime;
             storage
-                .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
-                    project_id: project_id.clone(),
-                    zoekt_version: "zoekt-real-v1".into(),
-                    qdrant_collection: sidecar_qdrant_collection(&project_id, hash),
-                    scip_revision: Some("graph-test".into()),
-                    built_at_epoch_ms: indexed_mtime,
-                    disk_bytes: None,
-                    degraded_modes_json: "[]".into(),
-                    embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-                    embedding_dim: Some(768),
-                    sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
-                    sidecar_input_hash: Some(hash.into()),
-                    sidecar_generation: Some(sidecar_generation_id(&project_id, hash)),
-                    projection_count: Some(0),
-                    symbol_doc_count: Some(0),
-                    dense_projection_count: Some(0),
-                    semantic_policy_version: Some(
-                        crate::generation::SEMANTIC_POLICY_VERSION.into(),
-                    ),
-                    graph_artifact_hash: Some("graph-test-hash".into()),
-                    dense_reason_counts_json: Some("{}".into()),
-                })
+                .upsert_retrieval_index_manifest(&manifest)
                 .expect("manifest");
         }
 

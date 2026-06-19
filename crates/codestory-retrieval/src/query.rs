@@ -86,10 +86,8 @@ pub fn execute_retrieval_query_with_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generation::{
-        SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_qdrant_collection,
-    };
     use crate::index::finalize_index;
+    use crate::test_support::retrieval_manifest_fixture;
     use crate::{QdrantClient, SidecarLayout, ZoektClient};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
@@ -100,26 +98,12 @@ mod tests {
         hash: &str,
         projection_count: i64,
     ) -> codestory_store::RetrievalIndexManifest {
-        codestory_store::RetrievalIndexManifest {
-            project_id: project_id.into(),
-            zoekt_version: "zoekt-real-v1".into(),
-            qdrant_collection: sidecar_qdrant_collection(project_id, hash),
-            scip_revision: Some("graph-test".into()),
-            built_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
-            disk_bytes: None,
-            degraded_modes_json: "[]".into(),
-            embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-            embedding_dim: Some(768),
-            sidecar_schema_version: Some(SIDECAR_SCHEMA_VERSION),
-            sidecar_input_hash: Some(hash.into()),
-            sidecar_generation: Some(sidecar_generation_id(project_id, hash)),
-            projection_count: Some(projection_count),
-            symbol_doc_count: Some(projection_count),
-            dense_projection_count: Some(projection_count),
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            graph_artifact_hash: Some("graph-test-hash".into()),
-            dense_reason_counts_json: Some(format!("{{\"public_api\":{projection_count}}}")),
-        }
+        let mut manifest = retrieval_manifest_fixture(project_id, hash);
+        manifest.projection_count = Some(projection_count);
+        manifest.symbol_doc_count = Some(projection_count);
+        manifest.dense_projection_count = Some(projection_count);
+        manifest.dense_reason_counts_json = Some(format!("{{\"public_api\":{projection_count}}}"));
+        manifest
     }
 
     #[test]
