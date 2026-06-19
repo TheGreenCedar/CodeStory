@@ -511,6 +511,7 @@ pub(crate) fn agent_packet(
     let phase_started = Instant::now();
     enforce_packet_output_budget(&project_root, &mut packet);
     append_packet_non_trace_phase(&mut packet.answer, "output_budget", phase_started);
+    enforce_packet_output_budget(&project_root, &mut packet);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
         packet.answer.retrieval_trace.annotations.push(diagnostic);
@@ -521,6 +522,7 @@ pub(crate) fn agent_packet(
             "trace_artifact_output_budget",
             phase_started,
         );
+        enforce_packet_output_budget(&project_root, &mut packet);
     }
 
     Ok(packet)
@@ -9781,6 +9783,15 @@ mod tests {
             max_output_bytes
         );
         assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        append_packet_non_trace_phase(&mut packet.answer, "output_budget", Instant::now());
+        enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
+        let serialized_len = serde_json::to_vec(&packet)
+            .expect("serialize packet after output budget marker")
+            .len();
+        assert_eq!(
+            packet.budget.used.output_bytes as usize, serialized_len,
+            "final diagnostic marker must be included in packet output accounting"
+        );
         assert!(
             packet
                 .answer
