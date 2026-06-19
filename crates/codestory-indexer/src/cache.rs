@@ -165,6 +165,9 @@ fn portable_compile_flag(root: &Path, flag: &str) -> Option<String> {
         return index_artifact_cache_path(root, path)
             .map(|path| format!("path:{}", path.to_string_lossy()));
     }
+    if is_standalone_slash_root_path_like(flag) {
+        return None;
+    }
     let root_text = root.to_string_lossy();
     if !root_text.is_empty() && flag.contains(root_text.as_ref()) {
         return None;
@@ -173,6 +176,13 @@ fn portable_compile_flag(root: &Path, flag: &str) -> Option<String> {
         return None;
     }
     Some(format!("flag:{flag}"))
+}
+
+fn is_standalone_slash_root_path_like(flag: &str) -> bool {
+    let Some(rest) = flag.strip_prefix('/').or_else(|| flag.strip_prefix('\\')) else {
+        return false;
+    };
+    rest.contains('/') || rest.contains('\\')
 }
 
 fn has_unportable_embedded_absolute_path(flag: &str) -> bool {
@@ -357,7 +367,13 @@ mod tests {
         let root = temp.path().join("root");
         let config = crate::get_language_for_ext("cpp").expect("cpp config");
 
-        for flag in ["--sysroot=/abs/sdk", "-include/abs/header.h"] {
+        for flag in [
+            "--sysroot=/abs/sdk",
+            "-include/abs/header.h",
+            "/abs/sdk",
+            "\\abs\\sdk",
+            "/abs/header.h",
+        ] {
             let key = build_index_artifact_cache_key(
                 &root,
                 Path::new("src/main.cpp"),
