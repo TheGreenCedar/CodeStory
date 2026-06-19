@@ -26,7 +26,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows | structural collector tests | exact-source structural anchors |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests | structural collector tests | exact-source structural anchors |
 
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
@@ -64,10 +64,15 @@ status. It is blocked:
 
 GitHub Actions workflow support is path-scoped to `.github/workflows/*.{yml,yaml}`.
 The pilot emits workflow, job, and step anchors with `exact_source` /
-`source_range_only` evidence. Unsupported shapes stay explicit: YAML anchors and
-merge keys are not interpreted, matrix expansion and expressions are not
-resolved, reusable workflows and shell bodies are not semantically traced, and
-the collector does not validate GitHub Actions execution semantics. Packet
+`source_range_only` evidence. Docker Compose support is path-scoped to
+`compose*.{yml,yaml}`, `docker-compose*.{yml,yaml}`, and
+`docker/*-compose.{yml,yaml}` style manifests; it emits stack, service, image or
+build, ports, environment key, and volume anchors with the same exact-source
+boundary. Unsupported shapes stay explicit: YAML anchors and merge keys are not
+interpreted, matrix expansion and expressions are not resolved, reusable
+workflows and shell bodies are not semantically traced, Compose interpolation,
+profiles, health checks, dependency order, and runtime container behavior are
+not interpreted, and neither collector validates execution semantics. Packet
 evidence treats these anchors as diagnostic unless a future structural role
 explicitly admits them; they must not satisfy semantic proof roles.
 
@@ -146,8 +151,8 @@ Workspace parser policy:
 
 Validation: each listed candidate passed an isolated `cargo check` probe with
 the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,
-and GitHub Actions workflows remain structural runtime paths, not parser-backed
-runtime claims.
+GitHub Actions workflows, and Docker Compose manifests remain structural runtime
+paths, not parser-backed runtime claims.
 
 | Language | Candidate crate | Version checked | Decision |
 | --- | --- | ---: | --- |
