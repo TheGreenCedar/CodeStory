@@ -25,6 +25,7 @@ use crate::stdio_catalog::{
 use crate::{
     build_ambiguous_target_error_output, build_query_resolution_output, build_search_hit_output,
 };
+use std::time::Instant;
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 
@@ -229,9 +230,20 @@ fn stdio_jsonrpc_tool_call_from_legacy(
     stdio_jsonrpc_success(id, stdio_tool_call_success(response))
 }
 
-fn stdio_tool_call_success(structured_content: serde_json::Value) -> serde_json::Value {
+fn stdio_tool_call_success(mut structured_content: serde_json::Value) -> serde_json::Value {
+    let is_packet = stdio_is_packet(&structured_content);
+    let text_started = Instant::now();
     let text = stdio_tool_text(&structured_content);
-    serde_json::json!({
+    if is_packet {
+        append_stdio_packet_phase(
+            &mut structured_content,
+            "text_materialization",
+            stdio_elapsed_ms(text_started),
+        );
+    }
+
+    let response_started = Instant::now();
+    let mut response = serde_json::json!({
         "content": [
             {
                 "type": "text",
@@ -239,14 +251,41 @@ fn stdio_tool_call_success(structured_content: serde_json::Value) -> serde_json:
             }
         ],
         "structuredContent": structured_content
-    })
+    });
+    if is_packet && let Some(structured_content) = response.get_mut("structuredContent") {
+        append_stdio_packet_phase(
+            structured_content,
+            "tool_response_materialization",
+            stdio_elapsed_ms(response_started),
+        );
+    }
+    response
 }
 
 fn stdio_tool_text(value: &serde_json::Value) -> String {
-    if value.get("packet_id").is_some() && value.get("answer").is_some() {
+    if stdio_is_packet(value) {
         return stdio_packet_text(value);
     }
     stdio_json_text(value)
+}
+
+fn stdio_is_packet(value: &serde_json::Value) -> bool {
+    value.get("packet_id").is_some() && value.get("answer").is_some()
+}
+
+fn append_stdio_packet_phase(packet: &mut serde_json::Value, label: &str, duration_ms: u32) {
+    if let Some(annotations) = packet
+        .pointer_mut("/answer/retrieval_trace/annotations")
+        .and_then(|value| value.as_array_mut())
+    {
+        annotations.push(serde_json::Value::String(format!(
+            "packet_stdio_phase label={label} duration_ms={duration_ms}"
+        )));
+    }
+}
+
+fn stdio_elapsed_ms(started_at: Instant) -> u32 {
+    started_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
 }
 
 fn stdio_packet_text(packet: &serde_json::Value) -> String {
