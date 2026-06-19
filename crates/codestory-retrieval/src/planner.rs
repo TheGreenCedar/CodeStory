@@ -13,6 +13,38 @@ pub enum RetrievalStageKind {
     Stage3RepoTextFallback,
 }
 
+impl RetrievalStageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RetrievalStageKind::Stage0ScipAnchor => "stage0_scip_anchor",
+            RetrievalStageKind::Stage1ZoektLexical => "stage1_zoekt_lexical",
+            RetrievalStageKind::Stage1bQdrantSemantic => "stage1b_qdrant_semantic",
+            RetrievalStageKind::Stage2ScipExpand => "stage2_scip_expand",
+            RetrievalStageKind::Stage3RepoTextFallback => "stage3_repo_text_fallback",
+        }
+    }
+
+    pub fn provenance_label(self) -> Option<&'static str> {
+        match self {
+            RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
+            RetrievalStageKind::Stage1ZoektLexical => None,
+            RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
+            RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
+            RetrievalStageKind::Stage3RepoTextFallback => None,
+        }
+    }
+
+    pub fn sidecar_latency_ms(self, elapsed_ms: u64) -> Option<u32> {
+        match self {
+            RetrievalStageKind::Stage0ScipAnchor
+            | RetrievalStageKind::Stage1ZoektLexical
+            | RetrievalStageKind::Stage1bQdrantSemantic
+            | RetrievalStageKind::Stage2ScipExpand => u32::try_from(elapsed_ms).ok(),
+            RetrievalStageKind::Stage3RepoTextFallback => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedStage {
     pub kind: RetrievalStageKind,
@@ -165,6 +197,30 @@ mod tests {
                 < kinds
                     .iter()
                     .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+        );
+    }
+
+    #[test]
+    fn stage_kind_metadata_matches_sidecar_stage_contract() {
+        assert_eq!(
+            RetrievalStageKind::Stage0ScipAnchor.label(),
+            "stage0_scip_anchor"
+        );
+        assert_eq!(
+            RetrievalStageKind::Stage1bQdrantSemantic.provenance_label(),
+            Some("dense_anchor")
+        );
+        assert_eq!(
+            RetrievalStageKind::Stage2ScipExpand.provenance_label(),
+            Some("graph_neighbor")
+        );
+        assert_eq!(
+            RetrievalStageKind::Stage1ZoektLexical.sidecar_latency_ms(42),
+            Some(42)
+        );
+        assert_eq!(
+            RetrievalStageKind::Stage3RepoTextFallback.sidecar_latency_ms(42),
+            None
         );
     }
 
