@@ -570,6 +570,8 @@ pub(crate) fn packet_anchor_probe_limit_for_budget(
         (base / 4).max(1)
     } else if usage_pct >= 50 {
         (base / 2).max(1)
+    } else if budget == PacketBudgetModeDto::Compact && usage_pct >= 25 {
+        (base / 2).max(1)
     } else {
         base
     }
@@ -891,6 +893,10 @@ mod tests {
     #[test]
     fn compact_packet_anchor_probe_limit_tapers_under_budget_pressure() {
         let latency = PacketLatencyBudget::new(Some(18_000));
+        assert_eq!(
+            packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 4_500,),
+            6
+        );
         assert_eq!(
             packet_anchor_probe_limit_for_budget(PacketBudgetModeDto::Compact, latency, 9_000,),
             6
