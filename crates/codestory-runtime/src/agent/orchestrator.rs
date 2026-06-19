@@ -431,6 +431,7 @@ pub(crate) fn agent_packet(
         &rank_terms,
         &mut answer,
     )?;
+    let phase_started = Instant::now();
     maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
     maybe_append_generic_source_shape_citations(&project_root, &question, &mut answer);
     let file_scoped_source_probes =
@@ -442,7 +443,10 @@ pub(crate) fn agent_packet(
         &file_scoped_source_probes,
         &mut answer,
     );
+    append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
+    let phase_started = Instant::now();
     packet_latency.apply_to_trace(&mut answer);
+    append_packet_non_trace_phase(&mut answer, "trace_apply", phase_started);
 
     let phase_started = Instant::now();
     rank_packet_evidence(&question, &mut answer);
@@ -9242,6 +9246,14 @@ mod tests {
         assert_eq!(
             packet_non_trace_phase_annotation("budget", 42),
             "packet_non_trace_phase label=budget duration_ms=42"
+        );
+        assert_eq!(
+            packet_non_trace_phase_annotation("pre_rank_citations", 7),
+            "packet_non_trace_phase label=pre_rank_citations duration_ms=7"
+        );
+        assert_eq!(
+            packet_non_trace_phase_annotation("trace_apply", 3),
+            "packet_non_trace_phase label=trace_apply duration_ms=3"
         );
     }
 
