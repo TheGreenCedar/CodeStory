@@ -662,13 +662,23 @@ fn symbol_doc_lexical_entry(project_root: &Path, doc: &SymbolSearchDoc) -> Lexic
 
 fn normalize_lexical_file_path(project_root: &Path, path: &str) -> Option<String> {
     let path = Path::new(path);
-    if path.is_absolute() {
+    let rel = if path.is_absolute() {
         path.strip_prefix(project_root)
             .ok()
             .map(|rel| rel.to_string_lossy().replace('\\', "/"))
     } else {
         Some(path.to_string_lossy().replace('\\', "/"))
-    }
+    }?;
+    Some(source_rooted_lexical_path(project_root, &rel).unwrap_or(rel))
+}
+
+fn source_rooted_lexical_path(project_root: &Path, rel_path: &str) -> Option<String> {
+    let rel = rel_path.trim_start_matches("./").trim_start_matches('/');
+    ["main/java/", "test/java/"]
+        .iter()
+        .any(|prefix| rel.starts_with(prefix))
+        .then(|| format!("src/{rel}"))
+        .filter(|source_rooted| project_root.join(source_rooted).is_file())
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -836,6 +846,26 @@ mod tests {
         assert_eq!(hit.source, LexicalDocumentSource::SymbolDoc);
         assert_eq!(hit.node_id.as_deref(), Some("2"));
         assert_eq!(hit.start_line, Some(1));
+    }
+
+    #[test]
+    fn symbol_doc_paths_prefer_existing_java_source_root() {
+        let project = TempDir::new().expect("project");
+        let source_file = project
+            .path()
+            .join("src/main/java/example/widgets/WidgetRules.java");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("mkdir source parent");
+        std::fs::write(&source_file, "class WidgetRules {}\n").expect("write source");
+
+        assert_eq!(
+            normalize_lexical_file_path(
+                project.path(),
+                "main/java/example/widgets/WidgetRules.java"
+            )
+            .as_deref(),
+            Some("src/main/java/example/widgets/WidgetRules.java")
+        );
     }
 
     #[test]

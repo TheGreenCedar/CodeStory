@@ -1037,31 +1037,15 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
     let candidates = result
         .hits
         .iter()
-        .take(MAX_SHADOW_CANDIDATES)
         .enumerate()
-        .map(|(index, hit)| RetrievalCandidateSummaryDto {
-            rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
-            file_path: hit.file_path.clone(),
-            line: hit.start_line,
-            symbol_name: hit.symbol_name.clone(),
-            score: hit.score,
-            source: candidate_source_label(hit.source),
-            resolution: resolution_labels.get(index).cloned(),
-            admission_status: admission_labels
-                .get(index)
-                .map(|label| label.admission_status.clone()),
-            loss_reason: admission_labels
-                .get(index)
-                .and_then(|label| label.loss_reason.clone()),
-            resolved_node_id: admission_labels
-                .get(index)
-                .and_then(|label| label.resolved_node_id.clone()),
-            search_hit_rank: admission_labels
-                .get(index)
-                .and_then(|label| label.search_hit_rank),
-            final_rank: admission_labels
-                .get(index)
-                .and_then(|label| label.final_rank),
+        .filter(|(index, _)| {
+            *index < MAX_SHADOW_CANDIDATES
+                || resolution_labels
+                    .get(*index)
+                    .is_some_and(|label| label != "resolved")
+        })
+        .map(|(index, hit)| {
+            shadow_candidate_summary(index, hit, resolution_labels, admission_labels)
         })
         .collect();
 
@@ -1104,6 +1088,38 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
         unresolved_candidate_count: u32::try_from(unresolved_candidate_count).unwrap_or(u32::MAX),
         diagnostic_only,
         candidate_resolution_counts,
+    }
+}
+
+fn shadow_candidate_summary(
+    index: usize,
+    hit: &CandidateHit,
+    resolution_labels: &[String],
+    admission_labels: &[SidecarCandidateAdmissionLabel],
+) -> RetrievalCandidateSummaryDto {
+    RetrievalCandidateSummaryDto {
+        rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
+        file_path: hit.file_path.clone(),
+        line: hit.start_line,
+        symbol_name: hit.symbol_name.clone(),
+        score: hit.score,
+        source: candidate_source_label(hit.source),
+        resolution: resolution_labels.get(index).cloned(),
+        admission_status: admission_labels
+            .get(index)
+            .map(|label| label.admission_status.clone()),
+        loss_reason: admission_labels
+            .get(index)
+            .and_then(|label| label.loss_reason.clone()),
+        resolved_node_id: admission_labels
+            .get(index)
+            .and_then(|label| label.resolved_node_id.clone()),
+        search_hit_rank: admission_labels
+            .get(index)
+            .and_then(|label| label.search_hit_rank),
+        final_rank: admission_labels
+            .get(index)
+            .and_then(|label| label.final_rank),
     }
 }
 
@@ -1940,6 +1956,76 @@ mod tests {
             shadow.unresolved_candidate_count, 0,
             "resolved candidates rejected by the final result window are not unresolved sidecar candidates"
         );
+    }
+
+    #[test]
+    fn shadow_candidate_summaries_keep_unresolved_candidates_past_display_cap() {
+        let hits = (0..21)
+            .map(|index| {
+                let path = if index == 20 {
+                    "missing.c".to_string()
+                } else {
+                    format!("src/resolved_{index}.c")
+                };
+                CandidateHit::with_source(
+                    &path,
+                    Some(format!("symbol_{index}")),
+                    0.5,
+                    CandidateSource::Zoekt,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut labels = vec!["resolved".to_string(); 21];
+        labels[20] = "path_unresolvable".to_string();
+        let admissions = labels
+            .iter()
+            .map(|label| {
+                if label == "resolved" {
+                    SidecarCandidateAdmissionLabel {
+                        admission_status: "admitted".to_string(),
+                        loss_reason: None,
+                        resolved_node_id: Some("1".to_string()),
+                        search_hit_rank: Some(1),
+                        final_rank: Some(1),
+                    }
+                } else {
+                    SidecarCandidateAdmissionLabel {
+                        admission_status: "unresolved".to_string(),
+                        loss_reason: Some(label.clone()),
+                        resolved_node_id: None,
+                        search_hit_rank: None,
+                        final_rank: None,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
+            QueryResult {
+                query: "command loop".into(),
+                features: classify_query("command loop"),
+                hits,
+                trace: QueryTrace {
+                    retrieval_mode: "full".into(),
+                    degraded_reason: None,
+                    total_budget_ms: 500,
+                    elapsed_ms: 1,
+                    cancel_reason: None,
+                    cache_hit: false,
+                    stages: Vec::new(),
+                },
+            },
+            21,
+            20,
+            &labels,
+            &admissions,
+        );
+
+        assert_eq!(shadow.candidates.len(), MAX_SHADOW_CANDIDATES + 1);
+        let unresolved = shadow.candidates.last().expect("unresolved detail");
+        assert_eq!(unresolved.rank, 21);
+        assert_eq!(unresolved.file_path, "missing.c");
+        assert_eq!(unresolved.resolution.as_deref(), Some("path_unresolvable"));
+        assert_eq!(shadow.unresolved_candidate_count, 1);
     }
 
     #[test]
