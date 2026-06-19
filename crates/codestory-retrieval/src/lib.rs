@@ -68,7 +68,10 @@ pub use qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION,
     PRUNE_SUPPRESSED_PROTECTION_SCAN_ERROR, QdrantStorageRepairReport, repair_qdrant_storage,
 };
-pub use query::{QueryRequest, execute_retrieval_query, execute_retrieval_query_with_cache};
+pub use query::{
+    QueryBatchItem, QueryBatchRequest, QueryRequest, execute_retrieval_query,
+    execute_retrieval_query_with_cache, execute_strict_retrieval_query_batch_with_cache,
+};
 pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;
 pub use scip_client::ScipClient;
