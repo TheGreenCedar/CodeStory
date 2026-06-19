@@ -4053,6 +4053,27 @@ function packetSearchPhaseTotal(searchSteps, mode) {
   return Number.isFinite(total) ? total : null;
 }
 
+function packetBatchTimings(annotations) {
+  if (!Array.isArray(annotations)) {
+    return [];
+  }
+  const pattern = /^(packet_[a-z_]+_batch) total_ms=(\d+) attributed_query_ms=(\d+) overhead_ms=(\d+) queries=(\d+)$/;
+  return annotations
+    .map((annotation) => pattern.exec(String(annotation ?? "")))
+    .filter(Boolean)
+    .map((match) => ({
+      label: match[1],
+      total_ms: Number(match[2]),
+      attributed_query_ms: Number(match[3]),
+      overhead_ms: Number(match[4]),
+      queries: Number(match[5]),
+    }));
+}
+
+function packetBatchTiming(timings, label, key) {
+  return finiteNumber(timings.find((timing) => timing.label === label)?.[key]);
+}
+
 function topPacketSearchQueries(searchSteps, limit = 8) {
   return [...searchSteps]
     .sort((left, right) => {
@@ -4075,18 +4096,25 @@ function packetLatencyTelemetry(packet, wallMs) {
   const steps = Array.isArray(retrievalTrace?.steps) ? retrievalTrace.steps : [];
   const topStep = [...steps].sort((left, right) => (right.duration_ms ?? 0) - (left.duration_ms ?? 0))[0] ?? null;
   const searchSteps = packetSearchStepTelemetry(steps);
+  const batchTimings = packetBatchTimings(retrievalTrace?.annotations);
   const retrievalTotalMs = finiteNumber(retrievalTrace?.total_latency_ms);
   const freshnessMs = finiteNumber(freshness?.duration_ms);
+  const accountedTraceMs =
+    Number.isFinite(retrievalTotalMs) && Number.isFinite(freshnessMs)
+      ? retrievalTotalMs + freshnessMs
+      : null;
   const unaccountedMs =
-    Number.isFinite(wallMs) && Number.isFinite(retrievalTotalMs) && Number.isFinite(freshnessMs)
-      ? Math.max(0, wallMs - retrievalTotalMs - freshnessMs)
+    Number.isFinite(wallMs) && Number.isFinite(accountedTraceMs)
+      ? Math.max(0, wallMs - accountedTraceMs)
       : null;
   return {
     freshness_ms: Number.isFinite(freshnessMs) ? freshnessMs : null,
     retrieval_total_ms: Number.isFinite(retrievalTotalMs) ? retrievalTotalMs : null,
+    accounted_trace_ms: Number.isFinite(accountedTraceMs) ? accountedTraceMs : null,
     sla_target_ms: finiteNumber(retrievalTrace?.sla_target_ms),
     sla_missed: retrievalTrace?.sla_missed ?? null,
     unaccounted_ms: unaccountedMs,
+    non_trace_wall_ms: unaccountedMs,
     top_step_kind: topStep?.kind ?? null,
     top_step_status: topStep?.status ?? null,
     top_step_duration_ms: finiteNumber(topStep?.duration_ms),
@@ -4098,6 +4126,18 @@ function packetLatencyTelemetry(packet, wallMs) {
     packet_lexical_subquery_search_total_ms: packetSearchPhaseTotal(searchSteps, "packet_lexical_batch"),
     packet_semantic_subquery_search_total_ms: packetSearchPhaseTotal(searchSteps, "packet_semantic_batch"),
     packet_search_queries: topPacketSearchQueries(searchSteps),
+    packet_batch_timings: batchTimings,
+    packet_batch_total_ms: batchTimings.reduce((sum, timing) => sum + timing.total_ms, 0),
+    packet_batch_attributed_query_ms: batchTimings.reduce((sum, timing) => sum + timing.attributed_query_ms, 0),
+    packet_batch_overhead_ms: batchTimings.reduce((sum, timing) => sum + timing.overhead_ms, 0),
+    packet_anchor_probe_batch_total_ms: packetBatchTiming(batchTimings, "packet_anchor_probe_batch", "total_ms"),
+    packet_anchor_probe_batch_attributed_query_ms: packetBatchTiming(batchTimings, "packet_anchor_probe_batch", "attributed_query_ms"),
+    packet_anchor_probe_batch_overhead_ms: packetBatchTiming(batchTimings, "packet_anchor_probe_batch", "overhead_ms"),
+    packet_anchor_probe_batch_queries: packetBatchTiming(batchTimings, "packet_anchor_probe_batch", "queries"),
+    packet_lexical_subquery_batch_total_ms: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "total_ms"),
+    packet_lexical_subquery_batch_attributed_query_ms: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "attributed_query_ms"),
+    packet_lexical_subquery_batch_overhead_ms: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "overhead_ms"),
+    packet_lexical_subquery_batch_queries: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "queries"),
     retrieval_shadow: retrievalShadow,
   };
 }
@@ -4394,7 +4434,13 @@ function summarizePacketRuntimeRuns(results) {
       median_budget_used_output_bytes: median(shapeRows.map((row) => row.packet_shape?.budget_used_output_bytes)),
       median_packet_freshness_ms: median(latencyRows.map((row) => row.packet_latency?.freshness_ms)),
       median_packet_retrieval_total_ms: median(latencyRows.map((row) => row.packet_latency?.retrieval_total_ms)),
+      median_packet_accounted_trace_ms: median(latencyRows.map((row) => row.packet_latency?.accounted_trace_ms)),
       median_packet_unaccounted_ms: median(latencyRows.map((row) => row.packet_latency?.unaccounted_ms)),
+      median_packet_batch_total_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_total_ms)),
+      median_packet_batch_attributed_query_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_attributed_query_ms)),
+      median_packet_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_overhead_ms)),
+      median_packet_anchor_probe_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_anchor_probe_batch_overhead_ms)),
+      median_packet_lexical_subquery_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_lexical_subquery_batch_overhead_ms)),
       packet_sla_missed_runs: latencyRows.filter((row) => row.packet_latency?.sla_missed === true).length,
       warm_stdio_packet_cache_hit_runs: successful.filter((row) => row.warm_stdio_packet_cache_hit === true).length,
       retrieval_shadow_cache_hit_runs: shadowRows.filter((shadow) => shadow.cache_hit === true).length,
@@ -4419,8 +4465,8 @@ function packetRuntimeMarkdown(summary) {
   const lines = [
     "# Packet Runtime Benchmark",
     "",
-    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Unaccounted ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(packetRuntimeMarkdownRow(row));
@@ -4445,6 +4491,11 @@ function packetRuntimeMarkdownRow(row) {
     formatValue(row.median_packet_retrieval_total_ms),
     formatValue(row.median_packet_freshness_ms),
     formatValue(row.median_packet_unaccounted_ms),
+    formatValue(row.median_packet_batch_total_ms),
+    formatValue(row.median_packet_batch_attributed_query_ms),
+    formatValue(row.median_packet_batch_overhead_ms),
+    formatValue(row.median_packet_anchor_probe_batch_overhead_ms),
+    formatValue(row.median_packet_lexical_subquery_batch_overhead_ms),
     row.packet_top_latency_step_kind ?? "",
     formatValue(row.median_packet_top_step_ms),
     formatValue(row.packet_sla_missed_runs),
@@ -5822,7 +5873,15 @@ function runSelfTest() {
     answer: {
       citations: [{ display_name: "run_index" }],
       graphs: [{ id: "g", edges: [{ id: "e1" }] }],
-      retrieval_trace: { steps: [] },
+      freshness: { duration_ms: 10 },
+      retrieval_trace: {
+        total_latency_ms: 100,
+        annotations: [
+          "packet_anchor_probe_batch total_ms=25 attributed_query_ms=20 overhead_ms=5 queries=2",
+          "packet_lexical_subquery_batch total_ms=40 attributed_query_ms=31 overhead_ms=9 queries=3",
+        ],
+        steps: [],
+      },
       sections: [{ blocks: [{ markdown: "answer" }] }],
     },
   };
@@ -5832,6 +5891,14 @@ function runSelfTest() {
     packetSufficiencyTelemetry(packetFixture, { pass: false }).sufficient_quality_mismatch,
     true,
   );
+  const packetLatency = packetLatencyTelemetry(packetFixture, 150);
+  assert.equal(packetLatency.accounted_trace_ms, 110);
+  assert.equal(packetLatency.non_trace_wall_ms, 40);
+  assert.equal(packetLatency.packet_batch_total_ms, 65);
+  assert.equal(packetLatency.packet_batch_attributed_query_ms, 51);
+  assert.equal(packetLatency.packet_batch_overhead_ms, 14);
+  assert.equal(packetLatency.packet_anchor_probe_batch_overhead_ms, 5);
+  assert.equal(packetLatency.packet_lexical_subquery_batch_overhead_ms, 9);
   assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }), true);
   assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }, { publishable: true }), false);
   const weakPacketTelemetry = packetSufficiencyTelemetry(
