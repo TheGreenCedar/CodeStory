@@ -122,7 +122,7 @@ Evidence sources: `crates/codestory-cli/tests/stdio_protocol_contracts.rs`,
 
 If the gates are satisfied, start with a written implementation plan that names
 why the new surface is not a duplicate of `explore`, the exact routes or
-commands to add, the screenshot-visible review loop, and the rollback path.
+commands to add, the screenshot-visible review loop, and the promotion guard path.
 
 ### Layer boundaries
 

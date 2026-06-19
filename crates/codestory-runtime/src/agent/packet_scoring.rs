@@ -1,5 +1,6 @@
 //! Packet citation scoring helpers for batch retrieval ranking.
 
+#[cfg(test)]
 use super::eval_probes::eval_citation_rank_adjustment;
 use crate::agent::packet_terms::{
     packet_terms_indicate_buffered_io_flow, packet_terms_indicate_client_send_flow,
@@ -180,7 +181,10 @@ pub(crate) fn packet_citation_rank(
         score += packet_shell_install_dispatch_rank_bonus(&normalized_display, &path);
     }
 
-    score = eval_citation_rank_adjustment(&normalized_display, &path, score);
+    #[cfg(test)]
+    {
+        score = eval_citation_rank_adjustment(&normalized_display, &path, score);
+    }
     if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
         score += breakdown.lexical * 2.0;
         score += breakdown.graph;

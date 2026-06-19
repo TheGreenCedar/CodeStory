@@ -74,10 +74,9 @@ use crate::agent::packet_terms::{
 };
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
-    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_log_rollback_after_packet,
-    maybe_run_retrieval_shadow, sidecar_retrieval_blocks_nucleo_supplement,
-    sidecar_retrieval_primary_enabled, sidecar_retrieval_unavailable_error,
-    try_sidecar_primary_search,
+    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
+    sidecar_retrieval_blocks_nucleo_supplement, sidecar_retrieval_primary_enabled,
+    sidecar_retrieval_unavailable_error, try_sidecar_primary_search,
 };
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
@@ -467,7 +466,6 @@ pub(crate) fn agent_packet(
         ));
         answer.retrieval_trace.retrieval_shadow = Some(shadow);
     }
-    maybe_log_rollback_after_packet(controller, answer.retrieval_trace.retrieval_shadow.as_ref());
     append_packet_step_trace_annotation(&mut answer);
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 

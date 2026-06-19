@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::agent::eval_probes::{
     eval_probes_enabled, push_eval_required_probe_queries,
     push_prompt_concept_derived_symbol_probes,
@@ -416,6 +417,7 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
         &packet_flow_requirement_queries_for_terms(terms, task_class),
     );
 
+    #[cfg(test)]
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
         return queries;
@@ -830,6 +832,9 @@ pub(crate) fn packet_prompt_exact_symbol_probe_queries(
             push_unique_term(&mut queries, &term);
         }
     }
+    #[cfg(not(test))]
+    let _ = terms;
+    #[cfg(test)]
     if eval_probes_enabled() {
         push_prompt_concept_derived_symbol_probes(terms, &mut queries);
     }

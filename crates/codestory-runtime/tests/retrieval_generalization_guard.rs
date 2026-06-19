@@ -405,17 +405,13 @@ fn linter_scans_production_files_with_diagnostic_or_test_like_names() {
             "eval_probes.rs",
             r#"pub fn leaked_eval_probe_path() -> &'static str { "codex-rs/eval/src/lib.rs" }"#,
         ),
-        (
-            "retrieval_rollback.rs",
-            r#"pub fn leaked_rollback_path() -> &'static str { "codex-rs/rollback/src/lib.rs" }"#,
-        ),
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
         "production files should not be excluded solely by basename, stderr={stderr}"
     );
-    for file in ["test_support.rs", "eval_probes.rs", "retrieval_rollback.rs"] {
+    for file in ["test_support.rs", "eval_probes.rs"] {
         assert!(
             stderr.contains(file),
             "lint should report banned literals in {file}, stderr={stderr}"

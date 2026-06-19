@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::agent::eval_probes::eval_probes_enabled;
 use crate::agent::packet_citations::{
     packet_citation_matching_display, packet_citation_matching_path_and_display,
@@ -50,20 +51,29 @@ pub(crate) fn packet_command_exact_probe_queries(
     question: &str,
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
-    if !eval_probes_enabled() || !packet_allows_command_probe_queries(question, task_class) {
-        return Vec::new();
+    #[cfg(not(test))]
+    {
+        let _ = (question, task_class);
+        Vec::new()
     }
 
-    let mut queries = Vec::new();
-    for descriptor in packet_command_descriptors(question) {
-        push_unique_term(
-            &mut queries,
-            &format!("Subcommand::{}", descriptor.subcommand_title),
-        );
-        push_unique_term(&mut queries, &format!("{}::Cli", descriptor.module));
-        push_unique_term(&mut queries, &format!("{}::run_main", descriptor.module));
+    #[cfg(test)]
+    {
+        if !eval_probes_enabled() || !packet_allows_command_probe_queries(question, task_class) {
+            return Vec::new();
+        }
+
+        let mut queries = Vec::new();
+        for descriptor in packet_command_descriptors(question) {
+            push_unique_term(
+                &mut queries,
+                &format!("Subcommand::{}", descriptor.subcommand_title),
+            );
+            push_unique_term(&mut queries, &format!("{}::Cli", descriptor.module));
+            push_unique_term(&mut queries, &format!("{}::run_main", descriptor.module));
+        }
+        queries
     }
-    queries
 }
 
 pub(crate) fn packet_command_role_probe_queries(
