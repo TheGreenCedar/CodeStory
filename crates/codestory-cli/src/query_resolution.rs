@@ -483,6 +483,27 @@ mod tests {
     use super::*;
     use codestory_contracts::api::{NodeId, SearchHitOrigin};
 
+    fn test_search_hit_defaults() -> SearchHit {
+        SearchHit {
+            node_id: NodeId(String::new()),
+            display_name: String::new(),
+            kind: NodeKind::UNKNOWN,
+            file_path: None,
+            line: None,
+            score: 0.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            score_breakdown: None,
+        }
+    }
+
     fn hit(id: &str, display_name: &str, kind: NodeKind, score: f32, path: &str) -> SearchHit {
         SearchHit {
             node_id: NodeId(id.to_string()),
@@ -495,6 +516,7 @@ mod tests {
             match_quality: None,
             resolvable: true,
             score_breakdown: None,
+            ..test_search_hit_defaults()
         }
     }
 
