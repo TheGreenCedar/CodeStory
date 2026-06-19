@@ -365,6 +365,7 @@ mod tests {
             candidate_count: 0,
             resolved_hit_count: 0,
             unresolved_candidate_count: 0,
+            diagnostic_only: false,
             candidate_resolution_counts: Vec::new(),
         });
         let json = packet_step_trace_json(&answer);
