@@ -16,6 +16,9 @@ pub(crate) struct PacketStepTraceRow {
     pub query: Option<String>,
     pub hits: Option<u32>,
     pub mode: Option<String>,
+    pub sidecar_query_ms: Option<u32>,
+    pub candidate_resolution_ms: Option<u32>,
+    pub sidecar_total_ms: Option<u32>,
     pub message: Option<String>,
 }
 
@@ -35,16 +38,8 @@ fn packet_step_row(index: usize, step: &AgentRetrievalStepDto) -> PacketStepTrac
         .iter()
         .find(|field| field.key == "query")
         .map(|field| field.value.clone());
-    let hits = step
-        .output
-        .iter()
-        .find(|field| field.key == "hits")
-        .and_then(|field| field.value.parse::<u32>().ok());
-    let mode = step
-        .output
-        .iter()
-        .find(|field| field.key == "mode")
-        .map(|field| field.value.clone());
+    let hits = step_output_u32(step, "hits");
+    let mode = step_output_string(step, "mode");
     PacketStepTraceRow {
         step_index: index,
         kind: format!("{:?}", step.kind),
@@ -53,8 +48,22 @@ fn packet_step_row(index: usize, step: &AgentRetrievalStepDto) -> PacketStepTrac
         query,
         hits,
         mode,
+        sidecar_query_ms: step_output_u32(step, "sidecar_query_ms"),
+        candidate_resolution_ms: step_output_u32(step, "candidate_resolution_ms"),
+        sidecar_total_ms: step_output_u32(step, "sidecar_total_ms"),
         message: step.message.clone(),
     }
+}
+
+fn step_output_string(step: &AgentRetrievalStepDto, key: &str) -> Option<String> {
+    step.output
+        .iter()
+        .find(|field| field.key == key)
+        .map(|field| field.value.clone())
+}
+
+fn step_output_u32(step: &AgentRetrievalStepDto, key: &str) -> Option<u32> {
+    step_output_string(step, key).and_then(|value| value.parse::<u32>().ok())
 }
 
 pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
@@ -65,6 +74,7 @@ pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
     let mut payload = json!({
         "total_latency_ms": answer.retrieval_trace.total_latency_ms,
         "attributed_step_duration_ms": attributable_step_duration_ms(&rows),
+        "unattributed_trace_ms": unattributed_trace_ms(answer, &rows),
         "sla_target_ms": answer.retrieval_trace.sla_target_ms,
         "sla_missed": answer.retrieval_trace.sla_missed,
         "semantic_fallback_count": semantic_fallback_count,
@@ -73,10 +83,16 @@ pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
         "attributed_step_count": attributable_rows.len(),
         "steps": rows,
         "by_kind_ms": by_kind,
+        "search_phase_summary": search_phase_summary(&attributable_rows),
         "top_cost_buckets": top_cost_buckets(&by_kind, 3),
     });
     if let Some(shadow) = &answer.retrieval_trace.retrieval_shadow {
         payload["retrieval_shadow"] = serde_json::to_value(shadow).unwrap_or(Value::Null);
+    }
+    if !answer.retrieval_trace.packet_sidecar_diagnostics.is_empty() {
+        payload["packet_sidecar_diagnostics"] =
+            serde_json::to_value(&answer.retrieval_trace.packet_sidecar_diagnostics)
+                .unwrap_or(Value::Null);
     }
     payload
 }
@@ -154,6 +170,13 @@ fn attributable_step_duration_ms(rows: &[PacketStepTraceRow]) -> u32 {
         .sum()
 }
 
+fn unattributed_trace_ms(answer: &AgentAnswerDto, rows: &[PacketStepTraceRow]) -> u32 {
+    answer
+        .retrieval_trace
+        .total_latency_ms
+        .saturating_sub(attributable_step_duration_ms(rows))
+}
+
 fn aggregate_by_kind(rows: &[&PacketStepTraceRow]) -> serde_json::Map<String, Value> {
     let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for row in rows {
@@ -177,6 +200,49 @@ fn top_cost_buckets(by_kind: &serde_json::Map<String, Value>, limit: usize) -> V
         .take(limit)
         .map(|(kind, ms)| json!({ "kind": kind, "duration_ms": ms }))
         .collect()
+}
+
+fn search_phase_summary(rows: &[&PacketStepTraceRow]) -> Vec<Value> {
+    let mut phases: std::collections::HashMap<String, Vec<&PacketStepTraceRow>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        if row.kind != format!("{:?}", AgentRetrievalStepKindDto::Search) {
+            continue;
+        }
+        let phase = row
+            .mode
+            .clone()
+            .unwrap_or_else(|| "unclassified_search".to_string());
+        phases.entry(phase).or_default().push(*row);
+    }
+    let mut summaries = phases
+        .into_iter()
+        .map(|(phase, rows)| {
+            let total_duration_ms = rows
+                .iter()
+                .map(|row| u64::from(row.duration_ms))
+                .sum::<u64>();
+            let top = rows.iter().max_by(|left, right| {
+                left.duration_ms
+                    .cmp(&right.duration_ms)
+                    .then_with(|| left.query.cmp(&right.query))
+            });
+            json!({
+                "phase": phase,
+                "step_count": rows.len(),
+                "total_duration_ms": total_duration_ms,
+                "max_duration_ms": top.map(|row| row.duration_ms),
+                "top_query": top.and_then(|row| row.query.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        right["total_duration_ms"]
+            .as_u64()
+            .cmp(&left["total_duration_ms"].as_u64())
+            .then_with(|| left["phase"].as_str().cmp(&right["phase"].as_str()))
+    });
+    summaries
 }
 
 #[cfg(test)]

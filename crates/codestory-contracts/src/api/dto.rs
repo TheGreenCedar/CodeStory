@@ -1638,6 +1638,16 @@ pub struct RetrievalShadowDto {
 pub struct PacketSidecarQueryDiagnosticDto {
     pub query: String,
     pub retrieval_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_query_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_resolution_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_elapsed_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub sidecar_stage_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_stage_total_ms: Option<u32>,
     pub candidate_count: u32,
     pub resolved_hit_count: u32,
     pub unresolved_candidate_count: u32,
@@ -2013,6 +2023,35 @@ mod packet_tests {
         assert_eq!(parsed.retrieval_mode, "full");
         assert_eq!(parsed.would_rank, vec!["src/lib.rs".to_string()]);
         assert_eq!(parsed.unresolved_candidate_count, 1);
+    }
+
+    #[test]
+    fn packet_sidecar_query_diagnostic_serializes_timing_fields() {
+        let diagnostic = PacketSidecarQueryDiagnosticDto {
+            query: "StringUtils".to_string(),
+            retrieval_mode: "full".to_string(),
+            sidecar_query_ms: Some(17),
+            candidate_resolution_ms: Some(3),
+            total_elapsed_ms: Some(20),
+            sidecar_stage_count: 2,
+            sidecar_stage_total_ms: Some(16),
+            candidate_count: 5,
+            resolved_hit_count: 4,
+            unresolved_candidate_count: 1,
+            diagnostic: Some("sidecar candidates did not all resolve".to_string()),
+        };
+
+        let value = serde_json::to_value(&diagnostic).expect("serialize");
+        assert_eq!(value["sidecar_query_ms"], 17);
+        assert_eq!(value["candidate_resolution_ms"], 3);
+        assert_eq!(value["total_elapsed_ms"], 20);
+        assert_eq!(value["sidecar_stage_count"], 2);
+        assert_eq!(value["sidecar_stage_total_ms"], 16);
+
+        let parsed: PacketSidecarQueryDiagnosticDto =
+            serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed.total_elapsed_ms, Some(20));
+        assert_eq!(parsed.sidecar_stage_total_ms, Some(16));
     }
 
     #[test]

@@ -2273,6 +2273,11 @@ mod tests {
         PacketSidecarQueryDiagnosticDto {
             query: query.to_string(),
             retrieval_mode: "full".to_string(),
+            sidecar_query_ms: None,
+            candidate_resolution_ms: None,
+            total_elapsed_ms: None,
+            sidecar_stage_count: 0,
+            sidecar_stage_total_ms: None,
             candidate_count: 1,
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,

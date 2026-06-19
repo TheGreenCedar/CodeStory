@@ -64,6 +64,21 @@ impl TraceRecorder {
         self.finish_with_status(token, AgentRetrievalStepStatusDto::Ok, output, None);
     }
 
+    pub(crate) fn finish_ok_with_duration_ms(
+        &mut self,
+        token: StepToken,
+        output: Vec<AgentRetrievalSummaryFieldDto>,
+        duration_ms: u32,
+    ) {
+        self.finish_with_status_and_duration(
+            token,
+            AgentRetrievalStepStatusDto::Ok,
+            output,
+            None,
+            Some(duration_ms),
+        );
+    }
+
     pub(crate) fn finish_skipped(
         &mut self,
         token: StepToken,
@@ -140,10 +155,23 @@ impl TraceRecorder {
         output: Vec<AgentRetrievalSummaryFieldDto>,
         message: Option<String>,
     ) {
+        self.finish_with_status_and_duration(token, status, output, message, None);
+    }
+
+    fn finish_with_status_and_duration(
+        &mut self,
+        token: StepToken,
+        status: AgentRetrievalStepStatusDto,
+        output: Vec<AgentRetrievalSummaryFieldDto>,
+        message: Option<String>,
+        explicit_duration_ms: Option<u32>,
+    ) {
         let duration_ms = if status == AgentRetrievalStepStatusDto::Skipped {
             0
         } else {
-            token.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32
+            explicit_duration_ms.unwrap_or_else(|| {
+                token.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32
+            })
         };
         self.steps.push(AgentRetrievalStepDto {
             kind: token.kind,

@@ -12,13 +12,14 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, QueryRequest, QueryResult, RetrievalStageKind,
+    CandidateHit, CandidateSource, QueryRequest, QueryResult, QueryTrace, RetrievalStageKind,
     execute_retrieval_query_with_cache, is_phantom_sidecar_hit, project_id_for_root,
     strict_sidecar_status,
 };
 use codestory_store::Store;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_000;
 const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
@@ -508,10 +509,23 @@ struct SidecarCandidateResolutionOutcome {
 fn packet_sidecar_query_diagnostic(
     query_result: &QueryResult,
     resolution: &SidecarCandidateResolutionOutcome,
+    sidecar_query_ms: u32,
+    candidate_resolution_ms: u32,
 ) -> PacketSidecarQueryDiagnosticDto {
+    let total_elapsed_ms = sidecar_query_ms.saturating_add(candidate_resolution_ms);
+    let stage_timings = retrieval_stage_timings(&query_result.trace);
+    let sidecar_stage_total_ms = stage_timings
+        .iter()
+        .map(|stage| stage.elapsed_ms)
+        .fold(0_u32, u32::saturating_add);
     PacketSidecarQueryDiagnosticDto {
         query: query_result.query.clone(),
         retrieval_mode: query_result.trace.retrieval_mode.clone(),
+        sidecar_query_ms: Some(sidecar_query_ms),
+        candidate_resolution_ms: Some(candidate_resolution_ms),
+        total_elapsed_ms: Some(total_elapsed_ms),
+        sidecar_stage_count: u32::try_from(stage_timings.len()).unwrap_or(u32::MAX),
+        sidecar_stage_total_ms: Some(sidecar_stage_total_ms),
         candidate_count: u32::try_from(resolution.attempted_candidate_count).unwrap_or(u32::MAX),
         resolved_hit_count: u32::try_from(resolution.resolved_hits.len()).unwrap_or(u32::MAX),
         unresolved_candidate_count: u32::try_from(resolution.unresolved_candidate_count)
@@ -547,6 +561,7 @@ fn search_sidecar_packet_batch_inner_with_query(
     let mut results = Vec::with_capacity(queries.len());
     let mut diagnostics = Vec::with_capacity(queries.len());
     for (query, max_results) in queries {
+        let query_started_at = Instant::now();
         let query_result =
             run_query(controller, query, Some(per_query_budget as u32)).map_err(|error| {
                 sidecar_retrieval_unavailable_error(
@@ -554,7 +569,9 @@ fn search_sidecar_packet_batch_inner_with_query(
                     format!("sidecar retrieval batch query failed: {error}"),
                 )
             })?;
+        let sidecar_query_ms = clamp_elapsed_ms(query_started_at);
         let max_results = (*max_results).clamp(1, 50);
+        let resolution_started_at = Instant::now();
         let resolution =
             resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results)
                 .map_err(|error| {
@@ -566,7 +583,13 @@ fn search_sidecar_packet_batch_inner_with_query(
                         ),
                     )
                 })?;
-        diagnostics.push(packet_sidecar_query_diagnostic(&query_result, &resolution));
+        let candidate_resolution_ms = clamp_elapsed_ms(resolution_started_at);
+        diagnostics.push(packet_sidecar_query_diagnostic(
+            &query_result,
+            &resolution,
+            sidecar_query_ms,
+            candidate_resolution_ms,
+        ));
         let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
             let diagnostic =
@@ -584,6 +607,10 @@ fn search_sidecar_packet_batch_inner_with_query(
         results,
         diagnostics,
     })
+}
+
+fn clamp_elapsed_ms(started_at: Instant) -> u32 {
+    started_at.elapsed().as_millis().min(u32::MAX as u128) as u32
 }
 
 fn sidecar_packet_batch_rejection_reason(
@@ -950,22 +977,7 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
     admission_labels: &[SidecarCandidateAdmissionLabel],
 ) -> RetrievalShadowDto {
     let trace = &result.trace;
-    let stage_timings = trace
-        .stages
-        .iter()
-        .map(|stage| RetrievalStageTimingDto {
-            stage: stage_kind_label(stage.stage),
-            deadline_ms: u32::try_from(stage.budget_ms).ok(),
-            elapsed_ms: u32::try_from(stage.elapsed_ms).unwrap_or(u32::MAX),
-            candidates_added: u32::try_from(stage.candidates_added).unwrap_or(u32::MAX),
-            marginal_gain: stage.marginal_gain,
-            cancel_reason: stage.cancel_reason.clone(),
-            cache_hit: stage.cache_hit,
-            sidecar_latency_ms: sidecar_stage_latency_ms(stage.stage, stage.elapsed_ms),
-            degraded: stage.degraded,
-            stub_reason: stage.stub_reason.clone(),
-        })
-        .collect();
+    let stage_timings = retrieval_stage_timings(trace);
 
     let candidates = result
         .hits
@@ -1032,6 +1044,25 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
         unresolved_candidate_count: u32::try_from(unresolved_candidate_count).unwrap_or(u32::MAX),
         candidate_resolution_counts,
     }
+}
+
+fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
+    trace
+        .stages
+        .iter()
+        .map(|stage| RetrievalStageTimingDto {
+            stage: stage_kind_label(stage.stage),
+            deadline_ms: u32::try_from(stage.budget_ms).ok(),
+            elapsed_ms: u32::try_from(stage.elapsed_ms).unwrap_or(u32::MAX),
+            candidates_added: u32::try_from(stage.candidates_added).unwrap_or(u32::MAX),
+            marginal_gain: stage.marginal_gain,
+            cancel_reason: stage.cancel_reason.clone(),
+            cache_hit: stage.cache_hit,
+            sidecar_latency_ms: sidecar_stage_latency_ms(stage.stage, stage.elapsed_ms),
+            degraded: stage.degraded,
+            stub_reason: stage.stub_reason.clone(),
+        })
+        .collect()
 }
 
 fn stage_kind_label(kind: RetrievalStageKind) -> String {
@@ -1509,11 +1540,12 @@ mod tests {
             unresolved_candidate_count: 1,
         };
 
-        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution);
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 2, 1);
 
         assert_eq!(diagnostic.candidate_count, 1);
         assert_eq!(diagnostic.resolved_hit_count, 0);
         assert_eq!(diagnostic.unresolved_candidate_count, 1);
+        assert_eq!(diagnostic.total_elapsed_ms, Some(3));
         assert!(diagnostic.diagnostic.is_some());
     }
 
@@ -1918,7 +1950,8 @@ mod tests {
             attempted_candidate_count: 0,
             unresolved_candidate_count: 0,
         };
-        let empty_diagnostic = packet_sidecar_query_diagnostic(&empty_full, &empty_resolution);
+        let empty_diagnostic =
+            packet_sidecar_query_diagnostic(&empty_full, &empty_resolution, 1, 0);
         assert_eq!(empty_diagnostic.candidate_count, 0);
         assert_eq!(empty_diagnostic.resolved_hit_count, 0);
         assert_eq!(empty_diagnostic.unresolved_candidate_count, 0);
@@ -1949,7 +1982,7 @@ mod tests {
             unresolved_candidate_count: 1,
         };
         let unresolved_diagnostic =
-            packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution);
+            packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution, 1, 0);
         assert_eq!(unresolved_diagnostic.candidate_count, 1);
         assert_eq!(unresolved_diagnostic.resolved_hit_count, 0);
         assert_eq!(unresolved_diagnostic.unresolved_candidate_count, 1);
@@ -2051,7 +2084,7 @@ mod tests {
         assert_eq!(resolution.resolved_hits.len(), 1);
         assert_eq!(resolution.unresolved_candidate_count, 0);
 
-        let diagnostic = packet_sidecar_query_diagnostic(&query_result, &resolution);
+        let diagnostic = packet_sidecar_query_diagnostic(&query_result, &resolution, 1, 0);
         assert_eq!(diagnostic.candidate_count, 1);
         assert_eq!(diagnostic.resolved_hit_count, 1);
         assert_eq!(diagnostic.unresolved_candidate_count, 0);

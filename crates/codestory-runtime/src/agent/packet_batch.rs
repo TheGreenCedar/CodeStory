@@ -8,7 +8,8 @@ use super::packet_scoring::{
     packet_subquery_hit_limit,
 };
 use super::packet_trace::{
-    merge_packet_lexical_subquery_batch, merge_packet_semantic_subquery_batch,
+    append_packet_query_timing_fields, merge_packet_lexical_subquery_batch,
+    merge_packet_semantic_subquery_batch, packet_query_diagnostic, packet_query_duration_ms,
 };
 use super::planning::packet_subquery_hybrid_weights;
 use super::trace::field;
@@ -16,8 +17,8 @@ use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal
 use codestory_contracts::api::{
     AgentAnswerDto, AgentHybridWeightsDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketPlanDto, PacketPlanQueryDto, SearchHit, SearchHitOrigin, SearchMatchQualityDto,
-    SemanticFallbackRecordDto,
+    PacketPlanDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit, SearchHitOrigin,
+    SearchMatchQualityDto, SemanticFallbackRecordDto,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -151,13 +152,21 @@ pub(crate) fn run_packet_planned_subqueries(
                 answer
                     .retrieval_trace
                     .packet_sidecar_diagnostics
-                    .extend(outcome.sidecar_diagnostics);
+                    .extend(outcome.sidecar_diagnostics.clone());
                 let results = outcome.results;
+                let diagnostics = outcome.sidecar_diagnostics;
+                annotate_packet_batch_timing(
+                    answer,
+                    "packet_lexical_subquery_batch",
+                    duration_ms,
+                    &diagnostics,
+                );
                 merge_packet_lexical_subquery_batch(
                     answer,
                     &lexical_pending,
                     &results,
                     duration_ms,
+                    &diagnostics,
                     include_evidence,
                     rank_terms,
                     stage_carry_limit,
@@ -201,13 +210,21 @@ pub(crate) fn run_packet_planned_subqueries(
                             answer
                                 .retrieval_trace
                                 .packet_sidecar_diagnostics
-                                .extend(outcome.sidecar_diagnostics);
+                                .extend(outcome.sidecar_diagnostics.clone());
+                            let diagnostics = outcome.sidecar_diagnostics;
                             record_semantic_fallbacks(answer, &outcome.fallbacks);
+                            annotate_packet_batch_timing(
+                                answer,
+                                "packet_lexical_subquery_hybrid_retry_batch",
+                                retry_duration_ms,
+                                &diagnostics,
+                            );
                             merge_packet_semantic_subquery_batch(
                                 answer,
                                 &hybrid_retry_pending,
                                 &outcome.results,
                                 retry_duration_ms,
+                                &diagnostics,
                                 include_evidence,
                                 rank_terms,
                                 budget,
@@ -263,13 +280,21 @@ pub(crate) fn run_packet_planned_subqueries(
                     answer
                         .retrieval_trace
                         .packet_sidecar_diagnostics
-                        .extend(outcome.sidecar_diagnostics);
+                        .extend(outcome.sidecar_diagnostics.clone());
+                    let diagnostics = outcome.sidecar_diagnostics;
                     record_semantic_fallbacks(answer, &outcome.fallbacks);
+                    annotate_packet_batch_timing(
+                        answer,
+                        "packet_semantic_subquery_batch",
+                        duration_ms,
+                        &diagnostics,
+                    );
                     merge_packet_semantic_subquery_batch(
                         answer,
                         &semantic_pending,
                         &outcome.results,
                         duration_ms,
+                        &diagnostics,
                         include_evidence,
                         rank_terms,
                         budget,
@@ -316,6 +341,44 @@ pub(crate) fn record_semantic_fallbacks(
             "semantic_fallback_summary count={} degraded_runtime=true",
             fallbacks.len()
         ));
+    }
+}
+
+fn annotate_packet_batch_timing(
+    answer: &mut AgentAnswerDto,
+    label: &str,
+    duration_ms: u32,
+    diagnostics: &[PacketSidecarQueryDiagnosticDto],
+) {
+    let attributed_ms = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.total_elapsed_ms.or(diagnostic.sidecar_query_ms))
+        .fold(0_u32, u32::saturating_add);
+    let overhead_ms = duration_ms.saturating_sub(attributed_ms);
+    answer.retrieval_trace.annotations.push(format!(
+        "{label} total_ms={} attributed_query_ms={} overhead_ms={} queries={}",
+        duration_ms,
+        attributed_ms,
+        overhead_ms,
+        diagnostics.len()
+    ));
+}
+
+fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
+    let Some(diagnostic) = diagnostic else {
+        return String::new();
+    };
+    match (
+        diagnostic.sidecar_query_ms,
+        diagnostic.candidate_resolution_ms,
+        diagnostic.total_elapsed_ms,
+    ) {
+        (Some(query_ms), Some(resolution_ms), Some(total_ms)) => format!(
+            " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={}",
+            query_ms, resolution_ms, total_ms
+        ),
+        (_, _, Some(total_ms)) => format!(" total_elapsed_ms={total_ms}"),
+        _ => String::new(),
     }
 }
 
@@ -401,10 +464,20 @@ pub(crate) fn run_packet_anchor_expansion(
             answer
                 .retrieval_trace
                 .packet_sidecar_diagnostics
-                .extend(outcome.sidecar_diagnostics);
+                .extend(outcome.sidecar_diagnostics.clone());
+            let diagnostics = outcome.sidecar_diagnostics;
+            annotate_packet_batch_timing(
+                answer,
+                "packet_anchor_probe_batch",
+                duration_ms,
+                &diagnostics,
+            );
             let results = outcome.results;
             let per_step_duration = duration_ms / results.len().max(1) as u32;
-            for (query, hits) in results {
+            for (diagnostic_index, (query, hits)) in results.into_iter().enumerate() {
+                let diagnostic = packet_query_diagnostic(&diagnostics, diagnostic_index, &query);
+                let step_duration =
+                    packet_query_duration_ms(diagnostic).unwrap_or(per_step_duration);
                 let mut added = 0usize;
                 let mut citations = hits
                     .iter()
@@ -422,24 +495,28 @@ pub(crate) fn run_packet_anchor_expansion(
                         added = added.saturating_add(1);
                     }
                 }
+                let mut output = vec![
+                    field("hits", hits.len().to_string()),
+                    field("accepted_hits", added.to_string()),
+                    field("stage_carry_limit", stage_carry_limit.to_string()),
+                    field("mode", "symbolic_packet_anchor_probe"),
+                ];
+                append_packet_query_timing_fields(&mut output, diagnostic);
                 answer.retrieval_trace.steps.push(AgentRetrievalStepDto {
                     kind: AgentRetrievalStepKindDto::Search,
                     status: AgentRetrievalStepStatusDto::Ok,
-                    duration_ms: per_step_duration,
+                    duration_ms: step_duration,
                     input: vec![field("query", query.clone())],
-                    output: vec![
-                        field("hits", hits.len().to_string()),
-                        field("accepted_hits", added.to_string()),
-                        field("stage_carry_limit", stage_carry_limit.to_string()),
-                        field("mode", "symbolic_packet_anchor_probe"),
-                    ],
+                    output,
                     message: Some("Packet symbol probe expanded broad task wording.".to_string()),
                 });
+                let timing_note = packet_anchor_timing_annotation(diagnostic);
                 answer.retrieval_trace.annotations.push(format!(
-                    "packet_anchor_probe query=`{}` hits={} added={}",
+                    "packet_anchor_probe query=`{}` hits={} added={}{}",
                     query.replace('`', "'"),
                     hits.len(),
-                    added
+                    added,
+                    timing_note
                 ));
             }
         }
