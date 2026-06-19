@@ -13,7 +13,7 @@ use codestory_contracts::api::{
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
     CandidateHit, CandidateSource, QueryRequest, QueryResult, QueryTrace,
-    execute_retrieval_query_with_cache, is_phantom_sidecar_hit, project_id_for_root,
+    execute_retrieval_query_with_cache, is_phantom_sidecar_hit, sidecar_project_id_for_root,
     strict_sidecar_status,
 };
 use codestory_store::Store;
@@ -241,7 +241,7 @@ fn retrieval_manifest_exists(storage_path: &Path, project_root: &Path) -> bool {
     let Ok(storage) = Store::open(storage_path) else {
         return false;
     };
-    let project_id = project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_root(project_root);
     storage
         .get_retrieval_index_manifest(&project_id)
         .ok()
@@ -1374,7 +1374,7 @@ mod tests {
     use super::*;
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
-        test_support::retrieval_manifest_fixture,
+        project_id_for_root, test_support::retrieval_manifest_fixture,
     };
 
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1784,6 +1784,37 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_manifest_exists_uses_canonical_sidecar_project_id_for_clean_repos() {
+        let Some(project) = git_project() else {
+            return;
+        };
+        let storage_dir = tempfile::tempdir().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let canonical_id = sidecar_project_id_for_root(project.path());
+        let root_id = project_id_for_root(project.path());
+        assert_ne!(canonical_id, root_id);
+        upsert_manifest(&storage_path, &canonical_id);
+
+        assert!(retrieval_manifest_exists(&storage_path, project.path()));
+
+        std::fs::write(project.path().join("lib.rs"), "pub fn dirty() {}\n").expect("dirty source");
+        assert!(!retrieval_manifest_exists(&storage_path, project.path()));
+    }
+
+    #[test]
+    fn retrieval_manifest_exists_uses_root_id_for_unidentifiable_repos() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_dir = tempfile::tempdir().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        upsert_manifest(&storage_path, "repo-v1-ffffffffffffffff");
+        assert!(!retrieval_manifest_exists(&storage_path, project.path()));
+
+        let root_id = project_id_for_root(project.path());
+        upsert_manifest(&storage_path, &root_id);
+        assert!(retrieval_manifest_exists(&storage_path, project.path()));
+    }
+
+    #[test]
     fn sidecar_mode_status_rejects_stale_manifest_before_health_probe() {
         let project = tempfile::tempdir().expect("project");
         let storage_dir = tempfile::tempdir().expect("storage");
@@ -1808,6 +1839,84 @@ mod tests {
         assert!(
             reason.contains("sidecar_embedding_backend_changed"),
             "expected embedding backend detail, got: {reason}"
+        );
+    }
+
+    fn upsert_manifest(storage_path: &Path, project_id: &str) {
+        let hash = "deadbeefcafebabe";
+        let generation = format!("{project_id}-{hash}");
+        let qdrant_collection = format!("codestory_{project_id}_{hash}");
+        let built_at_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis() as i64;
+        let mut storage = Store::open(storage_path).expect("open storage");
+        storage
+            .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
+                project_id: project_id.into(),
+                zoekt_version: "zoekt-real-v1".into(),
+                qdrant_collection,
+                scip_revision: Some("graph-test".into()),
+                built_at_epoch_ms,
+                disk_bytes: None,
+                degraded_modes_json: "[]".into(),
+                embedding_backend: Some(codestory_retrieval::embedding_runtime_id()),
+                embedding_dim: Some(codestory_retrieval::RETRIEVAL_EMBEDDING_DIM as i32),
+                sidecar_schema_version: Some(codestory_retrieval::SIDECAR_SCHEMA_VERSION),
+                sidecar_input_hash: Some(hash.into()),
+                sidecar_generation: Some(generation),
+                projection_count: Some(0),
+                symbol_doc_count: Some(0),
+                dense_projection_count: Some(0),
+                semantic_policy_version: Some("graph_first_v1".into()),
+                graph_artifact_hash: Some("graph-test-hash".into()),
+                dense_reason_counts_json: Some("{}".into()),
+            })
+            .expect("manifest");
+    }
+
+    fn git_project() -> Option<tempfile::TempDir> {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return None;
+        }
+        let project = tempfile::tempdir().expect("project");
+        git(project.path(), &["init"]);
+        git(
+            project.path(),
+            &["config", "user.email", "codestory@example.invalid"],
+        );
+        git(project.path(), &["config", "user.name", "CodeStory Test"]);
+        git(
+            project.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/TheGreenCedar/CodeStory.git",
+            ],
+        );
+        std::fs::write(project.path().join("lib.rs"), "pub fn run() {}\n").expect("write source");
+        git(project.path(), &["add", "."]);
+        git(project.path(), &["commit", "-m", "init"]);
+        Some(project)
+    }
+
+    fn git(project: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

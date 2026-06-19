@@ -2,7 +2,7 @@ use crate::cache::RetrievalCache;
 use crate::config::SidecarLayout;
 use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
 use crate::generation::manifest_unavailable_reason;
-use crate::index::project_id_for_root;
+use crate::index::sidecar_project_id_for_root;
 use crate::sidecar::validate_strict_sidecar_readiness;
 use crate::sidecar_search::LiveSidecarSearch;
 use anyhow::{Context, Result, bail};
@@ -30,7 +30,7 @@ pub fn execute_retrieval_query_with_cache(
     cache: &mut RetrievalCache,
 ) -> Result<QueryResult> {
     let layout = SidecarLayout::from_env();
-    let project_id = project_id_for_root(request.project_root);
+    let project_id = sidecar_project_id_for_root(request.project_root);
     let (manifest, file_roles) = if request.storage_path.exists() {
         let storage = Store::open(request.storage_path).context("open storage for query")?;
         let manifest = storage
