@@ -225,7 +225,7 @@ fn strict_batch_worker_limit(query_count: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    // ponytail: cap sidecar fan-out; make this configurable only if telemetry needs it.
+    // Cap sidecar fan-out; make this configurable only if telemetry needs it.
     query_count
         .min(available)
         .min(STRICT_BATCH_WORKER_CAP)
