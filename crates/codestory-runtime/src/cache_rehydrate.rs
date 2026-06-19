@@ -176,7 +176,7 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         invalidated_index_artifact_rows,
         rebased_path_bound_rows,
         preserved_scope: "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved".into(),
-        retrieval: "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests invalidated because sidecar identities are root derived".into(),
+        retrieval: retrieval_rehydrate_policy(request.dry_run),
         next_commands: rehydrate_next_commands(request.target_project),
     })
 }
@@ -403,6 +403,17 @@ fn rehydrate_next_commands(project: &Path) -> Vec<String> {
     ]
 }
 
+fn retrieval_rehydrate_policy(dry_run: bool) -> String {
+    let action = if dry_run {
+        "would be invalidated"
+    } else {
+        "invalidated"
+    };
+    format!(
+        "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests {action} because cache rehydrate copies SQLite cache state only; Zoekt/Qdrant/SCIP sidecar directories live outside the copied cache and must be revalidated by retrieval index before reuse"
+    )
+}
+
 fn quote_path(path: &Path) -> String {
     let value = path.to_string_lossy();
     if value.contains([' ', '"', '\'']) {
@@ -451,6 +462,13 @@ mod tests {
         assert_eq!(
             output.preserved_scope,
             "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved"
+        );
+        assert!(
+            output
+                .retrieval
+                .contains("retrieval manifests invalidated because cache rehydrate copies SQLite cache state only"),
+            "rehydrate output should name the fail-closed sidecar rebuild reason: {}",
+            output.retrieval
         );
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
