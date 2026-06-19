@@ -4074,6 +4074,42 @@ function packetBatchTiming(timings, label, key) {
   return finiteNumber(timings.find((timing) => timing.label === label)?.[key]);
 }
 
+function packetNonTracePhaseTimings(annotations) {
+  if (!Array.isArray(annotations)) {
+    return [];
+  }
+  const pattern = /^packet_non_trace_phase label=([a-z_]+) duration_ms=(\d+)$/;
+  return annotations
+    .map((annotation) => pattern.exec(String(annotation ?? "")))
+    .filter(Boolean)
+    .map((match) => ({
+      label: match[1],
+      duration_ms: Number(match[2]),
+    }));
+}
+
+function packetNonTracePhaseTiming(timings, label) {
+  return finiteNumber(timings.find((timing) => timing.label === label)?.duration_ms);
+}
+
+function packetStdioPhaseTimings(annotations) {
+  if (!Array.isArray(annotations)) {
+    return [];
+  }
+  const pattern = /^packet_stdio_phase label=([a-z_]+) duration_ms=(\d+)$/;
+  return annotations
+    .map((annotation) => pattern.exec(String(annotation ?? "")))
+    .filter(Boolean)
+    .map((match) => ({
+      label: match[1],
+      duration_ms: Number(match[2]),
+    }));
+}
+
+function packetStdioPhaseTiming(timings, label) {
+  return finiteNumber(timings.find((timing) => timing.label === label)?.duration_ms);
+}
+
 function topPacketSearchQueries(searchSteps, limit = 8) {
   return [...searchSteps]
     .sort((left, right) => {
@@ -4097,6 +4133,8 @@ function packetLatencyTelemetry(packet, wallMs) {
   const topStep = [...steps].sort((left, right) => (right.duration_ms ?? 0) - (left.duration_ms ?? 0))[0] ?? null;
   const searchSteps = packetSearchStepTelemetry(steps);
   const batchTimings = packetBatchTimings(retrievalTrace?.annotations);
+  const nonTracePhaseTimings = packetNonTracePhaseTimings(retrievalTrace?.annotations);
+  const stdioPhaseTimings = packetStdioPhaseTimings(retrievalTrace?.annotations);
   const retrievalTotalMs = finiteNumber(retrievalTrace?.total_latency_ms);
   const freshnessMs = finiteNumber(freshness?.duration_ms);
   const accountedTraceMs =
@@ -4138,6 +4176,18 @@ function packetLatencyTelemetry(packet, wallMs) {
     packet_lexical_subquery_batch_attributed_query_ms: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "attributed_query_ms"),
     packet_lexical_subquery_batch_overhead_ms: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "overhead_ms"),
     packet_lexical_subquery_batch_queries: packetBatchTiming(batchTimings, "packet_lexical_subquery_batch", "queries"),
+    packet_non_trace_phase_timings: nonTracePhaseTimings,
+    packet_non_trace_phase_total_ms: nonTracePhaseTimings.reduce((sum, timing) => sum + timing.duration_ms, 0),
+    packet_rank_and_window_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "rank_and_window"),
+    packet_shadow_and_trace_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "shadow_and_trace"),
+    packet_budget_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "budget"),
+    packet_evidence_sections_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "evidence_sections"),
+    packet_sufficiency_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "sufficiency"),
+    packet_trace_summary_ms: packetNonTracePhaseTiming(nonTracePhaseTimings, "trace_summary"),
+    packet_stdio_phase_timings: stdioPhaseTimings,
+    packet_stdio_phase_total_ms: stdioPhaseTimings.reduce((sum, timing) => sum + timing.duration_ms, 0),
+    packet_stdio_text_materialization_ms: packetStdioPhaseTiming(stdioPhaseTimings, "text_materialization"),
+    packet_stdio_tool_response_materialization_ms: packetStdioPhaseTiming(stdioPhaseTimings, "tool_response_materialization"),
     retrieval_shadow: retrievalShadow,
   };
 }
@@ -4441,6 +4491,16 @@ function summarizePacketRuntimeRuns(results) {
       median_packet_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_batch_overhead_ms)),
       median_packet_anchor_probe_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_anchor_probe_batch_overhead_ms)),
       median_packet_lexical_subquery_batch_overhead_ms: median(latencyRows.map((row) => row.packet_latency?.packet_lexical_subquery_batch_overhead_ms)),
+      median_packet_non_trace_phase_total_ms: median(latencyRows.map((row) => row.packet_latency?.packet_non_trace_phase_total_ms)),
+      median_packet_rank_and_window_ms: median(latencyRows.map((row) => row.packet_latency?.packet_rank_and_window_ms)),
+      median_packet_shadow_and_trace_ms: median(latencyRows.map((row) => row.packet_latency?.packet_shadow_and_trace_ms)),
+      median_packet_budget_ms: median(latencyRows.map((row) => row.packet_latency?.packet_budget_ms)),
+      median_packet_evidence_sections_ms: median(latencyRows.map((row) => row.packet_latency?.packet_evidence_sections_ms)),
+      median_packet_sufficiency_ms: median(latencyRows.map((row) => row.packet_latency?.packet_sufficiency_ms)),
+      median_packet_trace_summary_ms: median(latencyRows.map((row) => row.packet_latency?.packet_trace_summary_ms)),
+      median_packet_stdio_phase_total_ms: median(latencyRows.map((row) => row.packet_latency?.packet_stdio_phase_total_ms)),
+      median_packet_stdio_text_materialization_ms: median(latencyRows.map((row) => row.packet_latency?.packet_stdio_text_materialization_ms)),
+      median_packet_stdio_tool_response_materialization_ms: median(latencyRows.map((row) => row.packet_latency?.packet_stdio_tool_response_materialization_ms)),
       packet_sla_missed_runs: latencyRows.filter((row) => row.packet_latency?.sla_missed === true).length,
       warm_stdio_packet_cache_hit_runs: successful.filter((row) => row.warm_stdio_packet_cache_hit === true).length,
       retrieval_shadow_cache_hit_runs: shadowRows.filter((shadow) => shadow.cache_hit === true).length,
@@ -4465,8 +4525,8 @@ function packetRuntimeMarkdown(summary) {
   const lines = [
     "# Packet Runtime Benchmark",
     "",
-    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Repo | Task | Mode | Runs | Pass | Quality Pass | Sufficiency | Suff/quality gaps | Wall ms median | Retrieval ms median | Freshness ms median | Non-trace wall ms median | Post-retrieval phases ms median | Stdio phases ms median | Budget ms median | Sufficiency ms median | Batch total ms median | Batch attributed ms median | Batch overhead ms median | Anchor batch overhead ms median | Lexical batch overhead ms median | Top step | Top step ms median | SLA misses | Packet-cache hits | Retrieval cache-hit runs | Stage cache-hit runs | Response bytes median | Packet bytes median | Graph bytes median | Avoid-open median | Follow-up median | File recall | Citation coverage | Packet citation recall | Packet answer-surface recall | Packet structured recall |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const row of summary) {
     lines.push(packetRuntimeMarkdownRow(row));
@@ -4491,6 +4551,10 @@ function packetRuntimeMarkdownRow(row) {
     formatValue(row.median_packet_retrieval_total_ms),
     formatValue(row.median_packet_freshness_ms),
     formatValue(row.median_packet_unaccounted_ms),
+    formatValue(row.median_packet_non_trace_phase_total_ms),
+    formatValue(row.median_packet_stdio_phase_total_ms),
+    formatValue(row.median_packet_budget_ms),
+    formatValue(row.median_packet_sufficiency_ms),
     formatValue(row.median_packet_batch_total_ms),
     formatValue(row.median_packet_batch_attributed_query_ms),
     formatValue(row.median_packet_batch_overhead_ms),
@@ -5879,6 +5943,10 @@ function runSelfTest() {
         annotations: [
           "packet_anchor_probe_batch total_ms=25 attributed_query_ms=20 overhead_ms=5 queries=2",
           "packet_lexical_subquery_batch total_ms=40 attributed_query_ms=31 overhead_ms=9 queries=3",
+          "packet_non_trace_phase label=budget duration_ms=7",
+          "packet_non_trace_phase label=sufficiency duration_ms=11",
+          "packet_stdio_phase label=text_materialization duration_ms=3",
+          "packet_stdio_phase label=tool_response_materialization duration_ms=4",
         ],
         steps: [],
       },
@@ -5899,6 +5967,12 @@ function runSelfTest() {
   assert.equal(packetLatency.packet_batch_overhead_ms, 14);
   assert.equal(packetLatency.packet_anchor_probe_batch_overhead_ms, 5);
   assert.equal(packetLatency.packet_lexical_subquery_batch_overhead_ms, 9);
+  assert.equal(packetLatency.packet_non_trace_phase_total_ms, 18);
+  assert.equal(packetLatency.packet_budget_ms, 7);
+  assert.equal(packetLatency.packet_sufficiency_ms, 11);
+  assert.equal(packetLatency.packet_stdio_phase_total_ms, 7);
+  assert.equal(packetLatency.packet_stdio_text_materialization_ms, 3);
+  assert.equal(packetLatency.packet_stdio_tool_response_materialization_ms, 4);
   assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }), true);
   assert.equal(preludeAllowsAgentRun({ status: "pass_with_warnings" }, { publishable: true }), false);
   const weakPacketTelemetry = packetSufficiencyTelemetry(

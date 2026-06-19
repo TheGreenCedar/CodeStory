@@ -82,7 +82,7 @@ use crate::agent::retrieval_primary::{
 use crate::agent::trace::{TraceRecorder, field};
 use crate::agent::trace_export;
 use crate::{
-    AppController, FocusedSourceContext, HybridSearchScoredHit,
+    AppController, FocusedSourceContext, HybridSearchScoredHit, clamp_u128_to_u32,
     fallback_mermaid as diagnostic_mermaid, hybrid_retrieval_enabled, mermaid_flowchart,
     mermaid_gantt, mermaid_sequence, query_mentions_non_primary_source,
 };
@@ -443,9 +443,13 @@ pub(crate) fn agent_packet(
         &mut answer,
     );
     packet_latency.apply_to_trace(&mut answer);
+
+    let phase_started = Instant::now();
     rank_packet_evidence(&question, &mut answer);
     maybe_annotate_packet_candidate_window(&question, &limits, &mut answer);
+    append_packet_non_trace_phase(&mut answer, "rank_and_window", phase_started);
 
+    let phase_started = Instant::now();
     if answer.retrieval_trace.retrieval_shadow.is_none()
         && let Some(shadow) =
             maybe_run_retrieval_shadow(controller, &question, req.latency_budget_ms)
@@ -461,8 +465,10 @@ pub(crate) fn agent_packet(
     }
     maybe_log_rollback_after_packet(controller, answer.retrieval_trace.retrieval_shadow.as_ref());
     append_packet_step_trace_annotation(&mut answer);
+    append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
     let sufficiency_extra_probes = packet_plan_sufficiency_extra_probes(&plan, &extra_probes);
+    let phase_started = Instant::now();
     let budget = apply_packet_budget_with_extra(
         &project_root,
         &question,
@@ -472,7 +478,11 @@ pub(crate) fn agent_packet(
         &mut answer,
         &sufficiency_extra_probes,
     );
+    append_packet_non_trace_phase(&mut answer, "budget", phase_started);
+    let phase_started = Instant::now();
     append_packet_evidence_sections(&mut answer, plan.task_class, &limits);
+    append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
+    let phase_started = Instant::now();
     let sufficiency = build_packet_sufficiency_with_extra(
         &project_root,
         &question,
@@ -481,7 +491,10 @@ pub(crate) fn agent_packet(
         &budget,
         &sufficiency_extra_probes,
     );
+    append_packet_non_trace_phase(&mut answer, "sufficiency", phase_started);
+    let phase_started = Instant::now();
     let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
+    append_packet_non_trace_phase(&mut answer, "trace_summary", phase_started);
 
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
@@ -501,6 +514,20 @@ pub(crate) fn agent_packet(
     }
 
     Ok(packet)
+}
+
+fn append_packet_non_trace_phase(answer: &mut AgentAnswerDto, label: &str, started_at: Instant) {
+    answer
+        .retrieval_trace
+        .annotations
+        .push(packet_non_trace_phase_annotation(
+            label,
+            clamp_u128_to_u32(started_at.elapsed().as_millis()),
+        ));
+}
+
+fn packet_non_trace_phase_annotation(label: &str, duration_ms: u32) -> String {
+    format!("packet_non_trace_phase label={label} duration_ms={duration_ms}")
 }
 
 fn packet_plan_sufficiency_extra_probes(
@@ -9196,6 +9223,14 @@ mod tests {
         assert_eq!(answer.retrieval_trace.total_latency_ms, 1_150);
         assert!(answer.retrieval_trace.sla_missed);
         assert_eq!(answer.retrieval_trace.sla_target_ms, Some(1_000));
+    }
+
+    #[test]
+    fn packet_non_trace_phase_annotation_is_machine_readable() {
+        assert_eq!(
+            packet_non_trace_phase_annotation("budget", 42),
+            "packet_non_trace_phase label=budget duration_ms=42"
+        );
     }
 
     #[test]
