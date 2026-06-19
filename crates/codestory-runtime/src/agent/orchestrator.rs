@@ -431,6 +431,7 @@ pub(crate) fn agent_packet(
         &rank_terms,
         &mut answer,
     )?;
+    let phase_started = Instant::now();
     maybe_append_sql_schema_file_citations(&project_root, &question, &mut answer);
     maybe_append_generic_source_shape_citations(&project_root, &question, &mut answer);
     let file_scoped_source_probes =
@@ -442,7 +443,10 @@ pub(crate) fn agent_packet(
         &file_scoped_source_probes,
         &mut answer,
     );
+    append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
+    let phase_started = Instant::now();
     packet_latency.apply_to_trace(&mut answer);
+    append_packet_non_trace_phase(&mut answer, "trace_apply", phase_started);
 
     let phase_started = Instant::now();
     rank_packet_evidence(&question, &mut answer);
@@ -496,6 +500,7 @@ pub(crate) fn agent_packet(
     let retrieval_trace_summary = trace_export::packet_retrieval_trace_summary(&answer);
     append_packet_non_trace_phase(&mut answer, "trace_summary", phase_started);
 
+    let phase_started = Instant::now();
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
         question,
@@ -506,10 +511,21 @@ pub(crate) fn agent_packet(
         sufficiency,
         retrieval_trace_summary,
     };
+    append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
+    let phase_started = Instant::now();
+    enforce_packet_output_budget(&project_root, &mut packet);
+    append_packet_non_trace_phase(&mut packet.answer, "output_budget", phase_started);
     enforce_packet_output_budget(&project_root, &mut packet);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
         packet.answer.retrieval_trace.annotations.push(diagnostic);
+        let phase_started = Instant::now();
+        enforce_packet_output_budget(&project_root, &mut packet);
+        append_packet_non_trace_phase(
+            &mut packet.answer,
+            "trace_artifact_output_budget",
+            phase_started,
+        );
         enforce_packet_output_budget(&project_root, &mut packet);
     }
 
@@ -9231,6 +9247,14 @@ mod tests {
             packet_non_trace_phase_annotation("budget", 42),
             "packet_non_trace_phase label=budget duration_ms=42"
         );
+        assert_eq!(
+            packet_non_trace_phase_annotation("pre_rank_citations", 7),
+            "packet_non_trace_phase label=pre_rank_citations duration_ms=7"
+        );
+        assert_eq!(
+            packet_non_trace_phase_annotation("trace_apply", 3),
+            "packet_non_trace_phase label=trace_apply duration_ms=3"
+        );
     }
 
     #[test]
@@ -9771,6 +9795,15 @@ mod tests {
             max_output_bytes
         );
         assert_eq!(packet.budget.used.output_bytes as usize, serialized_len);
+        append_packet_non_trace_phase(&mut packet.answer, "output_budget", Instant::now());
+        enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
+        let serialized_len = serde_json::to_vec(&packet)
+            .expect("serialize packet after output budget marker")
+            .len();
+        assert_eq!(
+            packet.budget.used.output_bytes as usize, serialized_len,
+            "final diagnostic marker must be included in packet output accounting"
+        );
         assert!(
             packet
                 .answer
