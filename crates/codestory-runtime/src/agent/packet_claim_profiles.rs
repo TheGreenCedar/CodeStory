@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::agent::eval_probes::eval_probes_enabled;
 use crate::agent::packet_citations::packet_citation_source_text;
 use crate::agent::packet_evidence_roles::PacketEvidenceRole;
@@ -359,10 +360,10 @@ pub(crate) fn packet_source_derived_claims_for_citation(
     source: &str,
 ) -> Vec<String> {
     let mut claims = Vec::new();
-    let eval_diagnostics = eval_probes_enabled();
     let ctx = SourceClaimContext::new(prompt, citation, source);
 
-    if eval_diagnostics {
+    #[cfg(test)]
+    if eval_probes_enabled() {
         claims.extend(
             crate::agent::eval_probes::source_derived_claims_for_citation(prompt, citation, source),
         );
@@ -386,9 +387,6 @@ pub(crate) fn packet_source_derived_claim_for_role(
     }
     let ctx = SourceClaimContext::new(prompt, citation, &source);
     let request_flow = packet_terms_indicate_request_dispatch_flow(&ctx.prompt_terms);
-    let command_flow = packet_terms_indicate_event_loop_command_flow(&ctx.prompt_terms);
-    let search_flow = packet_terms_indicate_search_execution_flow(&ctx.prompt_terms);
-    let eval_diagnostics = eval_probes_enabled();
 
     if request_flow && let Some(claim) = python_like_request_dispatch_claim_for_role(&ctx) {
         return Some(claim);
@@ -420,75 +418,82 @@ pub(crate) fn packet_source_derived_claim_for_role(
         }
     }
 
-    if eval_diagnostics && command_flow && event_loop_prompt(&ctx) {
-        if let Some(claim) = event_loop_entry_claim(&ctx) {
+    #[cfg(test)]
+    {
+        let eval_diagnostics = eval_probes_enabled();
+        let command_flow = packet_terms_indicate_event_loop_command_flow(&ctx.prompt_terms);
+        let search_flow = packet_terms_indicate_search_execution_flow(&ctx.prompt_terms);
+
+        if eval_diagnostics && command_flow && event_loop_prompt(&ctx) {
+            if let Some(claim) = event_loop_entry_claim(&ctx) {
+                return Some(claim);
+            }
+            if let Some(claim) = event_loop_process_events_claim(&ctx) {
+                return Some(claim);
+            }
+        }
+
+        if eval_diagnostics
+            && command_flow
+            && role == PacketEvidenceRole::NetworkCommandInput
+            && let Some(claim) = network_command_input_claim(&ctx)
+        {
             return Some(claim);
         }
-        if let Some(claim) = event_loop_process_events_claim(&ctx) {
+
+        if eval_diagnostics && command_flow && role == PacketEvidenceRole::CommandDispatch {
+            if let Some(claim) = command_dispatch_table_claim(&ctx) {
+                return Some(claim);
+            }
+            if let Some(claim) = command_dispatch_call_claim(&ctx) {
+                return Some(claim);
+            }
+        }
+
+        if eval_diagnostics
+            && search_flow
+            && role == PacketEvidenceRole::SearchDriver
+            && let Some(claim) = search_driver_claim(&ctx)
+        {
             return Some(claim);
         }
-    }
 
-    if eval_diagnostics
-        && command_flow
-        && role == PacketEvidenceRole::NetworkCommandInput
-        && let Some(claim) = network_command_input_claim(&ctx)
-    {
-        return Some(claim);
-    }
-
-    if eval_diagnostics && command_flow && role == PacketEvidenceRole::CommandDispatch {
-        if let Some(claim) = command_dispatch_table_claim(&ctx) {
+        if eval_diagnostics
+            && search_flow
+            && role == PacketEvidenceRole::ArgumentPlanning
+            && let Some(claim) = argument_planning_claim(&ctx)
+        {
             return Some(claim);
         }
-        if let Some(claim) = command_dispatch_call_claim(&ctx) {
+
+        if eval_diagnostics
+            && search_flow
+            && role == PacketEvidenceRole::SearchExecutionUnit
+            && let Some(claim) = search_execution_state_claim(&ctx)
+        {
             return Some(claim);
         }
-    }
 
-    if eval_diagnostics
-        && search_flow
-        && role == PacketEvidenceRole::SearchDriver
-        && let Some(claim) = search_driver_claim(&ctx)
-    {
-        return Some(claim);
-    }
+        if eval_diagnostics
+            && search_flow
+            && let Some(claim) = search_walk_claim(&ctx)
+        {
+            return Some(claim);
+        }
 
-    if eval_diagnostics
-        && search_flow
-        && role == PacketEvidenceRole::ArgumentPlanning
-        && let Some(claim) = argument_planning_claim(&ctx)
-    {
-        return Some(claim);
-    }
+        if eval_diagnostics
+            && search_flow
+            && let Some(claim) = parallel_search_claim(&ctx)
+        {
+            return Some(claim);
+        }
 
-    if eval_diagnostics
-        && search_flow
-        && role == PacketEvidenceRole::SearchExecutionUnit
-        && let Some(claim) = search_execution_state_claim(&ctx)
-    {
-        return Some(claim);
-    }
-
-    if eval_diagnostics
-        && search_flow
-        && let Some(claim) = search_walk_claim(&ctx)
-    {
-        return Some(claim);
-    }
-
-    if eval_diagnostics
-        && search_flow
-        && let Some(claim) = parallel_search_claim(&ctx)
-    {
-        return Some(claim);
-    }
-
-    if eval_diagnostics
-        && search_flow
-        && let Some(claim) = search_execution_method_claim(&ctx)
-    {
-        return Some(claim);
+        if eval_diagnostics
+            && search_flow
+            && let Some(claim) = search_execution_method_claim(&ctx)
+        {
+            return Some(claim);
+        }
     }
 
     None

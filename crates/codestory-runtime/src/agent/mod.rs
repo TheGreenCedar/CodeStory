@@ -1,4 +1,5 @@
 pub(crate) mod citation;
+#[cfg(test)]
 pub(crate) mod eval_probes;
 pub(crate) mod nucleo_policy;
 pub(crate) mod orchestrator;
@@ -23,7 +24,6 @@ pub(crate) mod packet_trace;
 pub(crate) mod planning;
 pub(crate) mod profiles;
 pub(crate) mod retrieval_primary;
-pub(crate) mod retrieval_rollback;
 pub(crate) mod trace;
 pub(crate) mod trace_export;
 

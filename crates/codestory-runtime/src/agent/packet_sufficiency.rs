@@ -793,6 +793,7 @@ pub(crate) fn packet_claim_family(claim: &PacketClaimDto) -> Option<&'static str
         .or_else(|| (!claim.citations.is_empty()).then_some("source evidence"))
 }
 
+#[cfg(test)]
 pub(crate) fn packet_claim_can_satisfy_sufficiency(claim: &PacketClaimDto) -> bool {
     packet_claim_ineligibility_reason(claim, false, false).is_none()
 }
@@ -1467,6 +1468,7 @@ impl StructuralLanguagePolicy {
     }
 }
 
+#[cfg(test)]
 fn packet_missing_required_flow_roles(
     question: &str,
     task_class: PacketTaskClassDto,
@@ -1499,6 +1501,7 @@ fn packet_missing_required_flow_requirements(
         .collect()
 }
 
+#[cfg(test)]
 fn packet_missing_requirement_roles(requirements: &[FlowRequirement]) -> Vec<FlowRole> {
     let mut roles = Vec::new();
     for requirement in requirements {

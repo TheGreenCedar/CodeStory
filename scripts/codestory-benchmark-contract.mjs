@@ -4,8 +4,6 @@ import { existsSync, readFileSync } from "node:fs";
 const RETRIEVAL_ENV_KEYS = [
   "CODESTORY_RETRIEVAL",
   "CODESTORY_RETRIEVAL_SHADOW",
-  "CODESTORY_RETRIEVAL_V2",
-  "CODESTORY_RETRIEVAL_V2_SHADOW",
   "CODESTORY_QDRANT_ENABLED",
   "CODESTORY_ZOEKT_ENABLED",
   "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS",
@@ -30,9 +28,6 @@ function unsupportedSidecarContractRequests(env = process.env) {
   const blockers = [];
   if (unsupportedSidecarDisabledRequest(env)) {
     blockers.push("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory");
-  }
-  if (env.CODESTORY_RETRIEVAL_V2 != null || env.CODESTORY_RETRIEVAL_V2_SHADOW != null) {
-    blockers.push("deprecated CODESTORY_RETRIEVAL_V2 aliases are unsupported; sidecar retrieval is mandatory");
   }
   const shadow = String(env.CODESTORY_RETRIEVAL_SHADOW ?? "").trim().toLowerCase();
   if (shadow && !["0", "false", "no", "off"].includes(shadow)) {

@@ -1,7 +1,7 @@
+#[cfg(test)]
 use crate::agent::eval_probes::{
     eval_probes_enabled, push_eval_architecture_flow_probe_terms,
-    push_eval_flow_hint_packet_queries, push_index_derived_architecture_probes,
-    push_prompt_named_file_probe_queries,
+    push_eval_flow_hint_packet_queries, push_prompt_named_file_probe_queries,
 };
 use crate::agent::packet_command_profiles::{
     packet_command_exact_probe_queries, packet_command_role_probe_queries,
@@ -134,10 +134,13 @@ pub(crate) fn build_packet_plan_with_extra(
         trace,
     };
     dedupe_packet_plan_queries(&mut plan);
+    #[cfg(test)]
+    let eval_probes = eval_probes_enabled();
+    #[cfg(not(test))]
+    let eval_probes = false;
     plan.trace.push(format!(
-        "deduped_queries={} eval_probes={}",
-        plan.queries.len(),
-        eval_probes_enabled()
+        "deduped_queries={} eval_probes={eval_probes}",
+        plan.queries.len()
     ));
     plan
 }
@@ -218,6 +221,7 @@ pub(crate) fn packet_symbol_probe_queries(
         &mut queries,
         &packet_prompt_exact_symbol_probe_queries(question, &terms, task_class),
     );
+    #[cfg(test)]
     if eval_probes_enabled() {
         push_prompt_named_file_probe_queries(&terms, &mut queries);
     }
@@ -248,13 +252,32 @@ pub(crate) fn packet_symbol_probe_queries(
 
 fn push_flow_hint_packet_queries(terms: &[String], queries: &mut Vec<String>) {
     push_prompt_derived_flow_hint_packet_queries(terms, queries);
-    push_eval_flow_hint_packet_queries(terms, queries);
-    if !eval_probes_enabled() {
+    #[cfg(test)]
+    {
+        push_eval_flow_hint_packet_queries(terms, queries);
+    }
+    #[cfg(test)]
+    let use_index_derived = !eval_probes_enabled();
+    #[cfg(not(test))]
+    let use_index_derived = true;
+    if use_index_derived {
         push_index_derived_architecture_probes(
             PacketTaskClassDto::ArchitectureExplanation,
             terms,
             queries,
         );
+    }
+}
+
+fn push_index_derived_architecture_probes(
+    _task_class: PacketTaskClassDto,
+    terms: &[String],
+    queries: &mut Vec<String>,
+) {
+    for term in terms.iter().filter(|term| term.len() >= 5).take(8) {
+        if term.contains('/') || term.contains('.') {
+            push_unique_term(queries, term);
+        }
     }
 }
 
@@ -1596,6 +1619,7 @@ fn packet_architecture_flow_probe_terms(prompt: &str) -> Vec<String> {
             push_unique_term(&mut terms, term);
         }
     }
+    #[cfg(test)]
     push_eval_architecture_flow_probe_terms(&lower, &mut terms);
     terms
 }

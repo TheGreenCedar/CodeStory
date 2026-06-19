@@ -165,7 +165,7 @@ tests in the branch. Do not infer support for languages without direct benchmark
 | Holdout manifests + fetch script | done | `benchmarks/tasks/holdout-retrieval/`, `scripts/fetch-holdout-repos.mjs` |
 | `freelancer` / `traderotate` removed from default holdouts | done | OSS holdouts only |
 | Generalization lint + guard test | done | `lint-retrieval-generalization.mjs`, `retrieval_generalization_guard` |
-| Warning config | done | `docs/architecture/retrieval-rollback.json` |
+| Promotion guard config | done | `docs/architecture/retrieval-rollback.json` |
 | local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
 | holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
 | `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
@@ -193,21 +193,15 @@ tests in the branch. Do not infer support for languages without direct benchmark
 
 ---
 
-## Rollback Warning Drill
+## Promotion Guard Drill
 
-After promotion runs, verify rollback warnings:
+After promotion runs, verify guard thresholds from the benchmark artifacts:
 
-1. Point `retrieval_rollback` at a baseline `packet-runtime-summary.json` with thresholds that will trip on the current summary (or use unit test `rollback_drill_warns_without_setting_legacy_env` in `retrieval_rollback.rs`).
-2. Confirm `check_and_log_rollback_warnings` logs trigger ids without setting `CODESTORY_RETRIEVAL=0`.
-3. Record the trigger id with the promotion evidence if rollback fires during production promotion.
+1. Compare the fresh `packet-runtime-summary.json` against the accepted baseline named by `docs/architecture/retrieval-rollback.json`.
+2. Record any trigger id with the promotion evidence.
+3. Block promotion until the regression is explained or fixed.
 
-**One-shot operator drill (after each promotion run):**
-
-```sh
-cargo test -p codestory-runtime retrieval_rollback::tests::rollback_drill_warns_without_setting_legacy_env -- --nocapture
-```
-
-Expect rollback warnings only when configured thresholds fire (see `docs/architecture/retrieval-rollback.json`). Sidecar retrieval remains mandatory.
+These guards are benchmark/promotion evidence only. Sidecar retrieval remains mandatory.
 
 **Promotion note:** Local `retrieval status` can report `full` after Qdrant
 re-index. Sidecar-primary is the intended product path, but product promotion
@@ -221,4 +215,4 @@ still requires fresh benchmark evidence.
 |-----|------|
 | Design | [`docs/architecture/retrieval-design.md`](../architecture/retrieval-design.md) |
 | Operations | [`docs/ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) |
-| Rollback config | [`docs/architecture/retrieval-rollback.json`](../architecture/retrieval-rollback.json) |
+| Promotion guard config | [`docs/architecture/retrieval-rollback.json`](../architecture/retrieval-rollback.json) |

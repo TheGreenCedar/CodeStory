@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use codestory_contracts::api::{AgentCitationDto, PacketTaskClassDto};
+use codestory_contracts::api::AgentCitationDto;
 use serde::Deserialize;
 
 #[cfg(test)]
@@ -346,18 +346,6 @@ pub(crate) fn source_derived_claims_for_citation(
     }
 
     claims
-}
-
-pub(crate) fn push_index_derived_architecture_probes(
-    _task_class: PacketTaskClassDto,
-    terms: &[String],
-    queries: &mut Vec<String>,
-) {
-    for term in terms.iter().filter(|term| term.len() >= 5).take(8) {
-        if term.contains('/') || term.contains('.') {
-            push_unique_term(queries, term);
-        }
-    }
 }
 
 pub(crate) fn eval_citation_rank_adjustment(

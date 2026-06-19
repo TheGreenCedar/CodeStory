@@ -13,7 +13,6 @@ const SEMANTIC_DOC_SOURCE = path.join(
   "semantic_doc_text.rs",
 );
 const BENCHMARK_SOURCES = [
-  path.join(ROOT, "scripts", "embedding-gpu-fair-benchmark.mjs"),
   path.join(ROOT, "scripts", "cross-repo-promotion-benchmark.mjs"),
 ];
 const OVERLAP_THRESHOLD = Number(

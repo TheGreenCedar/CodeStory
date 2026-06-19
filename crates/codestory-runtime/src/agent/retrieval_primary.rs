@@ -2,7 +2,6 @@
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
-use crate::agent::retrieval_rollback::{RollbackCheckInput, check_and_log_rollback_warnings};
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::{
@@ -30,9 +29,7 @@ const MAX_SHADOW_WOULD_RANK: usize = 10;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
 
 const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
-const RETRIEVAL_ENV_DEPRECATED: &str = "CODESTORY_RETRIEVAL_V2";
 const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
-const RETRIEVAL_SHADOW_ENV_DEPRECATED: &str = "CODESTORY_RETRIEVAL_V2_SHADOW";
 
 fn env_flag_enabled(value: &str) -> bool {
     matches!(
@@ -58,16 +55,6 @@ fn env_bool_override(key: &str) -> Option<bool> {
     })
 }
 
-fn unsupported_deprecated_env() -> Option<&'static str> {
-    if std::env::var_os(RETRIEVAL_ENV_DEPRECATED).is_some() {
-        return Some(RETRIEVAL_ENV_DEPRECATED);
-    }
-    if std::env::var_os(RETRIEVAL_SHADOW_ENV_DEPRECATED).is_some() {
-        return Some(RETRIEVAL_SHADOW_ENV_DEPRECATED);
-    }
-    None
-}
-
 fn retrieval_env_override() -> Option<bool> {
     env_bool_override(RETRIEVAL_ENV)
 }
@@ -85,44 +72,27 @@ fn shadow_env_enabled() -> Option<bool> {
 /// - `CODESTORY_RETRIEVAL=0` is unsupported; packet paths fail closed.
 /// - Unset: sidecar primary when the manifest exists and all sidecars are healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
-    if let Some(env) = unsupported_deprecated_env() {
-        tracing::error!(
-            env,
-            "unsupported retrieval env alias; sidecar retrieval aliases are dead"
-        );
-        false
-    } else {
-        match retrieval_env_override() {
-            Some(false) => {
-                tracing::error!(
-                    "CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory"
-                );
-                false
+    match retrieval_env_override() {
+        Some(false) => {
+            tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory");
+            false
+        }
+        Some(true) => {
+            sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
+        }
+        None => {
+            // Default product path: sidecar primary when live local state is strong enough to serve.
+            let auto_on =
+                sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller);
+            if auto_on {
+                tracing::info!("retrieval primary auto-on (unset CODESTORY_RETRIEVAL; mode full)");
             }
-            Some(true) => {
-                sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
-            }
-            None => {
-                // Default product path: sidecar primary when live local state is strong enough to serve.
-                let auto_on = sidecar_retrieval_eligible(controller)
-                    && sidecar_mode_is_required_full(controller);
-                if auto_on {
-                    tracing::info!(
-                        "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; mode full)"
-                    );
-                }
-                auto_on
-            }
+            auto_on
         }
     }
 }
 
 pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -> Option<String> {
-    if let Some(env) = unsupported_deprecated_env() {
-        return Some(format!(
-            "{env} is unsupported; use CODESTORY_RETRIEVAL=1 or leave CODESTORY_RETRIEVAL unset"
-        ));
-    }
     if retrieval_env_override() == Some(false) {
         return Some("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory".into());
     }
@@ -205,13 +175,6 @@ fn clean_cli_path(value: &str) -> String {
 }
 
 pub(crate) fn shadow_retrieval_enabled() -> bool {
-    if let Some(env) = unsupported_deprecated_env() {
-        tracing::error!(
-            env,
-            "unsupported retrieval env alias; shadow retrieval disabled"
-        );
-        return false;
-    }
     if retrieval_env_override() == Some(true) {
         return false;
     }
@@ -683,44 +646,6 @@ fn sidecar_packet_batch_rejection_reason(
 
 pub(crate) fn packet_batch_should_use_sidecar(controller: &AppController) -> bool {
     sidecar_retrieval_primary_enabled(controller)
-}
-
-pub(crate) fn maybe_log_rollback_after_packet(
-    controller: &AppController,
-    shadow: Option<&RetrievalShadowDto>,
-) {
-    let Ok(project_root) = controller.require_project_root() else {
-        return;
-    };
-    let retrieval_p99_ms = shadow.and_then(|s| {
-        let mut latencies: Vec<u32> = s
-            .stage_timings
-            .iter()
-            .filter_map(|stage| stage.sidecar_latency_ms)
-            .collect();
-        if latencies.is_empty() {
-            latencies.push(s.retrieval_total_ms);
-        }
-        latencies.sort_unstable();
-        let index = ((latencies.len() as f64) * 0.99).ceil() as usize;
-        latencies
-            .get(index.saturating_sub(1))
-            .map(|value| f64::from(*value))
-    });
-    let degraded_mode_rate = shadow.map(|s| {
-        crate::agent::retrieval_rollback::record_degraded_mode_sample(s.retrieval_mode != "full")
-    });
-    let rollback_fired = check_and_log_rollback_warnings(
-        &project_root,
-        &RollbackCheckInput {
-            retrieval_p99_ms,
-            degraded_mode_rate,
-            ..Default::default()
-        },
-    );
-    if rollback_fired {
-        tracing::warn!("retrieval rollback triggers fired; sidecar retrieval remains mandatory");
-    }
 }
 
 pub(crate) fn shadow_from_query_result(result: QueryResult) -> RetrievalShadowDto {
@@ -2658,33 +2583,5 @@ mod tests {
             std::env::remove_var(RETRIEVAL_ENV);
         }
         assert_eq!(retrieval_env_override(), None);
-    }
-
-    #[test]
-    fn deprecated_retrieval_env_aliases_are_unsupported() {
-        let _lock = env_test_lock();
-        // SAFETY: test-only env mutation; no concurrent tests rely on these variables.
-        unsafe {
-            std::env::remove_var(RETRIEVAL_ENV);
-            std::env::remove_var(RETRIEVAL_SHADOW_ENV);
-            std::env::set_var(RETRIEVAL_ENV_DEPRECATED, "1");
-        }
-        assert_eq!(retrieval_env_override(), None);
-        assert_eq!(unsupported_deprecated_env(), Some(RETRIEVAL_ENV_DEPRECATED));
-
-        // SAFETY: test-only env cleanup and mutation.
-        unsafe {
-            std::env::remove_var(RETRIEVAL_ENV_DEPRECATED);
-            std::env::set_var(RETRIEVAL_SHADOW_ENV_DEPRECATED, "1");
-        }
-        assert_eq!(
-            unsupported_deprecated_env(),
-            Some(RETRIEVAL_SHADOW_ENV_DEPRECATED)
-        );
-
-        // SAFETY: test-only env cleanup.
-        unsafe {
-            std::env::remove_var(RETRIEVAL_SHADOW_ENV_DEPRECATED);
-        }
     }
 }

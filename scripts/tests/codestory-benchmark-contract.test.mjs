@@ -68,7 +68,6 @@ test("benchmark contract rejects diagnostic sidecar downgrades", () => {
   const env = {
     CODESTORY_RETRIEVAL: "1",
     CODESTORY_RETRIEVAL_SHADOW: "1",
-    CODESTORY_RETRIEVAL_V2: "1",
     CODESTORY_QDRANT_ENABLED: "0",
     CODESTORY_ZOEKT_ENABLED: "false",
     CODESTORY_RETRIEVAL_REAL_EMBEDDINGS: "0",
@@ -77,7 +76,7 @@ test("benchmark contract rejects diagnostic sidecar downgrades", () => {
   };
 
   const blockers = unsupportedSidecarContractRequests(env);
-  assert.equal(blockers.length, 7);
+  assert.equal(blockers.length, 6);
   assert.throws(() => benchmarkChildEnv(env), /Qdrant sidecar is mandatory/);
 });
 
@@ -88,8 +87,6 @@ test("retrieval env captures sidecar variables", () => {
 
   assert.equal(env.CODESTORY_RETRIEVAL, "1");
   assert.equal(env.CODESTORY_RETRIEVAL_SHADOW, null);
-  assert.equal(env.CODESTORY_RETRIEVAL_V2, null);
-  assert.equal(env.CODESTORY_RETRIEVAL_V2_SHADOW, null);
 });
 
 test("benchmark reuse contract accepts identical fingerprints", () => {

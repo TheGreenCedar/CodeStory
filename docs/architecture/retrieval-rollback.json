@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CodeStory sidecar retrieval auto-rollback triggers",
-  "description": "When CODESTORY_RETRIEVAL default is enabled, fail closed and warn if any trigger fires on consecutive full local-real benchmark runs.",
+  "title": "CodeStory sidecar retrieval promotion guards",
+  "description": "When sidecar retrieval is promotion-ready, block promotion if any trigger fires on consecutive full local-real benchmark runs.",
   "version": 1,
   "env": {
     "shadow_mode": "CODESTORY_RETRIEVAL_SHADOW",
