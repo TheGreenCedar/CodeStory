@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use codestory_store::{CURRENT_SCHEMA_VERSION, Store};
+use codestory_workspace::{RefreshInputs, WorkspaceInventory, WorkspaceManifest};
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -127,6 +128,35 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         ));
     }
 
+    let source_freshness = match source_cache_freshness(request.source_project, &source_db) {
+        Ok(freshness) => freshness,
+        Err(error) => {
+            return Ok(skipped_with_git_schema(
+                request,
+                format!("source cache freshness check failed: {error}"),
+                source_git,
+                target_git,
+                Some(schema_version),
+                Some(source_file_count),
+                rebuild,
+            ));
+        }
+    };
+    if source_freshness.changed_or_new_files > 0 || source_freshness.removed_files > 0 {
+        return Ok(skipped_with_git_schema(
+            request,
+            format!(
+                "source cache is stale: changed_or_new_files={} removed_files={}",
+                source_freshness.changed_or_new_files, source_freshness.removed_files
+            ),
+            source_git,
+            target_git,
+            Some(schema_version),
+            Some(source_file_count),
+            rebuild,
+        ));
+    }
+
     if !request.dry_run {
         copy_dir_recursive(request.source_cache_dir, request.target_cache_dir).with_context(
             || {
@@ -185,6 +215,28 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
 struct GitIdentity {
     remote: String,
     tree: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourceCacheFreshness {
+    changed_or_new_files: usize,
+    removed_files: usize,
+}
+
+fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCacheFreshness> {
+    let workspace = WorkspaceManifest::open(project.to_path_buf())
+        .with_context(|| format!("open source workspace {}", project.display()))?;
+    let storage = Store::open(source_db).context("open source cache for freshness")?;
+    let plan = workspace
+        .build_execution_plan(&RefreshInputs {
+            stored_files: storage.files().inventory()?,
+            inventory: WorkspaceInventory::default(),
+        })
+        .context("build source cache refresh plan")?;
+    Ok(SourceCacheFreshness {
+        changed_or_new_files: plan.files_to_index.len(),
+        removed_files: plan.files_to_remove.len(),
+    })
 }
 
 fn git_identity(project: &Path) -> Result<GitIdentity> {
@@ -544,10 +596,52 @@ mod tests {
     }
 
     #[test]
+    fn rehydrate_skips_when_source_cache_is_stale() {
+        let scenarios = [
+            StaleSourceChange::Modify,
+            StaleSourceChange::Add,
+            StaleSourceChange::Remove,
+        ];
+        for scenario in scenarios {
+            let Some((source_project, target_project)) = matching_git_projects() else {
+                return;
+            };
+            let source_cache = tempdir().expect("source cache");
+            let target_cache = tempdir().expect("target cache");
+            seed_cache(
+                &source_cache.path().join("codestory.db"),
+                source_project.path(),
+            );
+            apply_stale_source_change(source_project.path(), scenario);
+            apply_stale_source_change(target_project.path(), scenario);
+
+            let output = rehydrate_cache(CacheRehydrateRequest {
+                source_project: source_project.path(),
+                source_cache_dir: source_cache.path(),
+                target_project: target_project.path(),
+                target_cache_dir: target_cache.path(),
+                dry_run: false,
+            })
+            .expect("rehydrate");
+
+            assert_eq!(output.status, "skipped", "{scenario:?}");
+            assert!(
+                output
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("source cache is stale:")),
+                "stale source cache should return a clear skip reason: {output:?}"
+            );
+            assert!(!target_cache.path().join("codestory.db").exists());
+        }
+    }
+
+    #[test]
     fn rehydrate_skips_when_target_cache_is_inside_source_cache() {
         let project = tempdir().expect("project");
         let source_cache = tempdir().expect("source cache");
         let target_cache_path = source_cache.path().join("nested-target");
+        fs::write(project.path().join("src.rs"), "pub fn run() {}\n").expect("write source");
         seed_cache(&source_cache.path().join("codestory.db"), project.path());
 
         let output = rehydrate_cache(CacheRehydrateRequest {
@@ -599,6 +693,30 @@ mod tests {
         Some((source, target))
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum StaleSourceChange {
+        Modify,
+        Add,
+        Remove,
+    }
+
+    fn apply_stale_source_change(project: &Path, scenario: StaleSourceChange) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        match scenario {
+            StaleSourceChange::Modify => {
+                fs::write(project.join("src.rs"), "pub fn changed() {}\n").expect("modify source");
+            }
+            StaleSourceChange::Add => {
+                fs::write(project.join("new.rs"), "pub fn new_file() {}\n").expect("add source");
+            }
+            StaleSourceChange::Remove => {
+                fs::remove_file(project.join("src.rs")).expect("remove source");
+            }
+        }
+        git(project, &["add", "-A"]);
+        git(project, &["commit", "-m", "stale source change"]);
+    }
+
     fn git(project: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -618,6 +736,14 @@ mod tests {
         let mut storage = Store::open(path).expect("open storage");
         let absolute_source = project.join("src.rs");
         let absolute_source_text = absolute_source.to_string_lossy().to_string();
+        let source_mtime = fs::metadata(&absolute_source)
+            .expect("source metadata")
+            .modified()
+            .expect("source modified")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("source mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
         storage
             .insert_nodes_batch(&[
                 Node {
@@ -643,7 +769,7 @@ mod tests {
                 id: 1,
                 path: PathBuf::from(&absolute_source_text),
                 language: "rust".into(),
-                modification_time: 1,
+                modification_time: source_mtime,
                 indexed: true,
                 complete: true,
                 line_count: 1,
