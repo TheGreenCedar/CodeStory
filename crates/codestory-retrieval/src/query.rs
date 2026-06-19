@@ -1,18 +1,23 @@
 use crate::cache::RetrievalCache;
+use crate::cache::RetrievalCacheKey;
 use crate::config::SidecarLayout;
 use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
 use crate::generation::manifest_unavailable_reason;
 use crate::health::probe_sidecar_health;
-use crate::index::sidecar_project_id_for_root;
+use crate::index::{query_fingerprint, sidecar_project_id_for_root};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
+use crate::query_features::classify_query;
 use crate::sidecar::validate_strict_sidecar_readiness;
 use crate::sidecar_search::LiveSidecarSearch;
+use crate::sidecar_search::SidecarSearch;
 use anyhow::{Context, Result, bail};
 use codestory_store::{FileRole, RetrievalIndexManifest, Store};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+const STRICT_BATCH_WORKER_CAP: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct QueryRequest<'a> {
@@ -88,19 +93,143 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
             degraded_reason.as_deref().unwrap_or("unknown")
         );
     }
-    let mut executor = QueryExecutor {
-        sidecars: &sidecars,
-        cache,
+    execute_strict_retrieval_query_batch_against_sidecars(
+        &sidecars,
         manifest,
         file_roles,
         cancelled,
-        mode_override: Some(mode),
-    };
-    request
-        .queries
-        .iter()
-        .map(|query| executor.execute(query.query, query.budget_ms))
+        mode,
+        request.queries,
+        cache,
+        strict_batch_worker_limit(request.queries.len()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_strict_retrieval_query_batch_against_sidecars(
+    sidecars: &dyn SidecarSearch,
+    manifest: Option<RetrievalIndexManifest>,
+    file_roles: HashMap<String, FileRole>,
+    cancelled: Arc<AtomicBool>,
+    mode: RetrievalDegradedMode,
+    queries: &[QueryBatchItem<'_>],
+    cache: &mut RetrievalCache,
+    worker_limit: usize,
+) -> Result<Vec<QueryResult>> {
+    if mode != RetrievalDegradedMode::Full {
+        bail!(
+            "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason=unknown)",
+            mode.as_str()
+        );
+    }
+
+    let mut results = vec![None; queries.len()];
+    let mut misses = Vec::new();
+    for (index, query) in queries.iter().enumerate() {
+        if let Some(result) = cached_batch_result(manifest.as_ref(), cache, query.query, mode) {
+            results[index] = Some(result);
+        } else {
+            misses.push((index, query.query.to_string(), query.budget_ms));
+        }
+    }
+
+    for wave in misses.chunks(worker_limit.max(1)) {
+        let wave_results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(wave.len());
+            for (index, query, budget_ms) in wave {
+                let manifest = manifest.clone();
+                let file_roles = file_roles.clone();
+                let cancelled = Arc::clone(&cancelled);
+                handles.push(scope.spawn(move || {
+                    let mut worker_cache = RetrievalCache::new();
+                    let mut executor = QueryExecutor {
+                        sidecars,
+                        cache: &mut worker_cache,
+                        manifest,
+                        file_roles,
+                        cancelled,
+                        mode_override: Some(mode),
+                    };
+                    (*index, executor.execute(query, *budget_ms))
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("strict retrieval batch worker panicked")
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for (index, result) in wave_results {
+            let result = result?;
+            cache_completed_batch_result(manifest.as_ref(), cache, &result);
+            results[index] = Some(result);
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|result| result.context("strict retrieval batch dropped a query result"))
         .collect()
+}
+
+fn cached_batch_result(
+    manifest: Option<&RetrievalIndexManifest>,
+    cache: &RetrievalCache,
+    query: &str,
+    mode: RetrievalDegradedMode,
+) -> Option<QueryResult> {
+    let manifest = manifest?;
+    let features = classify_query(query);
+    let key = RetrievalCacheKey::from_manifest(manifest, query_fingerprint(&features.raw_query));
+    cache.get(&key).map(|hits| QueryResult {
+        query: features.raw_query.clone(),
+        features,
+        hits: hits.to_vec(),
+        trace: crate::executor::QueryTrace {
+            retrieval_mode: mode.as_str().into(),
+            degraded_reason: None,
+            total_budget_ms: 0,
+            elapsed_ms: 0,
+            cancel_reason: None,
+            cache_hit: true,
+            stages: Vec::new(),
+        },
+    })
+}
+
+fn cache_completed_batch_result(
+    manifest: Option<&RetrievalIndexManifest>,
+    cache: &mut RetrievalCache,
+    result: &QueryResult,
+) {
+    if result.trace.cancel_reason.is_some() {
+        return;
+    }
+    if let Some(manifest) = manifest {
+        let key = RetrievalCacheKey::from_manifest(
+            manifest,
+            query_fingerprint(&result.features.raw_query),
+        );
+        cache.insert(key, result.hits.clone());
+    }
+}
+
+fn strict_batch_worker_limit(query_count: usize) -> usize {
+    if query_count <= 1 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    // Cap sidecar fan-out; make this configurable only if telemetry needs it.
+    query_count
+        .min(available)
+        .min(STRICT_BATCH_WORKER_CAP)
+        .max(1)
 }
 
 fn single_query_mode_override() -> Option<RetrievalDegradedMode> {
@@ -183,11 +312,15 @@ fn resolve_batch_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CandidateHit;
     use crate::index::finalize_index;
+    use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
     use crate::{QdrantClient, SidecarLayout, ZoektClient};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn manifest_for(
@@ -227,6 +360,121 @@ mod tests {
         .expect("empty batch should short-circuit before storage setup");
 
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn strict_batch_runs_cache_misses_bounded_and_keeps_order() {
+        struct CountingSidecars {
+            active: AtomicUsize,
+            max_active: AtomicUsize,
+        }
+
+        impl CountingSidecars {
+            fn record(&self, query: &str) -> Vec<CandidateHit> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                if query == "slow" {
+                    std::thread::sleep(Duration::from_millis(30));
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                vec![CandidateHit::lexical_stub(format!("src/{query}.rs"), 1.0)]
+            }
+        }
+
+        impl SidecarSearch for CountingSidecars {
+            fn zoekt_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(self.record(query))
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let sidecars = CountingSidecars {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        };
+        let mut cache = RetrievalCache::new();
+        let manifest = manifest_for("testproj", "cafebabedeadbeef", 3);
+        let queries = [
+            QueryBatchItem {
+                query: "slow",
+                budget_ms: Some(500),
+            },
+            QueryBatchItem {
+                query: "fast",
+                budget_ms: Some(500),
+            },
+            QueryBatchItem {
+                query: "last",
+                budget_ms: Some(500),
+            },
+        ];
+
+        let results = execute_strict_retrieval_query_batch_against_sidecars(
+            &sidecars,
+            Some(manifest),
+            HashMap::new(),
+            cancellation_flag(),
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut cache,
+            2,
+        )
+        .expect("batch");
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.query.as_str())
+                .collect::<Vec<_>>(),
+            ["slow", "fast", "last"]
+        );
+        assert_eq!(sidecars.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn strict_batch_rejects_non_full_mode_before_cache_hits() {
+        let sidecars = crate::sidecar_search::mock::MockSidecarSearch::default();
+        let mut cache = RetrievalCache::new();
+        let manifest = manifest_for("testproj", "cafebabedeadbeef", 1);
+        cache.insert(
+            RetrievalCacheKey::from_manifest(&manifest, query_fingerprint("cached")),
+            vec![CandidateHit::lexical_stub("src/cached.rs", 1.0)],
+        );
+        let queries = [QueryBatchItem {
+            query: "cached",
+            budget_ms: Some(100),
+        }];
+
+        let error = execute_strict_retrieval_query_batch_against_sidecars(
+            &sidecars,
+            Some(manifest),
+            HashMap::new(),
+            cancellation_flag(),
+            RetrievalDegradedMode::NoSemantic,
+            &queries,
+            &mut cache,
+            1,
+        )
+        .expect_err("non-full mode must fail before cache use");
+
+        assert!(error.to_string().contains("retrieval sidecar is mandatory"));
     }
 
     #[test]
