@@ -293,6 +293,23 @@ services:
     }
 
     #[test]
+    fn docker_compose_requires_services_section_to_emit_anchors() {
+        let storage =
+            index_structural_source(Path::new("compose.yaml"), "name: api\nopenapi: 3.1.0\n")
+                .expect("index admitted non-compose yaml");
+        assert!(
+            storage.nodes.iter().all(|node| {
+                !node
+                    .canonical_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("docker-compose:")
+            }),
+            "compose-looking yaml without services must not invent compose anchors"
+        );
+    }
+
+    #[test]
     fn unnamed_github_actions_workflow_uses_jobs_source_anchor() {
         let yaml = r#"on:
   push:

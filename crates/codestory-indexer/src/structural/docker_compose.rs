@@ -11,6 +11,9 @@ pub(crate) fn collect_docker_compose_entities(
     storage: &mut IntermediateStorage,
 ) {
     let path_key = path.to_string_lossy().replace('\\', "/");
+    if !has_service_anchor(source) {
+        return;
+    }
     let Some((stack_name, stack_line, stack_col)) = compose_stack_anchor(source) else {
         return;
     };
@@ -205,6 +208,37 @@ fn push_anchor(
 
 fn compose_stack_anchor(source: &str) -> Option<(String, u32, u32)> {
     top_level_name(source).or_else(|| top_level_services_anchor(source))
+}
+
+fn has_service_anchor(source: &str) -> bool {
+    let mut in_services = false;
+    let mut service_indent = None;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(line);
+
+        if indent == 0 && trimmed == "services:" {
+            in_services = true;
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        if indent == 0 {
+            return false;
+        }
+        if service_indent.is_none() && indent > 0 {
+            service_indent = Some(indent);
+        }
+        if Some(indent) == service_indent && yaml_mapping_key(trimmed).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 fn top_level_name(source: &str) -> Option<(String, u32, u32)> {

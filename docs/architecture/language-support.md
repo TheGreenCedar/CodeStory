@@ -80,8 +80,8 @@ Safe wording: packet-runtime is implemented and completing the suite, but
 publishable agent-facing packet quality is not promoted until a coherent run has
 all quality, sufficiency, and cold-SLA gates green. This evidence is a
 development/proof-gate signal, not public product-grade proof for every
-parser-backed language. HTML, CSS, SQL, and GitHub Actions workflows remain
-structural source-proof collectors.
+parser-backed language. HTML, CSS, SQL, GitHub Actions workflows, and Docker
+Compose manifests remain structural source-proof collectors.
 
 Older development comparison: the language-expansion comparison artifact built
 on 2026-06-17:
