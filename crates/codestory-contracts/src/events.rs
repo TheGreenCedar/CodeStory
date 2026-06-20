@@ -1,3 +1,9 @@
+//! Runtime event contracts and in-process fanout.
+//!
+//! Events are lightweight status signals for progress, warnings, and telemetry.
+//! They are not durable audit records; consumers that need complete evidence
+//! should use the corresponding DTO, log, or artifact contract instead.
+
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -9,6 +15,7 @@ pub use telemetry::{
     new_correlation_id,
 };
 
+/// User-visible runtime status event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     IndexingStarted { file_count: usize },
@@ -18,6 +25,10 @@ pub enum Event {
     StatusUpdate { message: String },
 }
 
+/// In-process fanout bus for runtime events.
+///
+/// Publishing is best-effort: closed subscribers are dropped, and send failures
+/// are intentionally not surfaced to producers.
 #[derive(Clone)]
 pub struct EventBus {
     tx: Sender<Event>,

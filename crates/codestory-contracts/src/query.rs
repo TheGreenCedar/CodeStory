@@ -1,11 +1,22 @@
+//! Serializable graph-query AST.
+//!
+//! Query values describe caller intent, not an execution plan. Runtime crates
+//! remain responsible for resolving symbols, applying defaults, enforcing
+//! limits, and reporting partial evidence when the query cannot be satisfied.
+
 use crate::api::{NodeKind, TrailDirection};
 use serde::{Deserialize, Serialize};
 
+/// Ordered pipeline of graph-query operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GraphQueryAst {
     pub operations: Vec<GraphQueryOperation>,
 }
 
+/// One operation in a graph-query pipeline.
+///
+/// The serde tag is part of the JSON contract; callers should add operations
+/// append-only and keep existing tag spellings stable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum GraphQueryOperation {

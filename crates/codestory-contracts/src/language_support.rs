@@ -1,9 +1,20 @@
+//! Language support and claim-tier contracts.
+//!
+//! These tables separate three claims that are easy to overstate:
+//! extension/file routing, parser-backed graph extraction, and answer-quality
+//! proof. A language profile is product evidence for what the runtime may index
+//! today; it is not proof that every framework pattern, semantic edge, or packet
+//! answer is supported.
+
 use crate::api::{PacketEvidenceResolutionDto, PacketEvidenceTierDto};
 use crate::graph::NodeKind;
 
+/// How CodeStory obtains product evidence for a language profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageSupportMode {
+    /// Tree-sitter-backed extraction can produce graph nodes and edges.
     ParserBackedGraph,
+    /// Path- or syntax-specific collectors produce exact source anchors only.
     StructuralCollector,
 }
 
@@ -16,9 +27,12 @@ impl LanguageSupportMode {
     }
 }
 
+/// Evidence tier advertised by a language support profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageEvidenceTier {
+    /// Parser-backed graph evidence covered by fidelity checks.
     GraphFidelity,
+    /// Exact source anchors without parser-backed graph parity.
     StructuralOnly,
 }
 
@@ -31,6 +45,11 @@ impl LanguageEvidenceTier {
     }
 }
 
+/// Specific claim a proof artifact is allowed to support.
+///
+/// Higher tiers are intentionally not implied by lower tiers. For example,
+/// filename routing does not prove parser support, and parser extraction does
+/// not prove packet answer quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageClaimTier {
     FilenameRoute,
@@ -54,6 +73,7 @@ impl LanguageClaimTier {
     }
 }
 
+/// Kind of artifact accepted as proof for a language claim tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageProofRole {
     ExtensionRouting,
@@ -77,6 +97,7 @@ impl LanguageProofRole {
     }
 }
 
+/// Allowed proof roles and provenance expectations for one claim tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageClaimTierContract {
     pub tier: LanguageClaimTier,
@@ -117,6 +138,11 @@ pub const LANGUAGE_CLAIM_TIER_CONTRACTS: &[LanguageClaimTierContract] = &[
     },
 ];
 
+/// Structural collector contract for exact-source, non-semantic proof.
+///
+/// Each row is a product evidence boundary. `semantic_proof_allowed = false`
+/// means the collector may support navigation or diagnostics, but must not be
+/// promoted as typed semantic evidence without a separate proof tier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StructuralSourceProofContract {
     pub collector_name: &'static str,
@@ -210,6 +236,10 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
     },
 ];
 
+/// Public language profile exposed to callers and diagnostics.
+///
+/// `claim_label` is presentation text, while `support_mode` and
+/// `evidence_tier` are compatibility surfaces for downstream logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LanguageSupportProfile {
     pub language_name: &'static str,
@@ -278,10 +308,15 @@ const fn structural_profile(
     }
 }
 
+/// Normalize a file extension for registry lookup.
 pub fn normalize_extension(ext: &str) -> String {
     ext.trim().trim_start_matches('.').to_ascii_lowercase()
 }
 
+/// Look up a language profile by extension.
+///
+/// The lookup is case-insensitive and accepts a leading dot. A hit proves only
+/// the profile's declared claim tier, not parser or answer quality beyond it.
 pub fn language_support_profile_for_ext(ext: &str) -> Option<&'static LanguageSupportProfile> {
     let ext = ext.trim().trim_start_matches('.');
     LANGUAGE_SUPPORT_PROFILES.iter().find(|profile| {
@@ -292,6 +327,7 @@ pub fn language_support_profile_for_ext(ext: &str) -> Option<&'static LanguageSu
     })
 }
 
+/// Look up a profile by its public language name.
 pub fn language_support_profile_for_language_name(
     language_name: &str,
 ) -> Option<&'static LanguageSupportProfile> {
@@ -301,6 +337,7 @@ pub fn language_support_profile_for_language_name(
         .find(|profile| profile.language_name.eq_ignore_ascii_case(language_name))
 }
 
+/// Look up a profile from a file path's final extension.
 pub fn language_support_profile_for_path(
     path: Option<&str>,
 ) -> Option<&'static LanguageSupportProfile> {
@@ -308,27 +345,32 @@ pub fn language_support_profile_for_path(
     language_support_profile_for_ext(ext)
 }
 
+/// Return the public language name for a supported path.
 pub fn language_name_for_path(path: Option<&str>) -> Option<&'static str> {
     language_support_profile_for_path(path).map(|profile| profile.language_name)
 }
 
+/// Return a language name only when the path maps to parser-backed graph support.
 pub fn parser_backed_language_name_for_path(path: Option<&str>) -> Option<&'static str> {
     language_support_profile_for_path(path)
         .filter(|profile| profile.support_mode == LanguageSupportMode::ParserBackedGraph)
         .map(|profile| profile.language_name)
 }
 
+/// Return a language name only when the path maps to structural-only support.
 pub fn structural_language_name_for_path(path: Option<&str>) -> Option<&'static str> {
     language_support_profile_for_path(path)
         .filter(|profile| profile.support_mode == LanguageSupportMode::StructuralCollector)
         .map(|profile| profile.language_name)
 }
 
+/// Whether a public language name is structural-only.
 pub fn is_structural_language_name(language_name: &str) -> bool {
     language_support_profile_for_language_name(language_name)
         .is_some_and(|profile| profile.support_mode == LanguageSupportMode::StructuralCollector)
 }
 
+/// Whether a path is in the GitHub Actions workflow collector scope.
 pub fn is_github_actions_workflow_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     let mut parts = normalized.rsplit('/');
@@ -346,6 +388,7 @@ pub fn is_github_actions_workflow_path(path: &str) -> bool {
         && grandparent == ".github"
 }
 
+/// Whether a path is in the Docker Compose collector scope.
 pub fn is_docker_compose_file_path(path: &str) -> bool {
     if is_github_actions_workflow_path(path) {
         return false;
@@ -366,6 +409,7 @@ pub fn is_docker_compose_file_path(path: &str) -> bool {
         || (stem.ends_with("-compose") && parts.any(|part| part == "docker"))
 }
 
+/// Whether a path is exactly a Cargo manifest by basename.
 pub fn is_cargo_manifest_file_path(path: &str) -> bool {
     path.replace('\\', "/")
         .rsplit('/')
@@ -373,12 +417,14 @@ pub fn is_cargo_manifest_file_path(path: &str) -> bool {
         .is_some_and(|file_name| file_name == "Cargo.toml")
 }
 
+/// All extensions that have a public language profile.
 pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
     LANGUAGE_SUPPORT_PROFILES
         .iter()
         .flat_map(|profile| profile.extensions.iter().copied())
 }
 
+/// Claim tiers implied by a language support profile.
 pub fn language_claim_tiers_for_profile(
     profile: &LanguageSupportProfile,
 ) -> &'static [LanguageClaimTier] {
@@ -388,6 +434,7 @@ pub fn language_claim_tiers_for_profile(
     }
 }
 
+/// Contract row for one claim tier.
 pub fn language_claim_tier_contract(
     tier: LanguageClaimTier,
 ) -> Option<&'static LanguageClaimTierContract> {
