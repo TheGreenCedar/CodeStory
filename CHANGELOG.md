@@ -29,10 +29,10 @@ Reviewer comparison branch:
 | Reviewer diff | Baseline tag `v0.9.0` at `2feb60990c6e`. | Review branch `review/codestory-saga-from-v0.9.0-f4f6d3d6` preserves the saga diff before the version bump. | Compare URL above; #74 |
 | Workspace release version | Workspace crates were synchronized at `0.9.0`. | All eight `codestory-*` workspace crates and `Cargo.lock` are synchronized at `0.10.0`. | PR #151; `check-codestory-release.py --version 0.10.0` |
 | Repo-scale e2e after sidecar repair | No release claim based only on `retrieval_mode=full`. | E2E passed after repair with 14,041 symbol docs, 760 dense docs, 0 index errors, 83.31s full index, 28.42s repeat refresh, and 8.70s retrieval index. | `docs/testing/issue-72-promotion-audit-2026-06-18-f61e6717cbbf.md` |
-| Focused packet quality | Publishable packet-runtime evidence was blocked. | Focused Apache and Redis rows had quality `3/3` and sufficiency `sufficient:3`. | `docs/testing/pre-release-review-2026-06-19-ce1047249fe5.md`; #143 |
+| Focused packet quality | Publishable packet-runtime evidence was blocked. | Focused Apache and Redis rows had quality `3/3` and sufficiency `sufficient:3`. | #143 |
 | Packet-runtime SLA | Not cleared. | Redis focused cold row cleared `0/3` SLA misses; Apache focused cold still missed `2/3`. Warm SLA remains accepted residual risk. | #78; #143 |
 | Cache reuse | Cache identity was path/root-bound and expensive for parallel agent worktrees. | SQLite graph/search/doc rows and portable v2 artifact-cache rows can be reused across compatible clean worktrees; retrieval sidecars revalidate/rebuild fail-closed instead of being blindly trusted. | #82; PR #84, #114, #118, #123 |
-| Release notes / review package | No final package for the saga diff. | Report package includes Markdown, CSV, and SVG visual summary. | `docs/testing/pre-release-review-2026-06-19-ce1047249fe5.*` |
+| Release notes / review package | No final package for the saga diff. | Report package was produced for review outside committed docs. | #143 |
 
 ### Packet-Runtime Release Risk
 
