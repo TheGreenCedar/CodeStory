@@ -1,3 +1,11 @@
+//! Resolution pass for unresolved call/import graph edges.
+//!
+//! Parser rules create unresolved edges when the source proves a relationship
+//! but the target is not yet known. This pass resolves those edges against the
+//! stored graph using same-file/module/global strategies and optional semantic
+//! fallback. It records telemetry and candidate evidence without changing which
+//! files are fresh.
+
 use crate::semantic::{
     SemanticCandidateIndex, SemanticCandidateNodeSnapshot, SemanticResolutionCandidate,
     SemanticResolutionRequest, SemanticResolverRegistry,
@@ -48,6 +56,7 @@ type SameFileCacheKey = (i64, String, String);
 type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
 type RelativeImportCacheKey = (String, String, String, String);
+/// Version for cached resolution-support snapshots.
 pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -124,6 +133,7 @@ struct ResolvedEdgeUpdate {
     touch_metadata: bool,
 }
 
+/// Counts and telemetry returned by a resolution pass.
 #[derive(Default, Debug)]
 pub struct ResolutionStats {
     pub unresolved_calls_before: usize,
@@ -291,6 +301,7 @@ impl OverrideSupport {
     }
 }
 
+/// Per-phase timing and semantic-request counters for resolution.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ResolutionPhaseTelemetry {
     pub scope_prepare_ms: u64,
@@ -354,6 +365,7 @@ impl ResolutionPhaseTelemetry {
     }
 }
 
+/// Counters for the resolution strategies that produced target matches.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ResolutionStrategyCounters {
     pub call_same_file: usize,
@@ -585,6 +597,7 @@ impl ResolutionPolicy {
     }
 }
 
+/// Resolves unresolved call/import edges in a `Store`.
 pub struct ResolutionPass {
     flags: ResolutionFlags,
     policy: ResolutionPolicy,
@@ -598,6 +611,7 @@ impl Default for ResolutionPass {
 }
 
 impl ResolutionPass {
+    /// Create a resolution pass using environment-controlled policy flags.
     pub fn new() -> Self {
         let flags = ResolutionFlags::from_env();
         let policy = ResolutionPolicy::for_flags(flags);
@@ -608,10 +622,15 @@ impl ResolutionPass {
         }
     }
 
+    /// Resolve all eligible unresolved edges in the store.
     pub fn run(&self, storage: &mut Storage) -> Result<ResolutionStats> {
         self.run_with_scope(storage, None)
     }
 
+    /// Resolve unresolved edges scoped to callers in selected file ids.
+    ///
+    /// Scoped runs are used after incremental indexing so stale resolutions
+    /// outside the changed caller set are left untouched.
     pub fn run_with_scope(
         &self,
         storage: &mut Storage,

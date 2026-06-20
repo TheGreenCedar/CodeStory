@@ -29,6 +29,7 @@ use helpers::{
 };
 
 const SCHEMA_VERSION: u32 = 18;
+/// Current SQLite schema version expected by `Store`.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
 const GROUNDING_SNAPSHOT_STATE_DIRTY: i64 = 0;
@@ -266,6 +267,7 @@ fn outside_file_node_predicate(file_param: &str) -> String {
     format!("(file_node_id IS NULL OR file_node_id != {file_param})")
 }
 
+/// Errors returned by storage facade operations.
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("Database error: {0}")]
@@ -276,18 +278,28 @@ pub enum StorageError {
     Other(String),
 }
 
+/// SQLite-backed graph, search, file, and snapshot store.
+///
+/// The store is the persistence boundary for indexer output. It owns schema
+/// migration, projection replacement, retrieval manifest rows, and derived
+/// grounding snapshots. Callers must invalidate or rebuild derived snapshots
+/// after mutating graph/search projections.
 pub struct Storage {
     conn: Connection,
     cache: StorageCache,
     deferred_secondary_indexes: bool,
 }
 
+/// Opening mode for a SQLite store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageOpenMode {
+    /// Live stores create all indexes immediately and are ready for mixed reads.
     Live,
+    /// Build stores defer expensive secondary indexes until finalization.
     Build,
 }
 
+/// Per-table timing breakdown for a projection flush.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectionFlushBreakdown {
     pub files_ms: u32,
@@ -313,6 +325,11 @@ struct StorageCache {
         Arc<RwLock<HashMap<codestory_contracts::graph::NodeId, codestory_contracts::graph::Node>>>,
 }
 
+/// Stored file row persisted with graph projections.
+///
+/// `modification_time` is milliseconds since the Unix epoch and is compared by
+/// workspace refresh planning. `indexed` marks whether the file produced a
+/// completed projection in the current store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub id: i64,
@@ -326,6 +343,10 @@ pub struct FileInfo {
     pub file_role: FileRole,
 }
 
+/// Heuristic role assigned to a file for ranking and summaries.
+///
+/// This role is diagnostic metadata; it must not be treated as parser-backed
+/// evidence about symbols or language support.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRole {
@@ -460,6 +481,11 @@ impl FileRole {
     }
 }
 
+/// Counts describing the effective store contents.
+///
+/// When summary snapshots are ready, counts come from the snapshot read model;
+/// otherwise they are computed from live tables. Fatal errors are always counted
+/// from the error table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStats {
     pub node_count: i64,
@@ -599,6 +625,7 @@ fn normalize_framework_source_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Freshness state for derived grounding snapshot layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroundingSnapshotState {
     Dirty,
@@ -625,6 +652,11 @@ impl GroundingSnapshotState {
     }
 }
 
+/// Metadata row for derived grounding snapshots.
+///
+/// Ready states mean the corresponding read model has been built from the
+/// current persisted graph at that point in time. Projection writes must mark
+/// these states dirty before callers rely on them again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroundingSnapshotMetadata {
     pub version: i64,
@@ -689,12 +721,14 @@ pub struct CallerProjectionRemovalSummary {
     pub removed_callable_projection_state_count: usize,
 }
 
+/// Lightweight symbol projection used by lexical search sidecars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchSymbolProjection {
     pub node_id: NodeId,
     pub display_name: String,
 }
 
+/// Symbol projection plus source location details for review and diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchSymbolProjectionDetail {
     pub node_id: NodeId,
@@ -705,6 +739,11 @@ pub struct SearchSymbolProjectionDetail {
     pub end_line: Option<u32>,
 }
 
+/// Stored generated symbol document and embedding payload.
+///
+/// The document records graph-derived text and embedding metadata. Dense
+/// readiness still depends on the retrieval manifest; the row alone does not
+/// prove a sidecar is current.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmSymbolDoc {
     pub node_id: NodeId,
@@ -733,6 +772,7 @@ pub struct LlmSymbolDoc {
     pub updated_at_epoch_ms: i64,
 }
 
+/// Reuse metadata for deciding whether a stored symbol document is still fresh.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSymbolDocReuseMetadata {
     pub node_id: NodeId,
@@ -747,6 +787,7 @@ pub struct LlmSymbolDocReuseMetadata {
     pub dense_reason: Option<String>,
 }
 
+/// Aggregate metadata for stored generated symbol documents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LlmSymbolDocStats {
     pub doc_count: u32,
@@ -768,6 +809,7 @@ pub struct LlmSymbolDocStats {
     pub mixed_semantic_policy_versions: bool,
 }
 
+/// Counts of dense-anchor selection reasons.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DenseReasonCounts {
     pub public_api: u32,
@@ -778,6 +820,7 @@ pub struct DenseReasonCounts {
     pub unstructured_doc: u32,
 }
 
+/// Graph-native symbol-search document used by retrieval sidecars.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolSearchDoc {
     pub node_id: NodeId,
@@ -805,16 +848,19 @@ pub struct SymbolSummaryRecord {
 }
 
 impl Storage {
+    /// Open a live store, applying schema migrations and secondary indexes.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         Self::open_with_mode(path, StorageOpenMode::Live)
     }
 
+    /// Open a build-mode store after removing stale SQLite sidecars.
     pub fn open_build<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path = path.as_ref();
         cleanup_sqlite_sidecars(path)?;
         Self::open_with_mode(path, StorageOpenMode::Build)
     }
 
+    /// Open a store with explicit live or build indexing behavior.
     pub fn open_with_mode<P: AsRef<Path>>(
         path: P,
         mode: StorageOpenMode,
@@ -866,6 +912,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Create an in-memory store for tests and short-lived callers.
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -878,7 +925,10 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Expose raw connection for advanced operations (like batch processing).
+    /// Expose the raw connection for advanced read/write operations.
+    ///
+    /// Prefer typed store methods when they exist; direct writes must preserve
+    /// schema invariants and derived snapshot freshness manually.
     pub fn get_connection(&self) -> &Connection {
         &self.conn
     }
@@ -2501,6 +2551,12 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist one coherent set of file, graph, occurrence, and projection
+    /// rows.
+    ///
+    /// File-scoped errors for refreshed files are cleared before insertion. A
+    /// successful flush updates graph/search tables only; callers that maintain
+    /// derived grounding snapshots must invalidate or refresh them separately.
     pub fn flush_projection_batch(
         &mut self,
         batch: ProjectionBatch<'_>,
@@ -5097,6 +5153,7 @@ impl Storage {
         Ok(nodes)
     }
 
+    /// Return store counts, preferring ready summary snapshots when available.
     pub fn get_stats(&self) -> Result<StorageStats, StorageError> {
         let fatal_error_count = self.fatal_error_count()?;
         if self.has_ready_grounding_summary_snapshots()? {
