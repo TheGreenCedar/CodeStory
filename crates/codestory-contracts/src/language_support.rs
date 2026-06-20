@@ -138,6 +138,13 @@ const GITHUB_ACTIONS_WORKFLOW_UNSUPPORTED_SHAPES: &[&str] = &[
     "Matrix expansion, expressions, reusable-workflow calls, and shell bodies are not semantically resolved.",
     "The collector records exact source anchors; it does not validate GitHub Actions execution semantics.",
 ];
+const DOCKER_COMPOSE_NODE_KINDS: &[NodeKind] =
+    &[NodeKind::MODULE, NodeKind::FUNCTION, NodeKind::ANNOTATION];
+const DOCKER_COMPOSE_UNSUPPORTED_SHAPES: &[&str] = &[
+    "Variable interpolation and env-file expansion are not resolved.",
+    "Profiles, extends, health checks, dependency order, and runtime container behavior are not interpreted.",
+    "The collector records exact source anchors; it does not validate Docker Compose execution semantics.",
+];
 
 pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
     StructuralSourceProofContract {
@@ -150,6 +157,18 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         confidence: 1.0,
         unsupported_shape_notes: GITHUB_ACTIONS_WORKFLOW_UNSUPPORTED_SHAPES,
         claim_boundary: "structural exact-source proof only; not parser-backed graph parity, typed semantic resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "docker_compose",
+        path_pattern: "compose*.{yml,yaml}, docker-compose*.{yml,yaml}, docker/*-compose.{yml,yaml}",
+        emitted_node_kinds: DOCKER_COMPOSE_NODE_KINDS,
+        source_span: "1-based source line and column span for the matched stack, service, or service property anchor",
+        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: DOCKER_COMPOSE_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not parser-backed graph parity, typed semantic resolution, container runtime behavior, or packet semantic-proof admission",
         semantic_proof_allowed: false,
     },
 ];
@@ -288,6 +307,26 @@ pub fn is_github_actions_workflow_path(path: &str) -> bool {
     (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
         && parent == "workflows"
         && grandparent == ".github"
+}
+
+pub fn is_docker_compose_file_path(path: &str) -> bool {
+    if is_github_actions_workflow_path(path) {
+        return false;
+    }
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let mut parts = normalized.rsplit('/');
+    let Some(file_name) = parts.next().filter(|part| !part.is_empty()) else {
+        return false;
+    };
+    let Some((stem, ext)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    if !matches!(ext, "yml" | "yaml") {
+        return false;
+    }
+    stem.starts_with("compose")
+        || stem.starts_with("docker-compose")
+        || (stem.ends_with("-compose") && parts.any(|part| part == "docker"))
 }
 
 pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
@@ -443,6 +482,45 @@ mod tests {
         assert!(!contract.unsupported_shape_notes.is_empty());
         assert!(!contract.semantic_proof_allowed);
         assert!(contract.claim_boundary.contains("not parser-backed"));
+
+        let compose_contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+            .iter()
+            .find(|contract| contract.collector_name == "docker_compose")
+            .expect("docker compose structural contract");
+        assert_eq!(
+            compose_contract.path_pattern,
+            "compose*.{yml,yaml}, docker-compose*.{yml,yaml}, docker/*-compose.{yml,yaml}"
+        );
+        assert!(
+            compose_contract
+                .emitted_node_kinds
+                .contains(&NodeKind::MODULE)
+        );
+        assert!(
+            compose_contract
+                .emitted_node_kinds
+                .contains(&NodeKind::FUNCTION)
+        );
+        assert!(
+            compose_contract
+                .emitted_node_kinds
+                .contains(&NodeKind::ANNOTATION)
+        );
+        assert_eq!(
+            compose_contract.evidence_tier,
+            PacketEvidenceTierDto::ExactSource
+        );
+        assert_eq!(
+            compose_contract.resolution,
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        );
+        assert!(!compose_contract.semantic_proof_allowed);
+        assert!(
+            compose_contract
+                .unsupported_shape_notes
+                .iter()
+                .any(|note| note.contains("interpolation"))
+        );
     }
 
     #[test]
@@ -463,6 +541,20 @@ mod tests {
         assert!(!is_github_actions_workflow_path(
             "repo/.github/workflows/readme.md"
         ));
+        assert!(language_support_profile_for_ext("yaml").is_none());
+    }
+
+    #[test]
+    fn docker_compose_path_is_path_scoped_not_yaml_support() {
+        assert!(is_docker_compose_file_path("compose.yaml"));
+        assert!(is_docker_compose_file_path("deploy/compose.yml"));
+        assert!(is_docker_compose_file_path("docker-compose.override.yml"));
+        assert!(is_docker_compose_file_path(
+            r"repo\docker\retrieval-compose.yml"
+        ));
+        assert!(!is_docker_compose_file_path(".github/workflows/ci.yml"));
+        assert!(!is_docker_compose_file_path("openapi.yaml"));
+        assert!(!is_docker_compose_file_path("docs/service.yml"));
         assert!(language_support_profile_for_ext("yaml").is_none());
     }
 }
