@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Runtime state file written by `sidecar_up`.
+///
+/// The file records local sidecar endpoints and data roots only. It is not a readiness manifest;
+/// callers must use `sidecar_status` or `strict_sidecar_status` before trusting retrieval output.
 pub struct SidecarStateFile {
     pub zoekt_http_port: u16,
     pub qdrant_http_port: u16,
@@ -50,6 +54,10 @@ pub fn sidecar_down() -> Result<()> {
     Ok(())
 }
 
+/// Probe sidecar health and attach the latest retrieval manifest when storage is available.
+///
+/// A healthy infrastructure report is still weaker than strict readiness: it may show running
+/// services while the manifest is stale for the current worktree.
 pub fn sidecar_status(
     project_root: &Path,
     storage_path: Option<&Path>,
@@ -57,6 +65,9 @@ pub fn sidecar_status(
     sidecar_status_inner(project_root, storage_path, false)
 }
 
+/// Probe sidecar health and fail stale manifest identity checks.
+///
+/// This is the status surface to use before serving `retrieval_mode=full` packet/search evidence.
 pub fn strict_sidecar_status(
     project_root: &Path,
     storage_path: Option<&Path>,

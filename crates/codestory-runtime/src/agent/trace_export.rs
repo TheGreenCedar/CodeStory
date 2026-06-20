@@ -68,6 +68,10 @@ fn step_output_u32(step: &AgentRetrievalStepDto, key: &str) -> Option<u32> {
     step_output_string(step, key).and_then(|value| value.parse::<u32>().ok())
 }
 
+/// Export packet retrieval timing and sidecar diagnostics as JSON.
+///
+/// This is an observability surface for scoring and latency triage. It should not be treated as
+/// proof of answer sufficiency without the packet sufficiency fields on the answer itself.
 pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
     let rows = packet_step_trace_rows(answer);
     let attributable_rows = attributable_step_rows(&rows);

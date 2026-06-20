@@ -12,6 +12,10 @@ pub struct RankFeatures {
 }
 
 /// Unified retrieval candidate from any sidecar lane.
+///
+/// Candidates are navigation evidence until the runtime resolves them back to indexed symbols.
+/// Dense anchors, lexical hits, and graph neighbors should keep their `provenance` labels so
+/// packet diagnostics can distinguish evidence lanes from unresolved sidecar output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +39,7 @@ pub struct CandidateHit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Sidecar lane that produced a retrieval candidate.
 pub enum CandidateSource {
     Zoekt,
     Qdrant,

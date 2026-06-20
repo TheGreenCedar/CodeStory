@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Trace for one retrieval stage.
+///
+/// `degraded` and `stub_reason` are diagnostic fields. A stage trace does not make partial
+/// sidecar output eligible for packet/search primary results.
 pub struct StageTrace {
     pub stage: RetrievalStageKind,
     pub budget_ms: u64,
@@ -37,6 +41,10 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Trace for a complete sidecar query.
+///
+/// `retrieval_mode="full"` is the only product-ready mode. `degraded_reason`, cancellation, and
+/// cache-hit fields explain why a query could not provide fresh full-mode evidence.
 pub struct QueryTrace {
     pub retrieval_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +58,10 @@ pub struct QueryTrace {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Result of executing one retrieval query against the sidecar stack.
+///
+/// Hits may include lexical, graph, or dense-anchor candidates. Runtime packet code must still
+/// resolve candidates to indexed symbols before treating them as answer support.
 pub struct QueryResult {
     pub query: String,
     pub features: QueryFeatures,
@@ -57,6 +69,10 @@ pub struct QueryResult {
     pub trace: QueryTrace,
 }
 
+/// Executes sidecar retrieval stages with manifest-scoped caching.
+///
+/// The executor is fail-closed: live degraded modes return an error instead of serving partial
+/// results. Tests may use `mode_override`, but product callers should rely on live health probes.
 pub struct QueryExecutor<'a> {
     pub sidecars: &'a dyn SidecarSearch,
     pub cache: &'a mut RetrievalCache,
@@ -68,6 +84,10 @@ pub struct QueryExecutor<'a> {
 }
 
 impl<'a> QueryExecutor<'a> {
+    /// Run one query within the provided total budget.
+    ///
+    /// `total_budget_ms` caps retrieval work only; it does not include runtime candidate
+    /// resolution, packet sufficiency checks, or answer composition.
     pub fn execute(&mut self, query: &str, total_budget_ms: Option<u64>) -> Result<QueryResult> {
         let features = classify_query(query);
         let fingerprint = query_fingerprint(&features.raw_query);

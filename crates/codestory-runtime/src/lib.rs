@@ -1,3 +1,9 @@
+//! Headless CodeStory runtime orchestration.
+//!
+//! The public controller owns project state, search, packet generation, cache rehydration, and
+//! retrieval sidecar coordination. Packet/search methods are sidecar-primary: degraded retrieval
+//! is surfaced as diagnostics or errors, not as product-equivalent answer evidence.
+
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
@@ -7094,6 +7100,8 @@ fn clear_search_engine(state: &mut AppState) {
 ///
 /// This is intentionally "headless": any app shell (CLI, desktop, IDE integration)
 /// should call methods on this controller and subscribe to `AppEventPayload`.
+/// The controller also owns the per-runtime sidecar query cache, so callers should reuse a
+/// controller for one open project but re-open state when project or storage identity changes.
 #[derive(Clone)]
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
@@ -8616,10 +8624,18 @@ impl AppController {
             .collect()
     }
 
+    /// Run sidecar-primary search and return only the hit list.
+    ///
+    /// Use [`AppController::search_results`] when the caller needs retrieval mode, diagnostics,
+    /// or search-plan metadata.
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {
         Ok(self.search_results(req)?.hits)
     }
 
+    /// Run sidecar-primary search with retrieval state metadata.
+    ///
+    /// The returned retrieval state distinguishes full sidecar evidence from degraded or
+    /// diagnostic-only paths. Callers should not collapse those states into a generic success.
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
         self.ensure_consistent_read_state("Search")?;
         let original_query = req.query.clone();
@@ -9429,6 +9445,10 @@ impl AppController {
         Ok((results.hits, results.retrieval))
     }
 
+    /// Run hybrid search through the same sidecar-primary contract as `search_results`.
+    ///
+    /// `max_results` limits returned hits; it is not a retrieval budget and does not prove packet
+    /// sufficiency.
     pub fn search_hybrid(
         &self,
         req: SearchRequest,
@@ -9714,6 +9734,10 @@ impl AppController {
             .collect()
     }
 
+    /// Build an answer from indexed source and sidecar-primary retrieval.
+    ///
+    /// Degraded sidecar state is reported through retrieval diagnostics or an error rather than
+    /// silently substituting legacy search as answer-quality proof.
     pub fn agent_ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         agent::agent_ask(self, req)
     }
@@ -9728,6 +9752,11 @@ impl AppController {
         self.state.lock().last_hybrid_instrumentation.take()
     }
 
+    /// Build an evidence packet with sufficiency, diagnostics, and budget metadata.
+    ///
+    /// Packet sufficiency is a runtime judgment over resolved evidence. Full-mode sidecar
+    /// candidates that fail symbol resolution remain diagnostics and do not become supported
+    /// claims merely because retrieval returned them.
     pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
         agent::agent_packet(self, req)
     }
