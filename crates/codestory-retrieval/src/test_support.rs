@@ -29,5 +29,9 @@ pub fn retrieval_manifest_fixture(
         semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
         graph_artifact_hash: Some("graph-test-hash".into()),
         dense_reason_counts_json: Some("{}".into()),
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
     }
 }

@@ -1,7 +1,7 @@
 use crate::config::SidecarLayout;
 use crate::scip_index::{
-    SCIP_INDEX_FILE, SCIP_SYMBOLS_FILE, ScipSymbolRecord, load_fresh_scip_symbols,
-    load_scip_symbols,
+    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_INDEX_FILE, SCIP_SYMBOLS_FILE, ScipSymbolRecord,
+    load_fresh_scip_symbols, load_scip_symbols,
 };
 use std::cmp::Ordering;
 use std::path::Path;
@@ -61,9 +61,11 @@ impl ScipClient {
                 ScipAvailability::Unavailable {
                     reason: "scip_stub".into(),
                 }
-            } else if artifact_status == "scip_stale" {
+            } else if artifact_status == "scip_stale"
+                || artifact_status == "scip_imported_diagnostic_only"
+            {
                 ScipAvailability::Unavailable {
-                    reason: "scip_stale".into(),
+                    reason: artifact_status.into(),
                 }
             } else {
                 ScipAvailability::Ready {
@@ -400,10 +402,13 @@ fn scip_artifact_status(project_dir: &Path, revision: &str) -> &'static str {
         .flatten()
         .filter(|index| !index.symbols.is_empty())
         .map_or("scip_stub", |index| {
-            if index.is_fresh_for(revision) {
+            if !index.is_fresh_for(revision) {
+                return "scip_stale";
+            }
+            if index.contract.evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
                 "ready"
             } else {
-                "scip_stale"
+                "scip_imported_diagnostic_only"
             }
         })
 }
@@ -412,8 +417,8 @@ fn scip_artifact_status(project_dir: &Path, revision: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::scip_index::{
-        SCIP_IMPORTED_PROOF_PROVENANCE, ScipPackageIdentity, ScipProofAdapterContract,
-        ScipProofRecord, ScipSymbolsIndex,
+        SCIP_IMPORTED_PROOF_PROVENANCE, SCIP_PRECISE_SEMANTIC_IMPORT_PUBLIC_PROVENANCE,
+        ScipPackageIdentity, ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex,
     };
     use tempfile::TempDir;
 
@@ -628,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_proof_contract_labels_scip_candidates() {
+    fn imported_proof_contract_is_diagnostic_not_graph_health() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
             zoekt_http_port: 1,
@@ -669,12 +674,20 @@ mod tests {
         assert_eq!(loaded.contract.freshness, "fresh");
         assert_eq!(loaded.proofs.len(), 2);
 
+        assert_eq!(
+            loaded.contract.provenance_label(),
+            Some(SCIP_PRECISE_SEMANTIC_IMPORT_PUBLIC_PROVENANCE)
+        );
+        let probe = ScipClient::health_probe(&layout, project_id);
+        assert_eq!(
+            probe.availability,
+            ScipAvailability::Unavailable {
+                reason: "scip_imported_diagnostic_only".into()
+            }
+        );
         let hits = ScipClient::anchor_search(&layout, project_id, "fixture_package::run", 4)
             .expect("search");
-
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].source, crate::candidate::CandidateSource::Scip);
-        assert_eq!(hits[0].provenance, vec![SCIP_IMPORTED_PROOF_PROVENANCE]);
+        assert!(hits.is_empty());
     }
 
     #[test]

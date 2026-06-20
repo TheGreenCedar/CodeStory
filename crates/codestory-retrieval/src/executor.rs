@@ -475,6 +475,10 @@ mod tests {
             semantic_policy_version: None,
             graph_artifact_hash: None,
             dense_reason_counts_json: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
         }
     }
 

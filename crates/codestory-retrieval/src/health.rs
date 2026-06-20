@@ -110,6 +110,64 @@ fn manifest_contract_report(
         .sidecar_input_hash
         .clone()
         .unwrap_or_else(|| "input_hash_missing".into());
+    let mut lanes = vec![
+        RetrievalManifestLaneProvenance {
+            lane: "lexical".into(),
+            producer: manifest.zoekt_version.clone(),
+            provenance: format!("sidecar_generation:{generation}"),
+            count: None,
+            status: component_status_label(&report.zoekt),
+        },
+        RetrievalManifestLaneProvenance {
+            lane: "symbol_docs".into(),
+            producer: "codestory-symbol-doc".into(),
+            provenance: format!("sidecar_input_hash:{input_hash}"),
+            count: manifest.symbol_doc_count,
+            status: count_contract_status(manifest.symbol_doc_count),
+        },
+        RetrievalManifestLaneProvenance {
+            lane: "semantic_dense".into(),
+            producer: manifest
+                .embedding_backend
+                .clone()
+                .unwrap_or_else(|| "embedding_backend_missing".into()),
+            provenance: format!("qdrant_collection:{}", manifest.qdrant_collection),
+            count: manifest.dense_projection_count,
+            status: component_status_label(&report.qdrant),
+        },
+        RetrievalManifestLaneProvenance {
+            lane: "graph".into(),
+            producer: manifest
+                .scip_revision
+                .clone()
+                .unwrap_or_else(|| "scip_revision_missing".into()),
+            provenance: format!("graph_artifact_hash:{}", graph_hash_label(manifest)),
+            count: None,
+            status: component_status_label(&report.scip),
+        },
+    ];
+    if let Some(status) = manifest.precise_semantic_import_status.as_ref() {
+        lanes.push(RetrievalManifestLaneProvenance {
+            lane: "precise_semantic_import".into(),
+            producer: manifest
+                .precise_semantic_import_producer
+                .clone()
+                .unwrap_or_else(|| "producer_missing".into()),
+            provenance: manifest
+                .precise_semantic_import_revision
+                .as_ref()
+                .map(|revision| format!("precise_semantic_import_revision:{revision}"))
+                .or_else(|| {
+                    manifest
+                        .precise_semantic_import_reason
+                        .as_ref()
+                        .map(|reason| format!("precise_semantic_import_reason:{reason}"))
+                })
+                .unwrap_or_else(|| "precise_semantic_import_unconfigured".into()),
+            count: None,
+            status: status.clone(),
+        });
+    }
     RetrievalManifestContractReport {
         source_root: source_root.display().to_string(),
         project_id: manifest.project_id.clone(),
@@ -122,42 +180,7 @@ fn manifest_contract_report(
         degraded_modes: parse_degraded_modes(manifest),
         retrieval_mode: report.retrieval_mode.clone(),
         degraded_reason: report.degraded_reason.clone(),
-        lanes: vec![
-            RetrievalManifestLaneProvenance {
-                lane: "lexical".into(),
-                producer: manifest.zoekt_version.clone(),
-                provenance: format!("sidecar_generation:{generation}"),
-                count: None,
-                status: component_status_label(&report.zoekt),
-            },
-            RetrievalManifestLaneProvenance {
-                lane: "symbol_docs".into(),
-                producer: "codestory-symbol-doc".into(),
-                provenance: format!("sidecar_input_hash:{input_hash}"),
-                count: manifest.symbol_doc_count,
-                status: count_contract_status(manifest.symbol_doc_count),
-            },
-            RetrievalManifestLaneProvenance {
-                lane: "semantic_dense".into(),
-                producer: manifest
-                    .embedding_backend
-                    .clone()
-                    .unwrap_or_else(|| "embedding_backend_missing".into()),
-                provenance: format!("qdrant_collection:{}", manifest.qdrant_collection),
-                count: manifest.dense_projection_count,
-                status: component_status_label(&report.qdrant),
-            },
-            RetrievalManifestLaneProvenance {
-                lane: "graph".into(),
-                producer: manifest
-                    .scip_revision
-                    .clone()
-                    .unwrap_or_else(|| "scip_revision_missing".into()),
-                provenance: format!("graph_artifact_hash:{}", graph_hash_label(manifest)),
-                count: None,
-                status: component_status_label(&report.scip),
-            },
-        ],
+        lanes,
     }
 }
 
@@ -555,6 +578,10 @@ mod tests {
             semantic_policy_version: None,
             graph_artifact_hash: None,
             dense_reason_counts_json: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
         };
 
         let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
@@ -622,6 +649,10 @@ mod tests {
             semantic_policy_version: Some("graph_first_v1".into()),
             graph_artifact_hash: Some("graph-hash".into()),
             dense_reason_counts_json: Some(r#"{"public_api":3}"#.into()),
+            precise_semantic_import_status: Some("fresh".into()),
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: Some("imported-a".into()),
+            precise_semantic_import_producer: Some("scip-fixture".into()),
         };
         let report = RetrievalStatusReport {
             retrieval_mode: "full".into(),
@@ -690,7 +721,7 @@ mod tests {
         assert_eq!(contract.symbol_doc_count, Some(9));
         assert_eq!(contract.dense_anchor_count, Some(3));
         assert_eq!(contract.degraded_modes, vec!["qdrant_hash_vectors_only"]);
-        assert_eq!(contract.lanes.len(), 4);
+        assert_eq!(contract.lanes.len(), 5);
         assert!(contract.lanes.iter().any(|lane| {
             lane.lane == "lexical"
                 && lane.producer == "zoekt-real-v1"
@@ -706,6 +737,12 @@ mod tests {
             lane.lane == "graph"
                 && lane.producer == "graph-test"
                 && lane.provenance == "graph_artifact_hash:graph-hash"
+        }));
+        assert!(contract.lanes.iter().any(|lane| {
+            lane.lane == "precise_semantic_import"
+                && lane.producer == "scip-fixture"
+                && lane.provenance == "precise_semantic_import_revision:imported-a"
+                && lane.status == "fresh"
         }));
     }
 }
