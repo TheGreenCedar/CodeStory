@@ -366,6 +366,10 @@ mod tests {
             semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.into()),
             graph_artifact_hash: Some("graph-test-hash".into()),
             dense_reason_counts_json: Some("{\"public_api\":7}".into()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
         }
     }
 

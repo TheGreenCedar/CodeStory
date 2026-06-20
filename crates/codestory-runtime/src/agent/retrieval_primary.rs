@@ -2009,6 +2009,10 @@ mod tests {
                 semantic_policy_version: Some("graph_first_v1".into()),
                 graph_artifact_hash: Some("graph-test-hash".into()),
                 dense_reason_counts_json: Some("{}".into()),
+                precise_semantic_import_status: None,
+                precise_semantic_import_reason: None,
+                precise_semantic_import_revision: None,
+                precise_semantic_import_producer: None,
             })
             .expect("manifest");
     }

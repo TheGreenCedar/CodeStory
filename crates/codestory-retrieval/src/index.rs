@@ -8,7 +8,10 @@ use crate::generation::{
 };
 use crate::health::probe_sidecar_health;
 use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
-use crate::scip_index::emit_scip_artifacts_from_store;
+use crate::scip_index::{
+    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
+    import_precise_semantic_scip_artifact,
+};
 use crate::zoekt_client::ZoektClient;
 use crate::zoekt_index::{build_zoekt_shard, lexical_input_fingerprint};
 use anyhow::{Context, Result, bail};
@@ -246,6 +249,21 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
                 sidecar_input.projection_count,
             );
             if status.retrieval_mode == "full" && qdrant_point_count.is_some() {
+                let mut manifest = previous.clone();
+                if let Some(generation) = manifest.sidecar_generation.as_deref() {
+                    let scip_dir = layout.scip_project_dir(generation);
+                    if update_precise_semantic_import_status(&scip_dir, &mut manifest)? {
+                        return persist_finalized_manifest(
+                            storage_path,
+                            project_id,
+                            manifest,
+                            degraded_modes,
+                            zoekt_stubbed,
+                            qdrant_stubbed,
+                            scip_stubbed,
+                        );
+                    }
+                }
                 info!(
                     project_id = %project_id,
                     sidecar_generation = ?previous.sidecar_generation,
@@ -302,6 +320,7 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
     let scip_ready = existing_status.scip.capabilities.graph;
 
     if zoekt_ready && qdrant_ready_points.is_some() && scip_ready {
+        update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
         manifest.disk_bytes = sidecar_disk_bytes(&layout, &scip_dir);
         let status = probe_sidecar_health(&layout, &project_id, Some(manifest.clone()));
         if status.retrieval_mode == "full" {
@@ -351,6 +370,7 @@ pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<Finali
         scip_ready,
         &mut manifest,
     )?;
+    update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
 
     manifest.zoekt_version = zoekt_version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
@@ -500,6 +520,24 @@ fn ensure_scip_artifacts(
     }
 }
 
+fn update_precise_semantic_import_status(
+    scip_dir: &Path,
+    manifest: &mut RetrievalIndexManifest,
+) -> Result<bool> {
+    let Some(artifact) = std::env::var_os("CODESTORY_PRECISE_SEMANTIC_SCIP_ARTIFACT") else {
+        return Ok(false);
+    };
+    let status = import_precise_semantic_scip_artifact(
+        Path::new(&artifact),
+        &scip_dir.join(SCIP_PRECISE_SEMANTIC_IMPORT_DIR),
+    )?;
+    manifest.precise_semantic_import_status = Some(status.status);
+    manifest.precise_semantic_import_reason = status.reason;
+    manifest.precise_semantic_import_revision = status.revision;
+    manifest.precise_semantic_import_producer = status.producer;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_manifest_after_health_check(
     storage_path: &Path,
@@ -604,6 +642,10 @@ fn retrieval_manifest_for_sidecar(
         semantic_policy_version: sidecar_input.semantic_policy_version.clone(),
         graph_artifact_hash: Some(sidecar_input.graph_artifact_hash.clone()),
         dense_reason_counts_json: Some(sidecar_input.dense_reason_counts_json.clone()),
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
     }
 }
 

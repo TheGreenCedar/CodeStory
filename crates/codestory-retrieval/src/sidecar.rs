@@ -599,6 +599,10 @@ mod tests {
                 semantic_policy_version: input.semantic_policy_version.clone(),
                 graph_artifact_hash: Some(input.graph_artifact_hash.clone()),
                 dense_reason_counts_json: Some(input.dense_reason_counts_json.clone()),
+                precise_semantic_import_status: None,
+                precise_semantic_import_reason: None,
+                precise_semantic_import_revision: None,
+                precise_semantic_import_producer: None,
             })
             .expect("manifest");
 

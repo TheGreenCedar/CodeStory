@@ -51,6 +51,10 @@ fn mixed_flat_and_hashed_cache_protects_both_manifest_collections() {
             semantic_policy_version: None,
             graph_artifact_hash: None,
             dense_reason_counts_json: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
         })
         .expect("flat manifest");
 
@@ -77,6 +81,10 @@ fn mixed_flat_and_hashed_cache_protects_both_manifest_collections() {
             semantic_policy_version: None,
             graph_artifact_hash: None,
             dense_reason_counts_json: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
         })
         .expect("hashed manifest");
 
