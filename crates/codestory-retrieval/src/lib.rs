@@ -72,6 +72,7 @@ pub use mode::derive_degraded_mode;
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use qdrant_client::{
     QDRANT_INDEX_UPSERT_BATCH_SIZE, QDRANT_VECTOR_DIM, QdrantClient, QdrantUpsertPoint,
+    diagnostic_query_vector,
 };
 pub use qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION,

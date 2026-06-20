@@ -544,6 +544,14 @@ fn query_vector(query: &str) -> Result<Vec<f32>> {
     }
 }
 
+/// Diagnostic-only helper for offline vector-index parity checks.
+///
+/// Product retrieval must keep using [`QdrantClient::search`], which embeds and
+/// queries the mandatory Qdrant sidecar collection in one fail-closed path.
+pub fn diagnostic_query_vector(query: &str) -> Result<Vec<f32>> {
+    query_vector(query)
+}
+
 fn document_vectors(labels: &[String]) -> Result<Vec<Vec<f32>>> {
     if qdrant_semantic_vectors_enabled() {
         embeddings::embed_documents(labels)

@@ -22,3 +22,6 @@ ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+turbovec = { workspace = true }
