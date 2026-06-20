@@ -26,7 +26,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests | structural collector tests | exact-source structural anchors |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | exact-source structural/schema anchors |
 
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
@@ -68,20 +68,28 @@ The pilot emits workflow, job, and step anchors with `exact_source` /
 `compose*.{yml,yaml}`, `docker-compose*.{yml,yaml}`, and
 `docker/*-compose.{yml,yaml}` style manifests; it emits stack, service, image or
 build, ports, environment key, and volume anchors with the same exact-source
-boundary. Unsupported shapes stay explicit: YAML anchors and merge keys are not
+boundary. OpenAPI/Swagger endpoint schemas stay on the dedicated OpenAPI
+indexing path and emit `openapi:endpoint:*` anchors as `exact_source` /
+`source_range_only` diagnostic evidence only; they do not make generic YAML an
+OpenAPI surface. Unsupported shapes stay explicit: YAML anchors and merge keys are not
 interpreted, matrix expansion and expressions are not resolved, reusable
 workflows and shell bodies are not semantically traced, Compose interpolation,
 profiles, health checks, dependency order, and runtime container behavior are
-not interpreted, and neither collector validates execution semantics. Packet
-evidence treats these anchors as diagnostic unless a future structural role
-explicitly admits them; they must not satisfy semantic proof roles.
+not interpreted, and schema endpoint anchors do not prove handler
+implementation, auth behavior, request validation, response semantics, runtime
+route behavior, or generated-client correctness. Packet evidence treats these
+anchors as diagnostic unless a future structural role explicitly admits them;
+they must not satisfy semantic proof roles.
 
-Safe wording: packet-runtime is implemented and completing the suite, but
+Safe wording: OpenAPI endpoint anchors prove only that a schema declares the
+method/path at the cited source range. Packet-runtime is implemented and
+completing the suite, but
 publishable agent-facing packet quality is not promoted until a coherent run has
 all quality, sufficiency, and cold-SLA gates green. This evidence is a
 development/proof-gate signal, not public product-grade proof for every
 parser-backed language. HTML, CSS, SQL, GitHub Actions workflows, and Docker
-Compose manifests remain structural source-proof collectors.
+Compose manifests remain structural source-proof collectors; OpenAPI schemas
+remain a dedicated schema-anchor path.
 
 Older development comparison: the language-expansion comparison artifact built
 on 2026-06-17:

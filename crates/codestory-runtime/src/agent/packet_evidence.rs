@@ -8,6 +8,8 @@ use codestory_contracts::language_support::{
     is_docker_compose_file_path, is_github_actions_workflow_path,
 };
 
+const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
+
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
 pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
 
@@ -39,7 +41,7 @@ pub(crate) fn evidence_candidate_from_hit(hit: &SearchHit) -> EvidenceCandidate 
 
 pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
     let candidate = evidence_candidate_from_hit(hit);
-    let structural_source_proof = hit_is_structural_source_proof(hit);
+    let diagnostic_source_proof = hit_is_diagnostic_source_proof(hit);
     hit.evidence_tier = Some(candidate.tier);
     hit.evidence_producer = Some(candidate.producer);
     hit.resolution_status = Some(candidate.resolution);
@@ -47,7 +49,7 @@ pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
         hit.loss_reason = candidate.loss_reason;
     }
     hit.eligible_for_sufficiency = Some(
-        !structural_source_proof
+        !diagnostic_source_proof
             && evidence_is_sufficiency_eligible(candidate.tier, candidate.resolution),
     );
 }
@@ -65,14 +67,16 @@ pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &
         .or_else(|| Some(evidence_resolution_for_hit(hit)));
     citation.loss_reason = hit.loss_reason.clone();
     citation.coverage_role = hit.coverage_role.clone();
-    if citation_is_structural_source_proof(citation) {
+    if citation_is_diagnostic_source_proof(citation) {
         citation.evidence_tier = Some(PacketEvidenceTier::ExactSource);
         citation.resolution_status = Some(evidence_resolution_for_citation(citation));
-        citation.evidence_producer = citation
-            .file_path
-            .as_deref()
-            .and_then(structural_source_proof_producer)
-            .map(str::to_string);
+        if citation.evidence_producer.is_none() {
+            citation.evidence_producer = citation
+                .file_path
+                .as_deref()
+                .and_then(structural_source_proof_producer)
+                .map(str::to_string);
+        }
         citation.eligible_for_sufficiency = Some(false);
         return;
     }
@@ -104,7 +108,7 @@ pub(crate) fn evidence_is_sufficiency_eligible(
 }
 
 pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool {
-    if citation_is_structural_source_proof(citation) {
+    if citation_is_diagnostic_source_proof(citation) {
         return citation.eligible_for_sufficiency.unwrap_or(false);
     }
     let tier = citation
@@ -119,7 +123,7 @@ pub(crate) fn citation_sufficiency_eligible(citation: &AgentCitationDto) -> bool
 }
 
 pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
-    if hit_is_structural_source_proof(hit) {
+    if hit_is_diagnostic_source_proof(hit) {
         return PacketEvidenceTier::ExactSource;
     }
     if let Some(tier) = hit.evidence_tier {
@@ -150,7 +154,7 @@ pub(crate) fn evidence_tier_for_hit(hit: &SearchHit) -> PacketEvidenceTier {
 }
 
 pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceResolution {
-    if hit_is_structural_source_proof(hit) {
+    if hit_is_diagnostic_source_proof(hit) {
         return if hit.file_path.is_some() && hit.line.is_some() {
             PacketEvidenceResolution::SourceRangeOnly
         } else {
@@ -170,6 +174,9 @@ pub(crate) fn evidence_resolution_for_hit(hit: &SearchHit) -> PacketEvidenceReso
 }
 
 pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
+    if hit_is_openapi_endpoint_schema(hit) {
+        return OPENAPI_ENDPOINT_SCHEMA_PRODUCER.to_string();
+    }
     if hit_is_structural_source_proof(hit) {
         return hit
             .file_path
@@ -193,7 +200,7 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
 }
 
 fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
-    if citation_is_structural_source_proof(citation) {
+    if citation_is_diagnostic_source_proof(citation) {
         return PacketEvidenceTier::ExactSource;
     }
     if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
@@ -221,7 +228,7 @@ fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier
 }
 
 fn evidence_resolution_for_citation(citation: &AgentCitationDto) -> PacketEvidenceResolution {
-    if citation_is_structural_source_proof(citation) {
+    if citation_is_diagnostic_source_proof(citation) {
         return if citation.file_path.is_some() && citation.line.is_some() {
             PacketEvidenceResolution::SourceRangeOnly
         } else {
@@ -243,11 +250,27 @@ fn hit_is_structural_source_proof(hit: &SearchHit) -> bool {
         .is_some_and(is_structural_source_proof_path)
 }
 
+fn hit_is_diagnostic_source_proof(hit: &SearchHit) -> bool {
+    hit_is_structural_source_proof(hit) || hit_is_openapi_endpoint_schema(hit)
+}
+
+fn hit_is_openapi_endpoint_schema(hit: &SearchHit) -> bool {
+    hit.evidence_producer.as_deref() == Some(OPENAPI_ENDPOINT_SCHEMA_PRODUCER)
+}
+
 fn citation_is_structural_source_proof(citation: &AgentCitationDto) -> bool {
     citation
         .file_path
         .as_deref()
         .is_some_and(is_structural_source_proof_path)
+}
+
+fn citation_is_diagnostic_source_proof(citation: &AgentCitationDto) -> bool {
+    citation_is_structural_source_proof(citation) || citation_is_openapi_endpoint_schema(citation)
+}
+
+fn citation_is_openapi_endpoint_schema(citation: &AgentCitationDto) -> bool {
+    citation.evidence_producer.as_deref() == Some(OPENAPI_ENDPOINT_SCHEMA_PRODUCER)
 }
 
 fn is_structural_source_proof_path(path: &str) -> bool {
@@ -267,7 +290,9 @@ fn structural_source_proof_producer(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_contracts::api::{NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin};
+    use codestory_contracts::api::{
+        AgentCitationDto, NodeId, NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin,
+    };
 
     fn workflow_hit() -> SearchHit {
         SearchHit {
@@ -338,5 +363,74 @@ mod tests {
             Some("structural_docker_compose_collector")
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn openapi_endpoint_hit_is_exact_source_diagnostic() {
+        let mut hit = workflow_hit();
+        hit.node_id = NodeId("openapi-endpoint".to_string());
+        hit.display_name = "GET /api/users".to_string();
+        hit.file_path = Some("openapi.json".to_string());
+        hit.evidence_producer = Some("openapi_endpoint_schema".to_string());
+
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn openapi_endpoint_citation_is_not_sufficiency_eligible() {
+        let mut hit = workflow_hit();
+        hit.node_id = NodeId("openapi-endpoint".to_string());
+        hit.display_name = "GET /api/users".to_string();
+        hit.file_path = Some("openapi.json".to_string());
+        hit.evidence_producer = Some("openapi_endpoint_schema".to_string());
+        decorate_search_hit_evidence(&mut hit);
+
+        let mut citation = AgentCitationDto {
+            node_id: hit.node_id.clone(),
+            display_name: hit.display_name.clone(),
+            kind: hit.kind,
+            file_path: hit.file_path.clone(),
+            line: hit.line,
+            score: hit.score,
+            origin: hit.origin,
+            resolvable: hit.resolvable,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+        };
+
+        decorate_citation_from_hit(&mut citation, &hit);
+
+        assert_eq!(
+            citation.evidence_tier,
+            Some(PacketEvidenceTier::ExactSource)
+        );
+        assert_eq!(
+            citation.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
+        assert_eq!(
+            citation.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(citation.eligible_for_sufficiency, Some(false));
+        assert!(!citation_sufficiency_eligible(&citation));
     }
 }

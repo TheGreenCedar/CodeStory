@@ -7390,6 +7390,11 @@ impl AppController {
             }
         }
 
+        let openapi_endpoint = node
+            .canonical_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("openapi:endpoint:"));
+
         Some(SearchHit {
             node_id: NodeId::from(id),
             display_name,
@@ -7400,14 +7405,27 @@ impl AppController {
             origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
             match_quality: None,
             resolvable: true,
-            evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-            evidence_producer: Some("route_endpoint".to_string()),
-            resolution_status: Some(
-                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved,
+            evidence_tier: Some(if openapi_endpoint {
+                codestory_contracts::api::PacketEvidenceTierDto::ExactSource
+            } else {
+                codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph
+            }),
+            evidence_producer: Some(
+                if openapi_endpoint {
+                    "openapi_endpoint_schema"
+                } else {
+                    "route_endpoint"
+                }
+                .to_string(),
             ),
+            resolution_status: Some(if openapi_endpoint {
+                codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly
+            } else {
+                codestory_contracts::api::PacketEvidenceResolutionDto::Resolved
+            }),
             loss_reason: None,
             coverage_role: None,
-            eligible_for_sufficiency: Some(true),
+            eligible_for_sufficiency: Some(!openapi_endpoint),
             score_breakdown: None,
         })
     }
@@ -13973,6 +13991,48 @@ fn build_llm_symbol_doc_text() -> String {
         let mut hits = [text_only, ast.clone()];
         hits.sort_by(|left, right| compare_search_hits("/api/users", left, right));
         assert_eq!(hits.first().map(|hit| &hit.node_id), Some(&ast.node_id));
+    }
+
+    #[test]
+    fn build_search_hit_marks_openapi_endpoints_as_diagnostic_source() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(30),
+                    kind: NodeKind::FILE,
+                    serialized_name: "openapi.json".to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(31),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    file_node_id: Some(CoreNodeId(30)),
+                    canonical_id: Some("openapi:endpoint:GET /api/users".to_string()),
+                    start_line: Some(7),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert OpenAPI nodes");
+        let node_names = HashMap::from([(CoreNodeId(31), "GET /api/users".to_string())]);
+
+        let hit = AppController::build_search_hit(&storage, &node_names, CoreNodeId(31), 1.0)
+            .expect("OpenAPI endpoint hit");
+
+        assert_eq!(
+            hit.evidence_tier,
+            Some(codestory_contracts::api::PacketEvidenceTierDto::ExactSource)
+        );
+        assert_eq!(
+            hit.resolution_status,
+            Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("openapi_endpoint_schema")
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }
 
     #[test]
