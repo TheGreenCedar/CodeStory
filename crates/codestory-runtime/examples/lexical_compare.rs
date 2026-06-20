@@ -17,6 +17,7 @@ const LEXICAL_INDEX_FILE: &str = "lexical-index.jsonl";
 const CANDIDATE_DIR_PREFIX: &str = "codestory-lexical-tantivy-";
 const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_REPEATS: usize = 7;
+const DEFAULT_PREFILTER_LIMIT: usize = 2048;
 
 fn main() -> Result<()> {
     let opts = Options::parse(std::env::args().skip(1).collect())?;
@@ -189,6 +190,8 @@ struct CompareReport {
     top_k: usize,
     repeats: usize,
     missing_artifact_failure_behavior: String,
+    candidate_strategy: String,
+    candidate_prefilter_limit: usize,
     queries: Vec<QueryReport>,
     aggregate: AggregateReport,
 }
@@ -223,6 +226,7 @@ struct SearchHit {
     symbol_name: Option<String>,
     start_line: Option<u32>,
     score: f32,
+    doc_id: Option<usize>,
 }
 
 fn run_compare(opts: &Options) -> Result<CompareReport> {
@@ -255,7 +259,7 @@ fn run_compare(opts: &Options) -> Result<CompareReport> {
 
     let mut query_reports = Vec::new();
     for query in &opts.queries {
-        let _ = candidate.search(query, opts.top_k)?;
+        let _ = candidate.search_reranked(&entries, query, opts.top_k)?;
         let _ = jsonl_search(&entries, query, opts.top_k);
 
         let mut jsonl_times = Vec::new();
@@ -268,7 +272,7 @@ fn run_compare(opts: &Options) -> Result<CompareReport> {
             jsonl_times.push(started.elapsed().as_secs_f64() * 1000.0);
 
             let started = Instant::now();
-            tantivy_hits = candidate.search(query, opts.top_k)?;
+            tantivy_hits = candidate.search_reranked(&entries, query, opts.top_k)?;
             tantivy_times.push(started.elapsed().as_secs_f64() * 1000.0);
         }
 
@@ -296,6 +300,9 @@ fn run_compare(opts: &Options) -> Result<CompareReport> {
         missing_artifact_failure_behavior:
             "missing lexical-index.jsonl returns an error before building the candidate index"
                 .into(),
+        candidate_strategy:
+            "tantivy_or_prefilter_then_current_jsonl_score_rerank; diagnostic-only".into(),
+        candidate_prefilter_limit: DEFAULT_PREFILTER_LIMIT,
         queries: query_reports,
         aggregate,
     })
@@ -325,6 +332,7 @@ struct TantivyCandidate {
     node_id_field: tantivy::schema::Field,
     symbol_name_field: tantivy::schema::Field,
     start_line_field: tantivy::schema::Field,
+    doc_id_field: tantivy::schema::Field,
 }
 
 impl TantivyCandidate {
@@ -364,10 +372,30 @@ impl TantivyCandidate {
             node_id_field,
             symbol_name_field,
             start_line_field,
+            doc_id_field,
         })
     }
 
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    fn search_reranked(
+        &self,
+        entries: &[LexicalIndexEntry],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let prefilter_hits = self.search_prefilter(query, DEFAULT_PREFILTER_LIMIT.max(limit))?;
+        let allowed_doc_ids = prefilter_hits
+            .iter()
+            .filter_map(|hit| hit.doc_id)
+            .collect::<HashSet<_>>();
+        Ok(jsonl_search_filtered(
+            entries,
+            query,
+            limit,
+            Some(&allowed_doc_ids),
+        ))
+    }
+
+    fn search_prefilter(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let query = sanitize_tantivy_query(query);
         if query.is_empty() {
             return Ok(Vec::new());
@@ -404,6 +432,10 @@ impl TantivyCandidate {
                     .and_then(|value| u32::try_from(value).ok())
                     .filter(|value| *value > 0),
                 score,
+                doc_id: doc
+                    .get_first(self.doc_id_field)
+                    .and_then(|value| value.as_i64())
+                    .and_then(|value| usize::try_from(value).ok()),
             });
         }
         Ok(hits)
@@ -425,10 +457,19 @@ fn sanitize_tantivy_query(query: &str) -> String {
         .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
         .filter(|token| token.len() >= 2)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
 }
 
 fn jsonl_search(entries: &[LexicalIndexEntry], query: &str, limit: usize) -> Vec<SearchHit> {
+    jsonl_search_filtered(entries, query, limit, None)
+}
+
+fn jsonl_search_filtered(
+    entries: &[LexicalIndexEntry],
+    query: &str,
+    limit: usize,
+    allowed_doc_ids: Option<&HashSet<usize>>,
+) -> Vec<SearchHit> {
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
         return Vec::new();
@@ -453,7 +494,10 @@ fn jsonl_search(entries: &[LexicalIndexEntry], query: &str, limit: usize) -> Vec
     let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
     let mut hits = Vec::new();
 
-    for entry in entries {
+    for (doc_id, entry) in entries.iter().enumerate() {
+        if allowed_doc_ids.is_some_and(|allowed| !allowed.contains(&doc_id)) {
+            continue;
+        }
         let path_lower = entry.path.to_ascii_lowercase();
         let content_lower = entry.content.to_ascii_lowercase();
         let token_match = lexical_token_match(&tokens, &token_weights, &path_lower, &content_lower);
@@ -467,6 +511,7 @@ fn jsonl_search(entries: &[LexicalIndexEntry], query: &str, limit: usize) -> Vec
                 symbol_name: entry.symbol_name.clone(),
                 start_line: entry.start_line,
                 score: score_lexical_match(&entry.path, entry.source, &token_match),
+                doc_id: Some(doc_id),
             });
         }
     }
