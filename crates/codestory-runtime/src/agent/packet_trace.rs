@@ -235,6 +235,9 @@ pub(crate) fn append_packet_query_timing_fields(
     if let Some(value) = diagnostic.sidecar_stage_total_ms {
         output.push(field("sidecar_stage_total_ms", value.to_string()));
     }
+    if let Some(value) = diagnostic.batch_query_wall_ms {
+        output.push(field("batch_query_wall_ms", value.to_string()));
+    }
 }
 
 fn packet_query_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
@@ -245,12 +248,20 @@ fn packet_query_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnost
         diagnostic.sidecar_query_ms,
         diagnostic.candidate_resolution_ms,
         diagnostic.total_elapsed_ms,
+        diagnostic.batch_query_wall_ms,
     ) {
-        (Some(query_ms), Some(resolution_ms), Some(total_ms)) => format!(
+        (Some(query_ms), Some(resolution_ms), Some(total_ms), Some(batch_ms)) => format!(
+            " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={} batch_query_wall_ms={}",
+            query_ms, resolution_ms, total_ms, batch_ms
+        ),
+        (Some(query_ms), Some(resolution_ms), Some(total_ms), None) => format!(
             " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={}",
             query_ms, resolution_ms, total_ms
         ),
-        (_, _, Some(total_ms)) => format!(" total_elapsed_ms={total_ms}"),
+        (_, _, Some(total_ms), Some(batch_ms)) => {
+            format!(" total_elapsed_ms={total_ms} batch_query_wall_ms={batch_ms}")
+        }
+        (_, _, Some(total_ms), None) => format!(" total_elapsed_ms={total_ms}"),
         _ => String::new(),
     }
 }
@@ -298,6 +309,7 @@ mod golden_tests {
             total_elapsed_ms: Some(12),
             sidecar_stage_count: 0,
             sidecar_stage_total_ms: None,
+            batch_query_wall_ms: Some(11),
             candidate_count: 1,
             resolved_hit_count: 1,
             unresolved_candidate_count: 0,
@@ -359,6 +371,14 @@ mod golden_tests {
                 .find(|field| field.key == "sidecar_query_ms")
                 .map(|field| field.value.as_str()),
             Some("9")
+        );
+        assert_eq!(
+            answer.retrieval_trace.steps[0]
+                .output
+                .iter()
+                .find(|field| field.key == "batch_query_wall_ms")
+                .map(|field| field.value.as_str()),
+            Some("11")
         );
         let citation = to_citation_from_hit(&results[0].1[0], None, None, false);
         assert_eq!(answer.citations[0].display_name, citation.display_name);

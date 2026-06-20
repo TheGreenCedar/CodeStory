@@ -19,6 +19,7 @@ pub(crate) struct PacketStepTraceRow {
     pub sidecar_query_ms: Option<u32>,
     pub candidate_resolution_ms: Option<u32>,
     pub sidecar_total_ms: Option<u32>,
+    pub batch_query_wall_ms: Option<u32>,
     pub message: Option<String>,
 }
 
@@ -51,6 +52,7 @@ fn packet_step_row(index: usize, step: &AgentRetrievalStepDto) -> PacketStepTrac
         sidecar_query_ms: step_output_u32(step, "sidecar_query_ms"),
         candidate_resolution_ms: step_output_u32(step, "candidate_resolution_ms"),
         sidecar_total_ms: step_output_u32(step, "sidecar_total_ms"),
+        batch_query_wall_ms: step_output_u32(step, "batch_query_wall_ms"),
         message: step.message.clone(),
     }
 }
