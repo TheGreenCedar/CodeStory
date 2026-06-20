@@ -81,6 +81,7 @@ tempfile = "3.10"
 toml = "0.8"
 sha2 = "0.10"
 ureq = "2.12"
+turbovec = "0.9.0"
 
 criterion = "0.8.2"
 proptest = "1.5"

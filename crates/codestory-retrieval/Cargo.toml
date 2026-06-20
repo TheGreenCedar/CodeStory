@@ -22,3 +22,4 @@ ureq = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+turbovec = { workspace = true }
