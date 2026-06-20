@@ -12,8 +12,10 @@ checkout is only the tool artifact unless the user is editing CodeStory itself.
 
 ## Core Loop
 
-1. Prefer `CODESTORY_CLI`, then `codestory-cli` on `PATH`; run `scripts/setup.ps1`
-   or `scripts/setup.sh` from this skill only when no binary is available.
+1. Prefer `CODESTORY_CLI`, `codestory-cli` on `PATH`, this worktree's
+   `target/release/codestory-cli*`, then a sibling worktree's release binary;
+   run `scripts/setup.ps1` or `scripts/setup.sh` from this skill only when no
+   ready binary is available.
 2. Always pass `--project <target-workspace>` explicitly.
 3. Use `doctor` when cache, freshness, or retrieval health matters; use
    `index --refresh full` for first runs or historical indexing failures, and

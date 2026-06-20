@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Project = "."
+    [string]$Project = ".",
+    [switch]$ResolveCliOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,19 +37,72 @@ function Invoke-SetupStep {
     }
 }
 
-function Find-CodeStoryCli {
+function Test-CodeStoryCli {
+    param([string]$Candidate)
+
+    if (-not $Candidate) {
+        return $false
+    }
+    if (-not (Get-Command $Candidate -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+
+    # ponytail: --help proves the binary is runnable; doctor remains the real trust gate.
+    & $Candidate --help >$null 2>$null
+    return $LASTEXITCODE -eq 0
+}
+
+function Get-CodeStoryCliCandidates {
     param([string]$Root)
 
-    $candidates = @(
+    $candidates = @()
+    if ($env:CODESTORY_CLI) {
+        $candidates += $env:CODESTORY_CLI
+    }
+
+    $pathCli = Get-Command "codestory-cli" -ErrorAction SilentlyContinue
+    if ($pathCli) {
+        $candidates += $pathCli.Source
+    }
+
+    $candidates += @(
         (Join-Path $Root "target\release\codestory-cli.exe"),
         (Join-Path $Root "target\release\codestory-cli")
     )
+
+    $lines = if (Get-Command git -ErrorAction SilentlyContinue) {
+        & git worktree list --porcelain 2>$null
+    } else {
+        @()
+    }
+    if ($LASTEXITCODE -eq 0) {
+        foreach ($line in $lines) {
+            if (-not $line.StartsWith("worktree ")) {
+                continue
+            }
+            $candidateRoot = $line.Substring("worktree ".Length)
+            if (Same-Path $candidateRoot $Root) {
+                continue
+            }
+            $candidates += (Join-Path $candidateRoot "target\release\codestory-cli.exe")
+            $candidates += (Join-Path $candidateRoot "target\release\codestory-cli")
+        }
+    }
+
+    return $candidates | Where-Object { $_ } | Select-Object -Unique
+}
+
+function Find-CodeStoryCli {
+    param([string]$Root)
+
+    $candidates = Get-CodeStoryCliCandidates $Root
     foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (Test-CodeStoryCli $candidate) {
             return $candidate
         }
     }
-    throw "codestory-cli release binary was not found under target\release"
+
+    throw "No ready codestory-cli found via CODESTORY_CLI, PATH, this worktree's target\release, or sibling worktree target\release directories."
 }
 
 function Same-Path {
@@ -109,11 +163,24 @@ try {
         Write-Host "Using RUSTC_WRAPPER=$sccache"
     }
 
-    Invoke-SetupStep "Build release CLI" {
+    try {
+        $cli = Find-CodeStoryCli $projectPath
+    } catch {
+        if ($ResolveCliOnly) {
+            throw "$($_.Exception.Message) Re-run without -ResolveCliOnly to build with cargo, or set CODESTORY_CLI to a ready binary."
+        }
+        Write-Host ""
+        Write-Host "==> Build release CLI"
+        Write-Warning "$($_.Exception.Message) Building release CLI with cargo."
         Invoke-Checked "cargo" @("build", "--release", "-p", "codestory-cli")
+        $cli = Find-CodeStoryCli $projectPath
     }
 
-    $cli = Find-CodeStoryCli $projectPath
+    Write-Host "CODESTORY_CLI=$cli"
+    if ($ResolveCliOnly) {
+        return
+    }
+
     $source = Find-RehydrateSource $projectPath
     if ($source) {
         Invoke-SetupStep "Rehydrate CodeStory cache from $source" {
