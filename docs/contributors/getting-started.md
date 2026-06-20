@@ -103,6 +103,48 @@ Use this mapping:
 - args or output rendering: `codestory-cli`
 - shared DTOs or graph/event types: `codestory-contracts`
 
+## Rustdoc Baseline
+
+Run the rustdoc baseline before raising documentation or public API cleanup PRs:
+
+```sh
+cargo doc --workspace --no-deps
+```
+
+Document public Rust APIs that a maintainer, integration, or downstream crate
+would need to call correctly. Keep comments operational:
+
+- Start each public crate and intentionally public module with `//!` docs that
+  name the crate boundary, source of truth, and runtime side effects.
+- Put `///` docs on public structs, enums, traits, type aliases, constants,
+  re-exports, and functions that are meant to be reused across crates.
+- State invariants, cache or sidecar effects, error behavior, and required
+  verification commands when those details affect correct use.
+- Avoid issue history, benchmark holdout names, local machine paths, and
+  process narration in rustdoc.
+- Prefer one accurate paragraph over examples that would duplicate tests or
+  drift from real command behavior.
+
+Public API documentation priority:
+
+| Crate | Public surface to document first |
+| --- | --- |
+| `codestory-contracts` | Shared DTOs, graph model, events, language support contracts, and query/trail types. |
+| `codestory-runtime` | Headless orchestration, service facades, cache rehydration, search/runtime exports, and repository identity reports. |
+| `codestory-retrieval` | Sidecar health, query planning/execution, index manifests, cache keys, and degraded-mode contracts. |
+| `codestory-workspace` | Workspace discovery/settings, refresh planning, language settings, and repository/sidecar identity. |
+| `codestory-store` | Storage facades and projection/snapshot/file-store contracts. |
+| `codestory-indexer` | Public indexing config/results/events, language config, semantic-resolution contracts, and candidate path helpers. |
+| `codestory-cli` | Binary command behavior belongs in user/contributor docs; add rustdoc only for reusable library APIs if one is introduced. |
+| `codestory-bench` | Publish-false benchmark helpers; document only helpers reused outside a single benchmark lane. |
+
+Do not enable workspace-wide or crate-wide `missing_docs` yet. The current
+public surface is broad enough that a crate-wide lint would force a noisy sweep.
+Phase it in behind explicit allowlists: start with module-scoped
+`#![warn(missing_docs)]` on newly cleaned public modules, allow known transitional
+exports explicitly, and move to crate-wide lints only after the crate root and
+intentional re-exports are documented.
+
 ## Before Large Changes
 
 Read these pages first:
