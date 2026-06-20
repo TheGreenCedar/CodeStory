@@ -1848,12 +1848,12 @@ fn collect_form_validation_shape_candidates(
             eligible_for_sufficiency: true,
         });
     }
-    if source_lower.contains("novalidate") {
+    if let Some((attribute, line)) = packet_first_form_validation_bypass_attribute(source) {
         candidates.push(PacketGenericSourceShapeCandidate {
             path: path.to_path_buf(),
-            display_name: "novalidate".to_string(),
+            display_name: attribute,
             kind: NodeKind::ANNOTATION,
-            line: packet_source_line_containing(source, "novalidate").unwrap_or(1),
+            line,
             score: 129.0,
             coverage_role: "form_validation_bypass".to_string(),
             producer: "packet_generic_form_validation_source_probe".to_string(),
@@ -1889,38 +1889,21 @@ fn collect_buffered_io_shape_candidates(
     if !matches!(extension.as_str(), "kt" | "java" | "swift" | "go" | "rs") {
         return;
     }
-    let source_lower = source.to_ascii_lowercase();
-    for (needle, display_name, role, score) in [
-        (
-            "realbufferedsource",
-            "RealBufferedSource",
-            "buffered_source_impl",
-            136.0,
-        ),
-        (
-            "realbufferedsink",
-            "RealBufferedSink",
-            "buffered_sink_impl",
-            135.0,
-        ),
-    ] {
-        if source_lower.contains(needle) {
-            candidates.push(PacketGenericSourceShapeCandidate {
-                path: path.to_path_buf(),
-                display_name: display_name.to_string(),
-                kind: NodeKind::CLASS,
-                line: packet_source_line_containing(source, needle).unwrap_or(1),
-                score,
-                coverage_role: role.to_string(),
-                producer: "packet_generic_buffered_io_source_probe".to_string(),
-                eligible_for_sufficiency: true,
-            });
-        }
+    let buffered_type_names = packet_buffered_io_type_names(source);
+    for (display_name, role, score, line) in &buffered_type_names {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: display_name.clone(),
+            kind: NodeKind::CLASS,
+            line: *line,
+            score: *score,
+            coverage_role: (*role).to_string(),
+            producer: "packet_generic_buffered_io_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
     }
-    if source_lower.contains("buffer()")
-        && (source_lower.contains("realbufferedsource")
-            || source_lower.contains("realbufferedsink"))
-    {
+    let source_lower = source.to_ascii_lowercase();
+    if source_lower.contains("buffer()") && !buffered_type_names.is_empty() {
         candidates.push(PacketGenericSourceShapeCandidate {
             path: path.to_path_buf(),
             display_name: "buffer".to_string(),
@@ -1932,6 +1915,51 @@ fn collect_buffered_io_shape_candidates(
             eligible_for_sufficiency: true,
         });
     }
+}
+
+fn packet_buffered_io_type_names(source: &str) -> Vec<(String, &'static str, f32, u32)> {
+    let mut names = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let Some(name) = packet_declared_type_name(line) else {
+            continue;
+        };
+        let normalized = name.to_ascii_lowercase();
+        if !normalized.contains("buffered") {
+            continue;
+        }
+        let Some((role, score)) = packet_buffered_io_role(&normalized) else {
+            continue;
+        };
+        names.push((
+            name,
+            role,
+            score,
+            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+        ));
+    }
+    names
+}
+
+fn packet_declared_type_name(line: &str) -> Option<String> {
+    let mut words = line
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|word| !word.is_empty());
+    while let Some(word) = words.next() {
+        if matches!(word, "class" | "struct" | "interface" | "object") {
+            return words.next().map(|name| name.to_string());
+        }
+    }
+    None
+}
+
+fn packet_buffered_io_role(normalized_name: &str) -> Option<(&'static str, f32)> {
+    if normalized_name.ends_with("source") {
+        return Some(("buffered_source_impl", 136.0));
+    }
+    if normalized_name.ends_with("sink") {
+        return Some(("buffered_sink_impl", 135.0));
+    }
+    None
 }
 
 fn collect_url_session_request_shape_candidates(
@@ -1981,6 +2009,30 @@ fn collect_url_session_request_shape_candidates(
             eligible_for_sufficiency: true,
         });
     }
+}
+
+fn packet_first_form_validation_bypass_attribute(source: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("<form") {
+            continue;
+        }
+        for attribute in line.split_ascii_whitespace() {
+            let attribute = attribute
+                .trim_matches(|ch: char| ch == '<' || ch == '>' || ch == '/')
+                .split('=')
+                .next()
+                .unwrap_or_default();
+            let normalized = attribute.to_ascii_lowercase();
+            if normalized.starts_with("no") && normalized.ends_with("validate") {
+                return Some((
+                    attribute.to_string(),
+                    index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn packet_first_html_input_id(source: &str) -> Option<String> {
