@@ -62,10 +62,20 @@ fn capabilities_are_empty(cap: &SidecarCapabilities) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalRepairHint {
+    pub reason: String,
+    pub next_step: String,
+    pub next_command: String,
+    pub full_repair: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<RetrievalRepairHint>,
     pub query_embedding_backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_vector_embedding_backend: Option<String>,
@@ -95,6 +105,38 @@ pub fn attach_manifest_contract(
         .as_ref()
         .map(|manifest| manifest_contract_report(source_root, &report, manifest));
     report
+}
+
+pub fn attach_repair_hint(
+    mut report: RetrievalStatusReport,
+    project_root: &Path,
+) -> RetrievalStatusReport {
+    if report.retrieval_mode == "full" {
+        return report;
+    }
+    let reason = report
+        .degraded_reason
+        .clone()
+        .unwrap_or_else(|| "sidecar_retrieval_not_full".into());
+    let project = quote_command_path(project_root);
+    let full_repair = vec![
+        format!("codestory-cli retrieval bootstrap --project {project} --format json"),
+        format!("codestory-cli retrieval index --project {project} --refresh full --format json"),
+        format!("codestory-cli retrieval status --project {project} --format json"),
+    ];
+    report.repair = Some(RetrievalRepairHint {
+        reason,
+        next_step:
+            "Prepare sidecars, rebuild retrieval indexes with full refresh, then recheck status."
+                .into(),
+        next_command: full_repair[0].clone(),
+        full_repair,
+    });
+    report
+}
+
+fn quote_command_path(path: &Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
 }
 
 fn manifest_contract_report(
@@ -251,6 +293,7 @@ pub fn unavailable_status_report(
     RetrievalStatusReport {
         retrieval_mode: "unavailable".into(),
         degraded_reason: Some(reason.clone()),
+        repair: None,
         query_embedding_backend: crate::embeddings::embedding_runtime_id(),
         manifest_vector_embedding_backend,
         manifest_vector_embedding_dim,
@@ -527,6 +570,7 @@ pub fn probe_sidecar_health(
     RetrievalStatusReport {
         retrieval_mode: mode.as_str().into(),
         degraded_reason,
+        repair: None,
         query_embedding_backend: current_embedding_backend,
         manifest_vector_embedding_backend: manifest.embedding_backend.clone(),
         manifest_vector_embedding_dim: manifest.embedding_dim,
@@ -545,6 +589,33 @@ pub fn probe_sidecar_health(
 mod tests {
     use super::*;
     use crate::config::SidecarLayout;
+
+    #[test]
+    fn repair_hint_names_reason_and_full_sidecar_rebuild_sequence() {
+        let report = attach_repair_hint(
+            unavailable_status_report("retrieval_manifest_missing", None),
+            Path::new("C:/repo with spaces"),
+        );
+        let repair = report.repair.expect("repair hint");
+
+        assert_eq!(repair.reason, "retrieval_manifest_missing");
+        assert!(
+            repair.next_command.contains("retrieval bootstrap"),
+            "repair should start with sidecar bootstrap: {repair:?}"
+        );
+        assert!(
+            repair.full_repair.iter().any(|command| command
+                .contains("retrieval index --project \"C:/repo with spaces\" --refresh full")),
+            "repair should include full retrieval rebuild with quoted project path: {repair:?}"
+        );
+        assert!(
+            repair
+                .full_repair
+                .last()
+                .is_some_and(|command| command.contains("retrieval status")),
+            "repair should end with retrieval status proof: {repair:?}"
+        );
+    }
 
     #[test]
     fn status_reports_unavailable_when_zoekt_down() {
@@ -701,6 +772,7 @@ mod tests {
             },
             manifest_contract: None,
             manifest: Some(manifest),
+            repair: None,
         };
         let source_root = std::env::current_dir().expect("current dir");
 
