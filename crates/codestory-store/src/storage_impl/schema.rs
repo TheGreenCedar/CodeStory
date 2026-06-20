@@ -426,6 +426,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         migrate_v18_ast_first_symbol_docs(&storage.conn)?;
         storage.set_schema_version(18)?;
     }
+    if stored_version >= 18 {
+        // ponytail: v18 caches can be stamped current while missing additive columns.
+        migrate_v18_ast_first_symbol_docs(&storage.conn)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
