@@ -26,7 +26,7 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | exact-source structural/schema anchors |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | exact-source structural/schema anchors |
 
 Agent-facing packet/search quality is separate. The language-expansion A/B
 report is not blanket promotion proof for every parser-backed language.
@@ -77,9 +77,18 @@ workflows and shell bodies are not semantically traced, Compose interpolation,
 profiles, health checks, dependency order, and runtime container behavior are
 not interpreted, and schema endpoint anchors do not prove handler
 implementation, auth behavior, request validation, response semantics, runtime
-route behavior, or generated-client correctness. Packet evidence treats these
-anchors as diagnostic unless a future structural role explicitly admits them;
-they must not satisfy semantic proof roles.
+route behavior, or generated-client correctness. Neither collector validates
+execution semantics.
+Cargo manifest support is basename-scoped to `Cargo.toml`. It emits `[workspace]`
+member, `[package]` name, and direct dependency-key anchors from `[dependencies]`,
+`[dev-dependencies]`, and `[build-dependencies]` with the same exact-source /
+source-range-only boundary. It does not admit generic TOML, `Cargo.lock`,
+target-scoped dependency tables, `[workspace.dependencies]`, dependency
+subtables, feature tables, patch or replace tables, dependency resolution,
+feature activation, workspace inheritance, build-script behavior, or lockfile
+proof. Packet evidence treats these anchors as diagnostic unless a future
+structural role explicitly admits them; they must not satisfy semantic proof
+roles or semantic dependency proof.
 
 Safe wording: OpenAPI endpoint anchors prove only that a schema declares the
 method/path at the cited source range. Packet-runtime is implemented and
@@ -87,9 +96,9 @@ completing the suite, but
 publishable agent-facing packet quality is not promoted until a coherent run has
 all quality, sufficiency, and cold-SLA gates green. This evidence is a
 development/proof-gate signal, not public product-grade proof for every
-parser-backed language. HTML, CSS, SQL, GitHub Actions workflows, and Docker
-Compose manifests remain structural source-proof collectors; OpenAPI schemas
-remain a dedicated schema-anchor path.
+parser-backed language. HTML, CSS, SQL, GitHub Actions workflows, Docker Compose
+manifests, and Cargo manifests remain structural source-proof collectors;
+OpenAPI schemas remain a dedicated schema-anchor path.
 
 Older development comparison: the language-expansion comparison artifact built
 on 2026-06-17:

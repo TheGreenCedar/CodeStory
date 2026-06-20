@@ -611,6 +611,14 @@ fn normalize_exclude_match_key(path: &Path) -> String {
 }
 
 fn matches_source_group_language(path: &Path, language: &Language) -> bool {
+    if matches!(language, Language::Rust)
+        && codestory_contracts::language_support::is_cargo_manifest_file_path(
+            path.to_string_lossy().as_ref(),
+        )
+    {
+        return true;
+    }
+
     let Some(extension) = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -980,6 +988,26 @@ mod tests {
                 "compatibility-only source extension should stay accepted by workspace discovery: {extension}"
             );
         }
+    }
+
+    #[test]
+    fn rust_source_groups_keep_cargo_manifest_but_not_generic_toml() {
+        assert!(matches_source_group_language(
+            Path::new("Cargo.toml"),
+            &Language::Rust
+        ));
+        assert!(matches_source_group_language(
+            Path::new("crates/tool/Cargo.toml"),
+            &Language::Rust
+        ));
+        assert!(!matches_source_group_language(
+            Path::new("config.toml"),
+            &Language::Rust
+        ));
+        assert!(!matches_source_group_language(
+            Path::new("Cargo.lock"),
+            &Language::Rust
+        ));
     }
 
     #[test]
