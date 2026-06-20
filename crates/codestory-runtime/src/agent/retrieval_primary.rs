@@ -1042,13 +1042,20 @@ fn unresolved_candidates_are_diagnostic_only(
     resolution_labels: &[String],
     unresolved_candidate_count: usize,
 ) -> bool {
+    let has_resolved_hit = resolution_labels
+        .iter()
+        .any(|label| label.as_str() == "resolved");
     unresolved_candidate_count > 0
         && !resolution_labels.is_empty()
         && candidates
             .iter()
             .zip(resolution_labels)
             .filter(|(_, label)| label.as_str() != "resolved")
-            .all(|(candidate, label)| bare_dense_anchor_unresolved(candidate, label))
+            .all(|(candidate, label)| {
+                bare_dense_anchor_unresolved(candidate, label)
+                    || (has_resolved_hit
+                        && non_source_markdown_candidate_unresolved(candidate, label))
+            })
 }
 
 fn bare_dense_anchor_unresolved(candidate: &CandidateHit, resolution_label: &str) -> bool {
@@ -1065,6 +1072,16 @@ fn bare_dense_anchor_path(candidate: &CandidateHit) -> bool {
             .symbol_name
             .as_deref()
             .is_some_and(|symbol| symbol.trim().eq_ignore_ascii_case(file_path))
+}
+
+fn non_source_markdown_candidate_unresolved(
+    candidate: &CandidateHit,
+    resolution_label: &str,
+) -> bool {
+    resolution_label == "node_unresolved"
+        && candidate.source == CandidateSource::Zoekt
+        && candidate.symbol_name.is_none()
+        && candidate.file_path.to_ascii_lowercase().ends_with(".md")
 }
 
 fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
@@ -1794,6 +1811,46 @@ mod tests {
         let value = serde_json::to_value(&shadow).expect("serialize shadow");
         assert_eq!(shadow.unresolved_candidate_count, 1);
         assert_eq!(value.get("diagnostic_only"), None);
+    }
+
+    #[test]
+    fn shadow_marks_non_source_markdown_candidates_diagnostic_only_with_source_hits() {
+        let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
+            QueryResult {
+                query: "form validation".into(),
+                features: classify_query("form validation"),
+                hits: vec![
+                    CandidateHit::with_source(
+                        "docs/tasks/form-validation/marking.md",
+                        None,
+                        0.9,
+                        CandidateSource::Zoekt,
+                    ),
+                    CandidateHit::with_source(
+                        "src/forms/validation.html",
+                        Some("email".into()),
+                        0.8,
+                        CandidateSource::Qdrant,
+                    ),
+                ],
+                trace: QueryTrace {
+                    retrieval_mode: "full".into(),
+                    degraded_reason: None,
+                    total_budget_ms: 500,
+                    elapsed_ms: 1,
+                    cancel_reason: None,
+                    cache_hit: false,
+                    stages: Vec::new(),
+                },
+            },
+            2,
+            1,
+            &["node_unresolved".to_string(), "resolved".to_string()],
+            &[],
+        );
+        let value = serde_json::to_value(&shadow).expect("serialize shadow");
+        assert_eq!(shadow.unresolved_candidate_count, 1);
+        assert_eq!(value["diagnostic_only"], true);
     }
 
     #[test]

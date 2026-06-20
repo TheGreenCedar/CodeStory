@@ -1090,6 +1090,9 @@ fn maybe_append_generic_source_shape_citations(
         css_animation_flow,
         &mut candidates,
     );
+    if url_session_request_flow {
+        collect_cited_request_validation_shape_candidates(project_root, answer, &mut candidates);
+    }
     candidates.sort_by(|left, right| {
         right
             .score
@@ -1861,6 +1864,13 @@ fn collect_form_validation_shape_candidates(
         });
     }
     if let Some(input_id) = packet_first_html_input_id(source) {
+        let score = if packet_first_form_validation_bypass_attribute(source).is_some()
+            || source_lower.contains("validity")
+        {
+            132.0
+        } else {
+            128.0
+        };
         candidates.push(PacketGenericSourceShapeCandidate {
             path: path.to_path_buf(),
             display_name: format!("input#{input_id}"),
@@ -1868,8 +1878,20 @@ fn collect_form_validation_shape_candidates(
             line: packet_source_line_containing(source, &format!("id=\"{input_id}\""))
                 .or_else(|| packet_source_line_containing(source, &format!("id='{input_id}'")))
                 .unwrap_or(1),
-            score: 128.0,
+            score,
             coverage_role: "form_custom_input".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    if let Some((function, line)) = packet_first_form_validation_error_function(source) {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: function,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 134.0,
+            coverage_role: "form_custom_error_rendering".to_string(),
             producer: "packet_generic_form_validation_source_probe".to_string(),
             eligible_for_sufficiency: true,
         });
@@ -1998,17 +2020,90 @@ fn collect_url_session_request_shape_candidates(
     if source_lower.contains("func validate")
         && (source_lower.contains("validators") || source_lower.contains("validation"))
     {
+        let score = if type_name.to_ascii_lowercase().contains("data") {
+            138.0
+        } else {
+            135.0
+        };
         candidates.push(PacketGenericSourceShapeCandidate {
             path: path.to_path_buf(),
             display_name: format!("{type_name}.validate"),
             kind: NodeKind::METHOD,
             line: packet_source_line_containing(source, "func validate").unwrap_or(1),
-            score: 135.0,
+            score,
             coverage_role: "request_validation_pipeline".to_string(),
             producer: "packet_generic_url_session_request_source_probe".to_string(),
             eligible_for_sufficiency: true,
         });
     }
+    if source_lower.contains("urlsession")
+        && source_lower.contains("func urlsession")
+        && (source_lower.contains("didreceive") || source_lower.contains("didcomplete"))
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("{type_name}.urlSession"),
+            kind: NodeKind::METHOD,
+            line: packet_source_line_containing(source, "func urlSession").unwrap_or(1),
+            score: 137.0,
+            coverage_role: "session_callbacks".to_string(),
+            producer: "packet_generic_url_session_request_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_cited_request_validation_shape_candidates(
+    project_root: &Path,
+    answer: &AgentAnswerDto,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    for citation in &answer.citations {
+        let Some(path) = citation.file_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        let source_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        };
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("swift"))
+        {
+            continue;
+        }
+        let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if normalize_identifier(type_name) != normalize_identifier(&citation.display_name) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&source_path) else {
+            continue;
+        };
+        if !packet_swift_request_validation_source(&source) {
+            continue;
+        }
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: source_path,
+            display_name: format!("{}.validate", citation.display_name),
+            kind: NodeKind::METHOD,
+            line: packet_source_line_containing(&source, "func validate").unwrap_or(1),
+            score: 140.0,
+            coverage_role: "request_validation_pipeline".to_string(),
+            producer: "packet_generic_url_session_request_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_swift_request_validation_source(source: &str) -> bool {
+    let source_lower = source.to_ascii_lowercase();
+    source_lower.contains("func validate")
+        && source_lower.contains("request")
+        && (source_lower.contains("validators") || source_lower.contains("validation"))
 }
 
 fn packet_first_form_validation_bypass_attribute(source: &str) -> Option<(String, u32)> {
@@ -2058,6 +2153,28 @@ fn packet_first_html_input_id(source: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn packet_first_form_validation_error_function(source: &str) -> Option<(String, u32)> {
+    let source_lower = source.to_ascii_lowercase();
+    if !(source_lower.contains("validity.valuemissing")
+        || source_lower.contains("validity.typemismatch")
+        || source_lower.contains("validity.tooshort"))
+    {
+        return None;
+    }
+    source.lines().enumerate().find_map(|(index, line)| {
+        let trimmed = line.trim();
+        let name = trimmed.strip_prefix("function ")?.split_once('(')?.0.trim();
+        if name.is_empty() || !name.chars().all(packet_source_identifier_char) {
+            return None;
+        }
+        let normalized = normalize_identifier(name);
+        (normalized.contains("error") || normalized.contains("message")).then_some((
+            name.to_string(),
+            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+        ))
+    })
 }
 
 fn packet_source_line_containing(source: &str, needle: &str) -> Option<u32> {
@@ -12711,6 +12828,17 @@ mod tests {
             <form novalidate>
               <input id="mail" type="email" required>
             </form>
+            <script>
+              function showError() {
+                if (mail.validity.valueMissing) {
+                  error.textContent = "Email required";
+                } else if (mail.validity.typeMismatch) {
+                  error.textContent = "Email invalid";
+                } else if (mail.validity.tooShort) {
+                  error.textContent = "Email too short";
+                }
+              }
+            </script>
             "#,
         );
 
@@ -12755,6 +12883,14 @@ mod tests {
                     && citation.coverage_role.as_deref() == Some("form_custom_input")
             }),
             "expected input id source shape: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "showError"
+                    && citation.coverage_role.as_deref() == Some("form_custom_error_rendering")
+            }),
+            "expected custom error rendering source shape: {:?}",
             answer.citations
         );
 
@@ -12836,6 +12972,32 @@ mod tests {
             }
             "#,
         );
+        write_packet_fixture_file(
+            &root,
+            "Source/Core/DownloadRequest.swift",
+            r#"
+            open class DownloadRequest: Request {
+              public func validate(_ validation: @escaping Validation) -> Self {
+                validators.write { $0.append(validation) }
+                return self
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "Source/Core/SessionDelegate.swift",
+            r#"
+            open class SessionDelegate: NSObject, URLSessionDataDelegate {
+              open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                request.didReceive(data: data)
+              }
+              open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                request.didReceiveResponse(nil)
+              }
+            }
+            "#,
+        );
 
         let prompt = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
         let mut answer = packet_answer_fixture(prompt, Vec::new());
@@ -12855,6 +13017,70 @@ mod tests {
                     && citation.coverage_role.as_deref() == Some("request_validation_pipeline")
             }),
             "expected request validation source anchor: {:?}",
+            answer.citations
+        );
+        let data_rank = answer
+            .citations
+            .iter()
+            .position(|citation| citation.display_name == "DataRequest.validate")
+            .expect("DataRequest.validate anchor");
+        let download_rank = answer
+            .citations
+            .iter()
+            .position(|citation| citation.display_name == "DownloadRequest.validate")
+            .expect("DownloadRequest.validate anchor");
+        assert!(
+            data_rank < download_rank,
+            "data-bearing request validation should outrank sibling validation anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "SessionDelegate.urlSession"
+                    && citation.coverage_role.as_deref() == Some("session_callbacks")
+            }),
+            "expected URLSession delegate callback source anchor: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_cited_request_validation_anchor() {
+        let root = packet_temp_root("generic-source-shape-cited-urlsession");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "Example/BodyRequest.swift",
+            r#"
+            open class BodyRequest: Request {
+              public func validate(_ validation: @escaping Validation) -> Self {
+                validators.write { $0.append(validation) }
+                eventMonitor?.request(self, didValidateRequest: request)
+                return self
+              }
+            }
+            "#,
+        );
+
+        let prompt = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "BodyRequest",
+                "Example/BodyRequest.swift",
+                0.9,
+            )],
+        );
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "BodyRequest.validate"
+                    && citation.coverage_role.as_deref() == Some("request_validation_pipeline")
+            }),
+            "expected cited request validation source anchor: {:?}",
             answer.citations
         );
 
