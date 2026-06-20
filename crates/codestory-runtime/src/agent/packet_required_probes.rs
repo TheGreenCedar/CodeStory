@@ -962,6 +962,9 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     if packet_citation_matches_sql_schema_scripts_probe(query, citation) {
         return true;
     }
+    if packet_required_probe_needs_request_validation_anchor(query) {
+        return packet_citation_matches_request_validation_anchor(query, citation);
+    }
     let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
         return false;
     };
@@ -1050,6 +1053,8 @@ pub(crate) fn packet_citation_probe_match_rank(
         Some(5)
     } else if packet_citation_matches_sql_schema_scripts_probe(query, citation) {
         Some(5)
+    } else if packet_required_probe_needs_request_validation_anchor(query) {
+        packet_citation_matches_request_validation_anchor(query, citation).then_some(5)
     } else if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
         Some(5)
     } else if normalized_display == normalized_query
@@ -1067,6 +1072,32 @@ pub(crate) fn packet_citation_probe_match_rank(
     } else {
         None
     }
+}
+
+fn packet_required_probe_needs_request_validation_anchor(query: &str) -> bool {
+    let normalized_query = normalize_identifier(query);
+    normalized_query.contains("request") && normalized_query.contains("validation")
+}
+
+fn packet_citation_matches_request_validation_anchor(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let normalized_query = normalize_identifier(query);
+    let normalized_display = normalize_identifier(&citation.display_name);
+    let normalized_path = citation
+        .file_path
+        .as_deref()
+        .map(packet_display_path)
+        .map(|path| normalize_identifier(&path))
+        .unwrap_or_default();
+    let combined = format!("{normalized_display}{normalized_path}");
+    let requires_data = normalized_query.contains("data")
+        && normalized_query.contains("request")
+        && normalized_query.contains("validation");
+    combined.contains("request")
+        && combined.contains("validat")
+        && (!requires_data || combined.contains("data"))
 }
 
 fn packet_citation_matches_required_coverage_role(
@@ -1110,7 +1141,15 @@ fn packet_citation_matches_required_coverage_role(
             | "customvalidationvaliditystate"
             | "customvalidationerrorrendering" => normalized_role == "formcustomvalidation",
             "submitpreventdefault" | "submitinvalidguard" => normalized_role == "formsubmitguard",
-            _ => false,
+            "delegatecallbackhandling" | "urlsessioncallbackboundary" | "urlsessioncallbacks" => {
+                normalized_role == "sessioncallbacks"
+            }
+            _ => {
+                normalized_role == "sessioncallbacks"
+                    && normalized_query.contains("session")
+                    && normalized_query.contains("delegate")
+                    && normalized_query.contains("callback")
+            }
         }
 }
 
@@ -2153,6 +2192,16 @@ mod tests {
             "html form pattern constraint",
             &citation
         ));
+
+        citation.coverage_role = Some("session_callbacks".to_string());
+        assert!(packet_citation_satisfies_required_probe(
+            "delegate callback handling",
+            &citation
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "url session callback boundary",
+            &citation
+        ));
     }
 
     #[test]
@@ -2555,8 +2604,20 @@ mod tests {
             "request_object.swift request",
             &data_request
         ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "data request validation",
+            &data_request
+        ));
         assert!(packet_citation_satisfies_required_probe(
             "request_object.swift validate",
+            &data_request_validate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "data request validation",
+            &data_request_validate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "request validation pipeline",
             &data_request_validate
         ));
         assert!(packet_citation_satisfies_required_probe(

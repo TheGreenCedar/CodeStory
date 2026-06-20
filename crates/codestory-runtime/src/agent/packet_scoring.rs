@@ -726,6 +726,13 @@ fn packet_url_session_request_rank_bonus(normalized_display: &str, path: &str) -
     if normalized_display.ends_with("requestvalidate") {
         bonus += 9.0;
     }
+    if is_request_object_file
+        && path_stem.contains("data")
+        && normalized_display.starts_with(&path_stem)
+        && normalized_display.ends_with("requestvalidate")
+    {
+        bonus += 90.0;
+    }
     if normalized_display.contains("delegate")
         || (normalized_display.contains("urlsession") && is_delegate_callback_file)
     {
@@ -1450,6 +1457,43 @@ mod tests {
                 "beans",
                 "html/forms/native-form-widgets/advanced-examples.html"
             )
+        );
+    }
+
+    #[test]
+    fn url_session_rank_bonus_prefers_data_request_validation_anchor() {
+        let terms = vec![
+            "session".to_string(),
+            "request".to_string(),
+            "validates".to_string(),
+            "data".to_string(),
+            "urlsession".to_string(),
+        ];
+        let data_validate = test_rank_citation(
+            "DataRequest.validate",
+            "Source/Core/DataRequest.swift",
+            40.0,
+        );
+        let sibling_validate = test_rank_citation(
+            "DownloadRequest.validate",
+            "Source/Core/DownloadRequest.swift",
+            40.0,
+        );
+        let extension_validate = test_rank_citation(
+            "URLRequest+Library.validate",
+            "Source/Extensions/URLRequest+Library.swift",
+            40.0,
+        );
+
+        let data_rank = packet_citation_rank(&data_validate, &terms, false);
+
+        assert!(
+            data_rank > packet_citation_rank(&sibling_validate, &terms, false),
+            "data request validate anchor should outrank sibling request validate anchors"
+        );
+        assert!(
+            data_rank > packet_citation_rank(&extension_validate, &terms, false),
+            "data request validate anchor should outrank generic URLRequest validate extensions"
         );
     }
 
