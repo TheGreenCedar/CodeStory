@@ -48,7 +48,7 @@ rusqlite = { version = "0.38", features = ["backup", "bundled"] }
 
 # Search
 nucleo-matcher = "0.3"
-tantivy = "0.25"
+tantivy = "0.26"
 ndarray = "0.17.2"
 ort = { version = "=2.0.0-rc.12", features = ["directml"] }
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
@@ -72,7 +72,7 @@ anyhow = "1.0"
 crossbeam-channel = "0.5"
 crossterm = "0.28"
 parking_lot = "0.12"
-ratatui = "0.29"
+ratatui = "0.30"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0.0"

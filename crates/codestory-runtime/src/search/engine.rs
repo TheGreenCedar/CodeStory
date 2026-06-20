@@ -2137,7 +2137,7 @@ impl SearchEngine {
             .parse_query(query_str)
             .context("Failed to parse tantivy query")?;
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(20))?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(20).order_by_score())?;
 
         let mut results = Vec::new();
         let mut seen = HashSet::new();
