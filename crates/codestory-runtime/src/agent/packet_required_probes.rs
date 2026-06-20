@@ -1138,8 +1138,11 @@ fn packet_citation_matches_required_coverage_role(
             "customvalidation"
             | "customvalidationflow"
             | "customformvalidationinput"
-            | "customvalidationvaliditystate"
-            | "customvalidationerrorrendering" => normalized_role == "formcustomvalidation",
+            | "customvalidationvaliditystate" => normalized_role == "formcustomvalidation",
+            "customvalidationerrorrendering" | "customerrorrendering" => {
+                normalized_role == "formcustomvalidation"
+                    || normalized_role == "formcustomerrorrendering"
+            }
             "submitpreventdefault" | "submitinvalidguard" => normalized_role == "formsubmitguard",
             "delegatecallbackhandling" | "urlsessioncallbackboundary" | "urlsessioncallbacks" => {
                 normalized_role == "sessioncallbacks"
@@ -2190,6 +2193,12 @@ mod tests {
         citation.coverage_role = Some("form_native_constraints".to_string());
         assert!(packet_citation_satisfies_required_probe(
             "html form pattern constraint",
+            &citation
+        ));
+
+        citation.coverage_role = Some("form_custom_error_rendering".to_string());
+        assert!(packet_citation_satisfies_required_probe(
+            "custom validation error rendering",
             &citation
         ));
 

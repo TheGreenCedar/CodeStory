@@ -1091,7 +1091,7 @@ fn maybe_append_generic_source_shape_citations(
         &mut candidates,
     );
     if url_session_request_flow {
-        collect_cited_request_validation_shape_candidates(answer, &mut candidates);
+        collect_cited_request_validation_shape_candidates(project_root, answer, &mut candidates);
     }
     candidates.sort_by(|left, right| {
         right
@@ -2054,12 +2054,18 @@ fn collect_url_session_request_shape_candidates(
 }
 
 fn collect_cited_request_validation_shape_candidates(
+    project_root: &Path,
     answer: &AgentAnswerDto,
     candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
 ) {
     for citation in &answer.citations {
         let Some(path) = citation.file_path.as_deref().map(Path::new) else {
             continue;
+        };
+        let source_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
         };
         if path
             .extension()
@@ -2074,14 +2080,14 @@ fn collect_cited_request_validation_shape_candidates(
         if normalize_identifier(type_name) != normalize_identifier(&citation.display_name) {
             continue;
         }
-        let Ok(source) = std::fs::read_to_string(path) else {
+        let Ok(source) = std::fs::read_to_string(&source_path) else {
             continue;
         };
         if !packet_swift_request_validation_source(&source) {
             continue;
         }
         candidates.push(PacketGenericSourceShapeCandidate {
-            path: path.to_path_buf(),
+            path: source_path,
             display_name: format!("{}.validate", citation.display_name),
             kind: NodeKind::METHOD,
             line: packet_source_line_containing(&source, "func validate").unwrap_or(1),
@@ -13044,7 +13050,6 @@ mod tests {
     fn generic_source_shape_scan_adds_cited_request_validation_anchor() {
         let root = packet_temp_root("generic-source-shape-cited-urlsession");
         let _ = std::fs::remove_dir_all(&root);
-        let request_path = root.join("Example").join("BodyRequest.swift");
         write_packet_fixture_file(
             &root,
             "Example/BodyRequest.swift",
@@ -13064,7 +13069,7 @@ mod tests {
             prompt,
             vec![test_packet_citation(
                 "BodyRequest",
-                &request_path.to_string_lossy(),
+                "Example/BodyRequest.swift",
                 0.9,
             )],
         );
