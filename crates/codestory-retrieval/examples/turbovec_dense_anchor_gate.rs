@@ -13,6 +13,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 mod windows_gate {
     use anyhow::{Context, Result, bail};
+    use codestory_contracts::graph::{NodeId, NodeKind};
     use codestory_retrieval::{
         QdrantClient, SidecarLayout, diagnostic_query_vector, embedding_runtime_id,
         qdrant_vector_dim, sidecar_project_id_for_root, strict_sidecar_status,
@@ -169,13 +170,20 @@ mod windows_gate {
         {
             bail!("dense_doc_dim_mismatch");
         }
-        if dense_docs
-            .iter()
-            .any(|doc| doc.embedding_backend.as_deref() != Some(backend.as_str()))
-        {
+        if dense_docs.iter().any(|doc| {
+            !stored_doc_backend_matches_runtime(doc.embedding_backend.as_deref(), &backend)
+        }) {
             bail!("dense_doc_backend_mismatch");
         }
         Ok(())
+    }
+
+    fn stored_doc_backend_matches_runtime(stored: Option<&str>, runtime: &str) -> bool {
+        stored == Some(runtime)
+            || matches!(
+                (stored, runtime),
+                (Some("llamacpp"), "llamacpp:bge-base-en-v1.5")
+            )
     }
 
     fn build_index(
@@ -185,8 +193,9 @@ mod windows_gate {
         let mut vectors = Vec::with_capacity(docs.len() * dim);
         let mut ids = Vec::with_capacity(docs.len());
         let mut id_to_doc = HashMap::with_capacity(docs.len());
-        for doc in docs {
-            let id = u64::try_from(doc.node_id.0).context("negative node id")?;
+        for (index, doc) in docs.iter().enumerate() {
+            // ponytail: local ids avoid unsigned casts for virtual graph ids; id_to_doc keeps real ids.
+            let id = u64::try_from(index + 1).context("too many dense docs")?;
             if doc.embedding.len() != dim {
                 bail!(
                     "dense_doc_vector_dim_mismatch: node_id={} vector_dim={} expected={dim}",
@@ -326,6 +335,40 @@ mod windows_gate {
         assert_eq!(ids[0], 11);
         assert_eq!(percentile(&[1.0, 2.0, 3.0], 95.0), 3.0);
         assert_eq!(overlap_ratio(&["a", "b"], &["b", "c"]), 0.5);
+        assert!(stored_doc_backend_matches_runtime(
+            Some("llamacpp"),
+            "llamacpp:bge-base-en-v1.5"
+        ));
+        assert!(!stored_doc_backend_matches_runtime(
+            Some("onnx"),
+            "llamacpp:bge-base-en-v1.5"
+        ));
+        let mut embedding = vec![0.0; qdrant_vector_dim()];
+        embedding[0] = 1.0;
+        let negative_doc = LlmSymbolDoc {
+            node_id: NodeId(-42),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "virtual_dense_anchor".into(),
+            qualified_name: None,
+            file_path: None,
+            start_line: None,
+            doc_text: "virtual dense anchor".into(),
+            doc_version: 5,
+            doc_hash: "virtual-dense-anchor".into(),
+            embedding_profile: Some("bge-base-en-v1.5".into()),
+            embedding_model: "BAAI/bge-base-en-v1.5-local".into(),
+            embedding_backend: Some("llamacpp".into()),
+            embedding_dim: qdrant_vector_dim() as u32,
+            doc_shape: Some("self-test".into()),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            dense_reason: Some("component_report".into()),
+            embedding: embedding.clone(),
+            updated_at_epoch_ms: 0,
+        };
+        let (index, id_to_doc, _) = build_index(&[negative_doc])?;
+        let hits = turbovec_search(&index, &id_to_doc, &embedding, 1);
+        assert_eq!(hits[0].node_id, "-42");
         Ok(())
     }
 
