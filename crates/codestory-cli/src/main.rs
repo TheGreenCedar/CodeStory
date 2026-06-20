@@ -1,3 +1,15 @@
+//! Command-line integration entry point for CodeStory.
+//!
+//! This binary keeps command parsing, runtime setup, and output emission in one
+//! place so extension work has a single dispatch boundary. Subcommands should
+//! parse into types from `args`, open project state through `RuntimeContext`,
+//! and emit through `output` helpers so markdown, JSON, DOT, stdout, and
+//! `--output-file` behavior stays consistent.
+//!
+//! User-facing command usage belongs in CLI help and external docs. Rustdoc in
+//! this crate documents the code contracts that command handlers, output DTOs,
+//! and local integration transports rely on.
+
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};

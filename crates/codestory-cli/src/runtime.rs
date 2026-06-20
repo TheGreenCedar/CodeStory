@@ -1,3 +1,10 @@
+//! Runtime boundary between CLI commands and CodeStory services.
+//!
+//! Command handlers use this module to resolve a project, choose the cache root,
+//! open the runtime services, refresh indexes when requested, and translate API
+//! failures into CLI-facing errors. Keep command-specific output formatting out
+//! of this layer.
+
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
@@ -22,12 +29,21 @@ use crate::query_resolution::{
 const HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT: usize = 10;
 
 #[derive(Debug)]
+/// Project state after a command has opened or refreshed the repository.
+///
+/// `refresh_mode` records the resolved indexing action, not merely the user
+/// request, so output can distinguish `auto(full)` from `auto(incremental)`.
 pub(crate) struct OpenedProject {
     pub(crate) summary: ProjectSummary,
     pub(crate) refresh_mode: Option<IndexMode>,
     pub(crate) phase_timings: Option<IndexingPhaseTimings>,
 }
 
+/// Shared service handles and filesystem roots for a CLI command.
+///
+/// `RuntimeContext::new` may start installed managed embeddings before runtime
+/// access; use `new_inspect_only` for health and cache commands that should not
+/// mutate or start background dependencies.
 pub(crate) struct RuntimeContext {
     pub(crate) project: ProjectService,
     pub(crate) index: IndexService,
@@ -48,12 +64,17 @@ struct ResolutionCandidateRank {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Managed embedding startup behavior for runtime construction.
 pub(crate) enum ManagedEmbeddingStartup {
     AutostartIfInstalled,
     InspectOnly,
 }
 
 #[derive(Debug, Clone)]
+/// A query or id after CLI target resolution has selected one graph-backed hit.
+///
+/// `alternatives` is ordered for reviewer/operator display and may be truncated
+/// by the search layer; it is not a complete search result set.
 pub(crate) struct ResolvedTarget {
     pub(crate) selector: QuerySelectorOutput,
     pub(crate) requested: String,
@@ -63,6 +84,10 @@ pub(crate) struct ResolvedTarget {
 }
 
 #[derive(Debug, Clone)]
+/// Error returned when a query has multiple equally valid CLI targets.
+///
+/// Handlers render this as structured resolution output where possible so
+/// callers can rerun with `--choose` instead of guessing.
 pub(crate) struct AmbiguousTargetError {
     pub(crate) query: String,
     pub(crate) file_filter: Option<String>,
@@ -79,10 +104,12 @@ impl std::fmt::Display for AmbiguousTargetError {
 impl std::error::Error for AmbiguousTargetError {}
 
 impl RuntimeContext {
+    /// Open runtime services for a command that may use managed embeddings.
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
         Self::new_with_startup(args, ManagedEmbeddingStartup::AutostartIfInstalled)
     }
 
+    /// Open runtime services without starting managed embedding processes.
     pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
         Self::new_with_startup(args, ManagedEmbeddingStartup::InspectOnly)
     }
@@ -114,11 +141,19 @@ impl RuntimeContext {
         })
     }
 
+    /// Open the project and run the resolved refresh request when needed.
+    ///
+    /// `RefreshMode::None` is read-only with respect to indexing; commands that
+    /// require cached graph data must call `ensure_index_ready` after this.
     pub(crate) fn ensure_open(&self, refresh: RefreshMode) -> Result<OpenedProject> {
         let summary = self.open_project_summary()?;
         self.ensure_open_from_summary(refresh, summary)
     }
 
+    /// Open project state from an already-read summary.
+    ///
+    /// This keeps commands such as drill from reading the same summary twice
+    /// before deciding whether a refresh is necessary.
     pub(crate) fn ensure_open_from_summary(
         &self,
         refresh: RefreshMode,
@@ -146,6 +181,7 @@ impl RuntimeContext {
         self.ensure_open(refresh)
     }
 
+    /// Open the project summary using the resolved storage path.
     pub(crate) fn open_project_summary(&self) -> Result<ProjectSummary> {
         self.project
             .open_project_summary_with_storage_path(
@@ -156,6 +192,11 @@ impl RuntimeContext {
     }
 }
 
+/// Resolve a CLI target selector into one graph-backed search hit.
+///
+/// Id selectors bypass search. Query selectors use indexed symbol candidates,
+/// apply the optional file filter, and fail on ambiguous top-ranked matches so
+/// command handlers do not silently pick the wrong symbol.
 pub(crate) fn resolve_target(
     runtime: &RuntimeContext,
     target: TargetSelection,
@@ -373,6 +414,7 @@ fn tied_top_alternatives(
         .collect()
 }
 
+/// Canonicalize a project argument before deriving cache identity.
 pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
     let project = if project.is_absolute() {
         project.to_path_buf()
@@ -390,6 +432,10 @@ pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Return the cache directory used for one project.
+///
+/// Explicit overrides are returned unchanged; otherwise the cache root is a
+/// stable hash of the canonical project path under the platform cache directory.
 pub(crate) fn cache_root_for_project(
     project_root: &Path,
     override_dir: Option<&Path>,
@@ -405,6 +451,7 @@ pub(crate) fn cache_root_for_project(
     }
 }
 
+/// Small stable hash used for path-derived cache directory names.
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -414,6 +461,7 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+/// Convert a requested refresh mode into the indexing action to run.
 pub(crate) fn resolve_refresh_request(
     refresh: RefreshMode,
     summary: &ProjectSummary,
@@ -430,6 +478,7 @@ pub(crate) fn resolve_refresh_request(
     }
 }
 
+/// Human-readable label for the requested and resolved refresh pair.
 pub(crate) fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>) -> String {
     match (requested, resolved) {
         (RefreshMode::Auto, Some(IndexMode::Full)) => "auto(full)".to_string(),
@@ -441,6 +490,7 @@ pub(crate) fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>)
     }
 }
 
+/// Fail read commands early when the cache has no indexed graph data.
 pub(crate) fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Result<()> {
     if opened.summary.stats.node_count == 0 {
         let project = clean_path_string(&opened.summary.root);
@@ -451,10 +501,12 @@ pub(crate) fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Re
     Ok(())
 }
 
+/// Map runtime API errors into CLI errors with repair commands when available.
 pub(crate) fn map_api_error(error: ApiError) -> anyhow::Error {
     map_api_error_with_project(error, None)
 }
 
+/// Map runtime API errors with project-specific cache repair guidance.
 pub(crate) fn map_api_error_for_project(error: ApiError, project: &Path) -> anyhow::Error {
     map_api_error_with_project(error, Some(project))
 }
@@ -489,6 +541,7 @@ fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow
     anyhow!(message)
 }
 
+/// Rewrite cache-busy errors from non-API paths into the standard CLI message.
 pub(crate) fn map_cache_busy_anyhow(error: anyhow::Error, project: &Path) -> anyhow::Error {
     if is_cache_busy_text(&error.to_string()) {
         return anyhow!(cache_busy_message(Some(project)));
