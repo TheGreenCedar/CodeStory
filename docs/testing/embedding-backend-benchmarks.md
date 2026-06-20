@@ -34,6 +34,19 @@ As of the mandatory sidecar reset, older ONNX and hash-projection rows are
 historical diagnostics. Add a fresh sidecar row before calling the active runtime
 promoted on quality and cross-repo evidence.
 
+## Diagnostic Identity Probe
+
+Use `node scripts/codestory-embedding-runtime-compare.mjs` for the smallest local
+ONNX-vs-llama embedding identity check. It reports model load time, query and
+document embedding time, cache bytes, vector shape checks, and top-k overlap for
+a fixed fixture set.
+
+The probe is diagnostic only. ONNX output from this path cannot satisfy product
+`retrieval_mode=full` by itself, and hash projection remains rejected as product
+semantic readiness. If llama.cpp or managed ONNX assets are unavailable, keep the
+reported failure text as the evidence instead of rerunning broad benchmark
+suites.
+
 ## Primary Comparison Matrix
 
 | Candidate or lane | Best relevant evidence | Quality signal | Speed and footprint signal | Decision |

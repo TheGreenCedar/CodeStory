@@ -3040,6 +3040,131 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn embedding_identity_probe_from_env() -> Result<()> {
+        let _lock = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let query = std::env::var("CODESTORY_EMBED_IDENTITY_PROBE_QUERY").unwrap_or_else(|_| {
+            "Where is the retrieval sidecar embedding contract enforced?".into()
+        });
+        let docs = std::env::var("CODESTORY_EMBED_IDENTITY_PROBE_DOCS_JSON")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .filter(|docs| !docs.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "llama.cpp embedding sidecar is mandatory for product retrieval_mode full."
+                        .into(),
+                    "Managed ONNX assets are diagnostic until fresh quality evidence exists."
+                        .into(),
+                    "Hash projection is deterministic but not semantic product readiness.".into(),
+                    "Packet and search readiness require full sidecar retrieval evidence.".into(),
+                ]
+            });
+
+        let load_started = std::time::Instant::now();
+        let runtime = match EmbeddingRuntime::from_env() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                println!(
+                    "CODESTORY_EMBEDDING_IDENTITY_PROBE_JSON={}",
+                    serde_json::to_string(&serde_json::json!({
+                        "ok": false,
+                        "failure_text": error.to_string(),
+                        "backend_env": std::env::var(EMBEDDING_BACKEND_ENV).ok(),
+                        "profile_env": std::env::var(EMBEDDING_PROFILE_ENV).ok(),
+                        "model_env": std::env::var(ONNX_MODEL_PATH_ENV).ok(),
+                        "tokenizer_env": std::env::var(ONNX_TOKENIZER_PATH_ENV).ok(),
+                        "url_env": std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV).ok(),
+                    }))?
+                );
+                return Ok(());
+            }
+        };
+        let model_load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+
+        let query_started = std::time::Instant::now();
+        let query_embedding = runtime.embed_query(&query)?;
+        let query_embedding_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+
+        let batch_started = std::time::Instant::now();
+        let document_embeddings = runtime.embed_texts(&docs)?;
+        let batch_document_embedding_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut scored = document_embeddings
+            .iter()
+            .enumerate()
+            .map(|(index, embedding)| (index, dot_product(&query_embedding, embedding)))
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let model_path = runtime.model_path();
+        let cache_bytes = file_len(model_path)
+            .into_iter()
+            .chain(
+                std::env::var(ONNX_TOKENIZER_PATH_ENV)
+                    .ok()
+                    .and_then(|path| file_len(std::path::Path::new(&path))),
+            )
+            .sum::<u64>();
+        let cache_bytes = if cache_bytes == 0 {
+            None
+        } else {
+            Some(cache_bytes)
+        };
+
+        println!(
+            "CODESTORY_EMBEDDING_IDENTITY_PROBE_JSON={}",
+            serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "model_id": runtime.model_id(),
+                "model_path": model_path.to_string_lossy(),
+                "model_load_ms": model_load_ms,
+                "query_embedding_ms": query_embedding_ms,
+                "batch_document_embedding_ms": batch_document_embedding_ms,
+                "cache_bytes": cache_bytes,
+                "vector_dimension": query_embedding.len(),
+                "finite_vector_check": all_finite(&query_embedding) && document_embeddings.iter().all(|vector| all_finite(vector)),
+                "l2_normalized_vector_check": l2_normalized(&query_embedding) && document_embeddings.iter().all(|vector| l2_normalized(vector)),
+                "document_count": docs.len(),
+                "top_k": scored.iter().take(3).map(|(index, score)| serde_json::json!({
+                    "index": index,
+                    "score": score,
+                    "text": docs.get(*index).cloned().unwrap_or_default(),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        Ok(())
+    }
+
+    fn file_len(path: &std::path::Path) -> Option<u64> {
+        std::fs::metadata(path).ok().map(|metadata| metadata.len())
+    }
+
+    fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+        left.iter()
+            .zip(right.iter())
+            .map(|(left, right)| left * right)
+            .sum()
+    }
+
+    fn all_finite(vector: &[f32]) -> bool {
+        !vector.is_empty() && vector.iter().all(|value| value.is_finite())
+    }
+
+    fn l2_normalized(vector: &[f32]) -> bool {
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        (norm - 1.0).abs() <= 0.05
+    }
+
+    #[test]
     fn llamacpp_endpoint_parse_accepts_openai_embeddings_url() -> Result<()> {
         let endpoint = LlamaCppEndpoint::parse("http://127.0.0.1:8080/v1/embeddings")?;
 
