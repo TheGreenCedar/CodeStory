@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
@@ -14,6 +14,7 @@ use tantivy::schema::{INDEXED, STORED, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument};
 
 const LEXICAL_INDEX_FILE: &str = "lexical-index.jsonl";
+const CANDIDATE_DIR_PREFIX: &str = "codestory-lexical-tantivy-";
 const DEFAULT_TOP_K: usize = 10;
 const DEFAULT_REPEATS: usize = 7;
 
@@ -30,7 +31,6 @@ fn main() -> Result<()> {
 #[derive(Debug)]
 struct Options {
     shard_dir: PathBuf,
-    candidate_dir: PathBuf,
     queries: Vec<String>,
     top_k: usize,
     repeats: usize,
@@ -47,7 +47,6 @@ impl Options {
         if self_test {
             return Ok(Self {
                 shard_dir: PathBuf::new(),
-                candidate_dir: PathBuf::new(),
                 queries: Vec::new(),
                 top_k: DEFAULT_TOP_K,
                 repeats: DEFAULT_REPEATS,
@@ -56,7 +55,6 @@ impl Options {
         }
 
         let mut shard_dir = None;
-        let mut candidate_dir = None;
         let mut queries = Vec::new();
         let mut top_k = DEFAULT_TOP_K;
         let mut repeats = DEFAULT_REPEATS;
@@ -66,10 +64,6 @@ impl Options {
                 "--shard-dir" => {
                     i += 1;
                     shard_dir = args.get(i).map(PathBuf::from);
-                }
-                "--candidate-dir" => {
-                    i += 1;
-                    candidate_dir = args.get(i).map(PathBuf::from);
                 }
                 "--query" => {
                     i += 1;
@@ -99,7 +93,6 @@ impl Options {
         }
 
         let shard_dir = shard_dir.ok_or_else(|| anyhow!("--shard-dir is required"))?;
-        let candidate_dir = candidate_dir.unwrap_or_else(default_candidate_dir);
         if queries.is_empty() {
             queries = vec![
                 "retrieval manifest freshness".into(),
@@ -109,7 +102,6 @@ impl Options {
         }
         Ok(Self {
             shard_dir,
-            candidate_dir,
             queries,
             top_k,
             repeats,
@@ -124,8 +116,32 @@ fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
-fn default_candidate_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("codestory-lexical-tantivy-{}", std::process::id()))
+fn generated_candidate_dir() -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "{CANDIDATE_DIR_PREFIX}{}-{stamp}",
+        std::process::id()
+    ))
+}
+
+fn remove_generated_temp_dir(path: &Path) -> Result<()> {
+    let temp_dir = std::env::temp_dir().canonicalize()?;
+    let path = path.canonicalize()?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("candidate dir has no valid file name: {}", path.display()))?;
+    if !path.starts_with(&temp_dir) || !name.starts_with(CANDIDATE_DIR_PREFIX) {
+        bail!(
+            "refusing to remove non-generated temp dir: {}",
+            path.display()
+        );
+    }
+    fs::remove_dir_all(&path)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +180,8 @@ impl LexicalDocumentSource {
 #[derive(Debug, Clone, Serialize)]
 struct CompareReport {
     shard_dir: String,
+    candidate_dir: String,
+    jsonl_timing_scope: String,
     current_artifact_size_bytes: u64,
     candidate_artifact_size_bytes: u64,
     candidate_cold_build_index_ms: u128,
@@ -178,8 +196,8 @@ struct CompareReport {
 #[derive(Debug, Clone, Serialize)]
 struct QueryReport {
     query: String,
-    jsonl_scan_ms_p50: f64,
-    jsonl_scan_ms_p95: f64,
+    jsonl_in_memory_ms_p50: f64,
+    jsonl_in_memory_ms_p95: f64,
     tantivy_query_ms_p50: f64,
     tantivy_query_ms_p95: f64,
     top_k_overlap: usize,
@@ -222,20 +240,18 @@ fn run_compare(opts: &Options) -> Result<CompareReport> {
         bail!("lexical artifact is empty: {}", index_path.display());
     }
 
-    if opts.candidate_dir.exists() {
-        fs::remove_dir_all(&opts.candidate_dir).with_context(|| {
-            format!(
-                "remove previous candidate dir {}",
-                opts.candidate_dir.display()
-            )
-        })?;
-    }
-    fs::create_dir_all(&opts.candidate_dir)?;
+    let candidate_dir = generated_candidate_dir();
+    fs::create_dir(&candidate_dir).with_context(|| {
+        format!(
+            "create generated candidate dir {}; rerun if it already exists",
+            candidate_dir.display()
+        )
+    })?;
 
     let started = Instant::now();
-    let candidate = TantivyCandidate::build(&opts.candidate_dir, &entries)?;
+    let candidate = TantivyCandidate::build(&candidate_dir, &entries)?;
     let candidate_cold_build_index_ms = started.elapsed().as_millis();
-    let candidate_artifact_size_bytes = dir_size_bytes(&opts.candidate_dir)?;
+    let candidate_artifact_size_bytes = dir_size_bytes(&candidate_dir)?;
 
     let mut query_reports = Vec::new();
     for query in &opts.queries {
@@ -269,6 +285,8 @@ fn run_compare(opts: &Options) -> Result<CompareReport> {
     let aggregate = aggregate_report(&query_reports);
     Ok(CompareReport {
         shard_dir: opts.shard_dir.display().to_string(),
+        candidate_dir: candidate_dir.display().to_string(),
+        jsonl_timing_scope: "preloaded_in_memory_entries; production search also reads/parses lexical-index.jsonl per query".into(),
         current_artifact_size_bytes,
         candidate_artifact_size_bytes,
         candidate_cold_build_index_ms,
@@ -416,9 +434,20 @@ fn jsonl_search(entries: &[LexicalIndexEntry], query: &str, limit: usize) -> Vec
         return Vec::new();
     }
     let token_frequencies = token_document_frequencies(entries, &tokens);
+    let command_tokens = command_query_tokens(query);
     let token_weights = token_frequencies
         .iter()
-        .map(|frequency| lexical_token_weight(*frequency, entries.len()))
+        .zip(tokens.iter())
+        .map(|(frequency, token)| {
+            let mut weight = lexical_token_weight(*frequency, entries.len());
+            if command_tokens
+                .iter()
+                .any(|command_token| command_token == token)
+            {
+                weight *= 2.0;
+            }
+            weight
+        })
         .collect::<Vec<_>>();
     let total_weight = token_weights.iter().sum::<f32>();
     let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
@@ -465,6 +494,39 @@ fn lexical_query_tokens(query: &str) -> Vec<String> {
         }
     }
     tokens
+}
+
+fn command_query_tokens(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut in_backticks = false;
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch == '`' {
+            if in_backticks {
+                push_command_tokens(&current, &mut tokens);
+                current.clear();
+            }
+            in_backticks = !in_backticks;
+            continue;
+        }
+        if in_backticks {
+            current.push(ch);
+        }
+    }
+    tokens
+}
+
+fn push_command_tokens(command: &str, tokens: &mut Vec<String>) {
+    for token in command
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .map(|token| token.trim_start_matches('-').to_ascii_lowercase())
+        .filter(|token| token.len() >= 2)
+        .filter(|token| token != "codex")
+    {
+        if !tokens.iter().any(|existing| existing == &token) {
+            tokens.push(token);
+        }
+    }
 }
 
 const LEXICAL_STOP_WORDS: &[&str] = &[
@@ -617,8 +679,8 @@ fn query_report(
         unresolved_count(tantivy_hits) as isize - unresolved_count(jsonl_hits) as isize;
     QueryReport {
         query: query.to_string(),
-        jsonl_scan_ms_p50: percentile(jsonl_times, 0.50),
-        jsonl_scan_ms_p95: percentile(jsonl_times, 0.95),
+        jsonl_in_memory_ms_p50: percentile(jsonl_times, 0.50),
+        jsonl_in_memory_ms_p95: percentile(jsonl_times, 0.95),
         tantivy_query_ms_p50: percentile(tantivy_times, 0.50),
         tantivy_query_ms_p95: percentile(tantivy_times, 0.95),
         top_k_overlap: overlap,
@@ -706,9 +768,9 @@ fn dir_size_bytes(path: &Path) -> Result<u64> {
 }
 
 fn run_self_test() -> Result<()> {
-    let root = default_candidate_dir().with_extension("self-test");
+    let root = generated_candidate_dir().with_extension("self-test");
     if root.exists() {
-        fs::remove_dir_all(&root)?;
+        remove_generated_temp_dir(&root)?;
     }
     let shard = root.join("shard");
     fs::create_dir_all(&shard)?;
@@ -740,7 +802,6 @@ fn run_self_test() -> Result<()> {
 
     let report = run_compare(&Options {
         shard_dir: shard.clone(),
-        candidate_dir: root.join("tantivy"),
         queries: vec!["retrieval manifest".into(), "component_report".into()],
         top_k: 2,
         repeats: 2,
@@ -749,23 +810,23 @@ fn run_self_test() -> Result<()> {
     assert_eq!(report.entries, 2);
     assert_eq!(report.queries.len(), 2);
     assert!(report.candidate_artifact_size_bytes > 0);
+    remove_generated_temp_dir(Path::new(&report.candidate_dir))?;
 
     let missing = run_compare(&Options {
         shard_dir: root.join("missing"),
-        candidate_dir: root.join("missing-tantivy"),
         queries: vec!["retrieval".into()],
         top_k: 1,
         repeats: 1,
         self_test: false,
     });
     assert!(missing.is_err());
-    fs::remove_dir_all(&root)?;
+    remove_generated_temp_dir(&root)?;
     eprintln!("self-test ok");
     Ok(())
 }
 
 fn print_help() {
     eprintln!(
-        "Usage: cargo run -p codestory-runtime --example lexical_compare -- --shard-dir <dir> [--query <q>] [--queries \"a|b\"] [--top-k 10] [--repeats 7] [--candidate-dir <dir>]\n       cargo run -p codestory-runtime --example lexical_compare -- --self-test"
+        "Usage: cargo run -p codestory-runtime --example lexical_compare -- --shard-dir <dir> [--query <q>] [--queries \"a|b\"] [--top-k 10] [--repeats 7]\n       cargo run -p codestory-runtime --example lexical_compare -- --self-test"
     );
 }
