@@ -114,10 +114,12 @@ pub fn attach_repair_hint(
     if report.retrieval_mode == "full" {
         return report;
     }
-    let reason = report
-        .degraded_reason
-        .clone()
-        .unwrap_or_else(|| "sidecar_retrieval_not_full".into());
+    let reason = repair_reason_code(
+        report
+            .degraded_reason
+            .as_deref()
+            .unwrap_or("sidecar_retrieval_not_full"),
+    );
     let project = quote_command_path(project_root);
     let full_repair = vec![
         format!("codestory-cli retrieval bootstrap --project {project} --format json"),
@@ -133,6 +135,13 @@ pub fn attach_repair_hint(
         full_repair,
     });
     report
+}
+
+fn repair_reason_code(degraded_reason: &str) -> String {
+    if degraded_reason.starts_with("sidecar_manifest_stale:") {
+        return "sidecar_manifest_stale".into();
+    }
+    degraded_reason.to_string()
 }
 
 fn quote_command_path(path: &Path) -> String {
@@ -615,6 +624,19 @@ mod tests {
                 .is_some_and(|command| command.contains("retrieval status")),
             "repair should end with retrieval status proof: {repair:?}"
         );
+    }
+
+    #[test]
+    fn repair_hint_keeps_stale_reason_stable_and_degraded_reason_detailed() {
+        let detailed = "sidecar_manifest_stale: sidecar_input_hash_mismatch current=abc stored=def path=src/lib.rs";
+        let report = attach_repair_hint(
+            unavailable_status_report(detailed, None),
+            Path::new("C:/repo"),
+        );
+        let repair = report.repair.expect("repair hint");
+
+        assert_eq!(report.degraded_reason.as_deref(), Some(detailed));
+        assert_eq!(repair.reason, "sidecar_manifest_stale");
     }
 
     #[test]
