@@ -2939,6 +2939,29 @@ mod tests {
     }
 
     #[test]
+    fn openapi_endpoint_exact_source_does_not_satisfy_semantic_packet_proof() {
+        let mut citation = cited_anchor_with_tier(
+            "GET /api/users",
+            "openapi.json",
+            PacketEvidenceTierDto::ExactSource,
+            None,
+        );
+        citation.evidence_producer = Some("openapi_endpoint_schema".to_string());
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        let claim = cited_claim(
+            "The schema declares GET /api/users.",
+            Some("request_entrypoint"),
+            citation,
+            None,
+        );
+
+        assert!(
+            !packet_claim_can_satisfy_sufficiency(&claim),
+            "OpenAPI endpoint schema anchors are diagnostic source ranges, not handler/runtime proof"
+        );
+    }
+
+    #[test]
     fn covered_flow_roles_make_missing_probe_queries_follow_up_hints() {
         let question = "Explain how the form validation examples combine native HTML constraints with custom JavaScript validation.";
         let answer = answer_fixture(question);

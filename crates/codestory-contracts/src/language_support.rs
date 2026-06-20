@@ -145,6 +145,12 @@ const DOCKER_COMPOSE_UNSUPPORTED_SHAPES: &[&str] = &[
     "Profiles, extends, health checks, dependency order, and runtime container behavior are not interpreted.",
     "The collector records exact source anchors; it does not validate Docker Compose execution semantics.",
 ];
+const OPENAPI_ENDPOINT_NODE_KINDS: &[NodeKind] = &[NodeKind::FUNCTION];
+const OPENAPI_ENDPOINT_UNSUPPORTED_SHAPES: &[&str] = &[
+    "Handler implementation, auth behavior, request validation, response semantics, and runtime route behavior are not proven.",
+    "Generated-client correctness is not proven.",
+    "The dedicated OpenAPI indexer records exact schema endpoint anchors; it is not generic YAML structural routing.",
+];
 
 pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
     StructuralSourceProofContract {
@@ -169,6 +175,18 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         confidence: 1.0,
         unsupported_shape_notes: DOCKER_COMPOSE_UNSUPPORTED_SHAPES,
         claim_boundary: "structural exact-source proof only; not parser-backed graph parity, typed semantic resolution, container runtime behavior, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "openapi_endpoint_schema",
+        path_pattern: "OpenAPI/Swagger JSON or YAML schema files with paths",
+        emitted_node_kinds: OPENAPI_ENDPOINT_NODE_KINDS,
+        source_span: "1-based source line and column span for the matched schema endpoint method anchor",
+        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: OPENAPI_ENDPOINT_UNSUPPORTED_SHAPES,
+        claim_boundary: "dedicated OpenAPI exact-source schema anchor only; not handler implementation, auth behavior, request validation, response semantics, runtime route proof, generated-client correctness, generic YAML support, or packet semantic-proof admission",
         semantic_proof_allowed: false,
     },
 ];
@@ -520,6 +538,35 @@ mod tests {
                 .unsupported_shape_notes
                 .iter()
                 .any(|note| note.contains("interpolation"))
+        );
+
+        let openapi_contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+            .iter()
+            .find(|contract| contract.collector_name == "openapi_endpoint_schema")
+            .expect("OpenAPI endpoint schema contract");
+        assert_eq!(
+            openapi_contract.path_pattern,
+            "OpenAPI/Swagger JSON or YAML schema files with paths"
+        );
+        assert_eq!(openapi_contract.emitted_node_kinds, &[NodeKind::FUNCTION]);
+        assert_eq!(
+            openapi_contract.evidence_tier,
+            PacketEvidenceTierDto::ExactSource
+        );
+        assert_eq!(
+            openapi_contract.resolution,
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        );
+        assert!(!openapi_contract.semantic_proof_allowed);
+        assert!(
+            openapi_contract
+                .claim_boundary
+                .contains("not handler implementation")
+        );
+        assert!(
+            openapi_contract
+                .claim_boundary
+                .contains("generic YAML support")
         );
     }
 

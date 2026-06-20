@@ -21032,6 +21032,38 @@ function render() {
     }
 
     #[test]
+    fn openapi_components_only_schema_emits_no_endpoint_anchors() -> Result<()> {
+        let schema = r#"{
+  "openapi": "3.1.0",
+  "components": {
+    "schemas": {
+      "User": {
+        "type": "object"
+      }
+    }
+  }
+}"#;
+
+        let storage = index_openapi_schema_file(Path::new("openapi.json"), schema)?;
+
+        assert!(storage.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn generic_yaml_with_paths_key_is_not_openapi() -> Result<()> {
+        let yaml = r#"name: build
+paths:
+  cache: target
+"#;
+
+        let storage = index_openapi_schema_file(Path::new("config.yml"), yaml)?;
+
+        assert!(storage.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn github_actions_workflow_with_openapi_keys_stays_structural() -> Result<()> {
         let temp = tempdir()?;
         let workflow_dir = temp.path().join(".github").join("workflows");
