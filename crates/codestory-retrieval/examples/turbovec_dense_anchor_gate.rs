@@ -225,18 +225,25 @@ mod windows_gate {
         k: usize,
         repeats: usize,
     ) -> Result<QueryReport> {
-        let qdrant_hits = qdrant
-            .search(collection, query, k)
-            .context("qdrant search")?;
         let query_vector = diagnostic_query_vector(query).context("embed query for turbovec")?;
+        let qdrant_hits = qdrant
+            .diagnostic_search_vector(collection, &query_vector, k)
+            .context("qdrant vector search")?;
         let turbovec_hits = turbovec_search(index, id_to_doc, &query_vector, k);
         let repeats = repeats.max(1);
         let _ = qdrant.search(collection, query, k);
-        let _ = diagnostic_query_vector(query).map(|vector| index.search(&vector, k));
-        let qdrant_ms = timed_repeats(repeats, || qdrant.search(collection, query, k).map(drop))?;
-        let turbovec_ms = timed_repeats(repeats, || {
-            let vector = diagnostic_query_vector(query)?;
-            let _ = index.search(&vector, k);
+        let _ = qdrant.diagnostic_search_vector(collection, &query_vector, k);
+        let _ = index.search(&query_vector, k);
+        let embedding_ms = timed_repeats(repeats, || diagnostic_query_vector(query).map(drop))?;
+        let qdrant_total_ms =
+            timed_repeats(repeats, || qdrant.search(collection, query, k).map(drop))?;
+        let qdrant_lookup_ms = timed_repeats(repeats, || {
+            qdrant
+                .diagnostic_search_vector(collection, &query_vector, k)
+                .map(drop)
+        })?;
+        let turbovec_lookup_ms = timed_repeats(repeats, || {
+            let _ = index.search(&query_vector, k);
             Ok(())
         })?;
         let qdrant_ids = qdrant_hits
@@ -251,10 +258,18 @@ mod windows_gate {
             query: query.to_string(),
             overlap_at_k: overlap_ratio(&qdrant_ids, &turbovec_ids),
             mrr_delta: mrr(&qdrant_ids, &qdrant_ids) - mrr(&qdrant_ids, &turbovec_ids),
-            qdrant_p50_ms: percentile(&qdrant_ms, 50.0),
-            qdrant_p95_ms: percentile(&qdrant_ms, 95.0),
-            turbovec_p50_ms: percentile(&turbovec_ms, 50.0),
-            turbovec_p95_ms: percentile(&turbovec_ms, 95.0),
+            query_embedding_p50_ms: percentile(&embedding_ms, 50.0),
+            query_embedding_p95_ms: percentile(&embedding_ms, 95.0),
+            query_embedding_p99_ms: percentile(&embedding_ms, 99.0),
+            qdrant_total_p50_ms: percentile(&qdrant_total_ms, 50.0),
+            qdrant_total_p95_ms: percentile(&qdrant_total_ms, 95.0),
+            qdrant_total_p99_ms: percentile(&qdrant_total_ms, 99.0),
+            qdrant_lookup_p50_ms: percentile(&qdrant_lookup_ms, 50.0),
+            qdrant_lookup_p95_ms: percentile(&qdrant_lookup_ms, 95.0),
+            qdrant_lookup_p99_ms: percentile(&qdrant_lookup_ms, 99.0),
+            turbovec_lookup_p50_ms: percentile(&turbovec_lookup_ms, 50.0),
+            turbovec_lookup_p95_ms: percentile(&turbovec_lookup_ms, 95.0),
+            turbovec_lookup_p99_ms: percentile(&turbovec_lookup_ms, 99.0),
             qdrant_top_k: qdrant_ids.into_iter().map(str::to_string).collect(),
             turbovec_top_k: turbovec_ids.into_iter().map(str::to_string).collect(),
         })
@@ -334,6 +349,7 @@ mod windows_gate {
         let (_scores, ids) = index.search(&vectors[0..dim], 1);
         assert_eq!(ids[0], 11);
         assert_eq!(percentile(&[1.0, 2.0, 3.0], 95.0), 3.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0], 99.0), 3.0);
         assert_eq!(overlap_ratio(&["a", "b"], &["b", "c"]), 0.5);
         assert!(stored_doc_backend_matches_runtime(
             Some("llamacpp"),
@@ -461,10 +477,18 @@ mod windows_gate {
         query: String,
         overlap_at_k: f64,
         mrr_delta: f64,
-        qdrant_p50_ms: f64,
-        qdrant_p95_ms: f64,
-        turbovec_p50_ms: f64,
-        turbovec_p95_ms: f64,
+        query_embedding_p50_ms: f64,
+        query_embedding_p95_ms: f64,
+        query_embedding_p99_ms: f64,
+        qdrant_total_p50_ms: f64,
+        qdrant_total_p95_ms: f64,
+        qdrant_total_p99_ms: f64,
+        qdrant_lookup_p50_ms: f64,
+        qdrant_lookup_p95_ms: f64,
+        qdrant_lookup_p99_ms: f64,
+        turbovec_lookup_p50_ms: f64,
+        turbovec_lookup_p95_ms: f64,
+        turbovec_lookup_p99_ms: f64,
         qdrant_top_k: Vec<String>,
         turbovec_top_k: Vec<String>,
     }
