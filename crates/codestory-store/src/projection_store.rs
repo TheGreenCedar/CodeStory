@@ -3,10 +3,17 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
 };
 
+/// Mutable graph/search projection facade.
+///
+/// Projection writes replace the indexed view for refreshed files and remove
+/// stale file-scoped errors before inserting new output. Callers must flush a
+/// coherent batch: file rows, nodes, edges, occurrences, component access, and
+/// callable projection state should describe the same indexing pass.
 pub struct ProjectionStore<'a> {
     storage: &'a mut Store,
 }
 
+/// Borrowed indexer output ready to persist as one projection flush.
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
     pub nodes: &'a [Node],
@@ -21,6 +28,7 @@ impl<'a> ProjectionStore<'a> {
         Self { storage }
     }
 
+    /// Load callable projection state already persisted for a file node.
     pub fn get_callable_projection_states_for_file(
         &self,
         file_node_id: NodeId,
@@ -29,6 +37,7 @@ impl<'a> ProjectionStore<'a> {
             .get_callable_projection_states_for_file(file_node_id.0)
     }
 
+    /// Persist a coherent projection batch and return per-stage timing.
     pub fn flush_projection_batch(
         &mut self,
         batch: ProjectionBatch<'_>,

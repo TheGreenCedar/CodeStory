@@ -2,8 +2,11 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 
+/// Version of the repository identity hashing contract.
 pub const REPOSITORY_IDENTITY_SCHEMA_VERSION: u32 = 1;
 
+/// Git-derived identity used to decide whether portable sidecar cache reuse is
+/// safe for a project root.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryIdentity {
     pub canonical_repository_id: Option<String>,
@@ -15,6 +18,11 @@ pub struct RepositoryIdentity {
     pub portable_reuse_reason: String,
 }
 
+/// Project id decision for sidecar artifacts.
+///
+/// Clean, identifiable Git repositories use a stable repository-derived id.
+/// Dirty, missing, or non-Git roots fall back to the root-derived id so cached
+/// sidecars do not cross an unsafe freshness boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarProjectIdentity {
     pub project_id: String,
@@ -24,6 +32,7 @@ pub struct SidecarProjectIdentity {
     pub portable_reuse_reason: String,
 }
 
+/// Inspect Git remote, tree, and dirtiness for portable cache reuse.
 pub fn inspect_repository_identity(project_root: &Path) -> RepositoryIdentity {
     let remote = git_output(project_root, &["config", "--get", "remote.origin.url"]).ok();
     let tree = git_output(project_root, &["rev-parse", "HEAD^{tree}"]).ok();
@@ -46,6 +55,7 @@ pub fn inspect_repository_identity(project_root: &Path) -> RepositoryIdentity {
     }
 }
 
+/// Choose the sidecar project id while preserving the fallback reason.
 pub fn sidecar_project_identity(
     project_root: &Path,
     root_derived_project_id: String,

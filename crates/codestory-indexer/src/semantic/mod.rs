@@ -1,3 +1,10 @@
+//! Semantic fallback resolution for parser-backed graph edges.
+//!
+//! This module ranks candidate graph nodes after parser rules have emitted an
+//! unresolved call or import. Structural collector files can appear in the
+//! candidate index for language-family filtering, but resolver dispatch only
+//! uses parser-backed languages plus template script surfaces.
+
 use anyhow::Result;
 use codestory_contracts::graph::EdgeKind;
 use codestory_contracts::language_support::{
@@ -34,6 +41,7 @@ use ruby::RubySemanticResolver;
 use rust::RustSemanticResolver;
 use typescript::TypeScriptSemanticResolver;
 
+/// Request to resolve one unresolved parser-backed edge.
 #[derive(Debug, Clone)]
 pub struct SemanticResolutionRequest {
     pub edge_kind: EdgeKind,
@@ -43,6 +51,7 @@ pub struct SemanticResolutionRequest {
     pub target_name: String,
 }
 
+/// Candidate target returned by a semantic resolver.
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticResolutionCandidate {
     pub target_node_id: i64,
@@ -71,6 +80,7 @@ pub(crate) struct SemanticCandidateNodeSnapshot {
     pub language_family: Option<String>,
 }
 
+/// In-memory candidate index loaded from stored graph nodes.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticCandidateIndex {
     nodes: Vec<SemanticCandidateNode>,
@@ -282,6 +292,7 @@ impl SemanticCandidateIndex {
 }
 
 pub trait SemanticResolver: Send + Sync {
+    /// Return candidate targets for `request`, ordered by resolver confidence.
     fn resolve(
         &self,
         index: &SemanticCandidateIndex,
@@ -327,15 +338,18 @@ impl SemanticResolver for SemanticResolverKind {
     }
 }
 
+/// Registry that dispatches semantic resolution by caller file language.
 pub struct SemanticResolverRegistry {
     enabled: bool,
 }
 
 impl SemanticResolverRegistry {
+    /// Create a registry; disabled registries return no candidates.
     pub fn new(enabled: bool) -> Self {
         Self { enabled }
     }
 
+    /// Resolve a request with the parser-backed resolver for its caller path.
     pub fn resolve(
         &self,
         index: &SemanticCandidateIndex,

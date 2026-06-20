@@ -1,6 +1,12 @@
 use super::{Storage, StorageError};
 use serde::{Deserialize, Serialize};
 
+/// Manifest row describing retrieval sidecar freshness for one project id.
+///
+/// Full retrieval readiness requires this row to match the current sidecar
+/// schema, input hash, artifact generation, and graph/search projection counts.
+/// Degraded modes are recorded explicitly so callers can fail closed instead of
+/// treating SQLite graph state as equivalent to fresh sidecars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalIndexManifest {
     pub project_id: String,
@@ -35,6 +41,7 @@ pub struct RetrievalIndexManifest {
 }
 
 impl Storage {
+    /// Insert or replace the retrieval manifest for a project id.
     pub fn upsert_retrieval_index_manifest(
         &mut self,
         manifest: &RetrievalIndexManifest,
@@ -114,6 +121,7 @@ impl Storage {
         Ok(())
     }
 
+    /// Load the retrieval manifest for a project id, if one has been built.
     pub fn get_retrieval_index_manifest(
         &self,
         project_id: &str,
@@ -175,6 +183,7 @@ impl Storage {
         }))
     }
 
+    /// Return Qdrant collection names referenced by stored retrieval manifests.
     pub fn list_retrieval_qdrant_collections(&self) -> Result<Vec<String>, StorageError> {
         let mut stmt = self
             .conn
