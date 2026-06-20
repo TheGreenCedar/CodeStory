@@ -151,6 +151,13 @@ const OPENAPI_ENDPOINT_UNSUPPORTED_SHAPES: &[&str] = &[
     "Generated-client correctness is not proven.",
     "The dedicated OpenAPI indexer records exact schema endpoint anchors; it is not generic YAML structural routing.",
 ];
+const CARGO_MANIFEST_NODE_KINDS: &[NodeKind] =
+    &[NodeKind::MODULE, NodeKind::PACKAGE, NodeKind::ANNOTATION];
+const CARGO_MANIFEST_UNSUPPORTED_SHAPES: &[&str] = &[
+    "Dependency resolution, feature activation, workspace inheritance, build-script behavior, and lockfile proof are not interpreted.",
+    "Target-scoped dependency tables, workspace dependency tables, dependency subtables, features, patch, and replace tables are not semantic proof.",
+    "The collector records exact source anchors for selected manifest keys only; it does not validate Cargo behavior.",
+];
 
 pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = &[
     StructuralSourceProofContract {
@@ -187,6 +194,18 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         confidence: 1.0,
         unsupported_shape_notes: OPENAPI_ENDPOINT_UNSUPPORTED_SHAPES,
         claim_boundary: "dedicated OpenAPI exact-source schema anchor only; not handler implementation, auth behavior, request validation, response semantics, runtime route proof, generated-client correctness, generic YAML support, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "cargo_manifest",
+        path_pattern: "**/Cargo.toml",
+        emitted_node_kinds: CARGO_MANIFEST_NODE_KINDS,
+        source_span: "1-based source line and column span for matched workspace member, package name, or direct dependency key anchors",
+        evidence_tier: PacketEvidenceTierDto::ExactSource,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: CARGO_MANIFEST_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not parser-backed graph parity, typed semantic resolution, not semantic dependency proof, Cargo resolution, or packet semantic-proof admission",
         semantic_proof_allowed: false,
     },
 ];
@@ -345,6 +364,13 @@ pub fn is_docker_compose_file_path(path: &str) -> bool {
     stem.starts_with("compose")
         || stem.starts_with("docker-compose")
         || (stem.ends_with("-compose") && parts.any(|part| part == "docker"))
+}
+
+pub fn is_cargo_manifest_file_path(path: &str) -> bool {
+    path.replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .is_some_and(|file_name| file_name == "Cargo.toml")
 }
 
 pub fn supported_extensions() -> impl Iterator<Item = &'static str> {
@@ -568,6 +594,41 @@ mod tests {
                 .claim_boundary
                 .contains("generic YAML support")
         );
+
+        let cargo_contract = STRUCTURAL_SOURCE_PROOF_CONTRACTS
+            .iter()
+            .find(|contract| contract.collector_name == "cargo_manifest")
+            .expect("cargo manifest structural contract");
+        assert_eq!(cargo_contract.path_pattern, "**/Cargo.toml");
+        assert!(
+            cargo_contract
+                .emitted_node_kinds
+                .contains(&NodeKind::MODULE)
+        );
+        assert!(
+            cargo_contract
+                .emitted_node_kinds
+                .contains(&NodeKind::PACKAGE)
+        );
+        assert!(
+            cargo_contract
+                .emitted_node_kinds
+                .contains(&NodeKind::ANNOTATION)
+        );
+        assert_eq!(
+            cargo_contract.evidence_tier,
+            PacketEvidenceTierDto::ExactSource
+        );
+        assert_eq!(
+            cargo_contract.resolution,
+            PacketEvidenceResolutionDto::SourceRangeOnly
+        );
+        assert!(!cargo_contract.semantic_proof_allowed);
+        assert!(
+            cargo_contract
+                .claim_boundary
+                .contains("not semantic dependency proof")
+        );
     }
 
     #[test]
@@ -603,5 +664,17 @@ mod tests {
         assert!(!is_docker_compose_file_path("openapi.yaml"));
         assert!(!is_docker_compose_file_path("docs/service.yml"));
         assert!(language_support_profile_for_ext("yaml").is_none());
+    }
+
+    #[test]
+    fn cargo_manifest_path_is_basename_scoped_not_toml_support() {
+        assert!(is_cargo_manifest_file_path("Cargo.toml"));
+        assert!(is_cargo_manifest_file_path("crates/tool/Cargo.toml"));
+        assert!(is_cargo_manifest_file_path(r"crates\tool\Cargo.toml"));
+        assert!(!is_cargo_manifest_file_path("cargo.toml"));
+        assert!(!is_cargo_manifest_file_path("config.toml"));
+        assert!(!is_cargo_manifest_file_path(".cargo/config.toml"));
+        assert!(!is_cargo_manifest_file_path("Cargo.lock"));
+        assert!(language_support_profile_for_ext("toml").is_none());
     }
 }
