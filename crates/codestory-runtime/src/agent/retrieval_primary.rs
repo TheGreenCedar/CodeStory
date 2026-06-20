@@ -505,6 +505,7 @@ fn packet_sidecar_query_diagnostic(
     resolution: &SidecarCandidateResolutionOutcome,
     sidecar_query_ms: u32,
     candidate_resolution_ms: u32,
+    batch_query_wall_ms: u32,
 ) -> PacketSidecarQueryDiagnosticDto {
     let total_elapsed_ms = sidecar_query_ms.saturating_add(candidate_resolution_ms);
     let stage_timings = retrieval_stage_timings(&query_result.trace);
@@ -520,6 +521,7 @@ fn packet_sidecar_query_diagnostic(
         total_elapsed_ms: Some(total_elapsed_ms),
         sidecar_stage_count: u32::try_from(stage_timings.len()).unwrap_or(u32::MAX),
         sidecar_stage_total_ms: Some(sidecar_stage_total_ms),
+        batch_query_wall_ms: Some(batch_query_wall_ms),
         candidate_count: u32::try_from(resolution.attempted_candidate_count).unwrap_or(u32::MAX),
         resolved_hit_count: u32::try_from(resolution.resolved_hits.len()).unwrap_or(u32::MAX),
         unresolved_candidate_count: u32::try_from(resolution.unresolved_candidate_count)
@@ -559,12 +561,14 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         .iter()
         .map(|(query, _)| (query.clone(), per_query_budget))
         .collect::<Vec<_>>();
+    let batch_started_at = Instant::now();
     let query_results = run_query_batch(controller, &batch_queries).map_err(|error| {
         sidecar_retrieval_unavailable_error(
             controller,
             format!("sidecar retrieval batch query failed: {error}"),
         )
     })?;
+    let batch_query_wall_ms = clamp_elapsed_ms(batch_started_at);
     if query_results.len() != queries.len() {
         return Err(sidecar_retrieval_unavailable_error(
             controller,
@@ -607,6 +611,7 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
             &resolution,
             sidecar_query_ms,
             candidate_resolution_ms,
+            batch_query_wall_ms,
         ));
         let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
@@ -1599,7 +1604,7 @@ mod tests {
             unresolved_candidate_count: 1,
         };
 
-        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 2, 1);
+        let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 2, 1, 3);
 
         assert_eq!(diagnostic.candidate_count, 1);
         assert_eq!(diagnostic.resolved_hit_count, 0);
@@ -2163,7 +2168,7 @@ mod tests {
             unresolved_candidate_count: 0,
         };
         let empty_diagnostic =
-            packet_sidecar_query_diagnostic(&empty_full, &empty_resolution, 1, 0);
+            packet_sidecar_query_diagnostic(&empty_full, &empty_resolution, 1, 0, 1);
         assert_eq!(empty_diagnostic.candidate_count, 0);
         assert_eq!(empty_diagnostic.resolved_hit_count, 0);
         assert_eq!(empty_diagnostic.unresolved_candidate_count, 0);
@@ -2194,7 +2199,7 @@ mod tests {
             unresolved_candidate_count: 1,
         };
         let unresolved_diagnostic =
-            packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution, 1, 0);
+            packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution, 1, 0, 1);
         assert_eq!(unresolved_diagnostic.candidate_count, 1);
         assert_eq!(unresolved_diagnostic.resolved_hit_count, 0);
         assert_eq!(unresolved_diagnostic.unresolved_candidate_count, 1);
@@ -2296,7 +2301,7 @@ mod tests {
         assert_eq!(resolution.resolved_hits.len(), 1);
         assert_eq!(resolution.unresolved_candidate_count, 0);
 
-        let diagnostic = packet_sidecar_query_diagnostic(&query_result, &resolution, 1, 0);
+        let diagnostic = packet_sidecar_query_diagnostic(&query_result, &resolution, 1, 0, 1);
         assert_eq!(diagnostic.candidate_count, 1);
         assert_eq!(diagnostic.resolved_hit_count, 1);
         assert_eq!(diagnostic.unresolved_candidate_count, 0);

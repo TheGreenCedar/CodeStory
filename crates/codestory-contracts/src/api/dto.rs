@@ -1650,6 +1650,8 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub sidecar_stage_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_stage_total_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_query_wall_ms: Option<u32>,
     pub candidate_count: u32,
     pub resolved_hit_count: u32,
     pub unresolved_candidate_count: u32,
@@ -2038,6 +2040,7 @@ mod packet_tests {
             total_elapsed_ms: Some(20),
             sidecar_stage_count: 2,
             sidecar_stage_total_ms: Some(16),
+            batch_query_wall_ms: Some(19),
             candidate_count: 5,
             resolved_hit_count: 4,
             unresolved_candidate_count: 1,
@@ -2050,11 +2053,13 @@ mod packet_tests {
         assert_eq!(value["total_elapsed_ms"], 20);
         assert_eq!(value["sidecar_stage_count"], 2);
         assert_eq!(value["sidecar_stage_total_ms"], 16);
+        assert_eq!(value["batch_query_wall_ms"], 19);
 
         let parsed: PacketSidecarQueryDiagnosticDto =
             serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed.total_elapsed_ms, Some(20));
         assert_eq!(parsed.sidecar_stage_total_ms, Some(16));
+        assert_eq!(parsed.batch_query_wall_ms, Some(19));
     }
 
     #[test]

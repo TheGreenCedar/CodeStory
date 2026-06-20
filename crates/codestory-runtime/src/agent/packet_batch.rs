@@ -355,13 +355,21 @@ fn annotate_packet_batch_timing(
         .filter_map(|diagnostic| diagnostic.total_elapsed_ms.or(diagnostic.sidecar_query_ms))
         .fold(0_u32, u32::saturating_add);
     let overhead_ms = duration_ms.saturating_sub(attributed_ms);
-    answer.retrieval_trace.annotations.push(format!(
+    let batch_query_wall_ms = diagnostics
+        .iter()
+        .find_map(|diagnostic| diagnostic.batch_query_wall_ms);
+    let batch_wall_note = batch_query_wall_ms
+        .map(|ms| format!(" batch_query_wall_ms={ms}"))
+        .unwrap_or_default();
+    let mut annotation = format!(
         "{label} total_ms={} attributed_query_ms={} overhead_ms={} queries={}",
         duration_ms,
         attributed_ms,
         overhead_ms,
         diagnostics.len()
-    ));
+    );
+    annotation.push_str(&batch_wall_note);
+    answer.retrieval_trace.annotations.push(annotation);
 }
 
 fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnosticDto>) -> String {
@@ -372,12 +380,20 @@ fn packet_anchor_timing_annotation(diagnostic: Option<&PacketSidecarQueryDiagnos
         diagnostic.sidecar_query_ms,
         diagnostic.candidate_resolution_ms,
         diagnostic.total_elapsed_ms,
+        diagnostic.batch_query_wall_ms,
     ) {
-        (Some(query_ms), Some(resolution_ms), Some(total_ms)) => format!(
+        (Some(query_ms), Some(resolution_ms), Some(total_ms), Some(batch_ms)) => format!(
+            " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={} batch_query_wall_ms={}",
+            query_ms, resolution_ms, total_ms, batch_ms
+        ),
+        (Some(query_ms), Some(resolution_ms), Some(total_ms), None) => format!(
             " sidecar_query_ms={} candidate_resolution_ms={} total_elapsed_ms={}",
             query_ms, resolution_ms, total_ms
         ),
-        (_, _, Some(total_ms)) => format!(" total_elapsed_ms={total_ms}"),
+        (_, _, Some(total_ms), Some(batch_ms)) => {
+            format!(" total_elapsed_ms={total_ms} batch_query_wall_ms={batch_ms}")
+        }
+        (_, _, Some(total_ms), None) => format!(" total_elapsed_ms={total_ms}"),
         _ => String::new(),
     }
 }

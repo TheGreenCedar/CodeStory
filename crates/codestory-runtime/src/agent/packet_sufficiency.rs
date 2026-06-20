@@ -2281,6 +2281,7 @@ mod tests {
             total_elapsed_ms: None,
             sidecar_stage_count: 0,
             sidecar_stage_total_ms: None,
+            batch_query_wall_ms: None,
             candidate_count: 1,
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,
