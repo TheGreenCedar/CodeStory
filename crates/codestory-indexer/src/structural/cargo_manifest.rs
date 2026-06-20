@@ -17,7 +17,8 @@ pub(crate) fn collect_cargo_manifest_entities(
 
     for (line_idx, line_text) in source.lines().enumerate() {
         let line = line_idx.saturating_add(1).try_into().unwrap_or(u32::MAX);
-        let trimmed = line_text.trim();
+        let code_text = strip_toml_comment(line_text);
+        let trimmed = code_text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -31,8 +32,8 @@ pub(crate) fn collect_cargo_manifest_entities(
         if section == Section::Workspace
             && (in_workspace_members || toml_key(trimmed) == Some("members"))
         {
-            in_workspace_members = !line_text.contains(']');
-            for (member, col) in quoted_values(line_text) {
+            in_workspace_members = !code_text.contains(']');
+            for (member, col) in quoted_values(code_text) {
                 let member_id = push_structural_node(
                     storage,
                     file_id,
@@ -48,7 +49,7 @@ pub(crate) fn collect_cargo_manifest_entities(
         }
 
         if section == Section::Package && toml_key(trimmed) == Some("name") {
-            if let Some((name, col)) = first_quoted_value(line_text) {
+            if let Some((name, col)) = first_quoted_value(code_text) {
                 let id = push_structural_node(
                     storage,
                     file_id,
@@ -65,7 +66,7 @@ pub(crate) fn collect_cargo_manifest_entities(
         }
 
         if section.is_dependency_table()
-            && let Some((dependency, col)) = dependency_key(line_text)
+            && let Some((dependency, col)) = dependency_key(code_text)
         {
             let dep_id = push_structural_node(
                 storage,
@@ -128,6 +129,25 @@ fn section_header(trimmed: &str) -> Option<Section> {
         "build-dependencies" => Section::BuildDependencies,
         _ => Section::Other,
     })
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, ch) {
+            (Some('"'), '\\') => escaped = true,
+            (Some(current), value) if value == current => quote = None,
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '#') => return &line[..idx],
+            _ => {}
+        }
+    }
+    line
 }
 
 fn toml_key(trimmed: &str) -> Option<&str> {

@@ -328,13 +328,13 @@ services:
 
     #[test]
     fn indexes_cargo_manifest_source_proof_anchors() {
-        let source = r#"[workspace]
-members = ["crates/api", "crates/cli"]
+        let source = r#"[workspace] # workspace table
+members = ["crates/api", "crates/cli"] # "not-a-member"
 
 [package]
 name = "demo"
 
-[dependencies]
+[dependencies] # direct dependencies only
 serde = "1"
 tokio = { version = "1" }
 
@@ -358,6 +358,9 @@ default = ["serde"]
 
 [patch.crates-io]
 serde = { git = "https://example.invalid/serde" }
+
+[replace]
+replace_serde = { path = "vendor/serde" }
 "#;
 
         let storage = index_structural_source(Path::new("Cargo.toml"), source).unwrap();
@@ -370,7 +373,14 @@ serde = { git = "https://example.invalid/serde" }
         assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "tokio", 9, 1);
         assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "pretty_assertions", 12, 1);
         assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "cc", 15, 1);
-        for ignored in ["libc", "anyhow", "tracing", "default"] {
+        for ignored in [
+            "libc",
+            "anyhow",
+            "tracing",
+            "default",
+            "not-a-member",
+            "replace_serde",
+        ] {
             assert!(
                 !storage
                     .nodes
