@@ -2,7 +2,11 @@ use crate::mode::RetrievalDegradedMode;
 use crate::query_features::{QueryFeatures, QueryShape};
 use serde::{Deserialize, Serialize};
 
-/// Staged retrieval lane (design doc staged retrieval).
+/// Staged retrieval lane.
+///
+/// Stage labels are part of the trace contract consumed by runtime packet diagnostics. Repo-text
+/// fallback is represented here for diagnostics only; full sidecar plans do not use it as product
+/// evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStageKind {
@@ -46,6 +50,7 @@ impl RetrievalStageKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One planned stage with its local budget and candidate cap.
 pub struct PlannedStage {
     pub kind: RetrievalStageKind,
     pub budget_ms: u64,
@@ -53,6 +58,10 @@ pub struct PlannedStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Query plan for one sidecar request.
+///
+/// Non-full degraded modes intentionally produce no stages so callers fail closed instead of
+/// presenting partial sidecar coverage as complete retrieval.
 pub struct RetrievalPlan {
     pub stages: Vec<PlannedStage>,
     pub total_budget_ms: u64,
@@ -64,6 +73,10 @@ const DEFAULT_TOTAL_BUDGET_MS: u64 = 1_000;
 const MARGINAL_GAIN_THRESHOLD: f32 = 0.05;
 const LOW_GAIN_STREAK: u32 = 2;
 
+/// Build the sidecar plan for a classified query and live retrieval mode.
+///
+/// Budget values are per-request guardrails, not SLA proof. Packet orchestration may divide a
+/// larger packet budget across several calls before invoking this planner.
 pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> RetrievalPlan {
     if mode != RetrievalDegradedMode::Full {
         return RetrievalPlan {

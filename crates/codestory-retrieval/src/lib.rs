@@ -1,4 +1,13 @@
 //! Retrieval v2 sidecar orchestration: health probes, local-dev clients, and index manifests.
+//!
+//! Public query APIs in this crate are sidecar-first. A result with
+//! `retrieval_mode=full` means the manifest, lexical index, graph artifacts, and dense-anchor
+//! collection agreed at query time; other modes are degraded diagnostics and must not be treated
+//! as product-equivalent answer evidence.
+//!
+//! Cache keys and status reports intentionally carry manifest generation, input-hash, schema, and
+//! projection counts. Callers that copy caches or reuse worktrees must preserve those identity
+//! checks and revalidate sidecars before serving cached retrieval results.
 
 mod cache;
 mod candidate;

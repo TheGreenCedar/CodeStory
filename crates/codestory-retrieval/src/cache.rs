@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 /// Cache key ties results to a published retrieval manifest generation.
+///
+/// This is the boundary that prevents lexical/vector evidence from one sidecar build from being
+/// reused after the manifest identity changes. The query fingerprint is not enough on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RetrievalCacheKey {
     pub project_id: String,
@@ -38,6 +41,10 @@ impl RetrievalCacheKey {
 const DEFAULT_RETRIEVAL_CACHE_CAPACITY: usize = 128;
 
 /// In-memory version-keyed query result cache.
+///
+/// Entries are safe only for the manifest identity captured by [`RetrievalCacheKey`]. Cache
+/// rehydration across worktrees must invalidate copied retrieval manifests before this cache is
+/// trusted again.
 #[derive(Debug)]
 pub struct RetrievalCache {
     entries: HashMap<RetrievalCacheKey, Vec<super::CandidateHit>>,

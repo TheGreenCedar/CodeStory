@@ -7,6 +7,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
+/// Request to copy a compatible CodeStory cache between sibling worktrees.
+///
+/// Source and target must share git remote, tree, schema, and freshness. Retrieval manifests are
+/// path- and sidecar-bound, so successful rehydrate invalidates them before the target can serve
+/// sidecar retrieval.
 pub struct CacheRehydrateRequest<'a> {
     pub source_project: &'a Path,
     pub source_cache_dir: &'a Path,
@@ -16,6 +21,11 @@ pub struct CacheRehydrateRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Machine-readable result of a cache rehydrate attempt.
+///
+/// `preserved_scope` and `retrieval` explain the contract boundary: SQLite graph/search/doc rows
+/// may be reused after rebasing, but sidecar directories and retrieval manifests must be rebuilt
+/// or revalidated for the target worktree.
 pub struct CacheRehydrateOutput {
     pub status: String,
     pub reason: Option<String>,
@@ -39,6 +49,10 @@ pub struct CacheRehydrateOutput {
     pub next_commands: Vec<String>,
 }
 
+/// Copy a compatible cache, rebase path-bound rows, and invalidate copied retrieval manifests.
+///
+/// Skipped results are intentional safety outcomes, not hard failures. They preserve correctness
+/// when cache identity, freshness, or directory boundaries are not strong enough.
 pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydrateOutput> {
     let source_db = request.source_cache_dir.join("codestory.db");
     let target_db = request.target_cache_dir.join("codestory.db");
