@@ -1467,6 +1467,127 @@ fn live_open_migrates_v17_llm_doc_columns_before_secondary_indexes() -> Result<(
 }
 
 #[test]
+fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v18-precise-semantic-manifest-repair");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.execute(
+            "CREATE TABLE retrieval_index_manifest (
+                project_id TEXT PRIMARY KEY,
+                zoekt_version TEXT NOT NULL,
+                qdrant_collection TEXT NOT NULL,
+                scip_revision TEXT,
+                built_at_epoch_ms INTEGER NOT NULL,
+                disk_bytes INTEGER,
+                degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+                embedding_backend TEXT,
+                embedding_dim INTEGER,
+                sidecar_schema_version INTEGER,
+                sidecar_input_hash TEXT,
+                sidecar_generation TEXT,
+                projection_count INTEGER,
+                symbol_doc_count INTEGER,
+                dense_projection_count INTEGER,
+                semantic_policy_version TEXT,
+                graph_artifact_hash TEXT,
+                dense_reason_counts_json TEXT
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO retrieval_index_manifest (
+                project_id,
+                zoekt_version,
+                qdrant_collection,
+                built_at_epoch_ms,
+                degraded_modes_json
+            ) VALUES ('proj', 'zoekt', 'collection', 1, '[]')",
+            [],
+        )?;
+        conn.pragma_update(None, "user_version", 18)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for column in [
+        "precise_semantic_import_status",
+        "precise_semantic_import_reason",
+        "precise_semantic_import_revision",
+        "precise_semantic_import_producer",
+    ] {
+        assert!(columns.iter().any(|existing| existing == column));
+    }
+    let manifest = storage
+        .get_retrieval_index_manifest("proj")?
+        .expect("manifest survives repair");
+    assert_eq!(manifest.project_id, "proj");
+    assert_eq!(manifest.precise_semantic_import_status, None);
+
+    drop(storage);
+    let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v18-precise-semantic-manifest-preserve");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        let mut storage = Storage::open(&db_path)?;
+        storage.upsert_retrieval_index_manifest(&RetrievalIndexManifest {
+            project_id: "proj".into(),
+            zoekt_version: "zoekt".into(),
+            qdrant_collection: "collection".into(),
+            scip_revision: None,
+            built_at_epoch_ms: 1,
+            disk_bytes: None,
+            degraded_modes_json: "[]".into(),
+            embedding_backend: None,
+            embedding_dim: None,
+            sidecar_schema_version: Some(1),
+            sidecar_input_hash: Some("input".into()),
+            sidecar_generation: Some("generation".into()),
+            projection_count: Some(2),
+            symbol_doc_count: Some(3),
+            dense_projection_count: Some(4),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph".into()),
+            dense_reason_counts_json: Some("{\"public_api\":4}".into()),
+            precise_semantic_import_status: Some("fresh".into()),
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: Some("rev".into()),
+            precise_semantic_import_producer: Some("producer".into()),
+        })?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    let manifest = storage
+        .get_retrieval_index_manifest("proj")?
+        .expect("manifest remains present");
+    assert_eq!(
+        manifest.precise_semantic_import_status,
+        Some("fresh".into())
+    );
+    assert_eq!(
+        manifest.precise_semantic_import_revision,
+        Some("rev".into())
+    );
+    assert_eq!(
+        manifest.precise_semantic_import_producer,
+        Some("producer".into())
+    );
+
+    drop(storage);
+    let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
 fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
 -> Result<(), StorageError> {
     let live_path = unique_temp_db_path("live");
