@@ -1,6 +1,6 @@
 [package]
 name = "codestory-cli"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 description = "Local repository evidence and grounding CLI for source-backed coding workflows."
 license = "Apache-2.0"
