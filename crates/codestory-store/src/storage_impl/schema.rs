@@ -244,7 +244,11 @@ const TABLE_STATEMENTS: &[&str] = &[
         dense_projection_count INTEGER,
         semantic_policy_version TEXT,
         graph_artifact_hash TEXT,
-        dense_reason_counts_json TEXT
+        dense_reason_counts_json TEXT,
+        precise_semantic_import_status TEXT,
+        precise_semantic_import_reason TEXT,
+        precise_semantic_import_revision TEXT,
+        precise_semantic_import_producer TEXT
     )",
 ];
 
@@ -600,6 +604,26 @@ pub(super) fn migrate_v18_ast_first_symbol_docs(conn: &Connection) -> Result<(),
         "retrieval_index_manifest",
         "dense_reason_counts_json TEXT",
     )?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "precise_semantic_import_status TEXT",
+    )?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "precise_semantic_import_reason TEXT",
+    )?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "precise_semantic_import_revision TEXT",
+    )?;
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "precise_semantic_import_producer TEXT",
+    )?;
     Ok(())
 }
 
@@ -612,7 +636,11 @@ pub(super) fn migrate_v14_retrieval_index_manifest(conn: &Connection) -> Result<
             scip_revision TEXT,
             built_at_epoch_ms INTEGER NOT NULL,
             disk_bytes INTEGER,
-            degraded_modes_json TEXT NOT NULL DEFAULT '[]'
+            degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+            precise_semantic_import_status TEXT,
+            precise_semantic_import_reason TEXT,
+            precise_semantic_import_revision TEXT,
+            precise_semantic_import_producer TEXT
         )",
         [],
     )?;

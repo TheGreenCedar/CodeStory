@@ -2034,6 +2034,14 @@ pub(crate) struct DoctorSidecarStatusOutput {
     pub(crate) manifest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_input_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) precise_semantic_import_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) precise_semantic_import_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) precise_semantic_import_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) precise_semantic_import_producer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

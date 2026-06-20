@@ -28,6 +28,10 @@ pub struct RetrievalIndexManifest {
     pub semantic_policy_version: Option<String>,
     pub graph_artifact_hash: Option<String>,
     pub dense_reason_counts_json: Option<String>,
+    pub precise_semantic_import_status: Option<String>,
+    pub precise_semantic_import_reason: Option<String>,
+    pub precise_semantic_import_revision: Option<String>,
+    pub precise_semantic_import_producer: Option<String>,
 }
 
 impl Storage {
@@ -54,8 +58,12 @@ impl Storage {
                 dense_projection_count,
                 semantic_policy_version,
                 graph_artifact_hash,
-                dense_reason_counts_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                dense_reason_counts_json,
+                precise_semantic_import_status,
+                precise_semantic_import_reason,
+                precise_semantic_import_revision,
+                precise_semantic_import_producer
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
             ON CONFLICT(project_id) DO UPDATE SET
                 zoekt_version = excluded.zoekt_version,
                 qdrant_collection = excluded.qdrant_collection,
@@ -73,7 +81,11 @@ impl Storage {
                 dense_projection_count = excluded.dense_projection_count,
                 semantic_policy_version = excluded.semantic_policy_version,
                 graph_artifact_hash = excluded.graph_artifact_hash,
-                dense_reason_counts_json = excluded.dense_reason_counts_json",
+                dense_reason_counts_json = excluded.dense_reason_counts_json,
+                precise_semantic_import_status = excluded.precise_semantic_import_status,
+                precise_semantic_import_reason = excluded.precise_semantic_import_reason,
+                precise_semantic_import_revision = excluded.precise_semantic_import_revision,
+                precise_semantic_import_producer = excluded.precise_semantic_import_producer",
             rusqlite::params![
                 manifest.project_id,
                 manifest.zoekt_version,
@@ -93,6 +105,10 @@ impl Storage {
                 manifest.semantic_policy_version,
                 manifest.graph_artifact_hash,
                 manifest.dense_reason_counts_json,
+                manifest.precise_semantic_import_status,
+                manifest.precise_semantic_import_reason,
+                manifest.precise_semantic_import_revision,
+                manifest.precise_semantic_import_producer,
             ],
         )?;
         Ok(())
@@ -121,7 +137,11 @@ impl Storage {
                 dense_projection_count,
                 semantic_policy_version,
                 graph_artifact_hash,
-                dense_reason_counts_json
+                dense_reason_counts_json,
+                precise_semantic_import_status,
+                precise_semantic_import_reason,
+                precise_semantic_import_revision,
+                precise_semantic_import_producer
              FROM retrieval_index_manifest
              WHERE project_id = ?1",
         )?;
@@ -148,6 +168,10 @@ impl Storage {
             semantic_policy_version: row.get(15)?,
             graph_artifact_hash: row.get(16)?,
             dense_reason_counts_json: row.get(17)?,
+            precise_semantic_import_status: row.get(18)?,
+            precise_semantic_import_reason: row.get(19)?,
+            precise_semantic_import_revision: row.get(20)?,
+            precise_semantic_import_producer: row.get(21)?,
         }))
     }
 
@@ -224,6 +248,10 @@ mod tests {
                     semantic_policy_version: None,
                     graph_artifact_hash: None,
                     dense_reason_counts_json: None,
+                    precise_semantic_import_status: None,
+                    precise_semantic_import_reason: None,
+                    precise_semantic_import_revision: None,
+                    precise_semantic_import_producer: None,
                 })
                 .expect("upsert manifest");
         }
@@ -264,6 +292,10 @@ mod tests {
             semantic_policy_version: Some("graph_first_v1".into()),
             graph_artifact_hash: Some("graph-hash".into()),
             dense_reason_counts_json: Some("{\"public_api\":99}".into()),
+            precise_semantic_import_status: Some("fresh".into()),
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: Some("imported-a".into()),
+            precise_semantic_import_producer: Some("scip-fixture".into()),
         };
         storage
             .upsert_retrieval_index_manifest(&manifest)
@@ -307,6 +339,10 @@ mod tests {
                     semantic_policy_version: None,
                     graph_artifact_hash: None,
                     dense_reason_counts_json: None,
+                    precise_semantic_import_status: None,
+                    precise_semantic_import_reason: None,
+                    precise_semantic_import_revision: None,
+                    precise_semantic_import_producer: None,
                 })
                 .expect("upsert manifest");
         }

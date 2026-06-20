@@ -8473,11 +8473,31 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
                 .manifest
                 .as_ref()
                 .and_then(|manifest| manifest.sidecar_input_hash.clone());
+            let precise_semantic_import_status = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.precise_semantic_import_status.clone());
+            let precise_semantic_import_reason = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.precise_semantic_import_reason.clone());
+            let precise_semantic_import_revision = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.precise_semantic_import_revision.clone());
+            let precise_semantic_import_producer = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
             DoctorSidecarStatusOutput {
                 retrieval_mode: report.retrieval_mode,
                 degraded_reason: report.degraded_reason,
                 manifest_generation,
                 manifest_input_hash,
+                precise_semantic_import_status,
+                precise_semantic_import_reason,
+                precise_semantic_import_revision,
+                precise_semantic_import_producer,
             }
         }
         Err(error) => DoctorSidecarStatusOutput {
@@ -8485,6 +8505,10 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
             degraded_reason: Some(format!("sidecar_status_error: {error}")),
             manifest_generation: None,
             manifest_input_hash: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
         },
     }
 }
