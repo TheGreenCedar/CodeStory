@@ -67,8 +67,13 @@ function Find-RehydrateSource {
     param([string]$Target)
 
     if ($env:CODESTORY_REHYDRATE_FROM) {
-        $configured = (Resolve-Path -LiteralPath $env:CODESTORY_REHYDRATE_FROM).Path
-        if (-not (Same-Path $configured $Target)) {
+        try {
+            $configured = (Resolve-Path -LiteralPath $env:CODESTORY_REHYDRATE_FROM -ErrorAction Stop).Path
+        } catch {
+            Write-Warning "Ignoring CODESTORY_REHYDRATE_FROM='$env:CODESTORY_REHYDRATE_FROM': $($_.Exception.Message)"
+            $configured = $null
+        }
+        if ($configured -and -not (Same-Path $configured $Target)) {
             return $configured
         }
     }
