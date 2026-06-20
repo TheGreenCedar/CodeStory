@@ -3,6 +3,7 @@
 mod blanking;
 mod common;
 pub(crate) mod css;
+mod docker_compose;
 mod github_actions;
 mod html;
 mod sql;
@@ -18,11 +19,16 @@ pub fn structural_language_name(path: &Path) -> &'static str {
 use crate::intermediate_storage::IntermediateStorage;
 use anyhow::Result;
 use codestory_contracts::graph::NodeId;
-use codestory_contracts::language_support::is_github_actions_workflow_path;
+use codestory_contracts::language_support::{
+    is_docker_compose_file_path, is_github_actions_workflow_path,
+};
 use std::path::Path;
 
 pub fn is_structural_candidate_path(path: &Path) -> bool {
-    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+    let path_text = path.to_string_lossy();
+    if is_github_actions_workflow_path(path_text.as_ref())
+        || is_docker_compose_file_path(path_text.as_ref())
+    {
         return true;
     }
     matches!(
@@ -61,13 +67,16 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
     });
     storage.nodes.push(file_node);
 
-    if is_github_actions_workflow_path(path.to_string_lossy().as_ref()) {
+    let path_key = path.to_string_lossy();
+    if is_github_actions_workflow_path(path_key.as_ref()) {
         github_actions::collect_github_actions_workflow_entities(
             path,
             source,
             file_id,
             &mut storage,
         );
+    } else if is_docker_compose_file_path(path_key.as_ref()) {
+        docker_compose::collect_docker_compose_entities(path, source, file_id, &mut storage);
     } else {
         match structural_extension(path).as_deref() {
             Some("html" | "htm") => {
@@ -185,6 +194,122 @@ jobs:
     }
 
     #[test]
+    fn indexes_docker_compose_services_as_structural_source_proof() {
+        let source = r#"name: demo-stack
+services:
+  web:
+    image: nginx:1.27
+    ports:
+      - "8080:80"
+    environment:
+      RACK_ENV: production
+      FEATURE_FLAG: "true"
+    volumes:
+      - ./site:/usr/share/nginx/html:ro
+  worker:
+    build: ./worker
+    environment:
+      - QUEUE=critical
+    volumes:
+      - worker-cache:/cache
+"#;
+
+        let storage =
+            index_structural_source(Path::new("docker/demo-compose.yml"), source).unwrap();
+
+        assert_eq!(storage.files[0].language, "docker_compose");
+        assert!(
+            storage.nodes.iter().any(|node| {
+                node.kind == NodeKind::MODULE
+                    && node.serialized_name == "demo-stack"
+                    && node.start_line == Some(1)
+                    && node.start_col == Some(7)
+                    && node.end_col == Some(16)
+            }),
+            "compose stack name should be an exact source-span node"
+        );
+        assert_compose_node_span(&storage, NodeKind::FUNCTION, "web", 3, 3);
+        assert_compose_node_span(&storage, NodeKind::FUNCTION, "worker", 12, 3);
+        assert_compose_node_span(&storage, NodeKind::ANNOTATION, "image: nginx:1.27", 4, 5);
+        assert_compose_node_span(&storage, NodeKind::ANNOTATION, "build: ./worker", 13, 5);
+        assert_compose_node_span(&storage, NodeKind::ANNOTATION, "- \"8080:80\"", 6, 7);
+        assert_compose_node_span(&storage, NodeKind::ANNOTATION, "RACK_ENV", 8, 7);
+        assert_compose_node_span(&storage, NodeKind::ANNOTATION, "FEATURE_FLAG", 9, 7);
+        assert_compose_node_span(&storage, NodeKind::ANNOTATION, "QUEUE", 15, 9);
+        assert_compose_node_span(
+            &storage,
+            NodeKind::ANNOTATION,
+            "- ./site:/usr/share/nginx/html:ro",
+            11,
+            7,
+        );
+        assert_compose_node_span(
+            &storage,
+            NodeKind::ANNOTATION,
+            "- worker-cache:/cache",
+            17,
+            7,
+        );
+        assert!(
+            storage
+                .edges
+                .iter()
+                .any(|edge| edge.kind == EdgeKind::MEMBER)
+        );
+    }
+
+    #[test]
+    fn docker_compose_admission_is_path_scoped_not_generic_yaml() {
+        assert!(is_structural_candidate_path(Path::new(
+            "docker/retrieval-compose.yml"
+        )));
+        assert!(is_structural_candidate_path(Path::new("compose.yaml")));
+        assert!(is_structural_candidate_path(Path::new(
+            "docker-compose.override.yml"
+        )));
+        assert!(is_structural_candidate_path(Path::new(
+            r"deploy\compose.yaml"
+        )));
+        assert!(is_structural_candidate_path(Path::new(
+            ".github/workflows/ci.yml"
+        )));
+        assert!(!is_structural_candidate_path(Path::new("openapi.yaml")));
+        assert!(!is_structural_candidate_path(Path::new(
+            "docs/workflow.yml"
+        )));
+
+        let storage = index_structural_source(Path::new("compose.yml"), "openapi: 3.1.0\n")
+            .expect("index unsupported compose-shaped yaml");
+        assert!(
+            storage.nodes.iter().all(|node| {
+                !node
+                    .canonical_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("docker-compose:")
+            }),
+            "unsupported compose-shaped yaml should not invent compose anchors"
+        );
+    }
+
+    #[test]
+    fn docker_compose_requires_services_section_to_emit_anchors() {
+        let storage =
+            index_structural_source(Path::new("compose.yaml"), "name: api\nopenapi: 3.1.0\n")
+                .expect("index admitted non-compose yaml");
+        assert!(
+            storage.nodes.iter().all(|node| {
+                !node
+                    .canonical_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("docker-compose:")
+            }),
+            "compose-looking yaml without services must not invent compose anchors"
+        );
+    }
+
+    #[test]
     fn unnamed_github_actions_workflow_uses_jobs_source_anchor() {
         let yaml = r#"on:
   push:
@@ -279,6 +404,27 @@ jobs:
             node.end_col,
             Some(col + source_anchor.len() as u32 - 1),
             "step span must cover only source text"
+        );
+    }
+
+    fn assert_compose_node_span(
+        storage: &IntermediateStorage,
+        kind: NodeKind,
+        source_anchor: &str,
+        line: u32,
+        col: u32,
+    ) {
+        let node = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == kind && node.serialized_name == source_anchor)
+            .unwrap_or_else(|| panic!("missing compose source anchor {source_anchor}"));
+        assert_eq!(node.start_line, Some(line));
+        assert_eq!(node.start_col, Some(col));
+        assert_eq!(
+            node.end_col,
+            Some(col + source_anchor.len() as u32 - 1),
+            "compose span must cover only source text"
         );
     }
 
