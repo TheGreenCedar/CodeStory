@@ -108,8 +108,13 @@ Use this mapping:
 Run the rustdoc baseline before raising documentation or public API cleanup PRs:
 
 ```sh
-cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
+
+CI runs the same rustdoc warning gate for Rust and contributor-doc changes. It
+keeps `codestory-bench` in the workspace pass for warning and link regressions,
+but `publish = false` benchmark helpers do not carry a broader missing-docs
+policy.
 
 Document public Rust APIs that a maintainer, integration, or downstream crate
 would need to call correctly. Keep comments operational:
