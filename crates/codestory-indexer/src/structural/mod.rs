@@ -1,6 +1,7 @@
 //! Structural-language entity collectors (HTML, CSS, SQL) with explicit node/edge mapping.
 
 mod blanking;
+mod cargo_manifest;
 mod common;
 pub(crate) mod css;
 mod docker_compose;
@@ -20,7 +21,7 @@ use crate::intermediate_storage::IntermediateStorage;
 use anyhow::Result;
 use codestory_contracts::graph::NodeId;
 use codestory_contracts::language_support::{
-    is_docker_compose_file_path, is_github_actions_workflow_path,
+    is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
 };
 use std::path::Path;
 
@@ -28,6 +29,7 @@ pub fn is_structural_candidate_path(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
     if is_github_actions_workflow_path(path_text.as_ref())
         || is_docker_compose_file_path(path_text.as_ref())
+        || is_cargo_manifest_file_path(path_text.as_ref())
     {
         return true;
     }
@@ -77,6 +79,8 @@ pub fn index_structural_source(path: &Path, source: &str) -> Result<Intermediate
         );
     } else if is_docker_compose_file_path(path_key.as_ref()) {
         docker_compose::collect_docker_compose_entities(path, source, file_id, &mut storage);
+    } else if is_cargo_manifest_file_path(path_key.as_ref()) {
+        cargo_manifest::collect_cargo_manifest_entities(path, source, file_id, &mut storage);
     } else {
         match structural_extension(path).as_deref() {
             Some("html" | "htm") => {
@@ -310,6 +314,74 @@ services:
     }
 
     #[test]
+    fn cargo_manifest_admission_is_basename_scoped_not_generic_toml() {
+        assert!(is_structural_candidate_path(Path::new("Cargo.toml")));
+        assert!(is_structural_candidate_path(Path::new(
+            "crates/codestory-cli/Cargo.toml"
+        )));
+        assert!(!is_structural_candidate_path(Path::new("config.toml")));
+        assert!(!is_structural_candidate_path(Path::new(
+            ".cargo/config.toml"
+        )));
+        assert!(!is_structural_candidate_path(Path::new("Cargo.lock")));
+    }
+
+    #[test]
+    fn indexes_cargo_manifest_source_proof_anchors() {
+        let source = r#"[workspace]
+members = ["crates/api", "crates/cli"]
+
+[package]
+name = "demo"
+
+[dependencies]
+serde = "1"
+tokio = { version = "1" }
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[build-dependencies]
+cc = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[workspace.dependencies]
+anyhow = "1"
+
+[dependencies.tracing]
+version = "0.1"
+
+[features]
+default = ["serde"]
+
+[patch.crates-io]
+serde = { git = "https://example.invalid/serde" }
+"#;
+
+        let storage = index_structural_source(Path::new("Cargo.toml"), source).unwrap();
+
+        assert_eq!(storage.files[0].language, "cargo_manifest");
+        assert_manifest_node_span(&storage, NodeKind::MODULE, "crates/api", 2, 13);
+        assert_manifest_node_span(&storage, NodeKind::MODULE, "crates/cli", 2, 27);
+        assert_manifest_node_span(&storage, NodeKind::PACKAGE, "demo", 5, 9);
+        assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "serde", 8, 1);
+        assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "tokio", 9, 1);
+        assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "pretty_assertions", 12, 1);
+        assert_manifest_node_span(&storage, NodeKind::ANNOTATION, "cc", 15, 1);
+        for ignored in ["libc", "anyhow", "tracing", "default"] {
+            assert!(
+                !storage
+                    .nodes
+                    .iter()
+                    .any(|node| node.serialized_name == ignored),
+                "unsupported Cargo table should not emit {ignored}"
+            );
+        }
+    }
+
+    #[test]
     fn unnamed_github_actions_workflow_uses_jobs_source_anchor() {
         let yaml = r#"on:
   push:
@@ -425,6 +497,27 @@ jobs:
             node.end_col,
             Some(col + source_anchor.len() as u32 - 1),
             "compose span must cover only source text"
+        );
+    }
+
+    fn assert_manifest_node_span(
+        storage: &IntermediateStorage,
+        kind: NodeKind,
+        source_anchor: &str,
+        line: u32,
+        col: u32,
+    ) {
+        let node = storage
+            .nodes
+            .iter()
+            .find(|node| node.kind == kind && node.serialized_name == source_anchor)
+            .unwrap_or_else(|| panic!("missing Cargo manifest source anchor {source_anchor}"));
+        assert_eq!(node.start_line, Some(line));
+        assert_eq!(node.start_col, Some(col));
+        assert_eq!(
+            node.end_col,
+            Some(col + source_anchor.len() as u32 - 1),
+            "Cargo manifest span must cover only source text"
         );
     }
 

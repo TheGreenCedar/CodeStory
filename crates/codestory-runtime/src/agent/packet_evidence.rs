@@ -5,7 +5,7 @@ use codestory_contracts::api::{
     SearchHitOrigin,
 };
 use codestory_contracts::language_support::{
-    is_docker_compose_file_path, is_github_actions_workflow_path,
+    is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
 };
 
 const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
@@ -274,7 +274,9 @@ fn citation_is_openapi_endpoint_schema(citation: &AgentCitationDto) -> bool {
 }
 
 fn is_structural_source_proof_path(path: &str) -> bool {
-    is_github_actions_workflow_path(path) || is_docker_compose_file_path(path)
+    is_github_actions_workflow_path(path)
+        || is_docker_compose_file_path(path)
+        || is_cargo_manifest_file_path(path)
 }
 
 fn structural_source_proof_producer(path: &str) -> Option<&'static str> {
@@ -283,6 +285,9 @@ fn structural_source_proof_producer(path: &str) -> Option<&'static str> {
     }
     if is_docker_compose_file_path(path) {
         return Some("structural_docker_compose_collector");
+    }
+    if is_cargo_manifest_file_path(path) {
+        return Some("structural_cargo_manifest_collector");
     }
     None
 }
@@ -383,6 +388,28 @@ mod tests {
         assert_eq!(
             hit.evidence_producer.as_deref(),
             Some("openapi_endpoint_schema")
+        );
+        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn cargo_manifest_structural_hit_is_exact_source_diagnostic() {
+        let mut hit = workflow_hit();
+        hit.node_id = NodeId("cargo-serde".to_string());
+        hit.display_name = "serde".to_string();
+        hit.file_path = Some("crates/app/Cargo.toml".to_string());
+        hit.line = Some(8);
+
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::ExactSource));
+        assert_eq!(
+            hit.resolution_status,
+            Some(PacketEvidenceResolution::SourceRangeOnly)
+        );
+        assert_eq!(
+            hit.evidence_producer.as_deref(),
+            Some("structural_cargo_manifest_collector")
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
     }

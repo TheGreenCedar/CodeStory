@@ -4,7 +4,8 @@ use codestory_contracts::graph::{
     ResolutionCertainty, SourceLocation,
 };
 use codestory_contracts::language_support::{
-    is_docker_compose_file_path, is_github_actions_workflow_path, structural_language_name_for_path,
+    is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
+    structural_language_name_for_path,
 };
 use std::path::Path;
 
@@ -15,6 +16,9 @@ pub(crate) fn structural_language_name(path: &Path) -> &'static str {
     }
     if is_docker_compose_file_path(path.as_ref()) {
         return "docker_compose";
+    }
+    if is_cargo_manifest_file_path(path.as_ref()) {
+        return "cargo_manifest";
     }
     structural_language_name_for_path(Some(path.as_ref())).unwrap_or("structural")
 }
