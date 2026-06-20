@@ -140,6 +140,30 @@ fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
         status["manifest_contract"].is_null(),
         "manifest-missing status must not derive a manifest contract: {status}"
     );
+    assert_eq!(
+        status["repair"]["reason"].as_str(),
+        Some("retrieval_manifest_missing"),
+        "manifest-missing status should expose a typed repair reason: {status}"
+    );
+    assert!(
+        status["repair"]["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval bootstrap")),
+        "manifest-missing status should expose an actionable repair command: {status}"
+    );
+    assert!(
+        status["repair"]["full_repair"]
+            .as_array()
+            .is_some_and(
+                |commands| commands
+                    .iter()
+                    .any(|command| command
+                        .as_str()
+                        .is_some_and(|text| text.contains("retrieval index")
+                            && text.contains("--refresh full")))
+            ),
+        "manifest-missing status should include full sidecar rebuild guidance: {status}"
+    );
 }
 
 #[test]

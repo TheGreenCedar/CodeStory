@@ -45,6 +45,9 @@ pub struct CacheRehydrateOutput {
     pub invalidated_index_artifact_rows: usize,
     pub rebased_path_bound_rows: usize,
     pub preserved_scope: String,
+    pub retrieval_status: String,
+    pub retrieval_reason: String,
+    pub retrieval_next_command: Option<String>,
     pub retrieval: String,
     pub next_commands: Vec<String>,
 }
@@ -220,6 +223,9 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
         invalidated_index_artifact_rows,
         rebased_path_bound_rows,
         preserved_scope: "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved".into(),
+        retrieval_status: retrieval_rehydrate_status(request.dry_run),
+        retrieval_reason: retrieval_rehydrate_reason(),
+        retrieval_next_command: Some(retrieval_next_command(request.target_project)),
         retrieval: retrieval_rehydrate_policy(request.dry_run),
         next_commands: rehydrate_next_commands(request.target_project),
     })
@@ -409,6 +415,9 @@ fn skipped(
         invalidated_index_artifact_rows: 0,
         rebased_path_bound_rows: 0,
         preserved_scope: "none".into(),
+        retrieval_status: "not_rehydrated".into(),
+        retrieval_reason: "normal index and retrieval rebuild required".into(),
+        retrieval_next_command: None,
         retrieval: "not rehydrated; normal index/retrieval rebuild required".into(),
         next_commands,
     }
@@ -467,6 +476,25 @@ fn rehydrate_next_commands(project: &Path) -> Vec<String> {
         format!("codestory-cli retrieval index --project {project} --refresh full"),
         format!("codestory-cli doctor --project {project}"),
     ]
+}
+
+fn retrieval_next_command(project: &Path) -> String {
+    format!(
+        "codestory-cli retrieval index --project {} --refresh full",
+        quote_path(project)
+    )
+}
+
+fn retrieval_rehydrate_status(dry_run: bool) -> String {
+    if dry_run {
+        "would_invalidate_requires_rebuild".into()
+    } else {
+        "invalidated_requires_rebuild".into()
+    }
+}
+
+fn retrieval_rehydrate_reason() -> String {
+    "cache rehydrate copies SQLite graph/search/doc state only; sidecar manifests and Zoekt/Qdrant/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
 }
 
 fn retrieval_rehydrate_policy(dry_run: bool) -> String {
@@ -528,6 +556,22 @@ mod tests {
         assert_eq!(
             output.preserved_scope,
             "sqlite_graph_search_docs_rebased_v2_index_artifacts_preserved"
+        );
+        assert_eq!(output.retrieval_status, "invalidated_requires_rebuild");
+        assert!(
+            output
+                .retrieval_reason
+                .contains("SQLite graph/search/doc state only"),
+            "rehydrate output should distinguish SQLite reuse from sidecar readiness: {}",
+            output.retrieval_reason
+        );
+        assert!(
+            output
+                .retrieval_next_command
+                .as_deref()
+                .is_some_and(|command| command.contains("retrieval index")
+                    && command.contains("--refresh full")),
+            "rehydrate output should expose the sidecar rebuild command: {output:?}"
         );
         assert!(
             output

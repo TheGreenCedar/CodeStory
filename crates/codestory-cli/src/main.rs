@@ -340,6 +340,11 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
         output.rebased_path_bound_rows
     );
     let _ = writeln!(markdown, "retrieval: {}", output.retrieval);
+    let _ = writeln!(markdown, "retrieval_status: `{}`", output.retrieval_status);
+    let _ = writeln!(markdown, "retrieval_reason: {}", output.retrieval_reason);
+    if let Some(command) = output.retrieval_next_command.as_deref() {
+        let _ = writeln!(markdown, "retrieval_next_command: `{command}`");
+    }
     if !output.next_commands.is_empty() {
         let _ = writeln!(markdown, "next_commands:");
         for command in &output.next_commands {

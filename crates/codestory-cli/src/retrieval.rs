@@ -352,8 +352,18 @@ fn emit_retrieval_status(
             )
         })
         .unwrap_or_default();
+    let repair_note = report
+        .repair
+        .as_ref()
+        .map(|repair| {
+            format!(
+                "- repair: reason=`{}` next_step=\"{}\" next_command=`{}`\n",
+                repair.reason, repair.next_step, repair.next_command
+            )
+        })
+        .unwrap_or_default();
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -363,6 +373,7 @@ fn emit_retrieval_status(
         report.stored_doc_vector_dim,
         report.stored_doc_vector_mixed_backends,
         manifest_contract_note,
+        repair_note,
         report.zoekt.status,
         report.zoekt.detail,
         report.zoekt.capabilities.lexical,
