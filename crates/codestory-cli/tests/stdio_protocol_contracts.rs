@@ -1082,6 +1082,28 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "search outputSchema should expose optional retrieval_shadow DTOs: {search_output_schema}"
     );
     assert!(
+        schema_property(search_output_schema, "code")["type"] == "string"
+            && schema_property(search_output_schema, "message")["type"] == "string",
+        "search outputSchema should also admit typed API errors returned as tool errors: {search_output_schema}"
+    );
+    assert!(
+        required_fields(search_output_schema).is_empty(),
+        "search outputSchema should not globally require success-only fields because tool errors reuse the same outputSchema: {search_output_schema}"
+    );
+    assert!(
+        search_output_schema["anyOf"]
+            .as_array()
+            .is_some_and(|any_of| {
+                any_of
+                    .iter()
+                    .any(|branch| required_fields(branch).contains("code"))
+                    && any_of
+                        .iter()
+                        .any(|branch| required_fields(branch).contains("query"))
+            }),
+        "search outputSchema should accept either search results or typed API errors: {search_output_schema}"
+    );
+    assert!(
         !required_fields(search_hit_schema).contains("match_quality"),
         "SearchHit.match_quality is optional and must not be required: {search_hit_schema}"
     );
