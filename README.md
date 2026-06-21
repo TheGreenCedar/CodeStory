@@ -170,13 +170,8 @@ packet/search setup and repair.
 
 ## Docs For Operators And Contributors
 
-- [docs/usage.md](docs/usage.md)
-- [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md)
-- [docs/architecture/overview.md](docs/architecture/overview.md)
-- [docs/architecture/language-support.md](docs/architecture/language-support.md)
-- [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
-- [docs/contributors/debugging.md](docs/contributors/debugging.md)
-- [docs/contributors/testing-matrix.md](docs/contributors/testing-matrix.md)
+Start with the [docs entry map](docs/README.md) to choose the right durable
+page for setup, repair, architecture, verification, or research evidence.
 
 ## License
 
