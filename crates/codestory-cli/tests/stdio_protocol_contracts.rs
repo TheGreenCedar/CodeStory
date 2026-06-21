@@ -716,6 +716,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             "context",
             "definition",
             "get_node",
+            "ground",
             "neighbors",
             "packet",
             "query_subgraph",
@@ -754,6 +755,15 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         search_description.contains("Discover candidate")
             && search_description.contains("packet before snippet/source reads"),
         "search description should label discovery before source proof reads: {search_description}"
+    );
+    let ground_description = tool_by_name(&tools, "ground")["description"]
+        .as_str()
+        .expect("ground description");
+    assert!(
+        ground_description.contains("compact repository map")
+            && ground_description.contains("before packet/search")
+            && ground_description.contains("codestory://grounding"),
+        "ground description should connect the tool to orientation and the grounding resource: {ground_description}"
     );
     let snippet_description = tool_by_name(&tools, "snippet")["description"]
         .as_str()
@@ -877,6 +887,18 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         schema_property(packet, "include_evidence").get("default"),
         Some(&json!(true)),
         "packet.include_evidence should document the stdio default: {packet}"
+    );
+
+    let ground = tool_input_schema(&tools, "ground");
+    assert_schema_enum_values(
+        ground,
+        "/properties/budget/enum",
+        &["strict", "balanced", "max"],
+    );
+    assert_eq!(
+        schema_property(ground, "budget").get("default"),
+        Some(&json!("balanced")),
+        "ground.budget should document the stdio default: {ground}"
     );
 
     for name in ["symbol", "definition", "references", "snippet"] {
@@ -1006,6 +1028,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     for name in [
         "context",
         "definition",
+        "ground",
         "packet",
         "references",
         "search",
@@ -1062,6 +1085,24 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 assert!(
                     required_fields(output_schema).contains(field),
                     "packet outputSchema should require {field}: {tool}"
+                );
+            }
+        }
+        if name == "ground" {
+            assert_eq!(
+                schema_property(output_schema, "root")["type"],
+                "string",
+                "ground outputSchema should expose the project root: {tool}"
+            );
+            assert_schema_enum_values(
+                output_schema,
+                "/properties/budget/enum",
+                &["strict", "balanced", "max"],
+            );
+            for field in ["stats", "coverage", "root_symbols", "files"] {
+                assert!(
+                    required_fields(output_schema).contains(field),
+                    "ground outputSchema should require grounding DTO field {field}: {tool}"
                 );
             }
         }
@@ -1236,6 +1277,7 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     for expected in [
+        "ground",
         "search",
         "symbol",
         "trail",
@@ -1310,6 +1352,82 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
             .iter()
             .any(|prompt| prompt["name"] == "explain_symbol"),
         "prompts/list should include explain_symbol: {prompts}"
+    );
+}
+
+#[test]
+fn ground_tool_returns_budgeted_grounding_snapshot() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-strict",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+
+    let snapshot = assert_tool_success(&response, json!("ground-strict"));
+    assert_eq!(
+        snapshot["budget"],
+        json!("strict"),
+        "ground tool should honor the requested grounding budget: {snapshot}"
+    );
+    assert!(
+        snapshot["root"]
+            .as_str()
+            .is_some_and(|root| !root.is_empty())
+            && snapshot
+                .pointer("/stats/node_count")
+                .and_then(Value::as_u64)
+                > Some(0)
+            && snapshot
+                .pointer("/coverage/represented_files")
+                .and_then(Value::as_u64)
+                > Some(0),
+        "ground tool should return a populated grounding snapshot: {snapshot}"
+    );
+
+    let default_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-default",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {}}
+        }),
+    );
+    let default_snapshot = assert_tool_success(&default_response, json!("ground-default"));
+    assert_eq!(
+        default_snapshot["budget"],
+        json!("balanced"),
+        "ground tool should default to the existing grounding resource budget: {default_snapshot}"
+    );
+
+    let bad_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-bad-budget",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "huge"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&bad_response, json!("ground-bad-budget"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("ground.budget")),
+        "ground tool should fail closed on unknown budgets: {bad_response}"
     );
 }
 
@@ -1562,7 +1680,14 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
     );
     let mut strings = Vec::new();
     string_values_recursive(&guide, &mut strings);
-    for expected in ["packet", "search", "definition", "snippet"] {
+    for expected in [
+        "ground",
+        "packet",
+        "search",
+        "context",
+        "definition",
+        "snippet",
+    ] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
             "agent guide should recommend {expected} in its call sequence: {guide}"
@@ -1581,6 +1706,16 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
     assert!(
         guide_text.contains("unsafe to claim") && guide_text.contains("follow_up_commands"),
         "agent guide should name unsafe-to-claim and follow-up states: {guide}"
+    );
+    assert!(
+        guide_text.contains("direct_source_reads")
+            && guide_text.contains("missing, stale, or degraded index/sidecar state"),
+        "agent guide should name the direct source-read fallback: {guide}"
+    );
+    assert!(
+        guide_text.contains("files, affected, cache identity, retrieval status")
+            && guide_text.contains("deferred"),
+        "agent guide should record deferred stdio surfaces: {guide}"
     );
     assert!(
         !guide_text.contains("repo-text hits as evidence"),

@@ -569,6 +569,7 @@ fn handle_stdio_tool_call(
     match name {
         "packet" => handle_stdio_packet(runtime, state, request),
         "search" => handle_stdio_search(runtime, state, request, query),
+        "ground" => handle_stdio_ground(runtime, request),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
         "get_node" => handle_stdio_get_node(runtime, request),
@@ -582,6 +583,18 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
+}
+
+fn handle_stdio_ground(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+    let budget = match stdio_grounding_budget(request) {
+        Ok(budget) => budget,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    runtime
+        .grounding
+        .grounding_snapshot(budget)
+        .map(|snapshot| serde_json::json!({"result": snapshot}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
 
 fn handle_stdio_packet(
@@ -868,6 +881,19 @@ fn stdio_path_fingerprint(path: &std::path::Path) -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     format!("len:{}:mtime_ms:{}", metadata.len(), modified_ms)
+}
+
+fn stdio_grounding_budget(request: &serde_json::Value) -> Result<GroundingBudgetDto> {
+    match request
+        .pointer("/params/arguments/budget")
+        .and_then(|value| value.as_str())
+        .unwrap_or("balanced")
+    {
+        "strict" => Ok(GroundingBudgetDto::Strict),
+        "balanced" => Ok(GroundingBudgetDto::Balanced),
+        "max" => Ok(GroundingBudgetDto::Max),
+        value => bail!("ground.budget must be one of strict, balanced, or max; got {value}"),
+    }
 }
 
 fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDto> {
@@ -1709,6 +1735,13 @@ fn stdio_status_recommended_next_calls(
         },
         {
             "method": "tools/call",
+            "tool": "ground",
+            "arguments": {
+                "budget": "balanced"
+            }
+        },
+        {
+            "method": "tools/call",
             "tool": "packet",
             "arguments": {
                 "question": "<broad-task-question>",
@@ -1747,6 +1780,13 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             },
             {
                 "method": "tools/call",
+                "tool": "ground",
+                "arguments": {
+                    "budget": "balanced"
+                }
+            },
+            {
+                "method": "tools/call",
                 "tool": "packet",
                 "arguments": {
                     "question": "<broad-task-question>",
@@ -1759,6 +1799,13 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                 "arguments": {
                     "query": "<symbol-or-task>",
                     "limit": 10
+                }
+            },
+            {
+                "method": "tools/call",
+                "tool": "context",
+                "arguments": {
+                    "id": "<best-node-id>"
                 }
             },
             {
@@ -1781,8 +1828,41 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                 "uri": "codestory://trail/<best-node-id>"
             }
         ],
+        "surface_decisions": [
+            {
+                "surface": "ground",
+                "kind": "tool and codestory://grounding resource",
+                "when": "Use after status for compact repo orientation before planning, packet, search, or source reads."
+            },
+            {
+                "surface": "packet",
+                "kind": "tool",
+                "when": "Use for broad structural questions only when packet/search readiness is ready and strict retrieval is full."
+            },
+            {
+                "surface": "search",
+                "kind": "tool",
+                "when": "Use for bounded candidate discovery after readiness allows packet/search."
+            },
+            {
+                "surface": "context",
+                "kind": "tool",
+                "when": "Use after selecting one concrete target for proof-bearing source/graph evidence."
+            },
+            {
+                "surface": "direct_source_reads",
+                "kind": "fallback",
+                "when": "Use when status reports missing, stale, or degraded index/sidecar state."
+            },
+            {
+                "surface": "files, affected, cache identity, retrieval status",
+                "kind": "deferred",
+                "when": "Use CLI or resources until these receive explicit read-only stdio contracts."
+            }
+        ],
         "safety_notes": [
             "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
+            "Use ground for compact repository orientation after status.",
             "Use packet for broad task questions before snippet/source reads; use context only after selecting one concrete target.",
             "Treat packet status other than sufficient as unsafe to claim until gaps, open_next, and follow_up_commands are resolved.",
             "Use continuation links from search or definition results before broadening retrieval.",
