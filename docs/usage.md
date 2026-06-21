@@ -1,23 +1,25 @@
 # CodeStory Usage
 
-Start with the operator task, then run the smallest command path that proves the
-state you need.
+Start with the human task, then run the smallest path that proves the state you
+need. The plugin is the normal path. The CLI is for setup, repair, debugging,
+and transcripts.
 
-| Task | Use | Done when |
-| --- | --- | --- |
-| Install and first grounding | Plugin install, then `doctor`, `index`, `ground` | Local navigation reports ready and the first grounding names files/gaps. |
-| Navigate locally | `ground`, `files`, `symbol`, `trail`, `snippet`, `context --id`, `affected` | Output cites concrete files, symbols, snippets, or node ids. |
-| Ask a broad packet/search question | `packet` or `search` | Retrieval reports `retrieval_mode=full`. |
-| Fix stale local cache | `doctor`, `index --refresh full`, `doctor` | The refreshed cache is healthy before you trust local output. |
-| Repair sidecars | `retrieval bootstrap`, `retrieval index`, `retrieval status` | `agent_packet_search` is ready and `retrieval_mode=full`. |
-| Verify a docs or code change | The narrow repo check for the changed surface | Verification output matches the claim you plan to make. |
+## Operator Journey
+
+| Stage | Human action | Agent/CLI action | Trust check |
+| --- | --- | --- | --- |
+| Install | Install the `codestory` plugin from `TheGreenCedar`. | Plugin starts `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
+| First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | `local_navigation` is ready before using local graph output. |
+| Source work | Ask for a plan, review, or code path. | Use `files`, `symbol`, `trail`, `snippet`, `context`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
+| Broad discovery | Ask a repo-wide question. | Use `packet` or `search`. | Trust only when `agent_packet_search` is ready and `retrieval_mode=full`. |
+| Repair | Ask for a transcript or run CLI directly. | Use `doctor`, `index`, `retrieval status`, and sidecar repair commands. | Repeat readiness checks after repair. |
 
 Packet/search output from degraded retrieval, missing sidecars, stale manifests,
 or any non-`full` retrieval mode is navigation help only. It is not proof.
 
 Most humans should start from the plugin flow in
 [README - Use It With An Agent](../README.md#use-it-with-an-agent). Use the CLI
-when you need a direct setup, repair, or debug transcript.
+when you need the exact setup, repair, or debug record.
 
 Shell examples below are POSIX unless noted. On Windows PowerShell, use
 `.\target\release\codestory-cli.exe` for a source-built binary and set
@@ -55,15 +57,14 @@ explicit ref, setup fetches and builds the remote default branch.
 
 ## Readiness Lanes
 
-Keep the lanes separate when judging output:
-
-| | Local navigation | Agent packet/search |
+| Question | Local navigation | Agent packet/search |
 | --- | --- | --- |
 | Lane id | `local_navigation` | `agent_packet_search` |
 | Built by | `index` | `index`, then `retrieval index` |
 | Requires | Healthy SQLite cache and graph | Healthy sidecars and `retrieval_mode=full` |
+| Good for | Known files, symbols, trails, snippets, changed-file impact | Broad candidate discovery and bounded task packets |
 | Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `context --id`, `affected` | `packet`, `search`, broad `context --query` discovery |
-| Does not prove | Sidecar readiness | That cache-only browsing is enough for broad agent search |
+| Does not prove | Broad sidecar search is ready | That cache-only browsing is enough for broad agent search |
 
 Sidecar topology:
 [architecture/overview.md](architecture/overview.md),

@@ -5,9 +5,9 @@ description: Use when an agent should ground a local repository with CodeStory b
 
 # CodeStory Grounding
 
-Use CodeStory as the agent's local grounding surface. Prefer the MCP server when
-the plugin is installed and healthy; use the CLI for setup, repair, explicit
-transcripts, or when MCP is unavailable.
+Use CodeStory to keep source claims tied to the current local repository. Prefer
+the plugin MCP server when it is installed and healthy. Use the CLI for setup,
+repair, explicit transcripts, or when MCP is unavailable.
 
 The target is always a repository workspace. The CodeStory checkout is only the
 tool source unless the user is editing CodeStory itself.
@@ -37,9 +37,7 @@ tool source unless the user is editing CodeStory itself.
    - macOS x64 or missing asset: Source fallback. Build from source.
 5. Put the binary in a stable user bin directory, verify
    `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
-   same release when the host has the tools. If `PATH` changed, say that the
-   plugin MCP process may need a Codex host/app restart before a new agent thread
-   can see it.
+   same release when the host has the tools. If `PATH` changed, say the plugin MCP process may need a Codex host/app restart before a new agent thread can see it.
 6. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 
@@ -71,11 +69,12 @@ When MCP is unavailable or a transcript is needed, use the CLI directly:
 2. `index --project <target-workspace> --refresh full` for a first index;
    `--refresh incremental` for normal repair.
 3. `ground --project <target-workspace> --why` for compact orientation.
-4. `search --project <target-workspace> --query ... --why` for candidate
-   discovery after sidecars are full.
+4. `files --project <target-workspace>` for indexed file inventory.
 5. `context`, `symbol`, `trail --story --hide-speculative`, `snippet`, `files`,
    and `affected` for concrete source-backed follow-up.
-6. `packet --project <target-workspace> --question ...` for broad answers only
+6. `search --project <target-workspace> --query ... --why` for candidate
+   discovery after sidecars are full.
+7. `packet --project <target-workspace> --question ...` for broad answers only
    when packet/search readiness is full.
 
 Always pass `--project <target-workspace>` explicitly.
@@ -83,12 +82,14 @@ Always pass `--project <target-workspace>` explicitly.
 ## Evidence Rules
 
 - Treat CodeStory output as evidence, not omniscience.
+- Preserve cited file, symbol, trail, and snippet anchors in user-facing claims.
 - When `packet` reports `sufficient` and has no `follow_up_commands`, answer
-  from the packet and preserve its cited file/symbol anchors.
+  from the packet and preserve its cited anchors.
 - When `packet` reports `partial`, run the named follow-up commands before
   making proof claims.
 - Treat repo-text hits, semantic suggestions, fallback retrieval, stale caches,
-  and missing sidecar manifests as navigation hints only.
+  missing sidecar manifests, and any non-`full` retrieval mode as navigation
+  hints only.
 - `retrieval_mode=full` means graph and lexical sidecars are complete, generated
   symbol docs/component reports are current, and dense anchors are valid for the
   selected corpus. Anything weaker is not product packet/search proof.
@@ -98,15 +99,17 @@ Always pass `--project <target-workspace>` explicitly.
 
 ## Command Routing
 
-- Setup and health: `setup embeddings`, `doctor`, `ready`, `index`, `cache`.
-- Agent orientation: MCP `ground` / `codestory://grounding` or CLI `ground`.
-- Broad task packet: MCP/CLI `packet`.
-- Candidate discovery: MCP/CLI `search --why`.
-- Focused source view: `symbol`, `trail`, `snippet`, `context`, `explore`.
-- Coverage and impact: MCP/CLI `files`, `affected`.
-- Reusable targets: `bookmark`.
-- Structured evaluation: `drill`, `drill-suite`.
-- Local integration surface: `serve --stdio`.
+| Need | Route |
+| --- | --- |
+| Setup and health | `setup embeddings`, `doctor`, `ready`, `index`, `cache` |
+| Agent orientation | MCP `ground` / `codestory://grounding` or CLI `ground` |
+| Broad task packet | MCP/CLI `packet` |
+| Candidate discovery | MCP/CLI `search --why` |
+| Focused source view | `symbol`, `trail`, `snippet`, `context`, `explore` |
+| Coverage and impact | MCP/CLI `files`, `affected` |
+| Reusable targets | `bookmark` |
+| Structured evaluation | `drill`, `drill-suite` |
+| Local integration surface | `serve --stdio` |
 
 Load the matching reference only when detailed flags, examples, or
 troubleshooting rules are needed:
