@@ -3,17 +3,22 @@
 Setup, workflows, sidecars, recovery. Shell examples are POSIX unless noted.
 Windows: `.\target\release\codestory-cli.exe`, `$env:NAME = "value"`.
 
-## Install The Skill
+## Install The Plugin
 
-Install the grounding skill once, then point it at explicit target workspaces.
-See [README - Install as an agent skill](../README.md#install-as-an-agent-skill)
-for the full copy/setup commands and Windows PowerShell variant.
+Install the CodeStory plugin once, then point the agent at explicit target
+workspaces. See [README - Install as an agent plugin](../README.md#install-as-an-agent-plugin)
+and [the plugin README](../plugins/codestory/README.md) for the agent-first
+install and binary setup flow.
 
-The source skill package lives at
-[../.agents/skills/codestory-grounding/SKILL.md](../.agents/skills/codestory-grounding/SKILL.md).
-If you need a different source artifact, set `CODESTORY_REPO_URL` and
-`CODESTORY_REPO_REF` before running setup. Without an explicit ref, installed
-setup fetches and builds the remote default branch.
+The canonical skill package lives at
+[../plugins/codestory/skills/codestory-grounding/SKILL.md](../plugins/codestory/skills/codestory-grounding/SKILL.md).
+If you use its source-build setup fallback and need a different source artifact,
+set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` before running setup. Without
+an explicit ref, setup fetches and builds the remote default branch.
+
+For humans and repair lanes, use the CLI directly. The CLI tells you whether
+local navigation or packet/search is ready; do not infer readiness from a
+successful command that reports degraded state.
 
 ## Use From Source
 

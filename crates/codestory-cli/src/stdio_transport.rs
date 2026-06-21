@@ -32,9 +32,10 @@ use crate::stdio_catalog::{
 use crate::{
     build_ambiguous_target_error_output, build_query_resolution_output, build_search_hit_output,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
+const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Run the stdio server until stdin closes.
 ///
@@ -72,6 +73,14 @@ pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
 struct StdioServerState {
     packet_cache: StdioPacketCache,
     search_cache: StdioSearchFragmentCache,
+    status_cache: Option<StdioStatusCacheEntry>,
+}
+
+#[derive(Clone)]
+struct StdioStatusCacheEntry {
+    key: String,
+    value: serde_json::Value,
+    cached_at: Instant,
 }
 
 fn handle_stdio_message(
@@ -144,7 +153,7 @@ fn handle_stdio_message(
                     "Invalid params: missing resource uri",
                 ));
             };
-            read_stdio_resource(runtime, uri)
+            read_stdio_resource(runtime, state, uri)
         }
         "tools/call" => {
             let Some(name) = request
@@ -569,6 +578,7 @@ fn handle_stdio_tool_call(
     match name {
         "packet" => handle_stdio_packet(runtime, state, request),
         "search" => handle_stdio_search(runtime, state, request, query),
+        "ground" => handle_stdio_ground(runtime, request),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
         "get_node" => handle_stdio_get_node(runtime, request),
@@ -582,6 +592,18 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
+}
+
+fn handle_stdio_ground(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+    let budget = match stdio_grounding_budget(request) {
+        Ok(budget) => budget,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    runtime
+        .grounding
+        .grounding_snapshot(budget)
+        .map(|snapshot| serde_json::json!({"result": snapshot}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
 
 fn handle_stdio_packet(
@@ -868,6 +890,19 @@ fn stdio_path_fingerprint(path: &std::path::Path) -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     format!("len:{}:mtime_ms:{}", metadata.len(), modified_ms)
+}
+
+fn stdio_grounding_budget(request: &serde_json::Value) -> Result<GroundingBudgetDto> {
+    match request
+        .pointer("/params/arguments/budget")
+        .and_then(|value| value.as_str())
+        .unwrap_or("balanced")
+    {
+        "strict" => Ok(GroundingBudgetDto::Strict),
+        "balanced" => Ok(GroundingBudgetDto::Balanced),
+        "max" => Ok(GroundingBudgetDto::Max),
+        value => bail!("ground.budget must be one of strict, balanced, or max; got {value}"),
+    }
 }
 
 fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDto> {
@@ -1578,9 +1613,13 @@ fn stdio_legacy_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> 
     serde_json::json!(error.to_string())
 }
 
-fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
+fn read_stdio_resource(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    uri: &str,
+) -> serde_json::Value {
     let result = match uri {
-        "codestory://status" => read_stdio_status_resource(runtime),
+        "codestory://status" => read_stdio_status_resource_cached(runtime, state),
         "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource()),
         "codestory://project" => runtime
             .open_project_summary()
@@ -1602,6 +1641,49 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
     result
         .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn read_stdio_status_resource_cached(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+) -> Result<serde_json::Value> {
+    let key = stdio_status_cache_key(runtime);
+    if let Some(cached) = state.status_cache.as_ref()
+        && cached.key == key
+        && cached.cached_at.elapsed() < STDIO_STATUS_CACHE_TTL
+    {
+        return Ok(cached.value.clone());
+    }
+
+    let value = read_stdio_status_resource(runtime)?;
+    // ponytail: short stdio snapshot cache; storage/sidecar fingerprints bust it when runtime state changes.
+    state.status_cache = Some(StdioStatusCacheEntry {
+        key,
+        value: value.clone(),
+        cached_at: Instant::now(),
+    });
+    Ok(value)
+}
+
+fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
+    let layout = SidecarLayout::from_env();
+    [
+        format!("project:{}", runtime.project_root.display()),
+        format!("storage:{}", runtime.storage_path.display()),
+        format!(
+            "storage_state:{}",
+            stdio_storage_fingerprint(&runtime.storage_path)
+        ),
+        format!(
+            "sidecar_state:{}",
+            stdio_path_fingerprint(&layout.state_file)
+        ),
+        format!(
+            "active_embedding_backend:{}",
+            codestory_retrieval::embedding_runtime_id()
+        ),
+    ]
+    .join("|")
 }
 
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
@@ -1709,6 +1791,13 @@ fn stdio_status_recommended_next_calls(
         },
         {
             "method": "tools/call",
+            "tool": "ground",
+            "arguments": {
+                "budget": "balanced"
+            }
+        },
+        {
+            "method": "tools/call",
             "tool": "packet",
             "arguments": {
                 "question": "<broad-task-question>",
@@ -1747,6 +1836,13 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             },
             {
                 "method": "tools/call",
+                "tool": "ground",
+                "arguments": {
+                    "budget": "balanced"
+                }
+            },
+            {
+                "method": "tools/call",
                 "tool": "packet",
                 "arguments": {
                     "question": "<broad-task-question>",
@@ -1759,6 +1855,13 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                 "arguments": {
                     "query": "<symbol-or-task>",
                     "limit": 10
+                }
+            },
+            {
+                "method": "tools/call",
+                "tool": "context",
+                "arguments": {
+                    "id": "<best-node-id>"
                 }
             },
             {
@@ -1781,8 +1884,41 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                 "uri": "codestory://trail/<best-node-id>"
             }
         ],
+        "surface_decisions": [
+            {
+                "surface": "ground",
+                "kind": "tool and codestory://grounding resource",
+                "when": "Use after status for compact repo orientation before planning, packet, search, or source reads."
+            },
+            {
+                "surface": "packet",
+                "kind": "tool",
+                "when": "Use for broad structural questions only when packet/search readiness is ready and strict retrieval is full."
+            },
+            {
+                "surface": "search",
+                "kind": "tool",
+                "when": "Use for bounded candidate discovery after readiness allows packet/search."
+            },
+            {
+                "surface": "context",
+                "kind": "tool",
+                "when": "Use after selecting one concrete target for proof-bearing source/graph evidence."
+            },
+            {
+                "surface": "direct_source_reads",
+                "kind": "fallback",
+                "when": "Use when status reports missing, stale, or degraded index/sidecar state."
+            },
+            {
+                "surface": "files, affected, cache identity, retrieval status",
+                "kind": "deferred",
+                "when": "Use CLI or resources until these receive explicit read-only stdio contracts."
+            }
+        ],
         "safety_notes": [
             "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
+            "Use ground for compact repository orientation after status.",
             "Use packet for broad task questions before snippet/source reads; use context only after selecting one concrete target.",
             "Treat packet status other than sufficient as unsafe to claim until gaps, open_next, and follow_up_commands are resolved.",
             "Use continuation links from search or definition results before broadening retrieval.",
