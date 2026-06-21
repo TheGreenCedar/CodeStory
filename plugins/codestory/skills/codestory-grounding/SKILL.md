@@ -48,11 +48,13 @@ When the plugin MCP server is available:
 1. Read `codestory://status`.
 2. Read `codestory://agent-guide`.
 3. Read `codestory://grounding` or call `ground` for a compact repo map before planning.
-4. Use `packet` for broad repo questions only when status says
+4. Use `files` when you need indexed file inventory, language coverage, or
+   role counts from the existing cache.
+5. Use `packet` for broad repo questions only when status says
    `agent_packet_search` is ready and strict sidecar status reports
    `retrieval_mode=full`.
-5. Use `search` to discover candidates only when packet/search is ready.
-6. Use `symbol`, `trail`, `references`, `snippet`, and `context` after selecting
+6. Use `search` to discover candidates only when packet/search is ready.
+7. Use `symbol`, `trail`, `references`, `snippet`, and `context` after selecting
    a concrete target.
 
 If status is degraded, fall back to direct source reads or CLI local-navigation
