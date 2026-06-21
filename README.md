@@ -10,14 +10,18 @@ readiness checks the human operator can inspect.
 <a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
 </p>
 
-CodeStory is for a human who is about to let a coding agent work in a real
-repository.
+Coding agents are very good at sounding certain before they have grounded the
+repo in front of them. That is backwards. Before an operator asks for a plan,
+review, or edit, the agent needs current local context it can cite and the
+human can inspect.
 
-Its promise is narrow on purpose: the agent should begin from current local
-source evidence, cite the files and trails behind its claims, and tell you when
-broad packet/search evidence is not ready enough to trust.
+CodeStory gives the agent a read-only local MCP/CLI grounding surface: files,
+symbols, snippets, trails, packet/search, and readiness gates over the current
+checkout. The result is not magic. It is better plumbing: the agent starts from
+local evidence, knows when packet/search is trustworthy, and leaves claims a
+reviewer can follow back to source.
 
-Use CodeStory when the next agent answer needs to survive review:
+Use it when the next agent answer needs to survive review:
 
 - What is in this repo?
 - Which files changed, and what else might be affected?
@@ -26,7 +30,26 @@ Use CodeStory when the next agent answer needs to survive review:
 - Is broad packet/search ready enough to use as evidence?
 
 CodeStory does not replace source review, tests, or human judgment. It changes
-the starting point: local cited evidence first, confident-sounding guesses last.
+the starting point: local cited evidence first, confident guesses last.
+
+## Proof Before Trust
+
+These are documented regression and protocol numbers, not marketing claims.
+They do not prove token savings, answer quality, public benchmark promotion, or
+generalization.
+
+| What the repo evidence says | Number | Source | Trust boundary |
+| --- | ---: | --- | --- |
+| Repo-scale full-sidecar stats row | `75.36s` index, including `49.45s` semantic phase | 2026-06-18 `d8d59e9e+wt` #41 hardening row in [codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md); summarized in [performance-review-playbook.md](docs/testing/performance-review-playbook.md#current-ops-gates) | Regression telemetry only; the row says the real drill was intentionally skipped. |
+| Retrieval sidecar readiness on that row | `retrieval_mode full`, `4.34s` retrieval index, `0.39s` retrieval status | Same 2026-06-18 #41 hardening row and playbook snapshot | `retrieval_mode=full` proves infrastructure readiness for packet/search, not answer quality. |
+| Repeat full refresh cache reuse | `29.45s` repeat refresh with `750` reused and `0` embedded | Same 2026-06-18 #41 hardening row and playbook snapshot | Useful cache/reuse signal; not a quality or generalization result. |
+| Agent stdio loop smoke | `20` reps, `53.50ms` warm loop, protocol stdout-only | Small-fixture release-binary row in [codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md) | Protocol/read-surface smoke; not repo-scale packet/search proof. |
+
+The stricter rule is deliberate: local navigation readiness is useful, but broad
+packet/search claims require `agent_packet_search` ready and `retrieval_mode=full`.
+Even that is infrastructure readiness; public answer-quality claims need the
+separate packet-runtime or drill evidence described in
+[retrieval-architecture.md](docs/testing/retrieval-architecture.md).
 
 ## The Trust Loop
 
