@@ -180,7 +180,7 @@ fn cli_subsystem_doc_does_not_own_command_option_matrices() {
     assert!(
         cli_doc.contains("## Command Reference Ownership")
             && cli_doc.contains("crates/codestory-cli/src/args.rs")
-            && cli_doc.contains(".agents/skills/codestory-grounding/references/*.md"),
+            && cli_doc.contains("plugins/codestory/skills/codestory-grounding/references/*.md"),
         "CLI subsystem doc should route option semantics to CLI help and skill refs"
     );
     for forbidden in [

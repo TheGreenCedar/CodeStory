@@ -16,6 +16,10 @@ If you use its source-build setup fallback and need a different source artifact,
 set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` before running setup. Without
 an explicit ref, setup fetches and builds the remote default branch.
 
+For humans and repair lanes, use the CLI directly. The CLI tells you whether
+local navigation or packet/search is ready; do not infer readiness from a
+successful command that reports degraded state.
+
 ## Use From Source
 
 Use this path when you are changing CodeStory itself or testing the current
