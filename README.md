@@ -52,6 +52,8 @@ For agent use, install the CodeStory plugin package and keep
 [plugins/codestory/skills/codestory-grounding/SKILL.md](plugins/codestory/skills/codestory-grounding/SKILL.md).
 That skill tells the agent to read readiness first, use packet/search only when
 sidecars are ready, and fall back to direct source reads when they are not.
+If the binary is missing or outdated, the skill tells the agent to resolve the
+latest GitHub release for the host before falling back to a source build.
 
 For operator or repair work from this checkout:
 
@@ -126,14 +128,20 @@ external catalog first:
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
+The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
+This repository remains the plugin source. The catalog can list many plugins,
+and the CodeStory entry points at `plugins/codestory` in this repo.
+
 Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
 workspace plugin settings are managed from the Codex Apps/Plugins UI rather
 than the terminal, so use the UI path when the CLI marketplace command is
 unavailable.
 
-Start a new Codex thread after installation or refresh. Ask `@CodeStory` to
-check local-navigation and packet/search readiness, then ground the repo before
-planning or editing.
+Start a new Codex thread after installation or refresh. A good first prompt is:
+
+```text
+@CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
+```
 
 The canonical skill ships inside this repository's plugin package at
 [`plugins/codestory/skills/codestory-grounding/SKILL.md`](plugins/codestory/skills/codestory-grounding/SKILL.md).
