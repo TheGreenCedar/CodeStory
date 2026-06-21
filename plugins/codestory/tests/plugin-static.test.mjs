@@ -45,9 +45,12 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
   ];
   const forbidden = [
     "release-bound to " + "CodeStory `v" + "0.11.1`",
-    "codestory-cli-v" + "0.11.1",
     "use that version " + "unless",
     "Install plugin entry `codestory` from the external marketplace catalog:",
+  ];
+  const forbiddenPatterns = [
+    /\bcodestory-cli-v\d+\.\d+\.\d+/,
+    /release-bound to CodeStory `v\d+\.\d+\.\d+`/,
   ];
   const readmeRequired = [
     "The human job is simple",
@@ -57,7 +60,7 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "For normal Codex use, install the plugin through the Codex plugin flow for your",
     "/plugins",
     "TheGreenCedar -> codestory -> Install plugin",
-    "If the catalog is not listed",
+    "If the `TheGreenCedar` catalog is not listed",
     "codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace",
     "The marketplace source is `TheGreenCedar/AgentPluginMarketplace`",
     "This repository remains the plugin source",
@@ -69,6 +72,10 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "check whether this repository is ready for local navigation and packet/search",
     "Source docs, marketplace source checkout/cache, and the active installed MCP",
     "active runtime surface",
+    "For normal Codex use, refresh or uninstall the plugin from the Codex plugin",
+    "codex plugin marketplace upgrade TheGreenCedar",
+    "codex plugin marketplace remove TheGreenCedar",
+    "commands only for source registration",
     "The plugin does not bundle the binary",
     "TheGreenCedar/AgentPluginMarketplace",
     "Catalog name",
@@ -92,6 +99,9 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     }
     for (const phrase of forbidden) {
       assert.equal(text.includes(phrase), false, phrase);
+    }
+    for (const pattern of forbiddenPatterns) {
+      assert.equal(pattern.test(text), false, String(pattern));
     }
   }
   for (const phrase of readmeRequired) {

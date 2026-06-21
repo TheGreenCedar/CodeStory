@@ -108,7 +108,8 @@ sidecar setup and repair.
 
 ## Install As An Agent Plugin
 
-For normal Codex use, open Codex in the repo you want to ground, then use:
+For normal Codex use, install the plugin through the Codex plugin flow for your
+workspace. Open Codex in the repo you want to ground, then use:
 
 ```text
 /plugins
@@ -120,7 +121,7 @@ Choose:
 TheGreenCedar -> codestory -> Install plugin
 ```
 
-If the `TheGreenCedar` catalog is not listed and your Codex build supports
+If the `TheGreenCedar` catalog is not listed and your Codex build exposes
 terminal marketplace management for source marketplaces, add or refresh the
 external catalog first:
 
@@ -129,8 +130,7 @@ codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
 The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
-This repository remains the plugin source. The catalog can list many plugins,
-and the CodeStory entry points at `plugins/codestory` in this repo.
+This repository remains the plugin source.
 
 Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
 workspace plugin settings are managed from the Codex Apps/Plugins UI rather

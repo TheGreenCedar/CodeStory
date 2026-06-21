@@ -57,9 +57,9 @@ improvement.
 | Cross-platform plugin readiness | Plugin README, skill guidance, and static tests now cover Windows, macOS, and Linux install/readiness paths without adding an adapter runtime or changing Rust product behavior. | PR #269 |
 | Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this release. | PR #260 |
 
-Binary release assets are packaging evidence only. The plugin docs and installer
-defaults keep current archive names release-bound to `v0.11.1`; the marketplace
-catalog remains outside this repository.
+Binary release assets are packaging evidence only. In this release, the plugin
+docs and installer defaults kept archive names release-bound to `v0.11.1`; the
+marketplace catalog remains outside this repository.
 
 ## 0.11.0
 

@@ -52,19 +52,16 @@ Choose:
 TheGreenCedar -> codestory -> Install plugin
 ```
 
-Use the equivalent marketplace display wording if your Codex build shows a
-longer human name for the `TheGreenCedar` catalog. If the catalog is not listed
-and your Codex build exposes terminal marketplace management for source
-marketplaces, add or refresh the external catalog first:
+If the `TheGreenCedar` catalog is not listed and your Codex build exposes
+terminal marketplace management for source marketplaces, add or refresh the
+external catalog first:
 
 ```bash
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
 The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
-This repository remains the plugin source. One marketplace can list multiple plugins.
-CodeStory's entry points at `https://github.com/TheGreenCedar/CodeStory.git`
-with source path `plugins/codestory`.
+This repository remains the plugin source.
 
 Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
 workspace plugin settings are managed from the Codex Apps/Plugins UI rather
@@ -74,19 +71,6 @@ unavailable.
 Start a new Codex thread after installation or refresh. The installed package
 launches `codestory-cli serve --stdio --refresh none` directly.
 
-### Marketplace maintainer details
-
-The marketplace catalog is external:
-
-| Field | Value |
-| --- | --- |
-| Catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
-| Catalog name | `TheGreenCedar` |
-| Plugin entry | `codestory` |
-| Source kind | `git-subdir` |
-| Source repo | `https://github.com/TheGreenCedar/CodeStory.git` |
-| Source path | `plugins/codestory` |
-
 ### After install
 
 Open Codex in the repo you want to ground and ask the agent to check readiness
@@ -95,40 +79,6 @@ before planning or editing:
 ```text
 @CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
 ```
-
-### Runtime latest-release fallback
-
-The plugin does not bundle the binary. The agent should run
-`codestory-cli --version` first. If `codestory-cli` is missing or outdated
-against the latest GitHub release, resolve the latest release, download and
-unpack the matching host asset, verify it when practical, place it in a stable
-user bin directory, and re-check `codestory-cli --version`. If the host `PATH`
-changes, start a new agent thread so the MCP process can see the binary.
-
-For latest tag `vX.Y.Z`, choose the host asset derived from that tag:
-
-| Host OS | Binary setup |
-| --- | --- |
-| Windows x64 | Download `codestory-cli-vX.Y.Z-windows-x64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
-| Windows arm64 | Download `codestory-cli-vX.Y.Z-windows-arm64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
-| macOS arm64 | Download `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-| macOS x64 | Use the source fallback until a matching release asset exists. |
-| Linux x64 | Download `codestory-cli-vX.Y.Z-linux-x64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-| Linux arm64 | Download `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-
-Verify downloaded archives against `SHA256SUMS.txt` from the release when the
-host has the tools to do it. Source fallback for any OS:
-
-```sh
-cargo build --release -p codestory-cli
-```
-
-Then put `target/release` on the agent host `PATH`, or set `CODESTORY_CLI` for
-manual CLI fallback commands.
-
-Source docs, marketplace source checkout/cache, and the active installed MCP
-runtime can differ. Before claiming an installed behavior is live, verify the
-active runtime surface in the target Codex thread.
 
 ## What To Ask
 
@@ -169,6 +119,78 @@ codestory-cli retrieval status --project <repo> --format json
 Do not treat `ground`, `symbol`, `trail`, or `snippet` readiness as proof that
 agent packet/search is ready. That mistake is how agents write confident
 nonsense with a straight face.
+
+### Runtime latest-release fallback
+
+The plugin does not bundle the binary. The agent should run
+`codestory-cli --version` first. If `codestory-cli` is missing or outdated
+against the latest GitHub release, resolve the latest release, download and
+unpack the matching host asset, verify it when practical, place it in a stable
+user bin directory, and re-check `codestory-cli --version`. If the host `PATH`
+changes, start a new agent thread so the MCP process can see the binary.
+
+For latest tag `vX.Y.Z`, choose the host asset derived from that tag:
+
+| Host OS | Binary setup |
+| --- | --- |
+| Windows x64 | Download `codestory-cli-vX.Y.Z-windows-x64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
+| Windows arm64 | Download `codestory-cli-vX.Y.Z-windows-arm64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
+| macOS arm64 | Download `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
+| macOS x64 | Use the source fallback until a matching release asset exists. |
+| Linux x64 | Download `codestory-cli-vX.Y.Z-linux-x64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
+| Linux arm64 | Download `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
+
+Verify downloaded archives against `SHA256SUMS.txt` from the release when the
+host has the tools to do it. Source fallback for any OS:
+
+```sh
+cargo build --release -p codestory-cli
+```
+
+Then put `target/release` on the agent host `PATH`, or set `CODESTORY_CLI` for
+manual CLI fallback commands.
+
+Source docs, marketplace source checkout/cache, and the active installed MCP
+runtime can differ. Before claiming an installed behavior is live, verify the
+active runtime surface in the target Codex thread.
+
+## Update Or Remove
+
+For normal Codex use, refresh or uninstall the plugin from the Codex plugin
+surface:
+
+```text
+/plugins
+```
+
+Then choose the installed `codestory` plugin and use the available refresh or
+uninstall action.
+
+If your Codex build exposes terminal marketplace management for source
+marketplaces, these commands may be available:
+
+```bash
+codex plugin marketplace upgrade TheGreenCedar
+codex plugin marketplace remove TheGreenCedar
+```
+
+`marketplace remove` removes the source marketplace registration. It may not
+uninstall an already installed workspace plugin. Prefer the plugin UI for
+installed-plugin refresh/uninstall actions, and use terminal marketplace
+commands only for source registration when your Codex build supports them.
+
+### Marketplace maintainer details
+
+The marketplace catalog is external. One marketplace can list multiple plugins.
+
+| Field | Value |
+| --- | --- |
+| Catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
+| Catalog name | `TheGreenCedar` |
+| Plugin entry | `codestory` |
+| Source kind | `git-subdir` |
+| Source repo | `https://github.com/TheGreenCedar/CodeStory.git` |
+| Source path | `plugins/codestory` |
 
 ## Review Checks
 
