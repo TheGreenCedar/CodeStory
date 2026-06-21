@@ -172,12 +172,70 @@ function Find-ExistingCli {
 }
 
 function Test-WindowsX64 {
-    $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    $hostIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
         [System.Runtime.InteropServices.OSPlatform]::Windows
     )
     $isX64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq `
         [System.Runtime.InteropServices.Architecture]::X64
-    return ($isWindows -and $isX64)
+    return ($hostIsWindows -and $isX64)
+}
+
+function Normalize-PathListEntry {
+    param([string]$Value)
+
+    if (-not $Value) {
+        return ""
+    }
+    return ($Value.Trim() -replace "[\\/]+$", "")
+}
+
+function Test-PathListContains {
+    param(
+        [string]$PathList,
+        [string]$Directory
+    )
+
+    $normalizedDirectory = Normalize-PathListEntry $Directory
+    foreach ($entry in ($PathList -split ";")) {
+        if ((Normalize-PathListEntry $entry) -ieq $normalizedDirectory) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Ensure-InstallDirOnPath {
+    param(
+        [string]$InstallDirectory,
+        [string]$CliPath
+    )
+
+    $resolvedInstallDir = Resolve-Path -LiteralPath $InstallDirectory -ErrorAction SilentlyContinue
+    if (-not $resolvedInstallDir) {
+        return
+    }
+    $resolvedCli = Resolve-Path -LiteralPath $CliPath -ErrorAction SilentlyContinue
+    if (-not $resolvedCli) {
+        return
+    }
+    $installPath = $resolvedInstallDir.Path
+    $cliDir = Split-Path -Parent $resolvedCli.Path
+    if ((Normalize-PathListEntry $cliDir) -ine (Normalize-PathListEntry $installPath)) {
+        return
+    }
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not (Test-PathListContains $userPath $installPath)) {
+        $prefix = if ($userPath) { $userPath.TrimEnd(";") + ";" } else { "" }
+        [Environment]::SetEnvironmentVariable("Path", $prefix + $installPath, "User")
+        Write-Host "PATH updated for future Codex host processes: $installPath"
+    }
+
+    $processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+    if (-not (Test-PathListContains $processPath $installPath)) {
+        $prefix = if ($processPath) { $processPath.TrimEnd(";") + ";" } else { "" }
+        [Environment]::SetEnvironmentVariable("Path", $prefix + $installPath, "Process")
+    }
 }
 
 function Get-ExpectedHash {
@@ -393,6 +451,9 @@ function Assert-SelfTest {
 
 function Invoke-SelfTest {
     Set-RequiredVersion "v0.11.2"
+    Test-WindowsX64 | Out-Null
+    Assert-SelfTest (Test-PathListContains "C:\Tools;C:\CodeStory\bin\" "C:\CodeStory\bin") "path-list check should ignore trailing slash"
+    Assert-SelfTest (-not (Test-PathListContains "C:\Tools" "C:\CodeStory\bin")) "path-list check should reject missing directory"
     Assert-SelfTest ((Convert-ReleaseTagToVersion "v0.11.2") -eq "0.11.2") "release tag parser should strip v prefix"
     $parsedVersion = Convert-VersionText "codestory-cli 0.11.2"
     Assert-SelfTest (Test-RequiredVersion $parsedVersion) "version gate should accept current release"
@@ -506,6 +567,7 @@ if (-not $cliInfo) {
     }
     $cliInfo = Install-ReleaseCli $InstallDir $Version
 }
+Ensure-InstallDirOnPath $InstallDir $cliInfo.Path
 
 $projectPath = (Resolve-Path -LiteralPath $Project).Path
 $doctor = Invoke-DoctorJson $cliInfo.Path $projectPath

@@ -75,6 +75,7 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "downloads the latest matching release asset",
     "uses source fallback only when no release asset fits the host",
     "Agent runtime bootstrap",
+    "restart the Codex host/app before starting a new agent thread",
     "Source docs, marketplace source checkout/cache, and the active installed MCP",
     "active runtime surface",
     "For normal Codex use, refresh or uninstall the plugin from the Codex plugin",
@@ -93,6 +94,7 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
   const skillRequired = [
     "download and unpack only",
     "plugin MCP process may need",
+    "Codex host/app restart before a new agent thread",
     "new agent thread",
     "Read `codestory://grounding`",
     "Always pass `--project <target-workspace>` explicitly",
