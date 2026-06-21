@@ -66,6 +66,16 @@ On Windows PowerShell, use `.\target\release\codestory-cli.exe`, environment
 assignments such as `$env:TARGET_WORKSPACE = "C:\path\to\repo"`, and normal
 Windows paths.
 
+For a release-binary first Windows check, run:
+
+```powershell
+.\scripts\install-codestory.ps1 -Project C:\path\to\repo
+```
+
+The wrapper reuses `-CodestoryCli`, `CODESTORY_CLI`, or PATH before downloading
+the Windows x64 release asset. Its output separates executable install, local
+navigation readiness, and agent packet/search readiness.
+
 That path proves local navigation readiness. It does not prove sidecar readiness
 for `packet` or `search`.
 
