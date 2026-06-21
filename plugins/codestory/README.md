@@ -40,19 +40,46 @@ catalog lives in `TheGreenCedar/AgentPluginMarketplace` with catalog name
 
 ## Install For Agent Use
 
-Install plugin entry `codestory` from the external marketplace catalog:
+For normal Codex use, install the plugin through the Codex plugin flow for your
+workspace. Open Codex in the repo you want to ground, then use:
 
-| Field | Value |
-| --- | --- |
-| Catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
-| Catalog name | `TheGreenCedar` |
-| Plugin entry | `codestory` |
-| Source | `git-subdir` |
-| URL | `https://github.com/TheGreenCedar/CodeStory.git` |
-| Path | `plugins/codestory` |
+```text
+/plugins
+```
 
-Then make `codestory-cli` available on the same host that runs the agent and
-verify the MCP launch target is `codestory-cli serve --stdio --refresh none`.
+Choose:
+
+```text
+TheGreenCedar -> codestory -> Install plugin
+```
+
+Use the equivalent marketplace display wording if your Codex build shows a
+longer human name for the `TheGreenCedar` catalog.
+
+If your Codex build exposes terminal marketplace management for source
+marketplaces, add or refresh this marketplace first:
+
+```bash
+codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
+```
+
+Some workspace plugin settings are managed from the Codex Apps/Plugins UI rather
+than the terminal. Use the UI path when the CLI marketplace command is
+unavailable.
+
+Start a new Codex thread after installation or refresh. The installed package
+launches `codestory-cli serve --stdio --refresh none` directly.
+
+### After install
+
+Open Codex in the repo you want to ground and ask the agent to check readiness
+before planning or editing:
+
+```text
+@CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
+```
+
+### Runtime setup fallback
 
 The plugin does not bundle the binary. If `codestory-cli` is missing, the agent
 should resolve the latest GitHub release, download and unpack the matching host
@@ -82,6 +109,15 @@ cargo build --release -p codestory-cli
 
 Then put `target/release` on the agent host `PATH`, or set `CODESTORY_CLI` for
 manual CLI fallback commands.
+
+Source docs, marketplace source checkout/cache, and the active installed MCP
+runtime can differ. Before claiming an installed behavior is live, verify the
+active runtime surface in the target Codex thread.
+
+Source details for marketplace maintainers: the external catalog is
+`TheGreenCedar/AgentPluginMarketplace`; the catalog name is `TheGreenCedar`; the
+plugin entry is `codestory`; the source is `git-subdir` at
+`https://github.com/TheGreenCedar/CodeStory.git`, path `plugins/codestory`.
 
 ## What To Ask
 

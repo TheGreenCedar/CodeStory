@@ -97,11 +97,25 @@ setup and repair.
 
 ## Install As An Agent Plugin
 
-Install `codestory` from the external `TheGreenCedar` marketplace catalog in
-`TheGreenCedar/AgentPluginMarketplace`. The plugin entry is `codestory`, with
-source `git-subdir`, URL `https://github.com/TheGreenCedar/CodeStory.git`, and
-path `plugins/codestory`. The canonical skill ships inside this repository's
-plugin package at
+For normal Codex use, open Codex in the repo you want to ground and install
+through `/plugins`:
+
+```text
+TheGreenCedar -> codestory -> Install plugin
+```
+
+When supported, terminal marketplace management can add the source marketplace:
+
+```bash
+codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
+```
+
+Some plugin settings are UI-managed, so use `/plugins` when the CLI marketplace
+command is unavailable. Start a new Codex thread after install or refresh, then
+ask `@CodeStory` to check readiness and ground the repo before planning or
+editing.
+
+The canonical skill ships inside this repository's plugin package at
 [`plugins/codestory/skills/codestory-grounding/SKILL.md`](plugins/codestory/skills/codestory-grounding/SKILL.md).
 
 The plugin launches `codestory-cli serve --stdio --refresh none` directly. If
