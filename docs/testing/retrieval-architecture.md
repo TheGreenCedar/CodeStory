@@ -89,8 +89,7 @@ and must stay test-only.
 
 ## Local test workflows
 
-Repos: `codex`, `rootandruntime`, `sourcetrail`, `vscode` — manifests under
-`benchmarks/tasks/local-real/`.
+Local-real repo manifests live under `benchmarks/tasks/local-real/`.
 
 ```sh
 node scripts/codestory-agent-ab-benchmark.mjs \

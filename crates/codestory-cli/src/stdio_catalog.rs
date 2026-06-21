@@ -592,7 +592,13 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
         ),
         SchemaProperty::array("repo_text_hits", "Repo text hits.", &SEARCH_HIT_SCHEMA),
         SchemaProperty::array("hits", "Merged hit list.", &SEARCH_HIT_SCHEMA),
+        SchemaProperty::string("code", "Typed API error code."),
+        SchemaProperty::string("message", "Human-readable API error message."),
+        SchemaProperty::object("details", "Structured API error repair guidance.").nullable(),
     ],
+    &[],
+)
+.with_any_of_required(&[
     &[
         "query",
         "retrieval",
@@ -601,7 +607,8 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
         "repo_text_enabled",
         "hits",
     ],
-);
+    &["code", "message"],
+]);
 
 static SYMBOL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory symbol context DTO.",

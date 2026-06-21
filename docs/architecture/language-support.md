@@ -28,8 +28,8 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
 | Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | exact-source structural/schema anchors |
 
-Agent-facing packet/search quality is separate. The language-expansion A/B
-report is not blanket promotion proof for every parser-backed language.
+Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
+not blanket promotion proof for every parser-backed language.
 
 ## Claim Ladder
 
@@ -50,17 +50,7 @@ routing and structural source-proof only.
 No current language profile claims `typed_semantic_edges` or
 `packet_sufficient_answer_quality` from the profile registry alone.
 
-## Latest Agent-Facing Evidence
-
-The current publishable packet-runtime proof gate is the June 18 packet-runtime
-status. It is blocked:
-
-| Measure | Status | Read |
-| --- | ---: | --- |
-| Runs | `108/108` success | Runtime completed all measured tasks. |
-| Quality | `106/108` pass | Two rows still miss the quality bar. |
-| Sufficiency | `107/108` sufficient, `1` partial | One packet is not proof-complete. |
-| Cold SLA | `8` misses | Cold latency still blocks publishable promotion. |
+## Agent-Facing Evidence
 
 GitHub Actions workflow support is path-scoped to `.github/workflows/*.{yml,yaml}`.
 The pilot emits workflow, job, and step anchors with `exact_source` /
@@ -92,48 +82,13 @@ roles or semantic dependency proof.
 
 Safe wording: OpenAPI endpoint anchors prove only that a schema declares the
 method/path at the cited source range. Packet-runtime is implemented and
-completing the suite, but
-publishable agent-facing packet quality is not promoted until a coherent run has
-all quality, sufficiency, and cold-SLA gates green. This evidence is a
-development/proof-gate signal, not public product-grade proof for every
-parser-backed language. HTML, CSS, SQL, GitHub Actions workflows, Docker Compose
-manifests, and Cargo manifests remain structural source-proof collectors;
-OpenAPI schemas remain a dedicated schema-anchor path.
-
-Older development comparison: the language-expansion comparison artifact built
-on 2026-06-17:
-`target/agent-benchmark/language-expansion-holdout-20260617-fixed-baseline-vs-round24-codeonly-offline/reanalyzed-summary.md`.
-
-It is an offline reused-baseline composite. It combines the fixed no-CodeStory
-baseline at `target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4`
-with the CodeStory-only confirmation at
-`target/agent-benchmark/language-expansion-holdout-20260617-post-round24-codeonly-prepj1-j2`.
-No harness arm was executed to create the composite, and no no-CodeStory rows
-were rerun.
-
-That artifact is a development-quality read, not a final public promotion
-claim:
-
-| Measure | With CodeStory | Without CodeStory | Read |
-| --- | ---: | ---: | --- |
-| Runs attempted | `54` | `54` | Three repeats across 18 language tasks. |
-| Run success | `54/54` | `54/54` | Both arms successful in their source artifacts. |
-| Quality pass | `54/54` | `24/54` | CodeStory quality is never worse per row; some rows tie a saturated baseline. |
-| All-in wall time | `3,383,687 ms` | `7,943,578 ms` | CodeStory ratio `0.426`. |
-| Total tokens | `2,141,124` | `9,692,559` | CodeStory ratio `0.221`. |
-| Commands | `54` | `471` | CodeStory kept exploration bounded. |
-| Source reads | `0` | `417` | The CodeStory arm stayed packet-first. |
-
-Safe wording: on the fixed-baseline development comparison, CodeStory is
-quality-equal or better on every measured language task and materially cheaper
-overall. Do not describe this as product-grade proof for every supported
-language or framework until repeat, freshness, breadth, and promotion metadata
-are recorded. Future language-expansion loops may reuse the fixed no-CodeStory
-control only when the benchmark contract accepts the reused rows as
-fingerprint-compatible. Missing or incompatible fingerprints are diagnostic-only;
-generate a new control artifact when the task suite, pinned repo state, harness
-contract, scorer boundary, model, CLI identity, or retrieval contract changes
-with explicit approval.
+can complete measured suites, but publishable agent-facing packet quality is not
+promoted until one coherent run has all quality, sufficiency, and cold-SLA gates
+green. Run-specific scorecards belong in PRs, issues, release notes, or ignored
+`target/` artifacts; this page records the durable claim boundaries. HTML, CSS,
+SQL, GitHub Actions workflows, Docker Compose manifests, and Cargo manifests
+remain structural source-proof collectors; OpenAPI schemas remain a dedicated
+schema-anchor path.
 
 ## Resolution Claims
 
@@ -236,7 +191,7 @@ Before adding a parser-backed language or widening a public claim:
      --task-suite language-expansion-holdout \
      --arms without_codestory,with_codestory \
      --repeats 3 --materialize-repos --prepare-codestory-cache \
-     --reuse-baseline-from target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4 \
+     --reuse-baseline-from target/agent-benchmark/<compatible-baseline-run> \
      --out-dir target/agent-benchmark/language-expansion-holdout \
      --timeout-ms 600000
    ```

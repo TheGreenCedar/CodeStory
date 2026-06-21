@@ -137,7 +137,7 @@ shape for that role.
 | Tier | Example repos | Cold index budget | Sidecar disk budget | Query process budget |
 |------|---------------|-------------------|---------------------|----------------------|
 | S | `codestory`, `axios` | 8 min | 4 GB | 1.5 GB |
-| M | `ripgrep`, `rootandruntime`, `codex` | 15 min | 8 GB | 3 GB |
+| M | `ripgrep`, `rootandruntime`, `axios` | 15 min | 8 GB | 3 GB |
 | L | `redis`, `sourcetrail`, `vscode` | 45 min | 25 GB | 6 GB |
 | XL | `vscode` monolith | 60 min | 35 GB | 8 GB |
 
@@ -162,10 +162,10 @@ thresholds. It is not a runtime rollback mechanism.
 
 ## Generalization
 
-Local-real tuning repos are `codex`, `rootandruntime`, `sourcetrail`, and
-`vscode`. Holdout repos should be fetched into ignored target directories and
-must not influence ranker/planner tuning. Dogfood results on `codestory` are
-fast regression evidence, not generalization proof.
+Local-real tuning repos are declared in `benchmarks/tasks/local-real/`. Holdout
+repos should be fetched into ignored target directories and must not influence
+ranker/planner tuning. Dogfood results on `codestory` are fast regression
+evidence, not generalization proof.
 
 Promotion requires at least:
 

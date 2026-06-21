@@ -110,25 +110,13 @@ node scripts/codestory-agent-ab-benchmark.mjs \
   --publishable
 ```
 
-The packet-runtime ledger must cover cold and warm modes, three repeats, row
+The packet-runtime artifact bundle must cover cold and warm modes, three repeats, row
 concurrency `--jobs 4`, prepared sidecars, full sidecar provenance, no
 `--allow-failures`, no quality misses, no sufficiency gaps, and no SLA misses.
 Keep `--prepare-codestory-jobs` lower or capped; examples use `2` unless the
 prep lane is intentionally serial.
 
-The June 18 current scorecard is blocked: the non-publishable diagnostic
-artifact
-`target/agent-benchmark/language-expansion-proof-full-form-command-shapes`
-generated `2026-06-18T12:03:23.059Z` passed `108/108` success, quality, and
-sufficiency gates but had `9` cold SLA misses. The publishable artifact
-`target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`
-generated `2026-06-18T12:23:54.418Z` passed `108/108` success, `106/108`
-quality, and `107/108` sufficiency, with `1` partial and `8` cold SLA misses.
-Promotion blockers are apache-commons-lang cold SLA `3/3`, redis cold SLA
-`3/3`, AutoMapper cold SLA `1/3`, dart-http cold SLA `1/3`, square-okio cold
-quality `2/3`, and Alamofire cold quality `2/3` plus `1` partial sufficiency.
-
-With/without CodeStory A/B ledgers remain useful development comparisons for
+With/without CodeStory A/B artifacts remain useful development comparisons for
 elapsed time, tokens, estimated cost, observed tool calls, command counts,
 source reads, post-packet source reads, and manifest quality gates. Stale
 `--reuse-baseline-from` or fixed no-CodeStory comparisons are diagnostic unless

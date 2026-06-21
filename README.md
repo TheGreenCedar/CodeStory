@@ -7,7 +7,6 @@ Local codebase grounding for coding agents.
 <p align="center">
 <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 <a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
-<a href="docs/testing/benchmark-ledger.md"><img alt="Benchmarks" src="https://img.shields.io/badge/benchmarks-documented-blue"></a>
 </p>
 
 **Situation.** You are in a repo with more files than anyone holds in memory.
@@ -67,8 +66,18 @@ On Windows PowerShell, use `.\target\release\codestory-cli.exe`, environment
 assignments such as `$env:TARGET_WORKSPACE = "C:\path\to\repo"`, and normal
 Windows paths.
 
-That path proves local navigation readiness. It does not prove sidecar readiness
-for `packet` or `search`.
+For a release-binary first Windows check, run:
+
+```powershell
+.\scripts\install-codestory.ps1 -Project C:\path\to\repo
+```
+
+The wrapper reuses `-CodestoryCli`, `CODESTORY_CLI`, or PATH before downloading
+the Windows x64 release asset. Its output separates executable install, local
+navigation readiness, and agent packet/search readiness from `doctor`.
+
+Only a `ready` local-navigation verdict proves local navigation readiness. It
+does not prove sidecar readiness for `packet` or `search`.
 
 For agent-facing packet/search evidence, build and verify sidecars first:
 
@@ -120,9 +129,11 @@ HTML, CSS, and SQL use structural collectors.
 ## Evidence
 
 Benchmark notes are environment- and repository-specific evidence. Do not turn
-one row into a universal savings claim.
+one row into a universal savings claim. Run-specific scorecards, generated
+comparison docs, and benchmark ledgers belong in PRs, issues, release notes, or
+ignored `target/` artifacts instead of committed durable docs.
 
-- Scorecard and caveats: [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
+- Verification tiers and commands: [docs/contributors/testing-matrix.md](docs/contributors/testing-matrix.md)
 - Repo-scale timing history: [docs/testing/codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md)
 - Warm stdio loop history: [docs/testing/codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md)
 - Repeatable with/without harness: [`scripts/codestory-agent-ab-benchmark.mjs`](scripts/codestory-agent-ab-benchmark.mjs)
@@ -144,7 +155,7 @@ workspace shares build locks.
 - Concepts: [docs/concepts/how-codestory-works.md](docs/concepts/how-codestory-works.md)
 - Architecture: [docs/architecture/overview.md](docs/architecture/overview.md)
 - Languages: [docs/architecture/language-support.md](docs/architecture/language-support.md)
-- Benchmarks: [docs/testing/benchmark-ledger.md](docs/testing/benchmark-ledger.md)
+- Testing: [docs/contributors/testing-matrix.md](docs/contributors/testing-matrix.md)
 - Contributing: [docs/contributors/getting-started.md](docs/contributors/getting-started.md)
 
 ## License

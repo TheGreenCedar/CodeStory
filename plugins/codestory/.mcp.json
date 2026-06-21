@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codestory": {
+      "command": "codestory-cli",
+      "args": ["serve", "--stdio", "--refresh", "none"],
+      "tool_timeout_sec": 300
+    }
+  }
+}
