@@ -7065,6 +7065,7 @@ struct HybridSearchInstrumentation {
 struct CachedIndexFreshness {
     root: PathBuf,
     storage_path: PathBuf,
+    storage_fingerprint: String,
     value: IndexFreshnessDto,
     cached_at: Instant,
 }
@@ -7087,6 +7088,28 @@ fn index_freshness_cache_ttl_secs() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|ttl| *ttl > 0)
         .unwrap_or(INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS)
+}
+
+fn storage_fingerprint(path: &Path) -> String {
+    [
+        storage_path_fingerprint(path),
+        storage_path_fingerprint(&path.with_extension("db-wal")),
+        storage_path_fingerprint(&path.with_extension("db-shm")),
+    ]
+    .join("|")
+}
+
+fn storage_path_fingerprint(path: &Path) -> String {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("len:{}:mtime_ms:{modified_ms}", metadata.len())
 }
 
 fn publish_search_engine(state: &mut AppState, engine: SearchEngine) {
@@ -9416,11 +9439,13 @@ impl AppController {
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
+        let storage_fingerprint = storage_fingerprint(&storage_path);
         {
             let state = self.state.lock();
             if let Some(cached) = state.index_freshness_cache.as_ref()
                 && cached.root == root
                 && cached.storage_path == storage_path
+                && cached.storage_fingerprint == storage_fingerprint
                 && cached.cached_at.elapsed() < ttl
             {
                 return Ok(cached.value.clone());
@@ -9443,11 +9468,13 @@ impl AppController {
         storage: &Storage,
     ) -> IndexFreshnessDto {
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
+        let storage_fingerprint = storage_fingerprint(storage_path);
         {
             let state = self.state.lock();
             if let Some(cached) = state.index_freshness_cache.as_ref()
                 && cached.root == root
                 && cached.storage_path == storage_path
+                && cached.storage_fingerprint == storage_fingerprint
                 && cached.cached_at.elapsed() < ttl
             {
                 return cached.value.clone();
@@ -9459,6 +9486,7 @@ impl AppController {
         state.index_freshness_cache = Some(CachedIndexFreshness {
             root: root.to_path_buf(),
             storage_path: storage_path.to_path_buf(),
+            storage_fingerprint,
             value: freshness.clone(),
             cached_at: Instant::now(),
         });

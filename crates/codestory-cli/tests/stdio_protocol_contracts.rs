@@ -532,6 +532,46 @@ fn assert_stale_freshness_counts(value: &Value, context: &str) {
     );
 }
 
+fn assert_fresh_freshness_counts(value: &Value, context: &str) {
+    let freshness = find_index_freshness(value)
+        .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
+    assert_eq!(
+        freshness.get("status").and_then(Value::as_str),
+        Some("fresh"),
+        "{context} freshness should be fresh after reindex: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["changed_file_count", "changed_count", "changed"]
+        ),
+        Some(0),
+        "{context} freshness should report no changed files: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &["new_file_count", "new_count", "new", "added_count", "added"]
+        ),
+        Some(0),
+        "{context} freshness should report no new files: {freshness:#}"
+    );
+    assert_eq!(
+        freshness_count(
+            freshness,
+            &[
+                "removed_file_count",
+                "removed_count",
+                "removed",
+                "deleted_count",
+                "deleted"
+            ]
+        ),
+        Some(0),
+        "{context} freshness should report no removed files: {freshness:#}"
+    );
+}
+
 fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
     match value {
         Value::String(text) => strings.push(text),
@@ -1650,6 +1690,41 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         p95 < Duration::from_secs(1),
         "warm status freshness check p95 should stay under 1s for a small repo, got median={median:?}, p95={p95:?}"
     );
+
+    let mut index_command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    index_command
+        .arg("index")
+        .arg("--refresh")
+        .arg("full")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(fixture.workspace.path())
+        .arg("--cache-dir")
+        .arg(fixture.cache_dir.path());
+    apply_fixture_embedding_env(&mut index_command, fixture.hash_embeddings);
+    let output = index_command
+        .output()
+        .expect("rerun index after stale status");
+    assert!(
+        output.status.success(),
+        "reindex failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let refreshed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-freshness-after-reindex",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
+    let refreshed_status = json_resource_content(result, "codestory://status");
+    assert_fresh_freshness_counts(&refreshed_status, "codestory://status after reindex");
 }
 
 #[test]
