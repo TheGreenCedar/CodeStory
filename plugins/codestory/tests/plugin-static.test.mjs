@@ -26,23 +26,24 @@ test("codestory repo ships plugin source, not marketplace catalog or adapter run
   await assert.rejects(access(join(pluginRoot, "scripts", "codestory-mcp.mjs")));
 });
 
-test("plugin docs are agent-first, cross-platform, and latest-release aware", async () => {
+test("plugin docs are agent-first, marketplace-aware, and latest-release aware", async () => {
   const rootReadme = await readFile(join(repoRoot, "README.md"), "utf8");
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
   const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
   const sharedRequired = [
     "latest GitHub release",
     "codestory-cli --version",
+    "SHA256SUMS.txt",
+    "retrieval_mode=full",
+  ];
+  const skillReleaseRequired = [
     "missing or outdated",
     "codestory-cli-vX.Y.Z-windows-x64.zip",
     "codestory-cli-vX.Y.Z-windows-arm64.zip",
     "codestory-cli-vX.Y.Z-macos-arm64.tar.gz",
-    "macOS x64",
     "codestory-cli-vX.Y.Z-linux-x64.tar.gz",
     "codestory-cli-vX.Y.Z-linux-arm64.tar.gz",
     "Source fallback",
-    "SHA256SUMS.txt",
-    "retrieval_mode=full",
   ];
   const forbidden = [
     "release-bound to " + "CodeStory `v" + "0.11.1`",
@@ -64,18 +65,22 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "TheGreenCedar -> codestory -> Install plugin",
     "add or refresh this marketplace first",
     "codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace",
-    "The marketplace source is `TheGreenCedar/AgentPluginMarketplace`",
-    "This repository remains the plugin source",
-    "One marketplace can list multiple plugins",
+    "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
+    "marketplace display/name concept is `TheGreenCedar`",
+    "plugin source at `https://github.com/TheGreenCedar/CodeStory.git`",
+    "source path `plugins/codestory`",
+    "The CodeStory repo does not contain the marketplace catalog",
     "workspace plugin settings are managed from the Codex Apps/Plugins UI",
     "UI path when the CLI marketplace command is",
     "Start a new Codex thread after installation or refresh",
     "check whether this repository is ready for local navigation and packet/search",
     "The first run should be agent-owned",
-    "downloads the latest matching release asset",
+    "installs the latest matching release asset",
     "uses source fallback only when no release asset fits the host",
     "Agent runtime bootstrap",
-    "restart the Codex host/app before starting a new agent thread",
+    "restarts the Codex host/app before starting a new agent thread",
+    "The plugin does not bundle the binary",
+    "Use source fallback only when no release asset fits the host",
     "Source docs, marketplace source checkout/cache, and the active installed MCP",
     "active runtime surface",
     "For normal Codex use, refresh or uninstall the plugin from the Codex plugin",
@@ -83,8 +88,8 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "codex plugin marketplace remove TheGreenCedar",
     "commands only for source registration",
     "The plugin does not bundle the binary",
-    "TheGreenCedar/AgentPluginMarketplace",
-    "Catalog name",
+    "Marketplace catalog repo",
+    "Marketplace display/name",
     "Plugin entry",
     "git-subdir",
     "https://github.com/TheGreenCedar/CodeStory.git",
@@ -100,12 +105,16 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "Always pass `--project <target-workspace>` explicitly",
   ];
   const rootReadmeRequired = [
-    "The marketplace source is `TheGreenCedar/AgentPluginMarketplace`",
-    "This repository remains the plugin source. The catalog can list many plugins",
-    "the CodeStory entry points at `plugins/codestory` in this repo",
+    "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
+    "marketplace display/name concept is `TheGreenCedar`",
+    "plugin source at `https://github.com/TheGreenCedar/CodeStory.git`",
+    "source path `plugins/codestory`",
+    "The CodeStory repo does not contain the marketplace catalog",
     "add or refresh this marketplace first",
     "The plugin launches `codestory-cli serve --stdio --refresh none` directly",
-    "The skill owns the runtime check",
+    "The skill owns binary setup",
+    "restarts the Codex host/app before",
+    "starting a new agent thread if `PATH` changed",
   ];
 
   for (const text of [readme, skill]) {
@@ -127,6 +136,10 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
   }
   for (const phrase of readmeRequired) {
     assert.equal(readme.includes(phrase), true, phrase);
+  }
+  for (const phrase of skillReleaseRequired) {
+    assert.equal(skill.includes(phrase), true, phrase);
+    assert.equal(readme.includes(phrase), false, phrase);
   }
   for (const phrase of rootReadmeRequired) {
     assert.equal(rootReadme.includes(phrase), true, phrase);
