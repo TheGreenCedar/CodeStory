@@ -58,6 +58,7 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "The CLI is still there, but it is the escape hatch and repair surface",
     "codestory://status",
     "codestory://grounding",
+    "Inspect indexed file inventory and coverage.",
     "For normal Codex use, install the plugin through the Codex plugin flow for your",
     "/plugins",
     "TheGreenCedar -> codestory -> Install plugin",

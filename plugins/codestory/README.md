@@ -17,6 +17,7 @@ not the main user experience.
 | Is this repo indexed and safe to use? | `codestory://status` |
 | What should I do next? | `codestory://agent-guide` |
 | Give me a compact repo map. | `codestory://grounding` |
+| Inspect indexed file inventory and coverage. | `files` tool |
 | Answer a broad repo question with evidence. | `packet` tool, only with full sidecars |
 | Find candidate symbols, paths, or behavior terms. | `search` tool, only with full sidecars |
 | Follow a concrete target. | `symbol`, `trail`, `references`, `snippet`, `context` |

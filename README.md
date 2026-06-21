@@ -165,6 +165,7 @@ if `PATH` changed.
 | Call graph | `trail --project <repo> --id <node-id> --story` |
 | Source context | `snippet --project <repo> --id <node-id>` |
 | Target bundle | `context --project <repo> --id <node-id>` |
+| File inventory and coverage | `files --project <repo> --limit 80` |
 | Broad task packet with sidecars | `packet --project <repo> --question "..."` |
 | Persistent local reads | `serve --project <repo> --stdio` |
 
