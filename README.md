@@ -156,6 +156,44 @@ of answer quality, token savings, public benchmark promotion, or generalization.
 | Repeat full refresh | `29.45s` repeat refresh with `750` reused and `0` embedded | Same 2026-06-18 #41 hardening row | Cache/reuse signal, not quality or generalization proof. |
 | Stdio agent loop smoke | Small fixture release-binary run: `20` reps, `53.50ms` warm loop, protocol stdout-only | [codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md) | Protocol/read-surface smoke, not repo-scale packet/search proof. |
 
+## Speed And Context Value
+
+CodeStory's speed and token value come from avoiding the same broad repository
+scan over and over. The agent can ask for bounded graph, source, trail, impact,
+and packet evidence, then cite that evidence instead of repeatedly stuffing raw
+files into context.
+
+That mechanism is useful even without a token-savings percentage: local graph
+navigation narrows the next source reads, `affected` narrows review planning,
+and full `packet`/`search` returns bounded citations plus gaps instead of an
+unbounded repo sweep. Exact token-savings measurements are not currently
+published in this README, so the claim stays at mechanism and evidence shape,
+not a numeric savings promise.
+
+The committed timing evidence does show cache behavior that matters to operator
+flow: the 2026-06-18 #41 hardening row recorded a repeat full refresh at
+`29.45s` with `750` semantic docs reused and `0` embedded. Treat that as
+cache/reuse telemetry, not answer-quality proof.
+
+## Cache And Worktree Lifecycle
+
+Initial indexing is the expensive pass; pay it once when possible. CodeStory
+stores per-project SQLite graph/search/doc state in the local cache, and the
+Codex worktree setup script can run `cache rehydrate --from-project <source>`
+from a sibling worktree before refreshing the target checkout.
+
+After cache reuse or rehydrate, the normal path is still to verify freshness:
+run `doctor`, refresh with `index --refresh auto` or `--refresh incremental`,
+then trust local graph navigation only when readiness says it is current. For
+ordinary source edits, prefer incremental indexing so CodeStory reprocesses the
+changed files instead of rebuilding the world.
+
+Sidecar and artifact reuse has a stricter boundary. Retrieval manifests,
+sidecar input hashes, embedding backend identity, and stored candidate
+resolution still need revalidation after reuse. If packet/search does not report
+`retrieval_mode full`, the output is a lead for source inspection, not reusable
+proof.
+
 Use [retrieval-architecture.md](docs/testing/retrieval-architecture.md) for
 packet/search promotion gates and
 [docs/README.md](docs/README.md) to choose the right operator, architecture,
