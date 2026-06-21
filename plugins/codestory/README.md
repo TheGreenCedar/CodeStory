@@ -34,9 +34,8 @@ This package is intentionally thin:
 - `skills/codestory-grounding` is the single canonical CodeStory grounding
   skill shipped by this repository.
 
-There is no Node adapter and no marketplace catalog in this repository. The
-catalog lives in `TheGreenCedar/AgentPluginMarketplace` with catalog name
-`TheGreenCedar`. CodeStory owns the plugin package and the Rust CLI/MCP runtime.
+There is no Node adapter and no marketplace catalog in this repository.
+CodeStory owns the plugin package and the Rust CLI/MCP runtime.
 
 ## Install For Agent Use
 
@@ -54,21 +53,34 @@ TheGreenCedar -> codestory -> Install plugin
 ```
 
 Use the equivalent marketplace display wording if your Codex build shows a
-longer human name for the `TheGreenCedar` catalog.
-
-If your Codex build exposes terminal marketplace management for source
-marketplaces, add or refresh this marketplace first:
+longer human name for the `TheGreenCedar` catalog. If the catalog is not listed
+and your Codex build exposes terminal marketplace management for source
+marketplaces, add or refresh the external catalog first:
 
 ```bash
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
-Some workspace plugin settings are managed from the Codex Apps/Plugins UI rather
-than the terminal. Use the UI path when the CLI marketplace command is
+Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
+workspace plugin settings are managed from the Codex Apps/Plugins UI rather
+than the terminal, so use the UI path when the CLI marketplace command is
 unavailable.
 
 Start a new Codex thread after installation or refresh. The installed package
 launches `codestory-cli serve --stdio --refresh none` directly.
+
+### Marketplace maintainer details
+
+The marketplace catalog is external:
+
+| Field | Value |
+| --- | --- |
+| Catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
+| Catalog name | `TheGreenCedar` |
+| Plugin entry | `codestory` |
+| Source kind | `git-subdir` |
+| Source repo | `https://github.com/TheGreenCedar/CodeStory.git` |
+| Source path | `plugins/codestory` |
 
 ### After install
 
@@ -79,15 +91,14 @@ before planning or editing:
 @CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
 ```
 
-### Runtime setup fallback
+### Runtime latest-release fallback
 
-The plugin does not bundle the binary. If `codestory-cli` is missing, the agent
-should resolve the latest GitHub release, download and unpack the matching host
-asset, verify it when practical, place it in a stable user bin directory, and
-re-check `codestory-cli --version`. If `codestory-cli` is already installed,
-compare `codestory-cli --version` with the latest release tag and download only
-when the binary is missing or outdated. If the host `PATH` changes, start a new
-agent thread so the MCP process can see the binary.
+The plugin does not bundle the binary. The agent should run
+`codestory-cli --version` first. If `codestory-cli` is missing or outdated
+against the latest GitHub release, resolve the latest release, download and
+unpack the matching host asset, verify it when practical, place it in a stable
+user bin directory, and re-check `codestory-cli --version`. If the host `PATH`
+changes, start a new agent thread so the MCP process can see the binary.
 
 For latest tag `vX.Y.Z`, choose the host asset derived from that tag:
 
@@ -113,11 +124,6 @@ manual CLI fallback commands.
 Source docs, marketplace source checkout/cache, and the active installed MCP
 runtime can differ. Before claiming an installed behavior is live, verify the
 active runtime surface in the target Codex thread.
-
-Source details for marketplace maintainers: the external catalog is
-`TheGreenCedar/AgentPluginMarketplace`; the catalog name is `TheGreenCedar`; the
-plugin entry is `codestory`; the source is `git-subdir` at
-`https://github.com/TheGreenCedar/CodeStory.git`, path `plugins/codestory`.
 
 ## What To Ask
 

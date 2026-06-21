@@ -106,23 +106,34 @@ sidecar setup and repair.
 
 ## Install As An Agent Plugin
 
-For normal Codex use, open Codex in the repo you want to ground and install
-through `/plugins`:
+For normal Codex use, open Codex in the repo you want to ground, then use:
+
+```text
+/plugins
+```
+
+Choose:
 
 ```text
 TheGreenCedar -> codestory -> Install plugin
 ```
 
-When supported, terminal marketplace management can add the source marketplace:
+If the `TheGreenCedar` catalog is not listed and your Codex build supports
+terminal marketplace management for source marketplaces, add or refresh the
+external catalog first:
 
 ```bash
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
-Some plugin settings are UI-managed, so use `/plugins` when the CLI marketplace
-command is unavailable. Start a new Codex thread after install or refresh, then
-ask `@CodeStory` to check readiness and ground the repo before planning or
-editing.
+Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
+workspace plugin settings are managed from the Codex Apps/Plugins UI rather
+than the terminal, so use the UI path when the CLI marketplace command is
+unavailable.
+
+Start a new Codex thread after installation or refresh. Ask `@CodeStory` to
+check local-navigation and packet/search readiness, then ground the repo before
+planning or editing.
 
 The canonical skill ships inside this repository's plugin package at
 [`plugins/codestory/skills/codestory-grounding/SKILL.md`](plugins/codestory/skills/codestory-grounding/SKILL.md).
