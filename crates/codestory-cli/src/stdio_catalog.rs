@@ -1,12 +1,24 @@
+//! Catalog for the stdio integration surface.
+//!
+//! This module defines the tool/resource/prompt metadata exposed by
+//! `serve --stdio`. The catalog is declarative JSON shape: keep names, schemas,
+//! annotations, and safety metadata stable because clients discover behavior
+//! from these responses before calling into the transport.
+
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Side-effect class advertised for a stdio tool.
+///
+/// The current stdio surface is read-only and local-only; adding a new effect
+/// requires updating both safety metadata and tool annotations.
 pub(crate) enum ToolEffect {
     Read,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Safety metadata emitted in both legacy and annotation-style catalog fields.
 pub(crate) struct SafetyMetadata {
     effect: ToolEffect,
 }
@@ -42,6 +54,7 @@ impl SafetyMetadata {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Declarative stdio tool description returned by `tools/list`.
 pub(crate) struct ToolSpec {
     name: &'static str,
     description: &'static str,
@@ -67,6 +80,7 @@ impl ToolSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Declarative resource description returned by `resources/list`.
 pub(crate) struct ResourceSpec {
     uri: &'static str,
     name: &'static str,
@@ -84,6 +98,7 @@ impl ResourceSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Declarative resource template returned by `resources/templates/list`.
 pub(crate) struct ResourceTemplateSpec {
     uri_template: &'static str,
     name: &'static str,
@@ -101,6 +116,7 @@ impl ResourceTemplateSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Declarative prompt description returned by `prompts/list` and `prompts/get`.
 pub(crate) struct PromptSpec {
     name: &'static str,
     description: &'static str,
@@ -1139,10 +1155,12 @@ static PROMPTS: &[PromptSpec] = &[
     },
 ];
 
+/// Return whether a name is a registered stdio tool.
 pub(crate) fn is_tool_name(name: &str) -> bool {
     TOOLS.iter().any(|tool| tool.name == name)
 }
 
+/// Build the `tools/list` response.
 pub(crate) fn tools_list_json() -> Value {
     debug_assert_read_only_catalog();
     json!({
@@ -1152,6 +1170,7 @@ pub(crate) fn tools_list_json() -> Value {
     })
 }
 
+/// Build the `resources/list` response.
 pub(crate) fn resources_list_json() -> Value {
     json!({
         "result": {
@@ -1160,6 +1179,7 @@ pub(crate) fn resources_list_json() -> Value {
     })
 }
 
+/// Build the `resources/templates/list` response.
 pub(crate) fn resource_templates_list_json() -> Value {
     json!({
         "result": {
@@ -1171,6 +1191,7 @@ pub(crate) fn resource_templates_list_json() -> Value {
     })
 }
 
+/// Build the `prompts/list` response.
 pub(crate) fn prompts_list_json() -> Value {
     json!({
         "result": {
@@ -1179,6 +1200,7 @@ pub(crate) fn prompts_list_json() -> Value {
     })
 }
 
+/// Build the `prompts/get` response or fail when the prompt is unknown.
 pub(crate) fn prompt_get_json(name: &str) -> Result<Value> {
     PROMPTS
         .iter()

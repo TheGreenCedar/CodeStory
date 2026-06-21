@@ -19,6 +19,7 @@ pub(crate) struct PacketStepTraceRow {
     pub sidecar_query_ms: Option<u32>,
     pub candidate_resolution_ms: Option<u32>,
     pub sidecar_total_ms: Option<u32>,
+    pub batch_query_wall_ms: Option<u32>,
     pub message: Option<String>,
 }
 
@@ -51,6 +52,7 @@ fn packet_step_row(index: usize, step: &AgentRetrievalStepDto) -> PacketStepTrac
         sidecar_query_ms: step_output_u32(step, "sidecar_query_ms"),
         candidate_resolution_ms: step_output_u32(step, "candidate_resolution_ms"),
         sidecar_total_ms: step_output_u32(step, "sidecar_total_ms"),
+        batch_query_wall_ms: step_output_u32(step, "batch_query_wall_ms"),
         message: step.message.clone(),
     }
 }
@@ -66,6 +68,10 @@ fn step_output_u32(step: &AgentRetrievalStepDto, key: &str) -> Option<u32> {
     step_output_string(step, key).and_then(|value| value.parse::<u32>().ok())
 }
 
+/// Export packet retrieval timing and sidecar diagnostics as JSON.
+///
+/// This is an observability surface for scoring and latency triage. It should not be treated as
+/// proof of answer sufficiency without the packet sufficiency fields on the answer itself.
 pub fn packet_step_trace_json(answer: &AgentAnswerDto) -> Value {
     let rows = packet_step_trace_rows(answer);
     let attributable_rows = attributable_step_rows(&rows);

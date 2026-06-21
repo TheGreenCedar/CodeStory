@@ -3,7 +3,9 @@ use crate::generation::{
     SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
     manifest_staleness_reason, manifest_unavailable_reason,
 };
-use crate::health::{RetrievalStatusReport, attach_manifest_contract, probe_sidecar_health};
+use crate::health::{
+    RetrievalStatusReport, attach_manifest_contract, attach_repair_hint, probe_sidecar_health,
+};
 use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_root};
 use anyhow::{Context, Result};
 use codestory_contracts::language_support::{
@@ -15,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Runtime state file written by `sidecar_up`.
+///
+/// The file records local sidecar endpoints and data roots only. It is not a readiness manifest;
+/// callers must use `sidecar_status` or `strict_sidecar_status` before trusting retrieval output.
 pub struct SidecarStateFile {
     pub zoekt_http_port: u16,
     pub qdrant_http_port: u16,
@@ -50,6 +56,10 @@ pub fn sidecar_down() -> Result<()> {
     Ok(())
 }
 
+/// Probe sidecar health and attach the latest retrieval manifest when storage is available.
+///
+/// A healthy infrastructure report is still weaker than strict readiness: it may show running
+/// services while the manifest is stale for the current worktree.
 pub fn sidecar_status(
     project_root: &Path,
     storage_path: Option<&Path>,
@@ -57,6 +67,9 @@ pub fn sidecar_status(
     sidecar_status_inner(project_root, storage_path, false)
 }
 
+/// Probe sidecar health and fail stale manifest identity checks.
+///
+/// This is the status surface to use before serving `retrieval_mode=full` packet/search evidence.
 pub fn strict_sidecar_status(
     project_root: &Path,
     storage_path: Option<&Path>,
@@ -88,10 +101,13 @@ fn sidecar_status_inner(
             .context("check strict sidecar readiness")?
         {
             return Ok(enrich_status_with_semantic_doc_stats(
-                attach_manifest_contract(
-                    crate::health::unavailable_status_report(
-                        format!("sidecar_manifest_stale: {reason}"),
-                        Some(manifest.clone()),
+                attach_repair_hint(
+                    attach_manifest_contract(
+                        crate::health::unavailable_status_report(
+                            format!("sidecar_manifest_stale: {reason}"),
+                            Some(manifest.clone()),
+                        ),
+                        project_root,
                     ),
                     project_root,
                 ),
@@ -102,8 +118,11 @@ fn sidecar_status_inner(
             && let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest)
         {
             return Ok(enrich_status_with_semantic_doc_stats(
-                attach_manifest_contract(
-                    crate::health::unavailable_status_report(reason, Some(manifest.clone())),
+                attach_repair_hint(
+                    attach_manifest_contract(
+                        crate::health::unavailable_status_report(reason, Some(manifest.clone())),
+                        project_root,
+                    ),
                     project_root,
                 ),
                 &storage,
@@ -111,14 +130,17 @@ fn sidecar_status_inner(
         }
         let report = probe_sidecar_health(&layout, &project_id, manifest);
         return Ok(enrich_status_with_semantic_doc_stats(
-            attach_manifest_contract(report, project_root),
+            attach_repair_hint(attach_manifest_contract(report, project_root), project_root),
             &storage,
         ));
     } else {
         None
     };
-    Ok(attach_manifest_contract(
-        probe_sidecar_health(&layout, &project_id, manifest),
+    Ok(attach_repair_hint(
+        attach_manifest_contract(
+            probe_sidecar_health(&layout, &project_id, manifest),
+            project_root,
+        ),
         project_root,
     ))
 }

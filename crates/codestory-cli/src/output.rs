@@ -1,3 +1,10 @@
+//! Output emission and renderer contracts for CLI commands.
+//!
+//! Command handlers build typed DTOs, then call these helpers to choose markdown
+//! or pretty JSON and to honor `--output-file`. Renderer functions should not
+//! perform runtime reads or change command behavior; they only materialize the
+//! already-computed response.
+
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
@@ -42,6 +49,10 @@ pub(crate) fn emit<T: Serialize>(
     emit_content(&content, output_file)
 }
 
+/// Emit plain text while preserving the CLI newline contract.
+///
+/// Use this for DOT, Mermaid, and other text surfaces that do not have a typed
+/// JSON representation for the selected command mode.
 pub(crate) fn emit_text(content: String, output_file: Option<&Path>) -> Result<()> {
     let mut content = content;
     if !content.ends_with('\n') {
@@ -77,6 +88,10 @@ fn render_output_content<T: Serialize>(
     Ok(content)
 }
 
+/// Validate `--output-file` without creating files.
+///
+/// Command handlers call this before expensive work so a bad output path fails
+/// before indexing, retrieval, or report generation begins.
 pub(crate) fn validate_output_file_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path
         .parent()
@@ -1862,6 +1877,10 @@ fn render_agent_step_summary(step: &AgentRetrievalStepDto) -> String {
     )
 }
 
+/// Render one citation line for markdown output.
+///
+/// The output keeps retrieval provenance visible so callers can distinguish
+/// indexed-symbol, repo-text, and hybrid retrieval evidence.
 pub(crate) fn render_agent_citation(
     project_root: &Path,
     citation: &AgentCitationDto,
@@ -1978,6 +1997,10 @@ fn quoted_cli_arg(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\\\""))
 }
 
+/// Render the human-facing markdown form of a context packet.
+///
+/// JSON callers should use `context_packet_json` instead; this renderer may
+/// reorder or relabel sections for readability while preserving the evidence.
 pub(crate) fn render_context_markdown(project_root: &Path, answer: &AgentAnswerDto) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Context");
@@ -2059,6 +2082,10 @@ fn context_operator_next_action(answer: &AgentAnswerDto) -> &'static str {
     }
 }
 
+/// Normalize context answers into the CLI JSON packet contract.
+///
+/// This preserves the underlying answer data while renaming fields that are
+/// shared with packet-style integration consumers.
 pub(crate) fn context_packet_json(answer: &AgentAnswerDto) -> Value {
     let mut value = serde_json::to_value(answer).unwrap_or_else(|_| serde_json::json!({}));
     normalize_context_packet_json(&mut value);

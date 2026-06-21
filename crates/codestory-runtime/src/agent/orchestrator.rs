@@ -65,12 +65,14 @@ use crate::agent::packet_sufficiency::{
     packet_targeted_follow_up_queries,
 };
 use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_have_any, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
-    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_mapper_configuration_plan_flow,
+    packet_probe_terms, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
+    packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
+    packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
+    packet_terms_indicate_mapper_configuration_plan_flow,
     packet_terms_indicate_runtime_formatting_flow,
     packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
-    packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
+    packet_terms_indicate_stylesheet_animation_flow,
+    packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -1049,6 +1051,8 @@ fn maybe_append_generic_source_shape_citations(
     let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
     let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
     let client_send_flow = packet_terms_indicate_client_send_flow(&terms);
+    let buffered_io_flow = packet_terms_indicate_buffered_io_flow(&terms);
+    let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&terms);
     let hook_cache_flow = packet_terms_indicate_hook_cache_flow(&terms);
     let command_flow = packet_terms_indicate_event_loop_command_flow(&terms);
     let form_validation_flow = packet_terms_indicate_form_validation_flow(&terms);
@@ -1059,6 +1063,8 @@ fn maybe_append_generic_source_shape_citations(
     if !route_flow
         && !mapper_flow
         && !client_send_flow
+        && !buffered_io_flow
+        && !url_session_request_flow
         && !hook_cache_flow
         && !command_flow
         && !form_validation_flow
@@ -1075,6 +1081,8 @@ fn maybe_append_generic_source_shape_citations(
         route_flow,
         mapper_flow,
         client_send_flow,
+        buffered_io_flow,
+        url_session_request_flow,
         hook_cache_flow,
         command_flow,
         form_validation_flow,
@@ -1082,6 +1090,9 @@ fn maybe_append_generic_source_shape_citations(
         css_animation_flow,
         &mut candidates,
     );
+    if url_session_request_flow {
+        collect_cited_request_validation_shape_candidates(project_root, answer, &mut candidates);
+    }
     candidates.sort_by(|left, right| {
         right
             .score
@@ -1175,6 +1186,8 @@ fn collect_generic_source_shape_candidates(
     route_flow: bool,
     mapper_flow: bool,
     client_send_flow: bool,
+    buffered_io_flow: bool,
+    url_session_request_flow: bool,
     hook_cache_flow: bool,
     command_flow: bool,
     form_validation_flow: bool,
@@ -1207,6 +1220,8 @@ fn collect_generic_source_shape_candidates(
                     route_flow,
                     mapper_flow,
                     client_send_flow,
+                    buffered_io_flow,
+                    url_session_request_flow,
                     hook_cache_flow,
                     command_flow,
                     form_validation_flow,
@@ -1237,6 +1252,12 @@ fn collect_generic_source_shape_candidates(
         }
         if client_send_flow {
             collect_client_send_shape_candidates(&path, &source, candidates);
+        }
+        if buffered_io_flow {
+            collect_buffered_io_shape_candidates(&path, &source, candidates);
+        }
+        if url_session_request_flow {
+            collect_url_session_request_shape_candidates(&path, &source, candidates);
         }
         if hook_cache_flow {
             collect_hook_cache_shape_candidates(&path, &source, candidates);
@@ -1301,6 +1322,11 @@ fn packet_generic_source_shape_candidate_path(project_root: &Path, path: &Path) 
                     | "cxx"
                     | "cs"
                     | "dart"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "rs"
+                    | "swift"
             )
         })
         .unwrap_or(false)
@@ -1813,6 +1839,342 @@ fn collect_form_validation_shape_candidates(
             eligible_for_sufficiency: true,
         });
     }
+    if source_lower.contains("pattern=") {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "pattern".to_string(),
+            kind: NodeKind::ANNOTATION,
+            line: packet_source_line_containing(source, "pattern").unwrap_or(1),
+            score: 130.0,
+            coverage_role: "form_pattern_constraint".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    if let Some((attribute, line)) = packet_first_form_validation_bypass_attribute(source) {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: attribute,
+            kind: NodeKind::ANNOTATION,
+            line,
+            score: 129.0,
+            coverage_role: "form_validation_bypass".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    if let Some(input_id) = packet_first_html_input_id(source) {
+        let score = if packet_first_form_validation_bypass_attribute(source).is_some()
+            || source_lower.contains("validity")
+        {
+            132.0
+        } else {
+            128.0
+        };
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("input#{input_id}"),
+            kind: NodeKind::ANNOTATION,
+            line: packet_source_line_containing(source, &format!("id=\"{input_id}\""))
+                .or_else(|| packet_source_line_containing(source, &format!("id='{input_id}'")))
+                .unwrap_or(1),
+            score,
+            coverage_role: "form_custom_input".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    if let Some((function, line)) = packet_first_form_validation_error_function(source) {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: function,
+            kind: NodeKind::FUNCTION,
+            line,
+            score: 134.0,
+            coverage_role: "form_custom_error_rendering".to_string(),
+            producer: "packet_generic_form_validation_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_buffered_io_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "kt" | "java" | "swift" | "go" | "rs") {
+        return;
+    }
+    let buffered_type_names = packet_buffered_io_type_names(source);
+    for (display_name, role, score, line) in &buffered_type_names {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: display_name.clone(),
+            kind: NodeKind::CLASS,
+            line: *line,
+            score: *score,
+            coverage_role: (*role).to_string(),
+            producer: "packet_generic_buffered_io_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    let source_lower = source.to_ascii_lowercase();
+    if source_lower.contains("buffer()") && !buffered_type_names.is_empty() {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: "buffer".to_string(),
+            kind: NodeKind::FUNCTION,
+            line: packet_source_line_containing(source, "buffer()").unwrap_or(1),
+            score: 134.0,
+            coverage_role: "buffered_wrapper_helper".to_string(),
+            producer: "packet_generic_buffered_io_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_buffered_io_type_names(source: &str) -> Vec<(String, &'static str, f32, u32)> {
+    let mut names = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let Some(name) = packet_declared_type_name(line) else {
+            continue;
+        };
+        let normalized = name.to_ascii_lowercase();
+        if !normalized.contains("buffered") {
+            continue;
+        }
+        let Some((role, score)) = packet_buffered_io_role(&normalized) else {
+            continue;
+        };
+        names.push((
+            name,
+            role,
+            score,
+            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+        ));
+    }
+    names
+}
+
+fn packet_declared_type_name(line: &str) -> Option<String> {
+    let mut words = line
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|word| !word.is_empty());
+    while let Some(word) = words.next() {
+        if matches!(word, "class" | "struct" | "interface" | "object") {
+            return words.next().map(|name| name.to_string());
+        }
+    }
+    None
+}
+
+fn packet_buffered_io_role(normalized_name: &str) -> Option<(&'static str, f32)> {
+    if normalized_name.ends_with("source") {
+        return Some(("buffered_source_impl", 136.0));
+    }
+    if normalized_name.ends_with("sink") {
+        return Some(("buffered_sink_impl", 135.0));
+    }
+    None
+}
+
+fn collect_url_session_request_shape_candidates(
+    path: &Path,
+    source: &str,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if extension != "swift" {
+        return;
+    }
+    let source_lower = source.to_ascii_lowercase();
+    let type_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("Request");
+    if source_lower.contains("func resume")
+        && (source_lower.contains("task.resume") || source_lower.contains("task?.resume"))
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("{type_name}.resume"),
+            kind: NodeKind::METHOD,
+            line: packet_source_line_containing(source, "func resume").unwrap_or(1),
+            score: 136.0,
+            coverage_role: "request_resume_dispatch".to_string(),
+            producer: "packet_generic_url_session_request_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    if source_lower.contains("func validate")
+        && (source_lower.contains("validators") || source_lower.contains("validation"))
+    {
+        let score = if type_name.to_ascii_lowercase().contains("data") {
+            138.0
+        } else {
+            135.0
+        };
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("{type_name}.validate"),
+            kind: NodeKind::METHOD,
+            line: packet_source_line_containing(source, "func validate").unwrap_or(1),
+            score,
+            coverage_role: "request_validation_pipeline".to_string(),
+            producer: "packet_generic_url_session_request_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+    if source_lower.contains("urlsession")
+        && source_lower.contains("func urlsession")
+        && (source_lower.contains("didreceive") || source_lower.contains("didcomplete"))
+    {
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: path.to_path_buf(),
+            display_name: format!("{type_name}.urlSession"),
+            kind: NodeKind::METHOD,
+            line: packet_source_line_containing(source, "func urlSession").unwrap_or(1),
+            score: 137.0,
+            coverage_role: "session_callbacks".to_string(),
+            producer: "packet_generic_url_session_request_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn collect_cited_request_validation_shape_candidates(
+    project_root: &Path,
+    answer: &AgentAnswerDto,
+    candidates: &mut Vec<PacketGenericSourceShapeCandidate>,
+) {
+    for citation in &answer.citations {
+        let Some(path) = citation.file_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        let source_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.join(path)
+        };
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("swift"))
+        {
+            continue;
+        }
+        let Some(type_name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if normalize_identifier(type_name) != normalize_identifier(&citation.display_name) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&source_path) else {
+            continue;
+        };
+        if !packet_swift_request_validation_source(&source) {
+            continue;
+        }
+        candidates.push(PacketGenericSourceShapeCandidate {
+            path: source_path,
+            display_name: format!("{}.validate", citation.display_name),
+            kind: NodeKind::METHOD,
+            line: packet_source_line_containing(&source, "func validate").unwrap_or(1),
+            score: 140.0,
+            coverage_role: "request_validation_pipeline".to_string(),
+            producer: "packet_generic_url_session_request_source_probe".to_string(),
+            eligible_for_sufficiency: true,
+        });
+    }
+}
+
+fn packet_swift_request_validation_source(source: &str) -> bool {
+    let source_lower = source.to_ascii_lowercase();
+    source_lower.contains("func validate")
+        && source_lower.contains("request")
+        && (source_lower.contains("validators") || source_lower.contains("validation"))
+}
+
+fn packet_first_form_validation_bypass_attribute(source: &str) -> Option<(String, u32)> {
+    for (index, line) in source.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("<form") {
+            continue;
+        }
+        for attribute in line.split_ascii_whitespace() {
+            let attribute = attribute
+                .trim_matches(|ch: char| ch == '<' || ch == '>' || ch == '/')
+                .split('=')
+                .next()
+                .unwrap_or_default();
+            let normalized = attribute.to_ascii_lowercase();
+            if normalized.starts_with("no") && normalized.ends_with("validate") {
+                return Some((
+                    attribute.to_string(),
+                    index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn packet_first_html_input_id(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("<input") || !lower.contains("id=") {
+            continue;
+        }
+        for quote in ['"', '\''] {
+            let marker = format!("id={quote}");
+            let Some(start) = lower.find(&marker) else {
+                continue;
+            };
+            let value_start = start + marker.len();
+            let value = &line[value_start..];
+            let Some(end) = value.find(quote) else {
+                continue;
+            };
+            let id = value[..end].trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn packet_first_form_validation_error_function(source: &str) -> Option<(String, u32)> {
+    let source_lower = source.to_ascii_lowercase();
+    if !(source_lower.contains("validity.valuemissing")
+        || source_lower.contains("validity.typemismatch")
+        || source_lower.contains("validity.tooshort"))
+    {
+        return None;
+    }
+    source.lines().enumerate().find_map(|(index, line)| {
+        let trimmed = line.trim();
+        let name = trimmed.strip_prefix("function ")?.split_once('(')?.0.trim();
+        if name.is_empty() || !name.chars().all(packet_source_identifier_char) {
+            return None;
+        }
+        let normalized = normalize_identifier(name);
+        (normalized.contains("error") || normalized.contains("message")).then_some((
+            name.to_string(),
+            index.saturating_add(1).try_into().unwrap_or(u32::MAX),
+        ))
+    })
 }
 
 fn packet_source_line_containing(source: &str, needle: &str) -> Option<u32> {
@@ -5463,6 +5825,7 @@ mod tests {
                 total_elapsed_ms: None,
                 sidecar_stage_count: 0,
                 sidecar_stage_total_ms: None,
+                batch_query_wall_ms: None,
                 candidate_count: 1,
                 resolved_hit_count: 0,
                 unresolved_candidate_count: 1,
@@ -5481,6 +5844,7 @@ mod tests {
                 total_elapsed_ms: None,
                 sidecar_stage_count: 0,
                 sidecar_stage_total_ms: None,
+                batch_query_wall_ms: None,
                 candidate_count: 1,
                 resolved_hit_count: 0,
                 unresolved_candidate_count: 1,
@@ -12448,6 +12812,35 @@ mod tests {
             </form>
             "#,
         );
+        write_packet_fixture_file(
+            &root,
+            "lessons/forms/pattern-example.html",
+            r#"
+            <form>
+              <input id="fruit" required pattern="[a-z]+">
+            </form>
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "lessons/forms/custom-validation.html",
+            r#"
+            <form novalidate>
+              <input id="mail" type="email" required>
+            </form>
+            <script>
+              function showError() {
+                if (mail.validity.valueMissing) {
+                  error.textContent = "Email required";
+                } else if (mail.validity.typeMismatch) {
+                  error.textContent = "Email invalid";
+                } else if (mail.validity.tooShort) {
+                  error.textContent = "Email too short";
+                }
+              }
+            </script>
+            "#,
+        );
 
         let mut answer = packet_answer_fixture(
             "Explain how form validation examples combine native HTML constraints with custom JavaScript validation.",
@@ -12466,6 +12859,228 @@ mod tests {
                     && citation.eligible_for_sufficiency == Some(true)
             }),
             "expected native constraint source shape: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "pattern"
+                    && citation.coverage_role.as_deref() == Some("form_pattern_constraint")
+            }),
+            "expected pattern-only form source shape: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "novalidate"
+                    && citation.coverage_role.as_deref() == Some("form_validation_bypass")
+            }),
+            "expected novalidate source shape: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "input#mail"
+                    && citation.coverage_role.as_deref() == Some("form_custom_input")
+            }),
+            "expected input id source shape: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "showError"
+                    && citation.coverage_role.as_deref() == Some("form_custom_error_rendering")
+            }),
+            "expected custom error rendering source shape: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_buffered_io_anchors() {
+        let root = packet_temp_root("generic-source-shape-buffered-io");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "src/io/RealBufferedSource.kt",
+            r#"
+            internal class RealBufferedSource(val source: Source) {
+              val buffer = Buffer()
+              fun read(sink: Buffer, byteCount: Long): Long = source.read(buffer, byteCount)
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "src/io/Okio.kt",
+            r#"
+            fun Source.buffer(): BufferedSource = RealBufferedSource(this)
+            fun Sink.buffer(): BufferedSink = RealBufferedSink(this)
+            "#,
+        );
+
+        let prompt = "Explain how Buffer, Source, Sink, and buffered wrappers cooperate to move bytes through reads and writes.";
+        let mut answer = packet_answer_fixture(prompt, Vec::new());
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "RealBufferedSource"
+                    && citation.coverage_role.as_deref() == Some("buffered_source_impl")
+            }),
+            "expected buffered source implementation anchor: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "buffer"
+                    && citation.coverage_role.as_deref() == Some("buffered_wrapper_helper")
+            }),
+            "expected buffered wrapper helper anchor: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_url_session_request_anchors() {
+        let root = packet_temp_root("generic-source-shape-urlsession");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "Source/Core/Request.swift",
+            r#"
+            open class Request {
+              public func resume() -> Self {
+                task?.resume()
+                return self
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "Source/Core/DataRequest.swift",
+            r#"
+            open class DataRequest: Request {
+              public func validate(_ validation: @escaping Validation) -> Self {
+                validators.write { $0.append(validation) }
+                return self
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "Source/Core/DownloadRequest.swift",
+            r#"
+            open class DownloadRequest: Request {
+              public func validate(_ validation: @escaping Validation) -> Self {
+                validators.write { $0.append(validation) }
+                return self
+              }
+            }
+            "#,
+        );
+        write_packet_fixture_file(
+            &root,
+            "Source/Core/SessionDelegate.swift",
+            r#"
+            open class SessionDelegate: NSObject, URLSessionDataDelegate {
+              open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                request.didReceive(data: data)
+              }
+              open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                request.didReceiveResponse(nil)
+              }
+            }
+            "#,
+        );
+
+        let prompt = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
+        let mut answer = packet_answer_fixture(prompt, Vec::new());
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "Request.resume"
+                    && citation.coverage_role.as_deref() == Some("request_resume_dispatch")
+            }),
+            "expected request resume source anchor: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "DataRequest.validate"
+                    && citation.coverage_role.as_deref() == Some("request_validation_pipeline")
+            }),
+            "expected request validation source anchor: {:?}",
+            answer.citations
+        );
+        let data_rank = answer
+            .citations
+            .iter()
+            .position(|citation| citation.display_name == "DataRequest.validate")
+            .expect("DataRequest.validate anchor");
+        let download_rank = answer
+            .citations
+            .iter()
+            .position(|citation| citation.display_name == "DownloadRequest.validate")
+            .expect("DownloadRequest.validate anchor");
+        assert!(
+            data_rank < download_rank,
+            "data-bearing request validation should outrank sibling validation anchors: {:?}",
+            answer.citations
+        );
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "SessionDelegate.urlSession"
+                    && citation.coverage_role.as_deref() == Some("session_callbacks")
+            }),
+            "expected URLSession delegate callback source anchor: {:?}",
+            answer.citations
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generic_source_shape_scan_adds_cited_request_validation_anchor() {
+        let root = packet_temp_root("generic-source-shape-cited-urlsession");
+        let _ = std::fs::remove_dir_all(&root);
+        write_packet_fixture_file(
+            &root,
+            "Example/BodyRequest.swift",
+            r#"
+            open class BodyRequest: Request {
+              public func validate(_ validation: @escaping Validation) -> Self {
+                validators.write { $0.append(validation) }
+                eventMonitor?.request(self, didValidateRequest: request)
+                return self
+              }
+            }
+            "#,
+        );
+
+        let prompt = "Trace how a Session creates requests, resumes tasks, validates data requests, and receives URLSession callbacks.";
+        let mut answer = packet_answer_fixture(
+            prompt,
+            vec![test_packet_citation(
+                "BodyRequest",
+                "Example/BodyRequest.swift",
+                0.9,
+            )],
+        );
+        maybe_append_generic_source_shape_citations(&root, prompt, &mut answer);
+
+        assert!(
+            answer.citations.iter().any(|citation| {
+                citation.display_name == "BodyRequest.validate"
+                    && citation.coverage_role.as_deref() == Some("request_validation_pipeline")
+            }),
+            "expected cited request validation source anchor: {:?}",
             answer.citations
         );
 

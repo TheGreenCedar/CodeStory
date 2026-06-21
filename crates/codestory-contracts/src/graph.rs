@@ -1,3 +1,11 @@
+//! Core source graph contracts.
+//!
+//! The graph model is persisted and re-exposed through API DTOs, so ids, enum
+//! discriminants, source locations, and resolution metadata carry compatibility
+//! meaning. Producers may add richer analysis, but callers should treat these
+//! types as evidence records: unresolved endpoints and low-certainty edges are
+//! still useful diagnostics, not proof of an exact semantic relationship.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -18,6 +26,10 @@ pub use location_type::LocationType;
 pub use node_type::{BundleInfo, NodeType};
 pub use token_component::{Token, TokenComponent};
 
+/// Stable identifier for a graph node in one indexed store.
+///
+/// The numeric value is store-local, not a cross-repo identity. Use
+/// `canonical_id` or qualified names when a caller needs a durable symbol key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub i64);
 
@@ -27,9 +39,15 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Stable identifier for a graph edge in one indexed store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EdgeId(pub i64);
 
+/// Source graph node classification.
+///
+/// Variants intentionally mirror the persisted Sourcetrail-style integer
+/// discriminants. Append-only changes are safer than reordering existing
+/// variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(non_camel_case_types)]
 #[repr(i32)]
@@ -118,6 +136,10 @@ impl TryFrom<i32> for NodeKind {
     }
 }
 
+/// Source graph edge classification.
+///
+/// These variants describe observed or resolved relationships. `UNKNOWN` keeps
+/// imperfect extraction visible instead of dropping evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(non_camel_case_types)]
 #[repr(i32)]
@@ -174,6 +196,10 @@ impl TryFrom<i32> for EdgeKind {
     }
 }
 
+/// Confidence bucket for a resolved graph relationship.
+///
+/// This is diagnostic evidence. `Certain` is still an extractor confidence
+/// claim, not a guarantee that runtime behavior follows the edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResolutionCertainty {
@@ -223,6 +249,7 @@ impl FromStr for ResolutionCertainty {
     }
 }
 
+/// Persisted graph node with optional source span and durable names.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Node {
     pub id: NodeId,
@@ -237,6 +264,12 @@ pub struct Node {
     pub end_col: Option<u32>,
 }
 
+/// Persisted graph edge with raw and optionally resolved endpoints.
+///
+/// `source` and `target` retain the extracted relationship. `resolved_source`
+/// and `resolved_target` are product evidence for the best-known typed
+/// endpoints; callers that need the semantic endpoint should use
+/// `effective_source`, `effective_target`, or `effective_endpoints`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Edge {
     pub id: EdgeId,

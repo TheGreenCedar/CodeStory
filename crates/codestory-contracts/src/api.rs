@@ -1,3 +1,11 @@
+//! API-facing DTOs and mirrored enum types.
+//!
+//! These exports are the boundary between the runtime and external callers such
+//! as CLI JSON, UI bindings, and generated TypeScript types. The Rust names may
+//! look close to the core graph model, but the serialized forms are product
+//! contracts: preserve field names, serde aliases, defaults, and enum casing
+//! unless every caller can migrate in lockstep.
+
 mod dto;
 mod errors;
 mod events;

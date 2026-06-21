@@ -6,11 +6,14 @@ use super::types::{
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+/// Request to open or bind the runtime to a project root.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct OpenProjectRequest {
+    /// Filesystem path supplied by the caller; producers normalize it before use.
     pub path: String,
 }
 
+/// Grounding output budget requested by callers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GroundingBudgetDto {
@@ -20,6 +23,10 @@ pub enum GroundingBudgetDto {
     Max,
 }
 
+/// Store counts returned in project summaries and diagnostics.
+///
+/// Counts are product evidence for the indexed store at response time. They are
+/// encoded as `u32` so generated TypeScript can keep using plain `number`.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct StorageStatsDto {
     // Use u32 so TS can safely represent these as `number` without BigInt.
@@ -31,6 +38,7 @@ pub struct StorageStatsDto {
     pub fatal_error_count: u32,
 }
 
+/// Project-level summary returned after opening or indexing a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ProjectSummary {
     pub root: String,
@@ -76,6 +84,7 @@ pub struct SearchRequest {
     pub hybrid_limits: Option<SearchHybridLimitsDto>,
 }
 
+/// Search hit provenance before downstream reranking or packet admission.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchHitOrigin {
@@ -92,6 +101,10 @@ impl SearchHitOrigin {
     }
 }
 
+/// Match-quality label for ranking and diagnostics.
+///
+/// These values explain why a hit appeared; they do not by themselves prove the
+/// hit is sufficient evidence for an answer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMatchQualityDto {
@@ -103,6 +116,13 @@ pub enum SearchMatchQualityDto {
     RepoText,
 }
 
+/// Evidence provenance tier used by packet/search/citation surfaces.
+///
+/// Tiers are compatibility values. `ExactSource`, `ResolvedGraph`,
+/// `LexicalSource`, `SymbolDoc`, `ComponentReport`, and `DenseSemantic` are
+/// product evidence from indexed or sidecar sources. `SyntheticSourceScan` and
+/// `GeneratedSummary` are diagnostic or presentation evidence and should not be
+/// treated as source truth without a follow-up read.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketEvidenceTierDto {
@@ -116,6 +136,11 @@ pub enum PacketEvidenceTierDto {
     GeneratedSummary,
 }
 
+/// Whether a hit or citation resolved to a graph/source target.
+///
+/// `Resolved` is product evidence for a typed graph target. `SourceRangeOnly`
+/// is exact-source evidence without typed graph resolution. `Unresolved` and
+/// `DiagnosticOnly` are useful for troubleshooting but are not answer proof.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketEvidenceResolutionDto {
@@ -125,6 +150,7 @@ pub enum PacketEvidenceResolutionDto {
     DiagnosticOnly,
 }
 
+/// Current retrieval mode advertised to callers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalModeDto {
@@ -132,6 +158,7 @@ pub enum RetrievalModeDto {
     Symbolic,
 }
 
+/// Why hybrid retrieval could not use the semantic path.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalFallbackReasonDto {
@@ -141,6 +168,7 @@ pub enum RetrievalFallbackReasonDto {
     DegradedRuntime,
 }
 
+/// Semantic retrieval readiness state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModeDto {
@@ -156,6 +184,11 @@ pub struct SemanticFallbackRecordDto {
     pub reason: String,
 }
 
+/// Retrieval readiness and embedding compatibility visible to callers.
+///
+/// This is product evidence for the active index/retrieval surface. Diagnostic
+/// fallback fields explain why richer retrieval was not used; callers should
+/// not treat fallback output as equivalent to full sidecar readiness.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct RetrievalStateDto {
     pub mode: RetrievalModeDto,
@@ -176,6 +209,10 @@ pub struct RetrievalStateDto {
     pub fallback_message: Option<String>,
 }
 
+/// Embedding profile expected by the current runtime.
+///
+/// These fields are compatibility evidence used to compare active runtime
+/// configuration with stored semantic docs.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct EmbeddingProfileContractDto {
     pub profile: String,
@@ -187,6 +224,10 @@ pub struct EmbeddingProfileContractDto {
     pub doc_shape: String,
 }
 
+/// Semantic document profile stored in the index cache.
+///
+/// `mixed_*` flags are diagnostic evidence that the cache was built from more
+/// than one profile/model/backend/dimension/doc-shape and may need repair.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct StoredSemanticDocsContractDto {
     pub doc_count: u32,
@@ -257,6 +298,7 @@ pub struct IndexFreshnessDto {
     pub samples: Vec<IndexFreshnessSampleDto>,
 }
 
+/// Readiness goal being evaluated.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessGoalDto {
@@ -264,6 +306,7 @@ pub enum ReadinessGoalDto {
     AgentPacketSearch,
 }
 
+/// Repair-oriented readiness status.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessStatusDto {
@@ -273,6 +316,7 @@ pub enum ReadinessStatusDto {
     RepairRetrieval,
 }
 
+/// Index state snapshot used inside readiness verdicts.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ReadinessIndexSnapshotDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,6 +332,7 @@ pub struct ReadinessIndexSnapshotDto {
     pub indexed_file_count: u32,
 }
 
+/// Sidecar state snapshot used inside readiness verdicts.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ReadinessSidecarSnapshotDto {
     pub retrieval_mode: String,
@@ -299,6 +344,11 @@ pub struct ReadinessSidecarSnapshotDto {
     pub manifest_input_hash: Option<String>,
 }
 
+/// Readiness verdict for a caller goal.
+///
+/// `status` is the contract callers should branch on. `summary`,
+/// `minimum_next`, and `full_repair` are presentation/operation guidance. The
+/// optional snapshots are diagnostic evidence for explaining the verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ReadinessVerdictDto {
     pub goal: ReadinessGoalDto,
@@ -314,6 +364,11 @@ pub struct ReadinessVerdictDto {
     pub sidecar: Option<ReadinessSidecarSnapshotDto>,
 }
 
+/// Search result row shared by search, citations, and packet evidence.
+///
+/// Ranking fields (`score`, `score_breakdown`, `match_quality`) are diagnostic
+/// evidence. `evidence_tier`, `resolution_status`, `coverage_role`, and
+/// `eligible_for_sufficiency` control whether a hit may support an answer.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub node_id: NodeId,
@@ -536,6 +591,11 @@ pub struct SearchPlanDto {
     pub source_truth_checks: Vec<String>,
 }
 
+/// Search response with product hits and optional diagnostics.
+///
+/// `hits` is the merged presentation list. Source-specific lists and shadow
+/// fields are compatibility/diagnostic surfaces for callers that need to audit
+/// provenance, fallback, or sidecar behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
@@ -597,6 +657,10 @@ pub struct IndexedFileDto {
     pub error_count: u32,
 }
 
+/// Per-language file count and support claim shown in indexed-file summaries.
+///
+/// `support_mode` and `evidence_tier` are product evidence from
+/// `language_support`; `claim_label` is presentation text.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct IndexedFileLanguageCountDto {
     pub language: String,
@@ -632,6 +696,12 @@ pub struct IndexedFilesDto {
     pub files: Vec<IndexedFileDto>,
 }
 
+/// Framework route coverage reported by indexed-file diagnostics.
+///
+/// `coverage_evidence`, `confidence_floor`, `handler_link_support`,
+/// `unsupported_patterns`, and `known_gaps` are product evidence boundaries.
+/// The `fixture_status` alias is backward compatibility only; new JSON should
+/// emit `coverage_evidence`.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct FrameworkRouteCoverageDto {
     pub framework: String,
@@ -1006,6 +1076,11 @@ pub enum CanonicalMemberVisibility {
     Default,
 }
 
+/// Trail request DTO used by API callers.
+///
+/// The shape is serialized API surface. `hide_speculative` filters uncertain
+/// evidence from presentation; it does not alter the graph. `story` asks the
+/// runtime to add narrative grouping when available.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct TrailConfigDto {
     pub root_id: NodeId,
@@ -1381,6 +1456,10 @@ pub struct SearchHybridLimitsDto {
     pub semantic: Option<u32>,
 }
 
+/// Request for answer-oriented retrieval.
+///
+/// `include_evidence` defaults to true because callers should preserve the
+/// source and readiness evidence needed to audit an answer.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentAskRequest {
     pub prompt: String,
@@ -1604,6 +1683,10 @@ pub struct RetrievalCandidateResolutionCountDto {
 }
 
 /// Shadow sidecar retrieval diagnostics emitted alongside packet output.
+///
+/// This is diagnostic evidence for sidecar behavior and loss points. It should
+/// not be promoted to product readiness by itself; use `RetrievalStateDto` and
+/// packet sufficiency for caller decisions.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct RetrievalShadowDto {
     pub retrieval_mode: String,
@@ -1650,6 +1733,8 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub sidecar_stage_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_stage_total_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_query_wall_ms: Option<u32>,
     pub candidate_count: u32,
     pub resolved_hit_count: u32,
     pub unresolved_candidate_count: u32,
@@ -1695,6 +1780,10 @@ pub struct AgentAnswerDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
 }
 
+/// Evidence item kind in a packet.
+///
+/// Variants identify where evidence came from. `Negative` records absence or a
+/// rejected path and must not be counted as supporting proof.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceTypeDto {
@@ -1738,6 +1827,11 @@ pub struct EvidenceSourceLocationDto {
     pub line_end: Option<u32>,
 }
 
+/// One evidence row inside an evidence packet.
+///
+/// The row is auditable diagnostic/product evidence depending on
+/// `evidence_type`, `verification_status`, and optional source location. Artifact
+/// paths point to supporting files; they are not serialized source content.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct EvidenceItemDto {
     pub id: String,
@@ -1766,6 +1860,10 @@ pub struct SourceTruthCheckDto {
     pub required: bool,
 }
 
+/// Answer-readiness summary for packet consumers.
+///
+/// `safe_to_say` is supported output. `inferred_claims` and
+/// `needs_verification` are explicit non-claims until the listed checks pass.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AnswerReadinessReportDto {
     pub overall_status: ClaimReadinessDto,
@@ -1928,6 +2026,11 @@ pub struct PacketRetrievalTraceSummaryDto {
     pub trail_steps: u32,
 }
 
+/// Packet response for source-grounded answer workflows.
+///
+/// This is a compatibility surface for budget, sufficiency, answer, and
+/// retrieval-trace semantics. `sufficiency.status` is the primary readiness
+/// decision; budget truncation or diagnostic traces should not override it.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentPacketDto {
     pub packet_id: String,
@@ -2038,6 +2141,7 @@ mod packet_tests {
             total_elapsed_ms: Some(20),
             sidecar_stage_count: 2,
             sidecar_stage_total_ms: Some(16),
+            batch_query_wall_ms: Some(19),
             candidate_count: 5,
             resolved_hit_count: 4,
             unresolved_candidate_count: 1,
@@ -2050,11 +2154,13 @@ mod packet_tests {
         assert_eq!(value["total_elapsed_ms"], 20);
         assert_eq!(value["sidecar_stage_count"], 2);
         assert_eq!(value["sidecar_stage_total_ms"], 16);
+        assert_eq!(value["batch_query_wall_ms"], 19);
 
         let parsed: PacketSidecarQueryDiagnosticDto =
             serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed.total_elapsed_ms, Some(20));
         assert_eq!(parsed.sidecar_stage_total_ms, Some(16));
+        assert_eq!(parsed.batch_query_wall_ms, Some(19));
     }
 
     #[test]

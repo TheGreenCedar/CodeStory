@@ -16,6 +16,11 @@
 - Backend build/test: `cargo build`, `cargo test`, `cargo check`, `cargo fmt`, `cargo clippy`.
 - CLI runtime: `cargo run --release -p codestory-cli -- index --project .`.
 - Skill-first grounding: `cargo run --release -p codestory-cli -- ground --project .`.
+- Codex worktree setup runs `scripts/codex-worktree-setup.ps1` before the thread
+  starts: it resolves a ready CLI from `CODESTORY_CLI`, PATH, this worktree, or a
+  sibling worktree before building with `sccache`; then it tries `cache
+  rehydrate`, refreshes the SQLite index, and best-effort refreshes retrieval
+  sidecars/status.
 - Release version checks: `python .github/scripts/check-codestory-release.py --version <version>` and `node .github/scripts/check-workflow-policy.mjs`.
 - On Windows, the Codex npm shim should be invoked as `codex.cmd` (typically under `%APPDATA%\\npm`); using the extensionless `codex` shim can fail with `os error 193`.
 - In this PowerShell environment, large parallel file reads can truncate output; when investigating a single large file, prefer one direct read command (for example `Get-Content` or `cmd /c type`) before parallelizing.
@@ -39,6 +44,11 @@
 ## Commit & Pull Request Guidelines
 - Commit messages are short, lowercase, imperative (e.g., `fix minimap`, `refactor graph style`).
 - PRs should include a summary, tests run, linked issues, and relevant artifacts for behavior changes.
+- Routine implementation PRs branch from and target `dev/codestory-next`. Do not target `main` directly unless the lane is an explicit release, hotfix, final comparison/review artifact, or promotion.
+- Agent branches should use the `codex/` prefix by default. Saga comparison/review branches may use `review/codestory-saga-*` when the branch exists only to support a reviewer comparison.
+- The saga issue-link guard applies to `codex/*` heads, `review/codestory-saga-*` heads, `[codex]` PR titles, and PRs labeled `saga:codestory-intelligence`. Guarded PRs must include a closing issue reference (`Closes #123`, `Fixes #123`, `Resolves #123`, or the full GitHub issue URL) for the PR-sized issue. Use `Refs #...` only for broader parents or related context. For PRs targeting `dev/codestory-next`, add both the issue and PR to the Project because GitHub's computed Linked pull requests field may not populate until default-branch promotion.
+- If a slice is partial under a larger saga, create or use a PR-sized child issue and close that issue in the PR body; do not close the parent until its acceptance criteria are actually met.
+- Keep release comparisons, ledgers, and generated pre-release evidence in PR bodies, issue comments, project updates, or external artifacts. Do not commit generated comparison docs/CSVs/SVGs into the repo unless they are intended to become durable product documentation.
 
 ## Release Guidelines
 - `crates/codestory-cli/Cargo.toml` is the release version source.

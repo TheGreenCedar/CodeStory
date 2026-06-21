@@ -1,3 +1,10 @@
+//! JSON-lines stdio transport for the local integration server.
+//!
+//! `serve --stdio` reads one JSON-RPC request per stdin line and writes one
+//! JSON response per stdout line. Protocol errors are returned as JSON-RPC
+//! errors; tool execution failures are encoded as tool-call results so clients
+//! can display structured failure content without losing the response envelope.
+
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
@@ -29,6 +36,10 @@ use std::time::Instant;
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 
+/// Run the stdio server until stdin closes.
+///
+/// The server is local, stateful only for small packet/search caches, and keeps
+/// telemetry on stderr so stdout remains a newline-delimited JSON stream.
 pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

@@ -1,4 +1,10 @@
-//! Structural-language entity collectors (HTML, CSS, SQL) with explicit node/edge mapping.
+//! Structural entity collectors with exact source-span anchors.
+//!
+//! Structural collectors cover source formats where CodeStory can extract
+//! useful evidence without claiming parser-backed language support. They emit
+//! file rows, nodes, edges, occurrences, and callable projection state with
+//! conservative certainty. Callers should present this output as structural
+//! source proof, not as semantic resolution or full graph coverage.
 
 mod blanking;
 mod cargo_manifest;
@@ -13,6 +19,7 @@ pub use blanking::{
     EmbeddedRegion, EmbeddedRegionKind, blank_non_script_regions, blank_outside_regions,
     extract_embedded_regions,
 };
+/// Return the structural language label stored for `path`.
 pub fn structural_language_name(path: &Path) -> &'static str {
     common::structural_language_name(path)
 }
@@ -25,6 +32,11 @@ use codestory_contracts::language_support::{
 };
 use std::path::Path;
 
+/// Return whether `path` is routed to a structural collector.
+///
+/// YAML/TOML admission is path-scoped for known workflow, compose, and Cargo
+/// manifest conventions. Generic YAML and TOML files are intentionally not
+/// admitted here.
 pub fn is_structural_candidate_path(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
     if is_github_actions_workflow_path(path_text.as_ref())
@@ -39,11 +51,13 @@ pub fn is_structural_candidate_path(path: &Path) -> bool {
     )
 }
 
+/// Read and structurally index a file from disk.
 pub fn index_structural_file(path: &Path) -> Result<IntermediateStorage> {
     let source = std::fs::read_to_string(path)?;
     index_structural_source(path, &source)
 }
 
+/// Add CSS entities extracted from an embedded template style block.
 pub fn collect_embedded_style_css(
     path: &Path,
     style_source: &str,
@@ -54,6 +68,10 @@ pub fn collect_embedded_style_css(
     css::collect_css_entities(path, style_source, file_id, storage, line_offset);
 }
 
+/// Structurally index source text for an already admitted path.
+///
+/// The returned storage is ready to merge into a projection batch and includes
+/// callable projection state derived from the structural edges.
 pub fn index_structural_source(path: &Path, source: &str) -> Result<IntermediateStorage> {
     let mut storage = IntermediateStorage::default();
     let (file_node, _file_name, file_id) = crate::file_node_from_source(path, source);

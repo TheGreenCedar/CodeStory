@@ -191,11 +191,40 @@ impl QdrantClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<super::CandidateHit>> {
+        let vector = query_vector(query)?;
+        self.search_vector(collection, &vector, limit)
+    }
+
+    /// Diagnostic-only vector lookup against Qdrant without query embedding.
+    ///
+    /// Product retrieval must keep using [`QdrantClient::search`] so query
+    /// embedding and Qdrant lookup stay in the mandatory sidecar path.
+    pub fn diagnostic_search_vector(
+        &self,
+        collection: &str,
+        vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<super::CandidateHit>> {
+        self.search_vector(collection, vector, limit)
+    }
+
+    fn search_vector(
+        &self,
+        collection: &str,
+        vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<super::CandidateHit>> {
         if !qdrant_enabled() {
             bail!("qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
         }
+        let expected_dim = active_vector_dim();
+        if vector.len() != expected_dim {
+            bail!(
+                "qdrant query vector dim mismatch: vector={} expected={expected_dim}",
+                vector.len()
+            );
+        }
         let url = format!("{}/collections/{collection}/points/query", self.base_url);
-        let vector = query_vector(query)?;
         let body = serde_json::json!({
             "query": vector,
             "limit": limit,
@@ -542,6 +571,14 @@ fn query_vector(query: &str) -> Result<Vec<f32>> {
     } else {
         Ok(embeddings::label_to_vector(query))
     }
+}
+
+/// Diagnostic-only helper for offline vector-index parity checks.
+///
+/// Product retrieval must keep using [`QdrantClient::search`], which embeds and
+/// queries the mandatory Qdrant sidecar collection in one fail-closed path.
+pub fn diagnostic_query_vector(query: &str) -> Result<Vec<f32>> {
+    query_vector(query)
 }
 
 fn document_vectors(labels: &[String]) -> Result<Vec<Vec<f32>>> {

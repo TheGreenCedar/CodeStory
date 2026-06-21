@@ -1,3 +1,11 @@
+//! Command-line argument and serialized output contracts.
+//!
+//! The types in this module are the public integration shape of the CLI crate:
+//! `clap` reads command arguments into these structs, and `serde` writes many of
+//! them as `--format json` responses. Keep field names, enum casing, aliases,
+//! and `skip_serializing_if` behavior stable unless the command output contract
+//! is intentionally changing.
+
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
@@ -30,12 +38,20 @@ For agent packet/search readiness, first run retrieval bootstrap + retrieval ind
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
+/// Top-level CLI parser.
+///
+/// `Command` is the dispatch boundary used by `main`; adding a variant here
+/// requires a matching handler and output contract decision.
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
 #[derive(Subcommand, Debug)]
+/// Subcommands exposed by the executable.
+///
+/// Variants should stay thin: argument validation that affects help text lives
+/// in `clap` attributes, while runtime validation belongs in the handler.
 pub(crate) enum Command {
     #[command(about = "Build or refresh the repository index.")]
     Index(IndexCommand),
@@ -86,6 +102,10 @@ pub(crate) enum Command {
 }
 
 #[derive(Args, Debug, Clone)]
+/// Shared project and cache selector for commands that operate on a repository.
+///
+/// `project` is canonicalized by `RuntimeContext`; `cache_dir` is an exact
+/// override and bypasses the per-project hashed cache root.
 pub(crate) struct ProjectArgs {
     #[arg(
         long,
@@ -102,6 +122,10 @@ pub(crate) struct ProjectArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// Output family requested by a command.
+///
+/// Markdown and JSON go through `output::emit`; DOT is intentionally accepted
+/// only by graph-producing handlers that short-circuit to text emission.
 pub(crate) enum OutputFormat {
     Markdown,
     Json,
@@ -131,6 +155,10 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// Index refresh policy requested by a command.
+///
+/// The runtime resolves `Auto` against the current cache summary before any
+/// indexing work starts. Read-oriented commands usually default to `None`.
 pub(crate) enum RefreshMode {
     Auto,
     Full,
@@ -1240,6 +1268,10 @@ pub(crate) struct GenerateCompletionsCommand {
 }
 
 #[derive(Debug, Serialize)]
+/// JSON contract for `index`.
+///
+/// The markdown renderer is presentation-only; these fields are the machine
+/// contract for callers using `--format json`.
 pub(crate) struct IndexOutput<'a> {
     pub(crate) project: &'a str,
     pub(crate) storage_path: &'a str,
@@ -1274,6 +1306,10 @@ pub(crate) enum QuerySelectorOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Normalized search hit returned by navigation and search commands.
+///
+/// Optional fields are omitted when absent to keep CLI JSON compact without
+/// changing the meaning of missing retrieval, occurrence, or resolution data.
 pub(crate) struct SearchHitOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) number: Option<usize>,
@@ -1321,6 +1357,10 @@ pub(crate) struct VerificationTargetOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// JSON contract for `search`.
+///
+/// Retrieval readiness and repo-text mode are explicit so consumers can
+/// distinguish full sidecar evidence from degraded or fallback search paths.
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
@@ -1347,6 +1387,11 @@ pub(crate) struct SearchOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// JSON contract for target resolution shared by context, symbol, trail, and
+/// snippet commands.
+///
+/// `alternatives` is populated when a selected target needs review context;
+/// callers should not assume it lists every indexed match.
 pub(crate) struct QueryResolutionOutput {
     pub(crate) selector: QuerySelectorOutput,
     pub(crate) requested: String,
@@ -2045,6 +2090,10 @@ pub(crate) struct DoctorSidecarStatusOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// JSON contract for `doctor`.
+///
+/// This output reports cache/index/retrieval health as observed; it does not
+/// imply packet or search readiness unless the readiness fields say so.
 pub(crate) struct DoctorOutput {
     pub(crate) project: String,
     pub(crate) storage_path: String,

@@ -1,3 +1,16 @@
+//! Parser-backed and structural indexing pipeline.
+//!
+//! The indexer turns source files selected by `codestory-workspace` into graph
+//! projections persisted by `codestory-store`. Parser-backed languages use
+//! tree-sitter graph rules and optional semantic resolution. Structural
+//! collectors emit exact source anchors for files such as HTML, CSS, SQL,
+//! GitHub Actions workflows, Docker Compose files, and Cargo manifests; those
+//! anchors are source proof, not parser-backed language coverage.
+//!
+//! Freshness is owned by the caller's refresh plan. This crate assumes each
+//! `index_file` or `WorkspaceIndexer::run` input is scheduled for indexing and
+//! returns projection rows for storage to flush.
+
 use anyhow::{Result, anyhow};
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind,
@@ -145,6 +158,11 @@ enum LanguageRuleset {
     Bash,
 }
 
+/// Tree-sitter language plus graph/tag rules used for parser-backed indexing.
+///
+/// A `LanguageConfig` means CodeStory has parser rules for the file extension.
+/// Structural collectors and text-only diagnostics are routed elsewhere and
+/// should not be described as parser-backed graph support.
 #[derive(Debug, Clone)]
 pub struct LanguageConfig {
     pub language: Language,
@@ -574,6 +592,10 @@ fn get_language_config_for_path(
     get_language_for_ext(ext)
 }
 
+/// Batch sizes used while flushing incremental indexing output.
+///
+/// These values tune memory and write granularity only. They do not change
+/// parser routing, graph semantics, or freshness decisions.
 #[derive(Debug, Clone, Copy)]
 pub struct IncrementalIndexingConfig {
     pub file_batch_size: usize,
@@ -613,6 +635,11 @@ impl IncrementalIndexingConfig {
     }
 }
 
+/// In-memory graph projection for one indexed source.
+///
+/// Callers pass these vectors to `codestory-store` as one coherent projection
+/// batch. `errors` are tracked separately in `IntermediateStorage` during
+/// workspace runs.
 pub struct IndexResult {
     pub files: Vec<codestory_store::FileInfo>,
     pub nodes: Vec<Node>,
@@ -633,12 +660,14 @@ enum ProjectionUpdateMode {
     FullReplace,
 }
 
+/// Progress event emitted by low-level indexing flows.
 pub enum IndexingEvent {
     Progress(u64),
     Error(String),
     Finished,
 }
 
+/// Timings and counters collected during a workspace indexing run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IncrementalIndexingStats {
     pub setup_existing_projection_ids_ms: u64,
@@ -729,6 +758,12 @@ struct ArtifactCacheWrite {
     artifact_blob: Vec<u8>,
 }
 
+/// Workspace-level indexer that executes refresh plans into a `Store`.
+///
+/// The indexer does not discover stale files; it consumes a
+/// `RefreshExecutionPlan` from `codestory-workspace`. Incremental runs seed
+/// enough existing symbol state to preserve stable projections, while full
+/// refreshes rebuild from the scheduled files.
 pub struct WorkspaceIndexer {
     root: PathBuf,
     compilation_db: Option<compilation_database::CompilationDatabase>,
@@ -737,6 +772,11 @@ pub struct WorkspaceIndexer {
 }
 
 impl WorkspaceIndexer {
+    /// Create an indexer rooted at a workspace directory.
+    ///
+    /// If a compilation database is present, C/C++ header routing can use it;
+    /// load failures are reported later through the event bus and indexing
+    /// continues without that metadata.
     pub fn new(root: PathBuf) -> Self {
         let (compilation_db, compilation_db_warning) = if let Some(path) =
             compilation_database::CompilationDatabase::find_in_directory(&root)
@@ -763,16 +803,18 @@ impl WorkspaceIndexer {
         }
     }
 
+    /// Override incremental flush batch sizes.
     pub fn with_batch_config(mut self, batch_config: IncrementalIndexingConfig) -> Self {
         self.batch_config = batch_config;
         self
     }
 
-    /// Returns the workspace root path
+    /// Return the workspace root path used to normalize refresh-plan inputs.
     pub fn root(&self) -> &PathBuf {
         &self.root
     }
 
+    /// Run an incremental plan built from legacy `RefreshInfo`.
     pub fn run_incremental(
         &self,
         storage: &mut Storage,
@@ -791,6 +833,12 @@ impl WorkspaceIndexer {
         self.run(storage, &plan, event_bus, cancel_token)
     }
 
+    /// Execute a workspace refresh plan and flush projections into storage.
+    ///
+    /// The plan supplies the freshness decision. This method parses scheduled
+    /// files, routes structural candidates to structural collectors, flushes
+    /// graph/search projection batches, and publishes progress. Cancellation is
+    /// cooperative and returns stats for completed work.
     pub fn run(
         &self,
         storage: &mut Storage,
@@ -14273,6 +14321,10 @@ impl FrameworkRoute {
     }
 }
 
+/// Return whether a path is eligible for OpenAPI schema diagnostics.
+///
+/// Eligibility is extension-only; `looks_like_openapi_schema` must still verify
+/// content before endpoint source proof is emitted.
 pub fn is_openapi_candidate_path(path: &Path) -> bool {
     let extension = path
         .extension()
@@ -14282,6 +14334,10 @@ pub fn is_openapi_candidate_path(path: &Path) -> bool {
     matches!(extension.as_str(), "json" | "yaml" | "yml")
 }
 
+/// Return whether a path can receive text-only framework diagnostics.
+///
+/// Text-only candidates can contribute source proof for framework routes or
+/// endpoint literals, but they are not parser-backed graph coverage.
 pub fn is_text_only_candidate_path(path: &Path) -> bool {
     let extension = path
         .extension()
@@ -14736,6 +14792,7 @@ fn index_openapi_schema_file(path: &Path, source: &str) -> Result<Option<Interme
     Ok(Some(local_storage))
 }
 
+/// Return whether text contains the minimum OpenAPI/Swagger markers.
 pub fn looks_like_openapi_schema(source: &str) -> bool {
     let lower = source.to_ascii_lowercase();
     contains_openapi_schema_marker(&lower) && contains_openapi_paths_marker(&lower)
@@ -17669,7 +17726,12 @@ fn enclosing_callable_node_id(nodes: &HashMap<NodeId, Node>, line: u32) -> Optio
         .map(|node| node.id)
 }
 
-/// Index a file and return the results.
+/// Index one file with an already selected parser-backed language config.
+///
+/// This function expects the caller to provide the source and matching
+/// `LanguageConfig`. It emits parser-backed nodes, edges, occurrences, and
+/// callable projection state for that file, plus delegated structural CSS from
+/// supported template files.
 pub fn index_file(
     path: &Path,
     source: &str,
@@ -18287,10 +18349,12 @@ pub fn index_file(
     })
 }
 
+/// Return the public language-support profile for a file extension.
 pub fn language_support_profile_for_ext(ext: &str) -> Option<LanguageSupportProfile> {
     codestory_contracts::language_support::language_support_profile_for_ext(ext).copied()
 }
 
+/// Return the public language-support profile for a language name.
 pub fn language_support_profile_for_language_name(
     language_name: &str,
 ) -> Option<LanguageSupportProfile> {
@@ -18298,10 +18362,15 @@ pub fn language_support_profile_for_language_name(
         .copied()
 }
 
+/// Return parser-backed indexer configuration for an extension.
+///
+/// `None` can still be supported by a structural collector or diagnostic path;
+/// consult the language-support profile before presenting support tiers.
 pub fn get_language_for_ext(ext: &str) -> Option<LanguageConfig> {
     language_configs::get_language_for_ext(ext)
 }
 
+/// Generate a stable deterministic id from a canonical graph name.
 pub fn generate_id(name: &str) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in name.as_bytes() {

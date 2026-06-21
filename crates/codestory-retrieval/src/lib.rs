@@ -1,4 +1,13 @@
 //! Retrieval v2 sidecar orchestration: health probes, local-dev clients, and index manifests.
+//!
+//! Public query APIs in this crate are sidecar-first. A result with
+//! `retrieval_mode=full` means the manifest, lexical index, graph artifacts, and dense-anchor
+//! collection agreed at query time; other modes are degraded diagnostics and must not be treated
+//! as product-equivalent answer evidence.
+//!
+//! Cache keys and status reports intentionally carry manifest generation, input-hash, schema, and
+//! projection counts. Callers that copy caches or reuse worktrees must preserve those identity
+//! checks and revalidate sidecars before serving cached retrieval results.
 
 mod cache;
 mod candidate;
@@ -51,8 +60,8 @@ pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellat
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
 pub use health::{
     ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,
-    RetrievalManifestLaneProvenance, RetrievalStatusReport, probe_infrastructure_health,
-    probe_sidecar_health,
+    RetrievalManifestLaneProvenance, RetrievalRepairHint, RetrievalStatusReport,
+    probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
     FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, project_id_for_root,
@@ -63,6 +72,7 @@ pub use mode::derive_degraded_mode;
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use qdrant_client::{
     QDRANT_INDEX_UPSERT_BATCH_SIZE, QDRANT_VECTOR_DIM, QdrantClient, QdrantUpsertPoint,
+    diagnostic_query_vector,
 };
 pub use qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION,

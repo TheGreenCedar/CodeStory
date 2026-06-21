@@ -1,3 +1,14 @@
+//! Workspace discovery and refresh planning for the indexing pipeline.
+//!
+//! This crate turns a repository root plus optional CodeStory manifests into a
+//! stable set of source paths. It does not parse code and it does not persist
+//! graph state; its contract is to decide which files are in scope, which
+//! stored file records are stale, and which projections should be removed.
+//!
+//! Freshness is path- and mtime-based. Callers must provide inventory from the
+//! same project root they are planning, and must treat unreadable files as
+//! needing reindexing rather than as clean.
+
 use anyhow::Result;
 pub use codestory_contracts::workspace::{
     BuildMode, IndexedFileRecord, RefreshExecutionPlan, RefreshInfo, RefreshInputs, RefreshMode,
@@ -16,6 +27,12 @@ pub use repository_identity::{
     inspect_repository_identity, sidecar_project_identity,
 };
 
+/// Source-group language selector used during workspace discovery.
+///
+/// Parser support is defined by the shared language-support registry. Some
+/// variants are admitted as structural or text evidence only; matching a
+/// `Language` here means the file can enter a refresh plan, not that the
+/// indexer will emit parser-backed graph edges for it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Language {
     Cxx,
@@ -42,6 +59,10 @@ pub enum Language {
     Astro,
 }
 
+/// Optional language standard metadata carried by manifests.
+///
+/// Discovery preserves this value for downstream consumers. The workspace
+/// layer does not validate compiler flags or infer support tiers from it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LanguageStandard {
     Default,
@@ -54,6 +75,12 @@ pub enum LanguageStandard {
     Java17,
 }
 
+/// Serializable CodeStory project settings.
+///
+/// `source_groups` are the roots and filters used by discovery. A stored
+/// manifest with explicit groups filters by language; a synthetic default
+/// manifest keeps all supported paths so mixed-language repositories can be
+/// indexed without a hand-written config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSettings {
     pub name: String,
@@ -61,6 +88,13 @@ pub struct WorkspaceSettings {
     pub source_groups: Vec<SourceGroupSettings>,
 }
 
+/// One discovered source group in a project manifest.
+///
+/// `source_paths` may be files or directories, relative to the manifest root or
+/// absolute. `exclude_patterns` are applied against both workspace-relative and
+/// source-root-relative paths so repo-local build output can be pruned without
+/// excluding an explicitly selected workspace under a directory such as
+/// `target`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceGroupSettings {
     pub id: Uuid,
@@ -73,6 +107,10 @@ pub struct SourceGroupSettings {
     pub language_specific: LanguageSpecificSettings,
 }
 
+/// Language-specific discovery metadata carried through the manifest.
+///
+/// These settings describe caller intent for later stages. Discovery itself
+/// only uses the source paths, excludes, and `Language` selector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LanguageSpecificSettings {
     Cxx {
@@ -92,6 +130,13 @@ pub enum LanguageSpecificSettings {
     Other,
 }
 
+/// Loaded project manifest plus discovery state.
+///
+/// `WorkspaceManifest::open` prefers `codestory_workspace.json`, then
+/// `codestory_project.json`, then a synthetic default rooted at the requested
+/// directory. Synthetic manifests are intentionally broad: they keep
+/// non-Rust files so structural collectors and parser-backed indexers can make
+/// the final evidence-tier decision.
 #[derive(Debug, Clone)]
 pub struct WorkspaceManifest {
     settings: WorkspaceSettings,
@@ -100,11 +145,20 @@ pub struct WorkspaceManifest {
     members: Vec<PathBuf>,
 }
 
+/// Multi-member workspace manifest.
+///
+/// Each member becomes a synthetic source group rooted at that member path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceMembersManifest {
     pub members: Vec<PathBuf>,
 }
 
+/// Stateless discovery and refresh-planning facade.
+///
+/// Use this when the caller already has a manifest and stored inventory. The
+/// methods are pure with respect to CodeStory storage: they inspect the
+/// filesystem, compare stored mtimes and ids, and return a plan for the caller
+/// to execute.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceDiscovery;
 
@@ -116,6 +170,10 @@ struct CompiledExcludePattern {
 }
 
 impl WorkspaceManifest {
+    /// Build a manifest from already-parsed settings.
+    ///
+    /// The manifest is treated as explicit configuration, so discovery filters
+    /// files by each source group's `Language`.
     pub fn from_parts(settings: WorkspaceSettings, manifest_path: PathBuf) -> Self {
         Self {
             settings,
@@ -125,6 +183,7 @@ impl WorkspaceManifest {
         }
     }
 
+    /// Load a `codestory_project.json` manifest from disk.
     pub fn load(path: PathBuf) -> Result<Self> {
         let content = fs::read_to_string(&path)?;
         let settings: WorkspaceSettings = serde_json::from_str(&content)?;
@@ -136,6 +195,10 @@ impl WorkspaceManifest {
         })
     }
 
+    /// Persist explicit project settings to `manifest_path`.
+    ///
+    /// Saving clears the synthetic-default marker, so subsequent discovery uses
+    /// the stored source-group language filters.
     pub fn save(&self) -> Result<()> {
         let content = serde_json::to_string_pretty(&self.settings)?;
         fs::write(&self.manifest_path, content)?;
@@ -143,6 +206,7 @@ impl WorkspaceManifest {
         Ok(())
     }
 
+    /// Create an empty explicit project manifest.
     pub fn new(name: String, manifest_path: PathBuf) -> Self {
         Self {
             settings: WorkspaceSettings {
@@ -156,6 +220,11 @@ impl WorkspaceManifest {
         }
     }
 
+    /// Open a repository root as a CodeStory workspace.
+    ///
+    /// Existing workspace/project manifests are honored. Without one, a
+    /// synthetic default manifest is returned; that fallback is intentionally
+    /// not a persisted configuration until `save` is called.
     pub fn open(root_path: PathBuf) -> Result<Self> {
         let workspace_file = root_path.join("codestory_workspace.json");
         if workspace_file.exists() {
@@ -231,14 +300,17 @@ impl WorkspaceManifest {
         Ok(manifest)
     }
 
+    /// Return the effective manifest settings used by discovery.
     pub fn settings(&self) -> &WorkspaceSettings {
         &self.settings
     }
 
+    /// Return the manifest path that defines the workspace root.
     pub fn manifest_path(&self) -> &Path {
         &self.manifest_path
     }
 
+    /// Return the directory used for relative source paths and inventory keys.
     pub fn root_dir(&self) -> PathBuf {
         self.manifest_path
             .parent()
@@ -246,6 +318,7 @@ impl WorkspaceManifest {
             .to_path_buf()
     }
 
+    /// Return member roots loaded from `codestory_workspace.json`.
     pub fn members(&self) -> &[PathBuf] {
         &self.members
     }
@@ -254,14 +327,23 @@ impl WorkspaceManifest {
         !self.is_synthetic_default.get()
     }
 
+    /// Discover all currently in-scope source files.
+    ///
+    /// Results are normalized, de-duplicated, and sorted. Symlinked directory
+    /// entries that escape the selected source root are rejected.
     pub fn source_files(&self) -> Result<Vec<PathBuf>> {
         WorkspaceDiscovery.source_files(self)
     }
 
+    /// Discover source files unless the candidate set exceeds `max_files`.
+    ///
+    /// Returns `Ok(None)` when the bound is exceeded, allowing callers to avoid
+    /// expensive planning in large or unexpected workspaces.
     pub fn source_files_bounded(&self, max_files: usize) -> Result<Option<Vec<PathBuf>>> {
         WorkspaceDiscovery.source_files_bounded(self, max_files)
     }
 
+    /// Build a full-refresh plan that indexes every currently discovered file.
     pub fn full_refresh_plan(&self) -> Result<RefreshPlan> {
         Ok(RefreshPlan {
             mode: RefreshMode::FullRefresh,
@@ -271,14 +353,23 @@ impl WorkspaceManifest {
         })
     }
 
+    /// Back-compatible alias for `full_refresh_plan`.
     pub fn full_refresh_execution_plan(&self) -> Result<RefreshPlan> {
         self.full_refresh_plan()
     }
 
+    /// Build an incremental refresh plan from stored file inventory.
+    ///
+    /// A file is scheduled when it is new, unreadable, previously unindexed, or
+    /// its filesystem mtime differs from the stored millisecond timestamp.
+    /// Stored file ids absent from current discovery are scheduled for removal.
     pub fn build_execution_plan(&self, inputs: &RefreshInputs) -> Result<RefreshPlan> {
         WorkspaceDiscovery.build_refresh_plan(self, inputs)
     }
 
+    /// Build an incremental refresh plan with a current-file discovery bound.
+    ///
+    /// Returns `Ok(None)` when discovery exceeds `max_current_files`.
     pub fn build_execution_plan_bounded(
         &self,
         inputs: &RefreshInputs,
@@ -289,11 +380,13 @@ impl WorkspaceManifest {
 }
 
 impl WorkspaceDiscovery {
+    /// Discover all source files for `manifest`.
     pub fn source_files(&self, manifest: &WorkspaceManifest) -> Result<Vec<PathBuf>> {
         self.source_files_inner(manifest, None)
             .map(|files| files.unwrap_or_default())
     }
 
+    /// Discover source files with a hard candidate-count bound.
     pub fn source_files_bounded(
         &self,
         manifest: &WorkspaceManifest,
@@ -388,6 +481,8 @@ impl WorkspaceDiscovery {
         Ok(Some(all_files))
     }
 
+    /// Compare current discovery with stored inventory and return an
+    /// incremental refresh plan.
     pub fn build_refresh_plan(
         &self,
         manifest: &WorkspaceManifest,
@@ -397,6 +492,8 @@ impl WorkspaceDiscovery {
             .map(|plan| plan.unwrap_or_else(empty_incremental_plan))
     }
 
+    /// Compare current discovery with stored inventory unless discovery exceeds
+    /// `max_current_files`.
     pub fn build_refresh_plan_bounded(
         &self,
         manifest: &WorkspaceManifest,
@@ -735,8 +832,11 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Back-compatible alias for the loaded workspace manifest.
 pub type Project = WorkspaceManifest;
+/// Back-compatible alias for serializable workspace settings.
 pub type ProjectSettings = WorkspaceSettings;
+/// Back-compatible alias for the loaded workspace manifest.
 pub type Workspace = WorkspaceManifest;
 
 #[cfg(test)]

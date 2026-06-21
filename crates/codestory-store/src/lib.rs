@@ -1,3 +1,11 @@
+//! SQLite persistence facades for CodeStory graph, search, and snapshot state.
+//!
+//! `Store` owns the schema connection. The smaller facade types expose the
+//! pipeline contracts most callers need: file inventory for refresh planning,
+//! projection flushing for indexer output, and derived snapshot lifecycle for
+//! read-heavy grounding views. The store layer persists evidence; it does not
+//! upgrade structural source proof into parser-backed graph evidence.
+
 mod file_store;
 mod projection_store;
 mod snapshot_store;
@@ -18,14 +26,17 @@ pub use storage_impl::{
 };
 
 impl Store {
+    /// Access stored file inventory used by workspace refresh planning.
     pub fn files(&self) -> FileStore<'_> {
         FileStore::new(self)
     }
 
+    /// Access graph/search projection writes for indexer output.
     pub fn projections(&mut self) -> ProjectionStore<'_> {
         ProjectionStore::new(self)
     }
 
+    /// Access derived grounding snapshot lifecycle operations.
     pub fn snapshots(&self) -> SnapshotStore<'_> {
         SnapshotStore::new(self)
     }
