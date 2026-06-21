@@ -47,7 +47,7 @@ When the plugin MCP server is available:
 
 1. Read `codestory://status`.
 2. Read `codestory://agent-guide`.
-3. Read `codestory://grounding` for a compact repo map before planning.
+3. Read `codestory://grounding` or call `ground` for a compact repo map before planning.
 4. Use `packet` for broad repo questions only when status says
    `agent_packet_search` is ready and strict sidecar status reports
    `retrieval_mode=full`.
@@ -95,7 +95,7 @@ Always pass `--project <target-workspace>` explicitly.
 ## Command Routing
 
 - Setup and health: `setup embeddings`, `doctor`, `ready`, `index`, `cache`.
-- Agent orientation: MCP `codestory://grounding` or CLI `ground`.
+- Agent orientation: MCP `ground` / `codestory://grounding` or CLI `ground`.
 - Broad task packet: MCP/CLI `packet`.
 - Candidate discovery: MCP/CLI `search --why`.
 - Focused source view: `symbol`, `trail`, `snippet`, `context`, `explore`.

@@ -481,6 +481,7 @@ impl SchemaObject {
 const TEXT_HIT_ORIGINS: &[&str] = &["indexed_symbol", "text_match"];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
+const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
 const PACKET_TASK_CLASSES: &[&str] = &[
     "architecture_explanation",
@@ -634,6 +635,40 @@ static SYMBOLS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         &SYMBOL_SUMMARY_SCHEMA,
     )],
     &["symbols"],
+);
+
+static GROUNDING_SNAPSHOT_SCHEMA: SchemaObject = SchemaObject::object(
+    "CodeStory grounding snapshot DTO for compact repository orientation.",
+    &[
+        SchemaProperty::string("root", "Project root."),
+        SchemaProperty::string("budget", "Grounding output budget.").with_enum(GROUNDING_BUDGETS),
+        SchemaProperty::integer("generated_at_epoch_ms", "Snapshot generation time."),
+        SchemaProperty::object("stats", "Indexed project stats."),
+        SchemaProperty::object("retrieval", "Optional retrieval state DTO.").nullable(),
+        SchemaProperty::object("coverage", "Grounding coverage summary."),
+        SchemaProperty::array(
+            "root_symbols",
+            "Root symbol digests.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::array("files", "File digests.", &GENERIC_OBJECT_SCHEMA),
+        SchemaProperty::array(
+            "coverage_buckets",
+            "Compressed coverage buckets.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::string_array("notes", "Grounding notes."),
+        SchemaProperty::string_array("recommended_queries", "Suggested follow-up queries."),
+    ],
+    &[
+        "root",
+        "budget",
+        "generated_at_epoch_ms",
+        "stats",
+        "coverage",
+        "root_symbols",
+        "files",
+    ],
 );
 
 static TRAIL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
@@ -816,6 +851,14 @@ static SEARCH_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
             .with_bounds(1, 50),
     ],
     &["query"],
+);
+
+static GROUND_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return the same compact repository orientation as codestory://grounding.",
+    &[SchemaProperty::string("budget", "Grounding output budget.")
+        .with_enum(GROUNDING_BUDGETS)
+        .with_default(ValueLiteral::String("balanced"))],
+    &[],
 );
 
 static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
@@ -1012,6 +1055,13 @@ static TOOLS: &[ToolSpec] = &[
         description: "Discover candidate symbols and sidecar hits; for broad structural questions call packet before snippet/source reads.",
         input_schema: SEARCH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SEARCH_RESULTS_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "ground",
+        description: "Return a compact repository map for orientation after status and before packet/search; equivalent to codestory://grounding.",
+        input_schema: GROUND_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GROUNDING_SNAPSHOT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
