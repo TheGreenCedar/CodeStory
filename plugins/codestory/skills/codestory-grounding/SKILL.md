@@ -22,21 +22,23 @@ tool source unless the user is editing CodeStory itself.
    - otherwise use a nearby `target/release/codestory-cli*` from the current or
      sibling CodeStory checkout;
    - otherwise install the released binary for the host OS.
-3. If `codestory-cli` is missing, download and unpack the matching release asset
-   before asking the human to run manual commands. The archive names below are
-   release-bound to CodeStory `v0.11.1`; use that version unless the user asks
-   for another version:
-   - Windows x64: `codestory-cli-v0.11.1-windows-x64.zip`
-   - Windows arm64: `codestory-cli-v0.11.1-windows-arm64.zip`
-   - macOS arm64: `codestory-cli-v0.11.1-macos-arm64.tar.gz`
-   - Linux x64: `codestory-cli-v0.11.1-linux-x64.tar.gz`
-   - Linux arm64: `codestory-cli-v0.11.1-linux-arm64.tar.gz`
+3. Resolve the latest GitHub release tag. If `codestory-cli` exists, compare
+   `codestory-cli --version` with that tag and keep the binary only when it
+   already matches the latest release.
+4. If `codestory-cli` is missing or outdated, download and unpack only the
+   matching host asset derived from the latest tag before asking the human to
+   run manual commands. For latest tag `vX.Y.Z`, use:
+   - Windows x64: `codestory-cli-vX.Y.Z-windows-x64.zip`
+   - Windows arm64: `codestory-cli-vX.Y.Z-windows-arm64.zip`
+   - macOS arm64: `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`
+   - Linux x64: `codestory-cli-vX.Y.Z-linux-x64.tar.gz`
+   - Linux arm64: `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`
    - macOS x64 or missing asset: Source fallback. Build from source.
-4. Put the binary in a stable user bin directory, verify
-   `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` when the host
-   has the tools. If `PATH` changed, say that the plugin MCP process may need a
-   new agent thread to see it.
-5. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
+5. Put the binary in a stable user bin directory, verify
+   `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
+   same release when the host has the tools. If `PATH` changed, say that the
+   plugin MCP process may need a new agent thread to see it.
+6. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 
 ## MCP Loop

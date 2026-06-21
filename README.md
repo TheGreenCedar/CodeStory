@@ -98,14 +98,17 @@ setup and repair.
 ## Install As An Agent Plugin
 
 Install `codestory` from the external `TheGreenCedar` marketplace catalog in
-`TheGreenCedar/AgentPluginMarketplace`. The canonical skill ships inside this
-repository's plugin package at
+`TheGreenCedar/AgentPluginMarketplace`. The plugin entry is `codestory`, with
+source `git-subdir`, URL `https://github.com/TheGreenCedar/CodeStory.git`, and
+path `plugins/codestory`. The canonical skill ships inside this repository's
+plugin package at
 [`plugins/codestory/skills/codestory-grounding/SKILL.md`](plugins/codestory/skills/codestory-grounding/SKILL.md).
 
 The plugin launches `codestory-cli serve --stdio --refresh none` directly. If
-the binary is missing on the agent host, use the release asset or source fallback
-documented in [the plugin README](plugins/codestory/README.md), then restart the
-agent thread if `PATH` changed.
+the binary is missing or older than the latest GitHub release on the agent host,
+use the matching host release asset or source fallback documented in
+[the plugin README](plugins/codestory/README.md), then restart the agent thread
+if `PATH` changed.
 
 ## Commands
 

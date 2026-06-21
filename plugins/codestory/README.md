@@ -40,25 +40,38 @@ catalog lives in `TheGreenCedar/AgentPluginMarketplace` with catalog name
 
 ## Install For Agent Use
 
-Install the plugin from the external marketplace, then make `codestory-cli`
-available on the same host that runs the agent.
+Install plugin entry `codestory` from the external marketplace catalog:
+
+| Field | Value |
+| --- | --- |
+| Catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
+| Catalog name | `TheGreenCedar` |
+| Plugin entry | `codestory` |
+| Source | `git-subdir` |
+| URL | `https://github.com/TheGreenCedar/CodeStory.git` |
+| Path | `plugins/codestory` |
+
+Then make `codestory-cli` available on the same host that runs the agent and
+verify the MCP launch target is `codestory-cli serve --stdio --refresh none`.
 
 The plugin does not bundle the binary. If `codestory-cli` is missing, the agent
-should download and unpack the matching release asset, verify it when practical,
-place it in a stable user bin directory, and re-check `codestory-cli --version`.
-If the host `PATH` changes, start a new agent thread so the MCP process can see
-the binary.
+should resolve the latest GitHub release, download and unpack the matching host
+asset, verify it when practical, place it in a stable user bin directory, and
+re-check `codestory-cli --version`. If `codestory-cli` is already installed,
+compare `codestory-cli --version` with the latest release tag and download only
+when the binary is missing or outdated. If the host `PATH` changes, start a new
+agent thread so the MCP process can see the binary.
 
-The archive names below are release-bound to CodeStory `v0.11.1`.
+For latest tag `vX.Y.Z`, choose the host asset derived from that tag:
 
 | Host OS | Binary setup |
 | --- | --- |
-| Windows x64 | Download `codestory-cli-v0.11.1-windows-x64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
-| Windows arm64 | Download `codestory-cli-v0.11.1-windows-arm64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
-| macOS arm64 | Download `codestory-cli-v0.11.1-macos-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
+| Windows x64 | Download `codestory-cli-vX.Y.Z-windows-x64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
+| Windows arm64 | Download `codestory-cli-vX.Y.Z-windows-arm64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
+| macOS arm64 | Download `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
 | macOS x64 | Use the source fallback until a matching release asset exists. |
-| Linux x64 | Download `codestory-cli-v0.11.1-linux-x64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-| Linux arm64 | Download `codestory-cli-v0.11.1-linux-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
+| Linux x64 | Download `codestory-cli-vX.Y.Z-linux-x64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
+| Linux arm64 | Download `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
 
 Verify downloaded archives against `SHA256SUMS.txt` from the release when the
 host has the tools to do it. Source fallback for any OS:

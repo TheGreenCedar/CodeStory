@@ -26,20 +26,27 @@ test("codestory repo ships plugin source, not marketplace catalog or adapter run
   await assert.rejects(access(join(pluginRoot, "scripts", "codestory-mcp.mjs")));
 });
 
-test("plugin docs are agent-first, cross-platform, and release-bound", async () => {
+test("plugin docs are agent-first, cross-platform, and latest-release aware", async () => {
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
   const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
   const sharedRequired = [
-    "release-bound to CodeStory `v0.11.1`",
-    "codestory-cli-v0.11.1-windows-x64.zip",
-    "codestory-cli-v0.11.1-windows-arm64.zip",
-    "codestory-cli-v0.11.1-macos-arm64.tar.gz",
-    "macOS x64",
-    "codestory-cli-v0.11.1-linux-x64.tar.gz",
-    "codestory-cli-v0.11.1-linux-arm64.tar.gz",
-    "Source fallback",
+    "latest GitHub release",
     "codestory-cli --version",
+    "missing or outdated",
+    "codestory-cli-vX.Y.Z-windows-x64.zip",
+    "codestory-cli-vX.Y.Z-windows-arm64.zip",
+    "codestory-cli-vX.Y.Z-macos-arm64.tar.gz",
+    "macOS x64",
+    "codestory-cli-vX.Y.Z-linux-x64.tar.gz",
+    "codestory-cli-vX.Y.Z-linux-arm64.tar.gz",
+    "Source fallback",
+    "SHA256SUMS.txt",
     "retrieval_mode=full",
+  ];
+  const forbidden = [
+    "release-bound to " + "CodeStory `v" + "0.11.1`",
+    "codestory-cli-v" + "0.11.1",
+    "use that version " + "unless",
   ];
   const readmeRequired = [
     "The human job is simple",
@@ -47,9 +54,14 @@ test("plugin docs are agent-first, cross-platform, and release-bound", async () 
     "codestory://status",
     "codestory://grounding",
     "The plugin does not bundle the binary",
+    "TheGreenCedar/AgentPluginMarketplace",
+    "git-subdir",
+    "https://github.com/TheGreenCedar/CodeStory.git",
+    "plugins/codestory",
+    "codestory-cli serve --stdio --refresh none",
   ];
   const skillRequired = [
-    "download and unpack the matching release asset",
+    "download and unpack only",
     "plugin MCP process may need",
     "new agent thread",
     "Read `codestory://grounding`",
@@ -59,6 +71,9 @@ test("plugin docs are agent-first, cross-platform, and release-bound", async () 
   for (const text of [readme, skill]) {
     for (const phrase of sharedRequired) {
       assert.equal(text.includes(phrase), true, phrase);
+    }
+    for (const phrase of forbidden) {
+      assert.equal(text.includes(phrase), false, phrase);
     }
   }
   for (const phrase of readmeRequired) {
