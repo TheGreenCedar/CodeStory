@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "codestory": {
-      "cwd": ".",
-      "command": "node",
-      "args": ["./scripts/codestory-mcp.mjs"],
+      "command": "codestory-cli",
+      "args": ["serve", "--stdio", "--refresh", "none"],
       "tool_timeout_sec": 300
     }
   }
