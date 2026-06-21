@@ -87,10 +87,10 @@ marketplaces, add or refresh this marketplace first:
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
-The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
-This repository remains the plugin source. The catalog can list many plugins,
-and the CodeStory entry points at `plugins/codestory` in this repo.
-Marketplace edits do not live in this repo.
+The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`; its
+marketplace display/name concept is `TheGreenCedar`. This repository remains
+the plugin source at `https://github.com/TheGreenCedar/CodeStory.git`, with
+source path `plugins/codestory`. The CodeStory repo does not contain the marketplace catalog.
 
 Start a new Codex thread after install or refresh so the MCP process can see
 the current environment. A good first prompt is:
@@ -102,9 +102,9 @@ the current environment. A good first prompt is:
 The canonical plugin skill is
 [plugins/codestory/skills/codestory-grounding/SKILL.md](plugins/codestory/skills/codestory-grounding/SKILL.md).
 The plugin launches `codestory-cli serve --stdio --refresh none` directly.
-The skill owns the runtime check: it should verify `codestory-cli --version`,
-resolve the latest GitHub release when needed, and restart the Codex host/app
-before starting a new agent thread if `PATH` changed.
+The skill owns binary setup: it checks `codestory-cli --version`, resolves the
+latest GitHub release when needed, and restarts the Codex host/app before
+starting a new agent thread if `PATH` changed.
 
 ## Readiness Contract
 

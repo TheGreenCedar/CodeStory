@@ -60,10 +60,10 @@ marketplaces, add or refresh this marketplace first:
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
-The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
-This repository remains the plugin source. One marketplace can list multiple plugins.
-CodeStory's entry points at `https://github.com/TheGreenCedar/CodeStory.git`
-with source path `plugins/codestory`.
+The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`; its
+marketplace display/name concept is `TheGreenCedar`. This repository remains
+the plugin source at `https://github.com/TheGreenCedar/CodeStory.git`, with
+source path `plugins/codestory`. The CodeStory repo does not contain the marketplace catalog.
 
 Some workspace plugin settings are managed from the Codex Apps/Plugins UI
 rather than the terminal. Use the UI path when the CLI marketplace command is
@@ -82,7 +82,7 @@ before planning or editing:
 ```
 
 The first run should be agent-owned. The skill checks whether `codestory-cli` is
-present and current, downloads the latest matching release asset when needed,
+present and current, installs the latest matching release asset when needed,
 and uses source fallback only when no release asset fits the host.
 
 ## What To Ask
@@ -127,27 +127,13 @@ nonsense with a straight face.
 
 ### Agent runtime bootstrap
 
-The plugin does not bundle the binary. The agent should run
-`codestory-cli --version` first. If `codestory-cli` is missing or outdated
-against the latest GitHub release, resolve the latest release, download and
-unpack the matching host asset, verify it when practical, place it in a stable
-user bin directory, and re-check `codestory-cli --version`. If the host `PATH`
-changes, restart the Codex host/app before starting a new agent thread so the
-MCP process can see the binary.
+The plugin does not bundle the binary. The agent-owned skill verifies
+`codestory-cli --version`, compares it with the latest GitHub release, installs
+the matching release asset when practical, checks `SHA256SUMS.txt` when the host
+can, and restarts the Codex host/app before starting a new agent thread if the
+MCP process needs a fresh `PATH`.
 
-For latest tag `vX.Y.Z`, choose the host asset derived from that tag:
-
-| Host OS | Binary setup |
-| --- | --- |
-| Windows x64 | Download `codestory-cli-vX.Y.Z-windows-x64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
-| Windows arm64 | Download `codestory-cli-vX.Y.Z-windows-arm64.zip`, extract `codestory-cli.exe`, and put it on `PATH`. |
-| macOS arm64 | Download `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-| macOS x64 | Use the source fallback until a matching release asset exists. |
-| Linux x64 | Download `codestory-cli-vX.Y.Z-linux-x64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-| Linux arm64 | Download `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`, extract `codestory-cli`, put it on `PATH`, and run `chmod +x codestory-cli` if needed. |
-
-Verify downloaded archives against `SHA256SUMS.txt` from the release when the
-host has the tools to do it. Source fallback for any OS:
+Use source fallback only when no release asset fits the host:
 
 ```sh
 cargo build --release -p codestory-cli
@@ -191,8 +177,8 @@ The marketplace catalog is external. One marketplace can list multiple plugins.
 
 | Field | Value |
 | --- | --- |
-| Catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
-| Catalog name | `TheGreenCedar` |
+| Marketplace catalog repo | `TheGreenCedar/AgentPluginMarketplace` |
+| Marketplace display/name | `TheGreenCedar` |
 | Plugin entry | `codestory` |
 | Source kind | `git-subdir` |
 | Source repo | `https://github.com/TheGreenCedar/CodeStory.git` |
