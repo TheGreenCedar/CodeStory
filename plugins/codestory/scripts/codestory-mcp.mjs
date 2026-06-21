@@ -22,6 +22,7 @@ function findRepoRoot() {
 }
 
 const repoRoot = findRepoRoot();
+const binaryName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";
 
 function canRun(file) {
   try {
@@ -32,8 +33,8 @@ function canRun(file) {
   }
 }
 
-function pathCandidates(name) {
-  const extensions = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
+export function pathCandidates(name) {
+  const extensions = process.platform === "win32" ? [".exe"] : [""];
   return (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -51,8 +52,8 @@ export function resolveCli() {
     }
   }
   for (const candidate of [
-    join(repoRoot, "target", "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli"),
-    join(process.cwd(), "target", "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli"),
+    join(repoRoot, "target", "release", binaryName),
+    join(process.cwd(), "target", "release", binaryName),
   ]) {
     if (canRun(candidate)) {
       return candidate;
@@ -61,11 +62,12 @@ export function resolveCli() {
   return null;
 }
 
-function resolveProject() {
+export function resolveProject() {
   return (
     process.env.CODESTORY_PROJECT ||
     process.env.CODESTORY_WORKSPACE ||
     process.env.CODEX_WORKSPACE ||
+    repoRoot ||
     process.cwd()
   );
 }
@@ -77,8 +79,9 @@ function printMissingCli(project) {
     [
       "codestory-cli was not found.",
       "Set CODESTORY_CLI to a ready codestory-cli binary or add codestory-cli to PATH.",
-      `Setup action: pwsh -File "${setup}" -Project "${project}"`,
-      `Worktree fallback: pwsh -File "${worktreeSetup}" -Project "${project}" -ResolveCliOnly`,
+      `Setup action: powershell -ExecutionPolicy Bypass -File "${setup}" -Project "${project}"`,
+      `PowerShell 7: pwsh -File "${setup}" -Project "${project}"`,
+      `Worktree fallback: powershell -ExecutionPolicy Bypass -File "${worktreeSetup}" -Project "${project}" -ResolveCliOnly`,
       "",
     ].join("\n"),
   );
