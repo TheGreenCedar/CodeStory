@@ -1,6 +1,51 @@
 # Contributor Setup
 
-## First Commands
+## Choose The Verification Lane First
+
+Before running Cargo or setting up sidecars, answer two questions:
+
+1. Which crate owns the behavior?
+2. What is the smallest proof that covers the change?
+
+Use this lane picker from the repo root:
+
+| Change | Start here | Escalate when |
+| --- | --- | --- |
+| Docs only, including `README.md` or `docs/**` | Read the changed pages back, then run `git diff --check`. | The doc depends on new code behavior, command output, generated docs, or release evidence. |
+| CLI args, help, or output envelopes | `cargo test -p codestory-cli` | The CLI path crosses runtime behavior; use the runtime-backed CLI lane in the testing matrix. |
+| Runtime, search, grounding, or orchestration | `cargo test -p codestory-runtime` and `cargo test -p codestory-runtime --test retrieval_eval` | Agent-facing `packet` or `search` readiness is claimed; use the full sidecar proof path below. |
+| Indexer, graph, language, or semantic resolution | The full indexer fidelity suites in the testing matrix. | Language-level packet quality is claimed; use the manifest-backed packet-runtime lane. |
+| Store, snapshots, trails, bookmarks, or search docs | `cargo test -p codestory-store` | The change affects repo-scale semantic or cold-start behavior. |
+| Release or version bump | The release scripts in the testing matrix. | Packet/search readiness is part of the release claim; use the sidecar evidence tiers. |
+
+## Crate Ownership
+
+Before changing code, decide where the change belongs:
+
+```mermaid
+flowchart TD
+    start["Before changing code"] --> owner{"Which crate owns the behavior?"}
+    owner -->|"Manifest or discovery"| workspace["codestory-workspace"]
+    owner -->|"Parse, extract, or resolution"| indexer["codestory-indexer"]
+    owner -->|"SQLite, snapshots, trails, bookmarks, or search docs"| store["codestory-store"]
+    owner -->|"Search, grounding, orchestration, or agent flows"| runtime["codestory-runtime"]
+    owner -->|"Args or output rendering"| cli["codestory-cli"]
+    owner -->|"Shared DTOs, graph, or events"| contracts["codestory-contracts"]
+    start --> truth{"Source of truth or derived read model?"}
+    truth -->|"Source of truth"| first["Change the owning crate first"]
+    truth -->|"Derived or read model"| follow["Verify store and runtime boundaries before patching projections"]
+```
+
+Use this mapping:
+
+- manifest or discovery issue: `codestory-workspace`
+- parse, extract, or resolution issue: `codestory-indexer`
+- SQLite, snapshots, trails, bookmarks, or search docs: `codestory-store`
+- search ranking, grounding, orchestration, or agent flows: `codestory-runtime`
+- args or output rendering: `codestory-cli`
+- shared DTOs or graph/event types: `codestory-contracts`
+
+## Basic Cargo Lane
 
 Run these from the repo root:
 
@@ -12,12 +57,15 @@ cargo test -p codestory-cli
 
 Run them serially. This workspace shares Cargo build locks.
 
-If you touch graph extraction or semantic resolution, plan to run the fidelity suites from the testing matrix before you finish.
-If you touch runtime search, grounding, or repo-scale indexing behavior, check the testing matrix before you finish so you know whether the repo-scale runtime gate is required or can be deferred on a memory-constrained machine.
+Use this lane after the picker says broad Rust checks are useful. If you touch
+graph extraction, semantic resolution, runtime search, grounding, or repo-scale
+indexing behavior, check the testing matrix before you finish so the heavy lane
+is explicit instead of accidental.
 
-## First CLI Loop
+## Local CLI Loop
 
-After the basic cargo checks, verify the shipped CLI flow with the built binary instead of `cargo run`:
+When CLI behavior is in scope, verify the shipped flow with the built binary
+instead of `cargo run`:
 
 ```sh
 cargo build --release -p codestory-cli
@@ -38,7 +86,8 @@ below before treating those commands as product-quality proof.
 
 ## Hybrid Retrieval Setup
 
-Use the managed full-sidecar path before debugging ranking quality:
+Use this lane only for packet/search, retrieval, ranking-quality, or sidecar
+work. Prepare the managed full-sidecar path before debugging ranking quality:
 
 - managed real-model setup: `node scripts/setup-retrieval-env.mjs --fetch-embed-model`, then `codestory-cli retrieval bootstrap --project .`
 - default symbol-doc scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol diagnostic symbol-doc set
@@ -72,36 +121,6 @@ Build a mental model in this order before editing the biggest implementation pat
 5. the subsystem page for the owning crate
 6. [Debugging guide](debugging.md)
 7. [Testing matrix](testing-matrix.md)
-
-## Mental Model
-
-Before changing code, answer these two questions:
-
-1. Which crate owns the behavior?
-2. Is the change source-of-truth logic or a derived/read-model concern?
-
-```mermaid
-flowchart TD
-    start["Before changing code"] --> owner{"Which crate owns the behavior?"}
-    owner -->|"Manifest or discovery"| workspace["codestory-workspace"]
-    owner -->|"Parse, extract, or resolution"| indexer["codestory-indexer"]
-    owner -->|"SQLite, snapshots, trails, bookmarks, or search docs"| store["codestory-store"]
-    owner -->|"Search, grounding, orchestration, or agent flows"| runtime["codestory-runtime"]
-    owner -->|"Args or output rendering"| cli["codestory-cli"]
-    owner -->|"Shared DTOs, graph, or events"| contracts["codestory-contracts"]
-    start --> truth{"Source of truth or derived read model?"}
-    truth -->|"Source of truth"| first["Change the owning crate first"]
-    truth -->|"Derived or read model"| follow["Verify store and runtime boundaries before patching projections"]
-```
-
-Use this mapping:
-
-- manifest or discovery issue: `codestory-workspace`
-- parse, extract, or resolution issue: `codestory-indexer`
-- SQLite, snapshots, trails, bookmarks, or search docs: `codestory-store`
-- search ranking, grounding, orchestration, or agent flows: `codestory-runtime`
-- args or output rendering: `codestory-cli`
-- shared DTOs or graph/event types: `codestory-contracts`
 
 ## Rustdoc Baseline
 

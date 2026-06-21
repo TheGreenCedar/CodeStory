@@ -1,8 +1,9 @@
 # Testing Matrix
 
-Run Cargo verifications serially in this repo. The workspace shares build locks.
-Examples use POSIX shell syntax. On Windows PowerShell, use environment
-assignments such as `$env:NAME = "value"`.
+Choose the verification lane before running broad checks. Run Cargo
+verifications serially in this repo when the lane needs them; the workspace
+shares build locks. Examples use POSIX shell syntax. On Windows PowerShell, use
+environment assignments such as `$env:NAME = "value"`.
 
 ```mermaid
 flowchart TD
@@ -33,7 +34,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-These are the default checks for any contributor change.
+These are the default broad checks for code changes after the lane picker says
+workspace-wide proof is useful.
 
 ## Release And Version Bumps
 
