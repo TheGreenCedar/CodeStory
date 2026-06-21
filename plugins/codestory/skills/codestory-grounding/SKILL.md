@@ -1,28 +1,45 @@
 ---
 name: codestory-grounding
-description: Use when Codex should ground repository claims through CodeStory's local CLI and stdio server before answering or editing.
+description: Use when Codex should inspect a local repository through CodeStory before making source claims, choosing tests, or editing code.
 ---
 
 # CodeStory Grounding
 
-Use CodeStory as a local, read-only grounding layer. The product boundary stays
-at `codestory-cli`; this plugin only packages Codex metadata and the stdio
-launch path.
+CodeStory is a local read-only grounding service. This plugin only connects
+Codex to `codestory-cli serve --stdio`; all indexing, runtime, retrieval,
+packet, search, and sidecar behavior stays in `codestory-cli`.
 
-## Start Here
+## Setup First
 
-1. Read `codestory://status` before trusting packet or search.
-2. If `codestory-cli` is missing, run the setup action printed by the MCP
-   launcher or `scripts/install-codestory.ps1 -Project <workspace>`.
-3. If local navigation is not ready, follow the status resource's repair
-   commands before source-backed claims.
-4. Treat packet/search as degraded unless strict retrieval reports
+1. Start by reading `codestory://status`.
+2. If the launcher says `codestory-cli` is missing, run the printed
+   `powershell -ExecutionPolicy Bypass -File scripts/install-codestory.ps1`
+   setup action, or set `CODESTORY_CLI` to a ready binary.
+3. If `local_navigation` is not `ready`, run the status resource's repair
+   commands before relying on CodeStory output.
+4. If `agent_packet_search` is not `ready`, do not use packet/search results as
+   proof. Follow the repair commands and re-read `codestory://status`.
+5. Packet/search claims are allowed only when strict sidecar status reports
    `retrieval_mode=full`.
-5. Use packet for broad repository questions, search for candidate discovery,
-   then snippet/context/trail after selecting a concrete target.
+
+## Operating Loop
+
+Use this order unless the user asks for a narrower source read:
+
+1. `resources/read` `codestory://status`
+2. `resources/read` `codestory://agent-guide`
+3. `tools/call` `packet` for broad task questions, only when packet/search is
+   ready
+4. `tools/call` `search` for candidate discovery, only when packet/search is
+   ready
+5. `resources/read` `codestory://snippet/<node_id>` or
+   `codestory://trail/<node_id>` after selecting a concrete target
+
+If readiness is degraded, use direct source reads or ordinary local commands for
+the task, and label CodeStory packet/search as blocked.
 
 ## Safety
 
-The stdio tools are local-only, read-only, non-destructive, idempotent, and
-closed-world. Do not claim packet/search readiness from semantic-only,
-repo-text-only, stale, missing-manifest, or unavailable retrieval states.
+The stdio server is local-only and read-only. Treat repo-text, semantic-only,
+stale, missing-manifest, or unavailable retrieval states as navigation hints at
+most. They are not packet/search proof.

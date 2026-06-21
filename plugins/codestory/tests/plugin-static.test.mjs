@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,10 @@ test("plugin metadata maps skill and stdio server", async () => {
   assert.equal(manifest.interface.capabilities.includes("Read"), true);
   assert.equal(mcp.mcpServers.codestory.command, "node");
   assert.deepEqual(mcp.mcpServers.codestory.args, ["./scripts/codestory-mcp.mjs"]);
+});
+
+test("codestory repo does not ship the marketplace catalog", async () => {
+  await assert.rejects(access(join(repoRoot, ".agents", "plugins", "marketplace.json")));
 });
 
 test("missing binary prints setup action", () => {
