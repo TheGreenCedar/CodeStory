@@ -9,9 +9,9 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
-    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    NodeKind, PacketBudgetModeDto, PacketTaskClassDto, SearchRepoTextMode, SearchRequest,
-    TrailCallerScope, TrailDirection, TrailMode,
+    IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
+    SearchRepoTextMode, SearchRequest, TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
 use std::io::{BufRead, Write};
@@ -579,6 +579,7 @@ fn handle_stdio_tool_call(
         "packet" => handle_stdio_packet(runtime, state, request),
         "search" => handle_stdio_search(runtime, state, request, query),
         "ground" => handle_stdio_ground(runtime, request),
+        "files" => handle_stdio_files(runtime, request),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
         "get_node" => handle_stdio_get_node(runtime, request),
@@ -604,6 +605,52 @@ fn handle_stdio_ground(runtime: &RuntimeContext, request: &serde_json::Value) ->
         .grounding_snapshot(budget)
         .map(|snapshot| serde_json::json!({"result": snapshot}))
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+fn handle_stdio_files(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+    let role = match stdio_file_role(request) {
+        Ok(role) => role,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let limit = request
+        .pointer("/params/arguments/limit")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.clamp(1, 5000) as u32)
+        .unwrap_or(500);
+    runtime
+        .browser
+        .indexed_files(IndexedFilesRequest {
+            path_contains: request
+                .pointer("/params/arguments/path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            language: request
+                .pointer("/params/arguments/language")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            role,
+            limit: Some(limit),
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+fn stdio_file_role(request: &serde_json::Value) -> Result<Option<IndexedFileRoleDto>> {
+    let Some(role) = request
+        .pointer("/params/arguments/role")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    match role {
+        "source" => Ok(Some(IndexedFileRoleDto::Source)),
+        "test" => Ok(Some(IndexedFileRoleDto::Test)),
+        "generated" => Ok(Some(IndexedFileRoleDto::Generated)),
+        "vendor" => Ok(Some(IndexedFileRoleDto::Vendor)),
+        "unknown" => Ok(Some(IndexedFileRoleDto::Unknown)),
+        _ => bail!("files.role must be one of source, test, generated, vendor, unknown"),
+    }
 }
 
 fn handle_stdio_packet(

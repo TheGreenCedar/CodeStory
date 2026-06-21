@@ -480,6 +480,7 @@ impl SchemaObject {
 
 const TEXT_HIT_ORIGINS: &[&str] = &["indexed_symbol", "text_match"];
 const SEARCH_REPO_TEXT_MODES: &[&str] = &["auto", "on", "off"];
+const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "unknown"];
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
@@ -636,6 +637,45 @@ static SYMBOLS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     )],
     &["symbols"],
 );
+
+static INDEXED_FILE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Indexed file coverage row.",
+    &[
+        SchemaProperty::string("path", "Project-relative file path."),
+        SchemaProperty::string("language", "Detected language."),
+        SchemaProperty::boolean("indexed", "Whether the file was indexed."),
+        SchemaProperty::boolean("complete", "Whether indexing completed for this file."),
+        SchemaProperty::integer("line_count", "Line count."),
+        SchemaProperty::string("role", "Inferred file role.").with_enum(INDEXED_FILE_ROLES),
+        SchemaProperty::integer("error_count", "File-level index error count."),
+    ],
+    &[
+        "path",
+        "language",
+        "indexed",
+        "complete",
+        "line_count",
+        "role",
+    ],
+);
+
+static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Indexed file inventory and coverage summary.",
+    &[
+        SchemaProperty::string("project_root", "Project root."),
+        SchemaProperty::boolean("usable", "Whether the index has usable files."),
+        SchemaProperty::object("summary", "Indexed file summary DTO."),
+        SchemaProperty::array("files", "Indexed file rows.", &INDEXED_FILE_SCHEMA),
+        SchemaProperty::string("code", "Typed API error code."),
+        SchemaProperty::string("message", "Human-readable API error message."),
+        SchemaProperty::object("details", "Structured API error repair guidance.").nullable(),
+    ],
+    &[],
+)
+.with_any_of_required(&[
+    &["project_root", "usable", "summary", "files"],
+    &["code", "message"],
+]);
 
 static GROUNDING_SNAPSHOT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory grounding snapshot DTO for compact repository orientation.",
@@ -988,6 +1028,20 @@ static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 );
 
+static FILES_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "List indexed files from the existing local index.",
+    &[
+        SchemaProperty::string("path", "Only include files whose path contains this text."),
+        SchemaProperty::string("language", "Only include files for this language."),
+        SchemaProperty::string("role", "Only include files with this inferred role.")
+            .with_enum(INDEXED_FILE_ROLES),
+        SchemaProperty::integer("limit", "Maximum files returned.")
+            .with_default(ValueLiteral::Integer(500))
+            .with_bounds(1, 5000),
+    ],
+    &[],
+);
+
 static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Build a deep evidence packet for one concrete retrieval target.",
     &[
@@ -1062,6 +1116,13 @@ static TOOLS: &[ToolSpec] = &[
         description: "Return a compact repository map for orientation after status and before packet/search; equivalent to codestory://grounding.",
         input_schema: GROUND_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GROUNDING_SNAPSHOT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "files",
+        description: "List indexed files and coverage from the existing local index; never refreshes, indexes, or bootstraps sidecars.",
+        input_schema: FILES_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(INDEXED_FILES_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
