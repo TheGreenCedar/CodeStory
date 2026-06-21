@@ -79,10 +79,17 @@ cargo build --release -p codestory-cli
 
 On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
-Read commands default to `--refresh none`. If a read command says the cache is empty, either run `index --refresh full` first or rerun the read command with an explicit refresh mode.
-The first loop above exercises local navigation only. Agent-facing `packet` and
-`search` evidence require full retrieval sidecars; prepare the sidecar lane
-below before treating those commands as product-quality proof.
+This loop proves the local CLI and managed ONNX diagnostic path are wired, but
+it is not product packet/search sidecar setup. Treat `setup embeddings
+--dry-run` as an asset-plan check only. It should not start an embedding server,
+write a product retrieval manifest, or make agent-facing retrieval evidence
+trustworthy by itself.
+
+Read commands default to `--refresh none`. If a read command says the cache is
+empty, either run `index --refresh full` first or rerun the read command with an
+explicit refresh mode. Agent-facing `packet` and `search` evidence require full
+retrieval sidecars; prepare the sidecar lane below before treating those
+commands as product-quality proof.
 
 ## Hybrid Retrieval Setup
 

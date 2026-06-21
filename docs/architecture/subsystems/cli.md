@@ -87,7 +87,18 @@ rather than the general CLI architecture page.
 
 `context` is target context: DB-first evidence for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. It is not a natural-language question-answering surface and is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
-`doctor` is a read-only health report for project path resolution, cache presence, index counts, retrieval state, managed embedding setup, relevant embedding environment variables, and next commands. It should stay diagnostic; it should not mutate caches or fetch model assets. `setup embeddings` is the explicit mutating path for installing pinned ONNX Runtime BGE-base assets in the user cache. Managed setup does not launch or retain an embedding server.
+`doctor` is a read-only health report for project path resolution, cache
+presence, index counts, retrieval state, managed embedding setup, relevant
+embedding environment variables, and next commands. It should stay diagnostic;
+it should not mutate caches or fetch model assets.
+
+`setup embeddings` is the explicit mutating path for installing pinned ONNX
+Runtime BGE-base assets in the user cache. That managed setup path is for local
+semantic diagnostics and compatibility checks. It does not launch or retain an
+embedding server, and it does not prepare product `packet`/`search` retrieval.
+Product retrieval proof starts with `retrieval bootstrap`, then `retrieval index
+--refresh full`, then `retrieval status --format json` reporting
+`retrieval_mode: "full"`.
 
 ## Search And Context Research Boundary
 
