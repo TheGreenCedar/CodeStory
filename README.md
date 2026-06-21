@@ -84,8 +84,9 @@ snippet, packet, and search tools; it does not edit your repository.
 
 The skill owns binary setup. It checks `codestory-cli --version`, compares the
 installed binary with the latest GitHub release, installs a matching release
-asset when practical, and checks `SHA256SUMS.txt` when the host can. It also
-restarts the Codex host/app before starting a new agent thread if `PATH` changed.
+asset when practical, and checks `SHA256SUMS.txt` when the host can. If `PATH`
+changed, the skill tells the human that a Codex host/app restart may be needed
+before a fresh agent thread can see it.
 
 CodeStory publishes cross-platform CLI assets for Windows, macOS, and Linux.
 Source fallback is available when a release asset does not fit the host.

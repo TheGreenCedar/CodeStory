@@ -125,9 +125,8 @@ agent packet/search is ready.
 
 The plugin does not bundle the binary. The agent-owned skill verifies
 `codestory-cli --version`, compares it with the latest GitHub release, installs
-the matching release asset when practical, checks `SHA256SUMS.txt` when the host
-can, and restarts the Codex host/app before starting a new agent thread if the
-MCP process needs a fresh `PATH`.
+the matching release asset when practical, and checks `SHA256SUMS.txt` when the
+host can. If `PATH` changed, the skill tells the human that a Codex host/app restart may be needed before a fresh agent thread can see it.
 
 Use source fallback only when no release asset fits the host:
 
