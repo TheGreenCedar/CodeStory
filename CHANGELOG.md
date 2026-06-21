@@ -26,8 +26,8 @@ packet/search readiness, sidecar promotion, or benchmark improvement.
 | Cross-platform plugin readiness | Plugin README, skill guidance, and static tests now cover Windows, macOS, and Linux install/readiness paths without adding an adapter runtime or changing Rust product behavior. | PR #269 |
 | Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this patch release lane. | PR #260 |
 
-The plugin docs keep current archive names release-bound to `v0.11.0`; update
-them with the main release workflow when `0.11.1` assets exist.
+The plugin docs and installer defaults keep current archive names release-bound
+to `v0.11.1`; the marketplace catalog remains outside this repository.
 
 ## 0.11.0
 
