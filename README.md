@@ -1,8 +1,8 @@
 <h1 align="center">CodeStory</h1>
 
 <p align="center">
-Local codebase grounding for coding agents, with cited repository evidence and
-readiness checks the human operator can inspect.
+Local code intelligence for coding agents: graph-backed context, source
+citations, and explicit uncertainty.
 </p>
 
 <p align="center">
@@ -10,191 +10,154 @@ readiness checks the human operator can inspect.
 <a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
 </p>
 
-Coding agents are very good at sounding certain before they have grounded the
-repo in front of them. That is backwards. Before an operator asks for a plan,
-review, or edit, the agent needs current local context it can cite and the
-human can inspect.
+Coding agents can sound certain before they have mapped the repository in front
+of them. That is how plausible answers turn into review work.
 
-CodeStory gives the agent a read-only local MCP/CLI grounding surface: files,
-symbols, snippets, trails, packet/search, and readiness gates over the current
-checkout. The result is not magic. It is better plumbing: the agent starts from
-local evidence, knows when packet/search is trustworthy, and leaves claims a
-reviewer can follow back to source.
+The human needs answers that survive inspection: which files were read, which
+symbols connect, which behavior trail was followed, and where the evidence
+stops.
 
-Use it when the next agent answer needs to survive review:
+CodeStory builds a local map/code-intelligence layer for a repository so an
+agent can inspect code relationships, retrieve source, trace behavior, and cite
+what it found. It exposes that map through a read-only MCP server, a CLI, and a
+Codex plugin. When the map is stale, partial, or missing, CodeStory says so
+instead of letting a lead harden into a claim.
 
-- What is in this repo?
-- Which files changed, and what else might be affected?
-- Where is this behavior implemented?
-- Which symbols, references, snippets, and trails support the answer?
-- Is broad packet/search ready enough to use as evidence?
+## See It First
 
-CodeStory does not replace source review, tests, or human judgment. It changes
-the starting point: local cited evidence first, confident guesses last.
+Ask the agent for a grounded trace before it plans an edit:
 
-## Proof Before Trust
+```text
+@CodeStory Ground this repository, then trace where request routing is owned and identify the tests most likely affected by changing it.
+```
 
-These are documented regression and protocol numbers, not marketing claims.
-They do not prove token savings, answer quality, public benchmark promotion, or
-generalization.
+A representative result should look like this shape, with repo-specific paths
+and symbols filled in from the current checkout:
 
-| What the repo evidence says | Number | Source | Trust boundary |
-| --- | ---: | --- | --- |
-| Repo-scale full-sidecar stats row | `75.36s` index, including `49.45s` semantic phase | 2026-06-18 `d8d59e9e+wt` #41 hardening row in [codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md); summarized in [performance-review-playbook.md](docs/testing/performance-review-playbook.md#current-ops-gates) | Regression telemetry only; the row says the real drill was intentionally skipped. |
-| Retrieval sidecar readiness on that row | `retrieval_mode full`, `4.34s` retrieval index, `0.39s` retrieval status | Same 2026-06-18 #41 hardening row and playbook snapshot | `retrieval_mode=full` proves infrastructure readiness for packet/search, not answer quality. |
-| Repeat full refresh cache reuse | `29.45s` repeat refresh with `750` reused and `0` embedded | Same 2026-06-18 #41 hardening row and playbook snapshot | Useful cache/reuse signal; not a quality or generalization result. |
-| Agent stdio loop smoke | `20` reps, `53.50ms` warm loop, protocol stdout-only | Small-fixture release-binary row in [codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md) | Protocol/read-surface smoke; not repo-scale packet/search proof. |
+```text
+readiness
+- local_navigation: ready
+- agent_packet_search: ready only when retrieval_mode=full
 
-The stricter rule is deliberate: local navigation readiness is useful, but broad
-packet/search claims require `agent_packet_search` ready and `retrieval_mode=full`.
-Even that is infrastructure readiness; public answer-quality claims need the
-separate packet-runtime or drill evidence described in
-[retrieval-architecture.md](docs/testing/retrieval-architecture.md).
+evidence
+- files: <router file>, <handler file>, <route tests>
+- symbols: <router entrypoint>, <handler>, <test module>
+- trail: <entrypoint> -> <router> -> <handler>
+- snippets: cited source ranges for the concrete functions inspected
+- affected: likely review/test surfaces based on changed files and graph edges
 
-## The Trust Loop
+leads, not proof
+- degraded packet/search candidates when sidecars are not full
+- packet gaps and follow-up commands when broad evidence is partial
+```
+
+The useful distinction is simple: files, symbols, snippets, and trails are
+source-backed evidence. Broad `packet` and `search` output is evidence only when
+the retrieval lane reports `full`; otherwise it is a lead to inspect.
+
+## What It Helps An Agent Do
+
+- Orient inside an unfamiliar repository before planning work.
+- Inspect files, symbols, definitions, references, snippets, and graph trails.
+- Trace how behavior moves from an entrypoint to supporting code.
+- Estimate changed-file impact and likely test surfaces.
+- Build a bounded packet for a broad repository question.
+- Preserve uncertainty with readiness status, packet gaps, and follow-up
+  commands.
+
+## Install The Plugin
+
+The easiest path today is the Codex plugin.
+
+1. Open Codex in the repository you want to ground.
+2. Run `/plugins`, then install `TheGreenCedar -> codestory`.
+3. Start a fresh thread and ask `@CodeStory` to check readiness before planning
+   changes.
+
+Marketplace/catalog details and binary bootstrap behavior live in the
+[plugin README](plugins/codestory/README.md). Sidecar setup and repair details
+live in [retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    Human["Human operator"] --> Prompt["Ask the agent to ground the repo"]
-    Prompt --> Plugin["CodeStory plugin"]
-    Plugin --> Runtime["codestory-cli serve --stdio --refresh none"]
-    Runtime --> Evidence["Local graph, files, snippets, trails"]
-    Runtime --> Readiness["doctor/readiness status"]
-    Evidence --> Agent["Agent plans, reviews, or edits"]
-    Readiness --> Agent
-    Agent --> Human
-    Readiness -. "packet/search only when retrieval_mode=full" .-> Packet["packet/search evidence"]
+    Repo["Repository checkout"] --> Discovery["Discovery and refresh plan"]
+    Discovery --> Indexer["Parser/indexer and structural collectors"]
+    Indexer --> Graph["SQLite graph and source index"]
+    Graph --> Sidecars["Optional retrieval sidecars<br/>Zoekt, Qdrant, SCIP, llama.cpp"]
+    Graph --> Runtime["CodeStory runtime"]
+    Sidecars --> Runtime
+    Runtime --> Surfaces["MCP server, CLI, Codex plugin"]
+    Surfaces --> Agent["Coding agent"]
 ```
 
-The normal path is plugin-first. The CLI exists for setup, repair, debugging,
-and transcripts.
+The SQLite graph is the local navigation base. Retrieval sidecars add broad
+lexical, dense, and graph-backed search for packet/search workflows when they
+are healthy.
 
-## Use It With An Agent
+> [!IMPORTANT]
+> **Trust and privacy boundary**
+>
+> CodeStory runs locally and read-only. It does not edit the repository, and
+> CodeStory itself does not send indexed source to a hosted service. The agent
+> using CodeStory still has its own model/provider boundary.
+>
+> Local graph navigation works from the CodeStory index. Broad `packet` and
+> `search` results count as evidence only when `agent_packet_search` is ready
+> and retrieval reports `full`. Degraded, stale, fallback, or partial output is
+> a lead to inspect, not a fact to repeat.
 
-Most humans should install CodeStory through the agent plugin, not memorize CLI
-commands. Open Codex in the workspace you want to ground and use:
+## Language Support
 
-```text
-/plugins
-```
+CodeStory uses "support" with qualifiers. Parser-backed graph extraction,
+structural source anchors, and agent answer quality are different claims.
 
-Choose:
-
-```text
-TheGreenCedar -> codestory -> Install plugin
-```
-
-If your Codex build exposes terminal marketplace management for source
-marketplaces, add or refresh this marketplace first:
-
-```bash
-codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
-```
-
-The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`. Its
-marketplace display/name concept is `TheGreenCedar`. This repository is the
-plugin source at `https://github.com/TheGreenCedar/CodeStory.git`, with source path `plugins/codestory`. The CodeStory repo does not contain the marketplace catalog.
-
-Start a new Codex thread after install or refresh. A useful first prompt is:
-
-```text
-@CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
-```
-
-The plugin launches `codestory-cli serve --stdio --refresh none` directly. The
-local MCP server is read-only: it gives the agent grounding, inventory, graph,
-snippet, packet, and search tools; it does not edit your repository.
-
-The skill owns binary setup. It checks `codestory-cli --version`, compares the
-installed binary with the latest GitHub release, installs a matching release
-asset when practical, and checks `SHA256SUMS.txt` when the host can. If `PATH`
-changed, the skill tells the human that a Codex host/app restart may be needed
-before a fresh agent thread can see it.
-
-CodeStory publishes cross-platform CLI assets for Windows, macOS, and Linux.
-Source fallback is available when a release asset does not fit the host.
-
-## What Your Agent Gets
-
-| Human question | CodeStory surface | Trust boundary |
+| Claim | Current source truth | Safe wording |
 | --- | --- | --- |
-| Is this repository ready to use? | `codestory://status`, `doctor` | Separates local navigation from packet/search readiness. |
-| What is in this repo? | `codestory://grounding`, `ground`, `files` | Source-backed orientation, not a proof of every behavior. |
-| What changed, and what might be affected? | `affected` | Review planning help; still run the relevant tests. |
-| Where should we inspect next? | `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, `context` | Follow concrete source anchors before claiming facts. |
-| Can we ask a broad codebase question? | `packet`, `search` | Proof only with `agent_packet_search` ready and `retrieval_mode=full`. |
+| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | Daily graph navigation on typical code, with caveats. |
+| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | Exact-source structural/schema anchors, not semantic runtime proof. |
+| Agent-facing packet/search quality | Run-specific packet-runtime, drill, or benchmark evidence | Not implied by language support or sidecar readiness alone. |
 
-The canonical plugin skill is
-[plugins/codestory/skills/codestory-grounding/SKILL.md](plugins/codestory/skills/codestory-grounding/SKILL.md).
+The durable claim contract is
+[docs/architecture/language-support.md](docs/architecture/language-support.md).
+The source registry is
+[`crates/codestory-contracts/src/language_support.rs`](crates/codestory-contracts/src/language_support.rs).
 
-## Trust And Readiness
+## CLI Escape Hatch
 
-| Lane | Use it for | Trust it when | If not ready |
-| --- | --- | --- | --- |
-| Local navigation | Grounding, file inventory, changed-file impact, graph/source follow-up. | `local_navigation` is ready. | Refresh or rebuild the local cache, then source-read the named files. |
-| Packet/search | Broad repo questions and candidate discovery. | `agent_packet_search` is ready and `retrieval_mode=full`. | Treat output as navigation help only, then repair sidecars or fall back to direct source reads. |
-
-Non-`full` packet/search output is not proof. Degraded, partial, stale, fallback,
-or missing sidecar output may help the agent choose files to inspect; it cannot
-carry a product-grade claim.
-
-## When To Use The CLI
-
-Use the CLI when you need a direct setup, repair, or debug transcript.
-
-Setup and local navigation:
+Use the CLI when you need a direct setup, repair, or debug transcript:
 
 ```sh
 codestory-cli doctor --project <repo>
 codestory-cli index --project <repo> --refresh auto
 codestory-cli ground --project <repo> --why
-codestory-cli files --project <repo> --limit 80
 codestory-cli affected --project <repo> --format markdown
-```
-
-Repair a stale local cache:
-
-```sh
-codestory-cli doctor --project <repo>
-codestory-cli index --project <repo> --refresh full
-codestory-cli doctor --project <repo>
-```
-
-Debug packet/search readiness:
-
-```sh
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-Repair packet/search sidecars:
+For task-shaped CLI flows, see [docs/usage.md](docs/usage.md). For packet/search
+sidecars, see [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
 
-```sh
-codestory-cli retrieval bootstrap --project <repo> --format json
-codestory-cli retrieval index --project <repo> --refresh full
-codestory-cli retrieval status --project <repo> --format json
-```
+## Performance And Verification
 
-For source checkout work:
+These numbers are regression and protocol evidence. They do not prove answer
+quality, token savings, public benchmark promotion, or generalization.
 
-```sh
-cargo build --release -p codestory-cli
-```
+| Evidence surface | Current documented signal | Boundary |
+| --- | --- | --- |
+| Repo-scale e2e stats | 2026-06-18 `d8d59e9e+wt` #41 hardening row recorded `75.36s` index time, including `49.45s` semantic phase. See [codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md). | Regression telemetry; that row says the real drill was intentionally skipped. |
+| Retrieval sidecar readiness | Same row recorded `retrieval_mode full`, `4.34s` retrieval index, and `0.39s` retrieval status. | Infrastructure readiness for packet/search, not answer quality. |
+| Repeat full refresh cache reuse | Same row recorded `29.45s` repeat refresh with `750` reused and `0` embedded. | Cache/reuse signal only. |
+| Agent stdio loop smoke | Small-fixture release-binary row recorded `20` reps and `53.50ms` warm loop in [codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md). | Protocol/read-surface smoke, not repo-scale packet/search proof. |
 
-On Windows PowerShell, use `.\target\release\codestory-cli.exe` and normal
-Windows paths. The release-binary installer path is:
-
-```powershell
-.\scripts\install-codestory.ps1 -Project C:\path\to\repo
-```
-
-See [docs/usage.md](docs/usage.md) for task-shaped flows and
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for
-packet/search setup and repair.
+Promotion and proof tiers are described in
+[retrieval-architecture.md](docs/testing/retrieval-architecture.md).
 
 ## Docs For Operators And Contributors
 
-Start with the [docs entry map](docs/README.md) to choose the right durable
-page for setup, repair, architecture, verification, or research evidence.
+Start with [docs/README.md](docs/README.md) for setup, repair, architecture,
+verification, and research evidence.
 
 ## License
 
