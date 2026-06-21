@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.11.1
+
+CodeStory 0.11.1 is the patch release lane for the Codex plugin packaging work
+that landed after `v0.11.0`. It keeps the release version synchronized while
+making the new plugin path reviewable before the eventual main promotion:
+install/readiness stays in the CLI wrapper, the plugin package owns only Codex
+metadata and skill text, and `.mcp.json` launches `codestory-cli serve --stdio`
+directly instead of carrying a Node adapter.
+
+The marketplace catalog is still a non-claim for this release prep. Issue #264
+remains open, and PR #262 explicitly left the `TheGreenCedar/AgentPluginMarketplace`
+entry outside this repository. This changelog entry also does not claim new
+binary assets, a pushed `v0.11.1` tag, packet/search readiness, sidecar
+promotion, or benchmark improvement.
+
+### Shipped Since 0.11.0
+
+| Area | Delivered in 0.11.1 | Evidence |
+| --- | --- | --- |
+| Release version | All `codestory-*` workspace crates and `Cargo.lock` are synchronized at `0.11.1`. | Issue #267 |
+| Plugin packaging | `plugins/codestory` now contains the Codex plugin manifest, MCP metadata, package README, grounding skill, and static package tests. | PR #262 |
+| Direct CLI MCP launch | The plugin `.mcp.json` launches `codestory-cli serve --stdio --refresh none` directly, with no in-package Node adapter or duplicated retrieval/runtime logic. | PR #262 |
+| Install and readiness wrapper | `scripts/install-codestory.ps1` added the Windows x64 happy path for finding or installing `codestory-cli`, then reporting binary, local-navigation, and packet/search readiness from `doctor`. | PR #261 |
+| Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this patch release lane. | PR #260 |
+
+Automatic install remains Windows x64 first. The plugin docs point other
+platforms at the available release assets or an explicit `codestory-cli` on
+`PATH`, and macOS x64 remains source/manual until a matching asset exists.
+
 ## 0.11.0
 
 CodeStory 0.11.0 was published from `main` at
