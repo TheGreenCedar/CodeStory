@@ -26,8 +26,9 @@ tool source unless the user is editing CodeStory itself.
    `codestory-cli --version` with that tag and keep the binary only when it
    already matches the latest release.
 4. If `codestory-cli` is missing or outdated, download and unpack only the
-   matching host asset derived from the latest tag before asking the human to
-   run manual commands. For latest tag `vX.Y.Z`, use:
+   matching host asset derived from the latest tag. Do this before asking the
+   human to install or run manual commands unless network access, permissions,
+   or a missing release asset blocks the setup. For latest tag `vX.Y.Z`, use:
    - Windows x64: `codestory-cli-vX.Y.Z-windows-x64.zip`
    - Windows arm64: `codestory-cli-vX.Y.Z-windows-arm64.zip`
    - macOS arm64: `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`

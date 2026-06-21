@@ -53,9 +53,8 @@ Choose:
 TheGreenCedar -> codestory -> Install plugin
 ```
 
-If the `TheGreenCedar` catalog is not listed and your Codex build exposes
-terminal marketplace management for source marketplaces, add or refresh the
-external catalog first:
+If your Codex build exposes terminal marketplace management for source
+marketplaces, add or refresh this marketplace first:
 
 ```bash
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
@@ -66,9 +65,8 @@ This repository remains the plugin source. One marketplace can list multiple plu
 CodeStory's entry points at `https://github.com/TheGreenCedar/CodeStory.git`
 with source path `plugins/codestory`.
 
-Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
-workspace plugin settings are managed from the Codex Apps/Plugins UI rather
-than the terminal, so use the UI path when the CLI marketplace command is
+Some workspace plugin settings are managed from the Codex Apps/Plugins UI
+rather than the terminal. Use the UI path when the CLI marketplace command is
 unavailable.
 
 Start a new Codex thread after installation or refresh. The installed package
@@ -82,6 +80,10 @@ before planning or editing:
 ```text
 @CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
 ```
+
+The first run should be agent-owned. The skill checks whether `codestory-cli` is
+present and current, downloads the latest matching release asset when needed,
+and uses source fallback only when no release asset fits the host.
 
 ## What To Ask
 
@@ -123,7 +125,7 @@ Do not treat `ground`, `symbol`, `trail`, or `snippet` readiness as proof that
 agent packet/search is ready. That mistake is how agents write confident
 nonsense with a straight face.
 
-### Runtime latest-release fallback
+### Agent runtime bootstrap
 
 The plugin does not bundle the binary. The agent should run
 `codestory-cli --version` first. If `codestory-cli` is missing or outdated

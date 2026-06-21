@@ -47,13 +47,13 @@ directly.
 
 ## Start Here
 
-For agent use, install the CodeStory plugin package and keep
-`codestory-cli` available on the host `PATH`. The canonical grounding skill is
+For agent use, install the CodeStory plugin package. The canonical grounding skill is
 [plugins/codestory/skills/codestory-grounding/SKILL.md](plugins/codestory/skills/codestory-grounding/SKILL.md).
 That skill tells the agent to read readiness first, use packet/search only when
 sidecars are ready, and fall back to direct source reads when they are not.
-If the binary is missing or outdated, the skill tells the agent to resolve the
-latest GitHub release for the host before falling back to a source build.
+If `codestory-cli` is missing or outdated on the agent host, the skill tells the
+agent to resolve the latest GitHub release, download the matching host asset,
+and fall back to a source build only when a release asset is unavailable.
 
 For operator or repair work from this checkout:
 
@@ -121,9 +121,8 @@ Choose:
 TheGreenCedar -> codestory -> Install plugin
 ```
 
-If the `TheGreenCedar` catalog is not listed and your Codex build exposes
-terminal marketplace management for source marketplaces, add or refresh the
-external catalog first:
+If your Codex build exposes terminal marketplace management for source
+marketplaces, add or refresh this marketplace first:
 
 ```bash
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
@@ -133,9 +132,8 @@ The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
 This repository remains the plugin source. The catalog can list many plugins,
 and the CodeStory entry points at `plugins/codestory` in this repo.
 
-Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
-workspace plugin settings are managed from the Codex Apps/Plugins UI rather
-than the terminal, so use the UI path when the CLI marketplace command is
+Some workspace plugin settings are managed from the Codex Apps/Plugins UI rather
+than the terminal. Use the UI path when the CLI marketplace command is
 unavailable.
 
 Start a new Codex thread after installation or refresh. A good first prompt is:
@@ -147,11 +145,11 @@ Start a new Codex thread after installation or refresh. A good first prompt is:
 The canonical skill ships inside this repository's plugin package at
 [`plugins/codestory/skills/codestory-grounding/SKILL.md`](plugins/codestory/skills/codestory-grounding/SKILL.md).
 
-The plugin launches `codestory-cli serve --stdio --refresh none` directly. If
-the binary is missing or older than the latest GitHub release on the agent host,
-use the matching host release asset or source fallback documented in
-[the plugin README](plugins/codestory/README.md), then restart the agent thread
-if `PATH` changed.
+The plugin launches `codestory-cli serve --stdio --refresh none` directly.
+The skill owns the runtime check: it should compare `codestory-cli --version`
+against the latest GitHub release, download and unpack the matching host asset
+when the binary is missing or outdated, and restart the agent thread if `PATH`
+changed.
 
 ## Command Surfaces
 
