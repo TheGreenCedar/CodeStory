@@ -80,7 +80,7 @@ def main() -> None:
         copy_required_file(root, "README.md", stage_root)
         copy_required_file(root, "LICENSE", stage_root)
         copy_required_file(root, "docs/usage.md", stage_root)
-        copy_required_dir(root, ".agents/skills/codestory-grounding", stage_root)
+        copy_required_dir(root, "plugins/codestory/skills/codestory-grounding", stage_root)
 
         if archive_ext == ".zip":
             archive_zip(stage_root, archive_path)
