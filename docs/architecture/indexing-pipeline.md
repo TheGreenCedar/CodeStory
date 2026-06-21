@@ -300,7 +300,7 @@ Then use live tooling if you need workspace-specific evidence:
 
 - `codestory-cli index --project .`
 - `codestory-cli search --project . --query <symbol>`
-- the repo-local `codestory-grounding` skill in `.agents/skills/codestory-grounding/SKILL.md`
+- the canonical plugin skill in `plugins/codestory/skills/codestory-grounding/SKILL.md`
 
 Treat the grounding workflows as follow-up evidence, not the primary
 explanation. Local grounding and search-state rebuilds can depend on semantic

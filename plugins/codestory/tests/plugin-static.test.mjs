@@ -22,13 +22,14 @@ test("plugin metadata maps skill and direct stdio server", async () => {
 
 test("codestory repo ships plugin source, not marketplace catalog or adapter runtime", async () => {
   await assert.rejects(access(join(repoRoot, ".agents", "plugins", "marketplace.json")));
+  await assert.rejects(access(join(repoRoot, ".agents", "skills", "codestory-grounding", "SKILL.md")));
   await assert.rejects(access(join(pluginRoot, "scripts", "codestory-mcp.mjs")));
 });
 
-test("install guidance is cross-platform and release-bound", async () => {
+test("plugin docs are agent-first, cross-platform, and release-bound", async () => {
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
   const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
-  const required = [
+  const sharedRequired = [
     "release-bound to CodeStory `v0.11.1`",
     "codestory-cli-v0.11.1-windows-x64.zip",
     "codestory-cli-v0.11.1-windows-arm64.zip",
@@ -37,14 +38,40 @@ test("install guidance is cross-platform and release-bound", async () => {
     "codestory-cli-v0.11.1-linux-x64.tar.gz",
     "codestory-cli-v0.11.1-linux-arm64.tar.gz",
     "Source fallback",
-    "Codex host `PATH`",
-    "codestory://status",
+    "codestory-cli --version",
     "retrieval_mode=full",
+  ];
+  const readmeRequired = [
+    "The human job is simple",
+    "The CLI is still there, but it is the escape hatch and repair surface",
+    "codestory://status",
+    "codestory://grounding",
+    "The plugin does not bundle the binary",
+  ];
+  const skillRequired = [
+    "download and unpack the matching release asset",
+    "plugin MCP process may need",
+    "new agent thread",
+    "Read `codestory://grounding`",
+    "Always pass `--project <target-workspace>` explicitly",
   ];
 
   for (const text of [readme, skill]) {
-    for (const phrase of required) {
+    for (const phrase of sharedRequired) {
       assert.equal(text.includes(phrase), true, phrase);
     }
   }
+  for (const phrase of readmeRequired) {
+    assert.equal(readme.includes(phrase), true, phrase);
+  }
+  for (const phrase of skillRequired) {
+    assert.equal(skill.includes(phrase), true, phrase);
+  }
+});
+
+test("canonical grounding skill ships with plugin references", async () => {
+  await access(join(pluginRoot, "skills", "codestory-grounding", "references", "ground.md"));
+  await access(join(pluginRoot, "skills", "codestory-grounding", "references", "packet.md"));
+  await access(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.ps1"));
+  await access(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"));
 });
