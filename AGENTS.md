@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
-- Primary runtime surface is `crates/codestory-cli`; the repo-local skill lives under `.agents/skills/codestory-grounding`.
+- Primary runtime surface is `crates/codestory-cli`; the canonical agent skill ships with the plugin under `plugins/codestory/skills/codestory-grounding`.
 - Workspace crates: `codestory-contracts`, `codestory-workspace`, `codestory-store`, `codestory-indexer`, `codestory-retrieval`, `codestory-runtime`, `codestory-cli`, `codestory-bench`.
 - Runtime artifacts: user-cache SQLite grounding indexes keyed by repo path; build outputs in `target/`.
 

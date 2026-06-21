@@ -3,13 +3,18 @@
 Setup, workflows, sidecars, recovery. Shell examples are POSIX unless noted.
 Windows: `.\target\release\codestory-cli.exe`, `$env:NAME = "value"`.
 
-## Use Paths
+## Install The Plugin
 
-For agent workflows, install the CodeStory plugin package and keep
-`codestory-cli` available on the host `PATH`. The canonical grounding skill is
+Install the CodeStory plugin once, then point the agent at explicit target
+workspaces. See [README - Install as an agent plugin](../README.md#install-as-an-agent-plugin)
+and [the plugin README](../plugins/codestory/README.md) for the agent-first
+install and binary setup flow.
+
+The canonical skill package lives at
 [../plugins/codestory/skills/codestory-grounding/SKILL.md](../plugins/codestory/skills/codestory-grounding/SKILL.md).
-It is the operating contract for readiness, packet/search trust, and fallback
-to direct source reads.
+If you use its source-build setup fallback and need a different source artifact,
+set `CODESTORY_REPO_URL` and `CODESTORY_REPO_REF` before running setup. Without
+an explicit ref, setup fetches and builds the remote default branch.
 
 For humans and repair lanes, use the CLI directly. The CLI tells you whether
 local navigation or packet/search is ready; do not infer readiness from a

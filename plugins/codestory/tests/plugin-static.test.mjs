@@ -22,29 +22,83 @@ test("plugin metadata maps skill and direct stdio server", async () => {
 
 test("codestory repo ships plugin source, not marketplace catalog or adapter runtime", async () => {
   await assert.rejects(access(join(repoRoot, ".agents", "plugins", "marketplace.json")));
+  await assert.rejects(access(join(repoRoot, ".agents", "skills", "codestory-grounding", "SKILL.md")));
   await assert.rejects(access(join(pluginRoot, "scripts", "codestory-mcp.mjs")));
 });
 
-test("install guidance is cross-platform and release-bound", async () => {
+test("plugin docs are agent-first, cross-platform, and latest-release aware", async () => {
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
   const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
-  const required = [
-    "release-bound to CodeStory `v0.11.1`",
-    "codestory-cli-v0.11.1-windows-x64.zip",
-    "codestory-cli-v0.11.1-windows-arm64.zip",
-    "codestory-cli-v0.11.1-macos-arm64.tar.gz",
+  const sharedRequired = [
+    "latest GitHub release",
+    "codestory-cli --version",
+    "missing or outdated",
+    "codestory-cli-vX.Y.Z-windows-x64.zip",
+    "codestory-cli-vX.Y.Z-windows-arm64.zip",
+    "codestory-cli-vX.Y.Z-macos-arm64.tar.gz",
     "macOS x64",
-    "codestory-cli-v0.11.1-linux-x64.tar.gz",
-    "codestory-cli-v0.11.1-linux-arm64.tar.gz",
+    "codestory-cli-vX.Y.Z-linux-x64.tar.gz",
+    "codestory-cli-vX.Y.Z-linux-arm64.tar.gz",
     "Source fallback",
-    "Codex host `PATH`",
-    "codestory://status",
+    "SHA256SUMS.txt",
     "retrieval_mode=full",
+  ];
+  const forbidden = [
+    "release-bound to " + "CodeStory `v" + "0.11.1`",
+    "codestory-cli-v" + "0.11.1",
+    "use that version " + "unless",
+    "| Catalog repo |",
+    "Install plugin entry `codestory` from the external marketplace catalog:",
+  ];
+  const readmeRequired = [
+    "The human job is simple",
+    "The CLI is still there, but it is the escape hatch and repair surface",
+    "codestory://status",
+    "codestory://grounding",
+    "For normal Codex use, install the plugin through the Codex plugin flow for your",
+    "/plugins",
+    "TheGreenCedar -> codestory -> Install plugin",
+    "codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace",
+    "Some workspace plugin settings are managed from the Codex Apps/Plugins UI",
+    "Use the UI path when the CLI marketplace command is",
+    "Start a new Codex thread after installation or refresh",
+    "check whether this repository is ready for local navigation and packet/search",
+    "Source docs, marketplace source checkout/cache, and the active installed MCP",
+    "active runtime surface",
+    "The plugin does not bundle the binary",
+    "TheGreenCedar/AgentPluginMarketplace",
+    "git-subdir",
+    "https://github.com/TheGreenCedar/CodeStory.git",
+    "plugins/codestory",
+    "codestory-cli serve --stdio --refresh none",
+  ];
+  const skillRequired = [
+    "download and unpack only",
+    "plugin MCP process may need",
+    "new agent thread",
+    "Read `codestory://grounding`",
+    "Always pass `--project <target-workspace>` explicitly",
   ];
 
   for (const text of [readme, skill]) {
-    for (const phrase of required) {
+    for (const phrase of sharedRequired) {
       assert.equal(text.includes(phrase), true, phrase);
     }
+    for (const phrase of forbidden) {
+      assert.equal(text.includes(phrase), false, phrase);
+    }
   }
+  for (const phrase of readmeRequired) {
+    assert.equal(readme.includes(phrase), true, phrase);
+  }
+  for (const phrase of skillRequired) {
+    assert.equal(skill.includes(phrase), true, phrase);
+  }
+});
+
+test("canonical grounding skill ships with plugin references", async () => {
+  await access(join(pluginRoot, "skills", "codestory-grounding", "references", "ground.md"));
+  await access(join(pluginRoot, "skills", "codestory-grounding", "references", "packet.md"));
+  await access(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.ps1"));
+  await access(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"));
 });

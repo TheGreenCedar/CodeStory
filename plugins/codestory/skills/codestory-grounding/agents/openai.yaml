@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodeStory Grounding"
+  short_description: "Ground local repos through CodeStory's plugin MCP or CLI fallback before planning, editing, or reviewing."
+  default_prompt: "Use $codestory-grounding to resolve or install codestory-cli, check CodeStory status for this repository, read the grounding map, and use packet/search only when sidecars are full."
