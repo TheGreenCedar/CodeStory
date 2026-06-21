@@ -10,25 +10,28 @@ checks, and source citations the human operator can inspect.
 <a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
 </p>
 
-CodeStory gives your coding agent a local map of the repository before it
-starts guessing. It runs on your machine, reads the codebase, reports whether
-its evidence is ready, and gives the agent cited source paths to follow.
+CodeStory is for the human supervising a coding agent in a real repository.
+Install it when you want the agent to start from local source evidence instead
+of chat memory, fuzzy search, or whatever file it noticed first.
 
-Install it when you want an agent to answer practical questions with local
-evidence:
+It runs on your machine, reads the codebase, reports whether its evidence is
+ready, and gives the agent cited source paths to inspect. Use it when the next
+question is concrete:
 
 - What is in this repo?
 - Which files changed, and what else might be affected?
 - Where is this behavior implemented?
 - Which symbols, references, snippets, and source trails support the answer?
-- Is broad packet/search evidence ready enough to trust?
+- Is broad packet/search ready enough to trust?
 
-The short version: CodeStory is not here to replace reading code. It is here to
-make the agent read the right code first.
+CodeStory does not replace source review. It makes the agent read the right code
+first, and it tells the human when broad packet/search output is only a hint.
 
 ## Use It With An Agent
 
-For normal Codex use, install the plugin in the workspace you want to ground:
+Most humans should use CodeStory through the agent plugin, not by memorizing CLI
+commands. For normal Codex use, install the plugin in the workspace you want to
+ground:
 
 ```text
 /plugins
@@ -47,12 +50,9 @@ marketplaces, add or refresh this marketplace first:
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
-The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`; its
-marketplace display/name concept is `TheGreenCedar`. This repository remains
-the plugin source at `https://github.com/TheGreenCedar/CodeStory.git`, with
-source path `plugins/codestory`.
-
-The CodeStory repo does not contain the marketplace catalog.
+The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`. This
+repo owns the CodeStory plugin source under `plugins/codestory`; it does not
+contain the marketplace catalog.
 
 Start a new Codex thread after install or refresh so the MCP process gets the
 current environment. A good first prompt is:
@@ -61,22 +61,23 @@ current environment. A good first prompt is:
 @CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
 ```
 
-The plugin launches `codestory-cli serve --stdio --refresh none` directly. The
-local MCP server is read-only: it gives the agent grounding, inventory, graph,
-snippet, packet, and search tools; it does not edit your repository.
+The plugin launches `codestory-cli serve --stdio --refresh none`. The local MCP
+server is read-only: it gives the agent grounding, inventory, graph, snippet,
+packet, and search tools; it does not edit your repository.
 
 The skill owns binary setup. It checks `codestory-cli --version`, compares the
 installed binary with the latest GitHub release, installs a matching release
 asset when practical, and checks `SHA256SUMS.txt` when the host can.
 
-It restarts the Codex host/app before starting a new agent thread if `PATH` changed.
+Restart the Codex host/app before starting a new agent thread if setup changed
+`PATH`.
 
 CodeStory publishes cross-platform CLI assets for Windows, macOS, and Linux.
 Source fallback is still available when a release asset does not fit the host.
 
 ## What Your Agent Gets
 
-| Human question | CodeStory gives the agent |
+| Human question | What the agent gets |
 | --- | --- |
 | Is this repository ready to use? | Status and doctor output that separate local navigation from broad packet/search readiness. |
 | What is in this repo? | A compact grounding view and indexed file inventory. |
@@ -101,34 +102,50 @@ The canonical plugin skill is
 
 ## Trust And Readiness
 
-CodeStory has two trust lanes:
+Keep the two trust lanes separate:
 
 | Lane | Use it for | Trust it when |
 | --- | --- | --- |
 | Local navigation | Grounding, file inventory, changed-file impact, graph/source follow-up. | `local_navigation` is ready. |
 | Packet/search | Broad repo questions and candidate discovery. | `agent_packet_search` is ready and `retrieval_mode=full`. |
 
-Do not trust packet/search claims unless `retrieval_mode=full`. Degraded
-sidecar output can help the agent navigate, but it is not product-grade
-evidence.
+Do not treat packet/search as proof unless `retrieval_mode=full`. Degraded,
+partial, stale, or missing sidecar output can help the agent navigate; it is not
+product-grade evidence.
 
-Every answer still needs cited source. CodeStory can point the agent at the
-evidence; the agent still has to use it honestly.
+Every answer still needs cited source. CodeStory can point at the evidence; the
+agent still has to use it honestly.
 
 ## When To Use The CLI
 
 Most humans should start with the plugin. Use the CLI when you need a direct
 setup, repair, or debug transcript.
 
+Setup and local navigation:
+
 ```sh
 codestory-cli doctor --project <repo>
+codestory-cli index --project <repo> --refresh auto
 codestory-cli ground --project <repo> --why
 codestory-cli files --project <repo> --limit 80
 codestory-cli affected --project <repo> --format markdown
+```
+
+Repair a stale local cache:
+
+```sh
+codestory-cli doctor --project <repo>
+codestory-cli index --project <repo> --refresh full
+codestory-cli doctor --project <repo>
+```
+
+Debug packet/search readiness:
+
+```sh
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-When packet/search needs repair:
+Repair packet/search sidecars:
 
 ```sh
 codestory-cli retrieval bootstrap --project <repo> --format json
