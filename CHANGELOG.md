@@ -2,32 +2,39 @@
 
 ## 0.11.1
 
-CodeStory 0.11.1 is the patch release lane for the Codex plugin packaging work
-that landed after `v0.11.0`. It keeps the release version synchronized while
-making the new plugin path reviewable before the eventual main promotion:
-install/readiness stays in the CLI wrapper, the plugin package owns only Codex
-metadata and skill text, and `.mcp.json` launches `codestory-cli serve --stdio`
-directly instead of carrying a Node adapter.
+CodeStory 0.11.1 was published from `main` at
+`9dc3a20e7de84b7955579e6ad8dd44945a47d47a`. It ships the Codex plugin
+packaging work that landed after `v0.11.0`: install/readiness stays in the CLI
+wrapper, the plugin package owns only Codex metadata and skill text, and
+`.mcp.json` launches `codestory-cli serve --stdio` directly instead of carrying
+a Node adapter.
+
+Release evidence:
+
+- GitHub release: https://github.com/TheGreenCedar/CodeStory/releases/tag/v0.11.1
+- Full comparison: https://github.com/TheGreenCedar/CodeStory/compare/v0.11.0...v0.11.1
+- Version and packaging lane: #267
 
 The marketplace catalog is still outside this repository. Issue #264 closed the
 separate `TheGreenCedar/AgentPluginMarketplace` catalog lane, while PR #262 left
 CodeStory owning only the plugin package source under `plugins/codestory`. This
-changelog entry does not claim new binary assets, a pushed `v0.11.1` tag,
-packet/search readiness, sidecar promotion, or benchmark improvement.
+release does not claim packet/search readiness, sidecar promotion, or benchmark
+improvement.
 
 ### Shipped Since 0.11.0
 
 | Area | Delivered in 0.11.1 | Evidence |
 | --- | --- | --- |
-| Release version | All `codestory-*` workspace crates and `Cargo.lock` are synchronized at `0.11.1`. | Issue #267 |
+| Release version | All `codestory-*` workspace crates and `Cargo.lock` are synchronized at `0.11.1`. | Issue #267; tag `v0.11.1` |
 | Plugin packaging | `plugins/codestory` now contains the Codex plugin manifest, MCP metadata, package README, grounding skill, and static package tests. | PR #262 |
 | Direct CLI MCP launch | The plugin `.mcp.json` launches `codestory-cli serve --stdio --refresh none` directly, with no in-package Node adapter or duplicated retrieval/runtime logic. | PR #262 |
 | Install and readiness wrapper | `scripts/install-codestory.ps1` added the Windows x64 happy path for finding or installing `codestory-cli`, then reporting binary, local-navigation, and packet/search readiness from `doctor`. | PR #261 |
 | Cross-platform plugin readiness | Plugin README, skill guidance, and static tests now cover Windows, macOS, and Linux install/readiness paths without adding an adapter runtime or changing Rust product behavior. | PR #269 |
-| Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this patch release lane. | PR #260 |
+| Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this release. | PR #260 |
 
-The plugin docs and installer defaults keep current archive names release-bound
-to `v0.11.1`; the marketplace catalog remains outside this repository.
+Binary release assets are packaging evidence only. The plugin docs and installer
+defaults keep current archive names release-bound to `v0.11.1`; the marketplace
+catalog remains outside this repository.
 
 ## 0.11.0
 
