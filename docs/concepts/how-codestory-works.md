@@ -4,7 +4,7 @@ CodeStory indexes a workspace into a local graph, then serves read commands
 against that graph. It does not replace tests or judgment; it structures the
 first pass.
 
-Command loop: [README - What You Get](../../README.md#what-you-get).
+Command loop: [README - What Your Agent Gets](../../README.md#what-your-agent-gets).
 Readiness lanes: [usage.md](../usage.md#readiness-tracks).
 
 ```mermaid
