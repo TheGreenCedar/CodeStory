@@ -9,11 +9,11 @@ install/readiness stays in the CLI wrapper, the plugin package owns only Codex
 metadata and skill text, and `.mcp.json` launches `codestory-cli serve --stdio`
 directly instead of carrying a Node adapter.
 
-The marketplace catalog is still a non-claim for this release prep. Issue #264
-remains open, and PR #262 explicitly left the `TheGreenCedar/AgentPluginMarketplace`
-entry outside this repository. This changelog entry also does not claim new
-binary assets, a pushed `v0.11.1` tag, packet/search readiness, sidecar
-promotion, or benchmark improvement.
+The marketplace catalog is still outside this repository. Issue #264 closed the
+separate `TheGreenCedar/AgentPluginMarketplace` catalog lane, while PR #262 left
+CodeStory owning only the plugin package source under `plugins/codestory`. This
+changelog entry does not claim new binary assets, a pushed `v0.11.1` tag,
+packet/search readiness, sidecar promotion, or benchmark improvement.
 
 ### Shipped Since 0.11.0
 
@@ -23,11 +23,11 @@ promotion, or benchmark improvement.
 | Plugin packaging | `plugins/codestory` now contains the Codex plugin manifest, MCP metadata, package README, grounding skill, and static package tests. | PR #262 |
 | Direct CLI MCP launch | The plugin `.mcp.json` launches `codestory-cli serve --stdio --refresh none` directly, with no in-package Node adapter or duplicated retrieval/runtime logic. | PR #262 |
 | Install and readiness wrapper | `scripts/install-codestory.ps1` added the Windows x64 happy path for finding or installing `codestory-cli`, then reporting binary, local-navigation, and packet/search readiness from `doctor`. | PR #261 |
+| Cross-platform plugin readiness | Plugin README, skill guidance, and static tests now cover Windows, macOS, and Linux install/readiness paths without adding an adapter runtime or changing Rust product behavior. | PR #269 |
 | Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this patch release lane. | PR #260 |
 
-Automatic install remains Windows x64 first. The plugin docs point other
-platforms at the available release assets or an explicit `codestory-cli` on
-`PATH`, and macOS x64 remains source/manual until a matching asset exists.
+The plugin docs keep current archive names release-bound to `v0.11.0`; update
+them with the main release workflow when `0.11.1` assets exist.
 
 ## 0.11.0
 
