@@ -132,7 +132,8 @@ The plugin does not bundle the binary. The agent should run
 against the latest GitHub release, resolve the latest release, download and
 unpack the matching host asset, verify it when practical, place it in a stable
 user bin directory, and re-check `codestory-cli --version`. If the host `PATH`
-changes, start a new agent thread so the MCP process can see the binary.
+changes, restart the Codex host/app before starting a new agent thread so the
+MCP process can see the binary.
 
 For latest tag `vX.Y.Z`, choose the host asset derived from that tag:
 

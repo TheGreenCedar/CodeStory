@@ -103,8 +103,8 @@ The canonical plugin skill is
 [plugins/codestory/skills/codestory-grounding/SKILL.md](plugins/codestory/skills/codestory-grounding/SKILL.md).
 The plugin launches `codestory-cli serve --stdio --refresh none` directly.
 The skill owns the runtime check: it should verify `codestory-cli --version`,
-resolve the latest GitHub release when needed, and restart the agent thread if
-`PATH` changed.
+resolve the latest GitHub release when needed, and restart the Codex host/app
+before starting a new agent thread if `PATH` changed.
 
 ## Readiness Contract
 
