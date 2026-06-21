@@ -27,6 +27,7 @@ test("codestory repo ships plugin source, not marketplace catalog or adapter run
 });
 
 test("plugin docs are agent-first, cross-platform, and latest-release aware", async () => {
+  const rootReadme = await readFile(join(repoRoot, "README.md"), "utf8");
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
   const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
   const sharedRequired = [
@@ -92,6 +93,12 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
     "Read `codestory://grounding`",
     "Always pass `--project <target-workspace>` explicitly",
   ];
+  const rootReadmeRequired = [
+    "The marketplace source is `TheGreenCedar/AgentPluginMarketplace`",
+    "This repository remains the plugin source. The catalog can list many plugins",
+    "the CodeStory entry points at `plugins/codestory` in this repo",
+    "Then return to `/plugins` and install `TheGreenCedar -> codestory`",
+  ];
 
   for (const text of [readme, skill]) {
     for (const phrase of sharedRequired) {
@@ -104,8 +111,17 @@ test("plugin docs are agent-first, cross-platform, and latest-release aware", as
       assert.equal(pattern.test(text), false, String(pattern));
     }
   }
+  for (const phrase of forbidden) {
+    assert.equal(rootReadme.includes(phrase), false, phrase);
+  }
+  for (const pattern of forbiddenPatterns) {
+    assert.equal(pattern.test(rootReadme), false, String(pattern));
+  }
   for (const phrase of readmeRequired) {
     assert.equal(readme.includes(phrase), true, phrase);
+  }
+  for (const phrase of rootReadmeRequired) {
+    assert.equal(rootReadme.includes(phrase), true, phrase);
   }
   for (const phrase of skillRequired) {
     assert.equal(skill.includes(phrase), true, phrase);

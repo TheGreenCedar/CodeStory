@@ -130,7 +130,8 @@ codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
 The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
-This repository remains the plugin source.
+This repository remains the plugin source. The catalog can list many plugins,
+and the CodeStory entry points at `plugins/codestory` in this repo.
 
 Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
 workspace plugin settings are managed from the Codex Apps/Plugins UI rather
