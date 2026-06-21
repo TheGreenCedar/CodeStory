@@ -99,11 +99,11 @@ reuses the same runtime calls for `/definition`, `/references`, `/symbols`, and
 stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
 reports cache/index/retrieval health without mutating state.
 
-`explore` remains the browser surface until the
-[browser surface gate](overview.md#browser-surface-gate) is satisfied. Do not add a
-separate `browse` command, web UI route, or browser-specific UI without
-current manifest, warm-loop, stress-lane, explore, and screenshot-review
-evidence.
+`explore` and `serve --stdio` remain the browser-capable read surfaces until the
+[browser surface gate](../testing/codestory-stdio-warm-loop-stats.md#browser-surface-gate)
+is satisfied. Do not add a separate `browse` command, web UI route, or
+browser-specific UI without current manifest, warm-loop, stress-lane, explore,
+and screenshot-review evidence.
 
 ## Ownership Notes
 
