@@ -304,6 +304,11 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
         ),
         ("trail", ".trail_context(", "pub fn trail_context"),
         ("snippet", ".snippet_context(", "pub fn snippet_context"),
+        (
+            "affected",
+            ".affected_analysis(",
+            "pub fn affected_analysis",
+        ),
         ("context", ".ask(", "pub fn ask"),
     ];
 

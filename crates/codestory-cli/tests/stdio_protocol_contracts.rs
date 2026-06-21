@@ -753,6 +753,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     assert_eq!(
         tool_names,
         vec![
+            "affected",
             "context",
             "definition",
             "files",
@@ -772,8 +773,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         "stdio browser tool names should stay stable and read-only: {tools}"
     );
     assert!(
-        !tool_names.iter().any(|name| name.starts_with("codestory_"))
-            && !tool_names.iter().any(|name| matches!(*name, "affected")),
+        !tool_names.iter().any(|name| name.starts_with("codestory_")),
         "stdio tool names should stay agent-facing and avoid shell/file mutation surfaces: {tool_names:?}"
     );
     let packet_description = tool_by_name(&tools, "packet")["description"]
@@ -812,6 +812,17 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             && files_description.contains("existing local index")
             && files_description.contains("never refreshes"),
         "files description should make the read-only index boundary explicit: {files_description}"
+    );
+    let affected_description = tool_by_name(&tools, "affected")["description"]
+        .as_str()
+        .expect("affected description");
+    assert!(
+        affected_description.contains("changed paths")
+            && affected_description.contains("existing local index")
+            && affected_description.contains("never discovers git changes")
+            && affected_description.contains("never")
+            && affected_description.contains("indexes"),
+        "affected description should make the explicit-read-only boundary clear: {affected_description}"
     );
     let snippet_description = tool_by_name(&tools, "snippet")["description"]
         .as_str()
@@ -977,6 +988,77 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "files.limit should document the runtime clamp: {files}"
     );
 
+    let affected = tool_input_schema(&tools, "affected");
+    assert_eq!(
+        schema_property(affected, "changed_paths")["type"],
+        "array",
+        "affected.changed_paths should be an array: {affected}"
+    );
+    assert_eq!(
+        schema_property(affected, "changed_paths")["items"]["type"],
+        "string",
+        "affected.changed_paths should contain strings: {affected}"
+    );
+    let change_records = schema_property(affected, "change_records");
+    assert_eq!(
+        change_records["type"], "array",
+        "affected.change_records should be an array: {affected}"
+    );
+    let change_record = change_records
+        .get("items")
+        .unwrap_or_else(|| panic!("change_records should describe item schema: {affected}"));
+    assert!(
+        required_fields(change_record).contains("path")
+            && required_fields(change_record).contains("kind"),
+        "affected.change_records should require path and kind: {affected}"
+    );
+    assert_schema_enum_values(
+        change_record,
+        "/properties/kind/enum",
+        &[
+            "added",
+            "modified",
+            "deleted",
+            "renamed",
+            "copied",
+            "untracked",
+            "unknown",
+        ],
+    );
+    let affected_depth = schema_property(affected, "depth");
+    assert_eq!(
+        affected_depth.get("default"),
+        Some(&json!(2)),
+        "affected.depth should document the runtime default: {affected}"
+    );
+    assert_eq!(
+        affected_depth.get("minimum"),
+        Some(&json!(1)),
+        "affected.depth should document the lower bound: {affected}"
+    );
+    assert_eq!(
+        affected_depth.get("maximum"),
+        Some(&json!(8)),
+        "affected.depth should document the runtime clamp: {affected}"
+    );
+    assert_eq!(
+        schema_property(affected, "filter")["type"],
+        "string",
+        "affected.filter should be a string: {affected}"
+    );
+    let affected_any_of = affected["anyOf"].as_array().unwrap_or_else(|| {
+        panic!("affected should require paths or records via anyOf: {affected}")
+    });
+    assert!(
+        affected_any_of
+            .iter()
+            .any(|branch| required_fields(branch).contains("changed_paths"))
+            && affected_any_of
+                .iter()
+                .any(|branch| required_fields(branch).contains("change_records")),
+        "affected should require explicit changed_paths or change_records: {affected}"
+    );
+
     for name in ["symbol", "definition", "references", "snippet"] {
         let schema = tool_input_schema(&tools, name);
         let required = required_fields(schema);
@@ -1102,6 +1184,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     .clone();
 
     for name in [
+        "affected",
         "context",
         "definition",
         "files",
@@ -1206,6 +1289,50 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 file_schema,
                 "/properties/role/enum",
                 &["source", "test", "generated", "vendor", "unknown"],
+            );
+        }
+        if name == "affected" {
+            for field in [
+                "project_root",
+                "changed_paths",
+                "change_records",
+                "matched_files",
+                "matched_file_count",
+                "depth",
+                "impacted_symbols",
+                "impacted_tests",
+            ] {
+                assert!(
+                    output_schema["anyOf"]
+                        .as_array()
+                        .is_some_and(|any_of| any_of
+                            .iter()
+                            .any(|branch| required_fields(branch).contains(field))),
+                    "affected outputSchema should accept successful DTO field {field}: {tool}"
+                );
+            }
+            assert_eq!(
+                schema_property(output_schema, "changed_paths")["items"]["type"],
+                "string",
+                "affected outputSchema should expose changed path strings: {tool}"
+            );
+            let record_schema = output_schema
+                .pointer("/properties/change_records/items")
+                .unwrap_or_else(|| {
+                    panic!("affected outputSchema should describe change records: {tool}")
+                });
+            assert_schema_enum_values(
+                record_schema,
+                "/properties/kind/enum",
+                &[
+                    "added",
+                    "modified",
+                    "deleted",
+                    "renamed",
+                    "copied",
+                    "untracked",
+                    "unknown",
+                ],
             );
         }
     }
@@ -1381,6 +1508,7 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
     for expected in [
         "ground",
         "files",
+        "affected",
         "search",
         "symbol",
         "trail",
@@ -1600,6 +1728,113 @@ fn files_tool_lists_indexed_files_without_sidecars() {
             .as_str()
             .is_some_and(|message| message.contains("files.role")),
         "files tool should fail closed on unknown roles: {bad_role}"
+    );
+}
+
+#[test]
+fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-runtime",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "changed_paths": ["src/runtime.rs"],
+                    "change_records": [
+                        {
+                            "path": "src/runtime.rs",
+                            "kind": "modified",
+                            "status": "M"
+                        }
+                    ],
+                    "depth": 2
+                }
+            }
+        }),
+    );
+
+    let result = assert_tool_success(&response, json!("affected-runtime"));
+    assert_eq!(
+        result["changed_paths"],
+        json!(["src/runtime.rs"]),
+        "affected should preserve explicit changed paths: {result}"
+    );
+    assert_eq!(
+        result["change_records"][0]["kind"],
+        json!("modified"),
+        "affected should preserve explicit change records: {result}"
+    );
+    assert_eq!(
+        result["matched_file_count"],
+        json!(1),
+        "affected should match the indexed changed file: {result}"
+    );
+    assert_eq!(
+        result["matched_files"][0]["path"],
+        json!("src/runtime.rs"),
+        "affected should expose matched file rows: {result}"
+    );
+    assert!(
+        result["impacted_symbols"]
+            .as_array()
+            .is_some_and(|symbols| !symbols.is_empty()),
+        "affected should expand matched files to impacted symbols: {result}"
+    );
+}
+
+#[test]
+fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let bad_paths = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-bad-paths",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {"changed_paths": "src/runtime.rs"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&bad_paths, json!("affected-bad-paths"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("affected.changed_paths")),
+        "affected should fail closed on malformed path input: {bad_paths}"
+    );
+
+    let bad_record = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-bad-record",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "change_records": [
+                        {"path": "src/runtime.rs", "kind": "touched"}
+                    ]
+                }
+            }
+        }),
+    );
+    let error = assert_tool_error(&bad_record, json!("affected-bad-record"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("affected.change_records")),
+        "affected should fail closed on malformed change records: {bad_record}"
     );
 }
 
