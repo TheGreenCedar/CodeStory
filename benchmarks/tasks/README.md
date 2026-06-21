@@ -140,7 +140,7 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --repeats 3 `
   --materialize-repos `
   --prepare-codestory-cache `
-  --reuse-baseline-from target/agent-benchmark/language-expansion-holdout-20260617-baseline-j4 `
+  --reuse-baseline-from target/agent-benchmark/<compatible-baseline-run> `
   --out-dir target/agent-benchmark/language-expansion-holdout `
   --timeout-ms 600000
 ```
@@ -172,20 +172,10 @@ explicit `--extra-probe` inputs, or eval-only diagnostics; they are benchmark
 fixture behavior, not production steering. Framework/domain semantics belong in
 product code when they generalize to real projects.
 
-Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize the
-durable result in [language-expansion-ab-report.md](../../docs/testing/language-expansion-ab-report.md)
-instead of preserving local run directory catalogs here. The current June 18
-diagnostic full form+command packet-runtime artifact at
-`target/agent-benchmark/language-expansion-proof-full-form-command-shapes`
-passes `108/108` success, quality, and sufficiency gates, but has `9` cold SLA
-misses and is non-publishable development proof only. The current publishable
-artifact at
-`target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`
-passes `108/108` success, `106/108` quality, and `107/108` sufficiency, with
-`1` partial row and `8` cold SLA misses. Promotion is blocked by
-apache-commons-lang cold SLA `3/3`, redis cold SLA `3/3`, AutoMapper cold SLA
-`1/3`, dart-http cold SLA `1/3`, square-okio cold quality `2/3`, and Alamofire
-cold quality `2/3` plus `1` partial sufficiency.
+Write fresh outputs under `target/agent-benchmark/<run-name>` and summarize
+durable conclusions in the reviewing PR, issue, or release note. Do not commit
+local run directory catalogs, generated scorecards, or benchmark ledgers as repo
+docs unless they are deliberately converted into stable product documentation.
 
 ## Local Real-Repo Corpus
 
@@ -197,9 +187,9 @@ Current slots:
 
 - `codestory`: this repo.
 - `sourcetrail`: `../Sourcetrail`.
-- `codex`: `../codex`.
 - `vscode`: `../vscode`; currently verified against pinned commit
   `20ed2bc21d4d73a029b52d3ee6db382ee85c3cca` when that checkout is present.
+- Additional local-real fixtures are declared in `local-real/*.task.json`.
 
 Local-real rows are not public savings claims by themselves. They must be
 repeated, quality-gated, tied to clean pinned checkouts, and compared against

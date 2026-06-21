@@ -456,5 +456,4 @@ changes.
 - [architecture/runtime-execution-path.md](architecture/runtime-execution-path.md)
 - [contributors/debugging.md](contributors/debugging.md)
 - [contributors/testing-matrix.md](contributors/testing-matrix.md)
-- [testing/benchmark-ledger.md](testing/benchmark-ledger.md)
 - [testing/codestory-stdio-warm-loop-stats.md](testing/codestory-stdio-warm-loop-stats.md)
