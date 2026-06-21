@@ -102,7 +102,7 @@ Always pass `--project <target-workspace>` explicitly.
 - Broad task packet: MCP/CLI `packet`.
 - Candidate discovery: MCP/CLI `search --why`.
 - Focused source view: `symbol`, `trail`, `snippet`, `context`, `explore`.
-- Coverage and impact: `files`, `affected`.
+- Coverage and impact: MCP/CLI `files`, `affected`.
 - Reusable targets: `bookmark`.
 - Structured evaluation: `drill`, `drill-suite`.
 - Local integration surface: `serve --stdio`.

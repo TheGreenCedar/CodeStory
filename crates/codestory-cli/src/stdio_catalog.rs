@@ -484,6 +484,15 @@ const INDEXED_FILE_ROLES: &[&str] = &["source", "test", "generated", "vendor", "
 const SNIPPET_SCOPES: &[&str] = &["line_context", "function_body"];
 const GROUNDING_BUDGETS: &[&str] = &["strict", "balanced", "max"];
 const PACKET_BUDGETS: &[&str] = &["tiny", "compact", "standard", "deep"];
+const AFFECTED_CHANGE_KINDS: &[&str] = &[
+    "added",
+    "modified",
+    "deleted",
+    "renamed",
+    "copied",
+    "untracked",
+    "unknown",
+];
 const PACKET_TASK_CLASSES: &[&str] = &[
     "architecture_explanation",
     "bug_localization",
@@ -674,6 +683,96 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
 )
 .with_any_of_required(&[
     &["project_root", "usable", "summary", "files"],
+    &["code", "message"],
+]);
+
+static AFFECTED_CHANGE_RECORD_SCHEMA: SchemaObject = SchemaObject::object(
+    "Changed file record.",
+    &[
+        SchemaProperty::string_required("path", "Changed repo-relative path.").with_min_length(1),
+        SchemaProperty::string("kind", "Change kind.").with_enum(AFFECTED_CHANGE_KINDS),
+        SchemaProperty::string(
+            "status",
+            "Optional raw git-style status such as M, A, D, R100, C100, or ??.",
+        ),
+        SchemaProperty::string("previous_path", "Previous path for renames or copies.").nullable(),
+    ],
+    &["path", "kind"],
+);
+
+static AFFECTED_MATCHED_FILE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Matched indexed file row.",
+    &[
+        SchemaProperty::string("path", "Project-relative file path."),
+        SchemaProperty::string("role", "Inferred file role.").with_enum(INDEXED_FILE_ROLES),
+        SchemaProperty::boolean("indexed", "Whether the file was indexed."),
+        SchemaProperty::boolean("complete", "Whether indexing completed for this file."),
+        SchemaProperty::string("change_kind", "Matched change kind.")
+            .with_enum(AFFECTED_CHANGE_KINDS)
+            .nullable(),
+        SchemaProperty::string("change_status", "Matched raw change status.").nullable(),
+        SchemaProperty::integer("error_count", "File-level index error count."),
+    ],
+    &["path", "role", "indexed", "complete", "error_count"],
+);
+
+static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Changed-file impact analysis DTO from the existing local index.",
+    &[
+        SchemaProperty::string("project_root", "Project root."),
+        SchemaProperty::string_array("changed_paths", "Changed repo-relative paths."),
+        SchemaProperty::array(
+            "change_records",
+            "Normalized changed file records.",
+            &AFFECTED_CHANGE_RECORD_SCHEMA,
+        ),
+        SchemaProperty::array(
+            "matched_files",
+            "Changed paths matched to indexed files.",
+            &AFFECTED_MATCHED_FILE_SCHEMA,
+        ),
+        SchemaProperty::array(
+            "unmatched_paths",
+            "Changed paths that did not match indexed files.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::integer("matched_file_count", "Number of matched indexed files."),
+        SchemaProperty::integer("depth", "Applied dependent graph walk depth."),
+        SchemaProperty::array(
+            "impacted_symbols",
+            "Impacted symbol DTOs.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::array(
+            "impacted_routes",
+            "Impacted route or endpoint DTOs.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::array(
+            "impacted_tests",
+            "Likely impacted test file DTOs.",
+            &GENERIC_OBJECT_SCHEMA,
+        ),
+        SchemaProperty::string_array("blind_spots", "Known impact-analysis blind spots."),
+        SchemaProperty::string_array("next_commands", "Suggested follow-up commands."),
+        SchemaProperty::string_array("notes", "Additional analysis notes."),
+        SchemaProperty::string("code", "Typed API error code."),
+        SchemaProperty::string("message", "Human-readable API error message."),
+        SchemaProperty::object("details", "Structured API error repair guidance.").nullable(),
+    ],
+    &[],
+)
+.with_any_of_required(&[
+    &[
+        "project_root",
+        "changed_paths",
+        "change_records",
+        "matched_files",
+        "matched_file_count",
+        "depth",
+        "impacted_symbols",
+        "impacted_tests",
+    ],
     &["code", "message"],
 ]);
 
@@ -1042,6 +1141,27 @@ static FILES_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 );
 
+static AFFECTED_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Analyze explicit changed paths or change records against the existing local index.",
+    &[
+        SchemaProperty::string_array("changed_paths", "Changed repo-relative paths to analyze."),
+        SchemaProperty::array(
+            "change_records",
+            "Changed file records with path, kind, optional status, and optional previous_path.",
+            &AFFECTED_CHANGE_RECORD_SCHEMA,
+        ),
+        SchemaProperty::integer("depth", "Dependent graph walk depth.")
+            .with_default(ValueLiteral::Integer(2))
+            .with_bounds(1, 8),
+        SchemaProperty::string(
+            "filter",
+            "Optional impacted-symbol filter by path or display-name substring.",
+        ),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["changed_paths"], &["change_records"]]);
+
 static CONTEXT_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "Build a deep evidence packet for one concrete retrieval target.",
     &[
@@ -1123,6 +1243,13 @@ static TOOLS: &[ToolSpec] = &[
         description: "List indexed files and coverage from the existing local index; never refreshes, indexes, or bootstraps sidecars.",
         input_schema: FILES_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(INDEXED_FILES_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "affected",
+        description: "Analyze explicit changed paths against the existing local index; never discovers git changes, refreshes, indexes, or bootstraps sidecars.",
+        input_schema: AFFECTED_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(AFFECTED_ANALYSIS_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {

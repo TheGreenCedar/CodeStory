@@ -7,7 +7,8 @@
 
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
-    AgentAskRequest, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAskRequest,
+    AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
     IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
     NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
@@ -580,6 +581,7 @@ fn handle_stdio_tool_call(
         "search" => handle_stdio_search(runtime, state, request, query),
         "ground" => handle_stdio_ground(runtime, request),
         "files" => handle_stdio_files(runtime, request),
+        "affected" => handle_stdio_affected(runtime, request),
         "symbol" => handle_stdio_symbol(runtime, request),
         "trail" => handle_stdio_trail(runtime, request),
         "get_node" => handle_stdio_get_node(runtime, request),
@@ -635,6 +637,21 @@ fn handle_stdio_files(runtime: &RuntimeContext, request: &serde_json::Value) -> 
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
 
+fn handle_stdio_affected(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let affected = match stdio_affected_request(request) {
+        Ok(request) => request,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    runtime
+        .browser
+        .affected_analysis(affected)
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
 fn stdio_file_role(request: &serde_json::Value) -> Result<Option<IndexedFileRoleDto>> {
     let Some(role) = request
         .pointer("/params/arguments/role")
@@ -651,6 +668,155 @@ fn stdio_file_role(request: &serde_json::Value) -> Result<Option<IndexedFileRole
         "unknown" => Ok(Some(IndexedFileRoleDto::Unknown)),
         _ => bail!("files.role must be one of source, test, generated, vendor, unknown"),
     }
+}
+
+fn stdio_affected_request(request: &serde_json::Value) -> Result<AffectedAnalysisRequest> {
+    let changed_paths = stdio_affected_changed_paths(request)?;
+    let change_records = stdio_affected_change_records(request)?;
+    if changed_paths.is_empty() && change_records.is_empty() {
+        bail!("affected.changed_paths or affected.change_records is required");
+    }
+    Ok(AffectedAnalysisRequest {
+        changed_paths,
+        change_records,
+        depth: stdio_affected_depth(request)?,
+        filter: stdio_affected_filter(request)?,
+    })
+}
+
+fn stdio_affected_changed_paths(request: &serde_json::Value) -> Result<Vec<String>> {
+    let Some(value) = request.pointer("/params/arguments/changed_paths") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!("affected.changed_paths must be an array of non-empty strings");
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .with_context(|| {
+                    "affected.changed_paths must be an array of non-empty strings".to_string()
+                })
+        })
+        .collect()
+}
+
+fn stdio_affected_change_records(
+    request: &serde_json::Value,
+) -> Result<Vec<AffectedChangeRecordDto>> {
+    let Some(value) = request.pointer("/params/arguments/change_records") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!("affected.change_records must be an array of objects");
+    };
+    values.iter().map(stdio_affected_change_record).collect()
+}
+
+fn stdio_affected_change_record(value: &serde_json::Value) -> Result<AffectedChangeRecordDto> {
+    let object = value
+        .as_object()
+        .context("affected.change_records entries must be objects")?;
+    let path = object
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .context("affected.change_records[].path must be a non-empty string")?;
+    let kind_value = object
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .context("affected.change_records[].kind is required")?;
+    let kind = stdio_affected_change_kind(kind_value)?;
+    let status = object
+        .get("status")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| stdio_affected_default_status(&kind).to_string());
+    let previous_path = match object.get("previous_path") {
+        Some(value) if !value.is_null() => Some(
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .context("affected.change_records[].previous_path must be a non-empty string")?
+                .to_string(),
+        ),
+        _ => None,
+    };
+    Ok(AffectedChangeRecordDto {
+        path: path.to_string(),
+        kind,
+        status,
+        previous_path,
+    })
+}
+
+fn stdio_affected_change_kind(value: &str) -> Result<AffectedChangeKindDto> {
+    match value {
+        "added" => Ok(AffectedChangeKindDto::Added),
+        "modified" => Ok(AffectedChangeKindDto::Modified),
+        "deleted" => Ok(AffectedChangeKindDto::Deleted),
+        "renamed" => Ok(AffectedChangeKindDto::Renamed),
+        "copied" => Ok(AffectedChangeKindDto::Copied),
+        "untracked" => Ok(AffectedChangeKindDto::Untracked),
+        "unknown" => Ok(AffectedChangeKindDto::Unknown),
+        value => bail!(
+            "affected.change_records[].kind must be one of added, modified, deleted, renamed, copied, untracked, or unknown; got {value}"
+        ),
+    }
+}
+
+fn stdio_affected_default_status(kind: &AffectedChangeKindDto) -> &'static str {
+    match kind {
+        AffectedChangeKindDto::Added => "A",
+        AffectedChangeKindDto::Modified => "M",
+        AffectedChangeKindDto::Deleted => "D",
+        AffectedChangeKindDto::Renamed => "R",
+        AffectedChangeKindDto::Copied => "C",
+        AffectedChangeKindDto::Untracked => "??",
+        AffectedChangeKindDto::Unknown => "path",
+    }
+}
+
+fn stdio_affected_depth(request: &serde_json::Value) -> Result<Option<u32>> {
+    let Some(value) = request.pointer("/params/arguments/depth") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(depth) = value.as_u64() else {
+        bail!("affected.depth must be an integer between 1 and 8");
+    };
+    if !(1..=8).contains(&depth) {
+        bail!("affected.depth must be between 1 and 8");
+    }
+    Ok(Some(depth as u32))
+}
+
+fn stdio_affected_filter(request: &serde_json::Value) -> Result<Option<String>> {
+    let Some(value) = request.pointer("/params/arguments/filter") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .map(Some)
+        .context("affected.filter must be a string")
 }
 
 fn handle_stdio_packet(
