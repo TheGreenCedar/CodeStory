@@ -61,6 +61,11 @@ marketplaces, add or refresh the external catalog first:
 codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 ```
 
+The marketplace source is `TheGreenCedar/AgentPluginMarketplace`.
+This repository remains the plugin source. One marketplace can list multiple plugins.
+CodeStory's entry points at `https://github.com/TheGreenCedar/CodeStory.git`
+with source path `plugins/codestory`.
+
 Then return to `/plugins` and install `TheGreenCedar -> codestory`. Some
 workspace plugin settings are managed from the Codex Apps/Plugins UI rather
 than the terminal, so use the UI path when the CLI marketplace command is
