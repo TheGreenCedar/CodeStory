@@ -755,6 +755,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         vec![
             "context",
             "definition",
+            "files",
             "get_node",
             "ground",
             "neighbors",
@@ -772,9 +773,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     );
     assert!(
         !tool_names.iter().any(|name| name.starts_with("codestory_"))
-            && !tool_names
-                .iter()
-                .any(|name| matches!(*name, "files" | "affected")),
+            && !tool_names.iter().any(|name| matches!(*name, "affected")),
         "stdio tool names should stay agent-facing and avoid shell/file mutation surfaces: {tool_names:?}"
     );
     let packet_description = tool_by_name(&tools, "packet")["description"]
@@ -804,6 +803,15 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             && ground_description.contains("before packet/search")
             && ground_description.contains("codestory://grounding"),
         "ground description should connect the tool to orientation and the grounding resource: {ground_description}"
+    );
+    let files_description = tool_by_name(&tools, "files")["description"]
+        .as_str()
+        .expect("files description");
+    assert!(
+        files_description.contains("indexed files")
+            && files_description.contains("existing local index")
+            && files_description.contains("never refreshes"),
+        "files description should make the read-only index boundary explicit: {files_description}"
     );
     let snippet_description = tool_by_name(&tools, "snippet")["description"]
         .as_str()
@@ -941,6 +949,34 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "ground.budget should document the stdio default: {ground}"
     );
 
+    let files = tool_input_schema(&tools, "files");
+    assert_eq!(
+        schema_property(files, "path")["type"],
+        "string",
+        "files.path should be a string filter: {files}"
+    );
+    assert_eq!(
+        schema_property(files, "language")["type"],
+        "string",
+        "files.language should be a string filter: {files}"
+    );
+    assert_schema_enum_values(
+        files,
+        "/properties/role/enum",
+        &["source", "test", "generated", "vendor", "unknown"],
+    );
+    let files_limit = schema_property(files, "limit");
+    assert_eq!(
+        files_limit.get("default"),
+        Some(&json!(500)),
+        "files.limit should document the CLI-backed default: {files}"
+    );
+    assert_eq!(
+        files_limit.get("maximum"),
+        Some(&json!(5000)),
+        "files.limit should document the runtime clamp: {files}"
+    );
+
     for name in ["symbol", "definition", "references", "snippet"] {
         let schema = tool_input_schema(&tools, name);
         let required = required_fields(schema);
@@ -1068,6 +1104,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     for name in [
         "context",
         "definition",
+        "files",
         "ground",
         "packet",
         "references",
@@ -1145,6 +1182,31 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                     "ground outputSchema should require grounding DTO field {field}: {tool}"
                 );
             }
+        }
+        if name == "files" {
+            for field in ["project_root", "usable", "summary", "files"] {
+                assert!(
+                    output_schema["anyOf"]
+                        .as_array()
+                        .is_some_and(|any_of| any_of
+                            .iter()
+                            .any(|branch| required_fields(branch).contains(field))),
+                    "files outputSchema should accept successful DTO field {field}: {tool}"
+                );
+            }
+            let file_schema = output_schema
+                .pointer("/properties/files/items")
+                .unwrap_or_else(|| panic!("files outputSchema should describe file rows: {tool}"));
+            assert_eq!(
+                schema_property(file_schema, "path")["type"],
+                "string",
+                "file rows should expose project-relative paths: {tool}"
+            );
+            assert_schema_enum_values(
+                file_schema,
+                "/properties/role/enum",
+                &["source", "test", "generated", "vendor", "unknown"],
+            );
         }
     }
 
@@ -1318,6 +1380,7 @@ fn transcript_lists_tools_resources_templates_and_prompts() {
         .collect();
     for expected in [
         "ground",
+        "files",
         "search",
         "symbol",
         "trail",
@@ -1468,6 +1531,75 @@ fn ground_tool_returns_budgeted_grounding_snapshot() {
             .as_str()
             .is_some_and(|message| message.contains("ground.budget")),
         "ground tool should fail closed on unknown budgets: {bad_response}"
+    );
+}
+
+#[test]
+fn files_tool_lists_indexed_files_without_sidecars() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "files-source",
+            "method": "tools/call",
+            "params": {
+                "name": "files",
+                "arguments": {
+                    "path": "src/",
+                    "language": "rust",
+                    "role": "source",
+                    "limit": 2
+                }
+            }
+        }),
+    );
+
+    let result = assert_tool_success(&response, json!("files-source"));
+    assert!(
+        result["usable"].as_bool() == Some(true),
+        "files tool should report a usable indexed fixture: {result}"
+    );
+    assert!(
+        result
+            .pointer("/summary/visible_file_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count <= 2),
+        "files tool should respect the requested cap: {result}"
+    );
+    let files = result["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("files tool should return file rows: {result}"));
+    assert!(
+        !files.is_empty()
+            && files.iter().all(|file| file["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("src/")))
+            && files.iter().all(|file| file["language"] == json!("rust"))
+            && files.iter().all(|file| file["role"] == json!("source")),
+        "files tool should apply path/language/role filters: {result}"
+    );
+
+    let bad_role = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "files-bad-role",
+            "method": "tools/call",
+            "params": {
+                "name": "files",
+                "arguments": {"role": "workspace"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&bad_role, json!("files-bad-role"));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("files.role")),
+        "files tool should fail closed on unknown roles: {bad_role}"
     );
 }
 
