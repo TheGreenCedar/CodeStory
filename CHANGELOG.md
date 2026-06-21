@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.11.2
+
+CodeStory 0.11.2 carries the post-0.11.1 documentation and MCP stdio work from
+`dev/codestory-next` into a synchronized patch release. The release version is
+now aligned across all `codestory-*` workspace crates and `Cargo.lock`.
+
+The user-facing docs were tightened around the way people actually install,
+operate, and review CodeStory. The README and usage docs now separate source
+state from runtime proof, keep readiness checks visible, and avoid implying that
+docs alone prove packet/search health. Plugin install guidance now points at the
+latest-release flow where this repository owns the plugin package, while the
+external marketplace catalog remains owned by
+`TheGreenCedar/AgentPluginMarketplace`.
+
+The plugin MCP path is intentionally direct: `.mcp.json` runs
+`codestory-cli serve --stdio --refresh none` instead of carrying a duplicate
+adapter runtime. The stdio catalog also exposes a read-only `ground` tool for
+grounding snapshots, alongside the existing resource and packet/search safety
+boundaries.
+
+This release does not promote packet/search readiness, sidecar readiness,
+benchmark results, or query quality. It also does not claim live installed
+plugin runtime proof unless that surface is dogfooded separately from this
+source release lane.
+
 ## 0.11.1
 
 CodeStory 0.11.1 was published from `main` at

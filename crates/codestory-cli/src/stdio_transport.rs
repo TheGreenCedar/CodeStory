@@ -32,9 +32,10 @@ use crate::stdio_catalog::{
 use crate::{
     build_ambiguous_target_error_output, build_query_resolution_output, build_search_hit_output,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
+const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Run the stdio server until stdin closes.
 ///
@@ -72,6 +73,14 @@ pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
 struct StdioServerState {
     packet_cache: StdioPacketCache,
     search_cache: StdioSearchFragmentCache,
+    status_cache: Option<StdioStatusCacheEntry>,
+}
+
+#[derive(Clone)]
+struct StdioStatusCacheEntry {
+    key: String,
+    value: serde_json::Value,
+    cached_at: Instant,
 }
 
 fn handle_stdio_message(
@@ -144,7 +153,7 @@ fn handle_stdio_message(
                     "Invalid params: missing resource uri",
                 ));
             };
-            read_stdio_resource(runtime, uri)
+            read_stdio_resource(runtime, state, uri)
         }
         "tools/call" => {
             let Some(name) = request
@@ -1604,9 +1613,13 @@ fn stdio_legacy_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> 
     serde_json::json!(error.to_string())
 }
 
-fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value {
+fn read_stdio_resource(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    uri: &str,
+) -> serde_json::Value {
     let result = match uri {
-        "codestory://status" => read_stdio_status_resource(runtime),
+        "codestory://status" => read_stdio_status_resource_cached(runtime, state),
         "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource()),
         "codestory://project" => runtime
             .open_project_summary()
@@ -1628,6 +1641,49 @@ fn read_stdio_resource(runtime: &RuntimeContext, uri: &str) -> serde_json::Value
     result
         .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn read_stdio_status_resource_cached(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+) -> Result<serde_json::Value> {
+    let key = stdio_status_cache_key(runtime);
+    if let Some(cached) = state.status_cache.as_ref()
+        && cached.key == key
+        && cached.cached_at.elapsed() < STDIO_STATUS_CACHE_TTL
+    {
+        return Ok(cached.value.clone());
+    }
+
+    let value = read_stdio_status_resource(runtime)?;
+    // ponytail: short stdio snapshot cache; storage/sidecar fingerprints bust it when runtime state changes.
+    state.status_cache = Some(StdioStatusCacheEntry {
+        key,
+        value: value.clone(),
+        cached_at: Instant::now(),
+    });
+    Ok(value)
+}
+
+fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
+    let layout = SidecarLayout::from_env();
+    [
+        format!("project:{}", runtime.project_root.display()),
+        format!("storage:{}", runtime.storage_path.display()),
+        format!(
+            "storage_state:{}",
+            stdio_storage_fingerprint(&runtime.storage_path)
+        ),
+        format!(
+            "sidecar_state:{}",
+            stdio_path_fingerprint(&layout.state_file)
+        ),
+        format!(
+            "active_embedding_backend:{}",
+            codestory_retrieval::embedding_runtime_id()
+        ),
+    ]
+    .join("|")
 }
 
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
