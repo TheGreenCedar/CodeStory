@@ -7063,6 +7063,9 @@ struct HybridSearchInstrumentation {
 
 #[derive(Debug, Clone)]
 struct CachedIndexFreshness {
+    root: PathBuf,
+    storage_path: PathBuf,
+    storage_fingerprint: String,
     value: IndexFreshnessDto,
     cached_at: Instant,
 }
@@ -7085,6 +7088,28 @@ fn index_freshness_cache_ttl_secs() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|ttl| *ttl > 0)
         .unwrap_or(INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS)
+}
+
+fn storage_fingerprint(path: &Path) -> String {
+    [
+        storage_path_fingerprint(path),
+        storage_path_fingerprint(&path.with_extension("db-wal")),
+        storage_path_fingerprint(&path.with_extension("db-shm")),
+    ]
+    .join("|")
+}
+
+fn storage_path_fingerprint(path: &Path) -> String {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("len:{}:mtime_ms:{modified_ms}", metadata.len())
 }
 
 fn publish_search_engine(state: &mut AppState, engine: SearchEngine) {
@@ -7771,6 +7796,7 @@ impl AppController {
     fn project_summary_from_storage(
         &self,
         root: &Path,
+        storage_path: &Path,
         storage: &Storage,
     ) -> Result<ProjectSummary, ApiError> {
         let stats = storage
@@ -7793,7 +7819,8 @@ impl AppController {
         let workspace = Workspace::open(root.to_path_buf())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
-        let freshness = index_freshness_from_storage(root, &workspace, storage);
+        let freshness =
+            self.cached_index_freshness_from_storage(root, storage_path, &workspace, storage);
 
         Ok(ProjectSummary {
             root: root.to_string_lossy().to_string(),
@@ -7811,7 +7838,7 @@ impl AppController {
     ) -> Result<ProjectSummary, ApiError> {
         let storage = Storage::open(&storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let summary = self.project_summary_from_storage(&root, &storage)?;
+        let summary = self.project_summary_from_storage(&root, &storage_path, &storage)?;
 
         {
             let mut s = self.state.lock();
@@ -7833,7 +7860,7 @@ impl AppController {
         let mut storage = Storage::open(&storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
         let (node_names, engine) = load_persisted_search_state(&mut storage, &storage_path)?;
-        let mut summary = self.project_summary_from_storage(&root, &storage)?;
+        let mut summary = self.project_summary_from_storage(&root, &storage_path, &storage)?;
         summary.retrieval = Some(retrieval_state_from_storage(&storage)?);
 
         {
@@ -9410,26 +9437,60 @@ impl AppController {
 
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        let storage_fingerprint = storage_fingerprint(&storage_path);
         {
             let state = self.state.lock();
             if let Some(cached) = state.index_freshness_cache.as_ref()
+                && cached.root == root
+                && cached.storage_path == storage_path
+                && cached.storage_fingerprint == storage_fingerprint
                 && cached.cached_at.elapsed() < ttl
             {
                 return Ok(cached.value.clone());
             }
         }
 
-        let root = self.require_project_root()?;
         let storage = self.open_storage()?;
         let workspace = Workspace::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let freshness = index_freshness_from_storage(&root, &workspace, &storage);
+        let freshness =
+            self.cached_index_freshness_from_storage(&root, &storage_path, &workspace, &storage);
+        Ok(freshness)
+    }
+
+    fn cached_index_freshness_from_storage(
+        &self,
+        root: &Path,
+        storage_path: &Path,
+        workspace: &Workspace,
+        storage: &Storage,
+    ) -> IndexFreshnessDto {
+        let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
+        let storage_fingerprint = storage_fingerprint(storage_path);
+        {
+            let state = self.state.lock();
+            if let Some(cached) = state.index_freshness_cache.as_ref()
+                && cached.root == root
+                && cached.storage_path == storage_path
+                && cached.storage_fingerprint == storage_fingerprint
+                && cached.cached_at.elapsed() < ttl
+            {
+                return cached.value.clone();
+            }
+        }
+
+        let freshness = index_freshness_from_storage(root, workspace, storage);
         let mut state = self.state.lock();
         state.index_freshness_cache = Some(CachedIndexFreshness {
+            root: root.to_path_buf(),
+            storage_path: storage_path.to_path_buf(),
+            storage_fingerprint,
             value: freshness.clone(),
             cached_at: Instant::now(),
         });
-        Ok(freshness)
+        freshness
     }
 
     fn search_hybrid_results(
