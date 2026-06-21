@@ -95,11 +95,34 @@ For agent-facing packet/search evidence, build and verify sidecars first:
 [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md) for sidecar
 setup and repair.
 
-## Install As An Agent Skill
+## Install As An Agent Plugin
 
-Copy [`.agents/skills/codestory-grounding`](.agents/skills/codestory-grounding) to
-your skill directory. Run `scripts/setup.sh` or `scripts/setup.ps1`. See
-[`.agents/skills/codestory-grounding/SKILL.md`](.agents/skills/codestory-grounding/SKILL.md).
+For normal Codex use, open Codex in the repo you want to ground and install
+through `/plugins`:
+
+```text
+TheGreenCedar -> codestory -> Install plugin
+```
+
+When supported, terminal marketplace management can add the source marketplace:
+
+```bash
+codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
+```
+
+Some plugin settings are UI-managed, so use `/plugins` when the CLI marketplace
+command is unavailable. Start a new Codex thread after install or refresh, then
+ask `@CodeStory` to check readiness and ground the repo before planning or
+editing.
+
+The canonical skill ships inside this repository's plugin package at
+[`plugins/codestory/skills/codestory-grounding/SKILL.md`](plugins/codestory/skills/codestory-grounding/SKILL.md).
+
+The plugin launches `codestory-cli serve --stdio --refresh none` directly. If
+the binary is missing or older than the latest GitHub release on the agent host,
+use the matching host release asset or source fallback documented in
+[the plugin README](plugins/codestory/README.md), then restart the agent thread
+if `PATH` changed.
 
 ## Commands
 

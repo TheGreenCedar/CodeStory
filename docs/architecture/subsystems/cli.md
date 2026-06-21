@@ -27,7 +27,7 @@
 This page documents CLI ownership and subsystem boundaries, not detailed option
 semantics. The canonical option contract is the generated CLI help from
 `crates/codestory-cli/src/args.rs`; the agent-facing operational reference is
-`.agents/skills/codestory-grounding/references/*.md`. README and usage docs
+`plugins/codestory/skills/codestory-grounding/references/*.md`. README and usage docs
 should stay workflow-oriented and link to those sources instead of copying
 complete option matrices.
 
