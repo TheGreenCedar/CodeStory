@@ -51,6 +51,38 @@ The browser surface gate stays closed until a current real-repo run in this log
 meets the Web UI Promotion Budget, and the stress-lane gate for the target
 scale also passes.
 
+## Browser Surface Gate
+
+`explore` and `serve --stdio` are the current browser-capable read surfaces. Do
+not promote a new `browse` command, web UI route, or browser-specific UI until
+the repo has current evidence for each gate:
+
+- Tool, resource, and prompt manifests are stable under stdio catalog tests.
+- HTTP and stdio browser contracts stay aligned with the read-only browser
+  service.
+- Warm stdio/browser-loop p50, p95, and p99 timings are recorded here: small
+  fixture smoke p95 stays under the Smoke Budget, and a current real-repo run
+  meets the Web UI Promotion Budget.
+- Browser stress lanes pass at the intended scale, and synthetic evidence is not
+  treated as real-repository promotion proof.
+- `explore` demonstrates the browser workflow in JSON/Markdown and
+  keyboard-first TUI paths.
+- Screenshot-visible review is planned before implementation, with one reviewer
+  for the full viewport and one reviewer for the changed surface or acceptance
+  path.
+
+Evidence sources: `crates/codestory-cli/tests/stdio_protocol_contracts.rs`,
+`crates/codestory-cli/tests/http_transport_contracts.rs`,
+`crates/codestory-cli/tests/stdio_warm_loop_stats.rs`,
+`docs/testing/codestory-stdio-warm-loop-stats.md`,
+`docs/testing/codestory-stress-lanes.md`, and
+`crates/codestory-cli/tests/cli_golden_path.rs`.
+
+If the gates are satisfied, start with a written implementation plan that names
+why the new surface is not a duplicate of `explore`, the exact routes or
+commands to add, the screenshot-visible review loop, and the promotion guard
+path.
+
 ## Baseline Payload Sizes
 
 From the 2026-05-06 baseline:
