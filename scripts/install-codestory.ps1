@@ -4,13 +4,13 @@ param(
     [string]$Project = ".",
     [string]$CodestoryCli,
     [string]$InstallDir,
-    [string]$Version = "0.11.0",
+    [string]$Version = "0.11.1",
     [switch]$NoDownload,
     [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
-$MinimumVersion = [Version]"0.11.0"
+$MinimumVersion = [Version]"0.11.1"
 
 function Get-CodeStoryHome {
     if ($env:CODESTORY_HOME) {
@@ -374,7 +374,7 @@ function Assert-SelfTest {
 function Invoke-SelfTest {
     $parsedVersion = Convert-VersionText "codestory-cli 0.11.1"
     Assert-SelfTest (Test-MinimumVersion $parsedVersion) "version parser should accept 0.11.1"
-    Assert-SelfTest (-not (Test-MinimumVersion ([Version]"0.10.1"))) "version gate should reject 0.10.1"
+    Assert-SelfTest (-not (Test-MinimumVersion ([Version]"0.11.0"))) "version gate should reject 0.11.0"
 
     $staleDoctor = @'
 {
