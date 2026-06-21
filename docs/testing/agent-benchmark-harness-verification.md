@@ -21,7 +21,7 @@ The fixture verifies:
 
 - command category counts for CodeStory CLI, shell search, direct file reads,
   git, and build/test commands;
-- modern Codex JSONL tool category counts for web search, MCP tool calls,
+- runner JSONL tool category counts for web search, MCP tool calls,
   command execution, function calls, and other tool calls;
 - direct source-read accounting across the supported language extension set,
   including Dart, Bash, HTML, CSS, and SQL;
@@ -109,8 +109,8 @@ wall time, all-in wall time, tokens, tool calls, commands, and estimated cost.
 The Markdown summary prints the same totals before the per-task median table,
 so a human report can compare aggregate cost and time before looking at quality
 medians.
-`scripts/codestory-agent-ab-score.mjs` reuses that ledger for Autoresearch and
-emits `METRIC` lines for the raw per-arm wall time, tokens, tool calls,
+`scripts/codestory-agent-ab-score.mjs` reuses that accounting and emits
+`METRIC` lines for the raw per-arm wall time, tokens, tool calls,
 commands, CodeStory commands, shell searches, file-read commands, web searches,
 post-packet reads, quality pass counts, packet-first pass counts,
 packet-manifest quality pass counts, partial packet counts, and ratios.
@@ -154,25 +154,9 @@ For anti-overfit language work, run packet probes with production defaults and
 keep exact benchmark probes behind manifests, explicit request probes, or
 `CODESTORY_EVAL_PROBES=1` diagnostics only. Do not treat general
 framework/domain semantics as overfit when they apply to real projects.
-The current June 18 packet-runtime proof is split:
-
-- Non-publishable diagnostic artifact:
-  `target/agent-benchmark/language-expansion-proof-full-form-command-shapes`,
-  generated `2026-06-18T12:03:23.059Z`. It has `108/108` success, `108/108`
-  quality, and `108/108` sufficiency, but `9` cold SLA misses. Use it only as
-  development proof.
-- Publishable artifact:
-  `target/agent-benchmark/language-expansion-publishable-full-form-command-shapes`,
-  generated `2026-06-18T12:23:54.418Z`. It has `108/108` success, `106/108`
-  quality, `107/108` sufficiency, `1` partial, and `8` cold SLA misses.
-  Promotion is blocked.
-
-Current blockers are apache-commons-lang cold SLA `3/3`, redis cold SLA `3/3`,
-AutoMapper cold SLA `1/3`, dart-http cold SLA `1/3`, square-okio cold quality
-`2/3`, and Alamofire cold quality `2/3` plus `1` partial sufficiency.
-The older packet-gated A/B slice remains useful for cost/time/tool-call
-accounting, but it is diagnostic and selected from rows that were useful to
-compare at the time.
+Keep run-specific packet-runtime results in ignored `target/` artifacts and the
+reviewing PR, issue, or release note. This page documents the harness contract
+and commands; it should not become a historical benchmark ledger.
 
 The lower-level packet runtime mode can also be run directly with row-level
 parallelism:
@@ -230,10 +214,10 @@ usage, observed tool-call count, or command-count accounting. A publishable
 `without_codestory` row must inspect the local repository without CodeStory; a
 model-prior answer with zero local commands is not valid baseline evidence.
 
-On Windows, nested `codex exec --sandbox workspace-write` can fail before local
-commands launch with `CreateProcessWithLogonW failed: 1326`. Treat those rows as
-invalid local-repo evidence. For local smoke verification on a trusted checkout,
-rerun with `--sandbox danger-full-access` and confirm the summary shows local
+On Windows, nested sandboxed runner commands can fail before local commands
+launch with `CreateProcessWithLogonW failed: 1326`. Treat those rows as invalid
+local-repo evidence. For local smoke verification on a trusted checkout, rerun
+with the harness's trusted-checkout mode and confirm the summary shows local
 command/tool counts and zero web searches.
 
 Do not make public savings claims from these fixtures. They only prove

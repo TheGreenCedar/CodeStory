@@ -102,7 +102,7 @@ indexed 4,308 files and produced 385,735 nodes and 312,268 edges with 0 errors
 and 0 fatal errors. The latest per-language JSONL evidence is in
 `target/oss-language-corpus/reports/oss-language-corpus-latest.jsonl`.
 
-The cheap integrity check used by the Autoresearch gate is:
+The cheap integrity check used by downstream automation is:
 
 ```powershell
 node scripts\codestory-language-holdout-integrity.mjs
