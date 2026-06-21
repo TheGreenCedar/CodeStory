@@ -100,7 +100,7 @@ not expose ranking knobs for product search/context calls.
 
 HTTP serving keeps the current small GET/query-string shape. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
 
-`serve --stdio` is MCP-style JSON lines. It exposes tools for search, context, symbol, trail, definition, references, symbols, snippet, and warm graph primitives (`get_node`, `neighbors`, `shortest_path`, and `query_subgraph`); resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
+`serve --stdio` is MCP-style JSON lines. It exposes tools for ground, files, packet, search, context, symbol, trail, definition, references, symbols, snippet, and warm graph primitives (`get_node`, `neighbors`, `shortest_path`, and `query_subgraph`); resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
 
 The warm graph primitives are intentionally narrower than `packet`. They resolve exact node ids or bounded local graph neighborhoods before an agent asks for a broad evidence packet. Their responses include stable node ids, project-relative file refs when available, certainty metadata, count/truncation fields, and explicit result limits. `packet` remains the broad task tool with sufficiency, citations, retrieval traces, and budget accounting.
 

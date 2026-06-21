@@ -4,13 +4,33 @@ param(
     [string]$Project = ".",
     [string]$CodestoryCli,
     [string]$InstallDir,
-    [string]$Version = "0.11.1",
+    [string]$Version,
     [switch]$NoDownload,
     [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
-$MinimumVersion = [Version]"0.11.1"
+$RequiredVersion = $null
+
+function Convert-ReleaseTagToVersion {
+    param([string]$Tag)
+
+    if ($Tag -match "^v?(\d+\.\d+\.\d+)$") {
+        return $matches[1]
+    }
+    throw "Unable to parse CodeStory release tag: $Tag"
+}
+
+function Get-LatestReleaseVersion {
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/TheGreenCedar/CodeStory/releases/latest" -UseBasicParsing
+    return Convert-ReleaseTagToVersion $release.tag_name
+}
+
+function Set-RequiredVersion {
+    param([string]$ReleaseVersion)
+
+    $script:RequiredVersion = [Version](Convert-ReleaseTagToVersion $ReleaseVersion)
+}
 
 function Get-CodeStoryHome {
     if ($env:CODESTORY_HOME) {
@@ -48,10 +68,10 @@ function Invoke-CliVersion {
     }
 }
 
-function Test-MinimumVersion {
+function Test-RequiredVersion {
     param([Version]$Candidate)
 
-    return $Candidate.CompareTo($MinimumVersion) -ge 0
+    return $Candidate.CompareTo($script:RequiredVersion) -eq 0
 }
 
 function Resolve-CandidatePath {
@@ -122,8 +142,8 @@ function Find-ExistingCli {
             throw "Explicit codestory-cli path was not found or runnable: $ExplicitCli"
         }
         $version = Invoke-CliVersion $resolved
-        if (-not (Test-MinimumVersion $version.Version)) {
-            throw "Explicit codestory-cli is $($version.Version), but CodeStory readiness wrapper requires >= $MinimumVersion`: $resolved"
+        if (-not (Test-RequiredVersion $version.Version)) {
+            throw "Explicit codestory-cli is $($version.Version), but CodeStory readiness wrapper requires $script:RequiredVersion`: $resolved"
         }
         return [PSCustomObject]@{
             Path = $resolved
@@ -136,7 +156,7 @@ function Find-ExistingCli {
     foreach ($candidate in (Get-CliCandidates $ExplicitCli $InstallDirectory)) {
         try {
             $version = Invoke-CliVersion $candidate
-            if (Test-MinimumVersion $version.Version) {
+            if (Test-RequiredVersion $version.Version) {
                 return [PSCustomObject]@{
                     Path = $candidate
                     VersionText = $version.Text
@@ -152,12 +172,70 @@ function Find-ExistingCli {
 }
 
 function Test-WindowsX64 {
-    $isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    $hostIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
         [System.Runtime.InteropServices.OSPlatform]::Windows
     )
     $isX64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq `
         [System.Runtime.InteropServices.Architecture]::X64
-    return ($isWindows -and $isX64)
+    return ($hostIsWindows -and $isX64)
+}
+
+function Normalize-PathListEntry {
+    param([string]$Value)
+
+    if (-not $Value) {
+        return ""
+    }
+    return ($Value.Trim() -replace "[\\/]+$", "")
+}
+
+function Test-PathListContains {
+    param(
+        [string]$PathList,
+        [string]$Directory
+    )
+
+    $normalizedDirectory = Normalize-PathListEntry $Directory
+    foreach ($entry in ($PathList -split ";")) {
+        if ((Normalize-PathListEntry $entry) -ieq $normalizedDirectory) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Ensure-InstallDirOnPath {
+    param(
+        [string]$InstallDirectory,
+        [string]$CliPath
+    )
+
+    $resolvedInstallDir = Resolve-Path -LiteralPath $InstallDirectory -ErrorAction SilentlyContinue
+    if (-not $resolvedInstallDir) {
+        return
+    }
+    $resolvedCli = Resolve-Path -LiteralPath $CliPath -ErrorAction SilentlyContinue
+    if (-not $resolvedCli) {
+        return
+    }
+    $installPath = $resolvedInstallDir.Path
+    $cliDir = Split-Path -Parent $resolvedCli.Path
+    if ((Normalize-PathListEntry $cliDir) -ine (Normalize-PathListEntry $installPath)) {
+        return
+    }
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not (Test-PathListContains $userPath $installPath)) {
+        $prefix = if ($userPath) { $userPath.TrimEnd(";") + ";" } else { "" }
+        [Environment]::SetEnvironmentVariable("Path", $prefix + $installPath, "User")
+        Write-Host "PATH updated for future Codex host processes: $installPath"
+    }
+
+    $processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+    if (-not (Test-PathListContains $processPath $installPath)) {
+        $prefix = if ($processPath) { $processPath.TrimEnd(";") + ";" } else { "" }
+        [Environment]::SetEnvironmentVariable("Path", $prefix + $installPath, "Process")
+    }
 }
 
 function Get-ExpectedHash {
@@ -199,7 +277,7 @@ function Install-ReleaseCli {
     )
 
     if (-not (Test-WindowsX64)) {
-        throw "Automatic download currently supports Windows x64 only. Pass -CodestoryCli or set CODESTORY_CLI to reuse an existing >= $MinimumVersion binary."
+        throw "Automatic download currently supports Windows x64 only. Pass -CodestoryCli or set CODESTORY_CLI to reuse an existing $script:RequiredVersion binary."
     }
 
     $archiveName = "codestory-cli-v$ReleaseVersion-windows-x64.zip"
@@ -229,8 +307,8 @@ function Install-ReleaseCli {
         $dest = Join-Path $InstallDirectory "codestory-cli.exe"
         Copy-Item -LiteralPath $binary.FullName -Destination $dest -Force
         $version = Invoke-CliVersion $dest
-        if (-not (Test-MinimumVersion $version.Version)) {
-            throw "Downloaded codestory-cli is $($version.Version), expected >= $MinimumVersion"
+        if (-not (Test-RequiredVersion $version.Version)) {
+            throw "Downloaded codestory-cli is $($version.Version), expected $script:RequiredVersion"
         }
         return [PSCustomObject]@{
             Path = (Resolve-Path -LiteralPath $dest).Path
@@ -372,9 +450,39 @@ function Assert-SelfTest {
 }
 
 function Invoke-SelfTest {
-    $parsedVersion = Convert-VersionText "codestory-cli 0.11.1"
-    Assert-SelfTest (Test-MinimumVersion $parsedVersion) "version parser should accept 0.11.1"
-    Assert-SelfTest (-not (Test-MinimumVersion ([Version]"0.11.0"))) "version gate should reject 0.11.0"
+    Set-RequiredVersion "v0.11.3"
+    Test-WindowsX64 | Out-Null
+    Assert-SelfTest (Test-PathListContains "C:\Tools;C:\CodeStory\bin\" "C:\CodeStory\bin") "path-list check should ignore trailing slash"
+    Assert-SelfTest (-not (Test-PathListContains "C:\Tools" "C:\CodeStory\bin")) "path-list check should reject missing directory"
+    Assert-SelfTest ((Convert-ReleaseTagToVersion "v0.11.3") -eq "0.11.3") "release tag parser should strip v prefix"
+    $parsedVersion = Convert-VersionText "codestory-cli 0.11.3"
+    Assert-SelfTest (Test-RequiredVersion $parsedVersion) "version gate should accept current release"
+    Assert-SelfTest (-not (Test-RequiredVersion ([Version]"0.11.2"))) "version gate should reject stale 0.11.2"
+
+    $explicitStale = $false
+    try {
+        $staleCli = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-stale-" + [System.Guid]::NewGuid().ToString("N") + ".cmd")
+        Set-Content -LiteralPath $staleCli -Value "@echo codestory-cli 0.11.2" -Encoding ASCII
+        Find-ExistingCli $staleCli $null | Out-Null
+    } catch {
+        $explicitStale = $_.Exception.Message -match "requires 0.11.3"
+    } finally {
+        if ($staleCli -and (Test-Path -LiteralPath $staleCli)) {
+            Remove-Item -LiteralPath $staleCli -Force
+        }
+    }
+    Assert-SelfTest $explicitStale "explicit stale codestory-cli override should fail loudly"
+
+    try {
+        $currentCli = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-current-" + [System.Guid]::NewGuid().ToString("N") + ".cmd")
+        Set-Content -LiteralPath $currentCli -Value "@echo codestory-cli 0.11.3" -Encoding ASCII
+        $current = Find-ExistingCli $currentCli $null
+        Assert-SelfTest ($current.Version -eq [Version]"0.11.3") "explicit current codestory-cli override should be accepted"
+    } finally {
+        if ($currentCli -and (Test-Path -LiteralPath $currentCli)) {
+            Remove-Item -LiteralPath $currentCli -Force
+        }
+    }
 
     $staleDoctor = @'
 {
@@ -445,13 +553,21 @@ if (-not $InstallDir) {
     $InstallDir = Get-DefaultInstallDir
 }
 
+if (-not $Version) {
+    $Version = Get-LatestReleaseVersion
+} else {
+    $Version = Convert-ReleaseTagToVersion $Version
+}
+Set-RequiredVersion $Version
+
 $cliInfo = Find-ExistingCli $CodestoryCli $InstallDir
 if (-not $cliInfo) {
     if ($NoDownload) {
-        throw "No existing codestory-cli >= $MinimumVersion found. Pass -CodestoryCli, set CODESTORY_CLI, add codestory-cli to PATH, or rerun without -NoDownload on Windows x64."
+        throw "No existing codestory-cli $script:RequiredVersion found. Pass -CodestoryCli, set CODESTORY_CLI, add codestory-cli to PATH, or rerun without -NoDownload on Windows x64."
     }
     $cliInfo = Install-ReleaseCli $InstallDir $Version
 }
+Ensure-InstallDirOnPath $InstallDir $cliInfo.Path
 
 $projectPath = (Resolve-Path -LiteralPath $Project).Path
 $doctor = Invoke-DoctorJson $cliInfo.Path $projectPath

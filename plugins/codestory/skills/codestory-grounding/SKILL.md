@@ -26,8 +26,9 @@ tool source unless the user is editing CodeStory itself.
    `codestory-cli --version` with that tag and keep the binary only when it
    already matches the latest release.
 4. If `codestory-cli` is missing or outdated, download and unpack only the
-   matching host asset derived from the latest tag before asking the human to
-   run manual commands. For latest tag `vX.Y.Z`, use:
+   matching host asset derived from the latest tag. Do this before asking the
+   human to install or run manual commands unless network access, permissions,
+   or a missing release asset blocks the setup. For latest tag `vX.Y.Z`, use:
    - Windows x64: `codestory-cli-vX.Y.Z-windows-x64.zip`
    - Windows arm64: `codestory-cli-vX.Y.Z-windows-arm64.zip`
    - macOS arm64: `codestory-cli-vX.Y.Z-macos-arm64.tar.gz`
@@ -37,7 +38,8 @@ tool source unless the user is editing CodeStory itself.
 5. Put the binary in a stable user bin directory, verify
    `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
    same release when the host has the tools. If `PATH` changed, say that the
-   plugin MCP process may need a new agent thread to see it.
+   plugin MCP process may need a Codex host/app restart before a new agent thread
+   can see it.
 6. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 
@@ -48,11 +50,13 @@ When the plugin MCP server is available:
 1. Read `codestory://status`.
 2. Read `codestory://agent-guide`.
 3. Read `codestory://grounding` or call `ground` for a compact repo map before planning.
-4. Use `packet` for broad repo questions only when status says
+4. Use `files` when you need indexed file inventory, language coverage, or
+   role counts from the existing cache.
+5. Use `packet` for broad repo questions only when status says
    `agent_packet_search` is ready and strict sidecar status reports
    `retrieval_mode=full`.
-5. Use `search` to discover candidates only when packet/search is ready.
-6. Use `symbol`, `trail`, `references`, `snippet`, and `context` after selecting
+6. Use `search` to discover candidates only when packet/search is ready.
+7. Use `symbol`, `trail`, `references`, `snippet`, and `context` after selecting
    a concrete target.
 
 If status is degraded, fall back to direct source reads or CLI local-navigation
@@ -99,7 +103,7 @@ Always pass `--project <target-workspace>` explicitly.
 - Broad task packet: MCP/CLI `packet`.
 - Candidate discovery: MCP/CLI `search --why`.
 - Focused source view: `symbol`, `trail`, `snippet`, `context`, `explore`.
-- Coverage and impact: `files`, `affected`.
+- Coverage and impact: MCP/CLI `files`, `affected`.
 - Reusable targets: `bookmark`.
 - Structured evaluation: `drill`, `drill-suite`.
 - Local integration surface: `serve --stdio`.

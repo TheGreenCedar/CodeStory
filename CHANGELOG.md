@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.11.3
+
+CodeStory 0.11.3 promotes the post-0.11.2 plugin/runtime polish from
+`dev/codestory-next` into a synchronized patch release. The release keeps the
+plugin model simple: the CodeStory repository owns the plugin source,
+grounding skill, runtime docs, and direct stdio launch path, while
+`TheGreenCedar/AgentPluginMarketplace` remains the external marketplace catalog
+owner.
+
+The agent-facing stdio surface now includes read-only `files` and `affected`
+tools. `files` exposes indexed file inventory and coverage from the existing
+local cache; `affected` maps explicit changed paths or change records against
+that cache. Both tools are documented and contract-tested as read-only local
+navigation surfaces: they do not discover git changes, refresh the index, or
+bootstrap sidecars.
+
+The plugin and root README were rewritten around the real operating flow:
+install or refresh the plugin, check readiness, use local grounding tools first,
+and trust packet/search only when sidecars report full retrieval readiness. The
+docs also make the marketplace split explicit and keep install/update/remove
+guidance cross-platform instead of hiding platform-specific assumptions in the
+happy path.
+
+The Windows installer now resolves the latest GitHub release when no version is
+passed, requires an exact matching `codestory-cli` version instead of accepting
+older minimum-compatible binaries, updates the user/process `PATH` when it
+installs into the managed bin directory, and fails loudly for stale explicit
+CLI overrides.
+
+Supporting PRs: #288, #298, #299, #301, #303, #305, #307, #309, #311, #315,
+#316. This release does not claim new packet/search quality, sidecar readiness,
+benchmark improvement, marketplace catalog publication, or live installed
+plugin proof beyond the source and release checks in the promotion PR.
+
 ## 0.11.2
 
 CodeStory 0.11.2 carries the post-0.11.1 documentation and MCP stdio work from
@@ -57,9 +91,9 @@ improvement.
 | Cross-platform plugin readiness | Plugin README, skill guidance, and static tests now cover Windows, macOS, and Linux install/readiness paths without adding an adapter runtime or changing Rust product behavior. | PR #269 |
 | Release-note hygiene | Stale generated 0.11 pre-release docs and ledger-style artifacts were removed from committed docs before this release. | PR #260 |
 
-Binary release assets are packaging evidence only. The plugin docs and installer
-defaults keep current archive names release-bound to `v0.11.1`; the marketplace
-catalog remains outside this repository.
+Binary release assets are packaging evidence only. In this release, the plugin
+docs and installer defaults kept archive names release-bound to `v0.11.1`; the
+marketplace catalog remains outside this repository.
 
 ## 0.11.0
 
