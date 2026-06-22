@@ -1,0 +1,60 @@
+{
+  "$schema": "../manifest.schema.json",
+  "id": "codestory-index-refresh-mode",
+  "version": 1,
+  "suite": "readme-with-without",
+  "task_class": "route_tracing",
+  "repo": {
+    "name": "codestory",
+    "url": "https://github.com/TheGreenCedar/CodeStory.git",
+    "ref": "1f8e851c2e27709171bcc8a230ae9ba687ccc4bf",
+    "workspace_root": ".",
+    "languages": [
+      "Rust"
+    ]
+  },
+  "prompt": "Identify the local CodeStory CLI enum that defines index refresh modes. Cite the file and symbol.",
+  "expected_files": [
+    "crates/codestory-cli/src/args.rs"
+  ],
+  "expected_symbols": [
+    {
+      "name": "RefreshMode",
+      "path": "crates/codestory-cli/src/args.rs",
+      "kind": "enum",
+      "why": "Defines the refresh-mode values used by indexing."
+    }
+  ],
+  "expected_claims": [
+    {
+      "text": "`RefreshMode` defines the refresh-mode values used by the index command in `crates/codestory-cli/src/args.rs`."
+    }
+  ],
+  "forbidden_claims": [
+    {
+      "text": "The index refresh-mode enum lives outside `crates/codestory-cli/src/args.rs`.",
+      "severity": "critical"
+    },
+    {
+      "text": "The `index` command requires remote packet retrieval before it can run indexing.",
+      "severity": "major"
+    }
+  ],
+  "quality_thresholds": {
+    "min_expected_anchor_recall": 1,
+    "min_expected_file_recall": 1,
+    "min_expected_symbol_recall": 1,
+    "min_expected_claim_recall": 1,
+    "min_citation_coverage": 1,
+    "max_forbidden_claims": 0
+  },
+  "notes": [
+    "Small README value-comparison task; intended for scoped with-vs-without accounting, not broad promotion.",
+    "Runtime call-path proof is intentionally out of scope for this README metric."
+  ],
+  "tags": [
+    "readme",
+    "value-comparison",
+    "indexing"
+  ]
+}

@@ -158,22 +158,47 @@ of answer quality, token savings, public benchmark promotion, or generalization.
 
 ## Speed And Context Value
 
-CodeStory's speed and token value come from avoiding the same broad repository
-scan over and over. The agent can ask for bounded graph, source, trail, impact,
-and packet evidence, then cite that evidence instead of repeatedly stuffing raw
-files into context.
+The product comparison is with CodeStory versus ordinary local exploration on
+the same repo task. The current README evidence uses the focused
+`readme-with-without` task
+[`codestory-index-refresh-mode`](benchmarks/tasks/readme-with-without/codestory-index-refresh-mode.task.json):
+identify the `RefreshMode` enum that defines index refresh modes, cite the
+owning file, and pass the manifest quality gate.
 
-That mechanism is useful even without a token-savings percentage: local graph
-navigation narrows the next source reads, `affected` narrows review planning,
-and full `packet`/`search` returns bounded citations plus gaps instead of an
-unbounded repo sweep. Exact token-savings measurements are not currently
-published in this README, so the claim stays at mechanism and evidence shape,
-not a numeric savings promise.
+Command:
 
-The committed timing evidence does show cache behavior that matters to operator
-flow: the 2026-06-18 #41 hardening row recorded a repeat full refresh at
-`29.45s` with `750` semantic docs reused and `0` embedded. Treat that as
-cache/reuse telemetry, not answer-quality proof.
+```powershell
+node .\scripts\codestory-agent-ab-benchmark.mjs `
+  --task-suite readme-with-without `
+  --arms without_codestory,with_codestory `
+  --repeats 1 `
+  --codestory-cli .\target\release\codestory-cli.exe `
+  --out-dir .\target\agent-benchmark\issue-352-readme-with-without-v4 `
+  --timeout-ms 300000
+```
+
+Evidence artifact: `target/agent-benchmark/issue-352-readme-with-without-v4`.
+Both arms passed the task quality gate (`1/1`), the CodeStory packet manifest
+passed (`1/1`), packet/search readiness was `retrieval_mode full`, and the
+CodeStory arm used zero post-packet source reads.
+
+| Metric | Without CodeStory | With CodeStory | Result |
+| --- | ---: | ---: | --- |
+| Token/context spend | `198,109` tokens | `35,218` tokens | `82.2%` lower: `(198109 - 35218) / 198109` |
+| Repeat-task wall time | `76.571s` | `63.399s` | `17.2%` saved: `(76.571 - 63.399) / 76.571` |
+| Tool calls / commands | `11` | `1` | `90.9%` lower: `(11 - 1) / 11` |
+| Direct source reads | `8` | `0` | `100%` lower |
+| All-in wall time, including ready-cache check | `76.571s` | `76.793s` | `0.3%` slower; setup verification is not hidden |
+
+First setup is separate from repeat-task savings. This run used an already
+indexed repo with full retrieval sidecars; the ready-cache check still recorded
+`13.394s`, including `7.839s` for retrieval index refresh. Cold setup requires
+building or installing `codestory-cli`, running `index --refresh full`, and
+preparing retrieval sidecars before packet/search numbers are comparable.
+
+Scope matters: this is one small source-ownership task, not a broad
+answer-quality or generalization benchmark. Broader public savings claims still
+need repeated paired benchmark rows.
 
 ## Cache And Worktree Lifecycle
 
