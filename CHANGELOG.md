@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.5
+
+CodeStory 0.11.5 carries the setup and documentation repair cleanup that
+landed after 0.11.4 onto `main` as a synchronized patch release. The version is
+aligned across every `codestory-*` workspace crate and `Cargo.lock`, with
+`crates/codestory-cli/Cargo.toml` still acting as the release version source.
+
+The release tightens the human operator path around sidecar repair and readiness
+checks. The docs now explain when local navigation is usable, when packet/search
+needs full sidecar evidence, and how to recover from stale or missing retrieval
+state without turning the changelog into a release ledger.
+
+Setup now handles locked installed CLI binaries more predictably. When an
+existing installed `codestory-cli` cannot be replaced directly, the installer
+falls back to a locked-safe path instead of leaving the operator with a stale
+binary and a quiet success signal.
+
+Supporting PRs: #368, #369. This release does not create manual tags, add new
+answer-quality claims, or change runtime behavior beyond the promoted setup,
+documentation, and version metadata.
+
 ## 0.11.4
 
 CodeStory 0.11.4 promotes the docs/plugin/setup wave from
