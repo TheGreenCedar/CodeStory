@@ -62,43 +62,23 @@ Index output should expose:
 
 ## Read And Query Output
 
-Read commands default to `--refresh none` so they query the current cache unless
-the caller requests a refresh.
+Generated help and [../../usage.md](../../usage.md) own command syntax,
+workflow examples, and option semantics. This subsystem page owns the adapter
+boundary:
 
-`ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, and
-`explore` all support `--format markdown|json` and `--output-file <PATH>`.
-`trail` additionally supports Graphviz DOT via `--format dot`; `symbol` and
-`trail` support Mermaid via `--mermaid`.
+- parse CLI arguments without embedding runtime policy;
+- keep rendering in `output.rs`;
+- delegate refresh, retrieval, packet sufficiency, query planning, and health
+  checks to `codestory-runtime`;
+- report stale, partial, ambiguous, or degraded evidence instead of silently
+  hiding it;
+- keep mutating setup paths explicit so read commands do not download assets or
+  change sidecar state.
 
-`search --query` accepts field-qualified filters such as `kind:function`,
-`path:routes.ts`, `name:listUsers`, and `lang:typescript` for narrowing
-candidate sets without hiding the original query text. `search --why` keeps
-operator provenance compact by default; broad architecture-style `search`
-responses include the full Search Plan only when `--plan-details` is also
-requested. Treat that plan as discovery evidence and next-command guidance, not
-final answer prose.
-
-`drill` is the exception to the default refresh posture: it defaults to
-`--refresh full` so generated report bundles are mechanically fresh. Its
-agent-quality classification details live in the grounding skill references
-rather than the general CLI architecture page.
-
-`query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
-
-`context` is target context for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`; `--query` must identify a concrete target, not a broad natural-language question. After target selection, the CLI delegates to `codestory-runtime` through the Investigate agent path with a focused node id. The context answer/evidence packet needs full sidecar-primary retrieval and can fail closed when sidecars are unavailable, rejected, disabled, or non-`full`; use `symbol`, `trail`, `snippet`, or `explore` for cache-only local navigation. `context` is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
-
-`doctor` is a read-only health report for project path resolution, cache
-presence, index counts, retrieval state, managed embedding setup, relevant
-embedding environment variables, and next commands. It should stay diagnostic;
-it should not mutate caches or fetch model assets.
-
-`setup embeddings` is the explicit mutating path for installing pinned ONNX
-Runtime BGE-base assets in the user cache. That managed setup path is for local
-semantic diagnostics and compatibility checks. It does not launch or retain an
-embedding server, and it does not prepare product `packet`/`search` retrieval.
-Product retrieval proof starts with `retrieval bootstrap`, then `retrieval index
---refresh full`, then `retrieval status --format json` reporting
-`retrieval_mode: "full"`.
+Broad question surfaces (`packet`, sidecar-backed `search`, and `drill`) should
+remain separate from exact target context (`context`, `symbol`, `trail`,
+`snippet`, and local graph exploration). Generated help is the source of truth
+for the current flags on each command.
 
 ## Search And Context Research Boundary
 

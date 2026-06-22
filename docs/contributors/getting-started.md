@@ -141,7 +141,7 @@ commands as product-quality proof.
 Use this lane only for packet/search, retrieval, ranking-quality, or sidecar
 work. Prepare the managed full-sidecar path before debugging ranking quality:
 
-- managed real-model setup: `node scripts/setup-retrieval-env.mjs --fetch-embed-model`, then `codestory-cli retrieval bootstrap --project .`
+- product sidecar setup: `node scripts/setup-retrieval-env.mjs --fetch-embed-model`, then `codestory-cli retrieval bootstrap --project .`
 - default symbol-doc scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol diagnostic symbol-doc set
 - default dense policy: `graph_first_v1` embeds only selected dense anchors; private trivial code remains searchable through symbol docs, lexical source, and graph expansion
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows

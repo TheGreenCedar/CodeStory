@@ -23,12 +23,12 @@ path, repair path, architecture, verification, and research evidence.
 | --- | --- | --- |
 | Where do I start as a first-time user? | [README - Quick start](../README.md#quick-start) | [Usage - Operator Journey](usage.md#operator-journey) |
 | How do I repair readiness? | [Usage - Stale Local Cache](usage.md#stale-local-cache) | [Retrieval sidecars operations - Operator repair path](ops/retrieval-sidecars.md#operator-repair-path) |
-| How does CodeStory work internally? | [How CodeStory Works](concepts/how-codestory-works.md) | [Architecture overview](architecture/overview.md) and [runtime execution path](architecture/runtime-execution-path.md) |
+| How does CodeStory work internally? | [Architecture overview](architecture/overview.md) | [Runtime execution path](architecture/runtime-execution-path.md) and subsystem pages |
 | Which docs define sidecar architecture? | [Retrieval design](architecture/retrieval-design.md) | [Retrieval architecture and promotion guide](testing/retrieval-architecture.md) |
 | Which language support claims are safe? | [Language support](architecture/language-support.md) | [Testing matrix - Indexer And Graph Fidelity](contributors/testing-matrix.md#indexer-and-graph-fidelity) |
 | Which test proves my docs-only change? | [Testing matrix - Docs-Only Fast Path](contributors/testing-matrix.md#docs-only-fast-path) | [Contributor setup - Choose The Verification Lane First](contributors/getting-started.md#choose-the-verification-lane-first) |
 | Where are timing and benchmark records? | [E2E stats log](testing/codestory-e2e-stats-log.md) | [Performance review playbook](testing/performance-review-playbook.md), [embedding backend benchmarks](testing/embedding-backend-benchmarks.md), and [language-expansion holdout stats](testing/language-expansion-holdout-stats.md) |
-| What does a term mean? | [Glossary](glossary.md) | [How CodeStory Works](concepts/how-codestory-works.md) |
+| What does a term mean? | [Glossary](glossary.md) | [Usage - Readiness Lanes](usage.md#readiness-lanes) |
 | Where is the with/without comparison? | [README - With vs without CodeStory](../README.md#with-vs-without-codestory) | [Agent benchmark harness verification](testing/agent-benchmark-harness-verification.md) |
 
 Use the [verification lane picker](contributors/getting-started.md#choose-the-verification-lane-first) when a change needs a proof path beyond reading docs back.

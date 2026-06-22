@@ -225,23 +225,19 @@ and delete the backup only after `doctor` is healthy.
 ## Sidecar Repair
 
 Agent packet/search requires product sidecars and the `bge-base-en-v1.5`
-llama.cpp embedding contract.
+llama.cpp embedding contract. Product sidecar setup is owned by
+[ops/retrieval-sidecars.md](ops/retrieval-sidecars.md); follow that runbook for
+model download, sidecar lifecycle, environment variables, `retrieval bootstrap`,
+`retrieval index`, `retrieval status`, CI smoke, and repair steps.
 
-```sh
-node scripts/setup-retrieval-env.mjs --fetch-embed-model
-codestory-cli retrieval bootstrap --project <target-workspace> --format json
-codestory-cli index --project <target-workspace> --refresh full
-codestory-cli retrieval index --project <target-workspace> --refresh full --format json
-codestory-cli retrieval status --project <target-workspace> --format json
-codestory-cli doctor --project <target-workspace> --format markdown
-```
+Operational contract for this usage page:
 
-`setup-retrieval-env.mjs --fetch-embed-model` verifies the pinned GGUF before
-accepting it under `target/retrieval-models` or `CODESTORY_EMBED_MODEL_DIR`.
-Leave `CODESTORY_EMBED_BACKEND` and `CODESTORY_EMBED_LLAMACPP_URL` unset unless
-your machine needs non-default sidecar settings. `retrieval status --format
-json` reports the query, manifest, and stored-vector backends so backend drift
-is visible before packet/search is trusted.
+- Run `retrieval bootstrap` and `retrieval index` for the same target workspace
+  you will query.
+- Require `retrieval status --format json` to report
+  `retrieval_mode: "full"` before trusting packet/search evidence.
+- Treat backend drift fields in status JSON as blockers until the sidecar
+  runbook explains the mismatch.
 
 Legacy managed embeddings are diagnostic only:
 
@@ -340,7 +336,6 @@ changes.
 
 ## Further Reading
 
-- [concepts/how-codestory-works.md](concepts/how-codestory-works.md)
 - [architecture/overview.md](architecture/overview.md)
 - [architecture/runtime-execution-path.md](architecture/runtime-execution-path.md)
 - [contributors/debugging.md](contributors/debugging.md)

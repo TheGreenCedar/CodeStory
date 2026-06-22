@@ -111,7 +111,7 @@ before promotion.
 
 ## Where To Start
 
-- Product mental model: [../concepts/how-codestory-works.md](../concepts/how-codestory-works.md)
+- Product workflow: [../usage.md](../usage.md)
 - System behavior: [runtime-execution-path.md](runtime-execution-path.md)
 - Indexing lifecycle: [indexing-pipeline.md](indexing-pipeline.md)
 - Language support claims: [language-support.md](language-support.md)
