@@ -106,46 +106,6 @@ On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
 ## With vs without CodeStory
 
-The product comparison is with CodeStory versus ordinary local exploration on
-the same repo task. Two recorded tiers live here; both are scoped A/B evidence,
-not promises for every future question.
-
-### Focused README task
-
-The focused `readme-with-without` task
-[`codestory-index-refresh-mode`](benchmarks/tasks/readme-with-without/codestory-index-refresh-mode.task.json)
-asks the agent to identify the `RefreshMode` enum, cite the owning file, and
-pass the manifest quality gate.
-
-```powershell
-node .\scripts\codestory-agent-ab-benchmark.mjs `
-  --task-suite readme-with-without `
-  --arms without_codestory,with_codestory `
-  --repeats 1 `
-  --codestory-cli .\target\release\codestory-cli.exe `
-  --out-dir .\target\agent-benchmark\issue-352-readme-with-without-v4 `
-  --timeout-ms 300000
-```
-
-Evidence artifact: `target/agent-benchmark/issue-352-readme-with-without-v4`.
-Both arms passed the task quality gate (`1/1`), the CodeStory packet manifest
-passed (`1/1`), packet/search readiness was `retrieval_mode full`, and the
-CodeStory arm used zero post-packet source reads.
-
-| Metric | Without CodeStory | With CodeStory | Result |
-| --- | ---: | ---: | --- |
-| Token/context spend | `198,109` tokens | `35,218` tokens | `82.2%` lower: `(198109 - 35218) / 198109` |
-| Repeat-task wall time | `76.571s` | `63.399s` | `17.2%` saved: `(76.571 - 63.399) / 76.571` |
-| Tool calls / commands | `11` | `1` | `90.9%` lower: `(11 - 1) / 11` |
-| Direct source reads | `8` | `0` | `100%` lower |
-| All-in wall time, including ready-cache check | `76.571s` | `76.793s` | `0.3%` slower; setup verification is not hidden |
-
-First setup is separate from repeat-task savings. This run used an already
-indexed repo with full retrieval sidecars; the ready-cache check still recorded
-`13.394s`, including `7.839s` for retrieval index refresh. Cold setup requires
-building or installing `codestory-cli`, running `index --refresh full`, and
-preparing retrieval sidecars before packet/search numbers are comparable.
-
 ### Language expansion holdout (18 tasks)
 
 Broader public-repo evidence uses the
@@ -161,10 +121,6 @@ manifest across 18 pinned OSS packages. Latest recorded suite totals:
 
 Per-task medians, ranges, reproduction commands, and boundary notes:
 [language-expansion holdout stats](docs/testing/language-expansion-holdout-stats.md).
-
-Scope matters: these are manifest-backed benchmark rows, not broad
-answer-quality or generalization proof. Do not rerun the no-CodeStory baseline
-unless the harness contract changes.
 
 ## Documentation
 
