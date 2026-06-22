@@ -229,10 +229,6 @@ llama.cpp embedding contract.
 
 ```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
-export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
-export CODESTORY_EMBED_BACKEND="llamacpp"
-export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
-
 codestory-cli retrieval bootstrap --project <target-workspace> --format json
 codestory-cli index --project <target-workspace> --refresh full
 codestory-cli retrieval index --project <target-workspace> --refresh full --format json
@@ -240,36 +236,12 @@ codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace> --format markdown
 ```
 
-**Key concepts for sidecar repair:**
-
-- **`setup-retrieval-env.mjs --fetch-embed-model`**: Verifies the pinned GGUF before renaming it into `CODESTORY_EMBED_MODEL_DIR`. The accepted artifact is exactly `117974304` bytes with SHA-256 `ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`.
-- **`retrieval status --format json`**: Reports `query_embedding_backend`, `manifest_vector_embedding_backend`, and `stored_doc_vector_producer_backend` so backend drift is visible.
-- **Legacy managed embeddings**: Diagnostic only; do not start llama.cpp, create the retrieval manifest, or prove agent packet/search readiness.
-
-**Sidecar readiness verification:**
-
-The `retrieval status --format json` command provides detailed information about:
-
-- `query_embedding_backend`: The backend used for query embeddings
-- `manifest_vector_embedding_backend`: The backend used for manifest vector embeddings
-- `stored_doc_vector_producer_backend`: The backend used for stored document vector production
-
-This allows you to detect backend drift and ensure all components are using the correct embedding backend.
-
-**Sidecar repair process:**
-
-1. **Setup retrieval environment**: Fetch the required embedding model and configure environment variables
-2. **Bootstrap retrieval**: Initialize the retrieval system with the embedding model
-3. **Index the repository**: Build the SQLite graph and retrieval indexes
-4. **Verify sidecar status**: Check that retrieval mode is `full` and all components are healthy
-5. **Final verification**: Run `doctor` to confirm overall system health
-
-**Common sidecar issues and solutions:**
-
-- **Missing embedding model**: Use `setup-retrieval-env.mjs --fetch-embed-model` to download and verify the model
-- **Backend configuration errors**: Check `CODESTORY_EMBED_BACKEND` and related environment variables
-- **Retrieval manifest issues**: Re-run `retrieval bootstrap` and `retrieval index` with `--refresh full`
-- **Stale cache**: Use `index --refresh full` to rebuild the SQLite graph
+`setup-retrieval-env.mjs --fetch-embed-model` verifies the pinned GGUF before
+accepting it under `target/retrieval-models` or `CODESTORY_EMBED_MODEL_DIR`.
+Leave `CODESTORY_EMBED_BACKEND` and `CODESTORY_EMBED_LLAMACPP_URL` unset unless
+your machine needs non-default sidecar settings. `retrieval status --format
+json` reports the query, manifest, and stored-vector backends so backend drift
+is visible before packet/search is trusted.
 
 Legacy managed embeddings are diagnostic only:
 
