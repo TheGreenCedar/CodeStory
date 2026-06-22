@@ -27,7 +27,8 @@ flowchart LR
 - Rust toolchain with `cargo`, or an already-built `codestory-cli` binary.
 - Docker Desktop or Docker Engine for automated Qdrant, Zoekt, and llama.cpp
   sidecars.
-- Optional Node.js 18+ for `scripts/setup-retrieval-env.mjs`.
+- Node.js 18+ if you need `scripts/setup-retrieval-env.mjs` to fetch or verify
+  the pinned GGUF.
 - Localhost ports available: Zoekt `6070`, Qdrant HTTP `6333`, Qdrant gRPC
   `6334`, and llama.cpp embeddings `8080`.
 - GGUF embedding model available through `CODESTORY_EMBED_MODEL_DIR`, or fetched
@@ -61,14 +62,13 @@ From the CodeStory repository root:
 
 ```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
-export CODESTORY_EMBED_MODEL_DIR="$(pwd)/target/retrieval-models"
-export CODESTORY_EMBED_BACKEND="llamacpp"
-export CODESTORY_EMBED_LLAMACPP_URL="http://127.0.0.1:8080/v1/embeddings"
 cargo run -p codestory-cli -- retrieval bootstrap --project <repo> --format json
 ```
 
-On Windows PowerShell, use `$env:...` assignments and
-`.\target\release\codestory-cli.exe` if you are running a built binary.
+Use the environment variables from the minimum table only when the defaults do
+not match your machine. On Windows PowerShell, set them with `$env:NAME =
+"value"` and use `.\target\release\codestory-cli.exe` if you are running a
+built binary.
 
 `retrieval bootstrap` may start Docker Compose, create sidecar cache dirs, write
 `retrieval-sidecars.json`, and repair CodeStory-owned local sidecar state. For a
