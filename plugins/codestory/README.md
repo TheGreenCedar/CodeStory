@@ -151,8 +151,9 @@ why the MCP server is not ready:
 
 ```console
 codestory-cli --version
+codestory-cli ready --goal local --repair --project <repo> --format json
+codestory-cli ready --goal agent --repair --project <repo> --format json
 codestory-cli doctor --project <repo> --format markdown
-codestory-cli index --project <repo> --refresh full
 codestory-cli retrieval status --project <repo> --format json
 codestory-cli serve --project <repo> --stdio --refresh none
 ```
@@ -165,8 +166,7 @@ MCP surface is live.
 Packet/search evidence needs sidecars:
 
 ```console
-codestory-cli retrieval bootstrap --project <repo> --format json
-codestory-cli retrieval index --project <repo> --refresh full
+codestory-cli ready --goal agent --repair --project <repo> --format json
 codestory-cli retrieval status --project <repo> --format json
 ```
 

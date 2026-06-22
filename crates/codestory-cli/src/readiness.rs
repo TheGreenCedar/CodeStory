@@ -101,12 +101,7 @@ fn verdict_state(
     project_arg: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
     if stats.node_count == 0 {
-        return index_repair_state(
-            goal,
-            "No indexed symbols are available yet.",
-            project_arg,
-            "full",
-        );
+        return index_repair_state(goal, "No indexed symbols are available yet.", project_arg);
     }
 
     if stats.fatal_error_count > 0 {
@@ -122,7 +117,6 @@ fn verdict_state(
                 stats.fatal_error_count
             ),
             project_arg,
-            "full",
         );
     }
 
@@ -132,7 +126,6 @@ fn verdict_state(
                 goal,
                 "The index has changed, new, or removed files.",
                 project_arg,
-                "incremental",
             );
         }
         Some(IndexFreshnessStatusDto::NotChecked) => {
@@ -214,16 +207,14 @@ fn ready_summary_with_errors(base: &str, stats: &StorageStatsDto) -> String {
 
 fn agent_packet_search_repair_commands(project_arg: &str, include_core_index: bool) -> Vec<String> {
     let mut commands = Vec::new();
+    commands.push(ready_repair_command(
+        ReadinessGoalDto::AgentPacketSearch,
+        project_arg,
+    ));
     if include_core_index {
-        commands.push(format!(
-            "codestory-cli index --project {project_arg} --refresh full"
-        ));
+        commands.push(format!("codestory-cli doctor --project {project_arg}"));
     }
     commands.extend([
-        format!("codestory-cli retrieval bootstrap --project {project_arg} --format json"),
-        format!(
-            "codestory-cli retrieval index --project {project_arg} --refresh full --format json"
-        ),
         format!("codestory-cli retrieval status --project {project_arg} --format json"),
         format!("codestory-cli doctor --project {project_arg} --format markdown"),
     ]);
@@ -234,9 +225,8 @@ fn index_repair_state(
     goal: ReadinessGoalDto,
     reason: &str,
     project_arg: &str,
-    refresh: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
-    let command = format!("codestory-cli index --project {project_arg} --refresh {refresh}");
+    let command = ready_repair_command(goal, project_arg);
     (
         ReadinessStatusDto::RepairIndex,
         format!(
@@ -250,6 +240,20 @@ fn index_repair_state(
             format!("codestory-cli doctor --project {project_arg}"),
         ],
     )
+}
+
+fn ready_repair_command(goal: ReadinessGoalDto, project_arg: &str) -> String {
+    format!(
+        "codestory-cli ready --goal {} --repair --project {project_arg} --format json",
+        ready_goal_cli_label(goal)
+    )
+}
+
+fn ready_goal_cli_label(goal: ReadinessGoalDto) -> &'static str {
+    match goal {
+        ReadinessGoalDto::LocalNavigation => "local",
+        ReadinessGoalDto::AgentPacketSearch => "agent",
+    }
 }
 
 fn readiness_index_snapshot(
@@ -355,7 +359,7 @@ mod tests {
             "missing index should block all readiness goals: {verdicts:?}"
         );
         assert!(
-            verdicts[0].minimum_next[0].contains("--refresh full"),
+            verdicts[0].minimum_next[0].contains("ready --goal local --repair"),
             "missing index repair should request full refresh: {verdicts:?}"
         );
     }
@@ -392,7 +396,7 @@ mod tests {
         assert!(
             verdicts
                 .iter()
-                .all(|verdict| verdict.minimum_next[0].contains("--refresh full")),
+                .all(|verdict| verdict.minimum_next[0].contains("ready --goal")),
             "error-bearing indexes should request a full refresh repair: {verdicts:?}"
         );
     }
@@ -458,7 +462,10 @@ mod tests {
         );
 
         assert_eq!(verdict.status, ReadinessStatusDto::RepairIndex);
-        assert!(verdict.minimum_next[0].contains("--refresh incremental"));
+        assert!(
+            verdict.minimum_next[0].contains("ready --goal agent --repair"),
+            "stale index repair should point at the one-command repair path: {verdict:?}"
+        );
         assert!(verdict.summary.contains("changed, new, or removed files"));
     }
 
@@ -502,26 +509,11 @@ mod tests {
             Some("semantic store unavailable")
         );
         assert!(
-            !degraded
-                .full_repair
-                .iter()
-                .any(|command| command.contains("codestory-cli index")),
-            "fresh-index sidecar repair should not repeat a full core index: {degraded:?}"
-        );
-        assert!(
             degraded
                 .full_repair
                 .first()
-                .is_some_and(|command| command.contains("retrieval bootstrap")),
-            "fresh-index sidecar repair should start with retrieval bootstrap: {degraded:?}"
-        );
-        assert!(
-            degraded
-                .full_repair
-                .iter()
-                .any(|command| command.contains("retrieval index")
-                    && command.contains("--refresh full")),
-            "non-full sidecar repair should include full retrieval index: {degraded:?}"
+                .is_some_and(|command| command.contains("ready --goal agent --repair")),
+            "fresh-index sidecar repair should start with the one-command repair path: {degraded:?}"
         );
         assert!(
             degraded
@@ -570,9 +562,8 @@ mod tests {
             verdict
                 .full_repair
                 .first()
-                .is_some_and(|command| command.contains("codestory-cli index")
-                    && command.contains("--refresh full")),
-            "unknown freshness should keep the conservative full core index repair: {verdict:?}"
+                .is_some_and(|command| command.contains("ready --goal agent --repair")),
+            "unknown freshness should keep the conservative agent repair path: {verdict:?}"
         );
     }
 }

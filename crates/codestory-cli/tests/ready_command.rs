@@ -60,15 +60,41 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert!(markdown.contains("agent_packet_search"));
     assert!(markdown.contains("minimum_next:"));
     assert!(markdown.contains("full_repair:"));
-    assert!(markdown.contains("--refresh full"));
-    assert!(markdown.contains("codestory-cli retrieval bootstrap --project"));
-    assert!(markdown.contains("codestory-cli retrieval index --project"));
+    assert!(markdown.contains("codestory-cli ready --goal agent --repair --project"));
     assert!(markdown.contains("codestory-cli retrieval status --project"));
     assert!(markdown.contains("codestory-cli doctor --project"));
     assert!(markdown.contains("--format markdown"));
     assert!(
         !markdown.contains("codestory-cli index --project"),
         "fresh-index agent readiness should not recommend a full core reindex: {markdown}"
+    );
+}
+
+#[test]
+fn ready_repair_indexes_fresh_workspace_for_local_navigation() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let json_text = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["ready", "--goal", "local", "--repair", "--format", "json"],
+    );
+    let json: Value = serde_json::from_str(&json_text).expect("ready repair json");
+    let verdicts = json["verdicts"]
+        .as_array()
+        .expect("ready repair verdicts should be an array");
+
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0]["goal"], "local_navigation");
+    assert_eq!(verdicts[0]["status"], "ready");
+    assert!(
+        verdicts[0]["minimum_next"][0]
+            .as_str()
+            .expect("minimum next command")
+            .contains("codestory-cli ground --project"),
+        "repaired local readiness should point at grounding, not another index repair: {json_text}"
     );
 }
 
