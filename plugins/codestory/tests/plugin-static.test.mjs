@@ -105,16 +105,9 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "Always pass `--project <target-workspace>` explicitly",
   ];
   const rootReadmeRequired = [
-    "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
-    "marketplace display/name concept is `TheGreenCedar`",
-    "plugin source at `https://github.com/TheGreenCedar/CodeStory.git`",
-    "source path `plugins/codestory`",
-    "The CodeStory repo does not contain the marketplace catalog",
-    "add or refresh this marketplace first",
-    "The plugin launches `codestory-cli serve --stdio --refresh none` directly",
-    "The skill owns binary setup",
-    "the skill tells the human that a Codex host/app restart may be needed",
-    "before a fresh agent thread can see it",
+    "Marketplace catalog details, binary",
+    "[plugin README](plugins/codestory/README.md)",
+    "`codestory-cli serve --stdio --refresh none`",
   ];
 
   for (const text of [readme, skill]) {
