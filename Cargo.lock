@@ -455,7 +455,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "codestory-bench"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-cli"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-contracts"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-indexer"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-retrieval"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-runtime"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-store"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-workspace"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "anyhow",
  "codestory-contracts",

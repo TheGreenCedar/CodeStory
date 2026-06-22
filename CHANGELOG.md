@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.11.7
+
+CodeStory 0.11.7 closes the product-grade intelligence saga with the final
+post-release polish from `dev/codestory-next` promoted to `main`.
+
+The docs now describe the plugin path as an agent plugin backed by the local
+`codestory-cli serve --stdio --refresh none` surface, while keeping
+Codex-specific installation wording in the Codex plugin flow. The stdio/MCP
+initialize response now reports the crate package version instead of the old
+hard-coded `0.1.0`, and the protocol contract covers both version fields.
+
+Supporting PRs: #389, #390. This release does not add a wrapper layer, move the
+marketplace catalog into CodeStory, claim new sidecar performance, or broaden
+packet/search readiness beyond the existing sidecar evidence gates.
+
 ## 0.11.6
 
 CodeStory 0.11.6 promotes the reviewed `dev/codestory-next` release delta onto

@@ -6,14 +6,14 @@ last turn. CodeStory indexes once and serves evidence from that map so the agent
 can answer from citations instead of re-exploring the tree.
 
 Start with the human task, then run the smallest path that proves the state you
-need. The plugin is the normal path. The CLI is for setup, repair, debugging,
-and transcripts.
+need. The agent plugin is the normal path. The CLI is for setup, repair,
+debugging, transcripts, and direct stdio integration.
 
 ## Operator Journey
 
 | Stage | Human action | Agent/CLI action | Trust check |
 | --- | --- | --- | --- |
-| Install | Install the `codestory` plugin from `TheGreenCedar`. | Plugin starts `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
+| Install | Install the `codestory` agent plugin from `TheGreenCedar`. | Plugin starts `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
 | First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | `local_navigation` is ready before using local graph output. |
 | Source work | Ask for a plan, review, or code path. | Use `files`, `symbol`, `trail`, `snippet`, `context`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
 | Broad discovery | Ask a repo-wide question. | Use `packet` or `search`. | Trust only when `agent_packet_search` is ready and `retrieval_mode=full`. |
@@ -76,7 +76,7 @@ Install the CodeStory plugin once, then start a fresh agent thread for the
 workspace you want to ground. The canonical skill package lives at
 [../plugins/codestory/skills/codestory-grounding/SKILL.md](../plugins/codestory/skills/codestory-grounding/SKILL.md).
 
-**Plugin installation flow:**
+**Codex plugin installation flow:**
 
 1. Open Codex in the repository you want to ground
 2. Run `/plugins` and install **TheGreenCedar → codestory**
