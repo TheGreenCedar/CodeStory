@@ -322,8 +322,15 @@ function Remove-SetupSelfTestTemp {
 
 function Invoke-SelfTest {
     $oldCodeStoryHome = $env:CODESTORY_HOME
+    $oldCodeStoryCli = $env:CODESTORY_CLI
+    $oldPath = $env:PATH
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-setup-" + [System.Guid]::NewGuid().ToString("N"))
     try {
+        $isolatedPath = Join-Path $tempRoot "path"
+        New-Item -ItemType Directory -Force -Path $isolatedPath | Out-Null
+        $env:CODESTORY_CLI = $null
+        $env:PATH = $isolatedPath
+
         $projectRoot = Join-Path $tempRoot "project"
         $manifestDir = Join-Path $projectRoot "crates\codestory-cli"
         New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
@@ -341,6 +348,8 @@ function Invoke-SelfTest {
         Assert-SelfTest (Same-Path $resolvedCli $currentCli) "stale default install should be rejected and versioned current install should be used"
     } finally {
         $env:CODESTORY_HOME = $oldCodeStoryHome
+        $env:CODESTORY_CLI = $oldCodeStoryCli
+        $env:PATH = $oldPath
         Remove-SetupSelfTestTemp $tempRoot
     }
 
