@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { access, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -69,6 +71,7 @@ test("codestory repo ships plugin source, not marketplace catalog or adapter run
   await assert.rejects(
     access(join(pluginRoot, "scripts", "codestory-mcp.mjs")),
   );
+  await access(join(pluginRoot, "scripts", "check-runtime.mjs"));
 });
 
 test("plugin docs are agent-first, marketplace-aware, and latest-release aware", async () => {
@@ -148,6 +151,9 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "https://github.com/TheGreenCedar/CodeStory.git",
     "plugins/codestory",
     "codestory-cli serve --stdio --refresh none",
+    "node plugins/codestory/scripts/check-runtime.mjs",
+    "stop existing `codestory-cli serve --stdio --refresh none` processes",
+    "put that directory before older `codestory-cli` entries on `PATH`",
   ];
   const skillRequired = [
     "download and unpack only",
@@ -155,6 +161,10 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "not as the installed MCP launch path",
     "plugin MCP process may need",
     "Codex host/app restart before a new agent thread",
+    "node plugins/codestory/scripts/check-runtime.mjs",
+    "stop existing",
+    "codestory-cli serve --stdio --refresh none",
+    "earlier `PATH` directory",
     "new agent thread",
     "Read `codestory://grounding`",
     "Always pass `--project <target-workspace>` explicitly",
@@ -200,6 +210,41 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
   for (const phrase of skillRequired) {
     assert.equal(skill.includes(phrase), true, phrase);
   }
+});
+
+test("runtime preflight rejects stale codestory-cli on PATH", async () => {
+  const tempRoot = join(tmpdir(), "codestory-plugin-static-stale-runtime");
+  await rm(tempRoot, { recursive: true, force: true });
+  await mkdir(tempRoot, { recursive: true });
+
+  const command =
+    process.platform === "win32"
+      ? join(tempRoot, "codestory-cli.cmd")
+      : join(tempRoot, "codestory-cli");
+  const script =
+    process.platform === "win32"
+      ? "@echo off\r\necho codestory-cli 0.0.1\r\n"
+      : "#!/bin/sh\necho codestory-cli 0.0.1\n";
+  await writeFile(command, script, { mode: 0o755 });
+
+  const result = spawnSync(
+    process.execPath,
+    [join(pluginRoot, "scripts", "check-runtime.mjs")],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: tempRoot + delimiter + process.env.PATH,
+        PATHEXT: ".CMD;.EXE;.BAT;.COM",
+      },
+    },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /plugin package expects/u);
+  assert.match(result.stderr, /serve --stdio --refresh none/u);
+  assert.match(result.stderr, /older codestory-cli entries on PATH/u);
 });
 
 test("canonical grounding skill ships with plugin references", async () => {

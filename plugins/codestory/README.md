@@ -77,6 +77,20 @@ unavailable.
 Start a new Codex thread after installation or refresh. The installed package
 launches `codestory-cli serve --stdio --refresh none` from `PATH`.
 
+Before starting that fresh thread, run the runtime preflight from this plugin
+package:
+
+```console
+node plugins/codestory/scripts/check-runtime.mjs
+```
+
+It checks the `codestory-cli` resolved from `PATH` against the plugin package
+version. If it fails, install the matching release asset into a stable user bin
+directory, put that directory before older `codestory-cli` entries on `PATH`,
+stop existing `codestory-cli serve --stdio --refresh none` processes before
+replacing a locked binary, restart the Codex host/app if `PATH` changed, and
+then start a fresh thread.
+
 ### After install
 
 Open Codex in the repo you want to ground and ask the agent to check readiness
@@ -174,6 +188,17 @@ The plugin does not bundle the binary. The agent-owned skill verifies
 `codestory-cli --version`, compares it with the latest GitHub release, installs
 the matching release asset when practical, and checks `SHA256SUMS.txt` when the
 host can. If `PATH` changed, the skill tells the human that a Codex host/app restart may be needed before a fresh agent thread can see it.
+
+For installed MCP runtime, the host-safe preflight is:
+
+```console
+node plugins/codestory/scripts/check-runtime.mjs
+```
+
+Use the same repair rule on failure: install the matching release asset earlier
+on `PATH`, stop locked `codestory-cli serve --stdio --refresh none` processes
+before replacing an older binary, restart the Codex host/app if needed, and only
+then launch a fresh plugin thread.
 
 Use source fallback only when no release asset fits the host:
 

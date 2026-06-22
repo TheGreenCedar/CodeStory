@@ -32,6 +32,9 @@ tool source unless the user is editing CodeStory itself.
 2. For installed plugin MCP runtime, `.mcp.json` launches `codestory-cli` from
    the agent host `PATH`. Use `CODESTORY_CLI` only for manual CLI/source
    fallback commands, not as the installed MCP launch path.
+   When the plugin package source is available, run
+   `node plugins/codestory/scripts/check-runtime.mjs` before MCP launch to
+   confirm the `PATH` runtime matches the plugin package version.
 3. Resolve `<codestory-cli>` for explicit CLI commands:
    - prefer `CODESTORY_CLI` when set;
    - otherwise use `codestory-cli` on `PATH`;
@@ -54,6 +57,9 @@ tool source unless the user is editing CodeStory itself.
 6. Put the binary in a stable user bin directory, verify
    `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
    same release when the host has the tools. If `PATH` changed, say the plugin MCP process may need a Codex host/app restart before a new agent thread can see it.
+   If an older binary is locked, stop existing
+   `codestory-cli serve --stdio --refresh none` processes before replacing it,
+   or install the matching release asset in an earlier `PATH` directory.
 7. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 
