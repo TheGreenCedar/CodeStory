@@ -27,7 +27,10 @@ Per-task medians, ranges, reproduction commands, and boundary notes:
 
 ## Quick start
 
-The normal path is the **Codex plugin**. The CLI and MCP server are for setup, repair, and transcripts.
+The normal path is an **agent plugin** backed by the local stdio server. The
+CLI is for setup, repair, debugging, and transcripts.
+
+For Codex:
 
 1. Open Codex in the repository you want to ground.
 2. Run `/plugins`, then install **TheGreenCedar → codestory**.
@@ -37,7 +40,10 @@ The normal path is the **Codex plugin**. The CLI and MCP server are for setup, r
 @CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
 ```
 
-The plugin launches `codestory-cli serve --stdio --refresh none` on your machine. It does not edit your repository. Install details, binary bootstrap, and uninstall notes live in the [plugin README](plugins/codestory/README.md).
+The plugin launches `codestory-cli serve --stdio --refresh none` on your
+machine. It does not edit your repository. Other local MCP-style clients can
+run the same stdio surface directly. Install details, binary bootstrap, and
+uninstall notes live in the [plugin README](plugins/codestory/README.md).
 
 **Verify without the agent:**
 
