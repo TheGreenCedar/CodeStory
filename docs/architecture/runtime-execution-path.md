@@ -63,7 +63,7 @@ sequenceDiagram
     participant Graph as runtime graph builders
 
     CLI->>Runtime: concrete target request
-    Runtime->>Retrieval: validate full sidecar status and resolve target
+    Runtime->>Retrieval: record retrieval state for target context
     Runtime->>Graph: neighborhood, trail, snippets, citations
     Runtime-->>CLI: context packet with trace and evidence
     CLI->>CLI: render markdown/json and optional bundle
@@ -71,13 +71,12 @@ sequenceDiagram
 
 `context` is target-first. The CLI resolves `--id`, `--query`, or `--bookmark`
 to one concrete target. Query target selection may use read-only indexed-symbol
-resolution to choose that target, but context answer/evidence retrieval still
-fails closed unless strict sidecar status reports `retrieval_mode = full`.
+resolution to choose that target; it is not broad packet/search discovery.
 Runtime then builds the deep evidence packet from graph neighborhoods, trails,
 snippets, and citations. It is not a question-answering command and does not
-interpret broad natural-language prompts. Repo-text or hybrid state can guide
-diagnostics, but `retrieval_mode = full` sidecar evidence is the only
-product-serving retrieval state.
+interpret broad natural-language prompts. Use `packet` or `search` for broad
+sidecar-backed discovery, and treat non-`full` packet/search retrieval as a
+navigation hint until repaired.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 

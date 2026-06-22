@@ -63,7 +63,7 @@ explicit ref, setup fetches and builds the remote default branch.
 | Built by | `index` | `index`, then `retrieval index` |
 | Requires | Healthy SQLite cache and graph | Healthy sidecars and `retrieval_mode=full` |
 | Good for | Known files, symbols, trails, snippets, changed-file impact | Broad candidate discovery and bounded task packets |
-| Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `context --id`, `affected` | `packet`, `search`, broad `context --query` discovery |
+| Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `context --id`, `context --query <exact target>`, `affected` | `packet`, `search` |
 | Does not prove | Broad sidecar search is ready | That cache-only browsing is enough for broad agent search |
 
 Sidecar topology:
@@ -103,7 +103,7 @@ codestory-cli search --project <target-workspace> --query "<symbol/file/literal/
 ```
 
 Trust the result only when retrieval status reports `retrieval_mode: "full"`.
-If `packet`, `search`, or broad `context --query` reports
+If `packet` or `search` reports
 `retrieval_unavailable`, degraded retrieval, or a non-`full` mode, use the
 output only as a navigation hint and repair the sidecar lane before treating it
 as evidence.
@@ -204,7 +204,7 @@ variables such as `CODESTORY_SUMMARY_ENDPOINT`, `CODESTORY_SUMMARY_MODEL`, or
 | `files` | Indexed file inventory, language counts, roles, and coverage notes. |
 | `symbol`, `trail`, `snippet`, `context --id` | Exact-target source inspection once you have a node id. |
 | `affected` | Changed-file impact hints for review planning. |
-| `packet`, `search`, `context --query` | Broad sidecar-backed discovery; trust only with `retrieval_mode=full`. |
+| `packet`, `search` | Broad sidecar-backed discovery; trust only with `retrieval_mode=full`. |
 | `retrieval bootstrap`, `retrieval index`, `retrieval status` | Sidecar setup, indexing, and readiness checks. |
 | `serve --stdio` | Persistent local read surface for repeated agent queries. |
 | `generate-completions` | Shell completions from the command model. |

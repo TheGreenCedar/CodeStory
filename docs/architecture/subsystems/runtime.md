@@ -47,11 +47,13 @@ Important tuning surfaces:
 - `CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT`: local llama.cpp request concurrency, clamped from `1` to `16`.
 - `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`: semantic doc embedding batch size, default `128`.
 
-Product packet/search evidence is served through mandatory sidecars. The
-manifest must record `llamacpp:bge-base-en-v1.5` and live health must report
-`retrieval_mode=full`. ONNX, hash, and in-process embedding paths are historical
-or diagnostic research lanes unless a future spec promotes them with fresh
-sidecar-quality evidence. Current benchmark findings live in
+Product packet/search evidence is served through mandatory sidecars. The live
+query sidecar must use `llamacpp:bge-base-en-v1.5`, and health must report
+`retrieval_mode=full`. Stored product-compatible BGE-base dense docs may have
+ONNX or llama.cpp producer metadata when the dimension/backend contract matches
+the retrieval manifest; hash and other in-process embedding paths remain
+diagnostic unless a future spec promotes them with fresh sidecar-quality
+evidence. Current benchmark findings live in
 [embedding-backend-benchmarks.md](../../testing/embedding-backend-benchmarks.md).
 
 The CLI owns managed embedding setup. `codestory-cli retrieval bootstrap` starts

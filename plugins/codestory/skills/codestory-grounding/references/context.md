@@ -1,6 +1,6 @@
 # `context` - Target Context For One Concrete Target
 
-Builds DB-first target context around one concrete retrieval target. This is not a question-answering or chat command: it does not interpret natural-language questions. Use `packet` for broad task questions, `search` for candidate discovery, and `drill` for repeatable investigation reports.
+Builds DB-first target context around one concrete retrieval target. This is not a question-answering or chat command: it does not interpret natural-language questions, and `--query` must name a concrete symbol, file, literal, API path, module, or behavior term. Use `packet` for broad task questions, `search` for candidate discovery, and `drill` for repeatable investigation reports.
 
 ## Usage
 
@@ -34,6 +34,6 @@ Builds DB-first target context around one concrete retrieval target. This is not
 
 ## Notes
 
-- Do not pass broad questions to `context`. Use `packet --question` for broad task questions, `search --repo-text on --why` for candidate discovery, `drill` for deterministic reports, and then `context --id <node_id>` for selected anchors.
+- Do not pass broad questions to `context`. Use `packet --question` for broad task questions, `search --why` for candidate discovery, `drill` for deterministic reports, and then `context --id <node_id>` for selected anchors.
 - Good `--query` values are symbol names, file names, string literals, API paths, module names, and specific behavior terms.
 - Treat `context` output as incomplete when it reports weak hits, semantic stale/partial/failed states, missing snippets, no citations, or unresolved graph edges.

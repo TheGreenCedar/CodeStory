@@ -16,20 +16,23 @@ packet, and search. The CLI is still there, but it is the escape hatch and repai
 | What should I do next? | `codestory://agent-guide` | Let the skill route normal setup and repair. |
 | Give me a compact repo map. | `codestory://grounding` | Start from current local files. |
 | Inspect indexed file inventory and coverage. | `files` tool | Use for scope, language mix, and missing coverage. |
+| Map changed files to likely impact. | `affected` tool | Use for review planning and focused test choice. |
 | Find candidate symbols, paths, or behavior terms. | `search` tool, only with full sidecars | Navigation only unless packet/search is full. |
 | Answer a broad repo question with evidence. | `packet` tool, only with full sidecars | Proof only when strict sidecars are ready. |
 | Follow a concrete target. | `symbol`, `trail`, `references`, `snippet`, `context` | Source anchors still matter. |
 
 The status resource is the contract. Local navigation is ready only when
-`local_navigation` is ready. Agent packet/search is ready only when strict
-sidecar status reports `retrieval_mode=full`.
+`local_navigation` is ready. Agent packet/search is eligible only when strict
+sidecar status reports `retrieval_mode=full`; answer quality still needs the
+matching packet-runtime, drill, or benchmark proof.
 
 ## How It Runs
 
 This package stays thin:
 
 - `.codex-plugin/plugin.json` describes the Codex plugin package.
-- `.mcp.json` launches `codestory-cli serve --stdio --refresh none` directly.
+- `.mcp.json` launches `codestory-cli serve --stdio --refresh none` from the
+  agent host `PATH`.
 - `skills/codestory-grounding` is the single canonical CodeStory grounding
   skill shipped by this repository.
 
@@ -67,7 +70,7 @@ rather than the terminal. Use the UI path when the CLI marketplace command is
 unavailable.
 
 Start a new Codex thread after installation or refresh. The installed package
-launches `codestory-cli serve --stdio --refresh none` directly.
+launches `codestory-cli serve --stdio --refresh none` from `PATH`.
 
 ### After install
 
@@ -134,8 +137,9 @@ Use source fallback only when no release asset fits the host:
 cargo build --release -p codestory-cli
 ```
 
-Then put `target/release` on the agent host `PATH`, or set `CODESTORY_CLI` for
-manual CLI fallback commands.
+Then put `target/release` on the agent host `PATH` for installed MCP runtime
+use. Set `CODESTORY_CLI` only for manual CLI fallback commands or source-build
+debugging; `.mcp.json` does not launch through that variable.
 
 Source docs, marketplace source checkout/cache, and the active installed MCP
 runtime can differ. Before claiming an installed behavior is live, verify the
@@ -182,7 +186,10 @@ The marketplace catalog is external. One marketplace can list multiple plugins.
 ## Review Checks
 
 ```powershell
-python C:\Users\alber\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py plugins\codestory
+python <path-to-plugin-creator>\scripts\validate_plugin.py plugins\codestory
 node --test plugins\codestory\tests\plugin-static.test.mjs
 git diff --check
 ```
+
+The plugin validator path is maintainer-local. The committed repo check for
+plugin docs/static contracts is the Node test above.

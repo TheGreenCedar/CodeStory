@@ -85,7 +85,7 @@ rather than the general CLI architecture page.
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 
-`context` is target context: DB-first evidence for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. It is not a natural-language question-answering surface and is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
+`context` is target context: DB-first evidence for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. `--query` must identify a concrete target, not a broad natural-language question. It is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
 `doctor` is a read-only health report for project path resolution, cache
 presence, index counts, retrieval state, managed embedding setup, relevant
@@ -111,7 +111,7 @@ not expose ranking knobs for product search/context calls.
 
 HTTP serving keeps the current small GET/query-string shape. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
 
-`serve --stdio` is MCP-style JSON lines. It exposes tools for ground, files, packet, search, context, symbol, trail, definition, references, symbols, snippet, and warm graph primitives (`get_node`, `neighbors`, `shortest_path`, and `query_subgraph`); resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
+`serve --stdio` is MCP-style JSON lines. It exposes tools for ground, files, affected, packet, search, context, symbol, trail, definition, references, symbols, snippet, and warm graph primitives (`get_node`, `neighbors`, `shortest_path`, and `query_subgraph`); resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
 
 The warm graph primitives are intentionally narrower than `packet`. They resolve exact node ids or bounded local graph neighborhoods before an agent asks for a broad evidence packet. Their responses include stable node ids, project-relative file refs when available, certainty metadata, count/truncation fields, and explicit result limits. `packet` remains the broad task tool with sufficiency, citations, retrieval traces, and budget accounting.
 
