@@ -11,7 +11,7 @@ path, repair path, architecture, verification, and research evidence.
 
 | Reader job | Canonical doc | Use it to decide | Trust boundary |
 | --- | --- | --- | --- |
-| Operator using an agent | [Usage](usage.md) | How to install, ground a repo, and keep the plugin-first path straight. | The plugin is the normal path; the CLI is for setup, repair, debugging, and transcripts. |
+| Operator using an agent | [Usage](usage.md) | How to install, ground a repo, and keep the plugin-first path straight. | The agent plugin is the normal path; the CLI is for setup, repair, debugging, and transcripts. |
 | Maintainer debugging readiness | [Retrieval sidecars operations](ops/retrieval-sidecars.md) | How to repair local navigation versus packet/search readiness. | Packet/search is proof-bearing only when `retrieval_mode` is `full`. |
 | Contributor changing code | [Contributor setup](contributors/getting-started.md) | Which crate owns the change and which verification lane is enough. | Pick the smallest lane that covers the behavior; run Cargo checks serially. |
 | Reviewer verifying claims | [Testing matrix](contributors/testing-matrix.md) | Which command or evidence tier supports a PR claim. | Logs and benchmark pages are evidence records or playbooks, not product promises by themselves. |
