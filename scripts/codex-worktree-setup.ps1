@@ -164,6 +164,16 @@ function Get-ExpectedCodeStoryCliVersion {
     throw "Unable to read expected codestory-cli version from $manifest."
 }
 
+function Get-CodeStoryInstallDir {
+    if ($env:CODESTORY_HOME) {
+        return (Join-Path $env:CODESTORY_HOME "bin")
+    }
+    if ($env:LOCALAPPDATA) {
+        return (Join-Path $env:LOCALAPPDATA "CodeStory\bin")
+    }
+    return (Join-Path $HOME ".codestory\bin")
+}
+
 function Get-CodeStoryCliCandidates {
     param([string]$Root)
 
@@ -176,6 +186,13 @@ function Get-CodeStoryCliCandidates {
     if ($pathCli) {
         $candidates += $pathCli.Source
     }
+
+    $installDir = Get-CodeStoryInstallDir
+    $candidates += @(
+        (Join-Path $installDir "codestory-cli.exe"),
+        (Join-Path $installDir "codestory-cli.cmd"),
+        (Join-Path $installDir "codestory-cli")
+    )
 
     $candidates += @(
         (Join-Path $Root "target\release\codestory-cli.exe"),
@@ -225,6 +242,23 @@ function Find-CodeStoryCli {
         $message += " Stale candidates: $($staleCandidates -join '; ')."
     }
     throw $message
+}
+
+function Invoke-CurrentReleaseCliInstall {
+    param(
+        [string]$Root,
+        [string]$ExpectedVersion
+    )
+
+    $installer = Join-Path $PSScriptRoot "install-codestory.ps1"
+    if (-not (Test-Path -LiteralPath $installer)) {
+        throw "Current-release installer is missing: $installer"
+    }
+
+    Write-Host ""
+    Write-Host "==> Install current release CLI"
+    Write-Host "Trying codestory-cli $ExpectedVersion release install before Cargo build."
+    & $installer -Project $Root -Version $ExpectedVersion
 }
 
 function Same-Path {
@@ -288,14 +322,23 @@ try {
     try {
         $cli = Find-CodeStoryCli $projectPath
     } catch {
-        if ($ResolveCliOnly) {
-            throw "$($_.Exception.Message) Re-run without -ResolveCliOnly to build with cargo, or set CODESTORY_CLI to a ready binary."
+        $resolveError = $_.Exception.Message
+        $expectedVersion = Get-ExpectedCodeStoryCliVersion $projectPath
+        try {
+            Invoke-CurrentReleaseCliInstall $projectPath $expectedVersion
+            $cli = Find-CodeStoryCli $projectPath
+        } catch {
+            $installError = $_.Exception.Message
+            $installCommand = ".\scripts\install-codestory.ps1 -Project . -Version $expectedVersion"
+            if ($ResolveCliOnly) {
+                throw "$resolveError Current-release install failed: $installError. Run $installCommand, or set CODESTORY_CLI to a ready binary."
+            }
+            Write-Host ""
+            Write-Host "==> Build release CLI"
+            Write-Warning "$resolveError Current-release install failed: $installError. Building release CLI with cargo."
+            Invoke-Checked "cargo" @("build", "--release", "-p", "codestory-cli")
+            $cli = Find-CodeStoryCli $projectPath
         }
-        Write-Host ""
-        Write-Host "==> Build release CLI"
-        Write-Warning "$($_.Exception.Message) Building release CLI with cargo."
-        Invoke-Checked "cargo" @("build", "--release", "-p", "codestory-cli")
-        $cli = Find-CodeStoryCli $projectPath
     }
 
     Write-Host "CODESTORY_CLI=$cli"

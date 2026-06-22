@@ -450,22 +450,22 @@ function Assert-SelfTest {
 }
 
 function Invoke-SelfTest {
-    Set-RequiredVersion "v0.11.3"
+    Set-RequiredVersion "v0.11.4"
     Test-WindowsX64 | Out-Null
     Assert-SelfTest (Test-PathListContains "C:\Tools;C:\CodeStory\bin\" "C:\CodeStory\bin") "path-list check should ignore trailing slash"
     Assert-SelfTest (-not (Test-PathListContains "C:\Tools" "C:\CodeStory\bin")) "path-list check should reject missing directory"
-    Assert-SelfTest ((Convert-ReleaseTagToVersion "v0.11.3") -eq "0.11.3") "release tag parser should strip v prefix"
-    $parsedVersion = Convert-VersionText "codestory-cli 0.11.3"
+    Assert-SelfTest ((Convert-ReleaseTagToVersion "v0.11.4") -eq "0.11.4") "release tag parser should strip v prefix"
+    $parsedVersion = Convert-VersionText "codestory-cli 0.11.4"
     Assert-SelfTest (Test-RequiredVersion $parsedVersion) "version gate should accept current release"
-    Assert-SelfTest (-not (Test-RequiredVersion ([Version]"0.11.2"))) "version gate should reject stale 0.11.2"
+    Assert-SelfTest (-not (Test-RequiredVersion ([Version]"0.11.3"))) "version gate should reject stale 0.11.3"
 
     $explicitStale = $false
     try {
         $staleCli = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-stale-" + [System.Guid]::NewGuid().ToString("N") + ".cmd")
-        Set-Content -LiteralPath $staleCli -Value "@echo codestory-cli 0.11.2" -Encoding ASCII
+        Set-Content -LiteralPath $staleCli -Value "@echo codestory-cli 0.11.3" -Encoding ASCII
         Find-ExistingCli $staleCli $null | Out-Null
     } catch {
-        $explicitStale = $_.Exception.Message -match "requires 0.11.3"
+        $explicitStale = $_.Exception.Message -match "requires 0.11.4"
     } finally {
         if ($staleCli -and (Test-Path -LiteralPath $staleCli)) {
             Remove-Item -LiteralPath $staleCli -Force
@@ -475,9 +475,9 @@ function Invoke-SelfTest {
 
     try {
         $currentCli = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-current-" + [System.Guid]::NewGuid().ToString("N") + ".cmd")
-        Set-Content -LiteralPath $currentCli -Value "@echo codestory-cli 0.11.3" -Encoding ASCII
+        Set-Content -LiteralPath $currentCli -Value "@echo codestory-cli 0.11.4" -Encoding ASCII
         $current = Find-ExistingCli $currentCli $null
-        Assert-SelfTest ($current.Version -eq [Version]"0.11.3") "explicit current codestory-cli override should be accepted"
+        Assert-SelfTest ($current.Version -eq [Version]"0.11.4") "explicit current codestory-cli override should be accepted"
     } finally {
         if ($currentCli -and (Test-Path -LiteralPath $currentCli)) {
             Remove-Item -LiteralPath $currentCli -Force
