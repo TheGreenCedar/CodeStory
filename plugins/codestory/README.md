@@ -63,7 +63,7 @@ If your Codex build exposes terminal marketplace management for source
 marketplaces, add or refresh this marketplace first:
 
 ```bash
-codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace
+codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace --ref main
 ```
 
 The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`; its
@@ -209,9 +209,12 @@ If your Codex build exposes terminal marketplace management for source
 marketplaces, these commands may be available:
 
 ```bash
+codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace --ref main
 codex plugin marketplace upgrade TheGreenCedar
 codex plugin marketplace remove TheGreenCedar
 ```
+
+If TheGreenCedar was added from a local path, remove it and add the Git marketplace source again before using upgrade.
 
 `marketplace remove` removes the source marketplace registration. It may not
 uninstall an already installed workspace plugin. Prefer the plugin UI for
