@@ -157,6 +157,11 @@ codestory-cli retrieval status --project <repo> --format json
 codestory-cli serve --project <repo> --stdio --refresh none
 ```
 
+If `@CodeStory` loads the skill but no `mcp__codestory` tools or
+`codestory://status` resource are exposed, treat that as plugin MCP registration
+failure. The CLI can collect health evidence, but it does not prove the installed
+MCP surface is live.
+
 Packet/search evidence needs sidecars:
 
 ```console
