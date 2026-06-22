@@ -1237,6 +1237,9 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
 fn run_ready(cmd: ReadyCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ready")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    if cmd.repair && matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
+        managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+    }
     let runtime = if cmd.repair {
         RuntimeContext::new(&cmd.project)?
     } else {
