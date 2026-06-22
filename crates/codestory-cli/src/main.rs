@@ -1237,7 +1237,14 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
 fn run_ready(cmd: ReadyCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ready")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let runtime = if cmd.repair {
+        RuntimeContext::new(&cmd.project)?
+    } else {
+        RuntimeContext::new_inspect_only(&cmd.project)?
+    };
+    if cmd.repair {
+        repair_ready_state(&runtime, cmd.goal)?;
+    }
     let summary = runtime.open_project_summary()?;
     let sidecar = doctor_sidecar_status(&runtime);
     let mut verdicts = build_summary_readiness(
@@ -1253,6 +1260,43 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     let output = ReadyOutput { verdicts };
     let markdown = render_ready_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -> Result<()> {
+    let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
+    ensure_index_ready(&opened, "ready repair")?;
+    if !matches!(goal, None | Some(args::ReadyGoal::Agent)) {
+        return Ok(());
+    }
+
+    let storage_scope = codestory_retrieval::BootstrapStorageScope::from_parts(
+        Some(runtime.project_root.as_path()),
+        Some(runtime.storage_path.as_path()),
+        Some(runtime.cache_root.as_path()),
+    );
+    codestory_retrieval::bootstrap_sidecars(
+        Some(runtime.project_root.as_path()),
+        &storage_scope,
+        None,
+        false,
+        Duration::from_secs(90),
+    )
+    .context("ready repair retrieval bootstrap")?;
+    codestory_retrieval::repair_project_qdrant_collection(
+        &runtime.project_root,
+        &runtime.storage_path,
+    )
+    .context("ready repair project qdrant repair")?;
+    runtime
+        .index
+        .run_indexing_blocking(IndexMode::Full)
+        .map_err(map_api_error)
+        .context("ready repair retrieval index refresh")?;
+    retrieval::finalize_retrieval_index_for_runtime(runtime)
+        .context("ready repair retrieval index finalize")?;
+    codestory_retrieval::strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
+        .context("ready repair final retrieval status")?;
+    Ok(())
 }
 
 fn run_search(cmd: SearchCommand) -> Result<()> {
