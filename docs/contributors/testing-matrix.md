@@ -109,12 +109,14 @@ node scripts/codestory-agent-ab-benchmark.mjs \
   --codestory-cli ./target/release/codestory-cli \
   --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes \
   --timeout-ms 180000 \
+  --max-source-reads-after-packet 0 \
   --publishable
 ```
 
 The packet-runtime artifact bundle must cover cold and warm modes, three repeats, row
 concurrency `--jobs 4`, prepared sidecars, full sidecar provenance, no
-`--allow-failures`, no quality misses, no sufficiency gaps, and no SLA misses.
+`--allow-failures`, no quality misses, no sufficiency gaps, no post-packet
+source reads for packet-only promotion, and no SLA misses.
 Keep `--prepare-codestory-jobs` lower or capped; examples use `2` unless the
 prep lane is intentionally serial.
 
@@ -182,7 +184,7 @@ Release-readiness evidence is tiered:
 | Stats-only / degraded sidecar | Diagnostic timing or contract evidence without prepared full sidecars, or stats output whose `proof_tier` is `stats_only` | Useful local regression signal only; not release proof for packet/search readiness. The current passing `codestory_repo_release_e2e_emits_stats` harness asserts full sidecar status instead of completing as a passing no-full-sidecar row. |
 | Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after local Zoekt, SCIP, and required dense-anchor Qdrant/llama.cpp are prepared; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` with current symbol-doc and dense-anchor manifest fields; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
 | Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
-| Promotion-grade benchmark | Full holdout packet-runtime rows cover cold and warm modes with three repeats, `--jobs 4`, prepared sidecars, `--publishable`, no `--allow-failures`, full sidecar provenance, no quality misses, no sufficiency gaps, and no SLA misses. Fixed-baseline A/B rows are supporting diagnostics only unless fingerprint-compatible. | Required for performance or retrieval-quality promotion claims. |
+| Promotion-grade benchmark | Full holdout packet-runtime rows cover cold and warm modes with three repeats, `--jobs 4`, prepared sidecars, `--publishable`, explicit `--max-source-reads-after-packet 0`, no `--allow-failures`, full sidecar provenance, no quality misses, no sufficiency gaps, and no SLA misses. Fixed-baseline A/B rows are supporting diagnostics only unless fingerprint-compatible. | Required for performance or retrieval-quality promotion claims. |
 
 When logging release evidence, state the highest tier reached and the exact
 skip env vars used. The stats JSON reports `proof_tier` as the highest tier

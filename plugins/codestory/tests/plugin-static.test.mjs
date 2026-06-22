@@ -60,6 +60,7 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "codestory://status",
     "codestory://grounding",
     "Inspect indexed file inventory and coverage.",
+    "Map changed files to likely impact.",
     "For normal Codex use, install the plugin through the Codex plugin flow for your",
     "/plugins",
     "TheGreenCedar -> codestory -> Install plugin",
@@ -83,6 +84,11 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "Use source fallback only when no release asset fits the host",
     "Source docs, marketplace source checkout/cache, and the active installed MCP",
     "active runtime surface",
+    "agent host `PATH`",
+    "Set `CODESTORY_CLI` only for manual CLI fallback commands",
+    ".mcp.json` does not launch through that variable",
+    "python <path-to-plugin-creator>\\scripts\\validate_plugin.py plugins\\codestory",
+    "The plugin validator path is maintainer-local",
     "For normal Codex use, refresh or uninstall the plugin from the Codex plugin",
     "codex plugin marketplace upgrade TheGreenCedar",
     "codex plugin marketplace remove TheGreenCedar",
@@ -98,6 +104,8 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
   ];
   const skillRequired = [
     "download and unpack only",
+    "Use `CODESTORY_CLI` only for manual CLI/source",
+    "not as the installed MCP launch path",
     "plugin MCP process may need",
     "Codex host/app restart before a new agent thread",
     "new agent thread",
@@ -124,6 +132,11 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
   for (const phrase of forbidden) {
     assert.equal(rootReadme.includes(phrase), false, phrase);
   }
+  assert.equal(
+    readme.includes("C:\\Users\\alber"),
+    false,
+    "public plugin README must not contain maintainer workstation paths",
+  );
   for (const pattern of forbiddenPatterns) {
     assert.equal(pattern.test(rootReadme), false, String(pattern));
   }

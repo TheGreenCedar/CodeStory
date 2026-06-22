@@ -10,10 +10,11 @@ with `retrieval_mode=full`.
   answers smoke queries against source files plus generated graph-native symbol
   docs and component-report virtual docs.
 - Qdrant collection exists, has at least the manifest dense-anchor projection
-  count, uses the product llama.cpp `bge-base-en-v1.5` embedding backend, and
-  answers semantic smoke queries when the active semantic policy selects one or
-  more dense anchors. If the active policy selects zero dense anchors, Qdrant is
-  explicitly not required for that generation.
+  count, matches the product-compatible BGE-base embedding contract, and answers
+  semantic smoke queries from the live llama.cpp sidecar when the active
+  semantic policy selects one or more dense anchors. If the active policy
+  selects zero dense anchors, Qdrant is explicitly not required for that
+  generation.
 - SCIP graph artifacts exist and are not stub markers.
 - The SQLite `retrieval_index_manifest` has the current schema version,
   sidecar input hash, sidecar generation, Qdrant collection, embedding backend,

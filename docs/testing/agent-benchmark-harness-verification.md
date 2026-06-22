@@ -65,6 +65,7 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --codestory-cli target/release/codestory-cli.exe `
   --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes `
   --timeout-ms 180000 `
+  --max-source-reads-after-packet 0 `
   --publishable
 ```
 
@@ -171,6 +172,7 @@ node scripts\codestory-agent-ab-benchmark.mjs `
   --codestory-cli target\release\codestory-cli.exe `
   --out-dir target\agent-benchmark\<run-name> `
   --timeout-ms 180000 `
+  --max-source-reads-after-packet 0 `
   --publishable
 ```
 
