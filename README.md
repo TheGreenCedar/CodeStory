@@ -7,6 +7,24 @@
 
 CodeStory indexes your repository once and keeps a local, read-only map ready: files, symbols, call paths, snippets, and bounded answer packets with citations. The agent starts from evidence it can cite instead of re-exploring the tree from scratch.
 
+## With vs without CodeStory
+
+### Language expansion holdout (18 tasks)
+
+Broader public-repo evidence uses the
+[`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json)
+manifest across 18 pinned OSS packages. Latest recorded suite totals:
+
+| Metric | Without | With | Change |
+| --- | ---: | ---: | --- |
+| Context tokens | 9,692,559 | 5,514,580 | −43% |
+| Repeat-task wall time | 7,943s | 4,343s | −45% |
+| Tool calls | 475 | 60 | −87% |
+| Direct source reads | 417 | 0 | −100% |
+
+Per-task medians, ranges, reproduction commands, and boundary notes:
+[language-expansion holdout stats](docs/testing/language-expansion-holdout-stats.md).
+
 ## Quick start
 
 The normal path is the **Codex plugin**. The CLI and MCP server are for setup, repair, and transcripts.
@@ -103,24 +121,6 @@ cargo build --release -p codestory-cli
 ```
 
 On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
-
-## With vs without CodeStory
-
-### Language expansion holdout (18 tasks)
-
-Broader public-repo evidence uses the
-[`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json)
-manifest across 18 pinned OSS packages. Latest recorded suite totals:
-
-| Metric | Without | With | Change |
-| --- | ---: | ---: | --- |
-| Context tokens | 9,692,559 | 5,514,580 | −43% |
-| Repeat-task wall time | 7,943s | 4,343s | −45% |
-| Tool calls | 475 | 60 | −87% |
-| Direct source reads | 417 | 0 | −100% |
-
-Per-task medians, ranges, reproduction commands, and boundary notes:
-[language-expansion holdout stats](docs/testing/language-expansion-holdout-stats.md).
 
 ## Documentation
 
