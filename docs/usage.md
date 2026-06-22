@@ -63,8 +63,15 @@ explicit ref, setup fetches and builds the remote default branch.
 | Built by | `index` | `index`, then `retrieval index` |
 | Requires | Healthy SQLite cache and graph | Healthy sidecars and `retrieval_mode=full` |
 | Good for | Known files, symbols, trails, snippets, changed-file impact | Broad candidate discovery and bounded task packets |
-| Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `context --id`, `context --query <exact target>`, `affected` | `packet`, `search` |
+| Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `affected` | `packet`, `search`, `context` packet construction after target selection |
 | Does not prove | Broad sidecar search is ready | That cache-only browsing is enough for broad agent search |
+
+`context` straddles these lanes. Target selection is local/index-first:
+`--id`, `--bookmark`, or `--query <exact target>` chooses one concrete focus.
+The context answer/evidence packet then runs through the Investigate agent path
+and may fail closed unless sidecar-primary retrieval is full. Use `symbol`,
+`trail`, `snippet`, or `explore` for cache-only local navigation when sidecars
+are degraded.
 
 Sidecar topology:
 [architecture/overview.md](architecture/overview.md),
@@ -202,7 +209,8 @@ variables such as `CODESTORY_SUMMARY_ENDPOINT`, `CODESTORY_SUMMARY_MODEL`, or
 | `ground` | Broad repo-level orientation snapshot. |
 | `report` | Derived Markdown repo report or JSON graph export from the current SQLite store. |
 | `files` | Indexed file inventory, language counts, roles, and coverage notes. |
-| `symbol`, `trail`, `snippet`, `context --id` | Exact-target source inspection once you have a node id. |
+| `symbol`, `trail`, `snippet`, `explore` | Cache-local exact-target source inspection once you have a node id or target. |
+| `context --id`, `context --query <exact target>`, `context --bookmark` | Target-first Investigate context packet; target selection is local/index-first, answer/evidence retrieval needs full sidecar primary. |
 | `affected` | Changed-file impact hints for review planning. |
 | `packet`, `search` | Broad sidecar-backed discovery; trust only with `retrieval_mode=full`. |
 | `retrieval bootstrap`, `retrieval index`, `retrieval status` | Sidecar setup, indexing, and readiness checks. |

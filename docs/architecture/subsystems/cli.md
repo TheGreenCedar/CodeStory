@@ -85,7 +85,7 @@ rather than the general CLI architecture page.
 
 `query` is intentionally small. It parses source operations (`search`, `symbol`, `trail`) followed by stream refinements (`filter`, `limit`) and rejects malformed or unknown named arguments rather than silently ignoring typos.
 
-`context` is target context: DB-first evidence for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`, delegates to `codestory-runtime` retrieval orchestration, includes citations and retrieval traces, and always uses DB-first synthesis. `--query` must identify a concrete target, not a broad natural-language question. It is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
+`context` is target context for one concrete target. It resolves that target from `--id`, `--query`, or `--bookmark`; `--query` must identify a concrete target, not a broad natural-language question. After target selection, the CLI delegates to `codestory-runtime` through the Investigate agent path with a focused node id. The context answer/evidence packet needs full sidecar-primary retrieval and can fail closed when sidecars are unavailable, rejected, disabled, or non-`full`; use `symbol`, `trail`, `snippet`, or `explore` for cache-only local navigation. `context` is not a replacement for broad `packet`, `search`, or `drill` questions. `--bundle <DIR>` writes Markdown, JSON, and Mermaid artifacts for handoff.
 
 `doctor` is a read-only health report for project path resolution, cache
 presence, index counts, retrieval state, managed embedding setup, relevant
