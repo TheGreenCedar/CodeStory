@@ -91,9 +91,11 @@ Recovery order:
 
 1. Confirm whether the miss is in `indexed_symbol_hits`, `repo_text_hits`, or both.
 2. Confirm the reported retrieval mode and degraded-state reason before touching search ranking code.
-3. For product sidecar evidence, run `codestory-cli retrieval bootstrap --project .`, set
-   `CODESTORY_EMBED_BACKEND=llamacpp`, and point `CODESTORY_EMBED_LLAMACPP_URL` at the local
-   bge-base-en-v1.5 llama.cpp `/v1/embeddings` endpoint before reindexing.
+3. For product sidecar evidence, fetch the pinned GGUF when needed with
+   `node scripts/setup-retrieval-env.mjs --fetch-embed-model`, then run
+   `codestory-cli retrieval bootstrap --project .`. Set
+   `CODESTORY_EMBED_BACKEND=llamacpp` and `CODESTORY_EMBED_LLAMACPP_URL` only
+   when your local sidecar endpoint differs from the default.
 4. Rebuild once with `codestory-cli index --project . --refresh full`, then
    `codestory-cli retrieval index --project . --refresh full`.
 5. Require `codestory-cli retrieval status --project . --format json` to report
