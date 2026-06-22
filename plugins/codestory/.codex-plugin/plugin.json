@@ -23,9 +23,9 @@
     "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
     "termsOfServiceURL": "https://github.com/TheGreenCedar/CodeStory",
     "defaultPrompt": [
-      "@CodeStory ground this repository before editing.",
-      "@CodeStory check whether packet/search is ready.",
-      "@CodeStory find the symbols involved in this task."
+      "@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.",
+      "@CodeStory Where is RefreshMode defined, which codestory-cli commands accept --refresh, and what is the call path from index into codestory-store?",
+      "@CodeStory I am editing a file in this repo. What symbols are affected and what tests should I run first?"
     ],
     "brandColor": "#2563EB",
     "screenshots": []

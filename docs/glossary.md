@@ -1,5 +1,11 @@
 # Glossary
 
+CodeStory terms used across operator, architecture, and verification docs.
+
+## Product context
+
+- **repository rediscovery**: the repeated agent work of searching files, reading snippets, and rebuilding a mental map on every new question; CodeStory indexes once to reduce that cost
+
 ## Readiness
 
 - **local navigation readiness**: SQLite cache, graph, and DB-backed browse commands (`ground`, `report`, `files`, `trail`, `snippet`, `context --id`, etc.) are usable

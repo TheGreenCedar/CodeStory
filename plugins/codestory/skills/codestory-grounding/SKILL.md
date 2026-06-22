@@ -5,9 +5,22 @@ description: Use when an agent should ground a local repository with CodeStory b
 
 # CodeStory Grounding
 
+Agents usually rediscover a repository on every question: search files, read
+snippets, chase imports, and spend context rebuilding the same map. CodeStory
+indexes once and serves read-only evidence from that map so you can answer from
+citations instead of repeating discovery work.
+
 Use CodeStory to keep source claims tied to the current local repository. Prefer
 the plugin MCP server when it is installed and healthy. Use the CLI for setup,
 repair, explicit transcripts, or when MCP is unavailable.
+
+**Key concepts:**
+
+- **Repository rediscovery**: The repeated agent work of searching files, reading snippets, and rebuilding a mental map on every new question. CodeStory indexes once to reduce that cost.
+- **Local navigation**: SQLite cache, graph, and DB-backed browse commands (`ground`, `report`, `files`, `trail`, `snippet`, `context --id`, etc.) are usable.
+- **Agent packet/search**: Sidecars are healthy and `retrieval_mode=full`; required for trustworthy `packet`, `search`, and query-based candidate discovery.
+- **Retrieval mode**: Sidecar status contract; only `full` serves agent packet/search.
+- **Semantic ready**: Dense-anchor embedding state matches policy; not the same as agent packet/search readiness.
 
 The target is always a repository workspace. The CodeStory checkout is only the
 tool source unless the user is editing CodeStory itself.

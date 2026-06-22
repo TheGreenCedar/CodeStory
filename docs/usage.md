@@ -1,5 +1,10 @@
 # CodeStory Usage
 
+Every new agent question often restarts repository discovery: search, read,
+trace, repeat. That costs wall time and context on work you already did in the
+last turn. CodeStory indexes once and serves evidence from that map so the agent
+can answer from citations instead of re-exploring the tree.
+
 Start with the human task, then run the smallest path that proves the state you
 need. The plugin is the normal path. The CLI is for setup, repair, debugging,
 and transcripts.
@@ -18,8 +23,48 @@ Packet/search output from degraded retrieval, missing sidecars, stale manifests,
 or any non-`full` retrieval mode is navigation help only. It is not proof.
 
 Most humans should start from the plugin flow in
-[README - Use It With An Agent](../README.md#use-it-with-an-agent). Use the CLI
-when you need the exact setup, repair, or debug record.
+[README - Quick start](../README.md#quick-start). Use the CLI when you need the
+exact setup, repair, or debug record.
+
+### Example prompts
+
+**Portable templates (any repository):**
+
+```text
+@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+```
+
+```text
+@CodeStory Where is [TARGET_FEATURE] defined and who calls it?
+```
+
+```text
+@CodeStory I am editing [PATH_TO_FILE]. What symbols are affected and what tests should I run first?
+```
+
+Replace `[TARGET_FEATURE]` and `[PATH_TO_FILE]` with concrete symbols and paths
+from your project. A good answer cites concrete paths and flags gaps when
+sidecars or coverage are degraded.
+
+**CodeStory repository examples:**
+
+Use concrete repo terms, not generic architecture words:
+
+```text
+@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet on codestory-indexer changes.
+```
+
+```text
+@CodeStory Where is RefreshMode defined, which codestory-cli commands accept --refresh, and what is the call path from index into codestory-store?
+```
+
+```text
+@CodeStory I am editing crates/codestory-indexer/src/resolution/mod.rs. What symbols are affected by changes in this file, and what tests should I run first?
+```
+
+```text
+@CodeStory Explain where strict_sidecar_status decides retrieval_mode=full.
+```
 
 Shell examples below are POSIX unless noted. On Windows PowerShell, use
 `.\target\release\codestory-cli.exe` for a source-built binary and set
@@ -31,7 +76,17 @@ Install the CodeStory plugin once, then start a fresh agent thread for the
 workspace you want to ground. The canonical skill package lives at
 [../plugins/codestory/skills/codestory-grounding/SKILL.md](../plugins/codestory/skills/codestory-grounding/SKILL.md).
 
-For a direct CLI transcript:
+**Plugin installation flow:**
+
+1. Open Codex in the repository you want to ground
+2. Run `/plugins` and install **TheGreenCedar → codestory**
+3. Start a fresh thread and ask:
+
+```text
+@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+```
+
+**Direct CLI transcript (for setup, repair, or debugging):**
 
 ```sh
 codestory-cli doctor --project <target-workspace>
@@ -39,9 +94,35 @@ codestory-cli index --project <target-workspace> --refresh auto
 codestory-cli ground --project <target-workspace> --why
 ```
 
-`doctor` separates local navigation readiness from agent packet/search
-readiness. Do not infer packet/search readiness from a successful local
-grounding command.
+**What each command does:**
+
+- `doctor`: Separates local navigation readiness from agent packet/search readiness
+- `index`: Builds or refreshes the SQLite graph and derived local read models
+- `ground`: Provides a broad repo-level orientation snapshot
+
+**Key guidance:**
+
+Do not infer packet/search readiness from a successful local grounding command. Use `doctor` to check both readiness lanes separately.
+
+**Next steps after installation:**
+
+If the agent reports that local navigation is ready but agent packet/search is not ready, you may need to repair the sidecar lane. The agent will provide specific guidance on what to do next.
+
+**Common next steps:**
+
+- If `agent_packet_search` is not ready: The agent will guide you through setting up retrieval sidecars
+- If `local_navigation` is not ready: The agent will guide you through indexing the repository
+- If both are ready: You can proceed with using CodeStory for your task
+
+**Verification checkpoints:**
+
+After the initial setup, you can verify readiness with:
+
+```sh
+codestory-cli doctor --project <target-workspace>
+```
+
+This will tell you exactly what is ready and what needs to be repaired before you can use packet/search features.
 
 When changing CodeStory itself or testing the current checkout:
 
@@ -65,6 +146,13 @@ explicit ref, setup fetches and builds the remote default branch.
 | Good for | Known files, symbols, trails, snippets, changed-file impact | Broad candidate discovery and bounded task packets |
 | Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `affected` | `packet`, `search`, `context` packet construction after target selection |
 | Does not prove | Broad sidecar search is ready | That cache-only browsing is enough for broad agent search |
+
+**Key concepts for readiness lanes:**
+
+- **Local navigation**: SQLite cache, graph, and DB-backed browse commands (`ground`, `report`, `files`, `trail`, `snippet`, `context --id`, etc.) are usable.
+- **Agent packet/search**: Sidecars are healthy and `retrieval_mode=full`; required for trustworthy `packet`, `search`, and query-based candidate discovery.
+- **Retrieval mode**: Sidecar status contract; only `full` serves agent packet/search.
+- **Semantic ready**: Dense-anchor embedding state matches policy; not the same as agent packet/search readiness.
 
 `context` straddles these lanes. Target selection is local/index-first:
 `--id`, `--bookmark`, or `--query <exact target>` chooses one concrete focus.
@@ -152,14 +240,36 @@ codestory-cli retrieval status --project <target-workspace> --format json
 codestory-cli doctor --project <target-workspace> --format markdown
 ```
 
-`setup-retrieval-env.mjs --fetch-embed-model` verifies the pinned GGUF before
-renaming it into `CODESTORY_EMBED_MODEL_DIR`. The accepted artifact is exactly
-`117974304` bytes with SHA-256
-`ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`.
+**Key concepts for sidecar repair:**
 
-`retrieval status --format json` reports `query_embedding_backend`,
-`manifest_vector_embedding_backend`, and
-`stored_doc_vector_producer_backend` so backend drift is visible.
+- **`setup-retrieval-env.mjs --fetch-embed-model`**: Verifies the pinned GGUF before renaming it into `CODESTORY_EMBED_MODEL_DIR`. The accepted artifact is exactly `117974304` bytes with SHA-256 `ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c`.
+- **`retrieval status --format json`**: Reports `query_embedding_backend`, `manifest_vector_embedding_backend`, and `stored_doc_vector_producer_backend` so backend drift is visible.
+- **Legacy managed embeddings**: Diagnostic only; do not start llama.cpp, create the retrieval manifest, or prove agent packet/search readiness.
+
+**Sidecar readiness verification:**
+
+The `retrieval status --format json` command provides detailed information about:
+
+- `query_embedding_backend`: The backend used for query embeddings
+- `manifest_vector_embedding_backend`: The backend used for manifest vector embeddings
+- `stored_doc_vector_producer_backend`: The backend used for stored document vector production
+
+This allows you to detect backend drift and ensure all components are using the correct embedding backend.
+
+**Sidecar repair process:**
+
+1. **Setup retrieval environment**: Fetch the required embedding model and configure environment variables
+2. **Bootstrap retrieval**: Initialize the retrieval system with the embedding model
+3. **Index the repository**: Build the SQLite graph and retrieval indexes
+4. **Verify sidecar status**: Check that retrieval mode is `full` and all components are healthy
+5. **Final verification**: Run `doctor` to confirm overall system health
+
+**Common sidecar issues and solutions:**
+
+- **Missing embedding model**: Use `setup-retrieval-env.mjs --fetch-embed-model` to download and verify the model
+- **Backend configuration errors**: Check `CODESTORY_EMBED_BACKEND` and related environment variables
+- **Retrieval manifest issues**: Re-run `retrieval bootstrap` and `retrieval index` with `--refresh full`
+- **Stale cache**: Use `index --refresh full` to rebuild the SQLite graph
 
 Legacy managed embeddings are diagnostic only:
 

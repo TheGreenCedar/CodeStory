@@ -8,7 +8,9 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 
 test("plugin metadata maps skill and direct stdio server", async () => {
-  const manifest = JSON.parse(await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"));
+  const manifest = JSON.parse(
+    await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
+  );
   const mcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8"));
 
   assert.equal(manifest.name, "codestory");
@@ -16,20 +18,36 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.equal(manifest.mcpServers, "./.mcp.json");
   assert.equal(manifest.interface.capabilities.includes("Read"), true);
   assert.equal(mcp.mcpServers.codestory.command, "codestory-cli");
-  assert.deepEqual(mcp.mcpServers.codestory.args, ["serve", "--stdio", "--refresh", "none"]);
+  assert.deepEqual(mcp.mcpServers.codestory.args, [
+    "serve",
+    "--stdio",
+    "--refresh",
+    "none",
+  ]);
   assert.equal(Object.hasOwn(mcp.mcpServers.codestory, "cwd"), false);
 });
 
 test("codestory repo ships plugin source, not marketplace catalog or adapter runtime", async () => {
-  await assert.rejects(access(join(repoRoot, ".agents", "plugins", "marketplace.json")));
-  await assert.rejects(access(join(repoRoot, ".agents", "skills", "codestory-grounding", "SKILL.md")));
-  await assert.rejects(access(join(pluginRoot, "scripts", "codestory-mcp.mjs")));
+  await assert.rejects(
+    access(join(repoRoot, ".agents", "plugins", "marketplace.json")),
+  );
+  await assert.rejects(
+    access(
+      join(repoRoot, ".agents", "skills", "codestory-grounding", "SKILL.md"),
+    ),
+  );
+  await assert.rejects(
+    access(join(pluginRoot, "scripts", "codestory-mcp.mjs")),
+  );
 });
 
 test("plugin docs are agent-first, marketplace-aware, and latest-release aware", async () => {
   const rootReadme = await readFile(join(repoRoot, "README.md"), "utf8");
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
-  const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
+  const skill = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
+    "utf8",
+  );
   const sharedRequired = [
     "latest GitHub release",
     "codestory-cli --version",
@@ -74,7 +92,6 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "workspace plugin settings are managed from the Codex Apps/Plugins UI",
     "UI path when the CLI marketplace command is",
     "Start a new Codex thread after installation or refresh",
-    "check whether this repository is ready for local navigation and packet/search",
     "The first run should be agent-owned",
     "installs the latest matching release asset",
     "uses source fallback only when no release asset fits the host",
@@ -113,7 +130,7 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "Always pass `--project <target-workspace>` explicitly",
   ];
   const rootReadmeRequired = [
-    "Marketplace catalog details, binary",
+    "Install details, binary bootstrap",
     "[plugin README](plugins/codestory/README.md)",
     "`codestory-cli serve --stdio --refresh none`",
   ];
@@ -156,8 +173,28 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
 });
 
 test("canonical grounding skill ships with plugin references", async () => {
-  await access(join(pluginRoot, "skills", "codestory-grounding", "references", "ground.md"));
-  await access(join(pluginRoot, "skills", "codestory-grounding", "references", "packet.md"));
-  await access(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.ps1"));
-  await access(join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"));
+  await access(
+    join(
+      pluginRoot,
+      "skills",
+      "codestory-grounding",
+      "references",
+      "ground.md",
+    ),
+  );
+  await access(
+    join(
+      pluginRoot,
+      "skills",
+      "codestory-grounding",
+      "references",
+      "packet.md",
+    ),
+  );
+  await access(
+    join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.ps1"),
+  );
+  await access(
+    join(pluginRoot, "skills", "codestory-grounding", "scripts", "setup.sh"),
+  );
 });

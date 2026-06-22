@@ -1,11 +1,14 @@
 # How CodeStory Works
 
-CodeStory indexes a workspace into a local graph, then serves read commands
-against that graph. It does not replace tests or judgment; it structures the
-first pass.
+Agents usually rediscover a repository on every question: open files, chase
+imports, rebuild the same mental map, and spend context doing it again on the
+next turn. CodeStory indexes a workspace once into a local graph, then serves
+read commands against that graph. It does not replace tests or judgment; it
+structures the first pass so answers can cite source instead of repeating
+discovery work.
 
-Command loop: [README - What Your Agent Gets](../../README.md#what-your-agent-gets).
-Readiness lanes: [usage.md](../usage.md#readiness-tracks).
+Command surfaces: [README - What your agent gets](../../README.md#what-your-agent-gets).
+Readiness lanes: [usage.md](../usage.md#readiness-lanes).
 
 ```mermaid
 flowchart TD
@@ -61,12 +64,14 @@ More: [glossary.md](../glossary.md).
 
 A good CodeStory-backed answer does three things:
 
-1. Names the files, symbols, snippets, or sidecar evidence it used.
+1. Names concrete files, symbols, snippets, or sidecar evidence — for example
+   `crates/codestory-contracts/src/workspace.rs` for `RefreshMode`, not
+   "the refresh enum somewhere in the codebase."
 2. Says when evidence is stale, partial, ambiguous, or missing.
 3. Gives the next concrete command when the current evidence is not enough.
 
-The goal is not a more confident answer. The goal is confidence constrained by
-source evidence.
+The goal is not a more confident answer. The goal is less repeated discovery
+work, with confidence constrained by source evidence.
 
 ## Related
 

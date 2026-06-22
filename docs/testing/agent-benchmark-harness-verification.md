@@ -163,14 +163,14 @@ The lower-level packet runtime mode can also be run directly with row-level
 parallelism:
 
 ```powershell
-node scripts\codestory-agent-ab-benchmark.mjs `
+node scripts/codestory-agent-ab-benchmark.mjs `
   --packet-runtime --packet-runtime-mode both `
   --task-suite language-expansion-holdout `
   --repeats 3 `
   --materialize-repos `
   --jobs 4 --prepare-codestory-jobs 2 `
-  --codestory-cli target\release\codestory-cli.exe `
-  --out-dir target\agent-benchmark\<run-name> `
+  --codestory-cli target/release/codestory-cli.exe `
+  --out-dir target/agent-benchmark/<run-name> `
   --timeout-ms 180000 `
   --max-source-reads-after-packet 0 `
   --publishable
@@ -190,12 +190,12 @@ stay serial so both arms do not mutate the same checkout at the same time.
 When only CodeStory runtime packet behavior changed, reuse matching baselines:
 
 ```powershell
-node scripts\codestory-agent-ab-score.mjs `
+node scripts/codestory-agent-ab-score.mjs `
   --packet-gate --packet-probe-jobs 4 `
-  --packet-gate-improved-from target\agent-benchmark\<previous-run> `
+  --packet-gate-improved-from target/agent-benchmark/<previous-run> `
   --task-ids <comma-separated-task-ids> `
-  --reuse-baseline-from target\agent-benchmark\<previous-run> `
-  --out-dir target\agent-benchmark\<run-name>
+  --reuse-baseline-from target/agent-benchmark/<previous-run> `
+  --out-dir target/agent-benchmark/<run-name>
 ```
 
 Baseline reuse is strict. The benchmark reuses only `without_codestory` rows
@@ -226,3 +226,29 @@ Do not make public savings claims from these fixtures. They only prove
 transcript analyzer/parser and scorer behavior. Promotion evidence still
 requires real benchmark runs with raw transcripts, repeated medians, and quality
 thresholds.
+
+## README with/without row
+
+The [README with/without section](../../README.md#with-vs-without-codestory) keeps
+two recorded tiers: the focused `readme-with-without` task and a suite-total row
+for the 18-task `language-expansion-holdout` manifest
+[`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json).
+Latest recorded medians, ranges, and per-task rows:
+[language-expansion-holdout stats](language-expansion-holdout-stats.md).
+
+**Key concepts for benchmark harness verification:**
+
+- **Transcript analyzer/parser and scorer**: The harness exposes pure analyzer/scorer functions and keeps a built-in fixture smoke test.
+- **Runner JSONL tool category counts**: The harness counts runner JSONL tool categories for web search, MCP tool calls, command execution, function calls, and other tool calls.
+- **Direct source-read accounting**: The harness accounts for direct source reads across the supported language extension set, including Dart, Bash, HTML, CSS, and SQL.
+- **Ordinary source reads after the first successful packet command**: The harness counts source reads that occur after the first successful packet command.
+- **Harness-run no-CodeStory local-context preludes and CodeStory packet preludes**: The harness measures both no-CodeStory local-context preludes and CodeStory packet preludes as measured first-context commands.
+- **Duplicate file reads by normalized path**: The harness counts duplicate file reads by normalized path.
+- **Expected file, symbol, claim, and citation recall**: The harness verifies expected file, symbol, claim, and citation recall.
+- **Missed anchors as quality evidence**: The harness treats missed anchors as quality evidence, separate from operational run status.
+- **Forbidden-claim scoring**: The harness avoids contradicted positive-claim false positives, including hyphenated terms such as `whitespace-only`.
+- **Publishable blockers**: The harness reports external web/search tool calls as blockers and rejects rows missing wall time, total token usage, observed tool-call count, or command-count accounting.
+
+Historical comparison artifact:
+`target/agent-benchmark/language-expansion-holdout-20260617-post-quality-hardening-j2`
+(without baseline reused from `language-expansion-holdout-20260617-baseline-j4`).
