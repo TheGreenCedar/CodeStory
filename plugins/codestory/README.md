@@ -174,6 +174,10 @@ The plugin does not bundle the binary. The agent-owned skill verifies
 `codestory-cli --version`, compares it with the latest GitHub release, installs
 the matching release asset when practical, and checks `SHA256SUMS.txt` when the
 host can. If `PATH` changed, the skill tells the human that a Codex host/app restart may be needed before a fresh agent thread can see it.
+If a running `codestory-cli serve --stdio --refresh none` process locks the old
+binary, install the current release into a versioned directory and put that
+directory before stale entries on `PATH`; verify the command that MCP will
+launch with `codestory-cli --version` before starting a fresh Codex thread.
 
 Use source fallback only when no release asset fits the host:
 
