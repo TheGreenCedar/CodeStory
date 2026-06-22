@@ -46,6 +46,15 @@ function Get-DefaultInstallDir {
     return (Join-Path (Get-CodeStoryHome) "bin")
 }
 
+function Get-VersionedInstallDir {
+    param(
+        [string]$InstallDirectory,
+        [string]$ReleaseVersion
+    )
+
+    return (Join-Path (Join-Path $InstallDirectory "releases") $ReleaseVersion)
+}
+
 function Convert-VersionText {
     param([string]$Text)
 
@@ -106,6 +115,11 @@ function Get-CliCandidates {
     if ($InstallDirectory) {
         $candidates += (Join-Path $InstallDirectory "codestory-cli.exe")
         $candidates += (Join-Path $InstallDirectory "codestory-cli")
+        if ($script:RequiredVersion) {
+            $versionedInstallDir = Get-VersionedInstallDir $InstallDirectory $script:RequiredVersion.ToString()
+            $candidates += (Join-Path $versionedInstallDir "codestory-cli.exe")
+            $candidates += (Join-Path $versionedInstallDir "codestory-cli")
+        }
     }
     $pathCli = Get-Command "codestory-cli" -ErrorAction SilentlyContinue
     if ($pathCli) {
@@ -270,6 +284,34 @@ function Remove-InstallerTemp {
     Remove-Item -LiteralPath $resolved.Path -Recurse -Force
 }
 
+function Copy-ReleaseCliBinary {
+    param(
+        [string]$BinaryPath,
+        [string]$InstallDirectory,
+        [string]$ReleaseVersion
+    )
+
+    $dest = Join-Path $InstallDirectory "codestory-cli.exe"
+    try {
+        Copy-Item -LiteralPath $BinaryPath -Destination $dest -Force
+        return $dest
+    } catch {
+        $defaultError = $_.Exception.Message
+    }
+
+    $versionedInstallDir = Get-VersionedInstallDir $InstallDirectory $ReleaseVersion
+    $versionedDest = Join-Path $versionedInstallDir "codestory-cli.exe"
+    try {
+        New-Item -ItemType Directory -Force -Path $versionedInstallDir | Out-Null
+        Copy-Item -LiteralPath $BinaryPath -Destination $versionedDest -Force
+    } catch {
+        throw "Default install path is locked or not writable: $defaultError. Alternate install path also failed: $($_.Exception.Message). Stop the process holding $dest or restart the host, then run .\scripts\install-codestory.ps1 -Project . -Version $ReleaseVersion."
+    }
+
+    Write-Warning "Default install path is locked or not writable: $defaultError. Installed current release to $versionedDest. To replace the default binary later, stop the locking process or restart the host, then run .\scripts\install-codestory.ps1 -Project . -Version $ReleaseVersion."
+    return $versionedDest
+}
+
 function Install-ReleaseCli {
     param(
         [string]$InstallDirectory,
@@ -304,8 +346,7 @@ function Install-ReleaseCli {
         if (-not $binary) {
             throw "Downloaded archive did not contain codestory-cli.exe"
         }
-        $dest = Join-Path $InstallDirectory "codestory-cli.exe"
-        Copy-Item -LiteralPath $binary.FullName -Destination $dest -Force
+        $dest = Copy-ReleaseCliBinary $binary.FullName $InstallDirectory $ReleaseVersion
         $version = Invoke-CliVersion $dest
         if (-not (Test-RequiredVersion $version.Version)) {
             throw "Downloaded codestory-cli is $($version.Version), expected $script:RequiredVersion"
@@ -458,6 +499,29 @@ function Invoke-SelfTest {
     $parsedVersion = Convert-VersionText "codestory-cli 0.11.4"
     Assert-SelfTest (Test-RequiredVersion $parsedVersion) "version gate should accept current release"
     Assert-SelfTest (-not (Test-RequiredVersion ([Version]"0.11.3"))) "version gate should reject stale 0.11.3"
+
+    $lockRoot = $null
+    $lockStream = $null
+    try {
+        $lockRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-install-" + [System.Guid]::NewGuid().ToString("N"))
+        $lockInstallDir = Join-Path $lockRoot "bin"
+        New-Item -ItemType Directory -Force -Path $lockInstallDir | Out-Null
+        $sourceCli = Join-Path $lockRoot "source.exe"
+        $lockedDefault = Join-Path $lockInstallDir "codestory-cli.exe"
+        Set-Content -LiteralPath $sourceCli -Value "current" -Encoding ASCII
+        Set-Content -LiteralPath $lockedDefault -Value "stale" -Encoding ASCII
+        $lockStream = [System.IO.File]::Open($lockedDefault, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $fallback = Copy-ReleaseCliBinary $sourceCli $lockInstallDir "0.11.4"
+        $expectedFallback = Join-Path (Get-VersionedInstallDir $lockInstallDir "0.11.4") "codestory-cli.exe"
+        Assert-SelfTest ($fallback -ieq $expectedFallback) "locked default install should fall back to versioned release path"
+    } finally {
+        if ($lockStream) {
+            $lockStream.Dispose()
+        }
+        if ($lockRoot) {
+            Remove-InstallerTemp $lockRoot
+        }
+    }
 
     $explicitStale = $false
     try {

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Project = ".",
-    [switch]$ResolveCliOnly
+    [switch]$ResolveCliOnly,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -174,8 +175,17 @@ function Get-CodeStoryInstallDir {
     return (Join-Path $HOME ".codestory\bin")
 }
 
+function Get-VersionedCodeStoryInstallDir {
+    param([string]$Version)
+
+    return (Join-Path (Join-Path (Get-CodeStoryInstallDir) "releases") $Version)
+}
+
 function Get-CodeStoryCliCandidates {
-    param([string]$Root)
+    param(
+        [string]$Root,
+        [string]$ExpectedVersion
+    )
 
     $candidates = @()
     if ($env:CODESTORY_CLI) {
@@ -193,6 +203,14 @@ function Get-CodeStoryCliCandidates {
         (Join-Path $installDir "codestory-cli.cmd"),
         (Join-Path $installDir "codestory-cli")
     )
+    if ($ExpectedVersion) {
+        $versionedInstallDir = Get-VersionedCodeStoryInstallDir $ExpectedVersion
+        $candidates += @(
+            (Join-Path $versionedInstallDir "codestory-cli.exe"),
+            (Join-Path $versionedInstallDir "codestory-cli.cmd"),
+            (Join-Path $versionedInstallDir "codestory-cli")
+        )
+    }
 
     $candidates += @(
         (Join-Path $Root "target\release\codestory-cli.exe"),
@@ -225,7 +243,7 @@ function Find-CodeStoryCli {
     param([string]$Root)
 
     $expectedVersion = Get-ExpectedCodeStoryCliVersion $Root
-    $candidates = Get-CodeStoryCliCandidates $Root
+    $candidates = Get-CodeStoryCliCandidates $Root $expectedVersion
     $staleCandidates = @()
     foreach ($candidate in $candidates) {
         $actualVersion = $null
@@ -273,6 +291,62 @@ function Same-Path {
     return [string]::Equals($leftFull, $rightFull, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Assert-SelfTest {
+    param(
+        [bool]$Condition,
+        [string]$Message
+    )
+
+    if (-not $Condition) {
+        throw "Self-test failed: $Message"
+    }
+}
+
+function Remove-SetupSelfTestTemp {
+    param([string]$Path)
+
+    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+    if (-not $resolved) {
+        return
+    }
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $leaf = Split-Path -Leaf $resolved.Path
+    if (-not $resolved.Path.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove setup self-test temp outside system temp: $($resolved.Path)"
+    }
+    if (-not $leaf.StartsWith("codestory-setup-", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove unexpected setup self-test temp: $($resolved.Path)"
+    }
+    Remove-Item -LiteralPath $resolved.Path -Recurse -Force
+}
+
+function Invoke-SelfTest {
+    $oldCodeStoryHome = $env:CODESTORY_HOME
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-setup-" + [System.Guid]::NewGuid().ToString("N"))
+    try {
+        $projectRoot = Join-Path $tempRoot "project"
+        $manifestDir = Join-Path $projectRoot "crates\codestory-cli"
+        New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $manifestDir "Cargo.toml") -Value 'version = "0.11.4"' -Encoding ASCII
+
+        $env:CODESTORY_HOME = Join-Path $tempRoot "home"
+        $installDir = Get-CodeStoryInstallDir
+        $versionedInstallDir = Get-VersionedCodeStoryInstallDir "0.11.4"
+        New-Item -ItemType Directory -Force -Path $installDir, $versionedInstallDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $installDir "codestory-cli.cmd") -Value "@echo codestory-cli 0.11.3" -Encoding ASCII
+        $currentCli = Join-Path $versionedInstallDir "codestory-cli.cmd"
+        Set-Content -LiteralPath $currentCli -Value "@echo codestory-cli 0.11.4" -Encoding ASCII
+
+        $resolvedCli = Find-CodeStoryCli $projectRoot
+        Assert-SelfTest (Same-Path $resolvedCli $currentCli) "stale default install should be rejected and versioned current install should be used"
+    } finally {
+        $env:CODESTORY_HOME = $oldCodeStoryHome
+        Remove-SetupSelfTestTemp $tempRoot
+    }
+
+    Write-Host "codex-worktree-setup self-test: ok"
+}
+
 function Find-RehydrateSource {
     param([string]$Target)
 
@@ -307,6 +381,11 @@ function Find-RehydrateSource {
     }
 
     return $null
+}
+
+if ($SelfTest) {
+    Invoke-SelfTest
+    return
 }
 
 $projectPath = (Resolve-Path -LiteralPath $Project).Path
