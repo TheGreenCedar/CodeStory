@@ -23,6 +23,8 @@ const MANAGED_DOC_EMBED_BATCH_SIZE: usize = 2048;
 const MANAGED_SEMANTIC_DOC_MAX_TOKENS: usize = 512;
 const MANAGED_ONNX_BATCH_TOKENS: usize = 32_768;
 const MANAGED_STORED_VECTOR_ENCODING: &str = "int8";
+const BUNDLED_LLAMACPP_BACKEND_LABEL: &str = "llamacpp";
+const BUNDLED_LLAMACPP_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 const MANAGED_DIR_NAME: &str = "managed-embeddings";
 const MANAGED_POOLED_ONNX_MODEL_NAME: &str = "model_optimized_cls_pool.onnx";
 const ONNX_SOURCE_OUTPUT_NAME: &str = "last_hidden_state";
@@ -329,6 +331,20 @@ pub(crate) fn prepare_runtime_if_installed(root: &Path) {
     }
     if managed_endpoint_assets_available(root) {
         set_managed_endpoint_env(root);
+    }
+}
+
+pub(crate) fn prepare_bundled_llamacpp_client_env_defaults() {
+    unsafe {
+        if env_value_is_unset("CODESTORY_EMBED_RUNTIME_MODE")
+            && env_value_is_unset("CODESTORY_EMBED_BACKEND")
+        {
+            set_env_default_str("CODESTORY_EMBED_BACKEND", BUNDLED_LLAMACPP_BACKEND_LABEL);
+        }
+        if legacy_llamacpp_backend_selected() && env_value_is_unset("CODESTORY_EMBED_LLAMACPP_URL")
+        {
+            set_env_default_str("CODESTORY_EMBED_LLAMACPP_URL", BUNDLED_LLAMACPP_URL);
+        }
     }
 }
 
