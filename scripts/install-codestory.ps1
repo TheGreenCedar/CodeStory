@@ -218,6 +218,29 @@ function Test-PathListContains {
     return $false
 }
 
+function Set-PathListDirectoryFirst {
+    param(
+        [string]$PathList,
+        [string]$Directory
+    )
+
+    $normalizedDirectory = Normalize-PathListEntry $Directory
+    $entries = @()
+    foreach ($entry in ($PathList -split ";")) {
+        if (-not $entry) {
+            continue
+        }
+        if ((Normalize-PathListEntry $entry) -ieq $normalizedDirectory) {
+            continue
+        }
+        $entries += $entry
+    }
+    if ($entries.Count -gt 0) {
+        return (($Directory.TrimEnd(";")) + ";" + ($entries -join ";"))
+    }
+    return $Directory.TrimEnd(";")
+}
+
 function Ensure-InstallDirOnPath {
     param(
         [string]$InstallDirectory,
@@ -232,23 +255,40 @@ function Ensure-InstallDirOnPath {
     if (-not $resolvedCli) {
         return
     }
-    $installPath = $resolvedInstallDir.Path
+    $installPath = Normalize-PathListEntry $resolvedInstallDir.Path
     $cliDir = Split-Path -Parent $resolvedCli.Path
-    if ((Normalize-PathListEntry $cliDir) -ine (Normalize-PathListEntry $installPath)) {
+    $normalizedCliDir = Normalize-PathListEntry $cliDir
+    $underInstallDir = $normalizedCliDir.StartsWith(
+        $installPath + "\",
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if ($normalizedCliDir -ine $installPath -and -not $underInstallDir) {
         return
     }
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (-not (Test-PathListContains $userPath $installPath)) {
-        $prefix = if ($userPath) { $userPath.TrimEnd(";") + ";" } else { "" }
-        [Environment]::SetEnvironmentVariable("Path", $prefix + $installPath, "User")
-        Write-Host "PATH updated for future Codex host processes: $installPath"
+    $updatedUserPath = Set-PathListDirectoryFirst $userPath $cliDir
+    if ($updatedUserPath -ne $userPath) {
+        [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
+        Write-Host "PATH updated for future Codex host processes: $cliDir"
     }
 
     $processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
-    if (-not (Test-PathListContains $processPath $installPath)) {
-        $prefix = if ($processPath) { $processPath.TrimEnd(";") + ";" } else { "" }
-        [Environment]::SetEnvironmentVariable("Path", $prefix + $installPath, "Process")
+    $updatedProcessPath = Set-PathListDirectoryFirst $processPath $cliDir
+    if ($updatedProcessPath -ne $processPath) {
+        [Environment]::SetEnvironmentVariable("Path", $updatedProcessPath, "Process")
+    }
+}
+
+function Assert-PathCliResolvesCurrent {
+    $pathCli = Get-Command "codestory-cli" -ErrorAction SilentlyContinue
+    if (-not $pathCli) {
+        throw "Installed MCP runtime cannot resolve codestory-cli from PATH. Add the current CodeStory install directory before stale entries, then restart the Codex host/app before opening a fresh agent thread."
+    }
+
+    $version = Invoke-CliVersion $pathCli.Source
+    if (-not (Test-RequiredVersion $version.Version)) {
+        throw "Installed MCP runtime still resolves stale codestory-cli from PATH: $($pathCli.Source) ($($version.Text)); expected $script:RequiredVersion. Stop or restart running 'codestory-cli serve --stdio --refresh none' processes that lock old binaries, move the current install directory before stale PATH entries, then restart the Codex host/app before opening a fresh agent thread."
     }
 }
 
@@ -308,7 +348,7 @@ function Copy-ReleaseCliBinary {
         throw "Default install path is locked or not writable: $defaultError. Alternate install path also failed: $($_.Exception.Message). Stop the process holding $dest or restart the host, then run .\scripts\install-codestory.ps1 -Project . -Version $ReleaseVersion."
     }
 
-    Write-Warning "Default install path is locked or not writable: $defaultError. Installed current release to $versionedDest. To replace the default binary later, stop the locking process or restart the host, then run .\scripts\install-codestory.ps1 -Project . -Version $ReleaseVersion."
+    Write-Warning "Default install path is locked or not writable: $defaultError. Installed current release to $versionedDest and will put that versioned directory first on PATH for new MCP launches. To replace the default binary later, stop the locking process or restart the host, then run .\scripts\install-codestory.ps1 -Project . -Version $ReleaseVersion."
     return $versionedDest
 }
 
@@ -495,6 +535,8 @@ function Invoke-SelfTest {
     Test-WindowsX64 | Out-Null
     Assert-SelfTest (Test-PathListContains "C:\Tools;C:\CodeStory\bin\" "C:\CodeStory\bin") "path-list check should ignore trailing slash"
     Assert-SelfTest (-not (Test-PathListContains "C:\Tools" "C:\CodeStory\bin")) "path-list check should reject missing directory"
+    Assert-SelfTest ((Set-PathListDirectoryFirst "C:\Old;C:\CodeStory\bin" "C:\CodeStory\bin") -eq "C:\CodeStory\bin;C:\Old") "path ordering should put current install first"
+    Assert-SelfTest ((Set-PathListDirectoryFirst "C:\CodeStory\bin;C:\Old;C:\CodeStory\bin\" "C:\CodeStory\bin") -eq "C:\CodeStory\bin;C:\Old") "path ordering should remove duplicate install entries"
     Assert-SelfTest ((Convert-ReleaseTagToVersion "v0.11.4") -eq "0.11.4") "release tag parser should strip v prefix"
     $parsedVersion = Convert-VersionText "codestory-cli 0.11.4"
     Assert-SelfTest (Test-RequiredVersion $parsedVersion) "version gate should accept current release"
@@ -545,6 +587,35 @@ function Invoke-SelfTest {
     } finally {
         if ($currentCli -and (Test-Path -LiteralPath $currentCli)) {
             Remove-Item -LiteralPath $currentCli -Force
+        }
+    }
+
+    $pathRoot = $null
+    $originalProcessPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+    try {
+        $pathRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-install-" + [System.Guid]::NewGuid().ToString("N"))
+        $stalePathDir = Join-Path $pathRoot "stale"
+        $currentPathDir = Join-Path $pathRoot "current"
+        New-Item -ItemType Directory -Force -Path $stalePathDir, $currentPathDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $stalePathDir "codestory-cli.cmd") -Value "@echo codestory-cli 0.11.3" -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $currentPathDir "codestory-cli.cmd") -Value "@echo codestory-cli 0.11.4" -Encoding ASCII
+        [Environment]::SetEnvironmentVariable("Path", "$stalePathDir;$currentPathDir", "Process")
+
+        $pathStale = $false
+        try {
+            Assert-PathCliResolvesCurrent
+        } catch {
+            $pathStale = $_.Exception.Message -match "stale codestory-cli"
+        }
+        Assert-SelfTest $pathStale "stale codestory-cli first on PATH should fail loudly"
+
+        $fixedPath = Set-PathListDirectoryFirst ([Environment]::GetEnvironmentVariable("Path", "Process")) $currentPathDir
+        [Environment]::SetEnvironmentVariable("Path", $fixedPath, "Process")
+        Assert-PathCliResolvesCurrent
+    } finally {
+        [Environment]::SetEnvironmentVariable("Path", $originalProcessPath, "Process")
+        if ($pathRoot) {
+            Remove-InstallerTemp $pathRoot
         }
     }
 
@@ -632,6 +703,7 @@ if (-not $cliInfo) {
     $cliInfo = Install-ReleaseCli $InstallDir $Version
 }
 Ensure-InstallDirOnPath $InstallDir $cliInfo.Path
+Assert-PathCliResolvesCurrent
 
 $projectPath = (Resolve-Path -LiteralPath $Project).Path
 $doctor = Invoke-DoctorJson $cliInfo.Path $projectPath

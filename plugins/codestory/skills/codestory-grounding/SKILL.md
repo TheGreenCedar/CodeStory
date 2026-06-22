@@ -54,6 +54,10 @@ tool source unless the user is editing CodeStory itself.
 6. Put the binary in a stable user bin directory, verify
    `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
    same release when the host has the tools. If `PATH` changed, say the plugin MCP process may need a Codex host/app restart before a new agent thread can see it.
+   If a running `codestory-cli serve --stdio --refresh none` process locks the
+   old binary, install the current release into a versioned directory and put
+   that directory before stale entries on `PATH`; verify `codestory-cli
+   --version` from `PATH` before launch.
 7. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 

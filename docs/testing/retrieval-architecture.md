@@ -145,31 +145,25 @@ node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 
 ---
 
-## Promotion Checklist
+## Promotion Gates
 
-**Benchmark pass columns require a human run** with repos, sidecars, and release
-CLI. This page records the gates; it does not claim those rows have passed.
+This page defines the gates; dated pass/fail rows live in
+[`benchmark-ledger.md`](benchmark-ledger.md) and contributor verification lanes
+live in [`testing-matrix.md`](../contributors/testing-matrix.md).
 
-### Language support audit alignment
+Support claims must be backed by committed benchmark manifests, generated
+artifacts, or tests in the branch. Do not infer support for languages without
+direct benchmark artifacts.
 
-Support claims must be backed by committed benchmark manifests, generated artifacts, or
-tests in the branch. Do not infer support for languages without direct benchmark artifacts.
+A branch may claim only the highest gate that has current evidence:
 
-| Item | Status | Notes |
-|------|--------|-------|
-| Core sidecar stack | done | See implemented stack above |
-| Architecture / design docs | done | `docs/architecture/retrieval-design.md` |
-| Sidecar runbook | done | `docs/ops/retrieval-sidecars.md` |
-| Local-real manifests | done | `benchmarks/tasks/local-real/` |
-| Holdout manifests + fetch script | done | `benchmarks/tasks/holdout-retrieval/`, `scripts/fetch-holdout-repos.mjs` |
-| `freelancer` / `traderotate` removed from default holdouts | done | OSS holdouts only |
-| Generalization lint + guard test | done | `lint-retrieval-generalization.mjs`, `retrieval_generalization_guard` |
-| Promotion guard config | done | `docs/architecture/retrieval-rollback.json` |
-| local-real cold packet + north-star SLOs | **human** | p99 retrieval, quality 3/4, wall targets |
-| holdout-retrieval pass without skip allowances | **human** | Requires materialized OSS repos + index; no generalized claim without required recall/quality/forbidden-claim thresholds |
-| `agent_value_gap` &lt; 0.20 | **human** | Measure from a fresh coherent bundle |
-| Linux + Windows `retrieval-sidecar-smoke` CI jobs | split fail-closed sidecar smoke | [`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#preflight-smoke-contract) |
-| Ragas/Phoenix nightly eval | optional | Not configured |
+| Gate | Required evidence |
+|------|-------------------|
+| Stack shape | Implemented sidecar stack, design doc, sidecar runbook, manifests, warning config, and CI smoke contract exist and are linked from this repo. |
+| Self-e2e | Generalization lint, guard test, release CLI build, `doctor`, and repo-scale e2e stats pass on the branch. |
+| Local-real | Local-real packet/drill rows run against pinned repos with sidecars and no skip allowances. |
+| Holdout generalization | Holdout-retrieval suite runs against materialized OSS repos with required recall/quality thresholds and no forbidden-claim failures. |
+| Promotion-grade | Repeated paired CodeStory/no-CodeStory rows include quality gates, timing/cost accounting, and source-read avoidance checks. |
 
 ### North-Star SLOs
 
@@ -192,15 +186,14 @@ tests in the branch. Do not infer support for languages without direct benchmark
 
 ---
 
-## Promotion Guard Drill
+## Promotion Guard Evidence
 
-After promotion runs, verify guard thresholds from the benchmark artifacts:
+After promotion runs, verify sidecar evidence and guard thresholds from the
+benchmark artifacts:
 
-1. Compare the fresh `packet-runtime-summary.json` against the accepted baseline named by `docs/architecture/retrieval-rollback.json`.
-2. Record any trigger id with the promotion evidence.
-3. Block promotion until the regression is explained or fixed.
-
-These guards are benchmark/promotion evidence only. Sidecar retrieval remains mandatory.
+1. Record `retrieval status --format json` and `doctor --format json` output from the promoted index.
+2. Confirm packet/search evidence reports `retrieval_mode=full`.
+3. Compare the run against the guard thresholds in `docs/architecture/retrieval-rollback.json`; the file stores promotion guard thresholds, not runtime rollback behavior.
 
 **Promotion note:** Local `retrieval status` can report `full` after Qdrant
 re-index. Sidecar-primary is the intended product path, but product promotion

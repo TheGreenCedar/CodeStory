@@ -7,6 +7,24 @@ import { fileURLToPath } from "node:url";
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 
+function readCargoVersion(manifestText) {
+  let inPackage = false;
+  for (const line of manifestText.split(/\r?\n/u)) {
+    if (/^\[[^\]]+\]/u.test(line)) {
+      inPackage = line.trim() === "[package]";
+      continue;
+    }
+    if (!inPackage) {
+      continue;
+    }
+    const versionMatch = line.match(/^version\s*=\s*"([^"]+)"/u);
+    if (versionMatch) {
+      return versionMatch[1];
+    }
+  }
+  assert.fail("Cargo package must declare version");
+}
+
 test("plugin metadata maps skill and direct stdio server", async () => {
   const manifest = JSON.parse(
     await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
@@ -25,6 +43,18 @@ test("plugin metadata maps skill and direct stdio server", async () => {
     "none",
   ]);
   assert.equal(Object.hasOwn(mcp.mcpServers.codestory, "cwd"), false);
+});
+
+test("plugin package version tracks the codestory-cli release version", async () => {
+  const manifest = JSON.parse(
+    await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
+  );
+  const cliManifest = await readFile(
+    join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),
+    "utf8",
+  );
+
+  assert.equal(manifest.version, readCargoVersion(cliManifest));
 });
 
 test("codestory repo ships plugin source, not marketplace catalog or adapter runtime", async () => {
@@ -97,6 +127,9 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
     "uses source fallback only when no release asset fits the host",
     "Agent runtime bootstrap",
     "the skill tells the human that a Codex host/app restart may be needed",
+    "running `codestory-cli serve --stdio --refresh none` process locks the old",
+    "before stale entries on `PATH`",
+    "command that MCP will",
     "The plugin does not bundle the binary",
     "Use source fallback only when no release asset fits the host",
     "Source docs, marketplace source checkout/cache, and the active installed MCP",
