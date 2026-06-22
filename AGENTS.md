@@ -1,5 +1,8 @@
 # Repository Guidelines
 
+CodeStory indexes a repository once so coding agents can answer from local graph
+evidence instead of rediscovering the checkout on every question.
+
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
 - Primary runtime surface is `crates/codestory-cli`; the canonical agent skill ships with the plugin under `plugins/codestory/skills/codestory-grounding`.

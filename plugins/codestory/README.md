@@ -1,7 +1,12 @@
 # CodeStory Agent Plugin
 
+Every agent question often restarts repository discovery: hunt files, read
+snippets, chase imports, rebuild the map. That repeats on every turn and burns
+wall time plus context on work you already paid for.
+
 CodeStory gives a coding agent a local, read-only grounding surface before it
-plans, reviews, or edits a repository.
+plans, reviews, or edits a repository. Index once; answer from evidence with
+citations instead of re-exploring the tree on every prompt.
 
 The human job is simple: install the plugin, start a fresh thread in the repo,
 and ask the agent to check readiness before it makes source claims. The agent
@@ -78,21 +83,60 @@ Open Codex in the repo you want to ground and ask the agent to check readiness
 before planning or editing:
 
 ```text
-@CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
+@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
 ```
 
 The first run should be agent-owned. The skill checks whether `codestory-cli` is
-present and current, installs the latest matching release asset when needed,
-and uses source fallback only when no release asset fits the host.
+present and current, compares `codestory-cli --version` with the latest GitHub
+release, installs the latest matching release asset when needed, verifies
+`SHA256SUMS.txt` when the host can, and uses source fallback only when no release asset fits the host.
 
 ## What To Ask
 
-Good first prompts are agent-shaped:
+Use concrete repo terms. These examples are written for the CodeStory
+repository; adapt paths and symbols to your project:
 
-- `@CodeStory check whether this repository is ready for local navigation and packet/search.`
-- `@CodeStory ground this repository before you plan the change.`
-- `@CodeStory find the code paths involved in request routing, then inspect the concrete snippets.`
-- `@CodeStory answer where cache freshness is enforced, but only make packet/search claims if sidecars are full.`
+**For checking readiness before editing:**
+
+- `@CodeStory check local_navigation and agent_packet_search on this checkout before I edit codestory-indexer.`
+
+**For finding ownership:**
+
+- `@CodeStory Where is RefreshMode defined and which codestory-cli commands accept --refresh?`
+
+**For planning changes with impact hints:**
+
+- `@CodeStory I am editing crates/codestory-indexer/src/resolution/mod.rs. What symbols are affected and what tests should I run first?`
+
+**For understanding sidecar readiness:**
+
+- `@CodeStory Explain where strict_sidecar_status decides retrieval_mode=full.`
+
+**Generalizable prompt templates for any repository:**
+
+**For checking readiness before editing any crate:**
+
+```text
+@CodeStory check local_navigation and agent_packet_search on this checkout before I edit [TARGET_CRATE].
+```
+
+**For finding ownership of a feature:**
+
+```text
+@CodeStory Where is [TARGET_FEATURE] defined and which codestory-cli commands accept --refresh?
+```
+
+**For planning changes with impact hints:**
+
+```text
+@CodeStory I am editing [PATH_TO_FILE]. What symbols are affected by changes in this file, and what tests should I run first?
+```
+
+**For understanding sidecar readiness:**
+
+```text
+@CodeStory Explain where strict_sidecar_status decides retrieval_mode=full.
+```
 
 Avoid prompts that erase the trust boundary:
 

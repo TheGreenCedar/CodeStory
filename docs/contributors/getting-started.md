@@ -1,5 +1,24 @@
 # Contributor Setup
 
+CodeStory exists because agents otherwise rediscover the same repository on
+every question. When you change CodeStory itself, use the same grounding loop
+you ship to users: check readiness, ground the checkout, then trace the owning
+crate before editing.
+
+**Example when working in this repository:**
+
+```text
+@CodeStory Where is RefreshMode defined, which codestory-cli commands accept --refresh, and what is the call path from index into codestory-store?
+```
+
+**Generalizable prompt template for any CodeStory change:**
+
+```text
+@CodeStory Where is [TARGET_FEATURE] defined, which codestory-cli commands accept --refresh, and what is the call path from index into [OWNING_CRATE]?
+```
+
+Replace `[TARGET_FEATURE]` and `[OWNING_CRATE]` with the specific feature and crate you are working on.
+
 ## Choose The Verification Lane First
 
 Before running Cargo or setting up sidecars, answer two questions:
@@ -17,6 +36,15 @@ Use this lane picker from the repo root:
 | Indexer, graph, language, or semantic resolution | The full indexer fidelity suites in the testing matrix. | Language-level packet quality is claimed; use the manifest-backed packet-runtime lane. |
 | Store, snapshots, trails, bookmarks, or search docs | `cargo test -p codestory-store` | The change affects repo-scale semantic or cold-start behavior. |
 | Release or version bump | The release scripts in the testing matrix. | Packet/search readiness is part of the release claim; use the sidecar evidence tiers. |
+
+**Key concepts for verification lanes:**
+
+- **Docs-only changes**: Documentation that doesn't depend on new code behavior, command output, generated docs, or release evidence. Use `git diff --check` to verify formatting.
+- **CLI changes**: Changes to command-line arguments, help text, or output envelopes. These cross runtime behavior and need runtime-backed CLI verification.
+- **Runtime changes**: Changes to search, grounding, orchestration, or agent flows. These claim agent-facing `packet` or `search` readiness and need full sidecar proof.
+- **Indexer changes**: Changes to indexing, graph, language, or semantic resolution. These claim language-level packet quality and need manifest-backed packet-runtime verification.
+- **Store changes**: Changes to storage, snapshots, trails, bookmarks, or search docs. These affect repo-scale semantic or cold-start behavior.
+- **Release changes**: Changes that affect release or version bump. These need sidecar evidence tiers for packet/search readiness.
 
 ## Crate Ownership
 
@@ -55,12 +83,29 @@ cargo check
 cargo test -p codestory-cli
 ```
 
-Run them serially. This workspace shares Cargo build locks.
+**Why run serially:**
+
+This workspace shares Cargo build locks. Running commands serially prevents lock contention and ensures consistent build results.
+
+**When to use this lane:**
 
 Use this lane after the picker says broad Rust checks are useful. If you touch
 graph extraction, semantic resolution, runtime search, grounding, or repo-scale
 indexing behavior, check the testing matrix before you finish so the heavy lane
 is explicit instead of accidental.
+
+**What each command does:**
+
+- `cargo fmt --check`: Verifies that the code follows Rust formatting standards
+- `cargo check`: Checks for compilation errors without building
+- `cargo test -p codestory-cli`: Runs CLI tests to verify command behavior
+
+**Best practices:**
+
+- Always run these commands serially in the order shown
+- If any command fails, fix the issue before proceeding to the next
+- Use this lane for routine code changes and documentation updates
+- For heavy changes, use the appropriate verification lane from the testing matrix
 
 ## Local CLI Loop
 

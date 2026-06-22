@@ -1,6 +1,7 @@
 # Architecture Overview
 
-CodeStory turns a repository into local evidence a coding agent can query: files
+Agents usually rediscover a repository on every question. CodeStory turns a
+repository into local evidence a coding agent can query once and reuse: files
 and symbols in SQLite, optional sidecar indexes for packet/search, thin CLI on
 top of `codestory-runtime`.
 

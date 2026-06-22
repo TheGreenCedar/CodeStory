@@ -1,129 +1,81 @@
-<h1 align="center">CodeStory</h1>
+# CodeStory
 
-<p align="center">
-Local code intelligence for coding agents: graph-backed context, source
-citations, and explicit uncertainty.
-</p>
+**Local code intelligence for coding agents** — graph-backed context, source citations, and explicit uncertainty.
 
-<p align="center">
-<a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
-<a href="Cargo.toml"><img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-orange"></a>
-</p>
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange)](Cargo.toml)
 
-CodeStory builds a local map/code-intelligence layer for a repository so an
-agent can inspect code relationships, retrieve source, trace behavior, and cite
-what it found.
+CodeStory indexes your repository once and keeps a local, read-only map ready: files, symbols, call paths, snippets, and bounded answer packets with citations. The agent starts from evidence it can cite instead of re-exploring the tree from scratch.
 
-Coding agents can sound certain before they have actually mapped the current
-checkout. That is the review problem: plausible prose arrives before the agent
-knows the files, symbols, ownership boundaries, or call paths it is talking
-about.
+## Quick start
 
-The human task is not to get more confident prose. It is to get answers that can
-survive source review. CodeStory gives the agent a local, read-only code graph,
-source snippets, trails, changed-file impact hints, and optional sidecar-backed
-packet/search evidence.
-
-The useful result is smaller and better: the agent starts from evidence it can
-cite, says when the evidence is stale or partial, and treats degraded retrieval
-as a lead to inspect instead of a fact to repeat.
-
-## See It First
-
-Ask the agent for evidence before it plans:
-
-```text
-@CodeStory Ground this repository, then trace where request routing is owned and identify the tests most likely affected by changing it.
-```
-
-A CodeStory-backed answer should come back shaped like this. This is a
-representative result shape, not a transcript from this README branch.
-
-| Result part | What CodeStory gives the agent | How to trust it |
-| --- | --- | --- |
-| Readiness | `local_navigation: ready`; `agent_packet_search: ready`; `retrieval_mode: full` when sidecars are healthy | Local graph output is usable from the SQLite index. Broad packet/search evidence needs full retrieval. |
-| Source evidence | Files, symbols, definitions, references, snippets, and trails with concrete source anchors | Evidence: cite these paths, symbols, and snippets in the answer. |
-| Behavior trace | A bounded trail such as entrypoint -> handler -> helper -> persistence call | Evidence when the trail comes from indexed graph/source rows; inspect snippets before editing. |
-| Impact hints | Changed-file dependents and likely test files | Lead: review planning help, not a substitute for running tests. |
-| Packet/search gaps | Missing sidecars, stale manifests, partial retrieval, truncation, or follow-up commands | Lead only until repaired or source-verified. |
-
-## What Your Agent Gets
-
-- A current file inventory and language coverage notes for the local checkout.
-- Indexed files, symbols, definitions, references, occurrences, and snippets.
-- Graph trails for following callers, callees, imports, overrides, and nearby
-  relationships.
-- Changed-file impact hints for review planning and test selection.
-- Bounded `packet` output for broad repository questions, with citations, gaps,
-  truncation notes, and follow-up commands.
-- `search` for candidate discovery when the retrieval lane is full.
-- Clear degraded-state signals when the cache, index, or sidecars cannot support
-  a proof-bearing claim.
-
-## Use It With An Agent
-
-The easiest way to use CodeStory today is through its Codex plugin. The CLI and
-read-only MCP server are also available directly, but they are the setup, repair,
-and transcript path.
+The normal path is the **Codex plugin**. The CLI and MCP server are for setup, repair, and transcripts.
 
 1. Open Codex in the repository you want to ground.
-2. Use `/plugins`, then install `TheGreenCedar -> codestory`.
+2. Run `/plugins`, then install **TheGreenCedar → codestory**.
 3. Start a fresh thread and ask:
 
 ```text
-@CodeStory check whether this repository is ready for local navigation and packet/search, then ground it before planning changes.
+@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
 ```
 
-The plugin launches the local `codestory-cli serve --stdio --refresh none`
-runtime. It does not edit your repository. Marketplace catalog details, binary
-bootstrap behavior, source fallback, refresh, and uninstall notes live in the
-[plugin README](plugins/codestory/README.md).
+The plugin launches `codestory-cli serve --stdio --refresh none` on your machine. It does not edit your repository. Install details, binary bootstrap, and uninstall notes live in the [plugin README](plugins/codestory/README.md).
 
-## How CodeStory Works
+**Verify without the agent:**
 
-```mermaid
-flowchart LR
-    Repo["Repository checkout"] --> Discovery["Discovery + refresh plan"]
-    Discovery --> Indexer["Parser-backed and structural indexer"]
-    Indexer --> Graph["SQLite graph, snippets, snapshots"]
-    Graph --> Sidecars["Optional retrieval sidecars: Zoekt, Qdrant, SCIP, llama.cpp"]
-    Graph --> Runtime["codestory-runtime"]
-    Sidecars --> Runtime
-    Runtime --> Surfaces["MCP server, CLI, Codex plugin"]
+```sh
+codestory-cli doctor --project <repo>
 ```
 
-The repository is discovered locally, indexed into SQLite-backed graph state,
-and served through the runtime. Optional sidecars add full packet/search
-retrieval when they are healthy. The plugin is the normal agent entry point; the
-CLI is the direct operator path.
+**If install or MCP fails:** marketplace registration, CLI bootstrap, and host restart notes live in the [plugin README](plugins/codestory/README.md).
 
-## Trust And Privacy
+**If a readiness lane fails:** follow [Usage - Operator Journey](docs/usage.md#operator-journey), [Stale Local Cache](docs/usage.md#stale-local-cache), and [Sidecar Repair](docs/usage.md#sidecar-repair).
 
-> [!IMPORTANT]
-> CodeStory is local and read-only by default. Graph navigation comes from the
-> local SQLite index. Broad `packet` and `search` output counts as evidence only
-> when the retrieval lane reports `full`; degraded output is a lead to inspect,
-> not a fact to repeat. Setup may fetch release binaries or sidecar assets, but
-> indexed repository evidence stays in the local cache unless you copy it
-> elsewhere.
+Full operator flow, prompt catalog, and command cheat sheet: [docs/usage.md](docs/usage.md).
 
-## Language Support
+## Example prompts
 
-Public support claims come from
-[`crates/codestory-contracts/src/language_support.rs`](crates/codestory-contracts/src/language_support.rs)
-and the contract summary in
-[language-support.md](docs/architecture/language-support.md).
+Use concrete repo terms, not generic architecture words. When working in the CodeStory repository itself, these are good shapes:
 
-| Claim tier | Current surfaces | Safe wording |
-| --- | --- | --- |
-| Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | Daily graph navigation on typical code, with caveats. |
-| Structural source-proof | HTML, CSS, SQL, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped `Cargo.toml`, dedicated OpenAPI/Swagger endpoint schema anchors | Exact source/schema anchors; not parser-backed graph extraction or semantic runtime proof. |
+**Find ownership**
 
-Language support does not automatically prove typed semantic edges, framework
-route completeness, packet answer quality, token savings, or generalization.
-Those claims need their own tests or benchmark artifacts.
+```text
+@CodeStory Where is RefreshMode defined, which codestory-cli commands accept --refresh, and what is the call path from index into codestory-store?
+```
 
-## CLI Escape Hatch
+**Plan a change with impact hints**
+
+```text
+@CodeStory I am editing crates/codestory-indexer/src/resolution/mod.rs. What symbols are affected by changes in this file, and what tests should I run first?
+```
+
+**Broad question**
+
+```text
+@CodeStory Explain where strict_sidecar_status decides retrieval_mode=full.
+```
+
+Portable templates and adaptation guidance: [Usage - Example prompts](docs/usage.md#example-prompts).
+
+## What your agent gets
+
+| Need | CodeStory surface |
+| --- | --- |
+| Repo orientation | Grounding snapshot, file inventory, language coverage |
+| Symbol lookup | Search, symbol, snippet |
+| Behavior tracing | Trails across callers, callees, imports, and references |
+| Change impact | Affected-file hints for review and test selection |
+| Broad repo questions | Bounded `packet` output with citations and follow-up commands |
+| Candidate discovery | `search` when `agent_packet_search` is ready and `retrieval_mode=full` |
+
+Two readiness lanes matter:
+
+- **Local navigation** — graph, trails, snippets, and impact hints from the SQLite index.
+- **Agent packet/search** — broad discovery and task packets only when sidecar retrieval reports `retrieval_mode: full`.
+
+Treat degraded packet/search output as a lead to inspect, not proof.
+
+## CLI escape hatch
 
 Use the CLI when you need a direct setup, repair, or debug transcript:
 
@@ -135,37 +87,35 @@ codestory-cli files --project <repo> --limit 80
 codestory-cli affected --project <repo> --format markdown
 ```
 
-When packet/search readiness is the question, check the sidecar lane directly:
+When packet/search readiness is the question:
 
 ```sh
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-Repair commands and sidecar setup details are in
-[docs/usage.md](docs/usage.md) and
-[docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
+Repair commands and sidecar setup: [docs/usage.md](docs/usage.md) and [docs/ops/retrieval-sidecars.md](docs/ops/retrieval-sidecars.md).
 
-## Performance And Verification Evidence
+### Build from source
 
-These records are regression and protocol evidence. They are not product proof
-of answer quality, token savings, public benchmark promotion, or generalization.
+```sh
+cargo build --release -p codestory-cli
+./target/release/codestory-cli doctor --project .
+```
 
-| Evidence lane | Current recorded signal | Source | Boundary |
-| --- | --- | --- | --- |
-| Repo-scale full-sidecar stats | 2026-06-18 `d8d59e9e+wt` #41 hardening row: `75.36s` index, `49.45s` semantic phase, `retrieval_mode full`, `4.34s` retrieval index, `0.39s` retrieval status | [codestory-e2e-stats-log.md](docs/testing/codestory-e2e-stats-log.md), summarized in [performance-review-playbook.md](docs/testing/performance-review-playbook.md#current-ops-gates) | Regression telemetry only; that row says the real drill was intentionally skipped. |
-| Repeat full refresh | `29.45s` repeat refresh with `750` reused and `0` embedded | Same 2026-06-18 #41 hardening row | Cache/reuse signal, not quality or generalization proof. |
-| Stdio agent loop smoke | Small fixture release-binary run: `20` reps, `53.50ms` warm loop, protocol stdout-only | [codestory-stdio-warm-loop-stats.md](docs/testing/codestory-stdio-warm-loop-stats.md) | Protocol/read-surface smoke, not repo-scale packet/search proof. |
+On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
-## Speed And Context Value
+## With vs without CodeStory
 
 The product comparison is with CodeStory versus ordinary local exploration on
-the same repo task. The current README evidence uses the focused
-`readme-with-without` task
-[`codestory-index-refresh-mode`](benchmarks/tasks/readme-with-without/codestory-index-refresh-mode.task.json):
-identify the `RefreshMode` enum that defines index refresh modes, cite the
-owning file, and pass the manifest quality gate.
+the same repo task. Two recorded tiers live here; both are scoped A/B evidence,
+not promises for every future question.
 
-Command:
+### Focused README task
+
+The focused `readme-with-without` task
+[`codestory-index-refresh-mode`](benchmarks/tasks/readme-with-without/codestory-index-refresh-mode.task.json)
+asks the agent to identify the `RefreshMode` enum, cite the owning file, and
+pass the manifest quality gate.
 
 ```powershell
 node .\scripts\codestory-agent-ab-benchmark.mjs `
@@ -196,33 +146,40 @@ indexed repo with full retrieval sidecars; the ready-cache check still recorded
 building or installing `codestory-cli`, running `index --refresh full`, and
 preparing retrieval sidecars before packet/search numbers are comparable.
 
-Scope matters: this is one small source-ownership task, not a broad
-answer-quality or generalization benchmark. Broader public savings claims still
-need repeated paired benchmark rows.
+### Language expansion holdout (18 tasks)
 
-## Cache And Worktree Lifecycle
+Broader public-repo evidence uses the
+[`language-support-ab`](benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json)
+manifest across 18 pinned OSS packages. Latest recorded suite totals:
 
-Initial indexing is the expensive pass; pay it once when possible. CodeStory
-stores per-project SQLite graph/search/doc state in the local cache, and the
-Codex worktree setup script can run `cache rehydrate --from-project <source>`
-from a sibling worktree before refreshing the target checkout.
+| Metric | Without | With | Change |
+| --- | ---: | ---: | --- |
+| Context tokens | 9,692,559 | 5,514,580 | −43% |
+| Repeat-task wall time | 7,943s | 4,343s | −45% |
+| Tool calls | 475 | 60 | −87% |
+| Direct source reads | 417 | 0 | −100% |
 
-After cache reuse or rehydrate, the normal path is still to verify freshness:
-run `doctor`, refresh with `index --refresh auto` or `--refresh incremental`,
-then trust local graph navigation only when readiness says it is current. For
-ordinary source edits, prefer incremental indexing so CodeStory reprocesses the
-changed files instead of rebuilding the world.
+Per-task medians, ranges, reproduction commands, and boundary notes:
+[language-expansion holdout stats](docs/testing/language-expansion-holdout-stats.md).
 
-Sidecar and artifact reuse has a stricter boundary. Retrieval manifests,
-sidecar input hashes, embedding backend identity, and stored candidate
-resolution still need revalidation after reuse. If packet/search does not report
-`retrieval_mode full`, the output is a lead for source inspection, not reusable
-proof.
+Scope matters: these are manifest-backed benchmark rows, not broad
+answer-quality or generalization proof. Do not rerun the no-CodeStory baseline
+unless the harness contract changes.
 
-Use [retrieval-architecture.md](docs/testing/retrieval-architecture.md) for
-packet/search promotion gates and
-[docs/README.md](docs/README.md) to choose the right operator, architecture,
-verification, or research document.
+## Documentation
+
+Start from the job you need to do:
+
+| If you want to… | Read |
+| --- | --- |
+| Install, ground a repo, and use the plugin | [Usage](docs/usage.md) |
+| Repair local navigation or sidecar readiness | [Retrieval sidecars ops](docs/ops/retrieval-sidecars.md) |
+| Change CodeStory itself | [Contributor setup](docs/contributors/getting-started.md) |
+| Verify a claim or PR | [Testing matrix](docs/contributors/testing-matrix.md) |
+| Understand retrieval architecture | [Retrieval design](docs/architecture/retrieval-design.md) |
+| Review timing and benchmark records | [E2E stats log](docs/testing/codestory-e2e-stats-log.md) and [language-expansion holdout stats](docs/testing/language-expansion-holdout-stats.md) |
+
+Full doc routing: [docs/README.md](docs/README.md).
 
 ## License
 
