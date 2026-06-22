@@ -539,13 +539,14 @@ fn stdio_initialize_result_json(request: &serde_json::Value) -> serde_json::Valu
         .pointer("/params/protocolVersion")
         .and_then(|value| value.as_str())
         .unwrap_or("2024-11-05");
+    let version = env!("CARGO_PKG_VERSION");
     serde_json::json!({
         "protocolVersion": protocol_version,
         "name": "codestory",
-        "version": "0.1.0",
+        "version": version,
         "serverInfo": {
             "name": "codestory",
-            "version": "0.1.0"
+            "version": version
         },
         "capabilities": {
             "tools": {
