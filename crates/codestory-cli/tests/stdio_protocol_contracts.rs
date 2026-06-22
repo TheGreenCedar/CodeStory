@@ -700,6 +700,16 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
             .is_some_and(|name| name == "codestory"),
         "initialize should report codestory server info: {response}"
     );
+    assert_eq!(
+        result.get("version"),
+        Some(&json!(env!("CARGO_PKG_VERSION"))),
+        "initialize top-level version should match the CLI package version: {response}"
+    );
+    assert_eq!(
+        result.pointer("/serverInfo/version"),
+        Some(&json!(env!("CARGO_PKG_VERSION"))),
+        "initialize serverInfo version should match the CLI package version: {response}"
+    );
     assert!(
         result.get("capabilities").is_some(),
         "initialize should report server capabilities: {response}"
