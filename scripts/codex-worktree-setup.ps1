@@ -38,7 +38,11 @@ function Invoke-SetupStep {
 }
 
 function Test-CodeStoryCli {
-    param([string]$Candidate)
+    param(
+        [string]$Candidate,
+        [string]$ExpectedVersion,
+        [ref]$ActualVersion
+    )
 
     if (-not $Candidate) {
         return $false
@@ -47,9 +51,30 @@ function Test-CodeStoryCli {
         return $false
     }
 
-    # ponytail: --help proves the binary is runnable; doctor remains the real trust gate.
-    & $Candidate --help >$null 2>$null
-    return $LASTEXITCODE -eq 0
+    $versionOutput = & $Candidate --version 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    $versionLine = $versionOutput | Select-Object -First 1
+    if ($versionLine -notmatch '^codestory-cli\s+([0-9][0-9A-Za-z.+-]*)$') {
+        return $false
+    }
+
+    $ActualVersion.Value = $Matches[1]
+    return $ActualVersion.Value -eq $ExpectedVersion
+}
+
+function Get-ExpectedCodeStoryCliVersion {
+    param([string]$Root)
+
+    $manifest = Join-Path $Root "crates\codestory-cli\Cargo.toml"
+    foreach ($line in Get-Content -LiteralPath $manifest) {
+        if ($line -match '^\s*version\s*=\s*"([^"]+)"') {
+            return $Matches[1]
+        }
+    }
+
+    throw "Unable to read expected codestory-cli version from $manifest."
 }
 
 function Get-CodeStoryCliCandidates {
@@ -95,14 +120,24 @@ function Get-CodeStoryCliCandidates {
 function Find-CodeStoryCli {
     param([string]$Root)
 
+    $expectedVersion = Get-ExpectedCodeStoryCliVersion $Root
     $candidates = Get-CodeStoryCliCandidates $Root
+    $staleCandidates = @()
     foreach ($candidate in $candidates) {
-        if (Test-CodeStoryCli $candidate) {
+        $actualVersion = $null
+        if (Test-CodeStoryCli $candidate $expectedVersion ([ref]$actualVersion)) {
             return $candidate
+        }
+        if ($actualVersion) {
+            $staleCandidates += "$candidate reported $actualVersion"
         }
     }
 
-    throw "No ready codestory-cli found via CODESTORY_CLI, PATH, this worktree's target\release, or sibling worktree target\release directories."
+    $message = "No ready codestory-cli $expectedVersion found via CODESTORY_CLI, PATH, this worktree's target\release, or sibling worktree target\release directories."
+    if ($staleCandidates.Count -gt 0) {
+        $message += " Stale candidates: $($staleCandidates -join '; ')."
+    }
+    throw $message
 }
 
 function Same-Path {

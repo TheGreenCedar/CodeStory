@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.11.4
+
+CodeStory 0.11.4 promotes the docs/plugin/setup wave from
+`dev/codestory-next` to `main` as a synchronized patch release. The release
+version is aligned across every `codestory-*` workspace crate and `Cargo.lock`;
+`crates/codestory-cli/Cargo.toml` remains the version source.
+
+This release makes the operator path clearer without changing the product
+runtime contract. The README, docs entry points, glossary, usage guide, and
+architecture docs now start from how an agent or maintainer actually uses
+CodeStory: choose the local navigation lane first, keep source citations and
+uncertainty visible, and treat packet/search proof as valid only when full
+retrieval sidecars are ready. The README evidence was also tightened around a
+small with-vs-without task and then scoped back so it does not read like a broad
+benchmark claim.
+
+The plugin package and grounding skill now match that story. They keep the
+marketplace/catalog boundary outside this repository, document the direct
+`codestory-cli serve --stdio` launch path, guard the read-only stdio tool
+catalog with static tests, and clarify the difference between local navigation,
+exact-target context, and full sidecar-backed packet/search proof.
+
+Contributor and setup docs now bias toward the smallest useful verification
+lane before expensive checks. The worktree setup script also rejects stale
+`codestory-cli` binaries instead of accepting any executable that can print
+`--help`, which makes failed setup noisier but more honest.
+
+Supporting PRs: #340, #342, #344, #347, #350, #354, #355, #357. This release
+does not claim new answer-quality proof, new token-savings generalization,
+benchmark promotion, sidecar performance improvement, marketplace catalog
+publication, or live installed plugin proof beyond the source and release
+checks in the promotion PR.
+
 ## 0.11.3
 
 CodeStory 0.11.3 promotes the post-0.11.2 plugin/runtime polish from

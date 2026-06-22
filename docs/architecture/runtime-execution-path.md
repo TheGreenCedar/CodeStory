@@ -63,7 +63,7 @@ sequenceDiagram
     participant Graph as runtime graph builders
 
     CLI->>Runtime: concrete target request
-    Runtime->>Retrieval: validate full sidecar status and resolve target
+    Runtime->>Retrieval: Investigate sidecar-primary retrieval
     Runtime->>Graph: neighborhood, trail, snippets, citations
     Runtime-->>CLI: context packet with trace and evidence
     CLI->>CLI: render markdown/json and optional bundle
@@ -71,13 +71,17 @@ sequenceDiagram
 
 `context` is target-first. The CLI resolves `--id`, `--query`, or `--bookmark`
 to one concrete target. Query target selection may use read-only indexed-symbol
-resolution to choose that target, but context answer/evidence retrieval still
-fails closed unless strict sidecar status reports `retrieval_mode = full`.
-Runtime then builds the deep evidence packet from graph neighborhoods, trails,
-snippets, and citations. It is not a question-answering command and does not
-interpret broad natural-language prompts. Repo-text or hybrid state can guide
-diagnostics, but `retrieval_mode = full` sidecar evidence is the only
-product-serving retrieval state.
+resolution to choose that target; it is not broad packet/search discovery.
+The context packet still delegates to `runtime.browser.ask` with the
+`Investigate` retrieval profile and the selected `focus_node_id`. Runtime then
+builds the deep evidence packet from sidecar-primary retrieval, graph
+neighborhoods, trails, snippets, and citations. If sidecar primary is
+unavailable, rejected, disabled, or non-`full`, the Investigate path can fail
+closed rather than serving a DB-only answer packet. It is not a
+question-answering command and does not interpret broad natural-language
+prompts. Use `symbol`, `trail`, `snippet`, or `explore` for cache-only local
+navigation when sidecars are degraded; use `packet` or `search` for broad
+sidecar-backed discovery.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 
@@ -99,11 +103,11 @@ reuses the same runtime calls for `/definition`, `/references`, `/symbols`, and
 stdio MCP-style resources/prompts/tools. `doctor` opens the project summary and
 reports cache/index/retrieval health without mutating state.
 
-`explore` remains the browser surface until the
-[browser surface gate](overview.md#browser-surface-gate) is satisfied. Do not add a
-separate `browse` command, web UI route, or browser-specific UI without
-current manifest, warm-loop, stress-lane, explore, and screenshot-review
-evidence.
+`explore` and `serve --stdio` remain the browser-capable read surfaces until the
+[browser surface gate](../testing/codestory-stdio-warm-loop-stats.md#browser-surface-gate)
+is satisfied. Do not add a separate `browse` command, web UI route, or
+browser-specific UI without current manifest, warm-loop, stress-lane, explore,
+and screenshot-review evidence.
 
 ## Ownership Notes
 

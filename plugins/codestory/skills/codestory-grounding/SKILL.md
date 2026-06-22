@@ -5,9 +5,22 @@ description: Use when an agent should ground a local repository with CodeStory b
 
 # CodeStory Grounding
 
-Use CodeStory as the agent's local grounding surface. Prefer the MCP server when
-the plugin is installed and healthy; use the CLI for setup, repair, explicit
-transcripts, or when MCP is unavailable.
+Agents usually rediscover a repository on every question: search files, read
+snippets, chase imports, and spend context rebuilding the same map. CodeStory
+indexes once and serves read-only evidence from that map so you can answer from
+citations instead of repeating discovery work.
+
+Use CodeStory to keep source claims tied to the current local repository. Prefer
+the plugin MCP server when it is installed and healthy. Use the CLI for setup,
+repair, explicit transcripts, or when MCP is unavailable.
+
+**Key concepts:**
+
+- **Repository rediscovery**: The repeated agent work of searching files, reading snippets, and rebuilding a mental map on every new question. CodeStory indexes once to reduce that cost.
+- **Local navigation**: SQLite cache, graph, and DB-backed browse commands (`ground`, `report`, `files`, `trail`, `snippet`, `context --id`, etc.) are usable.
+- **Agent packet/search**: Sidecars are healthy and `retrieval_mode=full`; required for trustworthy `packet`, `search`, and query-based candidate discovery.
+- **Retrieval mode**: Sidecar status contract; only `full` serves agent packet/search.
+- **Semantic ready**: Dense-anchor embedding state matches policy; not the same as agent packet/search readiness.
 
 The target is always a repository workspace. The CodeStory checkout is only the
 tool source unless the user is editing CodeStory itself.
@@ -16,16 +29,19 @@ tool source unless the user is editing CodeStory itself.
 
 1. Resolve `<target-workspace>` explicitly. Do not infer the target from the
    current shell if the user named another repo.
-2. Resolve `<codestory-cli>`:
+2. For installed plugin MCP runtime, `.mcp.json` launches `codestory-cli` from
+   the agent host `PATH`. Use `CODESTORY_CLI` only for manual CLI/source
+   fallback commands, not as the installed MCP launch path.
+3. Resolve `<codestory-cli>` for explicit CLI commands:
    - prefer `CODESTORY_CLI` when set;
    - otherwise use `codestory-cli` on `PATH`;
    - otherwise use a nearby `target/release/codestory-cli*` from the current or
      sibling CodeStory checkout;
    - otherwise install the released binary for the host OS.
-3. Resolve the latest GitHub release tag. If `codestory-cli` exists, compare
+4. Resolve the latest GitHub release tag. If `codestory-cli` exists, compare
    `codestory-cli --version` with that tag and keep the binary only when it
    already matches the latest release.
-4. If `codestory-cli` is missing or outdated, download and unpack only the
+5. If `codestory-cli` is missing or outdated, download and unpack only the
    matching host asset derived from the latest tag. Do this before asking the
    human to install or run manual commands unless network access, permissions,
    or a missing release asset blocks the setup. For latest tag `vX.Y.Z`, use:
@@ -35,12 +51,10 @@ tool source unless the user is editing CodeStory itself.
    - Linux x64: `codestory-cli-vX.Y.Z-linux-x64.tar.gz`
    - Linux arm64: `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`
    - macOS x64 or missing asset: Source fallback. Build from source.
-5. Put the binary in a stable user bin directory, verify
+6. Put the binary in a stable user bin directory, verify
    `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
-   same release when the host has the tools. If `PATH` changed, say that the
-   plugin MCP process may need a Codex host/app restart before a new agent thread
-   can see it.
-6. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
+   same release when the host has the tools. If `PATH` changed, say the plugin MCP process may need a Codex host/app restart before a new agent thread can see it.
+7. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 
 ## MCP Loop
@@ -71,11 +85,12 @@ When MCP is unavailable or a transcript is needed, use the CLI directly:
 2. `index --project <target-workspace> --refresh full` for a first index;
    `--refresh incremental` for normal repair.
 3. `ground --project <target-workspace> --why` for compact orientation.
-4. `search --project <target-workspace> --query ... --why` for candidate
-   discovery after sidecars are full.
+4. `files --project <target-workspace>` for indexed file inventory.
 5. `context`, `symbol`, `trail --story --hide-speculative`, `snippet`, `files`,
    and `affected` for concrete source-backed follow-up.
-6. `packet --project <target-workspace> --question ...` for broad answers only
+6. `search --project <target-workspace> --query ... --why` for candidate
+   discovery after sidecars are full.
+7. `packet --project <target-workspace> --question ...` for broad answers only
    when packet/search readiness is full.
 
 Always pass `--project <target-workspace>` explicitly.
@@ -83,30 +98,35 @@ Always pass `--project <target-workspace>` explicitly.
 ## Evidence Rules
 
 - Treat CodeStory output as evidence, not omniscience.
+- Preserve cited file, symbol, trail, and snippet anchors in user-facing claims.
 - When `packet` reports `sufficient` and has no `follow_up_commands`, answer
-  from the packet and preserve its cited file/symbol anchors.
+  from the packet and preserve its cited anchors.
 - When `packet` reports `partial`, run the named follow-up commands before
   making proof claims.
 - Treat repo-text hits, semantic suggestions, fallback retrieval, stale caches,
-  and missing sidecar manifests as navigation hints only.
+  missing sidecar manifests, and any non-`full` retrieval mode as navigation
+  hints only.
 - `retrieval_mode=full` means graph and lexical sidecars are complete, generated
   symbol docs/component reports are current, and dense anchors are valid for the
-  selected corpus. Anything weaker is not product packet/search proof.
+  selected corpus. It is infrastructure eligibility, not answer-quality proof.
+  Anything weaker is not product packet/search proof.
 - Do not run broad reindexing, sidecar rebuilds, benchmarks, or Cargo builds in
   parallel with another noise-sensitive lane unless the user accepts the timing
   noise.
 
 ## Command Routing
 
-- Setup and health: `setup embeddings`, `doctor`, `ready`, `index`, `cache`.
-- Agent orientation: MCP `ground` / `codestory://grounding` or CLI `ground`.
-- Broad task packet: MCP/CLI `packet`.
-- Candidate discovery: MCP/CLI `search --why`.
-- Focused source view: `symbol`, `trail`, `snippet`, `context`, `explore`.
-- Coverage and impact: MCP/CLI `files`, `affected`.
-- Reusable targets: `bookmark`.
-- Structured evaluation: `drill`, `drill-suite`.
-- Local integration surface: `serve --stdio`.
+| Need | Route |
+| --- | --- |
+| Setup and health | `setup embeddings`, `doctor`, `ready`, `index`, `cache` |
+| Agent orientation | MCP `ground` / `codestory://grounding` or CLI `ground` |
+| Broad task packet | MCP/CLI `packet` |
+| Candidate discovery | MCP/CLI `search --why` |
+| Focused source view | `symbol`, `trail`, `snippet`, `context`, `explore` |
+| Coverage and impact | MCP/CLI `files`, `affected` |
+| Reusable targets | `bookmark` |
+| Structured evaluation | `drill`, `drill-suite` |
+| Local integration surface | `serve --stdio` |
 
 Load the matching reference only when detailed flags, examples, or
 troubleshooting rules are needed:
