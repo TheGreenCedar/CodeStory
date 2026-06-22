@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import tomllib
@@ -49,6 +50,18 @@ def lock_packages(root: Path) -> dict[str, set[str]]:
     return packages
 
 
+def plugin_version(root: Path) -> str:
+    manifest_path = root / "plugins" / "codestory" / ".codex-plugin" / "plugin.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{manifest_path} does not exist") from exc
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version:
+        raise ValueError(f"{manifest_path} must declare a string version")
+    return version
+
+
 def fail(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
@@ -77,6 +90,13 @@ def main() -> None:
         fail(f"{cli_manifest} package.name is {cli_name!r}, expected 'codestory-cli'")
     if cli_version != expected:
         fail(f"codestory-cli version is {cli_version}, expected {expected}")
+
+    current_plugin_version = plugin_version(root)
+    if current_plugin_version != expected:
+        fail(
+            "plugins/codestory/.codex-plugin/plugin.json version is "
+            f"{current_plugin_version}, expected {expected}"
+        )
 
     workspace_versions: dict[str, str] = {}
     for manifest_path in workspace_members(root):
@@ -111,7 +131,7 @@ def main() -> None:
 
     print(
         f"CodeStory release version {expected} is synchronized across "
-        f"{len(workspace_versions)} workspace crates and Cargo.lock."
+        f"{len(workspace_versions)} workspace crates, Cargo.lock, and the codestory plugin."
     )
 
 
