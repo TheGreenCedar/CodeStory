@@ -17,7 +17,7 @@ debugging, transcripts, and direct stdio integration.
 | First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | `local_navigation` is ready before using local graph output. |
 | Source work | Ask for a plan, review, or code path. | Use `files`, `symbol`, `trail`, `snippet`, `context`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
 | Broad discovery | Ask a repo-wide question. | Use `packet` or `search`. | Trust only when `agent_packet_search` is ready and `retrieval_mode=full`. |
-| Repair | Ask for a transcript or run CLI directly. | Use `doctor`, `index`, `retrieval status`, and sidecar repair commands. | Repeat readiness checks after repair. |
+| Repair | Ask for a transcript or run CLI directly. | Use `ready --goal local --repair` or `ready --goal agent --repair`. | Repeat readiness checks after repair. |
 
 Packet/search output from degraded retrieval, missing sidecars, stale manifests,
 or any non-`full` retrieval mode is navigation help only. It is not proof.
@@ -89,15 +89,13 @@ workspace you want to ground. The canonical skill package lives at
 **Direct CLI transcript (for setup, repair, or debugging):**
 
 ```sh
-codestory-cli doctor --project <target-workspace>
-codestory-cli index --project <target-workspace> --refresh auto
+codestory-cli ready --goal local --repair --project <target-workspace> --format json
 codestory-cli ground --project <target-workspace> --why
 ```
 
 **What each command does:**
 
-- `doctor`: Separates local navigation readiness from agent packet/search readiness
-- `index`: Builds or refreshes the SQLite graph and derived local read models
+- `ready --goal local --repair`: Builds or refreshes the SQLite graph and derived local read models
 - `ground`: Provides a broad repo-level orientation snapshot
 
 **Key guidance:**
@@ -106,7 +104,11 @@ Do not infer packet/search readiness from a successful local grounding command. 
 
 **Next steps after installation:**
 
-If the agent reports that local navigation is ready but agent packet/search is not ready, you may need to repair the sidecar lane. The agent will provide specific guidance on what to do next.
+If the agent reports that local navigation is ready but agent packet/search is not ready, repair the sidecar lane with:
+
+```sh
+codestory-cli ready --goal agent --repair --project <target-workspace> --format json
+```
 
 **Common next steps:**
 

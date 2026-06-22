@@ -481,6 +481,11 @@ pub(crate) struct ReadyCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long, value_enum)]
     pub(crate) goal: Option<ReadyGoal>,
+    #[arg(
+        long,
+        help = "Repair readiness before reporting it. Local repairs refresh the index; agent repairs also bootstrap and rebuild retrieval sidecars."
+    )]
+    pub(crate) repair: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(

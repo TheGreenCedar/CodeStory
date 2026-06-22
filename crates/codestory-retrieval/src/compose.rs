@@ -1,4 +1,4 @@
-use crate::config::{SidecarLayout, retrieval_compose_profile};
+use crate::config::{SidecarLayout, retrieval_compose_profile, user_cache_root};
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
 use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 /// Relative path from repository root to the retrieval compose file.
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
+const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-compose.yml");
 
 #[derive(Debug, Clone)]
 pub struct BootstrapReport {
@@ -122,10 +123,23 @@ pub fn resolve_compose_file(
             return Ok(candidate);
         }
     }
-    bail!(
-        "retrieval compose file not found (expected {DEFAULT_COMPOSE_REL_PATH} under repo root); \
-         set CODESTORY_RETRIEVAL_COMPOSE_FILE or pass --compose-file"
-    );
+    write_bundled_compose_file(&user_cache_root())
+}
+
+fn write_bundled_compose_file(cache_root: &Path) -> Result<PathBuf> {
+    let compose_path = cache_root.join("retrieval-compose.yml");
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("create CodeStory cache dir {}", cache_root.display()))?;
+    if compose_path.is_file()
+        && std::fs::read_to_string(&compose_path)
+            .map(|contents| contents == BUNDLED_RETRIEVAL_COMPOSE)
+            .unwrap_or(false)
+    {
+        return Ok(compose_path);
+    }
+    std::fs::write(&compose_path, BUNDLED_RETRIEVAL_COMPOSE)
+        .with_context(|| format!("write bundled retrieval compose {}", compose_path.display()))?;
+    Ok(compose_path)
 }
 
 pub fn docker_available() -> bool {
@@ -332,5 +346,29 @@ mod tests {
             docker_bind_path(Path::new(r"\\?\C:\Users\alber\codestory\models")),
             "C:/Users/alber/codestory/models"
         );
+    }
+
+    #[test]
+    fn bundled_compose_file_is_written_to_cache() {
+        let cache = tempdir().expect("cache");
+        let path = write_bundled_compose_file(cache.path()).expect("write bundled compose");
+
+        assert_eq!(path, cache.path().join("retrieval-compose.yml"));
+        let contents = std::fs::read_to_string(path).expect("read bundled compose");
+        assert!(contents.contains("name: codestory-retrieval"));
+        assert!(contents.contains("qdrant/qdrant:v1.12.5"));
+    }
+
+    #[test]
+    fn repo_compose_file_still_wins_over_bundled_fallback() {
+        let project = tempdir().expect("project");
+        let compose = project.path().join(DEFAULT_COMPOSE_REL_PATH);
+        std::fs::create_dir_all(compose.parent().expect("compose parent"))
+            .expect("create compose parent");
+        std::fs::write(&compose, "services: {}\n").expect("write compose");
+
+        let resolved = resolve_compose_file(Some(project.path()), None).expect("resolve compose");
+
+        assert_eq!(resolved, compose);
     }
 }

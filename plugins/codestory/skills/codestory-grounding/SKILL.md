@@ -89,17 +89,18 @@ commands and label packet/search as blocked.
 
 When MCP is unavailable or a transcript is needed, use the CLI directly:
 
-1. `doctor --project <target-workspace>` for cache, index, freshness, and
-   sidecar health.
-2. `index --project <target-workspace> --refresh full` for a first index;
-   `--refresh incremental` for normal repair.
-3. `ground --project <target-workspace> --why` for compact orientation.
-4. `files --project <target-workspace>` for indexed file inventory.
-5. `context`, `symbol`, `trail --story --hide-speculative`, `snippet`, `files`,
+1. `ready --goal local --repair --project <target-workspace> --format json`
+   before local navigation or delegation when the index is missing or stale.
+2. `ready --goal agent --repair --project <target-workspace> --format json`
+   before packet/search claims when sidecars are missing or stale.
+3. `doctor --project <target-workspace>` for a read-only health transcript.
+4. `ground --project <target-workspace> --why` for compact orientation.
+5. `files --project <target-workspace>` for indexed file inventory.
+6. `context`, `symbol`, `trail --story --hide-speculative`, `snippet`, `files`,
    and `affected` for concrete source-backed follow-up.
-6. `search --project <target-workspace> --query ... --why` for candidate
+7. `search --project <target-workspace> --query ... --why` for candidate
    discovery after sidecars are full.
-7. `packet --project <target-workspace> --question ...` for broad answers only
+8. `packet --project <target-workspace> --question ...` for broad answers only
    when packet/search readiness is full.
 
 Always pass `--project <target-workspace>` explicitly.

@@ -1970,9 +1970,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert!(
         !next_call_text.contains("codestory-cli index --project")
-            && next_call_text.contains("--refresh full")
-            && next_call_text.contains("retrieval bootstrap")
-            && next_call_text.contains("retrieval index")
+            && !next_call_text.contains("retrieval bootstrap")
+            && !next_call_text.contains("retrieval index")
+            && next_call_text.contains("codestory-cli ready --goal agent --repair")
             && next_call_text.contains("retrieval status")
             && next_call_text.contains("codestory://status")
             && next_call_text.contains("codestory://agent-guide"),
@@ -2051,8 +2051,7 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         "stale index readiness should recommend repair, not packet/search calls: {last_status}"
     );
     assert!(
-        status_next_call_text.contains("codestory-cli index --project")
-            && status_next_call_text.contains("--refresh incremental")
+        status_next_call_text.contains("codestory-cli ready --goal local --repair")
             && status_next_call_text.contains("codestory://status"),
         "stale index readiness should recommend index repair and a status recheck: {last_status}"
     );
