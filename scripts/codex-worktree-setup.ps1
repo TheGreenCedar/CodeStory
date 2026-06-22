@@ -37,6 +37,93 @@ function Invoke-SetupStep {
     }
 }
 
+function Get-ReadinessVerdict {
+    param(
+        $Doctor,
+        [string]$Goal
+    )
+
+    foreach ($verdict in @($Doctor.readiness)) {
+        if ($verdict.goal -eq $Goal) {
+            return $verdict
+        }
+    }
+
+    return $null
+}
+
+function Test-ReadinessReady {
+    param($Verdict)
+
+    return ($Verdict -and $Verdict.status -eq "ready")
+}
+
+function Get-MinimumNextCommand {
+    param(
+        $LocalVerdict,
+        $AgentVerdict,
+        $Doctor
+    )
+
+    foreach ($verdict in @($LocalVerdict, $AgentVerdict)) {
+        if (-not (Test-ReadinessReady $verdict)) {
+            foreach ($command in @($verdict.minimum_next)) {
+                if ($command) {
+                    return [string]$command
+                }
+            }
+        }
+    }
+
+    foreach ($command in @($Doctor.next_commands)) {
+        if ($command) {
+            return [string]$command
+        }
+    }
+
+    return $null
+}
+
+function Invoke-DoctorJson {
+    param(
+        [string]$Cli,
+        [string]$ProjectPath
+    )
+
+    $json = (& $Cli doctor --project $ProjectPath --format json 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "codestory-cli doctor failed with exit code $LASTEXITCODE`n$json"
+    }
+
+    return ($json | ConvertFrom-Json)
+}
+
+function Write-DoctorReadinessSummary {
+    param($Doctor)
+
+    $local = Get-ReadinessVerdict $Doctor "local_navigation"
+    $agent = Get-ReadinessVerdict $Doctor "agent_packet_search"
+    $minimumNext = Get-MinimumNextCommand $local $agent $Doctor
+
+    Write-Host "CodeStory worktree readiness"
+    Write-Host ("  local_navigation: {0}" -f $(if ($local) { $local.status } else { "unknown" }))
+    if ($local -and $local.summary) {
+        Write-Host ("    reason: {0}" -f $local.summary)
+    }
+    Write-Host ("  agent_packet_search: {0}" -f $(if ($agent) { $agent.status } else { "unknown" }))
+    if ($agent -and $agent.summary) {
+        Write-Host ("    reason: {0}" -f $agent.summary)
+    }
+    Write-Host ("  retrieval_mode: {0}" -f $Doctor.retrieval_mode)
+    Write-Host ("  degraded_reason: {0}" -f $(if ($Doctor.degraded_reason) { $Doctor.degraded_reason } else { "none" }))
+    if ($minimumNext) {
+        Write-Host ("  minimum_next: {0}" -f $minimumNext)
+    }
+    if (-not (Test-ReadinessReady $agent)) {
+        Write-Host "  handoff: CodeStory packet/search is unavailable; use direct source reads until the minimum_next command repairs readiness."
+    }
+}
+
 function Test-CodeStoryCli {
     param(
         [string]$Candidate,
@@ -239,8 +326,9 @@ try {
         Invoke-Checked $cli @("retrieval", "index", "--project", $projectPath, "--refresh", "auto")
     } -Optional
 
-    Invoke-SetupStep "Doctor" {
-        Invoke-Checked $cli @("doctor", "--project", $projectPath, "--format", "markdown")
+    Invoke-SetupStep "Doctor readiness handoff" {
+        $doctor = Invoke-DoctorJson $cli $projectPath
+        Write-DoctorReadinessSummary $doctor
     } -Optional
 } finally {
     Pop-Location
