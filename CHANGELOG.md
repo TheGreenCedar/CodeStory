@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.11.6
+
+CodeStory 0.11.6 promotes the reviewed `dev/codestory-next` release delta onto
+`main` as a synchronized patch release. The version is aligned across every
+`codestory-*` workspace crate, `Cargo.lock`, and the CodeStory plugin manifest
+so future release checks catch plugin/package drift before a PR reaches review.
+
+The plugin and release path now make stale runtime repair more explicit. The
+plugin package version tracks the CLI release, while the Windows installer can
+recover when an old stdio server keeps the default `codestory-cli` binary
+locked: it installs the current release into a versioned directory, moves that
+directory ahead of stale PATH entries for new launches, and fails loudly if
+`codestory-cli --version` still resolves to the wrong binary.
+
+The documentation cleanup keeps readers on the durable operating surfaces:
+usage for operator flow, architecture pages for subsystem ownership, sidecar
+runbooks for packet/search readiness, and benchmark/testing docs for promotion
+evidence. Packet/search remains proof-bearing only when sidecar retrieval is
+full.
+
+Supporting PRs: #376, #377, #379. This release does not claim new answer-quality
+proof, sidecar performance improvement, benchmark promotion, marketplace
+publication, or live installed plugin proof beyond the source and release
+checks in the promotion PR.
+
 ## 0.11.5
 
 CodeStory 0.11.5 carries the setup and documentation repair cleanup that
