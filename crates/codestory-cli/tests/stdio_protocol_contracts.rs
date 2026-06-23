@@ -13,6 +13,7 @@ struct StdioFixture {
     cache_dir: TempDir,
     hash_embeddings: bool,
     latest_release_version: String,
+    disable_installed_cli_probe: bool,
 }
 
 struct StdioServer {
@@ -132,6 +133,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         cache_dir,
         hash_embeddings,
         latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        disable_installed_cli_probe: false,
     }
 }
 
@@ -222,6 +224,9 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         "CODESTORY_LATEST_RELEASE_VERSION",
         &fixture.latest_release_version,
     );
+    if fixture.disable_installed_cli_probe {
+        command.env("CODESTORY_DISABLE_INSTALLED_CLI_PROBE", "1");
+    }
     let mut child = command.spawn().expect("spawn stdio server");
 
     let stdin = child.stdin.take().expect("stdio stdin");
@@ -2098,6 +2103,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
     let mut fixture = indexed_fixture();
     fixture.latest_release_version = "999.0.0".to_string();
+    fixture.disable_installed_cli_probe = true;
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -2143,6 +2149,7 @@ fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
 fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
     let mut fixture = indexed_fixture();
     fixture.latest_release_version = "999.0.0".to_string();
+    fixture.disable_installed_cli_probe = true;
     let mut server = spawn_stdio_server(&fixture);
 
     for (tool, arguments) in [

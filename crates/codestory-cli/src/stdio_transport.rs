@@ -17,6 +17,8 @@ use codestory_contracts::api::{
 };
 use codestory_retrieval::SidecarLayout;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration as StdDuration;
 
 use crate::args;
@@ -2049,13 +2051,140 @@ fn stdio_setup_repair_input(
     let latest = stdio_latest_release_version()?;
     let active = env!("CARGO_PKG_VERSION");
     if compare_semver(active, &latest).is_some_and(|ordering| ordering.is_lt()) {
+        let newer = stdio_newer_installed_cli(active, &latest, server_executable);
         return Some(crate::readiness::ReadinessSetupInput {
             active_path: server_executable.unwrap_or("<unknown>").to_string(),
             active_version: active.to_string(),
             latest_version: latest,
+            newer_installed_path: newer.as_ref().map(|cli| cli.path.clone()),
+            newer_installed_version: newer.map(|cli| cli.version),
         });
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledCliCandidate {
+    path: String,
+    version: String,
+}
+
+fn stdio_newer_installed_cli(
+    active_version: &str,
+    latest_version: &str,
+    server_executable: Option<&str>,
+) -> Option<InstalledCliCandidate> {
+    if std::env::var("CODESTORY_DISABLE_INSTALLED_CLI_PROBE").is_ok() {
+        return None;
+    }
+    stdio_installed_cli_candidates(latest_version)
+        .into_iter()
+        .filter(|candidate| {
+            server_executable.is_none_or(|active| !same_path_text(candidate, active))
+        })
+        .filter_map(|candidate| stdio_cli_version(&candidate).map(|version| (candidate, version)))
+        .filter(|(_, version)| {
+            compare_semver(version, active_version).is_some_and(|ordering| ordering.is_gt())
+        })
+        .max_by(|left, right| {
+            semver_triplet(&left.1)
+                .unwrap_or_default()
+                .cmp(&semver_triplet(&right.1).unwrap_or_default())
+        })
+        .map(|(path, version)| InstalledCliCandidate { path, version })
+}
+
+fn stdio_installed_cli_candidates(latest_version: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(cli) = std::env::var("CODESTORY_CLI")
+        && !cli.trim().is_empty()
+    {
+        candidates.push(cli);
+    }
+    for home in stdio_codestory_home_candidates() {
+        let bin = home.join("bin");
+        push_cli_candidate_paths(&mut candidates, &bin);
+        push_cli_candidate_paths(&mut candidates, &bin.join("releases").join(latest_version));
+    }
+    dedupe_path_text(candidates)
+}
+
+fn stdio_codestory_home_candidates() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Ok(home) = std::env::var("CODESTORY_HOME")
+        && !home.trim().is_empty()
+    {
+        homes.push(PathBuf::from(home));
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
+        && !local_app_data.trim().is_empty()
+    {
+        homes.push(PathBuf::from(local_app_data).join("CodeStory"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        homes.push(PathBuf::from(home).join(".codestory"));
+    }
+    dedupe_pathbufs(homes)
+}
+
+fn push_cli_candidate_paths(candidates: &mut Vec<String>, directory: &Path) {
+    candidates.push(
+        directory
+            .join(if cfg!(windows) {
+                "codestory-cli.exe"
+            } else {
+                "codestory-cli"
+            })
+            .to_string_lossy()
+            .to_string(),
+    );
+    candidates.push(
+        directory
+            .join("codestory-cli")
+            .to_string_lossy()
+            .to_string(),
+    );
+}
+
+fn stdio_cli_version(candidate: &str) -> Option<String> {
+    let output = Command::new(candidate).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace().find_map(normalize_release_version)
+}
+
+fn same_path_text(left: &str, right: &str) -> bool {
+    left.trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(right.trim_end_matches(['\\', '/']))
+}
+
+fn dedupe_path_text(paths: Vec<String>) -> Vec<String> {
+    let mut deduped: Vec<String> = Vec::new();
+    for path in paths {
+        if path.trim().is_empty() || deduped.iter().any(|seen| same_path_text(seen, &path)) {
+            continue;
+        }
+        deduped.push(path);
+    }
+    deduped
+}
+
+fn dedupe_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if deduped
+            .iter()
+            .any(|seen| same_path_text(&seen.to_string_lossy(), &path.to_string_lossy()))
+        {
+            continue;
+        }
+        deduped.push(path);
+    }
+    deduped
 }
 
 fn stdio_latest_release_version() -> Option<String> {
@@ -2098,12 +2227,7 @@ fn stdio_status_recommended_next_calls(readiness: &[ReadinessVerdictDto]) -> ser
             non_ready
                 .full_repair
                 .iter()
-                .map(|command| {
-                    serde_json::json!({
-                        "method": "cli",
-                        "command": command
-                    })
-                })
+                .map(|command| stdio_recommended_next_call(command))
                 .chain([
                     serde_json::json!({
                         "method": "resources/read",
@@ -2158,6 +2282,19 @@ fn stdio_status_recommended_next_calls(readiness: &[ReadinessVerdictDto]) -> ser
             "uri": "codestory://trail/<node_id-from-search>"
         }
     ])
+}
+
+fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
+    if command.starts_with("Restart/reload the Codex host/app") {
+        return serde_json::json!({
+            "method": "host/restart",
+            "instruction": command
+        });
+    }
+    serde_json::json!({
+        "method": "cli",
+        "command": command
+    })
 }
 
 fn stdio_server_executable_status() -> (Option<String>, Vec<String>) {
@@ -2522,6 +2659,31 @@ mod tests {
             storage_fingerprint: storage_fingerprint.to_string(),
             ..base_packet_cache_key_input(question)
         })
+    }
+
+    #[test]
+    fn stdio_recommended_next_calls_labels_restart_boundary_as_host_action() {
+        let restart =
+            "Restart/reload the Codex host/app so MCP relaunches codestory-cli 0.11.11 from C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe; then open a fresh agent thread and read codestory://status."
+                .to_string();
+        let calls = stdio_status_recommended_next_calls(&[ReadinessVerdictDto {
+            goal: ReadinessGoalDto::LocalNavigation,
+            status: ReadinessStatusDto::RepairSetup,
+            summary: "A newer installed codestory-cli exists outside the active process."
+                .to_string(),
+            minimum_next: vec![restart.clone()],
+            full_repair: vec![restart.clone()],
+            setup: None,
+            index: None,
+            sidecar: None,
+        }]);
+
+        assert_eq!(calls[0]["method"], json!("host/restart"));
+        assert_eq!(calls[0]["instruction"], json!(restart));
+        assert!(
+            calls[0].get("command").is_none(),
+            "restart boundary should not be exposed as a CLI command: {calls}"
+        );
     }
 
     #[test]

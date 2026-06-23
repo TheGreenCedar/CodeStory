@@ -323,6 +323,10 @@ pub struct ReadinessSetupSnapshotDto {
     pub active_path: String,
     pub active_version: String,
     pub latest_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_installed_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_installed_version: Option<String>,
 }
 
 /// Index state snapshot used inside readiness verdicts.
