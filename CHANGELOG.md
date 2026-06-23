@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.11.8
+
+CodeStory 0.11.8 promotes the latest reviewed readiness and plugin guidance
+fixes from `dev/codestory-next` onto `main` without carrying stale 0.11.6
+release metadata forward.
+
+The release documents the MCP registration failure path in the plugin guidance,
+repairs readiness setup around bundled compose artifacts and explicit ready
+environment handling, and keeps llama.cpp environment propagation visible when
+`ready` prepares semantic sidecars. The version is aligned across every
+`codestory-*` workspace crate, `Cargo.lock`, and the CodeStory plugin manifest.
+
+Supporting PRs: #396, #398, #401. This release does not claim new packet/search
+answer-quality proof, sidecar performance improvement, benchmark promotion, or
+live installed plugin proof beyond the source and release checks in the
+promotion PR.
+
 ## 0.11.7
 
 CodeStory 0.11.7 closes the product-grade intelligence saga with the final
