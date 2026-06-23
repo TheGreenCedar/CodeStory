@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.15
+
+CodeStory 0.11.15 fixes installed hook execution in Codex plugin caches that
+inherit an ES module package scope from the Codex home. Hook runtime scripts now
+ship as CommonJS `.cjs` entrypoints so `SessionStart` and `UserPromptSubmit`
+can load before emitting ambient grounding context.
+
+This release does not change the hook grounding behavior introduced in 0.11.14;
+it makes that behavior executable from the installed plugin surface.
+
 ## 0.11.14
 
 CodeStory 0.11.14 makes plugin lifecycle hooks ambient instead of merely
