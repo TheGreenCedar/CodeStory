@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.14
+
+CodeStory 0.11.14 makes plugin lifecycle hooks ambient instead of merely
+instructional. Hook-enabled hosts now keep CodeStory-first grounding in hidden
+context, attempt a strict startup ground snapshot, and attempt request-aware
+packet grounding from the actual user prompt.
+
+Hooks still fail open: missing runtime pieces, degraded retrieval, non-repo
+folders, empty output, or hook-budget timeouts leave next-step guidance instead
+of blocking the agent session.
+
 ## 0.11.13
 
 CodeStory 0.11.13 reports the host restart/reload boundary after a stale
