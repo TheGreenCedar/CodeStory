@@ -17,6 +17,7 @@ use codestory_contracts::api::{
 };
 use codestory_retrieval::SidecarLayout;
 use std::io::{BufRead, Write};
+use std::time::Duration as StdDuration;
 
 use crate::args;
 use crate::http_transport::{
@@ -185,6 +186,20 @@ fn handle_stdio_message(
                     "Invalid params: tool arguments must be an object",
                 ));
             }
+            match stdio_tool_blocked_error(runtime, state, name) {
+                Ok(Some(error)) => {
+                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = serde_json::json!({
+                        "code": "readiness_unavailable",
+                        "message": format!("Unable to evaluate CodeStory readiness before running `{name}`: {error}"),
+                        "tool": name
+                    });
+                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                }
+            }
             return Some(stdio_jsonrpc_tool_call_from_legacy(
                 id,
                 handle_stdio_tool_call(runtime, state, &request),
@@ -248,6 +263,55 @@ fn stdio_jsonrpc_from_legacy(
         return response;
     }
     stdio_jsonrpc_success(id, response)
+}
+
+fn stdio_tool_blocked_error(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let status = read_stdio_status_resource_cached(runtime, state)?;
+    let Some(surface) = status.pointer(&format!("/allowed_surfaces/{name}")) else {
+        return Ok(None);
+    };
+    if surface
+        .get("allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let readiness_goal = surface
+        .get("readiness_goal")
+        .and_then(serde_json::Value::as_str);
+    let verdict = readiness_goal.and_then(|goal| {
+        status
+            .get("readiness")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|verdicts| {
+                verdicts.iter().find(|verdict| {
+                    verdict.get("goal").and_then(serde_json::Value::as_str) == Some(goal)
+                })
+            })
+    });
+    let message = surface
+        .get("blocked_reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| surface.get("summary").and_then(serde_json::Value::as_str))
+        .unwrap_or("CodeStory readiness blocks this tool.");
+    Ok(Some(serde_json::json!({
+        "code": "codestory_tool_blocked",
+        "message": format!("CodeStory tool `{name}` is blocked: {message}"),
+        "tool": name,
+        "readiness_goal": surface.get("readiness_goal").cloned().unwrap_or(serde_json::Value::Null),
+        "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "minimum_next": surface.get("minimum_next").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "full_repair": surface.get("full_repair").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
+        "sidecar": verdict.and_then(|verdict| verdict.get("sidecar")).cloned().unwrap_or(serde_json::Value::Null),
+    })))
 }
 
 fn stdio_jsonrpc_tool_call_from_legacy(
@@ -1938,10 +2002,13 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "manifest_generation": manifest_generation.clone(),
         "manifest_input_hash": manifest_input_hash.clone(),
     });
+    let (server_executable, server_warnings) = stdio_server_executable_status();
+    let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
         stats: &summary.stats,
         freshness: summary.freshness.as_ref(),
+        setup: setup_repair.as_ref(),
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
             retrieval_mode: &sidecar_mode,
             degraded_reason: degraded_reason.as_deref(),
@@ -1951,7 +2018,6 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     });
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness);
-    let (server_executable, server_warnings) = stdio_server_executable_status();
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "server_executable": server_executable,
@@ -1975,6 +2041,55 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "allowed_surfaces": allowed_surfaces,
         "recommended_next_calls": recommended_next_calls
     }))
+}
+
+fn stdio_setup_repair_input(
+    server_executable: Option<&str>,
+) -> Option<crate::readiness::ReadinessSetupInput> {
+    let latest = stdio_latest_release_version()?;
+    let active = env!("CARGO_PKG_VERSION");
+    if compare_semver(active, &latest).is_some_and(|ordering| ordering.is_lt()) {
+        return Some(crate::readiness::ReadinessSetupInput {
+            active_path: server_executable.unwrap_or("<unknown>").to_string(),
+            active_version: active.to_string(),
+            latest_version: latest,
+        });
+    }
+    None
+}
+
+fn stdio_latest_release_version() -> Option<String> {
+    if let Ok(version) = std::env::var("CODESTORY_LATEST_RELEASE_VERSION")
+        && let Some(version) = normalize_release_version(&version)
+    {
+        return Some(version);
+    }
+    let response =
+        ureq::get("https://api.github.com/repos/TheGreenCedar/CodeStory/releases/latest")
+            .timeout(StdDuration::from_secs(2))
+            .call()
+            .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&response.into_string().ok()?).ok()?;
+    body.get("tag_name")
+        .and_then(|value| value.as_str())
+        .and_then(normalize_release_version)
+}
+
+fn normalize_release_version(version: &str) -> Option<String> {
+    let trimmed = version.trim().trim_start_matches('v');
+    semver_triplet(trimmed).map(|_| trimmed.to_string())
+}
+
+fn compare_semver(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(semver_triplet(left)?.cmp(&semver_triplet(right)?))
+}
+
+fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
 }
 
 fn stdio_status_recommended_next_calls(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
@@ -2099,6 +2214,7 @@ fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::V
                 "readiness_goal": crate::readiness::goal_label(verdict.goal),
                 "status": crate::readiness::status_label(verdict.status),
                 "summary": verdict.summary,
+                "repair_reason": stdio_repair_reason(verdict),
                 "blocked_reason": if allowed { None } else { Some(verdict.summary.as_str()) },
                 "minimum_next": verdict.minimum_next,
                 "full_repair": verdict.full_repair,
@@ -2109,11 +2225,26 @@ fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::V
             "readiness_goal": null,
             "status": "unknown",
             "summary": "Readiness verdict was not available for this surface.",
+            "repair_reason": null,
             "blocked_reason": "Readiness verdict was not available for this surface.",
             "minimum_next": [],
             "full_repair": [],
         }),
     }
+}
+
+fn stdio_repair_reason(verdict: &ReadinessVerdictDto) -> Option<String> {
+    if verdict.status == ReadinessStatusDto::RepairSetup {
+        return Some("stale_active_cli".to_string());
+    }
+    if verdict.status == ReadinessStatusDto::RepairRetrieval {
+        return verdict
+            .sidecar
+            .as_ref()
+            .and_then(|sidecar| sidecar.degraded_reason.clone())
+            .or_else(|| Some("retrieval_not_full".to_string()));
+    }
+    None
 }
 
 fn read_stdio_agent_guide_resource() -> serde_json::Value {

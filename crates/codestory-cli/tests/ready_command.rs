@@ -68,6 +68,40 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
         !markdown.contains("codestory-cli index --project"),
         "fresh-index agent readiness should not recommend a full core reindex: {markdown}"
     );
+
+    let agent_json_text = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["ready", "--goal", "agent", "--format", "json"],
+    );
+    let agent_json: Value = serde_json::from_str(&agent_json_text).expect("ready agent json");
+    let agent = &agent_json["verdicts"][0];
+    assert_eq!(agent["status"], "repair_retrieval");
+    assert_eq!(
+        agent["sidecar"]["degraded_reason"],
+        "retrieval_manifest_missing"
+    );
+    assert!(
+        agent["minimum_next"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| command
+                .as_str()
+                .is_some_and(|text| text.contains("ready --goal agent --repair")))),
+        "missing sidecars should point at the agent-owned repair command: {agent_json_text}"
+    );
+    assert!(
+        agent["full_repair"]
+            .as_array()
+            .is_some_and(
+                |commands| commands
+                    .iter()
+                    .any(|command| command
+                        .as_str()
+                        .is_some_and(|text| text.contains("retrieval status")
+                            && text.contains("--format json")))
+            ),
+        "missing sidecars should finish with status proof guidance: {agent_json_text}"
+    );
 }
 
 #[test]

@@ -12,6 +12,7 @@ struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,
     hash_embeddings: bool,
+    latest_release_version: String,
 }
 
 struct StdioServer {
@@ -130,6 +131,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         workspace,
         cache_dir,
         hash_embeddings,
+        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 
@@ -216,6 +218,10 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
+    command.env(
+        "CODESTORY_LATEST_RELEASE_VERSION",
+        &fixture.latest_release_version,
+    );
     let mut child = command.spawn().expect("spawn stdio server");
 
     let stdin = child.stdin.take().expect("stdio stdin");
@@ -2042,6 +2048,13 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             "agent_packet_search",
             "repair_retrieval",
         );
+        assert_eq!(
+            status
+                .pointer(&format!("/allowed_surfaces/{surface}/repair_reason"))
+                .and_then(Value::as_str),
+            Some("retrieval_manifest_missing"),
+            "blocked agent surface should expose typed sidecar repair reason: {status}"
+        );
     }
     assert!(
         readiness
@@ -2079,6 +2092,105 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .is_some_and(|calls| !calls.is_empty()),
         "status should include recommended next calls: {status}"
     );
+}
+
+#[test]
+fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
+    let mut fixture = indexed_fixture();
+    fixture.latest_release_version = "999.0.0".to_string();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-cli",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-stale-cli"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(
+        status["readiness"][0]["status"],
+        json!("repair_setup"),
+        "stale active CLI should be a hard setup repair state: {status}"
+    );
+    let setup = &status["readiness"][0]["setup"];
+    assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(setup["latest_version"], "999.0.0");
+    assert!(
+        setup["active_path"]
+            .as_str()
+            .is_some_and(|path| path.contains("codestory-cli")),
+        "setup snapshot should expose active executable path: {status}"
+    );
+    for surface in ["ground", "files", "packet", "search", "context"] {
+        let surface_status = &status["allowed_surfaces"][surface];
+        assert_eq!(surface_status["allowed"], json!(false));
+        assert_eq!(surface_status["status"], json!("repair_setup"));
+        assert_eq!(surface_status["repair_reason"], json!("stale_active_cli"));
+    }
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        next_call_text.contains("install-codestory.ps1") && next_call_text.contains("999.0.0"),
+        "stale active CLI repair should be an installer command, not a prompt: {status}"
+    );
+}
+
+#[test]
+fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
+    let mut fixture = indexed_fixture();
+    fixture.latest_release_version = "999.0.0".to_string();
+    let mut server = spawn_stdio_server(&fixture);
+
+    for (tool, arguments) in [
+        ("ground", json!({})),
+        ("search", json!({"query": "AppController"})),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("stale-{tool}"),
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments
+                }
+            }),
+        );
+        let error = assert_tool_error(&response, json!(format!("stale-{tool}")));
+        assert_eq!(
+            error.pointer("/code").and_then(Value::as_str),
+            Some("codestory_tool_blocked")
+        );
+        assert_eq!(
+            error.pointer("/status").and_then(Value::as_str),
+            Some("repair_setup")
+        );
+        assert_eq!(
+            error.pointer("/repair_reason").and_then(Value::as_str),
+            Some("stale_active_cli")
+        );
+        let setup = error
+            .pointer("/setup")
+            .unwrap_or_else(|| panic!("blocked stale CLI tool should include setup: {response}"));
+        assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(setup["latest_version"], "999.0.0");
+        assert!(
+            error
+                .pointer("/minimum_next")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| commands.iter().any(|command| command
+                    .as_str()
+                    .is_some_and(
+                        |text| text.contains("install-codestory.ps1") && text.contains("999.0.0")
+                    ))),
+            "blocked stale CLI tool should expose installer repair command: {response}"
+        );
+    }
 }
 
 #[test]
@@ -2518,57 +2630,47 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
     let error = assert_tool_error(&response, json!("search-requires-full-retrieval"));
     assert_eq!(
         error.pointer("/code").and_then(Value::as_str),
-        Some("retrieval_unavailable"),
-        "stdio search should preserve typed retrieval failure code: {response}"
+        Some("codestory_tool_blocked"),
+        "stdio search should be blocked by readiness before dispatch: {response}"
     );
-    let message = error
-        .pointer("/message")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("stdio search error should include message: {response}"));
-    assert!(
-        message.contains("sidecar retrieval primary is unavailable or degraded")
-            && message.contains("expected mode=full"),
-        "stdio search should fail closed when the fixture has only a plain index: {response}"
-    );
-    let details = error
-        .pointer("/details")
-        .unwrap_or_else(|| panic!("stdio search error should include details: {response}"));
-    assert_eq!(details["failed_layer"], json!("retrieval_sidecar"));
-    let expected_project = fs::canonicalize(fixture.workspace.path()).expect("canonical project");
     assert_eq!(
-        details["project"].as_str(),
-        Some(expected_project.to_str().expect("workspace path")),
-        "stdio search error should include the current project path: {response}"
+        error.pointer("/readiness_goal").and_then(Value::as_str),
+        Some("agent_packet_search")
     );
-    let next_commands = details["next_commands"]
+    assert_eq!(
+        error.pointer("/status").and_then(Value::as_str),
+        Some("repair_retrieval")
+    );
+    assert_eq!(
+        error.pointer("/repair_reason").and_then(Value::as_str),
+        Some("retrieval_manifest_missing")
+    );
+    assert_eq!(
+        error
+            .pointer("/sidecar/degraded_reason")
+            .and_then(Value::as_str),
+        Some("retrieval_manifest_missing")
+    );
+    let minimum_next = error["minimum_next"]
         .as_array()
-        .unwrap_or_else(|| panic!("stdio search error should include next_commands: {response}"));
+        .unwrap_or_else(|| panic!("stdio search error should include minimum_next: {response}"));
     assert!(
-        details["minimum_next"]
-            .as_array()
-            .is_some_and(|commands| !commands.is_empty()),
-        "stdio search error should include minimum_next: {response}"
+        minimum_next.iter().any(|command| command
+            .as_str()
+            .is_some_and(|text| text.contains("codestory-cli ready --goal agent --repair"))),
+        "stdio search readiness error should point at agent-owned repair: {response}"
     );
+    let full_repair = error["full_repair"]
+        .as_array()
+        .unwrap_or_else(|| panic!("stdio search error should include full_repair: {response}"));
     assert!(
-        details["full_repair"]
-            .as_array()
-            .is_some_and(|commands| commands.len() >= next_commands.len()),
-        "stdio search error should include full_repair: {response}"
-    );
-    assert!(
-        next_commands.iter().all(|command| command
+        full_repair.iter().all(|command| command
             .as_str()
             .is_some_and(|text| !text.contains("codestory-cli index"))),
         "stdio search sidecar errors should not repeat core index repair commands: {response}"
     );
     assert!(
-        next_commands.iter().any(|command| command
-            .as_str()
-            .is_some_and(|text| text.contains("codestory-cli retrieval bootstrap"))),
-        "stdio search error should include sidecar bootstrap repair command: {response}"
-    );
-    assert!(
-        next_commands.iter().any(|command| command
+        full_repair.iter().any(|command| command
             .as_str()
             .is_some_and(|text| text.contains("codestory-cli retrieval status")
                 && text.contains("--format json"))),

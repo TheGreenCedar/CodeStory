@@ -1,6 +1,7 @@
 use codestory_contracts::api::{
     IndexFreshnessDto, IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessIndexSnapshotDto,
-    ReadinessSidecarSnapshotDto, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
+    ReadinessSetupSnapshotDto, ReadinessSidecarSnapshotDto, ReadinessStatusDto,
+    ReadinessVerdictDto, StorageStatsDto,
 };
 
 use crate::display::{clean_path_string, quote_command_argument_value};
@@ -10,7 +11,15 @@ pub(crate) struct ReadinessInputs<'a> {
     pub(crate) project: &'a str,
     pub(crate) stats: &'a StorageStatsDto,
     pub(crate) freshness: Option<&'a IndexFreshnessDto>,
+    pub(crate) setup: Option<&'a ReadinessSetupInput>,
     pub(crate) sidecar: Option<ReadinessSidecarInput<'a>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReadinessSetupInput {
+    pub(crate) active_path: String,
+    pub(crate) active_version: String,
+    pub(crate) latest_version: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,10 +44,12 @@ pub(crate) fn build_readiness_verdict(
     let project = clean_path_string(inputs.project);
     let project_arg = project_arg(&project);
     let index = readiness_index_snapshot(inputs.stats, inputs.freshness);
+    let setup = inputs.setup.map(readiness_setup_snapshot);
     let sidecar = inputs.sidecar.map(readiness_sidecar_snapshot);
 
     let (status, summary, minimum_next, full_repair) = verdict_state(
         goal,
+        inputs.setup,
         inputs.stats,
         inputs.freshness,
         inputs.sidecar,
@@ -51,6 +62,7 @@ pub(crate) fn build_readiness_verdict(
         summary,
         minimum_next,
         full_repair,
+        setup,
         index: Some(index),
         sidecar,
     }
@@ -80,6 +92,7 @@ pub(crate) fn primary_non_ready(verdicts: &[ReadinessVerdictDto]) -> Option<&Rea
 pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
     match status {
         ReadinessStatusDto::Ready => "ready",
+        ReadinessStatusDto::RepairSetup => "repair_setup",
         ReadinessStatusDto::RepairIndex => "repair_index",
         ReadinessStatusDto::CheckIndex => "check_index",
         ReadinessStatusDto::RepairRetrieval => "repair_retrieval",
@@ -95,11 +108,32 @@ pub(crate) fn goal_label(goal: ReadinessGoalDto) -> &'static str {
 
 fn verdict_state(
     goal: ReadinessGoalDto,
+    setup: Option<&ReadinessSetupInput>,
     stats: &StorageStatsDto,
     freshness: Option<&IndexFreshnessDto>,
     sidecar: Option<ReadinessSidecarInput<'_>>,
     project_arg: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
+    if let Some(setup) = setup {
+        let install = format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command '$installer = Join-Path $env:TEMP \"install-codestory.ps1\"; Invoke-WebRequest -UseBasicParsing -Uri \"https://raw.githubusercontent.com/TheGreenCedar/CodeStory/v{}/scripts/install-codestory.ps1\" -OutFile $installer; & $installer -Project {project_arg} -Version {}'",
+            setup.latest_version, setup.latest_version
+        );
+        return (
+            ReadinessStatusDto::RepairSetup,
+            format!(
+                "Active codestory-cli {} at {} is older than latest release {}; repair setup before using CodeStory surfaces.",
+                setup.active_version, setup.active_path, setup.latest_version
+            ),
+            vec![install.clone()],
+            vec![
+                install,
+                "where.exe codestory-cli".to_string(),
+                "codestory-cli --version".to_string(),
+            ],
+        );
+    }
+
     if stats.node_count == 0 {
         return index_repair_state(goal, "No indexed symbols are available yet.", project_arg);
     }
@@ -282,6 +316,14 @@ fn readiness_index_snapshot(
     }
 }
 
+fn readiness_setup_snapshot(input: &ReadinessSetupInput) -> ReadinessSetupSnapshotDto {
+    ReadinessSetupSnapshotDto {
+        active_path: input.active_path.to_string(),
+        active_version: input.active_version.to_string(),
+        latest_version: input.latest_version.to_string(),
+    }
+}
+
 fn readiness_sidecar_snapshot(input: ReadinessSidecarInput<'_>) -> ReadinessSidecarSnapshotDto {
     ReadinessSidecarSnapshotDto {
         retrieval_mode: input.retrieval_mode.to_string(),
@@ -342,6 +384,7 @@ mod tests {
             project: "C:/workspace/project",
             stats,
             freshness,
+            setup: None,
             sidecar,
         }
     }
@@ -362,6 +405,49 @@ mod tests {
             verdicts[0].minimum_next[0].contains("ready --goal local --repair"),
             "missing index repair should request full refresh: {verdicts:?}"
         );
+    }
+
+    #[test]
+    fn stale_active_cli_requires_setup_repair_before_index_or_sidecars() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
+        let verdicts = build_readiness_verdicts(ReadinessInputs {
+            project: "C:/workspace/project",
+            stats: &stats,
+            freshness: Some(&freshness),
+            setup: Some(&ReadinessSetupInput {
+                active_path: "C:/Users/alber/.local/bin/codestory-cli.exe".to_string(),
+                active_version: "0.11.6".to_string(),
+                latest_version: "0.11.9".to_string(),
+            }),
+            sidecar: Some(ReadinessSidecarInput {
+                retrieval_mode: "full",
+                degraded_reason: None,
+                manifest_generation: Some("generation"),
+                manifest_input_hash: Some("hash"),
+            }),
+        });
+
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| verdict.status == ReadinessStatusDto::RepairSetup),
+            "stale active CLI must block all readiness goals: {verdicts:?}"
+        );
+        for verdict in verdicts {
+            let setup = verdict.setup.as_ref().expect("setup snapshot");
+            assert_eq!(setup.active_version, "0.11.6");
+            assert_eq!(setup.latest_version, "0.11.9");
+            assert!(
+                setup.active_path.contains("codestory-cli.exe"),
+                "setup snapshot should expose stale executable path: {setup:?}"
+            );
+            assert!(
+                verdict.minimum_next[0].contains("install-codestory.ps1")
+                    && verdict.minimum_next[0].contains("0.11.9"),
+                "stale CLI repair must be an install action, not advice: {verdict:?}"
+            );
+        }
     }
 
     #[test]

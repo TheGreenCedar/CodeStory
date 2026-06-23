@@ -194,12 +194,15 @@ MCP is live, `codestory://status` is the runtime proof. Use
 `where.exe codestory-cli`, `codestory-cli --version`, and release repair checks
 only when MCP is missing or the status fields show stale binary drift.
 
-If `PATH` changed, the skill tells the human that a Codex host/app restart may
-be needed before a fresh agent thread can see it.
+If status reports `repair_setup`, the active CLI is older than the latest
+release. The agent runs the installer command from `recommended_next_calls`
+before using local navigation, packet, search, or context.
 If a running `codestory-cli serve --stdio --refresh none` process locks the old
 binary, install the current release into a versioned directory and put that
 directory before stale entries on `PATH`; verify the command that MCP will
-launch with `codestory-cli --version` before starting a fresh Codex thread.
+launch with `codestory-cli --version`. If `PATH` changed, mention restart only
+after the current binary is installed and verified; a Codex host/app restart may
+be needed before a fresh agent thread sees the new `PATH`.
 
 Use source fallback only when no release asset fits the host:
 
