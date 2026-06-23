@@ -1237,11 +1237,12 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
 fn run_ready(cmd: ReadyCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ready")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    if cmd.repair && matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
-        managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
-    }
     let runtime = if cmd.repair {
-        RuntimeContext::new(&cmd.project)?
+        if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
+            RuntimeContext::new_agent_sidecar(&cmd.project)?
+        } else {
+            RuntimeContext::new(&cmd.project)?
+        }
     } else {
         RuntimeContext::new_inspect_only(&cmd.project)?
     };
@@ -8153,7 +8154,7 @@ fn render_affected_footer(
 }
 
 fn run_serve(cmd: ServeCommand) -> Result<()> {
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = RuntimeContext::new_agent_sidecar(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
     if cmd.stdio {
@@ -8508,6 +8509,7 @@ fn build_summary_readiness(
         project,
         stats,
         freshness,
+        setup: None,
         sidecar: Some(readiness_sidecar_input(sidecar)),
     })
 }

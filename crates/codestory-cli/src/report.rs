@@ -143,6 +143,7 @@ fn attach_report_handoff(
         project: &summary.root,
         stats: &summary.stats,
         freshness: summary.freshness.as_ref(),
+        setup: None,
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
             retrieval_mode: &sidecar.retrieval_mode,
             degraded_reason: sidecar.degraded_reason.as_deref(),
