@@ -484,15 +484,12 @@ pub fn probe_sidecar_health(
     let qdrant = if dense_anchor_count == 0 {
         ComponentHealth {
             name: "qdrant".into(),
-            status: ComponentStatus::Healthy,
+            status: ComponentStatus::Degraded,
             latency_ms: None,
-            detail: "graph_first_v1 selected zero dense anchors; qdrant not required".into(),
-            degraded_reason: None,
-            capabilities: SidecarCapabilities {
-                lexical: false,
-                semantic: true,
-                graph: false,
-            },
+            detail: "graph_first_v1 selected zero dense anchors; semantic retrieval is unavailable"
+                .into(),
+            degraded_reason: Some("semantic_dense_projection_count_zero".into()),
+            capabilities: SidecarCapabilities::NONE,
         }
     } else {
         let collection = manifest.qdrant_collection.clone();
@@ -702,6 +699,49 @@ mod tests {
         assert!(qdrant_point_count_incomplete(&probe, Some(11)));
         assert!(!qdrant_point_count_incomplete(&probe, Some(10)));
         assert!(!qdrant_point_count_incomplete(&probe, None));
+    }
+
+    #[test]
+    fn zero_dense_manifest_degrades_semantic_lane() {
+        let layout = SidecarLayout::from_env();
+        let project_id = "testproject";
+        let input_hash = "ba5eba11cafebeef";
+        let manifest = codestory_store::RetrievalIndexManifest {
+            project_id: project_id.into(),
+            zoekt_version: "zoekt-real-v1".into(),
+            qdrant_collection: crate::generation::sidecar_qdrant_collection(project_id, input_hash),
+            scip_revision: Some("graph-test".into()),
+            built_at_epoch_ms: 1,
+            disk_bytes: None,
+            degraded_modes_json: "[]".into(),
+            embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
+            embedding_dim: Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32),
+            sidecar_schema_version: Some(crate::generation::SIDECAR_SCHEMA_VERSION),
+            sidecar_input_hash: Some(input_hash.into()),
+            sidecar_generation: Some(crate::generation::sidecar_generation_id(
+                project_id, input_hash,
+            )),
+            projection_count: Some(0),
+            symbol_doc_count: Some(14741),
+            dense_projection_count: Some(0),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: Some("graph-test-hash".into()),
+            dense_reason_counts_json: Some("{}".into()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+
+        let report = probe_sidecar_health(&layout, project_id, Some(manifest));
+
+        assert_eq!(report.qdrant.status, ComponentStatus::Degraded);
+        assert_eq!(
+            report.qdrant.degraded_reason.as_deref(),
+            Some("semantic_dense_projection_count_zero")
+        );
+        assert!(!report.qdrant.capabilities.semantic);
+        assert_ne!(report.retrieval_mode, "full");
     }
 
     #[test]

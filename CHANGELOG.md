@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.12
+
+CodeStory 0.11.12 restores Codex lifecycle hook registration in the plugin
+manifest so installed builds appear in the Codex hooks manager and can inject
+the existing status-first grounding guidance at session start.
+
+No runtime, indexing, packet/search, or sidecar behavior changed in this
+release.
+
 ## 0.11.11
 
 CodeStory 0.11.11 carries the post-adapter guardrail cleanup and release
