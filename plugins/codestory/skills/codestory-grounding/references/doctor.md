@@ -2,6 +2,11 @@
 
 Reads project/cache/index/retrieval health without mutating the index. Use it at the start of an LLM browser loop and when a read command fails unexpectedly.
 
+When plugin MCP is live, read `codestory://status` first and treat its
+`server_version`, `server_executable`, and `allowed_surfaces` as active runtime
+truth. Use `doctor` when MCP is missing, a repair transcript is needed, or a
+status field points to stale runtime or readiness evidence.
+
 ## Usage
 
 ```
@@ -24,6 +29,18 @@ Reads project/cache/index/retrieval health without mutating the index. Use it at
 | Normal path | `<codestory-cli> doctor --project <target-workspace>` | Reports project root, cache path, indexed stats, retrieval state, sidecar embedding setup, environment hints, and next commands. |
 | Failure path | If cache or index checks warn, run `index --project <target-workspace> --refresh full`; if mandatory sidecars are missing or stale, run the setup/index commands surfaced by `doctor`; if symbol docs, dense anchors, policy version, Qdrant counts, or semantic health report partial/stale/failed state, rebuild before trusting broad packet/search evidence. | Separates missing index, stale symbol docs, partial dense anchors, and mandatory retrieval setup failures. |
 | Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
+
+For MCP/runtime drift, collect binary evidence only after status is missing or
+suspect:
+
+```powershell
+where.exe codestory-cli
+codestory-cli --version
+codestory-cli doctor --project <target-workspace> --format json
+```
+
+If PATH repair changes which binary `codestory-cli` resolves to, start a fresh
+Codex host/app session before treating the plugin MCP runtime as updated.
 
 ## Notes
 

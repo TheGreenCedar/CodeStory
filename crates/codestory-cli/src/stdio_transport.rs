@@ -12,7 +12,8 @@ use codestory_contracts::api::{
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
     IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
     NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
-    SearchRepoTextMode, SearchRequest, TrailCallerScope, TrailDirection, TrailMode,
+    ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode, SearchRequest,
+    TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
 use std::io::{BufRead, Write};
@@ -1948,8 +1949,13 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             manifest_input_hash: manifest_input_hash.as_deref(),
         }),
     });
+    let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness);
+    let (server_executable, server_warnings) = stdio_server_executable_status();
     Ok(serde_json::json!({
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "server_executable": server_executable,
+        "warnings": server_warnings,
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
         "storage_exists": runtime.storage_path.exists(),
@@ -1966,13 +1972,12 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         },
         "index_freshness": summary.freshness,
         "readiness": readiness,
+        "allowed_surfaces": allowed_surfaces,
         "recommended_next_calls": recommended_next_calls
     }))
 }
 
-fn stdio_status_recommended_next_calls(
-    readiness: &[codestory_contracts::api::ReadinessVerdictDto],
-) -> serde_json::Value {
+fn stdio_status_recommended_next_calls(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
         return serde_json::Value::Array(
             non_ready
@@ -2040,6 +2045,77 @@ fn stdio_status_recommended_next_calls(
     ])
 }
 
+fn stdio_server_executable_status() -> (Option<String>, Vec<String>) {
+    match std::env::current_exe() {
+        Ok(path) => (
+            Some(crate::display::clean_path_string(&path.to_string_lossy())),
+            Vec::new(),
+        ),
+        Err(error) => (
+            None,
+            vec![format!("server_executable_unavailable: {error}")],
+        ),
+    }
+}
+
+fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+    let local = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation);
+    let agent = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);
+
+    let mut surfaces = serde_json::Map::new();
+    for surface in [
+        "ground",
+        "files",
+        "symbol",
+        "definition",
+        "get_node",
+        "neighbors",
+        "shortest_path",
+        "query_subgraph",
+        "symbols",
+        "trail",
+        "references",
+        "snippet",
+        "affected",
+    ] {
+        surfaces.insert(surface.to_string(), stdio_allowed_surface(local));
+    }
+    for surface in ["packet", "search", "context"] {
+        surfaces.insert(surface.to_string(), stdio_allowed_surface(agent));
+    }
+    serde_json::Value::Object(surfaces)
+}
+
+fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::Value {
+    match verdict {
+        Some(verdict) => {
+            let allowed = verdict.status == ReadinessStatusDto::Ready;
+            serde_json::json!({
+                "allowed": allowed,
+                "readiness_goal": crate::readiness::goal_label(verdict.goal),
+                "status": crate::readiness::status_label(verdict.status),
+                "summary": verdict.summary,
+                "blocked_reason": if allowed { None } else { Some(verdict.summary.as_str()) },
+                "minimum_next": verdict.minimum_next,
+                "full_repair": verdict.full_repair,
+            })
+        }
+        None => serde_json::json!({
+            "allowed": false,
+            "readiness_goal": null,
+            "status": "unknown",
+            "summary": "Readiness verdict was not available for this surface.",
+            "blocked_reason": "Readiness verdict was not available for this surface.",
+            "minimum_next": [],
+            "full_repair": [],
+        }),
+    }
+}
+
 fn read_stdio_agent_guide_resource() -> serde_json::Value {
     serde_json::json!({
         "purpose": "Default read-only CodeStory browser loop for local codebase grounding.",
@@ -2047,77 +2123,122 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             {
                 "method": "resources/read",
                 "uri": "codestory://status"
+            }
+        ],
+        "readiness_lanes": [
+            {
+                "readiness_goal": "local_navigation",
+                "condition": "Use only surfaces whose codestory://status allowed_surfaces.<surface>.allowed value is true.",
+                "surfaces": ["ground", "files", "symbol", "definition", "get_node", "neighbors", "shortest_path", "query_subgraph", "symbols", "snippet", "references", "trail", "affected"],
+                "calls": [
+                    {
+                        "method": "tools/call",
+                        "tool": "ground",
+                        "arguments": {
+                            "budget": "balanced"
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "files",
+                        "arguments": {
+                            "limit": 50
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "definition",
+                        "arguments": {
+                            "id": "<best-node-id>"
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "get_node",
+                        "arguments": {
+                            "id": "<best-node-id>"
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "neighbors",
+                        "arguments": {
+                            "id": "<best-node-id>",
+                            "depth": 1
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "symbols",
+                        "arguments": {
+                            "limit": 50
+                        }
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://snippet/<best-node-id>"
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://references/<best-node-id>"
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://trail/<best-node-id>"
+                    }
+                ]
             },
             {
-                "method": "tools/call",
-                "tool": "ground",
-                "arguments": {
-                    "budget": "balanced"
-                }
-            },
-            {
-                "method": "tools/call",
-                "tool": "packet",
-                "arguments": {
-                    "question": "<broad-task-question>",
-                    "budget": "compact"
-                }
-            },
-            {
-                "method": "tools/call",
-                "tool": "search",
-                "arguments": {
-                    "query": "<symbol-or-task>",
-                    "limit": 10
-                }
-            },
-            {
-                "method": "tools/call",
-                "tool": "context",
-                "arguments": {
-                    "id": "<best-node-id>"
-                }
-            },
-            {
-                "method": "tools/call",
-                "tool": "definition",
-                "arguments": {
-                    "id": "<best-node-id>"
-                }
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://snippet/<best-node-id>"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://references/<best-node-id>"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://trail/<best-node-id>"
+                "readiness_goal": "agent_packet_search",
+                "condition": "Use packet/search/context only when their codestory://status allowed_surfaces entries are true.",
+                "surfaces": ["packet", "search", "context"],
+                "calls": [
+                    {
+                        "method": "tools/call",
+                        "tool": "packet",
+                        "arguments": {
+                            "question": "<broad-task-question>",
+                            "budget": "compact"
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "search",
+                        "arguments": {
+                            "query": "<symbol-or-task>",
+                            "limit": 10
+                        }
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "context",
+                        "arguments": {
+                            "id": "<best-node-id>"
+                        }
+                    }
+                ]
             }
         ],
         "surface_decisions": [
             {
                 "surface": "ground",
                 "kind": "tool and codestory://grounding resource",
-                "when": "Use after status for compact repo orientation before planning, packet, search, or source reads."
+                "when": "Use after status when allowed_surfaces.ground.allowed is true."
             },
             {
                 "surface": "packet",
                 "kind": "tool",
-                "when": "Use for broad structural questions only when packet/search readiness is ready and strict retrieval is full."
+                "when": "Use for broad structural questions only when allowed_surfaces.packet.allowed is true and strict retrieval is full."
             },
             {
                 "surface": "search",
                 "kind": "tool",
-                "when": "Use for bounded candidate discovery after readiness allows packet/search."
+                "when": "Use for bounded candidate discovery only when allowed_surfaces.search.allowed is true."
             },
             {
                 "surface": "context",
                 "kind": "tool",
-                "when": "Use after selecting one concrete target for proof-bearing source/graph evidence."
+                "when": "Use after selecting one concrete target only when allowed_surfaces.context.allowed is true."
             },
             {
                 "surface": "direct_source_reads",
@@ -2125,15 +2246,16 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                 "when": "Use when status reports missing, stale, or degraded index/sidecar state."
             },
             {
-                "surface": "files, affected, cache identity, retrieval status",
+                "surface": "cache identity, retrieval status",
                 "kind": "deferred",
                 "when": "Use CLI or resources until these receive explicit read-only stdio contracts."
             }
         ],
         "safety_notes": [
             "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
-            "Use ground for compact repository orientation after status.",
-            "Use packet for broad task questions before snippet/source reads; use context only after selecting one concrete target.",
+            "Read codestory://status first and branch on allowed_surfaces before choosing tools.",
+            "Use ground for compact repository orientation after status when local_navigation is ready.",
+            "Use packet for broad task questions only when packet/search status is allowed; use context only when allowed_surfaces.context.allowed is true.",
             "Treat packet status other than sufficient as unsafe to claim until gaps, open_next, and follow_up_commands are resolved.",
             "Use continuation links from search or definition results before broadening retrieval.",
             "Keep search limits bounded; stdio search clamps limit to 1..50.",

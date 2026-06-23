@@ -17,19 +17,26 @@ packet, and search. The CLI is still there, but it is the escape hatch and repai
 
 | Agent need | CodeStory surface | Human reading |
 | --- | --- | --- |
-| Is this repo indexed and safe to use? | `codestory://status` | Check readiness before trusting claims. |
+| Is this repo indexed and safe to use? | `codestory://status` | Read first; status is the runtime truth. |
 | What should I do next? | `codestory://agent-guide` | Let the skill route normal setup and repair. |
 | Give me a compact repo map. | `codestory://grounding` | Start from current local files. |
 | Inspect indexed file inventory and coverage. | `files` tool | Use for scope, language mix, and missing coverage. |
 | Map changed files to likely impact. | `affected` tool | Use for review planning and focused test choice. |
-| Find candidate symbols, paths, or behavior terms. | `search` tool, only with full sidecars | Navigation only unless packet/search is full. |
-| Answer a broad repo question with evidence. | `packet` tool, only with full sidecars | Proof only when strict sidecars are ready. |
-| Follow a concrete target. | `symbol`, `trail`, `references`, `snippet`, `context` | Source anchors still matter. |
+| Follow a local graph target. | `symbol`, `definition`, `trail`, `references`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph` | Check each surface's own allowed bit. |
+| Find candidate symbols, paths, or behavior terms. | `search` tool, only when status allows search | Requires `retrieval_mode=full`. |
+| Answer a broad repo question or build an evidence context. | `packet` or `context`, only when status allows that surface | Requires `retrieval_mode=full`. |
 
-The status resource is the contract. Local navigation is ready only when
-`local_navigation` is ready. Agent packet/search is eligible only when strict
-sidecar status reports `retrieval_mode=full`; answer quality still needs the
-matching packet-runtime, drill, or benchmark proof.
+The status resource is the contract. When MCP is live, read
+`codestory://status` first and obey `allowed_surfaces`. Treat
+`server_version` and `server_executable` from status as the active runtime
+evidence; source docs, marketplace cache contents, and local build outputs can
+all differ from the running server.
+
+| Status lane | Allows | Does not allow |
+| --- | --- | --- |
+| `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
+| `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
+| `codestory://status` fields | Current `server_version`, `server_executable`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
 
 ## How It Runs
 
@@ -83,13 +90,18 @@ Open Codex in the repo you want to ground and ask the agent to check readiness
 before planning or editing:
 
 ```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+@CodeStory read codestory://status, report allowed_surfaces for this checkout, ground the repo if allowed, and tell me whether packet/search/context need sidecar repair before I use them.
 ```
 
 The first run should be agent-owned. The skill checks whether `codestory-cli` is
-present and current, compares `codestory-cli --version` with the latest GitHub
-release, installs the latest matching release asset when needed, verifies
-`SHA256SUMS.txt` when the host can, and uses source fallback only when no release asset fits the host.
+live through MCP by reading `codestory://status`. If MCP is live, the agent uses
+`server_version`, `server_executable`, and `allowed_surfaces` from status
+instead of rechecking PATH or release metadata.
+
+Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
+missing, status reports a suspect runtime, or you are debugging/repairing the
+installed CLI. If PATH changed during repair, start a fresh Codex host/app
+session before treating a new MCP runtime as live.
 
 ## What To Ask
 
@@ -98,7 +110,7 @@ repository; adapt paths and symbols to your project:
 
 **For checking readiness before editing:**
 
-- `@CodeStory check local_navigation and agent_packet_search on this checkout before I edit codestory-indexer.`
+- `@CodeStory read codestory://status and check allowed_surfaces before I edit codestory-indexer.`
 
 **For finding ownership:**
 
@@ -117,7 +129,7 @@ repository; adapt paths and symbols to your project:
 **For checking readiness before editing any crate:**
 
 ```text
-@CodeStory check local_navigation and agent_packet_search on this checkout before I edit [TARGET_CRATE].
+@CodeStory read codestory://status and check allowed_surfaces before I edit [TARGET_CRATE].
 ```
 
 **For finding ownership of a feature:**
@@ -142,7 +154,7 @@ Avoid prompts that erase the trust boundary:
 
 - `Run every CodeStory command.`
 - `Search broadly and summarize whatever comes back.`
-- `Trust packet/search even though status says sidecars are degraded.`
+- `Trust packet/search/context even though status says sidecars are degraded.`
 
 ## Manual CLI Escape Hatch
 
@@ -150,6 +162,7 @@ Use the CLI when the agent needs to repair setup, produce a transcript, or debug
 why the MCP server is not ready:
 
 ```console
+where.exe codestory-cli
 codestory-cli --version
 codestory-cli ready --goal local --repair --project <repo> --format json
 codestory-cli ready --goal agent --repair --project <repo> --format json
@@ -170,15 +183,19 @@ codestory-cli ready --goal agent --repair --project <repo> --format json
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-Do not treat `ground`, `symbol`, `trail`, or `snippet` readiness as proof that
-agent packet/search is ready.
+Do not treat `ground`, `symbol`, `trail`, `snippet`, or local graph readiness as
+proof that `packet`, `search`, or `context` is ready.
 
-### Agent runtime bootstrap
+### Agent runtime repair
 
-The plugin does not bundle the binary. The agent-owned skill verifies
-`codestory-cli --version`, compares it with the latest GitHub release, installs
-the matching release asset when practical, and checks `SHA256SUMS.txt` when the
-host can. If `PATH` changed, the skill tells the human that a Codex host/app restart may be needed before a fresh agent thread can see it.
+The plugin does not bundle the binary. The installed MCP runtime launches
+`codestory-cli serve --stdio --refresh none` from the agent host `PATH`. Once
+MCP is live, `codestory://status` is the runtime proof. Use
+`where.exe codestory-cli`, `codestory-cli --version`, and release repair checks
+only when MCP is missing or the status fields show stale binary drift.
+
+If `PATH` changed, the skill tells the human that a Codex host/app restart may
+be needed before a fresh agent thread can see it.
 If a running `codestory-cli serve --stdio --refresh none` process locks the old
 binary, install the current release into a versioned directory and put that
 directory before stale entries on `PATH`; verify the command that MCP will
