@@ -186,6 +186,20 @@ fn handle_stdio_message(
                     "Invalid params: tool arguments must be an object",
                 ));
             }
+            match stdio_tool_blocked_error(runtime, state, name) {
+                Ok(Some(error)) => {
+                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = serde_json::json!({
+                        "code": "readiness_unavailable",
+                        "message": format!("Unable to evaluate CodeStory readiness before running `{name}`: {error}"),
+                        "tool": name
+                    });
+                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                }
+            }
             return Some(stdio_jsonrpc_tool_call_from_legacy(
                 id,
                 handle_stdio_tool_call(runtime, state, &request),
@@ -249,6 +263,55 @@ fn stdio_jsonrpc_from_legacy(
         return response;
     }
     stdio_jsonrpc_success(id, response)
+}
+
+fn stdio_tool_blocked_error(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let status = read_stdio_status_resource_cached(runtime, state)?;
+    let Some(surface) = status.pointer(&format!("/allowed_surfaces/{name}")) else {
+        return Ok(None);
+    };
+    if surface
+        .get("allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let readiness_goal = surface
+        .get("readiness_goal")
+        .and_then(serde_json::Value::as_str);
+    let verdict = readiness_goal.and_then(|goal| {
+        status
+            .get("readiness")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|verdicts| {
+                verdicts.iter().find(|verdict| {
+                    verdict.get("goal").and_then(serde_json::Value::as_str) == Some(goal)
+                })
+            })
+    });
+    let message = surface
+        .get("blocked_reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| surface.get("summary").and_then(serde_json::Value::as_str))
+        .unwrap_or("CodeStory readiness blocks this tool.");
+    Ok(Some(serde_json::json!({
+        "code": "codestory_tool_blocked",
+        "message": format!("CodeStory tool `{name}` is blocked: {message}"),
+        "tool": name,
+        "readiness_goal": surface.get("readiness_goal").cloned().unwrap_or(serde_json::Value::Null),
+        "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "minimum_next": surface.get("minimum_next").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "full_repair": surface.get("full_repair").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
+        "sidecar": verdict.and_then(|verdict| verdict.get("sidecar")).cloned().unwrap_or(serde_json::Value::Null),
+    })))
 }
 
 fn stdio_jsonrpc_tool_call_from_legacy(
