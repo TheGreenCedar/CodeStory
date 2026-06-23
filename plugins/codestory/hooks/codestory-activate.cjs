@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 const { spawnSync } = require('child_process');
-const { getCodeStoryInstructions } = require('./codestory-instructions');
-const { rememberActiveState, writeHookOutput } = require('./codestory-runtime');
+const { getCodeStoryInstructions } = require('./codestory-instructions.cjs');
+const { rememberActiveState, writeHookOutput } = require('./codestory-runtime.cjs');
 
 const MAX_OUTPUT_CHARS = 12000;
 const RUNTIME_TIMEOUT_MS = 3500;

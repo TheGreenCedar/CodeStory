@@ -103,8 +103,8 @@ test("session-start hooks are thin and host manifests point at them", async () =
   assert.equal(hookConfig.hooks.UserPromptSubmit.length, 1);
 
   for (const hook of hookCommands) {
-    assert.match(hook.command, /codestory-activate\.js/u);
-    assert.match(hook.commandWindows, /codestory-activate\.js/u);
+    assert.match(hook.command, /codestory-activate\.cjs/u);
+    assert.match(hook.commandWindows, /codestory-activate\.cjs/u);
     assert.equal(
       Object.hasOwn(hook, "args"),
       false,
@@ -145,7 +145,7 @@ async function withFakeCodeStoryCli(callback) {
 
 test("hook output keeps CodeStory ambient and attempts request-aware grounding", async () => {
   const { spawnSync } = await import("node:child_process");
-  const hookPath = join(pluginRoot, "hooks", "codestory-activate.js");
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
 
   await withFakeCodeStoryCli(async (binDir) => {
     const fakeCli = process.platform === "win32"
@@ -213,9 +213,68 @@ test("hook output keeps CodeStory ambient and attempts request-aware grounding",
   });
 });
 
+test("hook script executes under Codex home module scope", async () => {
+  const { cp } = await import("node:fs/promises");
+  const { spawnSync } = await import("node:child_process");
+  const codexHome = await mkdtemp(join(tmpdir(), "codestory-codex-home-"));
+  const installRoot = join(
+    codexHome,
+    "plugins",
+    "cache",
+    "TheGreenCedar",
+    "codestory",
+    "0.0.0",
+  );
+
+  try {
+    await writeFile(join(codexHome, "package.json"), '{"type":"module"}\n', "utf8");
+    await cp(join(pluginRoot, "hooks"), join(installRoot, "hooks"), {
+      recursive: true,
+    });
+    await cp(
+      join(pluginRoot, "skills"),
+      join(installRoot, "skills"),
+      { recursive: true },
+    );
+
+    await withFakeCodeStoryCli(async (binDir) => {
+      const fakeCli = process.platform === "win32"
+        ? join(binDir, "codestory-cli.cmd")
+        : join(binDir, "codestory-cli");
+      const result = spawnSync(
+        process.execPath,
+        [join(installRoot, "hooks", "codestory-activate.cjs")],
+        {
+          env: {
+            ...process.env,
+            CODESTORY_CLI: fakeCli,
+            COPILOT_PLUGIN_DATA: "",
+            PLUGIN_DATA: join(codexHome, "plugin-data"),
+          },
+          input: JSON.stringify({
+            hook_event_name: "UserPromptSubmit",
+            prompt: "Explain hook loading.",
+            cwd: repoRoot,
+          }),
+          encoding: "utf8",
+        },
+      );
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.doesNotMatch(result.stderr, /require is not defined/u);
+      assert.match(
+        JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
+        /CODESTORY REQUEST GROUNDING ACTIVE/u,
+      );
+    });
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("hook output fails open when runtime grounding is unavailable", async () => {
   const { spawnSync } = await import("node:child_process");
-  const hookPath = join(pluginRoot, "hooks", "codestory-activate.js");
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
   const result = spawnSync(process.execPath, [hookPath], {
     env: {
       ...process.env,
