@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.11.11
+
+CodeStory 0.11.11 carries the post-adapter guardrail cleanup and release
+metadata sync. Ambient agent instructions now avoid wasting context in huge or
+non-code folders, trust `packet`, `search`, and `context` when status reports
+full sidecar readiness, and keep ordinary setup on incremental/default refresh
+paths before explicit rebuilds.
+
+The plugin package versions are aligned with the CLI release, and the Codex
+plugin category is now Developer Tools.
+
+## 0.11.10
+
+CodeStory 0.11.10 shipped the portable agent adapter source and marketplace
+publication split. The CodeStory repo owns the plugin source, manifests, hooks,
+skill, and runtime docs, while the external marketplace catalog repo owns the
+host marketplace entries.
+
+The adapter hooks inject status-first grounding guidance at session start
+without running indexing, packet, search, or repair work themselves. Claude Code
+and GitHub Copilot host manifests now ship beside the existing Codex plugin
+source.
+
 ## 0.11.9
 
 CodeStory 0.11.9 promotes the plugin grounding consolidation so Codex sessions
