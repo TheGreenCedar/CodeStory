@@ -137,6 +137,18 @@ test("hook output injects CodeStory grounding context without CLI work", async (
     output.hookSpecificOutput.additionalContext,
     /codestory:\/\/status/u,
   );
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /avoid no-op grounding context/u,
+  );
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /use packet, search, and context confidently/u,
+  );
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /incremental ready repair/u,
+  );
 });
 
 test("portable agent adapters are present", async () => {
@@ -197,6 +209,16 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
       "codestory-grounding",
       "references",
       "serve.md",
+    ),
+    "utf8",
+  );
+  const indexReference = await readFile(
+    join(
+      pluginRoot,
+      "skills",
+      "codestory-grounding",
+      "references",
+      "index.md",
     ),
     "utf8",
   );
@@ -268,6 +290,19 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "`allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full`",
     "`context` is not a local-only browse surface",
   ];
+  const ambientScopeRequired = [
+    "The hook injects guidance, not repository evidence",
+    "skip no-op ground output in huge\nor non-code folders",
+    "Lifecycle hooks provide instructions only; they do not run `ground`, index, or\nsidecar retrieval by themselves",
+    "no repo, no supported files, or zero indexed files",
+    "Do not inject, summarize, or paste empty ground\noutput as context",
+    "incremental by default",
+    "Use `packet`, `search`, and `context` confidently",
+    "Once sidecars are installed and status reports full\n   readiness, prefer these surfaces",
+    "Keep the default `auto` refresh for ordinary agent setup",
+    "Use explicit `--refresh full` only",
+    "ready --goal local --repair --project <target-workspace> --format json",
+  ];
   const forbidden = [
     "release-bound to " + "CodeStory `v" + "0.11.1`",
     "use that version " + "unless",
@@ -319,6 +354,17 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
   }
   for (const phrase of marketplaceSourceRequired) {
     assert.equal(readme.includes(phrase), true, phrase);
+  }
+  for (const phrase of ambientScopeRequired) {
+    assert.equal(
+      readme.includes(phrase) ||
+        skill.includes(phrase) ||
+        indexReference.includes(phrase) ||
+        doctorReference.includes(phrase) ||
+        serveReference.includes(phrase),
+      true,
+      phrase,
+    );
   }
   for (const phrase of ambientHookRequired) {
     assert.equal(readme.includes(phrase), true, phrase);

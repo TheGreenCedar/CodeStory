@@ -28,14 +28,17 @@ synchronizes selected dense anchors when embedding assets are available.
 
 | Mode | Behavior |
 |------|----------|
-| `auto` | Use `full` for an empty cache and `incremental` otherwise. |
+| `auto` | Build the cache when it is empty, then use incremental refresh for existing caches. |
 | `full` | Rebuild the project graph, symbol docs, component reports, and dense anchors from the discovered workspace. |
 | `incremental` | Reindex changed/new/unindexed files, remove disappeared files, and prune touched symbol docs or dense anchors. |
 | `none` | Inspect the existing cache without refreshing it. Use only after a known-good same-session index. |
 
-Use `--refresh full` for first-time indexes, cache/schema uncertainty, and fixes
-for historical indexing failures. Incremental runs can leave stale error rows
-when previously failing files are not touched.
+Keep the default `auto` refresh for ordinary agent setup. It performs the needed
+first build for an empty repository cache and incremental refreshes after that.
+Use explicit `--refresh full` only for diagnosed cache/schema uncertainty,
+historical indexing failures, moved roots, or user-requested rebuild evidence.
+Incremental runs can leave stale error rows when previously failing files are
+not touched.
 
 ## Symbol Docs And Dense Anchors
 
@@ -50,7 +53,8 @@ unstructured docs. On a fresh machine, check the setup plan first:
 ```
 
 Then install assets with `setup embeddings --project <target-workspace>` if the
-plan is acceptable, and rerun `index --refresh full`.
+plan is acceptable, and rerun `index --project <target-workspace>` unless the
+setup plan explicitly asks for a full refresh.
 
 High-signal environment toggles:
 
@@ -87,7 +91,8 @@ Important timing fields are `timings_ms.parse`, `timings_ms.flush`,
 
 ```text
 <codestory-cli> index --project <target-workspace>
-<codestory-cli> index --project <target-workspace> --refresh full
+<codestory-cli> index --project <target-workspace> --refresh incremental
+<codestory-cli> index --project <target-workspace> --refresh full # explicit rebuild
 <codestory-cli> index --project <target-workspace> --dry-run
 <codestory-cli> index --project <target-workspace> --watch --progress
 CODESTORY_SUMMARY_ENDPOINT=local <codestory-cli> index --project <target-workspace> --summarize

@@ -11,6 +11,18 @@ agent can stop rediscovering the same files, symbols, and call paths every turn.
 The target is always the repository workspace being grounded. The CodeStory
 checkout is only tool source unless the user is editing CodeStory itself.
 
+## Ambient Scope Guard
+
+Lifecycle hooks provide instructions only; they do not run `ground`, index, or
+sidecar retrieval by themselves.
+
+Before calling CodeStory surfaces, confirm the target is a repository workspace.
+In huge or mixed folders, use repo/workspace cues first. If `status`, `ready`,
+or `ground` reports no repo, no supported files, or zero indexed files, stop the
+CodeStory path for that turn. Do not inject, summarize, or paste empty ground
+output as context. Fall back to ordinary source/file inspection or ask for the
+intended repo path when the target is genuinely ambiguous.
+
 ## Runtime Truth
 
 When plugin MCP is live, `codestory://status` is the first and canonical runtime
@@ -23,7 +35,7 @@ Use status fields this way:
 | `server_version` | Version of the active MCP server binary. | Use as active runtime evidence once MCP is live. |
 | `server_executable` | Executable path serving this MCP session. | Use as active runtime evidence; do not guess from source paths. |
 | `allowed_surfaces.<surface>.allowed` | A concrete MCP surface is allowed. | Use local graph entries such as `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` only when their surface is allowed. |
-| `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Sidecar-backed agent surfaces are allowed. | Use `packet`, `search`, and `context` only when their own allowed bit is true and `retrieval_mode=full`. |
+| `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Sidecar-backed agent surfaces are allowed. | Use `packet`, `search`, and `context` confidently when their own allowed bit is true and `retrieval_mode=full`. |
 
 Use `where.exe codestory-cli`, `codestory-cli --version`, release install, or
 source-build checks only when MCP is missing, the plugin needs repair, or the
@@ -55,7 +67,9 @@ When the plugin MCP server is available:
    `retrieval_mode=full`; use `search` only when
    `allowed_surfaces.search.allowed` is true and `retrieval_mode=full`; use
    `context` only when `allowed_surfaces.context.allowed` is true and
-   `retrieval_mode=full`.
+   `retrieval_mode=full`. Once sidecars are installed and status reports full
+   readiness, prefer these surfaces for broad repo questions instead of
+   avoiding sidecar evidence.
 
 If the skill is visible but no `mcp__codestory` tools or `codestory://status`
 resource are exposed, call it a plugin MCP registration failure. Use CLI only
@@ -68,6 +82,9 @@ CLI directly:
 
 1. `ready --goal local --repair --project <target-workspace> --format json`
    before local navigation or delegation when the index is missing or stale.
+   This setup path is incremental by default; request a full rebuild only for
+   explicit stale-cache, corruption, schema-mismatch, moved-root, or user-chosen
+   reset cases.
 2. `ready --goal agent --repair --project <target-workspace> --format json`
    before packet/search claims when sidecars are missing or stale.
 3. `doctor --project <target-workspace>` for a read-only health transcript.
