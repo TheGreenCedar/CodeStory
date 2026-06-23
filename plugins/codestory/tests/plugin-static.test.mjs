@@ -33,8 +33,13 @@ test("plugin metadata maps skill and direct stdio server", async () => {
 
   assert.equal(manifest.name, "codestory");
   assert.equal(manifest.skills, "./skills/");
+  assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
   assert.equal(manifest.mcpServers, "./.mcp.json");
   assert.equal(manifest.interface.capabilities.includes("Read"), true);
+  assert.equal(
+    manifest.interface.capabilities.includes("Lifecycle hooks"),
+    true,
+  );
   assert.equal(mcp.mcpServers.codestory.command, "codestory-cli");
   assert.deepEqual(mcp.mcpServers.codestory.args, [
     "serve",

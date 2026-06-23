@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.11.11",
+  "version": "0.11.12",
   "description": "CodeStory grounding for Codex over the local codestory-cli stdio server.",
   "author": {
     "name": "The Green Cedar",
@@ -11,6 +11,7 @@
   "license": "Apache-2.0",
   "keywords": ["codestory", "codex", "grounding", "mcp", "local"],
   "skills": "./skills/",
+  "hooks": "./hooks/claude-codex-hooks.json",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "CodeStory",
@@ -18,7 +19,7 @@
     "longDescription": "CodeStory gives Codex a local, read-only grounding surface backed by codestory-cli. It exposes the existing CodeStory skill plus the local stdio protocol without duplicating indexing, retrieval, packet, or sidecar logic in the plugin.",
     "developerName": "The Green Cedar",
     "category": "Developer Tools",
-    "capabilities": ["Interactive", "Read"],
+    "capabilities": ["Interactive", "Read", "Lifecycle hooks"],
     "websiteURL": "https://github.com/TheGreenCedar/CodeStory",
     "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
     "termsOfServiceURL": "https://github.com/TheGreenCedar/CodeStory",
