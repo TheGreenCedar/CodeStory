@@ -71,112 +71,107 @@ test("codestory repo ships plugin source, not marketplace catalog or adapter run
   );
 });
 
-test("plugin docs are agent-first, marketplace-aware, and latest-release aware", async () => {
+test("plugin docs are agent-first, status-first, and marketplace-aware", async () => {
   const rootReadme = await readFile(join(repoRoot, "README.md"), "utf8");
   const readme = await readFile(join(pluginRoot, "README.md"), "utf8");
   const skill = await readFile(
     join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
     "utf8",
   );
-  const sharedRequired = [
-    "latest GitHub release",
-    "codestory-cli --version",
-    "SHA256SUMS.txt",
-    "retrieval_mode=full",
+  const doctorReference = await readFile(
+    join(
+      pluginRoot,
+      "skills",
+      "codestory-grounding",
+      "references",
+      "doctor.md",
+    ),
+    "utf8",
+  );
+  const serveReference = await readFile(
+    join(
+      pluginRoot,
+      "skills",
+      "codestory-grounding",
+      "references",
+      "serve.md",
+    ),
+    "utf8",
+  );
+  const usage = await readFile(join(repoRoot, "docs", "usage.md"), "utf8");
+  const retrievalSidecars = await readFile(
+    join(repoRoot, "docs", "ops", "retrieval-sidecars.md"),
+    "utf8",
+  );
+  const statusRuntimeRequired = [
+    "codestory://status",
+    "server_version",
+    "server_executable",
+    "allowed_surfaces",
   ];
-  const skillReleaseRequired = [
-    "missing or outdated",
-    "codestory-cli-vX.Y.Z-windows-x64.zip",
-    "codestory-cli-vX.Y.Z-windows-arm64.zip",
-    "codestory-cli-vX.Y.Z-macos-arm64.tar.gz",
-    "codestory-cli-vX.Y.Z-linux-x64.tar.gz",
-    "codestory-cli-vX.Y.Z-linux-arm64.tar.gz",
-    "Source fallback",
+  const cliRepairRequired = ["where.exe codestory-cli", "codestory-cli --version"];
+  const stdioLaunchRequired = [
+    "codestory-cli serve --stdio --refresh none",
+    "agent host `PATH`",
+  ];
+  const marketplaceSourceRequired = [
+    "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
+    "plugin source at `https://github.com/TheGreenCedar/CodeStory.git`",
+    "source path `plugins/codestory`",
+    "The CodeStory repo does not contain the marketplace catalog",
+    "git-subdir",
+  ];
+  const restartBoundaryRequired = [
+    "Codex host/app restart may",
+    "fresh Codex host/app session",
+  ];
+  const perSurfaceRequired = [
+    "`allowed_surfaces.<surface>.allowed`",
+    "`allowed_surfaces.packet.allowed`",
+    "`allowed_surfaces.search.allowed`",
+    "`allowed_surfaces.context.allowed`",
+    "`retrieval_mode=full`",
+  ];
+  const localGraphSurfaceNames = [
+    "ground",
+    "files",
+    "symbol",
+    "definition",
+    "trail",
+    "references",
+    "snippet",
+    "affected",
+    "symbols",
+    "get_node",
+    "neighbors",
+    "shortest_path",
+    "query_subgraph",
+  ];
+  const sidecarSurfaceNames = ["packet", "search", "context"];
+  const publicSurfaceRequired = [
+    "`allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`",
+    "check each surface's own `.allowed` bit",
+    "`allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full`",
+    "`context` is not a local-only browse surface",
   ];
   const forbidden = [
     "release-bound to " + "CodeStory `v" + "0.11.1`",
     "use that version " + "unless",
     "Install plugin entry `codestory` from the external marketplace catalog:",
+    "The first run should be agent-owned. The skill checks whether `codestory-cli` is\npresent and current",
   ];
   const forbiddenPatterns = [
     /\bcodestory-cli-v\d+\.\d+\.\d+/,
+    /\bcodestory-cli-vX\.Y\.Z/u,
     /release-bound to CodeStory `v\d+\.\d+\.\d+`/,
-  ];
-  const readmeRequired = [
-    "The human job is simple",
-    "The CLI is still there, but it is the escape hatch and repair surface",
-    "codestory://status",
-    "codestory://grounding",
-    "mcp__codestory",
-    "plugin MCP registration",
-    "ready --goal local --repair",
-    "ready --goal agent --repair",
-    "Inspect indexed file inventory and coverage.",
-    "Map changed files to likely impact.",
-    "For normal Codex use, install the plugin through the Codex plugin flow for your",
-    "/plugins",
-    "TheGreenCedar -> codestory -> Install plugin",
-    "add or refresh this marketplace first",
-    "codex plugin marketplace add TheGreenCedar/AgentPluginMarketplace",
-    "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
-    "marketplace display/name concept is `TheGreenCedar`",
-    "plugin source at `https://github.com/TheGreenCedar/CodeStory.git`",
-    "source path `plugins/codestory`",
-    "The CodeStory repo does not contain the marketplace catalog",
-    "workspace plugin settings are managed from the Codex Apps/Plugins UI",
-    "UI path when the CLI marketplace command is",
-    "Start a new Codex thread after installation or refresh",
-    "The first run should be agent-owned",
-    "installs the latest matching release asset",
-    "uses source fallback only when no release asset fits the host",
-    "Agent runtime bootstrap",
-    "the skill tells the human that a Codex host/app restart may be needed",
-    "running `codestory-cli serve --stdio --refresh none` process locks the old",
-    "before stale entries on `PATH`",
-    "command that MCP will",
-    "The plugin does not bundle the binary",
-    "Use source fallback only when no release asset fits the host",
-    "Source docs, marketplace source checkout/cache, and the active installed MCP",
-    "active runtime surface",
-    "agent host `PATH`",
-    "Set `CODESTORY_CLI` only for manual CLI fallback commands",
-    ".mcp.json` does not launch through that variable",
-    "python <path-to-plugin-creator>\\scripts\\validate_plugin.py plugins\\codestory",
-    "The plugin validator path is maintainer-local",
-    "For normal Codex use, refresh or uninstall the plugin from the Codex plugin",
-    "codex plugin marketplace upgrade TheGreenCedar",
-    "codex plugin marketplace remove TheGreenCedar",
-    "commands only for source registration",
-    "The plugin does not bundle the binary",
-    "Marketplace catalog repo",
-    "Marketplace display/name",
-    "Plugin entry",
-    "git-subdir",
-    "https://github.com/TheGreenCedar/CodeStory.git",
-    "plugins/codestory",
-    "codestory-cli serve --stdio --refresh none",
-  ];
-  const skillRequired = [
-    "download and unpack only",
-    "Use `CODESTORY_CLI` only for manual CLI/source",
-    "not as the installed MCP launch path",
-    "plugin MCP process may need",
-    "Codex host/app restart before a new agent thread",
-    "new agent thread",
-    "Read `codestory://grounding`",
-    "plugin MCP registration",
-    "ready --goal local --repair",
-    "ready --goal agent --repair",
-    "Always pass `--project <target-workspace>` explicitly",
   ];
   const rootReadmeRequired = [
     "Install details, binary bootstrap",
     "[plugin README](plugins/codestory/README.md)",
     "`codestory-cli serve --stdio --refresh none`",
   ];
-
   for (const text of [readme, skill]) {
-    for (const phrase of sharedRequired) {
+    for (const phrase of statusRuntimeRequired) {
       assert.equal(text.includes(phrase), true, phrase);
     }
     for (const phrase of forbidden) {
@@ -197,18 +192,58 @@ test("plugin docs are agent-first, marketplace-aware, and latest-release aware",
   for (const pattern of forbiddenPatterns) {
     assert.equal(pattern.test(rootReadme), false, String(pattern));
   }
-  for (const phrase of readmeRequired) {
+  for (const phrase of cliRepairRequired) {
+    assert.equal(readme.includes(phrase), true, phrase);
+    assert.equal(skill.includes(phrase), true, phrase);
+    assert.equal(doctorReference.includes(phrase), true, phrase);
+    assert.equal(serveReference.includes(phrase), true, phrase);
+  }
+  for (const phrase of stdioLaunchRequired) {
+    assert.equal(readme.includes(phrase), true, phrase);
+    assert.equal(serveReference.includes(phrase), true, phrase);
+  }
+  for (const phrase of marketplaceSourceRequired) {
     assert.equal(readme.includes(phrase), true, phrase);
   }
-  for (const phrase of skillReleaseRequired) {
-    assert.equal(skill.includes(phrase), true, phrase);
-    assert.equal(readme.includes(phrase), false, phrase);
+  assert.equal(
+    restartBoundaryRequired.some((phrase) => readme.includes(phrase)),
+    true,
+    "readme must mention restart boundary",
+  );
+  assert.equal(
+    restartBoundaryRequired.some((phrase) => serveReference.includes(phrase)),
+    true,
+    "serve reference must mention restart boundary",
+  );
+  for (const phrase of statusRuntimeRequired) {
+    assert.equal(serveReference.includes(phrase), true, phrase);
   }
   for (const phrase of rootReadmeRequired) {
     assert.equal(rootReadme.includes(phrase), true, phrase);
   }
-  for (const phrase of skillRequired) {
+  for (const phrase of perSurfaceRequired) {
     assert.equal(skill.includes(phrase), true, phrase);
+    assert.equal(serveReference.includes(phrase), true, phrase);
+  }
+  for (const surface of localGraphSurfaceNames) {
+    assert.equal(readme.includes(surface), true, surface);
+    assert.equal(skill.includes(surface), true, surface);
+    assert.equal(serveReference.includes(surface), true, surface);
+    assert.equal(usage.includes(surface), true, surface);
+    assert.equal(retrievalSidecars.includes(surface), true, surface);
+  }
+  for (const surface of sidecarSurfaceNames) {
+    assert.equal(readme.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
+    assert.equal(skill.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
+    assert.equal(serveReference.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
+  }
+  for (const text of [usage, retrievalSidecars]) {
+    for (const phrase of statusRuntimeRequired) {
+      assert.equal(text.includes(phrase), true, phrase);
+    }
+    for (const phrase of publicSurfaceRequired) {
+      assert.equal(text.includes(phrase), true, phrase);
+    }
   }
 });
 

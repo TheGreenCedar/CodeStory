@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.9
+
+CodeStory 0.11.9 promotes the plugin grounding consolidation so Codex sessions
+can trust the active MCP status before choosing a tool.
+
+The stdio status resource now reports `server_version`, best-effort
+`server_executable`, warnings, and per-surface `allowed_surfaces`. Local graph
+surfaces stay usable when local navigation is ready, while `packet`, `search`,
+and `context` stay blocked unless full agent packet/search readiness is present.
+The plugin README, grounding skill, sidecar docs, usage docs, and static tests
+now point agents at that same status-first contract.
+
+This release does not claim new packet/search answer-quality proof, sidecar
+performance improvement, benchmark promotion, or live installed plugin proof
+beyond the source and release checks in the promotion PR.
+
 ## 0.11.8
 
 CodeStory 0.11.8 promotes the latest reviewed readiness and plugin guidance

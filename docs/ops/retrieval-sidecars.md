@@ -1,13 +1,24 @@
 # Retrieval sidecars operations
 
-Local Zoekt, Qdrant, SCIP, and llama.cpp sidecars back agent `packet` and
-`search`. They are required for `agent_packet_search` infrastructure readiness:
-`retrieval status` must report `retrieval_mode: "full"` before packet/search
-evidence can claim full sidecar retrieval.
+Local Zoekt, Qdrant, SCIP, and llama.cpp sidecars back agent `packet`, `search`,
+and `context`. They are required for `agent_packet_search` infrastructure
+readiness: `retrieval status` must report `retrieval_mode: "full"` before those
+surfaces can claim full sidecar retrieval.
 
 A healthy SQLite cache alone is not enough. Full sidecars also do not prove
 answer quality by themselves; answer quality still needs the matching
 packet-runtime, drill, or benchmark evidence tier.
+
+| Runtime truth | Allows | Blocks |
+| --- | --- | --- |
+| `codestory://status` | Current MCP `server_version`, `server_executable`, and `allowed_surfaces`; use this first when plugin MCP is live. | Guessing the active runtime from source checkout, marketplace cache, or PATH alone. |
+| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
+| `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
+
+For local-only audits, do not run sidecar repair just because `packet`, `search`,
+or `context` is blocked. Use this runbook when the task needs one of those
+surfaces or when status says `agent_packet_search` should be repaired.
+`context` is not a local-only browse surface.
 
 Design: [`retrieval-design.md`](../architecture/retrieval-design.md).
 Promotion checks: [`retrieval-architecture.md`](../testing/retrieval-architecture.md).
