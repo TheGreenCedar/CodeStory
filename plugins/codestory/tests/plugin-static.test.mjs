@@ -46,20 +46,29 @@ test("plugin metadata maps skill and direct stdio server", async () => {
 });
 
 test("plugin package version tracks the codestory-cli release version", async () => {
-  const manifest = JSON.parse(
-    await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
-  );
   const cliManifest = await readFile(
     join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),
     "utf8",
   );
+  const expectedVersion = readCargoVersion(cliManifest);
+  const manifestPaths = [
+    join(pluginRoot, ".codex-plugin", "plugin.json"),
+    join(pluginRoot, ".claude-plugin", "plugin.json"),
+    join(pluginRoot, ".github", "plugin", "plugin.json"),
+  ];
 
-  assert.equal(manifest.version, readCargoVersion(cliManifest));
+  for (const manifestPath of manifestPaths) {
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    assert.equal(manifest.version, expectedVersion);
+  }
 });
 
-test("codestory repo ships plugin source, not marketplace catalog or adapter runtime", async () => {
+test("codestory repo ships plugin source, not marketplace catalog or server adapter runtime", async () => {
   await assert.rejects(
     access(join(repoRoot, ".agents", "plugins", "marketplace.json")),
+  );
+  await assert.rejects(
+    access(join(pluginRoot, ".github", "plugin", "marketplace.json")),
   );
   await assert.rejects(
     access(
@@ -69,6 +78,99 @@ test("codestory repo ships plugin source, not marketplace catalog or adapter run
   await assert.rejects(
     access(join(pluginRoot, "scripts", "codestory-mcp.mjs")),
   );
+});
+
+test("session-start hooks are thin and host manifests point at them", async () => {
+  const hookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "claude-codex-hooks.json"), "utf8"),
+  );
+  const copilotHookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "copilot-hooks.json"), "utf8"),
+  );
+  const hostManifest = join(pluginRoot, ".claude-plugin", "plugin.json");
+  const hookCommands = Object.values(hookConfig.hooks)
+    .flat()
+    .flatMap((entry) => entry.hooks);
+  const hookScript = /hooks[\\/]([\w.-]+\.(?:js|mjs|cjs|ps1|sh))/u;
+
+  assert.equal(copilotHookConfig.hooks.sessionStart.length, 1);
+
+  for (const hook of hookCommands) {
+    assert.equal(hook.command, "node");
+    assert.deepEqual(hook.args, [
+      "${CLAUDE_PLUGIN_ROOT}/hooks/codestory-activate.js",
+    ]);
+    assert.equal(
+      Object.hasOwn(hook, "commandWindows"),
+      false,
+      "Claude hook schema does not read commandWindows",
+    );
+    const match = hook.args[0].match(hookScript);
+    assert.ok(match, `cannot find hook script in args: ${hook.args[0]}`);
+    await access(join(pluginRoot, "hooks", match[1]));
+  }
+
+  const manifest = JSON.parse(await readFile(hostManifest, "utf8"));
+  assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
+});
+
+test("hook output injects CodeStory grounding context without CLI work", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.js");
+  const result = spawnSync(process.execPath, [hookPath], {
+    env: {
+      ...process.env,
+      COPILOT_PLUGIN_DATA: "",
+      PLUGIN_DATA: join(repoRoot, ".tmp-plugin-data"),
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /CODESTORY BACKGROUND GROUNDING ACTIVE/u,
+  );
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /codestory:\/\/status/u,
+  );
+});
+
+test("portable agent adapters are present", async () => {
+  const copilotManifest = JSON.parse(
+    await readFile(join(pluginRoot, ".github", "plugin", "plugin.json"), "utf8"),
+  );
+  const rootCopilotInstructions = await readFile(
+    join(repoRoot, ".github", "copilot-instructions.md"),
+    "utf8",
+  );
+  const rootCursorRule = await readFile(
+    join(repoRoot, ".cursor", "rules", "codestory.mdc"),
+    "utf8",
+  );
+  const pluginCursorRule = await readFile(
+    join(pluginRoot, ".cursor", "rules", "codestory.mdc"),
+    "utf8",
+  );
+  const portability = await readFile(
+    join(pluginRoot, "docs", "agent-portability.md"),
+    "utf8",
+  );
+
+  assert.equal(copilotManifest.hooks, "hooks/copilot-hooks.json");
+  assert.equal(copilotManifest.skills, "skills/");
+  for (const text of [
+    rootCopilotInstructions,
+    rootCursorRule,
+    pluginCursorRule,
+    portability,
+  ]) {
+    assert.match(text, /codestory:\/\/status/u);
+    assert.match(text, /retrieval_mode=full/u);
+  }
 });
 
 test("plugin docs are agent-first, status-first, and marketplace-aware", async () => {
@@ -120,6 +222,12 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "source path `plugins/codestory`",
     "The CodeStory repo does not contain the marketplace catalog",
     "git-subdir",
+  ];
+  const ambientHookRequired = [
+    "Hosts with lifecycle-hook adapters inject CodeStory's status-first\ngrounding rules at session start",
+    "With lifecycle hooks enabled, the agent should first check CodeStory\nstatus",
+    "If the host does not expose lifecycle hooks yet",
+    "Agent Portability",
   ];
   const restartBoundaryRequired = [
     "Codex host/app restart may",
@@ -175,6 +283,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "Install details, binary bootstrap",
     "[plugin README](plugins/codestory/README.md)",
     "`codestory-cli serve --stdio --refresh none`",
+    "Codex uses the plugin's MCP server plus the\n`@CodeStory` skill",
   ];
   for (const text of [readme, skill]) {
     for (const phrase of statusRuntimeRequired) {
@@ -209,6 +318,9 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     assert.equal(serveReference.includes(phrase), true, phrase);
   }
   for (const phrase of marketplaceSourceRequired) {
+    assert.equal(readme.includes(phrase), true, phrase);
+  }
+  for (const phrase of ambientHookRequired) {
     assert.equal(readme.includes(phrase), true, phrase);
   }
   assert.equal(

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "node \"${PLUGIN_ROOT}/hooks/codestory-activate.js\"",
+        "powershell": "node \"${PLUGIN_ROOT}\\hooks\\codestory-activate.js\"",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}
