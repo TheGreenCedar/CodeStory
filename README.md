@@ -40,6 +40,11 @@ For Codex:
 @CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
 ```
 
+Claude Code, GitHub Copilot, and Cursor adapters can load the same
+status-first grounding rules automatically when their host supports hooks or
+project instructions. Codex uses the plugin's MCP server plus the
+`@CodeStory` skill.
+
 The plugin launches `codestory-cli serve --stdio --refresh none` on your
 machine. It does not edit your repository. Other local MCP-style clients can
 run the same stdio surface directly. Install details, binary bootstrap, and

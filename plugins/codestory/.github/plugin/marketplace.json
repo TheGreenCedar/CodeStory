@@ -1,0 +1,19 @@
+{
+  "name": "codestory",
+  "description": "Local CodeStory grounding for coding agents.",
+  "owner": {
+    "name": "The Green Cedar",
+    "url": "https://github.com/TheGreenCedar"
+  },
+  "plugins": [
+    {
+      "name": "codestory",
+      "description": "Local CodeStory grounding backed by codestory-cli.",
+      "source": "./",
+      "category": "coding",
+      "tags": ["codestory", "grounding", "mcp", "local"],
+      "skills": "skills/",
+      "hooks": "hooks/copilot-hooks.json"
+    }
+  ]
+}

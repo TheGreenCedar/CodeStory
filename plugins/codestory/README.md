@@ -8,10 +8,13 @@ CodeStory gives a coding agent a local, read-only grounding surface before it
 plans, reviews, or edits a repository. Index once; answer from evidence with
 citations instead of re-exploring the tree on every prompt.
 
-The human job is simple: install the plugin, start a fresh thread in the repo,
-and ask the agent to check readiness before it makes source claims. The agent
-uses CodeStory for status, grounding, file inventory, graph trails, snippets,
-packet, and search. The CLI is still there, but it is the escape hatch and repair surface, not the main user experience.
+The human job is simple: install the plugin and start a fresh thread in the
+repo. Hosts with lifecycle-hook adapters inject CodeStory's status-first
+grounding rules at session start, so the agent can check readiness before it
+makes source claims without waiting for a special prompt. The agent uses
+CodeStory for status, grounding, file inventory, graph trails, snippets, packet,
+and search. The CLI is still there, but it is the escape hatch and repair
+surface, not the main user experience.
 
 ## What The Agent Gets
 
@@ -45,11 +48,14 @@ This package stays thin:
 - `.codex-plugin/plugin.json` describes the Codex plugin package.
 - `.mcp.json` launches `codestory-cli serve --stdio --refresh none` from the
   agent host `PATH`.
+- `hooks/` injects status-first grounding rules at session start for host
+  adapters that support lifecycle hooks.
 - `skills/codestory-grounding` is the single canonical CodeStory grounding
   skill shipped by this repository.
 
-There is no Node adapter and no marketplace catalog in this repository.
-CodeStory owns the plugin package and the Rust CLI/MCP runtime.
+There is a tiny Node hook adapter, but no Node runtime server and no marketplace
+catalog in this repository. CodeStory owns the plugin package and the Rust
+CLI/MCP runtime.
 
 ## Install For Agent Use
 
@@ -86,8 +92,11 @@ launches `codestory-cli serve --stdio --refresh none` from `PATH`.
 
 ### After install
 
-Open Codex in the repo you want to ground and ask the agent to check readiness
-before planning or editing:
+Open the agent host in the repo you want to ground and ask normal repository
+questions. With lifecycle hooks enabled, the agent should first check CodeStory
+status and allowed surfaces before planning or editing.
+
+If the host does not expose lifecycle hooks yet, use the explicit prompt:
 
 ```text
 @CodeStory read codestory://status, report allowed_surfaces for this checkout, ground the repo if allowed, and tell me whether packet/search/context need sidecar repair before I use them.
@@ -258,6 +267,12 @@ The marketplace catalog is external. One marketplace can list multiple plugins.
 | Source kind | `git-subdir` |
 | Source repo | `https://github.com/TheGreenCedar/CodeStory.git` |
 | Source path | `plugins/codestory` |
+
+## Agent Portability
+
+CodeStory also ships thin adapters for hosts that do not install the Codex
+plugin package directly: Claude Code, GitHub Copilot CLI, GitHub Copilot editor,
+and Cursor. See [Agent Portability](docs/agent-portability.md).
 
 ## Review Checks
 
