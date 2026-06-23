@@ -27,7 +27,7 @@ status field points to stale runtime or readiness evidence.
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> doctor --project <target-workspace>` | Reports project root, cache path, indexed stats, retrieval state, sidecar embedding setup, environment hints, and next commands. |
-| Failure path | If cache or index checks warn, run `index --project <target-workspace> --refresh full`; if mandatory sidecars are missing or stale, run the setup/index commands surfaced by `doctor`; if symbol docs, dense anchors, policy version, Qdrant counts, or semantic health report partial/stale/failed state, rebuild before trusting broad packet/search evidence. | Separates missing index, stale symbol docs, partial dense anchors, and mandatory retrieval setup failures. |
+| Failure path | If cache or index checks warn, run `ready --goal local --repair --project <target-workspace> --format json` or the setup/index command surfaced by `doctor`; use explicit `index --refresh full` only when the reported failure calls for a rebuild. If mandatory sidecars are missing or stale, run the sidecar setup/index commands surfaced by `doctor`; if symbol docs, dense anchors, policy version, Qdrant counts, or semantic health report partial/stale/failed state, repair before trusting broad packet/search evidence. | Separates missing index, stale symbol docs, partial dense anchors, and mandatory retrieval setup failures. |
 | Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
 
 For MCP/runtime drift, collect binary evidence only after status is missing or

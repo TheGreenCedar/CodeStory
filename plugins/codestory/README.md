@@ -16,6 +16,12 @@ CodeStory for status, grounding, file inventory, graph trails, snippets, packet,
 and search. The CLI is still there, but it is the escape hatch and repair
 surface, not the main user experience.
 
+The hook injects guidance, not repository evidence. Agents should first confirm
+they are in a repository with supported files, skip no-op ground output in huge
+or non-code folders, default setup to incremental `ready --goal local --repair`,
+and use `packet`, `search`, or `context` confidently once status reports full
+sidecar readiness.
+
 ## What The Agent Gets
 
 | Agent need | CodeStory surface | Human reading |

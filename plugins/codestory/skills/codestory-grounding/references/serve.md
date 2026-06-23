@@ -46,7 +46,7 @@ grounding, packet, or search call.
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
-| Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `index --project <target-workspace> --refresh full`; if bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
+| Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `ready --goal local --repair --project <target-workspace> --format json`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
 | Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
 
 ## Stdio Runtime Contract
