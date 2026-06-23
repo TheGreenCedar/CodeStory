@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { access, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join, delimiter } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -99,19 +100,18 @@ test("session-start hooks are thin and host manifests point at them", async () =
   const hookScript = /hooks[\\/]([\w.-]+\.(?:js|mjs|cjs|ps1|sh))/u;
 
   assert.equal(copilotHookConfig.hooks.sessionStart.length, 1);
+  assert.equal(hookConfig.hooks.UserPromptSubmit.length, 1);
 
   for (const hook of hookCommands) {
-    assert.equal(hook.command, "node");
-    assert.deepEqual(hook.args, [
-      "${CLAUDE_PLUGIN_ROOT}/hooks/codestory-activate.js",
-    ]);
+    assert.match(hook.command, /codestory-activate\.js/u);
+    assert.match(hook.commandWindows, /codestory-activate\.js/u);
     assert.equal(
-      Object.hasOwn(hook, "commandWindows"),
+      Object.hasOwn(hook, "args"),
       false,
-      "Claude hook schema does not read commandWindows",
+      "shell-guarded hooks should not rely on args-only launch",
     );
-    const match = hook.args[0].match(hookScript);
-    assert.ok(match, `cannot find hook script in args: ${hook.args[0]}`);
+    const match = `${hook.command}\n${hook.commandWindows}`.match(hookScript);
+    assert.ok(match, `cannot find hook script in command: ${hook.command}`);
     await access(join(pluginRoot, "hooks", match[1]));
   }
 
@@ -119,7 +119,101 @@ test("session-start hooks are thin and host manifests point at them", async () =
   assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
 });
 
-test("hook output injects CodeStory grounding context without CLI work", async () => {
+async function withFakeCodeStoryCli(callback) {
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-test-"));
+  const shPath = join(binDir, "codestory-cli");
+  const cmdPath = join(binDir, "codestory-cli.cmd");
+
+  await writeFile(
+    shPath,
+    "#!/bin/sh\nprintf 'FAKE_CODESTORY_CLI %s\\n' \"$*\"\n",
+    "utf8",
+  );
+  await chmod(shPath, 0o755);
+  await writeFile(
+    cmdPath,
+    "@echo off\r\necho FAKE_CODESTORY_CLI %*\r\n",
+    "utf8",
+  );
+
+  try {
+    await callback(binDir);
+  } finally {
+    await rm(binDir, { recursive: true, force: true });
+  }
+}
+
+test("hook output keeps CodeStory ambient and attempts request-aware grounding", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.js");
+
+  await withFakeCodeStoryCli(async (binDir) => {
+    const fakeCli = process.platform === "win32"
+      ? join(binDir, "codestory-cli.cmd")
+      : join(binDir, "codestory-cli");
+    const env = {
+      ...process.env,
+      CODESTORY_CLI: fakeCli,
+      COPILOT_PLUGIN_DATA: "",
+      PLUGIN_DATA: join(repoRoot, ".tmp-plugin-data"),
+      PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+    };
+
+    const sessionResult = spawnSync(process.execPath, [hookPath], {
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "startup",
+        cwd: repoRoot,
+      }),
+      encoding: "utf8",
+    });
+
+    assert.equal(sessionResult.status, 0, sessionResult.stderr);
+    const sessionOutput = JSON.parse(sessionResult.stdout);
+    assert.equal(sessionOutput.systemMessage, "CODESTORY:BACKGROUND");
+    assert.match(
+      sessionOutput.hookSpecificOutput.additionalContext,
+      /CODESTORY SESSION GROUNDING ACTIVE \(startup\)/u,
+    );
+    assert.match(
+      sessionOutput.hookSpecificOutput.additionalContext,
+      /Before manually opening source files/u,
+    );
+    assert.match(
+      sessionOutput.hookSpecificOutput.additionalContext,
+      /FAKE_CODESTORY_CLI ground --project/u,
+    );
+
+    const promptResult = spawnSync(process.execPath, [hookPath], {
+      env,
+      input: JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        prompt: "Where is RefreshMode defined?",
+        cwd: repoRoot,
+      }),
+      encoding: "utf8",
+    });
+
+    assert.equal(promptResult.status, 0, promptResult.stderr);
+    const promptOutput = JSON.parse(promptResult.stdout);
+    assert.equal(promptOutput.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    assert.match(
+      promptOutput.hookSpecificOutput.additionalContext,
+      /Prompt: Where is RefreshMode defined\?/u,
+    );
+    assert.match(
+      promptOutput.hookSpecificOutput.additionalContext,
+      /FAKE_CODESTORY_CLI packet --project/u,
+    );
+    assert.match(
+      promptOutput.hookSpecificOutput.additionalContext,
+      /--question Where is RefreshMode defined\?/u,
+    );
+  });
+});
+
+test("hook output fails open when runtime grounding is unavailable", async () => {
   const { spawnSync } = await import("node:child_process");
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.js");
   const result = spawnSync(process.execPath, [hookPath], {
@@ -127,32 +221,25 @@ test("hook output injects CodeStory grounding context without CLI work", async (
       ...process.env,
       COPILOT_PLUGIN_DATA: "",
       PLUGIN_DATA: join(repoRoot, ".tmp-plugin-data"),
+      PATH: "",
     },
+    input: JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Explain indexing flow.",
+      cwd: repoRoot,
+    }),
     encoding: "utf8",
   });
 
   assert.equal(result.status, 0, result.stderr);
   const output = JSON.parse(result.stdout);
-  assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
   assert.match(
     output.hookSpecificOutput.additionalContext,
-    /CODESTORY BACKGROUND GROUNDING ACTIVE/u,
+    /attempted request packet but did not receive usable output/u,
   );
   assert.match(
     output.hookSpecificOutput.additionalContext,
     /codestory:\/\/status/u,
-  );
-  assert.match(
-    output.hookSpecificOutput.additionalContext,
-    /avoid no-op grounding context/u,
-  );
-  assert.match(
-    output.hookSpecificOutput.additionalContext,
-    /use packet, search, and context confidently/u,
-  );
-  assert.match(
-    output.hookSpecificOutput.additionalContext,
-    /incremental ready repair/u,
   );
 });
 
@@ -251,7 +338,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "git-subdir",
   ];
   const ambientHookRequired = [
-    "Hosts with lifecycle-hook adapters inject CodeStory's status-first\ngrounding rules at session start",
+    "Hosts with lifecycle-hook adapters keep CodeStory ambient",
     "With lifecycle hooks enabled, the agent should first check CodeStory\nstatus",
     "If the host does not expose lifecycle hooks yet",
     "Agent Portability",
@@ -296,9 +383,10 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "`context` is not a local-only browse surface",
   ];
   const ambientScopeRequired = [
-    "The hook injects guidance, not repository evidence",
+    "strict startup grounding plus request-aware packets",
+    "Hooks fail open",
+    "Hook output is a starting packet, not final proof",
     "skip no-op ground output in huge\nor non-code folders",
-    "Lifecycle hooks provide instructions only; they do not run `ground`, index, or\nsidecar retrieval by themselves",
     "no repo, no supported files, or zero indexed files",
     "Do not inject, summarize, or paste empty ground\noutput as context",
     "incremental by default",

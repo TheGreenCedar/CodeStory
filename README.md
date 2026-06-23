@@ -42,7 +42,9 @@ For Codex:
 
 Claude Code, GitHub Copilot, and Cursor adapters can load the same
 status-first grounding rules automatically when their host supports hooks or
-project instructions. Codex uses the plugin's MCP server plus the
+project instructions. Hook-enabled hosts keep CodeStory ambient and can attempt
+strict startup grounding plus request-aware packets before the agent opens
+source files. Codex uses the plugin's MCP server plus the
 `@CodeStory` skill.
 
 The plugin launches `codestory-cli serve --stdio --refresh none` on your

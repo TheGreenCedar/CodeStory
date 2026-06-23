@@ -2,10 +2,11 @@ const fs = require('fs');
 const path = require('path');
 
 const SKILL_PATH = path.join(__dirname, '..', 'skills', 'codestory-grounding', 'SKILL.md');
+const MAX_PROMPT_CHARS = 600;
 
 const FALLBACK = `CODESTORY BACKGROUND GROUNDING ACTIVE
 
-Before making source claims, planning edits, choosing tests, or reviewing changes in a repository:
+Before reading source files, making source claims, planning edits, choosing tests, or reviewing changes in a repository:
 
 1. Confirm the target is a repository workspace before grounding it. In huge or mixed folders, stop CodeStory grounding if status, ready, or ground reports no repo, no supported files, or zero indexed files; do not inject or summarize empty ground output.
 2. If the CodeStory MCP server is live, read codestory://status first.
@@ -24,14 +25,43 @@ function skillBody() {
   }
 }
 
-function getCodeStoryInstructions() {
-  const body = skillBody();
-  if (!body) return FALLBACK;
+function compactPrompt(prompt) {
+  const text = String(prompt || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= MAX_PROMPT_CHARS) return text;
+  return `${text.slice(0, MAX_PROMPT_CHARS)}...`;
+}
 
-  return `CODESTORY BACKGROUND GROUNDING ACTIVE
+function eventHeader(event, input = {}) {
+  if (event === 'UserPromptSubmit') {
+    const prompt = compactPrompt(input.prompt);
+    return [
+      'CODESTORY REQUEST GROUNDING ACTIVE',
+      '',
+      'Use CodeStory before source files for this user prompt.',
+      prompt ? `Prompt: ${prompt}` : 'Prompt: unavailable from hook input.',
+      '',
+    ].join('\n');
+  }
+
+  const source = input.source ? ` (${input.source})` : '';
+  return [
+    `CODESTORY SESSION GROUNDING ACTIVE${source}`,
+    '',
+    'Keep CodeStory ambient in this session. Before source reads, claims, edits, reviews, or test choices, check CodeStory status and use allowed grounding surfaces first.',
+    '',
+  ].join('\n');
+}
+
+function getCodeStoryInstructions(event = 'SessionStart', input = {}) {
+  const body = skillBody();
+  if (!body) return `${eventHeader(event, input)}${FALLBACK}`;
+
+  return `${eventHeader(event, input)}CODESTORY BACKGROUND GROUNDING RULES
 
 Use CodeStory proactively for repository grounding. Do not wait for the user to call it by name.
-First confirm the target is a repository with supported files; avoid no-op grounding context in huge or non-code folders.
+Before manually opening source files, first read codestory://status when MCP is live, then use the allowed CodeStory surface that fits the task.
+For broad user requests, prefer a packet tied to the user's actual question. For concrete symbols, files, or routes, use search/context/trail/snippet. For no request context, use a compact ground snapshot only after confirming the target repo is indexable.
+Avoid no-op grounding context in huge or non-code folders.
 When retrieval sidecars are full and allowed, use packet, search, and context confidently.
 Use incremental ready repair as the default setup path once a repository target is known.
 
@@ -40,5 +70,6 @@ ${body}`;
 
 module.exports = {
   FALLBACK,
+  compactPrompt,
   getCodeStoryInstructions,
 };
