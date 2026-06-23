@@ -489,6 +489,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "ureq 2.12.1",
 ]
 
 [[package]]

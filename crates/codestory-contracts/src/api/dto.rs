@@ -311,9 +311,18 @@ pub enum ReadinessGoalDto {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessStatusDto {
     Ready,
+    RepairSetup,
     RepairIndex,
     CheckIndex,
     RepairRetrieval,
+}
+
+/// Host CLI setup snapshot used inside readiness verdicts.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct ReadinessSetupSnapshotDto {
+    pub active_path: String,
+    pub active_version: String,
+    pub latest_version: String,
 }
 
 /// Index state snapshot used inside readiness verdicts.
@@ -358,6 +367,8 @@ pub struct ReadinessVerdictDto {
     pub minimum_next: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub full_repair: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ReadinessSetupSnapshotDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<ReadinessIndexSnapshotDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

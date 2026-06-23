@@ -8508,6 +8508,7 @@ fn build_summary_readiness(
         project,
         stats,
         freshness,
+        setup: None,
         sidecar: Some(readiness_sidecar_input(sidecar)),
     })
 }

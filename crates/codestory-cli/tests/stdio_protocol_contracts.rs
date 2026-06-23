@@ -12,6 +12,7 @@ struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,
     hash_embeddings: bool,
+    latest_release_version: String,
 }
 
 struct StdioServer {
@@ -130,6 +131,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         workspace,
         cache_dir,
         hash_embeddings,
+        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 
@@ -216,6 +218,10 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
+    command.env(
+        "CODESTORY_LATEST_RELEASE_VERSION",
+        &fixture.latest_release_version,
+    );
     let mut child = command.spawn().expect("spawn stdio server");
 
     let stdin = child.stdin.take().expect("stdio stdin");
@@ -2042,6 +2048,13 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             "agent_packet_search",
             "repair_retrieval",
         );
+        assert_eq!(
+            status
+                .pointer(&format!("/allowed_surfaces/{surface}/repair_reason"))
+                .and_then(Value::as_str),
+            Some("retrieval_manifest_missing"),
+            "blocked agent surface should expose typed sidecar repair reason: {status}"
+        );
     }
     assert!(
         readiness
@@ -2078,6 +2091,51 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .and_then(Value::as_array)
             .is_some_and(|calls| !calls.is_empty()),
         "status should include recommended next calls: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
+    let mut fixture = indexed_fixture();
+    fixture.latest_release_version = "999.0.0".to_string();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-cli",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-stale-cli"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(
+        status["readiness"][0]["status"],
+        json!("repair_setup"),
+        "stale active CLI should be a hard setup repair state: {status}"
+    );
+    let setup = &status["readiness"][0]["setup"];
+    assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(setup["latest_version"], "999.0.0");
+    assert!(
+        setup["active_path"]
+            .as_str()
+            .is_some_and(|path| path.contains("codestory-cli")),
+        "setup snapshot should expose active executable path: {status}"
+    );
+    for surface in ["ground", "files", "packet", "search", "context"] {
+        let surface_status = &status["allowed_surfaces"][surface];
+        assert_eq!(surface_status["allowed"], json!(false));
+        assert_eq!(surface_status["status"], json!("repair_setup"));
+        assert_eq!(surface_status["repair_reason"], json!("stale_active_cli"));
+    }
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        next_call_text.contains("install-codestory.ps1") && next_call_text.contains("999.0.0"),
+        "stale active CLI repair should be an installer command, not a prompt: {status}"
     );
 }
 
