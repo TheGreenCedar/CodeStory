@@ -1,6 +1,6 @@
 [package]
 name = "codestory-workspace"
-version = "0.11.6"
+version = "0.11.9"
 edition = "2024"
 
 [dependencies]

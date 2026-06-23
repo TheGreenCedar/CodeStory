@@ -2,6 +2,17 @@
 
 Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready.
 
+For the installed plugin, `.mcp.json` starts:
+
+```text
+codestory-cli serve --stdio --refresh none
+```
+
+The process resolves `codestory-cli` from the agent host `PATH`. Once MCP is
+live, `codestory://status` is the runtime truth: use `server_version`,
+`server_executable`, and `allowed_surfaces` from status before any local
+grounding, packet, or search call.
+
 ## Usage
 
 ```
@@ -36,7 +47,20 @@ Serves the indexed project over either a small HTTP JSON API or an MCP-style JSO
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
 | Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `index --project <target-workspace> --refresh full`; if bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
-| Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, and `context`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
+| Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
+
+## Stdio Runtime Contract
+
+| Status field | Use |
+|--------------|-----|
+| `server_version` | Active MCP server version. Prefer this over source checkout or package version once MCP is live. |
+| `server_executable` | Active MCP server executable path. Use it to diagnose stale PATH or binary drift. |
+| `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
+| `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |
+
+Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is not
+registered, status is unavailable, or the status executable/version indicates a
+stale binary. If PATH changes during repair, start a fresh Codex host/app session before checking status again.
 
 ## Notes
 

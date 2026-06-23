@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.11.9
+
+CodeStory 0.11.9 promotes the plugin grounding consolidation so Codex sessions
+can trust the active MCP status before choosing a tool.
+
+The stdio status resource now reports `server_version`, best-effort
+`server_executable`, warnings, and per-surface `allowed_surfaces`. Local graph
+surfaces stay usable when local navigation is ready, while `packet`, `search`,
+and `context` stay blocked unless full agent packet/search readiness is present.
+The plugin README, grounding skill, sidecar docs, usage docs, and static tests
+now point agents at that same status-first contract.
+
+This release does not claim new packet/search answer-quality proof, sidecar
+performance improvement, benchmark promotion, or live installed plugin proof
+beyond the source and release checks in the promotion PR.
+
+## 0.11.8
+
+CodeStory 0.11.8 promotes the latest reviewed readiness and plugin guidance
+fixes from `dev/codestory-next` onto `main` without carrying stale 0.11.6
+release metadata forward.
+
+The release documents the MCP registration failure path in the plugin guidance,
+repairs readiness setup around bundled compose artifacts and explicit ready
+environment handling, and keeps llama.cpp environment propagation visible when
+`ready` prepares semantic sidecars. The version is aligned across every
+`codestory-*` workspace crate, `Cargo.lock`, and the CodeStory plugin manifest.
+
+Supporting PRs: #396, #398, #401. This release does not claim new packet/search
+answer-quality proof, sidecar performance improvement, benchmark promotion, or
+live installed plugin proof beyond the source and release checks in the
+promotion PR.
+
+## 0.11.7
+
+CodeStory 0.11.7 closes the product-grade intelligence saga with the final
+post-release polish from `dev/codestory-next` promoted to `main`.
+
+The docs now describe the plugin path as an agent plugin backed by the local
+`codestory-cli serve --stdio --refresh none` surface, while keeping
+Codex-specific installation wording in the Codex plugin flow. The stdio/MCP
+initialize response now reports the crate package version instead of the old
+hard-coded `0.1.0`, and the protocol contract covers both version fields.
+
+Supporting PRs: #389, #390. This release does not add a wrapper layer, move the
+marketplace catalog into CodeStory, claim new sidecar performance, or broaden
+packet/search readiness beyond the existing sidecar evidence gates.
+
 ## 0.11.6
 
 CodeStory 0.11.6 promotes the reviewed `dev/codestory-next` release delta onto

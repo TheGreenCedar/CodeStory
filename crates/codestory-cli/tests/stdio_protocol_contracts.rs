@@ -572,6 +572,58 @@ fn assert_fresh_freshness_counts(value: &Value, context: &str) {
     );
 }
 
+fn assert_allowed_surface(
+    status: &Value,
+    surface: &str,
+    expected_allowed: bool,
+    expected_goal: &str,
+    expected_status: &str,
+) {
+    let surface_status = status
+        .pointer(&format!("/allowed_surfaces/{surface}"))
+        .unwrap_or_else(|| panic!("status should include allowed_surfaces.{surface}: {status}"));
+    assert_eq!(
+        surface_status["allowed"],
+        json!(expected_allowed),
+        "unexpected allowed state for {surface}: {surface_status}"
+    );
+    assert_eq!(
+        surface_status["readiness_goal"],
+        json!(expected_goal),
+        "unexpected readiness goal for {surface}: {surface_status}"
+    );
+    assert_eq!(
+        surface_status["status"],
+        json!(expected_status),
+        "unexpected readiness status for {surface}: {surface_status}"
+    );
+    assert!(
+        surface_status["summary"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "surface status should include a readiness summary for {surface}: {surface_status}"
+    );
+    if expected_allowed {
+        assert!(
+            surface_status["blocked_reason"].is_null(),
+            "allowed surface {surface} should not include a blocked reason: {surface_status}"
+        );
+    } else {
+        assert!(
+            surface_status["blocked_reason"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "blocked surface {surface} should explain why it is blocked: {surface_status}"
+        );
+        assert!(
+            surface_status["minimum_next"]
+                .as_array()
+                .is_some_and(|commands| !commands.is_empty()),
+            "blocked surface {surface} should include minimum repair guidance: {surface_status}"
+        );
+    }
+}
+
 fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
     match value {
         Value::String(text) => strings.push(text),
@@ -1899,6 +1951,20 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 
     let result = assert_success_envelope(&response, json!("status-resource"));
     let status = json_resource_content(result, "codestory://status");
+    assert_eq!(
+        status["server_version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "status should identify the serving package version: {status}"
+    );
+    assert!(
+        status["server_executable"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty())
+            || status["warnings"]
+                .as_array()
+                .is_some_and(|warnings| !warnings.is_empty()),
+        "status should expose server_executable or an explicit warning: {status}"
+    );
     assert!(
         status
             .get("project_root")
@@ -1951,6 +2017,32 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     let readiness = status["readiness"]
         .as_array()
         .unwrap_or_else(|| panic!("status should include readiness verdicts: {status}"));
+    for surface in [
+        "ground",
+        "files",
+        "symbol",
+        "definition",
+        "get_node",
+        "neighbors",
+        "shortest_path",
+        "query_subgraph",
+        "symbols",
+        "trail",
+        "references",
+        "snippet",
+        "affected",
+    ] {
+        assert_allowed_surface(&status, surface, true, "local_navigation", "ready");
+    }
+    for surface in ["packet", "search", "context"] {
+        assert_allowed_surface(
+            &status,
+            surface,
+            false,
+            "agent_packet_search",
+            "repair_retrieval",
+        );
+    }
     assert!(
         readiness
             .iter()
@@ -2126,9 +2218,69 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
             .or_else(|| guide.get("recommended_call_sequence"))
             .or_else(|| guide.get("recommended_next_calls"))
             .and_then(Value::as_array)
-            .is_some_and(|calls| calls.len() >= 3),
+            .is_some_and(|calls| {
+                calls
+                    .iter()
+                    .any(|call| call["uri"] == json!("codestory://status"))
+            })
+            && guide
+                .get("readiness_lanes")
+                .and_then(Value::as_array)
+                .is_some_and(|lanes| lanes.len() >= 2),
         "agent guide should include a concise default browser loop or call sequence: {guide}"
     );
+    let local_lane = guide["readiness_lanes"]
+        .as_array()
+        .and_then(|lanes| {
+            lanes
+                .iter()
+                .find(|lane| lane["readiness_goal"] == json!("local_navigation"))
+        })
+        .unwrap_or_else(|| panic!("agent guide should include local_navigation lane: {guide}"));
+    let local_surfaces = local_lane["surfaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("local lane should list surfaces: {guide}"));
+    for expected in [
+        "ground",
+        "files",
+        "symbol",
+        "definition",
+        "get_node",
+        "neighbors",
+        "shortest_path",
+        "query_subgraph",
+        "symbols",
+        "snippet",
+        "references",
+        "trail",
+        "affected",
+    ] {
+        assert!(
+            local_surfaces.iter().any(|surface| surface == expected),
+            "local lane should include {expected}: {guide}"
+        );
+    }
+    assert!(
+        !local_surfaces.iter().any(|surface| surface == "context"),
+        "context is sidecar-backed and should not be in the local lane: {guide}"
+    );
+    let agent_lane = guide["readiness_lanes"]
+        .as_array()
+        .and_then(|lanes| {
+            lanes
+                .iter()
+                .find(|lane| lane["readiness_goal"] == json!("agent_packet_search"))
+        })
+        .unwrap_or_else(|| panic!("agent guide should include agent_packet_search lane: {guide}"));
+    let agent_surfaces = agent_lane["surfaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent lane should list surfaces: {guide}"));
+    for expected in ["packet", "search", "context"] {
+        assert!(
+            agent_surfaces.iter().any(|surface| surface == expected),
+            "agent lane should include {expected}: {guide}"
+        );
+    }
     let mut strings = Vec::new();
     string_values_recursive(&guide, &mut strings);
     for expected in [
@@ -2145,6 +2297,22 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         );
     }
     let guide_text = strings.join("\n").to_ascii_lowercase();
+    let unconditional_sequence_text = guide
+        .get("recommended_call_sequence")
+        .and_then(Value::as_array)
+        .map(|calls| Value::Array(calls.clone()).to_string())
+        .unwrap_or_default();
+    assert!(
+        !unconditional_sequence_text.contains("\"tool\":\"packet\"")
+            && !unconditional_sequence_text.contains("\"tool\":\"search\""),
+        "packet/search should not be unconditional normal next steps: {guide}"
+    );
+    assert!(
+        guide_text.contains("allowed_surfaces.packet.allowed")
+            && guide_text.contains("allowed_surfaces.search.allowed")
+            && guide_text.contains("allowed_surfaces.context.allowed"),
+        "agent guide should make packet/search/context conditional on status allowed_surfaces: {guide}"
+    );
     assert!(
         guide_text.contains("repo-text hits as navigation clues"),
         "agent guide should treat repo-text hits as navigation clues: {guide}"
@@ -2164,9 +2332,21 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "agent guide should name the direct source-read fallback: {guide}"
     );
     assert!(
-        guide_text.contains("files, affected, cache identity, retrieval status")
-            && guide_text.contains("deferred"),
-        "agent guide should record deferred stdio surfaces: {guide}"
+        guide_text.contains("ground")
+            && guide_text.contains("files")
+            && guide_text.contains("definition")
+            && guide_text.contains("get_node")
+            && guide_text.contains("neighbors")
+            && guide_text.contains("shortest_path")
+            && guide_text.contains("query_subgraph")
+            && guide_text.contains("symbols")
+            && guide_text.contains("affected")
+            && guide_text.contains("local_navigation"),
+        "agent guide should record local navigation surfaces: {guide}"
+    );
+    assert!(
+        !guide_text.contains("files, affected, cache identity, retrieval status"),
+        "agent guide should not describe allowed files/affected surfaces as deferred: {guide}"
     );
     assert!(
         !guide_text.contains("repo-text hits as evidence"),
@@ -2189,6 +2369,21 @@ fn transcript_calls_search_tool() {
         return;
     };
     let mut server = spawn_stdio_server(&fixture);
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "full-retrieval-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(&status_response, json!("full-retrieval-status"));
+    let status = json_resource_content(status_result, "codestory://status");
+    for surface in ["packet", "search", "context"] {
+        assert_allowed_surface(&status, surface, true, "agent_packet_search", "ready");
+    }
 
     let response = send_json(
         &mut server,
