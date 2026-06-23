@@ -9,18 +9,22 @@ plans, reviews, or edits a repository. Index once; answer from evidence with
 citations instead of re-exploring the tree on every prompt.
 
 The human job is simple: install the plugin and start a fresh thread in the
-repo. Hosts with lifecycle-hook adapters inject CodeStory's status-first
-grounding rules at session start, so the agent can check readiness before it
-makes source claims without waiting for a special prompt. The agent uses
-CodeStory for status, grounding, file inventory, graph trails, snippets, packet,
-and search. The CLI is still there, but it is the escape hatch and repair
-surface, not the main user experience.
+repo. Hosts with lifecycle-hook adapters keep CodeStory ambient: on session
+start, resume, clear, and compact, the hook injects CodeStory-first grounding
+rules and attempts a strict `ground` snapshot from the session cwd; on each user
+prompt, it attempts a tiny `packet` using that exact prompt. The agent should
+use CodeStory before source files whenever it needs to verify repository facts,
+plan edits, choose tests, or review changes. The CLI is still there, but it is
+the escape hatch and repair surface, not the main user experience.
 
-The hook injects guidance, not repository evidence. Agents should first confirm
-they are in a repository with supported files, skip no-op ground output in huge
-or non-code folders, default setup to incremental `ready --goal local --repair`,
-and use `packet`, `search`, or `context` confidently once status reports full
-sidecar readiness.
+This is strict startup grounding plus request-aware packets, not a random
+repository summary. Hooks fail open. Missing `node`, missing `codestory-cli`, missing MCP, degraded
+sidecars, timeouts, non-repo folders, and empty output must not block the host
+session. If the hook cannot produce useful grounding, it leaves the agent with
+the next CodeStory check to run: usually `codestory://status`, an allowed
+`packet`/`search`/`context` call, or incremental
+`ready --goal local --repair`. Agents still skip no-op ground output in huge
+or non-code folders.
 
 ## What The Agent Gets
 
@@ -54,8 +58,9 @@ This package stays thin:
 - `.codex-plugin/plugin.json` describes the Codex plugin package.
 - `.mcp.json` launches `codestory-cli serve --stdio --refresh none` from the
   agent host `PATH`.
-- `hooks/` injects status-first grounding rules at session start for host
-  adapters that support lifecycle hooks.
+- `hooks/` keeps CodeStory ambient for host adapters that support lifecycle
+  hooks: `SessionStart` attempts strict startup grounding and
+  `UserPromptSubmit` attempts request-aware packet grounding.
 - `skills/codestory-grounding` is the single canonical CodeStory grounding
   skill shipped by this repository.
 
@@ -100,7 +105,10 @@ launches `codestory-cli serve --stdio --refresh none` from `PATH`.
 
 Open the agent host in the repo you want to ground and ask normal repository
 questions. With lifecycle hooks enabled, the agent should first check CodeStory
-status and allowed surfaces before planning or editing.
+status and allowed surfaces before planning, editing, or reading source files.
+If the prompt is concrete enough, the hook should already have supplied a tiny
+packet tied to that exact prompt. Treat that packet as a starting point and
+follow any gaps or next commands before making source claims.
 
 If the host does not expose lifecycle hooks yet, use the explicit prompt:
 
