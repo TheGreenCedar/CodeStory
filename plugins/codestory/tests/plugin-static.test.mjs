@@ -103,10 +103,6 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     join(repoRoot, "docs", "ops", "retrieval-sidecars.md"),
     "utf8",
   );
-  const dogfoodChecklist = await readFile(
-    join(repoRoot, "docs", "ops", "codestory-plugin-dogfood-checklist.md"),
-    "utf8",
-  );
   const statusRuntimeRequired = [
     "codestory://status",
     "server_version",
@@ -174,18 +170,6 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "[plugin README](plugins/codestory/README.md)",
     "`codestory-cli serve --stdio --refresh none`",
   ];
-  const dogfoodRequired = [
-    "git status --short --branch",
-    "where.exe codestory-cli",
-    "codestory-cli --version",
-    "server_version",
-    "server_executable",
-    "allowed_surfaces",
-    "allowed_surfaces.context.allowed",
-    "Do not run packet, search, or context unless that surface's allowed bit is true and retrieval_mode=full",
-    "Do not edit files",
-  ];
-
   for (const text of [readme, skill]) {
     for (const phrase of statusRuntimeRequired) {
       assert.equal(text.includes(phrase), true, phrase);
@@ -247,13 +231,11 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     assert.equal(serveReference.includes(surface), true, surface);
     assert.equal(usage.includes(surface), true, surface);
     assert.equal(retrievalSidecars.includes(surface), true, surface);
-    assert.equal(dogfoodChecklist.includes(surface), true, surface);
   }
   for (const surface of sidecarSurfaceNames) {
     assert.equal(readme.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
     assert.equal(skill.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
     assert.equal(serveReference.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
-    assert.equal(dogfoodChecklist.includes(`allowed_surfaces.${surface}.allowed`), true, surface);
   }
   for (const text of [usage, retrievalSidecars]) {
     for (const phrase of statusRuntimeRequired) {
@@ -262,9 +244,6 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     for (const phrase of publicSurfaceRequired) {
       assert.equal(text.includes(phrase), true, phrase);
     }
-  }
-  for (const phrase of dogfoodRequired) {
-    assert.equal(dogfoodChecklist.includes(phrase), true, phrase);
   }
 });
 

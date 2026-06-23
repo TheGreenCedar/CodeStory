@@ -9,8 +9,8 @@ The stdio status resource now reports `server_version`, best-effort
 `server_executable`, warnings, and per-surface `allowed_surfaces`. Local graph
 surfaces stay usable when local navigation is ready, while `packet`, `search`,
 and `context` stay blocked unless full agent packet/search readiness is present.
-The plugin README, grounding skill, sidecar docs, usage docs, static tests, and
-dogfood checklist now point agents at that same status-first contract.
+The plugin README, grounding skill, sidecar docs, usage docs, and static tests
+now point agents at that same status-first contract.
 
 This release does not claim new packet/search answer-quality proof, sidecar
 performance improvement, benchmark promotion, or live installed plugin proof
