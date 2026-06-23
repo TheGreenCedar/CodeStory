@@ -32,16 +32,21 @@ tool source unless the user is editing CodeStory itself.
 2. For installed plugin MCP runtime, `.mcp.json` launches `codestory-cli` from
    the agent host `PATH`. Use `CODESTORY_CLI` only for manual CLI/source
    fallback commands, not as the installed MCP launch path.
-3. Resolve `<codestory-cli>` for explicit CLI commands:
+3. When the user explicitly invokes CodeStory, check that the `mcp__codestory`
+   tools or `codestory://status` resource are actually exposed. If the skill is
+   visible but the MCP namespace is missing, call it a plugin MCP registration
+   failure and use CLI only as a degraded fallback while reporting that setup
+   defect.
+4. Resolve `<codestory-cli>` for explicit CLI commands:
    - prefer `CODESTORY_CLI` when set;
    - otherwise use `codestory-cli` on `PATH`;
    - otherwise use a nearby `target/release/codestory-cli*` from the current or
      sibling CodeStory checkout;
    - otherwise install the released binary for the host OS.
-4. Resolve the latest GitHub release tag. If `codestory-cli` exists, compare
+5. Resolve the latest GitHub release tag. If `codestory-cli` exists, compare
    `codestory-cli --version` with that tag and keep the binary only when it
    already matches the latest release.
-5. If `codestory-cli` is missing or outdated, download and unpack only the
+6. If `codestory-cli` is missing or outdated, download and unpack only the
    matching host asset derived from the latest tag. Do this before asking the
    human to install or run manual commands unless network access, permissions,
    or a missing release asset blocks the setup. For latest tag `vX.Y.Z`, use:
@@ -51,14 +56,14 @@ tool source unless the user is editing CodeStory itself.
    - Linux x64: `codestory-cli-vX.Y.Z-linux-x64.tar.gz`
    - Linux arm64: `codestory-cli-vX.Y.Z-linux-arm64.tar.gz`
    - macOS x64 or missing asset: Source fallback. Build from source.
-6. Put the binary in a stable user bin directory, verify
+7. Put the binary in a stable user bin directory, verify
    `codestory-cli --version`, and prefer checking `SHA256SUMS.txt` from the
    same release when the host has the tools. If `PATH` changed, say the plugin MCP process may need a Codex host/app restart before a new agent thread can see it.
    If a running `codestory-cli serve --stdio --refresh none` process locks the
    old binary, install the current release into a versioned directory and put
    that directory before stale entries on `PATH`; verify `codestory-cli
    --version` from `PATH` before launch.
-7. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
+8. Use `scripts/setup.ps1` or `scripts/setup.sh` from this skill only for the
    source-build fallback or explicit source-artifact setup.
 
 ## MCP Loop
@@ -84,17 +89,18 @@ commands and label packet/search as blocked.
 
 When MCP is unavailable or a transcript is needed, use the CLI directly:
 
-1. `doctor --project <target-workspace>` for cache, index, freshness, and
-   sidecar health.
-2. `index --project <target-workspace> --refresh full` for a first index;
-   `--refresh incremental` for normal repair.
-3. `ground --project <target-workspace> --why` for compact orientation.
-4. `files --project <target-workspace>` for indexed file inventory.
-5. `context`, `symbol`, `trail --story --hide-speculative`, `snippet`, `files`,
+1. `ready --goal local --repair --project <target-workspace> --format json`
+   before local navigation or delegation when the index is missing or stale.
+2. `ready --goal agent --repair --project <target-workspace> --format json`
+   before packet/search claims when sidecars are missing or stale.
+3. `doctor --project <target-workspace>` for a read-only health transcript.
+4. `ground --project <target-workspace> --why` for compact orientation.
+5. `files --project <target-workspace>` for indexed file inventory.
+6. `context`, `symbol`, `trail --story --hide-speculative`, `snippet`, `files`,
    and `affected` for concrete source-backed follow-up.
-6. `search --project <target-workspace> --query ... --why` for candidate
+7. `search --project <target-workspace> --query ... --why` for candidate
    discovery after sidecars are full.
-7. `packet --project <target-workspace> --question ...` for broad answers only
+8. `packet --project <target-workspace> --question ...` for broad answers only
    when packet/search readiness is full.
 
 Always pass `--project <target-workspace>` explicitly.

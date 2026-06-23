@@ -151,17 +151,22 @@ why the MCP server is not ready:
 
 ```console
 codestory-cli --version
+codestory-cli ready --goal local --repair --project <repo> --format json
+codestory-cli ready --goal agent --repair --project <repo> --format json
 codestory-cli doctor --project <repo> --format markdown
-codestory-cli index --project <repo> --refresh full
 codestory-cli retrieval status --project <repo> --format json
 codestory-cli serve --project <repo> --stdio --refresh none
 ```
 
+If `@CodeStory` loads the skill but no `mcp__codestory` tools or
+`codestory://status` resource are exposed, treat that as plugin MCP registration
+failure. The CLI can collect health evidence, but it does not prove the installed
+MCP surface is live.
+
 Packet/search evidence needs sidecars:
 
 ```console
-codestory-cli retrieval bootstrap --project <repo> --format json
-codestory-cli retrieval index --project <repo> --refresh full
+codestory-cli ready --goal agent --repair --project <repo> --format json
 codestory-cli retrieval status --project <repo> --format json
 ```
 

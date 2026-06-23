@@ -910,4 +910,57 @@ mod tests {
         assert!(env::var("CODESTORY_EMBED_ONNX_MODEL").is_ok());
         assert!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").is_ok());
     }
+
+    #[test]
+    fn bundled_llamacpp_defaults_prevent_managed_onnx_autostart_for_agent_repair() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("repo");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
+
+        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+        RuntimeContext::new(&ProjectArgs {
+            project,
+            cache_dir: Some(cache),
+        })
+        .expect("runtime context");
+
+        assert_eq!(
+            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
+            Some("llamacpp")
+        );
+        assert_eq!(
+            env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
+            Some("http://127.0.0.1:8080/v1/embeddings")
+        );
+        assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
+        assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
+    }
+
+    #[test]
+    fn bundled_llamacpp_defaults_preserve_explicit_user_env() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        unsafe {
+            env::set_var("CODESTORY_EMBED_BACKEND", "llamacpp");
+            env::set_var(
+                "CODESTORY_EMBED_LLAMACPP_URL",
+                "http://127.0.0.1:18080/v1/embeddings",
+            );
+        }
+
+        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+
+        assert_eq!(
+            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
+            Some("llamacpp")
+        );
+        assert_eq!(
+            env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
+            Some("http://127.0.0.1:18080/v1/embeddings")
+        );
+    }
 }
