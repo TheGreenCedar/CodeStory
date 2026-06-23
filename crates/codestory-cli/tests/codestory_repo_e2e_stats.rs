@@ -518,6 +518,22 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
     let sidecar_retrieval_mode =
         string_field(&retrieval_status_json, &["retrieval_mode"]).to_string();
+    let retrieval_degraded_reason = retrieval_status_json
+        .get("degraded_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("<none>");
+    assert_eq!(
+        sidecar_retrieval_mode,
+        "full",
+        "retrieval status after retrieval index should be full before trusting index/ground/search evidence; degraded_reason={}; manifest dense_projection_count={} projection_count={} symbol_doc_count={}",
+        retrieval_degraded_reason,
+        optional_u64_field(
+            &retrieval_status_json,
+            &["manifest", "dense_projection_count"]
+        ),
+        optional_u64_field(&retrieval_status_json, &["manifest", "projection_count"]),
+        optional_u64_field(&retrieval_status_json, &["manifest", "symbol_doc_count"])
+    );
 
     let search_dir_before = fs::metadata(&search_dir)
         .expect("search dir metadata before reads")
