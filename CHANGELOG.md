@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.13
+
+CodeStory 0.11.13 reports the host restart/reload boundary after a stale
+active stdio process detects that repair installed a newer codestory-cli
+outside the running MCP process. The readiness status now avoids repeating the
+installer loop in that state and labels the next action as a host restart.
+
 ## 0.11.12
 
 CodeStory 0.11.12 restores Codex lifecycle hook registration in the plugin

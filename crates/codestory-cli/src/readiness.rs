@@ -20,6 +20,8 @@ pub(crate) struct ReadinessSetupInput {
     pub(crate) active_path: String,
     pub(crate) active_version: String,
     pub(crate) latest_version: String,
+    pub(crate) newer_installed_path: Option<String>,
+    pub(crate) newer_installed_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +117,31 @@ fn verdict_state(
     project_arg: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
     if let Some(setup) = setup {
+        if let (Some(newer_path), Some(newer_version)) = (
+            setup.newer_installed_path.as_ref(),
+            setup.newer_installed_version.as_ref(),
+        ) {
+            let restart = format!(
+                "Restart/reload the Codex host/app so MCP relaunches codestory-cli {newer_version} from {newer_path}; then open a fresh agent thread and read codestory://status."
+            );
+            return (
+                ReadinessStatusDto::RepairSetup,
+                format!(
+                    "Active codestory-cli {} at {} is older than latest release {}; a newer installed codestory-cli {} exists at {}. Restart or reload the host before retrying CodeStory surfaces.",
+                    setup.active_version,
+                    setup.active_path,
+                    setup.latest_version,
+                    newer_version,
+                    newer_path
+                ),
+                vec![restart.clone()],
+                vec![
+                    restart,
+                    "where.exe codestory-cli".to_string(),
+                    "codestory-cli --version".to_string(),
+                ],
+            );
+        }
         let install = format!(
             "powershell -NoProfile -ExecutionPolicy Bypass -Command '$installer = Join-Path $env:TEMP \"install-codestory.ps1\"; Invoke-WebRequest -UseBasicParsing -Uri \"https://raw.githubusercontent.com/TheGreenCedar/CodeStory/v{}/scripts/install-codestory.ps1\" -OutFile $installer; & $installer -Project {project_arg} -Version {}'",
             setup.latest_version, setup.latest_version
@@ -321,6 +348,8 @@ fn readiness_setup_snapshot(input: &ReadinessSetupInput) -> ReadinessSetupSnapsh
         active_path: input.active_path.to_string(),
         active_version: input.active_version.to_string(),
         latest_version: input.latest_version.to_string(),
+        newer_installed_path: input.newer_installed_path.clone(),
+        newer_installed_version: input.newer_installed_version.clone(),
     }
 }
 
@@ -419,6 +448,8 @@ mod tests {
                 active_path: "C:/Users/alber/.local/bin/codestory-cli.exe".to_string(),
                 active_version: "0.11.6".to_string(),
                 latest_version: "0.11.9".to_string(),
+                newer_installed_path: None,
+                newer_installed_version: None,
             }),
             sidecar: Some(ReadinessSidecarInput {
                 retrieval_mode: "full",
@@ -446,6 +477,55 @@ mod tests {
                 verdict.minimum_next[0].contains("install-codestory.ps1")
                     && verdict.minimum_next[0].contains("0.11.9"),
                 "stale CLI repair must be an install action, not advice: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_active_cli_with_newer_installed_binary_reports_restart_boundary() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
+        let verdicts = build_readiness_verdicts(ReadinessInputs {
+            project: "C:/workspace/project",
+            stats: &stats,
+            freshness: Some(&freshness),
+            setup: Some(&ReadinessSetupInput {
+                active_path: "C:/Users/alber/.local/bin/codestory-cli.exe".to_string(),
+                active_version: "0.11.10".to_string(),
+                latest_version: "0.11.12".to_string(),
+                newer_installed_path: Some(
+                    "C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe".to_string(),
+                ),
+                newer_installed_version: Some("0.11.11".to_string()),
+            }),
+            sidecar: Some(ReadinessSidecarInput {
+                retrieval_mode: "full",
+                degraded_reason: None,
+                manifest_generation: Some("generation"),
+                manifest_input_hash: Some("hash"),
+            }),
+        });
+
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| verdict.status == ReadinessStatusDto::RepairSetup),
+            "stale active CLI must remain a setup repair state: {verdicts:?}"
+        );
+        for verdict in verdicts {
+            let setup = verdict.setup.as_ref().expect("setup snapshot");
+            assert_eq!(
+                setup.newer_installed_path.as_deref(),
+                Some("C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe")
+            );
+            assert_eq!(setup.newer_installed_version.as_deref(), Some("0.11.11"));
+            assert!(
+                verdict.minimum_next[0].contains("Restart/reload the Codex host/app"),
+                "stale CLI with newer installed binary should report the host boundary: {verdict:?}"
+            );
+            assert!(
+                !verdict.minimum_next[0].contains("install-codestory.ps1"),
+                "minimum_next should not repeat the installer after a newer binary is present: {verdict:?}"
             );
         }
     }
