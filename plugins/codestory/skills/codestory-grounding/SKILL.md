@@ -13,8 +13,18 @@ checkout is only tool source unless the user is editing CodeStory itself.
 
 ## Ambient Scope Guard
 
-Lifecycle hooks provide instructions only; they do not run `ground`, index, or
-sidecar retrieval by themselves.
+Lifecycle hooks keep CodeStory ambient in hosts that support them. On session
+start, resume, clear, and compact they inject CodeStory-first grounding rules
+and attempt a strict `ground` snapshot from the session cwd. On user prompts,
+they attempt a tiny `packet` using the actual prompt text. Hook output is
+best-effort and must fail open: missing `node`, missing `codestory-cli`, missing
+MCP, degraded sidecars, timeouts, non-repo folders, and empty output never block
+the host session.
+
+Hook output is a starting packet, not final proof. Before opening source files,
+read `codestory://status` when MCP is live and use the allowed CodeStory
+surface that fits the task. If the hook could not provide useful grounding,
+follow its repair or packet/search/context next step first.
 
 Before calling CodeStory surfaces, confirm the target is a repository workspace.
 In huge or mixed folders, use repo/workspace cues first. If `status`, `ready`,
