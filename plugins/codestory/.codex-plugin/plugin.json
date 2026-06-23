@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.11.10",
+  "version": "0.11.11",
   "description": "CodeStory grounding for Codex over the local codestory-cli stdio server.",
   "author": {
     "name": "The Green Cedar",
@@ -17,7 +17,7 @@
     "shortDescription": "Use local CodeStory grounding from Codex",
     "longDescription": "CodeStory gives Codex a local, read-only grounding surface backed by codestory-cli. It exposes the existing CodeStory skill plus the local stdio protocol without duplicating indexing, retrieval, packet, or sidecar logic in the plugin.",
     "developerName": "The Green Cedar",
-    "category": "Coding",
+    "category": "Developer Tools",
     "capabilities": ["Interactive", "Read"],
     "websiteURL": "https://github.com/TheGreenCedar/CodeStory",
     "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
