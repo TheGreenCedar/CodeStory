@@ -14,9 +14,9 @@ debugging, transcripts, and direct stdio integration.
 | Stage | Human action | Agent/CLI action | Trust check |
 | --- | --- | --- | --- |
 | Install | Install the `codestory` agent plugin from `TheGreenCedar`. | Plugin starts `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
-| First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | `local_navigation` is ready before using local graph output. |
-| Source work | Ask for a plan, review, or code path. | Use `files`, `symbol`, `trail`, `snippet`, `context`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
-| Broad discovery | Ask a repo-wide question. | Use `packet` or `search`. | Trust only when `agent_packet_search` is ready and `retrieval_mode=full`. |
+| First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | Status reports `server_version`, `server_executable`, and `allowed_surfaces`. |
+| Source work | Ask for a plan, review, or code path. | Use allowed local graph surfaces such as `files`, `symbol`, `trail`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
+| Broad discovery | Ask a repo-wide question. | Use `packet`, `search`, or `context`. | Trust only when that surface is allowed and `retrieval_mode=full`. |
 | Repair | Ask for a transcript or run CLI directly. | Use `ready --goal local --repair` or `ready --goal agent --repair`. | Repeat readiness checks after repair. |
 
 Packet/search output from degraded retrieval, missing sidecars, stale manifests,
@@ -31,7 +31,7 @@ exact setup, repair, or debug record.
 **Portable templates (any repository):**
 
 ```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+@CodeStory read codestory://status, report allowed_surfaces for this checkout, ground the repo if allowed, and tell me whether packet/search/context need sidecar repair before I use them.
 ```
 
 ```text
@@ -51,7 +51,7 @@ sidecars or coverage are degraded.
 Use concrete repo terms, not generic architecture words:
 
 ```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet on codestory-indexer changes.
+@CodeStory read codestory://status, report allowed_surfaces for this checkout, ground the repo if allowed, and tell me whether packet/search/context need sidecar repair before codestory-indexer changes.
 ```
 
 ```text
@@ -83,7 +83,7 @@ workspace you want to ground. The canonical skill package lives at
 3. Start a fresh thread and ask:
 
 ```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+@CodeStory read codestory://status, report allowed_surfaces for this checkout, ground the repo if allowed, and tell me whether packet/search/context need sidecar repair before I use them.
 ```
 
 **Direct CLI transcript (for setup, repair, or debugging):**
@@ -100,11 +100,16 @@ codestory-cli ground --project <target-workspace> --why
 
 **Key guidance:**
 
-Do not infer packet/search readiness from a successful local grounding command. Use `doctor` to check both readiness lanes separately.
+When MCP is live, use `codestory://status` as the runtime truth. Its
+`server_version` and `server_executable` fields identify the active server, and
+`allowed_surfaces` tells the agent which tools are safe now. Do not infer
+packet/search readiness from a successful local grounding command.
 
 **Next steps after installation:**
 
-If the agent reports that local navigation is ready but agent packet/search is not ready, repair the sidecar lane with:
+If the agent reports that local graph surfaces are allowed but `packet`,
+`search`, or `context` is not allowed, local browse work can continue. Repair
+the sidecar lane only when the task needs those sidecar-backed surfaces:
 
 ```sh
 codestory-cli ready --goal agent --repair --project <target-workspace> --format json
@@ -112,19 +117,20 @@ codestory-cli ready --goal agent --repair --project <target-workspace> --format 
 
 **Common next steps:**
 
-- If `agent_packet_search` is not ready: The agent will guide you through setting up retrieval sidecars
-- If `local_navigation` is not ready: The agent will guide you through indexing the repository
+- If `packet`, `search`, or `context` is not allowed: Keep local browse work local; repair retrieval sidecars only when the task needs those surfaces
+- If `ground` or `files` is not allowed: The agent will guide you through indexing the repository
 - If both are ready: You can proceed with using CodeStory for your task
 
 **Verification checkpoints:**
 
-After the initial setup, you can verify readiness with:
+After the initial setup, you can collect CLI health evidence with:
 
 ```sh
 codestory-cli doctor --project <target-workspace>
 ```
 
-This will tell you exactly what is ready and what needs to be repaired before you can use packet/search features.
+Use this when MCP is missing, a repair transcript is needed, or the status
+resource points to stale runtime evidence.
 
 When changing CodeStory itself or testing the current checkout:
 
@@ -138,30 +144,19 @@ The plugin source-build setup fallback accepts `CODESTORY_REPO_URL` and
 `CODESTORY_REPO_REF` when you need a specific source artifact. Without an
 explicit ref, setup fetches and builds the remote default branch.
 
-## Readiness Lanes
+## Readiness Contract
 
-| Question | Local navigation | Agent packet/search |
+| Runtime truth | Allows | Blocks |
 | --- | --- | --- |
-| Lane id | `local_navigation` | `agent_packet_search` |
-| Built by | `index` | `index`, then `retrieval index` |
-| Requires | Healthy SQLite cache and graph | Healthy sidecars and `retrieval_mode=full` |
-| Good for | Known files, symbols, trails, snippets, changed-file impact | Broad candidate discovery and bounded task packets |
-| Commands | `ground`, `report`, `files`, `symbol`, `trail`, `snippet`, `explore`, `affected` | `packet`, `search`, `context` packet construction after target selection |
-| Does not prove | Broad sidecar search is ready | That cache-only browsing is enough for broad agent search |
+| `codestory://status` | Current `server_version`, `server_executable`, and `allowed_surfaces`; use this first when MCP is live. | Guessing active runtime from source checkout, marketplace cache, or `PATH` alone. |
+| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
+| `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without matching packet-runtime, drill, benchmark, or source evidence. |
 
-**Key concepts for readiness lanes:**
-
-- **Local navigation**: SQLite cache, graph, and DB-backed browse commands (`ground`, `report`, `files`, `trail`, `snippet`, `context --id`, etc.) are usable.
-- **Agent packet/search**: Sidecars are healthy and `retrieval_mode=full`; required for trustworthy `packet`, `search`, and query-based candidate discovery.
-- **Retrieval mode**: Sidecar status contract; only `full` serves agent packet/search.
-- **Semantic ready**: Dense-anchor embedding state matches policy; not the same as agent packet/search readiness.
-
-`context` straddles these lanes. Target selection is local/index-first:
-`--id`, `--bookmark`, or `--query <exact target>` chooses one concrete focus.
-The context answer/evidence packet then runs through the Investigate agent path
-and may fail closed unless sidecar-primary retrieval is full. Use `symbol`,
-`trail`, `snippet`, or `explore` for cache-only local navigation when sidecars
-are degraded.
+`context` is not a local-only browse surface. Even when the target is concrete,
+use it only when `allowed_surfaces.context.allowed` is true and
+`retrieval_mode=full`. Use each allowed MCP local graph surface's own status bit
+for cache-only local navigation when sidecars are degraded. `explore` is
+CLI-only and is not an MCP `allowed_surfaces` entry.
 
 Sidecar topology:
 [architecture/overview.md](architecture/overview.md),
