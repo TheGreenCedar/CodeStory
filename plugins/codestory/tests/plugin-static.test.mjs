@@ -68,6 +68,9 @@ test("codestory repo ships plugin source, not marketplace catalog or server adap
     access(join(repoRoot, ".agents", "plugins", "marketplace.json")),
   );
   await assert.rejects(
+    access(join(pluginRoot, ".github", "plugin", "marketplace.json")),
+  );
+  await assert.rejects(
     access(
       join(repoRoot, ".agents", "skills", "codestory-grounding", "SKILL.md"),
     ),
