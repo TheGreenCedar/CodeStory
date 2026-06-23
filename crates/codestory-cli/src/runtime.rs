@@ -109,6 +109,12 @@ impl RuntimeContext {
         Self::new_with_startup(args, ManagedEmbeddingStartup::AutostartIfInstalled)
     }
 
+    /// Open runtime services for agent-facing packet/search commands.
+    pub(crate) fn new_agent_sidecar(args: &ProjectArgs) -> Result<Self> {
+        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+        Self::new(args)
+    }
+
     /// Open runtime services without starting managed embedding processes.
     pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
         Self::new_with_startup(args, ManagedEmbeddingStartup::InspectOnly)
@@ -912,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_llamacpp_defaults_prevent_managed_onnx_autostart_for_agent_repair() {
+    fn agent_sidecar_runtime_defaults_prevent_managed_onnx_autostart() {
         let _env_lock = crate::config::config_env_test_lock();
         let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let temp = tempdir().expect("temp dir");
@@ -921,8 +927,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project");
         write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
 
-        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
-        RuntimeContext::new(&ProjectArgs {
+        RuntimeContext::new_agent_sidecar(&ProjectArgs {
             project,
             cache_dir: Some(cache),
         })
