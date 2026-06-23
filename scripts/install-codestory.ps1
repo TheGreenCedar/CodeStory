@@ -579,6 +579,22 @@ function Invoke-SelfTest {
     }
     Assert-SelfTest $explicitStale "explicit stale codestory-cli override should fail loudly"
 
+    Set-RequiredVersion "v0.11.9"
+    $staleLatestRepair = $false
+    try {
+        $staleCli = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-stale-" + [System.Guid]::NewGuid().ToString("N") + ".cmd")
+        Set-Content -LiteralPath $staleCli -Value "@echo codestory-cli 0.11.6" -Encoding ASCII
+        Find-ExistingCli $staleCli $null | Out-Null
+    } catch {
+        $staleLatestRepair = $_.Exception.Message -match "requires 0.11.9"
+    } finally {
+        if ($staleCli -and (Test-Path -LiteralPath $staleCli)) {
+            Remove-Item -LiteralPath $staleCli -Force
+        }
+    }
+    Assert-SelfTest $staleLatestRepair "stale 0.11.6 should require latest 0.11.9 repair"
+    Set-RequiredVersion "v0.11.4"
+
     try {
         $currentCli = Join-Path ([System.IO.Path]::GetTempPath()) ("codestory-current-" + [System.Guid]::NewGuid().ToString("N") + ".cmd")
         Set-Content -LiteralPath $currentCli -Value "@echo codestory-cli 0.11.4" -Encoding ASCII

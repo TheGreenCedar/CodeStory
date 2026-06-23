@@ -31,6 +31,12 @@ user asks for a CLI transcript. `CODESTORY_CLI` is for manual CLI/source
 fallback commands; `.mcp.json` launches `codestory-cli` from the agent host
 `PATH`.
 
+If `codestory://status` reports `repair_setup` because the active
+`server_version` is older than the latest release, repair the CLI before local
+navigation, packet, search, or context. Run the installer command from
+`recommended_next_calls`; do not ask the human to install the binary unless
+network, permissions, or release assets block the repair.
+
 ## MCP Loop
 
 When the plugin MCP server is available:

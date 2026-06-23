@@ -125,6 +125,12 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "Codex host/app restart may",
     "fresh Codex host/app session",
   ];
+  const staleCliRepairRequired = [
+    "If status reports `repair_setup`",
+    "The agent runs the installer command from `recommended_next_calls`",
+    "If `codestory://status` reports `repair_setup`",
+    "do not ask the human to install the binary",
+  ];
   const perSurfaceRequired = [
     "`allowed_surfaces.<surface>.allowed`",
     "`allowed_surfaces.packet.allowed`",
@@ -217,6 +223,9 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
   );
   for (const phrase of statusRuntimeRequired) {
     assert.equal(serveReference.includes(phrase), true, phrase);
+  }
+  for (const phrase of staleCliRepairRequired) {
+    assert.equal(readme.includes(phrase) || skill.includes(phrase), true, phrase);
   }
   for (const phrase of rootReadmeRequired) {
     assert.equal(rootReadme.includes(phrase), true, phrase);
