@@ -27,6 +27,14 @@ function readCargoVersion(manifestText) {
   assert.fail("Cargo package must declare version");
 }
 
+async function readPluginVersion() {
+  const manifest = JSON.parse(
+    await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
+  );
+  assert.equal(typeof manifest.version, "string");
+  return manifest.version;
+}
+
 function releaseAssetForPlatform(version) {
   const target = process.platform === "win32" && process.arch === "x64"
     ? "windows-x64"
@@ -46,24 +54,25 @@ function releaseAssetForPlatform(version) {
 }
 
 async function writeFakeCli(cliPath) {
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}]}));process.exit(0)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
-      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))" %*\r\n`,
+      `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`,
       "utf8",
     );
     return;
   }
   await writeFile(
     cliPath,
-    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))' "$@"\n`,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`,
     "utf8",
   );
   await chmod(cliPath, 0o755);
 }
 
 async function writeRecordingCli(cliPath) {
-  const script = "const fs=require('fs');fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args:process.argv.slice(1)})+'\\n')";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}]}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
   if (process.platform === "win32") {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`, "utf8");
     return;
@@ -129,9 +138,10 @@ test("codestory repo ships plugin source, not marketplace catalog or server adap
 
 test("mcp launcher prefers a checksummed managed cli without PATH", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-cli-"));
   const outFile = join(dataDir, "env.json");
-  const cliDir = join(dataDir, "codestory-cli", "0.11.17");
+  const cliDir = join(dataDir, "codestory-cli", version);
   const cliPath = join(
     cliDir,
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
@@ -165,6 +175,8 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.source, "managed");
     assert.equal(observed.path, cliPath);
     assert.equal(observed.sha256, sha256);
+    assert.equal(observed.pluginRoot, pluginRoot);
+    assert.equal(observed.pluginCacheVersion, "");
     assert.equal(observed.sidecarPolicy, "ask");
     assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
     assert.match(observed.sidecarEnable, /--policy-file/u);
@@ -184,6 +196,227 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
     );
     assert.equal(policy.state, "enabled");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-mcp-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
+  ].join("\n") + "\n";
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: "",
+        COPILOT_PLUGIN_DATA: "",
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 3, result.stdout);
+    const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.plugin_runtime.plugin_version, version);
+    assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
+    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
+    assert.equal(status.readiness[0].status, "repair_setup");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+    assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
+    assert.equal(responses[2].result.isError, true);
+    assert.equal(
+      responses[2].result.structuredContent.code,
+      "codestory_mcp_runtime_unavailable",
+    );
+    assert.equal(
+      responses[2].result.structuredContent.plugin_runtime.plugin_root,
+      pluginRoot,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when local navigation is not ready", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-index-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliScript = join(dataDir, "fake-codestory-cli.cjs");
+  const cliPath = join(
+    dataDir,
+    process.platform === "win32" ? "fake-codestory-cli.cmd" : "fake-codestory-cli",
+  );
+  const marker = join(dataDir, "serve-called.txt");
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
+  ].join("\n") + "\n";
+
+  try {
+    await writeFile(
+      cliScript,
+      [
+        "const fs = require('node:fs');",
+        "const version = process.env.TEST_CODESTORY_VERSION;",
+        "const marker = process.env.TEST_OUT;",
+        "const command = process.argv[2];",
+        "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
+        "if (command === 'ready') {",
+        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'No indexed symbols are available yet.', minimum_next: ['codestory-cli ready --goal local --repair --project \"fixture\" --format json'], full_repair: ['codestory-cli doctor --project \"fixture\"'] }] }));",
+        "  process.exit(0);",
+        "}",
+        "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(1); }",
+        "process.exit(2);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    if (process.platform === "win32") {
+      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+    } else {
+      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
+      await chmod(cliPath, 0o755);
+    }
+
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: dataDir,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: marker,
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    await assert.rejects(access(marker));
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 3, result.stdout);
+    const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
+    assert.equal(status.readiness[0].status, "repair_index");
+    assert.equal(status.readiness[0].repair_reason, "local_navigation_repair_index");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+    assert.equal(status.allowed_surfaces.ground.status, "repair_index");
+    assert.match(status.readiness[0].minimum_next[0], /ready --goal local --repair/u);
+    assert.equal(responses[2].result.isError, true);
+    assert.equal(responses[2].result.structuredContent.status, "repair_index");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-override-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const missingCli = join(dataDir, process.platform === "win32" ? "missing.exe" : "missing");
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "status",
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  }) + "\n";
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: missingCli,
+        PLUGIN_DATA: dataDir,
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    const status = JSON.parse(response.result.contents[0].text);
+    assert.equal(status.plugin_runtime.plugin_version, version);
+    assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
+    assert.equal(status.readiness[0].repair_reason, "local_dev_override_cli_unspawnable");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when managed cli probe fails", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-managed-"));
+  const cliDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(
+    cliDir,
+    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+  );
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "tool",
+    method: "tools/call",
+    params: { name: "ground", arguments: {} },
+  }) + "\n";
+
+  try {
+    await mkdir(cliDir, { recursive: true });
+    if (process.platform === "win32") {
+      await writeFile(cliPath, "@echo off\r\nexit /b 7\r\n", "utf8");
+    } else {
+      await writeFile(cliPath, "#!/bin/sh\nexit 7\n", "utf8");
+      await chmod(cliPath, 0o755);
+    }
+    const sha256 = createHash("sha256")
+      .update(await readFile(cliPath))
+      .digest("hex");
+    await writeFile(
+      join(cliDir, "manifest.json"),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: dataDir,
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    assert.equal(response.result.isError, true);
+    assert.equal(
+      response.result.structuredContent.repair_reason,
+      "managed_cli_unspawnable",
+    );
+    assert.equal(
+      response.result.structuredContent.plugin_runtime.plugin_version,
+      version,
+    );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -220,9 +453,10 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
 
 test("enabled sidecar policy schedules existing agent repair path", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
   const logFile = join(dataDir, "calls.jsonl");
-  const cliDir = join(dataDir, "codestory-cli", "0.11.17");
+  const cliDir = join(dataDir, "codestory-cli", version);
   const cliPath = join(
     cliDir,
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
@@ -282,7 +516,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     return;
   }
 
-  const version = "0.11.17";
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
   const outFile = join(dataDir, "env.json");
@@ -649,6 +883,8 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "server_executable_sha256",
     "sidecar_contract_version",
     "plugin_runtime",
+    "plugin_runtime.plugin_root",
+    "plugin_cache_version",
     "sidecar_setup",
     "build_source",
     "repo_ref",
@@ -660,6 +896,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "scripts/codestory-mcp.cjs",
     "github_release",
     "path_fallback",
+    "closing transport",
   ];
   const marketplaceSourceRequired = [
     "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",

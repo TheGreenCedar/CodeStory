@@ -47,7 +47,7 @@ Use status fields this way:
 | `server_executable` | Executable path serving this MCP session. | Use as active runtime evidence; do not guess from source paths. |
 | `server_executable_sha256` | Checksum of the active MCP server binary when available. | Use to confirm the exact runtime binary after install, repair, or reload. |
 | `sidecar_contract_version` | Sidecar schema contract compiled into the active CLI. | Use to diagnose sidecar/runtime contract drift. |
-| `plugin_runtime` | Plugin launch source and managed CLI metadata, including `build_source` and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `path_fallback` as degraded launch evidence. |
+| `plugin_runtime` | Plugin launch source and managed CLI metadata, including `plugin_runtime.plugin_root`, `plugin_cache_version`, `build_source`, and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `path_fallback` as degraded launch evidence. |
 | `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Ask before first automatic sidecar setup; respect `enabled` and `disabled`. |
 | `allowed_surfaces.<surface>.allowed` | A concrete MCP surface is allowed. | Use local graph entries such as `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` only when their surface is allowed. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Sidecar-backed agent surfaces are allowed. | Use `packet`, `search`, and `context` confidently when their own allowed bit is true and `retrieval_mode=full`. |
@@ -57,7 +57,9 @@ source-build checks only when MCP is missing, the plugin needs repair, status
 shows `path_fallback`, or the user asks for a CLI transcript. `CODESTORY_CLI`
 is an explicit local-dev override; installed `.mcp.json` launches the managed
 adapter first, provisions from `github_release` when needed, and records the
-launch source in `plugin_runtime`.
+launch source in `plugin_runtime`. If the resolved runtime cannot spawn, or if
+only a missing, unversioned, or stale `PATH` fallback is available, the adapter
+stays up with `repair_setup` diagnostics instead of closing transport.
 
 If `codestory://status` reports `repair_setup` because the active
 `server_version` is older than the latest release, repair the CLI before local

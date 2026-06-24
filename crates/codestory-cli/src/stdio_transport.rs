@@ -2403,6 +2403,8 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         .unwrap_or_default();
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
+        "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
+        "plugin_cache_version": env_nonempty("CODESTORY_PLUGIN_CACHE_VERSION"),
         "cli_version": env_nonempty("CODESTORY_PLUGIN_CLI_VERSION"),
         "cli_source": cli_source,
         "cli_path": env_nonempty("CODESTORY_PLUGIN_CLI_PATH"),
