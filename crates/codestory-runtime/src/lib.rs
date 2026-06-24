@@ -14,15 +14,15 @@ use codestory_contracts::api::{
     GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
     GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileLanguageCountDto,
-    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
-    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
+    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
@@ -3419,6 +3419,26 @@ fn normalize_path_key(path: &str) -> String {
 
 fn indexed_file_role(path: &Path) -> IndexedFileRoleDto {
     path_role_from_key(&normalize_path_key(&path.to_string_lossy()))
+}
+
+fn indexed_file_incomplete_reason(
+    file: &FileInfo,
+    errors_by_file: &HashMap<i64, u32>,
+) -> Option<(&'static str, &'static str)> {
+    if file.complete {
+        return None;
+    }
+    if errors_by_file.contains_key(&file.id) {
+        Some((
+            "index_error",
+            "recorded file-level index errors; inspect error_count or reindex the file",
+        ))
+    } else {
+        Some((
+            "unknown",
+            "incomplete with no recorded file-level error; run a full reindex or inspect indexer logs",
+        ))
+    }
 }
 
 fn path_role_from_key(path: &str) -> IndexedFileRoleDto {
@@ -8888,6 +8908,7 @@ impl AppController {
         }
 
         let mut language_counts = BTreeMap::<String, u32>::new();
+        let mut incomplete_reason_counts = BTreeMap::<String, (u32, String)>::new();
         let mut indexed_file_count = 0_u32;
         let mut incomplete_file_count = 0_u32;
         let mut error_file_count = 0_u32;
@@ -8896,6 +8917,12 @@ impl AppController {
             indexed_file_count += u32::from(file.indexed);
             incomplete_file_count += u32::from(!file.complete);
             error_file_count += u32::from(errors_by_file.contains_key(&file.id));
+            if let Some((reason, detail)) = indexed_file_incomplete_reason(file, &errors_by_file) {
+                let entry = incomplete_reason_counts
+                    .entry(reason.to_string())
+                    .or_insert_with(|| (0, detail.to_string()));
+                entry.0 += 1;
+            }
         }
 
         let path_filter = req.path_contains.as_deref().map(normalize_path_key);
@@ -8950,6 +8977,16 @@ impl AppController {
                 }
             })
             .collect::<Vec<_>>();
+        let incomplete_reason_counts = incomplete_reason_counts
+            .into_iter()
+            .map(
+                |(reason, (file_count, detail))| IndexedFileIncompleteReasonCountDto {
+                    reason,
+                    file_count,
+                    detail,
+                },
+            )
+            .collect::<Vec<_>>();
         let file_count = language_counts
             .iter()
             .map(|entry| entry.file_count)
@@ -8965,6 +9002,7 @@ impl AppController {
                 visible_file_count,
                 incomplete_file_count,
                 error_file_count,
+                incomplete_reason_counts,
                 truncated,
                 language_counts,
                 framework_route_coverage: framework_route_coverage_matrix(),
@@ -14123,6 +14161,81 @@ fn build_llm_symbol_doc_text() -> String {
             Some("openapi_endpoint_schema")
         );
         assert_eq!(hit.eligible_for_sufficiency, Some(false));
+    }
+
+    #[test]
+    fn indexed_files_reports_incomplete_reason_counts() {
+        let temp = tempdir().expect("temp dir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("db parent")).expect("create db dir");
+        let unknown_path = temp.path().join("src").join("unknown.rs");
+        let error_path = temp.path().join("src").join("error.rs");
+        std::fs::create_dir_all(unknown_path.parent().expect("src parent")).expect("create src");
+        std::fs::write(&unknown_path, "fn unknown() {}\n").expect("write unknown");
+        std::fs::write(&error_path, "fn broken( {\n").expect("write error");
+
+        {
+            let storage = Storage::open(&storage_path).expect("open storage");
+            for (id, path) in [(11, unknown_path), (12, error_path)] {
+                storage
+                    .insert_file(&FileInfo {
+                        id,
+                        path,
+                        language: "rust".to_string(),
+                        modification_time: 1,
+                        indexed: true,
+                        complete: false,
+                        line_count: 1,
+                        file_role: codestory_store::FileRole::Source,
+                    })
+                    .expect("insert file");
+            }
+            storage
+                .insert_error(&codestory_contracts::graph::ErrorInfo {
+                    message: "parse failed".to_string(),
+                    file_id: Some(CoreNodeId(12)),
+                    line: Some(1),
+                    column: Some(1),
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                })
+                .expect("insert error");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+        let output = controller
+            .indexed_files(IndexedFilesRequest {
+                path_contains: None,
+                language: None,
+                role: None,
+                limit: Some(50),
+            })
+            .expect("indexed files");
+
+        assert_eq!(output.summary.incomplete_file_count, 2);
+        assert_eq!(output.summary.error_file_count, 1);
+        let reasons = output
+            .summary
+            .incomplete_reason_counts
+            .iter()
+            .map(|entry| {
+                (
+                    entry.reason.as_str(),
+                    (entry.file_count, entry.detail.as_str()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(reasons.get("index_error").map(|entry| entry.0), Some(1));
+        assert_eq!(reasons.get("unknown").map(|entry| entry.0), Some(1));
+        assert!(
+            reasons
+                .get("unknown")
+                .is_some_and(|entry| entry.1.contains("full reindex")),
+            "{reasons:?}"
+        );
     }
 
     #[test]

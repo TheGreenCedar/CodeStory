@@ -685,6 +685,13 @@ pub struct IndexedFileLanguageCountDto {
     pub claim_label: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexedFileIncompleteReasonCountDto {
+    pub reason: String,
+    pub file_count: u32,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct IndexedFilesSummaryDto {
     pub file_count: u32,
@@ -695,6 +702,8 @@ pub struct IndexedFilesSummaryDto {
     pub visible_file_count: u32,
     pub incomplete_file_count: u32,
     pub error_file_count: u32,
+    #[serde(default)]
+    pub incomplete_reason_counts: Vec<IndexedFileIncompleteReasonCountDto>,
     pub truncated: bool,
     pub language_counts: Vec<IndexedFileLanguageCountDto>,
     #[serde(default)]

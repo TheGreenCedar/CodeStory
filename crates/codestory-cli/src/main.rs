@@ -8357,6 +8357,16 @@ fn render_files_summary(markdown: &mut String, output: &codestory_contracts::api
             .join(", ");
         let _ = writeln!(markdown, "- language_support_claims: {claim_labels}");
     }
+    if !output.summary.incomplete_reason_counts.is_empty() {
+        let reasons = output
+            .summary
+            .incomplete_reason_counts
+            .iter()
+            .map(|entry| format!("{}={} ({})", entry.reason, entry.file_count, entry.detail))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(markdown, "- incomplete_reasons: {reasons}");
+    }
     for note in &output.summary.coverage_notes {
         let _ = writeln!(markdown, "- coverage: {note}");
     }
@@ -10489,8 +10499,10 @@ mod tests {
     use codestory_contracts::api::{
         AgentAnswerDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
         AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse,
-        IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeId, ProjectSummary, RetrievalModeDto,
-        RetrievalStateDto, SearchHit, SemanticModeDto, StorageStatsDto, TrailContextDto,
+        IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto,
+        IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId,
+        ProjectSummary, RetrievalModeDto, RetrievalStateDto, SearchHit, SemanticModeDto,
+        StorageStatsDto, TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -10563,6 +10575,52 @@ mod tests {
                 "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn files_markdown_reports_incomplete_reason_text() {
+        let output = IndexedFilesDto {
+            project_root: "C:/repo".to_string(),
+            usable: true,
+            summary: IndexedFilesSummaryDto {
+                file_count: 1,
+                indexed_file_count: 1,
+                filtered_file_count: 1,
+                visible_file_count: 1,
+                incomplete_file_count: 1,
+                error_file_count: 0,
+                incomplete_reason_counts: vec![IndexedFileIncompleteReasonCountDto {
+                    reason: "unknown".to_string(),
+                    file_count: 1,
+                    detail: "incomplete with no recorded file-level error; run a full reindex"
+                        .to_string(),
+                }],
+                truncated: false,
+                language_counts: Vec::new(),
+                framework_route_coverage: Vec::new(),
+                coverage_notes: Vec::new(),
+            },
+            files: vec![IndexedFileDto {
+                path: "src/lib.rs".to_string(),
+                language: "rust".to_string(),
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                role: IndexedFileRoleDto::Source,
+                error_count: 0,
+            }],
+        };
+
+        let markdown = render_files_markdown(&output);
+
+        assert!(
+            markdown.contains("- incomplete_reasons: unknown=1"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("run a full reindex"),
+            "incomplete counts need operator-actionable reason text: {markdown}"
+        );
     }
 
     #[test]
