@@ -440,13 +440,85 @@ function failOpenReasonForProbe(resolved, probe) {
   return null;
 }
 
-function fallbackDiagnostic(resolved, probe, reason) {
+function localRepairCommand(projectRoot = process.cwd()) {
+  return `codestory-cli ready --goal local --repair --project ${JSON.stringify(projectRoot)} --format json`;
+}
+
+function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
+  const result = spawnSync(resolved.path, ['ready', '--goal', 'local', '--project', projectRoot, '--format', 'json'], {
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+    timeout: 10000,
+    windowsHide: true,
+  });
+  const setup = {
+    ready_probe_status: result.status,
+    ready_probe_error: result.error ? result.error.message : null,
+    ready_probe_stdout: result.stdout || '',
+    ready_probe_stderr: result.stderr || '',
+  };
+  if (result.error || result.status !== 0) {
+    const repair = localRepairCommand(projectRoot);
+    return {
+      ready: false,
+      reason: 'local_navigation_probe_failed',
+      status: 'repair_setup',
+      summary: 'CodeStory MCP could not verify local navigation readiness before starting stdio.',
+      minimumNext: [repair],
+      fullRepair: [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
+      setup,
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout || '{}');
+  } catch (error) {
+    const repair = localRepairCommand(projectRoot);
+    return {
+      ready: false,
+      reason: 'local_navigation_probe_invalid_json',
+      status: 'repair_setup',
+      summary: `CodeStory MCP local readiness probe returned invalid JSON: ${error.message}`,
+      minimumNext: [repair],
+      fullRepair: [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
+      setup,
+    };
+  }
+  const verdict = Array.isArray(parsed.verdicts)
+    ? parsed.verdicts.find((item) => item && item.goal === 'local_navigation') || parsed.verdicts[0]
+    : null;
+  if (verdict && verdict.status === 'ready') {
+    return { ready: true };
+  }
+  const repair = localRepairCommand(projectRoot);
+  const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
+  return {
+    ready: false,
+    reason: `local_navigation_${status}`,
+    status,
+    summary: verdict?.summary || 'CodeStory local navigation is not ready.',
+    minimumNext: Array.isArray(verdict?.minimum_next) && verdict.minimum_next.length > 0
+      ? verdict.minimum_next
+      : [repair],
+    fullRepair: Array.isArray(verdict?.full_repair) && verdict.full_repair.length > 0
+      ? verdict.full_repair
+      : [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
+    setup: {
+      ...setup,
+      readiness_verdict: verdict || null,
+    },
+  };
+}
+
+function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   const projectRoot = process.cwd();
-  const minimumNext = [
+  const minimumNext = options.minimumNext || [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
     process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
     'codestory-cli --version',
   ];
+  const fullRepair = options.fullRepair || minimumNext;
+  const recommendedNext = options.recommendedNext || fullRepair;
   const plugin = {
     plugin_version: resolved.version,
     plugin_root: pluginRoot,
@@ -465,12 +537,12 @@ function fallbackDiagnostic(resolved, probe, reason) {
     warnings: [...resolved.warnings, reason].filter(Boolean),
   };
   const repair = {
-    goal: 'local_navigation',
-    status: 'repair_setup',
-    summary: 'CodeStory plugin MCP could not start a compatible codestory-cli stdio runtime.',
+    goal: options.goal || 'local_navigation',
+    status: options.status || 'repair_setup',
+    summary: options.summary || 'CodeStory plugin MCP could not start a compatible codestory-cli stdio runtime.',
     repair_reason: reason,
     minimum_next: minimumNext,
-    full_repair: minimumNext,
+    full_repair: fullRepair,
     setup: {
       active_path: resolved.path,
       active_version: probe.version,
@@ -479,6 +551,7 @@ function fallbackDiagnostic(resolved, probe, reason) {
       probe_status: probe.status,
       probe_stdout: probe.stdout,
       probe_stderr: probe.stderr,
+      ...(options.setup || {}),
     },
   };
   const localSurfaces = [
@@ -500,10 +573,10 @@ function fallbackDiagnostic(resolved, probe, reason) {
   const blockedSurface = (surface, goal) => ({
     allowed: false,
     readiness_goal: goal,
-    status: 'repair_setup',
+    status: repair.status,
     repair_reason: reason,
     minimum_next: minimumNext,
-    full_repair: minimumNext,
+    full_repair: fullRepair,
   });
   const allowedSurfaces = Object.fromEntries([
     ...localSurfaces.map((surface) => [surface, blockedSurface(surface, 'local_navigation')]),
@@ -528,9 +601,9 @@ function fallbackDiagnostic(resolved, probe, reason) {
     allowed_surfaces: allowedSurfaces,
     recommended_next_calls: [
       { method: 'resources/read', uri: 'codestory://status' },
-      { method: 'host/restart', instruction: minimumNext[0] },
-      { method: 'cli', command: minimumNext[1] },
-      { method: 'cli', command: minimumNext[2] },
+      ...recommendedNext.map((command) => command.startsWith('Refresh or reinstall') || command.startsWith('Restart/reload')
+        ? { method: 'host/restart', instruction: command }
+        : { method: 'cli', command }),
     ],
   };
 }
@@ -568,17 +641,18 @@ function resourceContents(uri, value) {
 }
 
 function failOpenToolResult(status) {
+  const readiness = status.readiness[0];
   return {
     isError: true,
     content: [{ type: 'text', text: diagnosticText(status) }],
     structuredContent: {
       code: 'codestory_mcp_runtime_unavailable',
-      status: 'repair_setup',
+      status: readiness.status,
       repair_reason: status.degraded_reason,
       plugin_runtime: status.plugin_runtime,
-      setup: status.readiness[0].setup,
-      minimum_next: status.readiness[0].minimum_next,
-      full_repair: status.readiness[0].full_repair,
+      setup: readiness.setup,
+      minimum_next: readiness.minimum_next,
+      full_repair: readiness.full_repair,
       recommended_next_calls: status.recommended_next_calls,
     },
   };
@@ -684,6 +758,20 @@ async function main() {
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
   if (failOpenReason) {
     runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason));
+    return;
+  }
+  const localReadiness = probeLocalNavigation(resolved);
+  if (!localReadiness.ready) {
+    runFailOpenMcp(fallbackDiagnostic(resolved, probe, localReadiness.reason, {
+      status: localReadiness.status,
+      summary: localReadiness.summary,
+      minimumNext: localReadiness.minimumNext,
+      fullRepair: [
+        ...localReadiness.fullRepair,
+        'Restart/reload the Codex host/app after repairing the local CodeStory index, then read codestory://status in a fresh thread.',
+      ],
+      setup: localReadiness.setup,
+    }));
     return;
   }
   const sidecarPolicy = readSidecarPolicy();

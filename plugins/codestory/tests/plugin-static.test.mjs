@@ -54,24 +54,25 @@ function releaseAssetForPlatform(version) {
 }
 
 async function writeFakeCli(cliPath) {
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}]}));process.exit(0)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
-      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))" %*\r\n`,
+      `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`,
       "utf8",
     );
     return;
   }
   await writeFile(
     cliPath,
-    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))' "$@"\n`,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`,
     "utf8",
   );
   await chmod(cliPath, 0o755);
 }
 
 async function writeRecordingCli(cliPath) {
-  const script = "const fs=require('fs');fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args:process.argv.slice(1)})+'\\n')";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}]}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
   if (process.platform === "win32") {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`, "utf8");
     return;
@@ -243,6 +244,81 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
       responses[2].result.structuredContent.plugin_runtime.plugin_root,
       pluginRoot,
     );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when local navigation is not ready", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-index-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliScript = join(dataDir, "fake-codestory-cli.cjs");
+  const cliPath = join(
+    dataDir,
+    process.platform === "win32" ? "fake-codestory-cli.cmd" : "fake-codestory-cli",
+  );
+  const marker = join(dataDir, "serve-called.txt");
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
+  ].join("\n") + "\n";
+
+  try {
+    await writeFile(
+      cliScript,
+      [
+        "const fs = require('node:fs');",
+        "const version = process.env.TEST_CODESTORY_VERSION;",
+        "const marker = process.env.TEST_OUT;",
+        "const command = process.argv[2];",
+        "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
+        "if (command === 'ready') {",
+        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'No indexed symbols are available yet.', minimum_next: ['codestory-cli ready --goal local --repair --project \"fixture\" --format json'], full_repair: ['codestory-cli doctor --project \"fixture\"'] }] }));",
+        "  process.exit(0);",
+        "}",
+        "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(1); }",
+        "process.exit(2);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    if (process.platform === "win32") {
+      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+    } else {
+      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
+      await chmod(cliPath, 0o755);
+    }
+
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: dataDir,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: marker,
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    await assert.rejects(access(marker));
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 3, result.stdout);
+    const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
+    assert.equal(status.readiness[0].status, "repair_index");
+    assert.equal(status.readiness[0].repair_reason, "local_navigation_repair_index");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+    assert.equal(status.allowed_surfaces.ground.status, "repair_index");
+    assert.match(status.readiness[0].minimum_next[0], /ready --goal local --repair/u);
+    assert.equal(responses[2].result.isError, true);
+    assert.equal(responses[2].result.structuredContent.status, "repair_index");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
