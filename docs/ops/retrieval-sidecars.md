@@ -31,6 +31,65 @@ flowchart LR
     cli --> embed[llama.cpp embedding endpoint]
 ```
 
+## Agent readiness repair
+
+Use this section when an agent tool says `packet`, `search`, or `context` is
+blocked, or when `doctor` reports `agent_packet_search` needs repair. Keep local
+navigation and agent retrieval separate: a ready SQLite graph can support
+`ground`, `files`, and symbol navigation while sidecar packet/search remains
+blocked.
+
+Start with the active runtime surface:
+
+```sh
+codestory-cli agent preflight --project <repo> --format json
+codestory-cli doctor --project <repo> --format markdown
+codestory-cli retrieval status --project <repo> --format json
+```
+
+When plugin MCP is live, read `codestory://status` first and use its
+`allowed_surfaces` values as the tool boundary. Do not infer the active runtime
+from the source checkout, marketplace cache, or PATH when status is available.
+
+| State | Meaning | Operator action |
+|-------|---------|-----------------|
+| `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
+| `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; run the repair command from preflight/status before packet/search claims |
+| `local_navigation=repair_local` | Core index or cache is missing or stale | Run `codestory-cli ready --goal local --repair --project <repo> --format json`, then rerun `doctor` |
+| `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Repair the failing sidecar layer, rerun `retrieval index --refresh full`, then rerun `retrieval status` |
+| `doctor` ready but a packet/search command returns `retrieval_unavailable` | Runtime/status disagreement or sidecar process drift | Capture the failing command output, `doctor`, and `retrieval status`; repair the named layer before retrying |
+
+Layer repair should follow the first failing layer, not a broad rebuild:
+
+| Failing layer | Evidence to capture | Small repair |
+|---------------|---------------------|--------------|
+| Active runtime or plugin adapter | `codestory://status` fields, `server_executable`, `cli_version`, `plugin_runtime`, `allowed_surfaces` | Reload or reinstall the active CLI/plugin runtime, then reread status |
+| Core SQLite graph | `doctor` cache/index checks and indexed file counts | `codestory-cli ready --goal local --repair --project <repo> --format json` |
+| Zoekt lexical sidecar | `retrieval status` mode/degraded reason and Zoekt health text | Free port `6070` or rerun bootstrap, then `retrieval index --refresh full` |
+| Qdrant dense sidecar | Qdrant health, collection name, point count, dense-anchor count, backend/dimension fields | Fix Qdrant/model/backend state; move the Qdrant cache aside only if repeated health checks fail |
+| SCIP graph artifacts | `scip_unavailable`, graph artifact hash/path, manifest contract | Rerun `retrieval index --refresh full`; inspect SCIP cache paths if it repeats |
+| Embedding endpoint | `CODESTORY_EMBED_LLAMACPP_URL`, managed embeddings probe, model/backend/dimension fields | Start or reconfigure llama.cpp, then rerun retrieval index/status |
+| Manifest contract | `manifest_contract`, source root, input hash, generation, schema, graph hash, counts, lane provenance | Rerun `retrieval index --project <repo> --refresh full` |
+
+A legacy semantic diagnostic warning against `127.0.0.1:8080` is not by itself a
+packet/search blocker when `doctor` reports `sidecar_retrieval: mode=full` and
+the managed embeddings probe succeeds against the configured endpoint. Keep the
+warning in the evidence bundle; do not treat it as proof that a separate
+runtime fix has landed.
+
+Attach these artifacts to issues or PRs that claim readiness repair:
+
+- `codestory://status` transcript when MCP is live, or the full
+  `agent preflight` JSON when it is not.
+- `doctor --format markdown` or JSON output, including readiness verdicts and
+  legacy/managed embedding diagnostics.
+- `retrieval status --format json`, including `retrieval_mode`,
+  `degraded_reason`, and `manifest_contract`.
+- The exact failing `packet`, `search`, or `context` command output when a
+  ready status disagrees with a tool call.
+- Any cache directory moved aside during reset, plus the status output after the
+  replacement index is healthy.
+
 ## Operator repair path
 
 ### Prerequisites

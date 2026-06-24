@@ -6,8 +6,8 @@ generic symbol/path roles; benchmark-only probe catalogs remain behind test-only
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
 configuration error, not a diagnostic route.
 
-**Related:** [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md) (setup,
-env vars, CI smoke), [`../architecture/retrieval-design.md`](../architecture/retrieval-design.md)
+**Related:** [`../ops/retrieval-sidecars.md`](../ops/retrieval-sidecars.md#agent-readiness-repair) (setup,
+agent readiness repair, env vars, CI smoke), [`../architecture/retrieval-design.md`](../architecture/retrieval-design.md)
 (mode definitions, cost envelopes, promotion guards).
 
 ---
@@ -78,7 +78,7 @@ classified as source-truth follow-up rather than hidden grounding.
 
 Version pins, env vars, bootstrap commands, troubleshooting, and CI smoke
 sequences are owned by
-[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md). AST-first policy gates
+[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#agent-readiness-repair). AST-first policy gates
 and dense-anchor promotion fields are summarized there and in
 [`retrieval-design.md`](../architecture/retrieval-design.md#ast-first-semantic-contract).
 
