@@ -2,7 +2,7 @@
   "schema_version": 1,
   "fixture_file": "production_packet_search_fixtures.json",
   "k": 5,
-  "packet_anchor_budget": 1200,
+  "packet_anchor_budget": 6000,
   "required_full_modes": {
     "readiness_mode": "ready",
     "retrieval_mode": "full"

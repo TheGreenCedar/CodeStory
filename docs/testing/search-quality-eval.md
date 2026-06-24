@@ -41,8 +41,8 @@ schema, category, baseline, and non-full-mode gating checks with:
 cargo test -p codestory-cli --test packet_search_eval
 ```
 
-The live production-path check is ignored by default because it requires
-`retrieval_mode=full` sidecars for the checkout:
+The live production-path check is ignored by default because it repairs and
+requires `retrieval_mode=full` agent sidecars for the checkout:
 
 ```
 cargo test -p codestory-cli --test packet_search_eval -- --ignored --nocapture packet_search_eval_live_runs_production_cli_path

@@ -363,19 +363,18 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             readiness_mode: "ready".to_string(),
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
-                "crates/codestory-cli/src/main.rs".to_string(),
-                "crates/codestory-runtime/src/agent/retrieval_primary.rs".to_string(),
+                "crates/codestory-retrieval/src/mode.rs".to_string(),
+                "crates/codestory-retrieval/src/executor.rs".to_string(),
             ],
             ranked_symbols: vec![
-                "run_search".to_string(),
-                "SidecarPrimarySearchOutcome".to_string(),
+                "RetrievalDegradedMode::Full".to_string(),
+                "QueryTrace".to_string(),
             ],
-            packet_text:
-                "retrieval_mode must be full before promotion; errors include expected mode=full"
-                    .to_string(),
+            packet_text: "append_search_evidence_packet cites TrackingSidecars::qdrant_search"
+                .to_string(),
             anchor_offsets: BTreeMap::from([
-                ("retrieval_mode".to_string(), 40),
-                ("expected mode=full".to_string(), 96),
+                ("append_search_evidence_packet".to_string(), 10),
+                ("TrackingSidecars::qdrant_search".to_string(), 52),
             ]),
         },
         EvalRun {
@@ -383,15 +382,18 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             readiness_mode: "ready".to_string(),
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
-                "crates/codestory-cli/src/main.rs".to_string(),
-                "crates/codestory-cli/src/args.rs".to_string(),
+                "crates/codestory-cli/src/output.rs".to_string(),
+                "crates/codestory-runtime/src/agent/packet_evidence.rs".to_string(),
             ],
-            ranked_symbols: vec!["run_packet".to_string(), "SearchOutput".to_string()],
-            packet_text: "run_packet emits packet output; search JSON contains indexed_symbol_hits"
+            ranked_symbols: vec![
+                "append_search_evidence_packet".to_string(),
+                "decorate_search_hit_evidence".to_string(),
+            ],
+            packet_text: "decorate_search_hit_evidence uses evidence_candidate_from_hit"
                 .to_string(),
             anchor_offsets: BTreeMap::from([
-                ("run_packet".to_string(), 5),
-                ("indexed_symbol_hits".to_string(), 70),
+                ("decorate_search_hit_evidence".to_string(), 5),
+                ("evidence_candidate_from_hit".to_string(), 40),
             ]),
         },
     ];
@@ -495,7 +497,10 @@ fn packet_search_eval_live_runs_production_cli_path() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     let project = repo_root();
-    let readiness = run_cli(&project, &["ready", "--goal", "agent", "--format", "json"]);
+    let readiness = run_cli(
+        &project,
+        &["ready", "--goal", "agent", "--repair", "--format", "json"],
+    );
     assert!(
         readiness.status.success(),
         "agent readiness failed: {}",

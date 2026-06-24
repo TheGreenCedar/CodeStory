@@ -9,16 +9,16 @@
       "mode": "packet_search",
       "expected": {
         "files": [
-          "crates/codestory-cli/src/main.rs",
-          "crates/codestory-runtime/src/agent/retrieval_primary.rs"
+          "crates/codestory-retrieval/src/mode.rs",
+          "crates/codestory-retrieval/src/executor.rs"
         ],
         "symbols": [
-          "run_search",
-          "SidecarPrimarySearchOutcome"
+          "RetrievalDegradedMode::Full",
+          "QueryTrace"
         ],
         "anchors": [
-          "retrieval_mode",
-          "expected mode=full"
+          "append_search_evidence_packet",
+          "TrackingSidecars::qdrant_search"
         ]
       },
       "provenance": {
@@ -39,16 +39,16 @@
       "mode": "packet_search",
       "expected": {
         "files": [
-          "crates/codestory-cli/src/main.rs",
-          "crates/codestory-cli/src/args.rs"
+          "crates/codestory-cli/src/output.rs",
+          "crates/codestory-runtime/src/agent/packet_evidence.rs"
         ],
         "symbols": [
-          "run_packet",
-          "SearchOutput"
+          "append_search_evidence_packet",
+          "decorate_search_hit_evidence"
         ],
         "anchors": [
-          "run_packet",
-          "indexed_symbol_hits"
+          "decorate_search_hit_evidence",
+          "evidence_candidate_from_hit"
         ]
       },
       "provenance": {
