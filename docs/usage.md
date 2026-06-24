@@ -105,6 +105,15 @@ When MCP is live, use `codestory://status` as the runtime truth. Its
 `allowed_surfaces` tells the agent which tools are safe now. Do not infer
 packet/search readiness from a successful local grounding command.
 
+When MCP is not live, use the CLI preflight contract instead:
+
+```sh
+codestory-cli agent preflight --project <target-workspace> --format json
+```
+
+Use its `safe_surfaces`, `blocked_surfaces`, and `repair_command` fields as the
+agent handoff.
+
 **Next steps after installation:**
 
 If the agent reports that local graph surfaces are allowed but `packet`,

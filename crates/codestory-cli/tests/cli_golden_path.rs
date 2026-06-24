@@ -733,6 +733,61 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
 }
 
 #[test]
+fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    let preflight = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["agent", "preflight", "--format", "json"],
+    );
+
+    assert_eq!(preflight["usable"], true, "{preflight:#}");
+    assert_eq!(preflight["mode"], "local_graph", "{preflight:#}");
+    assert_eq!(preflight["local_graph"]["ready"], true, "{preflight:#}");
+    assert_eq!(
+        preflight["full_retrieval"]["status"], "repair_retrieval",
+        "{preflight:#}"
+    );
+    assert!(
+        preflight["safe_surfaces"]
+            .as_array()
+            .expect("safe surfaces")
+            .iter()
+            .any(|surface| surface == "ground"),
+        "local graph surfaces should be safe: {preflight:#}"
+    );
+    assert!(
+        preflight["blocked_surfaces"]
+            .as_array()
+            .expect("blocked surfaces")
+            .iter()
+            .any(|surface| surface == "packet_full"),
+        "full retrieval surfaces should be blocked: {preflight:#}"
+    );
+    assert!(
+        preflight["repair_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("ready --goal agent --repair")),
+        "preflight should point at the existing agent repair path: {preflight:#}"
+    );
+    assert!(
+        preflight["human_summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("Local graph is ready")),
+        "preflight should include a human summary: {preflight:#}"
+    );
+}
+
+#[test]
 fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

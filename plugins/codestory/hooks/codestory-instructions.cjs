@@ -9,11 +9,11 @@ const FALLBACK = `CODESTORY BACKGROUND GROUNDING ACTIVE
 Before reading source files, making source claims, planning edits, choosing tests, or reviewing changes in a repository:
 
 1. Confirm the target is a repository workspace before grounding it. In huge or mixed folders, stop CodeStory grounding if status, ready, or ground reports no repo, no supported files, or zero indexed files; do not inject or summarize empty ground output.
-2. If the CodeStory MCP server is live, read codestory://status first.
+2. If the CodeStory MCP server is live, read codestory://status first; otherwise run codestory-cli agent preflight --project <repo> --format json.
 3. Use server_version, server_executable, allowed_surfaces, and retrieval_mode from status as runtime truth.
 4. Use local graph surfaces only when their own allowed_surfaces entry allows them.
 5. Use packet, search, or context confidently when that surface is allowed and retrieval_mode=full.
-6. If MCP is missing, use codestory-cli ready --goal local --repair as an incremental-by-default setup/repair fallback; reserve full rebuilds for explicit stale, corrupt, schema, or root-change cases.
+6. If MCP is missing, use the preflight repair_command as the setup/repair fallback; reserve full rebuilds for explicit stale, corrupt, schema, or root-change cases.
 
 Do this without waiting for the user to mention CodeStory.`;
 
@@ -59,11 +59,11 @@ function getCodeStoryInstructions(event = 'SessionStart', input = {}) {
   return `${eventHeader(event, input)}CODESTORY BACKGROUND GROUNDING RULES
 
 Use CodeStory proactively for repository grounding. Do not wait for the user to call it by name.
-Before manually opening source files, first read codestory://status when MCP is live, then use the allowed CodeStory surface that fits the task.
+Before manually opening source files, first read codestory://status when MCP is live; when it is not, run codestory-cli agent preflight --project <repo> --format json and use the reported safe_surfaces.
 For broad user requests, prefer a packet tied to the user's actual question. For concrete symbols, files, or routes, use search/context/trail/snippet. For no request context, use a compact ground snapshot only after confirming the target repo is indexable.
 Avoid no-op grounding context in huge or non-code folders.
 When retrieval sidecars are full and allowed, use packet, search, and context confidently.
-Use incremental ready repair as the default setup path once a repository target is known.
+Use the preflight repair_command as the default setup path once a repository target is known.
 
 ${body}`;
 }

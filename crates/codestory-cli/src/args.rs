@@ -11,8 +11,8 @@ use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
     NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
-    ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
+    ReadinessStatusDto, ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
+    RetrievalShadowDto, RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
     SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
     TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
@@ -67,6 +67,8 @@ pub(crate) enum Command {
     Doctor(DoctorCommand),
     #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
     Ready(ReadyCommand),
+    #[command(about = "Agent-facing readiness and repair helpers.")]
+    Agent(AgentCommand),
     #[command(about = "Install or check local setup assets.")]
     Setup(SetupCommand),
     #[command(about = "Prepare or inspect local cache artifacts.")]
@@ -487,6 +489,32 @@ pub(crate) struct ReadyCommand {
     )]
     pub(crate) repair: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AgentCommand {
+    #[command(subcommand)]
+    pub(crate) action: AgentAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum AgentAction {
+    #[command(about = "Print one JSON contract for safe agent CodeStory surfaces.")]
+    Preflight(AgentPreflightCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AgentPreflightCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -1296,6 +1324,25 @@ pub(crate) struct IndexOutput<'a> {
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadyOutput {
     pub(crate) verdicts: Vec<ReadinessVerdictDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentPreflightLaneOutput {
+    pub(crate) ready: bool,
+    pub(crate) status: ReadinessStatusDto,
+    pub(crate) summary: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentPreflightOutput {
+    pub(crate) usable: bool,
+    pub(crate) mode: String,
+    pub(crate) local_graph: AgentPreflightLaneOutput,
+    pub(crate) full_retrieval: AgentPreflightLaneOutput,
+    pub(crate) safe_surfaces: Vec<String>,
+    pub(crate) blocked_surfaces: Vec<String>,
+    pub(crate) repair_command: Option<String>,
+    pub(crate) human_summary: String,
 }
 
 #[derive(Debug, Serialize)]
