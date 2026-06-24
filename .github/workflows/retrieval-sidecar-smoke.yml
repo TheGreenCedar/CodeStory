@@ -82,6 +82,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Capture Rust cache key
+        id: rust-cache-key
+        shell: bash
+        run: |
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
         uses: actions/cache/restore@v5
@@ -91,8 +97,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
             ${{ runner.os }}-cargo-stable-
 
       - name: Runtime sidecar and packet contract tests
@@ -136,6 +143,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Capture Rust cache key
+        id: rust-cache-key
+        run: |
+          $release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }
+          "version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
         uses: actions/cache/restore@v5
@@ -145,8 +158,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
             ${{ runner.os }}-cargo-stable-
 
       - name: Retrieval bootstrap manifest-missing contract

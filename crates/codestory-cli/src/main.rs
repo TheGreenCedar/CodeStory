@@ -22,10 +22,11 @@ use codestory_contracts::api::{
     EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto,
     IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest, NodeId, NodeKind,
     NodeOccurrencesRequest, PacketBudgetModeDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
-    RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto,
-    RetrievalShadowDto, SearchHit, SearchMatchQualityDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope,
-    TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
+    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -182,6 +183,7 @@ fn main() -> Result<()> {
         Command::Packet(cmd) => run_packet(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Ready(cmd) => run_ready(cmd),
+        Command::Agent(cmd) => run_agent(cmd),
         Command::Setup(cmd) => run_setup(cmd),
         Command::Cache(cmd) => run_cache(cmd),
         Command::Search(cmd) => run_search(cmd),
@@ -1266,6 +1268,29 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
+fn run_agent(cmd: args::AgentCommand) -> Result<()> {
+    match cmd.action {
+        args::AgentAction::Preflight(cmd) => run_agent_preflight(cmd),
+    }
+}
+
+fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "agent preflight")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let summary = runtime.open_project_summary()?;
+    let sidecar = doctor_sidecar_status(&runtime);
+    let readiness = build_summary_readiness(
+        &summary.root,
+        &summary.stats,
+        summary.freshness.as_ref(),
+        &sidecar,
+    );
+    let output = build_agent_preflight_output(&readiness);
+    let markdown = render_agent_preflight_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
 fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -> Result<()> {
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
@@ -1301,6 +1326,114 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
     codestory_retrieval::strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
         .context("ready repair final retrieval status")?;
     Ok(())
+}
+
+const LOCAL_GRAPH_AGENT_SURFACES: &[&str] =
+    &["ground", "files", "symbol", "trail", "snippet", "affected"];
+const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "context_full"];
+
+fn build_agent_preflight_output(
+    readiness: &[codestory_contracts::api::ReadinessVerdictDto],
+) -> args::AgentPreflightOutput {
+    let local = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
+        .expect("local_navigation readiness verdict");
+    let agent = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
+        .expect("agent_packet_search readiness verdict");
+    let local_ready = local.status == ReadinessStatusDto::Ready;
+    let full_ready = agent.status == ReadinessStatusDto::Ready;
+    let mut safe_surfaces = Vec::new();
+    let mut blocked_surfaces = Vec::new();
+
+    if local_ready {
+        safe_surfaces.extend(surface_strings(LOCAL_GRAPH_AGENT_SURFACES));
+    } else {
+        blocked_surfaces.extend(surface_strings(LOCAL_GRAPH_AGENT_SURFACES));
+    }
+    if full_ready {
+        safe_surfaces.extend(surface_strings(FULL_RETRIEVAL_AGENT_SURFACES));
+    } else {
+        blocked_surfaces.extend(surface_strings(FULL_RETRIEVAL_AGENT_SURFACES));
+    }
+
+    let mode = if full_ready {
+        "full_retrieval"
+    } else if local_ready {
+        "local_graph"
+    } else {
+        "blocked"
+    };
+    let repair_command = readiness::primary_non_ready(readiness)
+        .and_then(|verdict| verdict.full_repair.first().cloned());
+    let human_summary = agent_preflight_summary(local_ready, full_ready, local);
+
+    args::AgentPreflightOutput {
+        usable: local_ready || full_ready,
+        mode: mode.to_string(),
+        local_graph: agent_preflight_lane(local),
+        full_retrieval: agent_preflight_lane(agent),
+        safe_surfaces,
+        blocked_surfaces,
+        repair_command,
+        human_summary,
+    }
+}
+
+fn surface_strings(surfaces: &[&str]) -> Vec<String> {
+    surfaces
+        .iter()
+        .map(|surface| (*surface).to_string())
+        .collect()
+}
+
+fn agent_preflight_lane(
+    verdict: &codestory_contracts::api::ReadinessVerdictDto,
+) -> args::AgentPreflightLaneOutput {
+    args::AgentPreflightLaneOutput {
+        ready: verdict.status == ReadinessStatusDto::Ready,
+        status: verdict.status,
+        summary: verdict.summary.clone(),
+    }
+}
+
+fn agent_preflight_summary(
+    local_ready: bool,
+    full_ready: bool,
+    local: &codestory_contracts::api::ReadinessVerdictDto,
+) -> String {
+    match (local_ready, full_ready) {
+        (_, true) => "Local graph and full retrieval are ready.".to_string(),
+        (true, false) => "Local graph is ready. Full retrieval needs sidecar repair.".to_string(),
+        (false, _) => format!(
+            "Local graph is not ready: {} Full retrieval is also unavailable for agent packet/search.",
+            local.summary
+        ),
+    }
+}
+
+fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Agent Preflight");
+    let _ = writeln!(markdown, "usable: `{}`", output.usable);
+    let _ = writeln!(markdown, "mode: `{}`", output.mode);
+    let _ = writeln!(
+        markdown,
+        "local_graph: {}",
+        readiness::status_label(output.local_graph.status)
+    );
+    let _ = writeln!(
+        markdown,
+        "full_retrieval: {}",
+        readiness::status_label(output.full_retrieval.status)
+    );
+    let _ = writeln!(markdown, "human_summary: {}", output.human_summary);
+    if let Some(command) = output.repair_command.as_deref() {
+        let _ = writeln!(markdown, "repair_command: `{command}`");
+    }
+    markdown
 }
 
 fn run_search(cmd: SearchCommand) -> Result<()> {

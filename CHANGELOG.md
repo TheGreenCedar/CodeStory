@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.16
+
+CodeStory 0.11.16 promotes the current `dev/codestory-next` release slice:
+agent preflight JSON output, Rust release-aware Cargo cache keys,
+plugin-managed versioned CLI provisioning with `codestory://status` runtime
+metadata, and the golden agent path docs for explicit hook behavior.
+
+This release is a promotion and metadata sync only. It does not add new backlog
+features or claim new packet/search readiness beyond the existing sidecar
+evidence tiers.
+
 ## 0.11.15
 
 CodeStory 0.11.15 fixes installed hook execution in Codex plugin caches that

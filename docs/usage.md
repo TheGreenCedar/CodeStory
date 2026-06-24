@@ -6,17 +6,19 @@ last turn. CodeStory indexes once and serves evidence from that map so the agent
 can answer from citations instead of re-exploring the tree.
 
 Start with the human task, then run the smallest path that proves the state you
-need. The agent plugin is the normal path. The CLI is for setup, repair,
-debugging, transcripts, and direct stdio integration.
+need. The golden path is CLI preflight first, then the agent plugin/MCP/hooks
+path. The CLI is otherwise for repair, debugging, transcripts, and direct stdio
+integration.
 
 ## Operator Journey
 
 | Stage | Human action | Agent/CLI action | Trust check |
 | --- | --- | --- | --- |
-| Install | Install the `codestory` agent plugin from `TheGreenCedar`. | Plugin starts `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
-| First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | Status reports `server_version`, `server_executable`, and `allowed_surfaces`. |
+| Preflight | Run `codestory-cli agent preflight --project <target-workspace> --format json`. | Reports local graph readiness, full retrieval readiness, safe/blocked surfaces, and repair command. | Local graph surfaces are safe before source work; sidecar surfaces require `retrieval_mode=full`. |
+| Install | Install the `codestory` agent plugin from `TheGreenCedar`. | Plugin starts its managed MCP adapter, then `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
+| First grounding | Start a fresh thread in the repo. | Hooks attempt startup grounding; the agent reads `codestory://status`, then `codestory://grounding` or `ground`. | Status reports `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and `allowed_surfaces`. |
 | Source work | Ask for a plan, review, or code path. | Use allowed local graph surfaces such as `files`, `symbol`, `trail`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
-| Broad discovery | Ask a repo-wide question. | Use `packet`, `search`, or `context`. | Trust only when that surface is allowed and `retrieval_mode=full`. |
+| Broad discovery | Ask a repo-wide question. | Hooks may attempt request-aware packets; the agent may use `packet`, `search`, or `context`. | Trust only when that surface is allowed and `retrieval_mode=full`. |
 | Repair | Ask for a transcript or run CLI directly. | Use `ready --goal local --repair` or `ready --goal agent --repair`. | Repeat readiness checks after repair. |
 
 Packet/search output from degraded retrieval, missing sidecars, stale manifests,
@@ -25,6 +27,11 @@ or any non-`full` retrieval mode is navigation help only. It is not proof.
 Most humans should start from the plugin flow in
 [README - Quick start](../README.md#quick-start). Use the CLI when you need the
 exact setup, repair, or debug record.
+
+Hook-enabled hosts keep CodeStory ambient. Hooks attempt strict grounding on
+session start, resume, clear, and compact handoff; they attempt request-aware
+packet grounding on each user prompt; and they fail open with the next
+CodeStory check instead of blocking the host.
 
 ### Example prompts
 
@@ -72,8 +79,19 @@ environment variables with `$env:NAME = "value"`.
 
 ## Install And Ground A Repo
 
-Install the CodeStory plugin once, then start a fresh agent thread for the
-workspace you want to ground. The canonical skill package lives at
+Run the CLI preflight in the workspace first:
+
+```sh
+codestory-cli agent preflight --project <target-workspace> --format json
+```
+
+Use its `safe_surfaces`, `blocked_surfaces`, and `repair_command` fields as the
+agent handoff. If local graph surfaces are blocked, run the repair command
+before source work. If only `packet`, `search`, or `context` is blocked, local
+navigation can continue while sidecars are repaired later.
+
+Install the CodeStory plugin once, then start a fresh agent thread for that
+workspace. The canonical skill package lives at
 [../plugins/codestory/skills/codestory-grounding/SKILL.md](../plugins/codestory/skills/codestory-grounding/SKILL.md).
 
 **Codex plugin installation flow:**
@@ -89,6 +107,7 @@ workspace you want to ground. The canonical skill package lives at
 **Direct CLI transcript (for setup, repair, or debugging):**
 
 ```sh
+codestory-cli agent preflight --project <target-workspace> --format json
 codestory-cli ready --goal local --repair --project <target-workspace> --format json
 codestory-cli ground --project <target-workspace> --why
 ```
@@ -101,9 +120,21 @@ codestory-cli ground --project <target-workspace> --why
 **Key guidance:**
 
 When MCP is live, use `codestory://status` as the runtime truth. Its
-`server_version` and `server_executable` fields identify the active server, and
+`server_version`, `cli_version`, `server_executable`,
+`server_executable_sha256`, `sidecar_contract_version`, and `plugin_runtime`
+fields identify the active server, CLI, sidecar contract, plugin launch source,
+`build_source`, and `repo_ref`, and
 `allowed_surfaces` tells the agent which tools are safe now. Do not infer
 packet/search readiness from a successful local grounding command.
+
+When MCP is not live, use the CLI preflight contract instead:
+
+```sh
+codestory-cli agent preflight --project <target-workspace> --format json
+```
+
+Use its `safe_surfaces`, `blocked_surfaces`, and `repair_command` fields as the
+agent handoff.
 
 **Next steps after installation:**
 
@@ -148,7 +179,7 @@ explicit ref, setup fetches and builds the remote default branch.
 
 | Runtime truth | Allows | Blocks |
 | --- | --- | --- |
-| `codestory://status` | Current `server_version`, `server_executable`, and `allowed_surfaces`; use this first when MCP is live. | Guessing active runtime from source checkout, marketplace cache, or `PATH` alone. |
+| `codestory://status` | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `build_source`, `repo_ref`, and `allowed_surfaces`; use this first when MCP is live. | Guessing active runtime from source checkout, marketplace cache, or `PATH` alone. |
 | `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without matching packet-runtime, drill, benchmark, or source evidence. |
 
