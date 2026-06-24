@@ -280,6 +280,10 @@ fn top_level_help_names_command_purposes() {
             "Answer a broad repository question with evidence.",
         ),
         ("doctor", "Check cache, index, and retrieval health."),
+        (
+            "smoke",
+            "Run a machine-readable smoke profile for CI and agent images.",
+        ),
         ("setup", "Install or check local setup assets."),
         ("cache", "Prepare or inspect local cache artifacts."),
         ("symbol", "Inspect a symbol by query or id."),
@@ -295,6 +299,83 @@ fn top_level_help_names_command_purposes() {
             "top-level help should show {command:?} purpose {purpose:?}, not only command names:\n{help_text}"
         );
     }
+}
+
+#[test]
+fn smoke_ci_agent_json_runs_tiny_repo_profile() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["smoke", "--profile", "ci-agent", "--format", "json"],
+    );
+    assert_success(&output, "smoke ci-agent failed");
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse smoke json");
+    assert_eq!(json_string(&json, "/profile"), "ci-agent");
+    assert_eq!(json_string(&json, "/status"), "pass");
+
+    let checked = json["checked_surfaces"]
+        .as_array()
+        .expect("checked surfaces array");
+    for surface in ["index", "ground", "symbol", "affected"] {
+        assert!(
+            checked
+                .iter()
+                .any(|item| item["surface"] == surface && item["status"] == "pass"),
+            "smoke should pass required surface {surface}: {json:#}"
+        );
+    }
+    assert!(
+        checked
+            .iter()
+            .any(|item| item["surface"] == "sidecar_full_mode")
+            || json["skipped_optional_surfaces"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item["surface"] == "sidecar_full_mode")),
+        "sidecar full mode should be checked or explicitly skipped: {json:#}"
+    );
+}
+
+#[test]
+fn smoke_ci_agent_invalid_project_emits_json_failure() {
+    let workspace = tempdir().expect("workspace dir");
+    let missing = workspace.path().join("missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .args([
+            "smoke",
+            "--profile",
+            "ci-agent",
+            "--format",
+            "json",
+            "--project",
+        ])
+        .arg(&missing)
+        .output()
+        .expect("run codestory-cli");
+    assert!(
+        !output.status.success(),
+        "invalid project smoke should fail, stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).expect("parse smoke json");
+    assert_eq!(json_string(&json, "/profile"), "ci-agent");
+    assert_eq!(json_string(&json, "/status"), "fail");
+    assert_eq!(json_string(&json, "/checked_surfaces/0/surface"), "project");
+    assert!(
+        json["repair_hints"]
+            .as_array()
+            .is_some_and(|hints| !hints.is_empty()),
+        "failure JSON should include repair hints: {json:#}"
+    );
 }
 
 #[test]

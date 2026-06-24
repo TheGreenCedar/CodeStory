@@ -220,6 +220,18 @@ cargo test -p codestory-cli
 
 Prefer this lane before `cargo test` for the whole workspace when the change is isolated to CLI args, rendering, or contract envelopes.
 
+For CI agents or container images that need a single machine-readable local
+readiness check, run:
+
+```sh
+codestory-cli smoke --project <repo> --profile ci-agent --format json
+```
+
+The profile indexes the local graph, grounds the repo, resolves one indexed
+symbol, runs `affected` on a fake changed path, and reports sidecar full mode
+only when the existing sidecar status already proves it. Non-full sidecars are
+listed under `skipped_optional_surfaces` with repair hints.
+
 Runtime-backed CLI fixture flows are a separate heavier lane:
 
 ```sh
