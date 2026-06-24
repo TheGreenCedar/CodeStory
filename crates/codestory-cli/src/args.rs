@@ -67,6 +67,8 @@ pub(crate) enum Command {
     Doctor(DoctorCommand),
     #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
     Ready(ReadyCommand),
+    #[command(about = "Run a machine-readable smoke profile for CI and agent images.")]
+    Smoke(SmokeCommand),
     #[command(about = "Agent-facing readiness and repair helpers.")]
     Agent(AgentCommand),
     #[command(about = "Install or check local setup assets.")]
@@ -316,6 +318,28 @@ pub(crate) struct GroundCommand {
         help = "Explain retrieval mode, coverage, and query hints in the Markdown output."
     )]
     pub(crate) why: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SmokeProfile {
+    #[value(name = "ci-agent")]
+    CiAgent,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SmokeCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = SmokeProfile::CiAgent)]
+    pub(crate) profile: SmokeProfile,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
