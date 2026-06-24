@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join, delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,41 @@ function readCargoVersion(manifestText) {
   assert.fail("Cargo package must declare version");
 }
 
+function releaseAssetForPlatform(version) {
+  const target = process.platform === "win32" && process.arch === "x64"
+    ? "windows-x64"
+    : process.platform === "win32" && process.arch === "arm64"
+      ? "windows-arm64"
+      : process.platform === "linux" && process.arch === "x64"
+        ? "linux-x64"
+        : process.platform === "linux" && process.arch === "arm64"
+          ? "linux-arm64"
+          : process.platform === "darwin" && process.arch === "arm64"
+            ? "macos-arm64"
+            : null;
+  assert.ok(target, `unsupported test platform: ${process.platform}-${process.arch}`);
+  const archiveBase = `codestory-cli-v${version}-${target}`;
+  const archiveName = `${archiveBase}.${target.startsWith("windows-") ? "zip" : "tar.gz"}`;
+  return { archiveBase, archiveName };
+}
+
+async function writeFakeCli(cliPath) {
+  if (process.platform === "win32") {
+    await writeFile(
+      cliPath,
+      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,args:process.argv.slice(1)}))" %*\r\n`,
+      "utf8",
+    );
+    return;
+  }
+  await writeFile(
+    cliPath,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,args:process.argv.slice(1)}))' "$@"\n`,
+    "utf8",
+  );
+  await chmod(cliPath, 0o755);
+}
+
 test("plugin metadata maps skill and direct stdio server", async () => {
   const manifest = JSON.parse(
     await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
@@ -41,12 +77,9 @@ test("plugin metadata maps skill and direct stdio server", async () => {
     manifest.interface.capabilities.includes("Lifecycle hooks"),
     true,
   );
-  assert.equal(mcp.mcpServers.codestory.command, "codestory-cli");
+  assert.equal(mcp.mcpServers.codestory.command, "node");
   assert.deepEqual(mcp.mcpServers.codestory.args, [
-    "serve",
-    "--stdio",
-    "--refresh",
-    "none",
+    "./scripts/codestory-mcp.cjs",
   ]);
   assert.equal(Object.hasOwn(mcp.mcpServers.codestory, "cwd"), false);
 });
@@ -81,9 +114,123 @@ test("codestory repo ships plugin source, not marketplace catalog or server adap
       join(repoRoot, ".agents", "skills", "codestory-grounding", "SKILL.md"),
     ),
   );
-  await assert.rejects(
-    access(join(pluginRoot, "scripts", "codestory-mcp.mjs")),
+  await access(join(pluginRoot, "scripts", "codestory-mcp.cjs"));
+});
+
+test("mcp launcher prefers a checksummed managed cli without PATH", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-cli-"));
+  const outFile = join(dataDir, "env.json");
+  const cliDir = join(dataDir, "codestory-cli", "0.11.15");
+  const cliPath = join(
+    cliDir,
+    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
   );
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+
+  try {
+    await mkdir(cliDir, { recursive: true });
+    await writeFakeCli(cliPath);
+    const sha256 = createHash("sha256")
+      .update(await readFile(cliPath))
+      .digest("hex");
+    await writeFile(
+      join(cliDir, "manifest.json"),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: dataDir,
+        TEST_OUT: outFile,
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(await readFile(outFile, "utf8"));
+    assert.equal(observed.source, "managed");
+    assert.equal(observed.path, cliPath);
+    assert.equal(observed.sha256, sha256);
+    assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none"]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher provisions a checksummed release asset into plugin data", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  if (tarProbe.status !== 0) {
+    t.skip("tar unavailable for archive fixture");
+    return;
+  }
+
+  const version = "0.11.15";
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
+  const outFile = join(dataDir, "env.json");
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const stageDir = join(releaseDir, archiveBase);
+  const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
+  const cliPath = join(stageDir, cliName);
+  const archivePath = join(releaseDir, archiveName);
+
+  try {
+    await mkdir(stageDir, { recursive: true });
+    await writeFakeCli(cliPath);
+    const packArgs = archiveName.endsWith(".zip")
+      ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
+      : ["-czf", archivePath, "-C", releaseDir, archiveBase];
+    const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
+    assert.equal(pack.status, 0, pack.stderr);
+    const archiveSha256 = createHash("sha256")
+      .update(await readFile(archivePath))
+      .digest("hex");
+    await writeFile(
+      join(releaseDir, "SHA256SUMS.txt"),
+      `${archiveSha256}  ${archiveName}\n`,
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        PLUGIN_DATA: dataDir,
+        TEST_OUT: outFile,
+      },
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(await readFile(outFile, "utf8"));
+    assert.equal(observed.source, "managed");
+    assert.equal(observed.version, version);
+    assert.equal(observed.repoRef, `v${version}`);
+    assert.equal(observed.buildSource, "github_release");
+    assert.equal(observed.archiveSha256, archiveSha256);
+    assert.match(observed.path, /codestory-cli[\\/]+0\.11\.15[\\/]bin[\\/]codestory-cli/u);
+    assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none"]);
+
+    const manifest = JSON.parse(
+      await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
+    );
+    assert.equal(manifest.version, version);
+    assert.equal(manifest.repo_ref, `v${version}`);
+    assert.equal(manifest.build_source, "github_release");
+    assert.equal(manifest.archive, archiveName);
+    assert.equal(manifest.archive_sha256, archiveSha256);
+    assert.equal(typeof manifest.sha256, "string");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
 });
 
 test("session-start hooks are thin and host manifests point at them", async () => {
@@ -381,13 +528,21 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
   const statusRuntimeRequired = [
     "codestory://status",
     "server_version",
+    "cli_version",
     "server_executable",
+    "server_executable_sha256",
+    "sidecar_contract_version",
+    "plugin_runtime",
+    "build_source",
+    "repo_ref",
     "allowed_surfaces",
   ];
   const cliRepairRequired = ["where.exe codestory-cli", "codestory-cli --version"];
   const stdioLaunchRequired = [
     "codestory-cli serve --stdio --refresh none",
-    "agent host `PATH`",
+    "scripts/codestory-mcp.cjs",
+    "github_release",
+    "path_fallback",
   ];
   const marketplaceSourceRequired = [
     "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
@@ -470,6 +625,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "Install details, binary bootstrap",
     "[plugin README](plugins/codestory/README.md)",
     "`codestory-cli serve --stdio --refresh none`",
+    "managed MCP adapter",
     "Codex uses the plugin's MCP server plus the\n`@CodeStory` skill",
   ];
   for (const text of [readme, skill]) {

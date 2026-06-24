@@ -47,10 +47,11 @@ strict startup grounding plus request-aware packets before the agent opens
 source files. Codex uses the plugin's MCP server plus the
 `@CodeStory` skill.
 
-The plugin launches `codestory-cli serve --stdio --refresh none` on your
-machine. It does not edit your repository. Other local MCP-style clients can
-run the same stdio surface directly. Install details, binary bootstrap, and
-uninstall notes live in the [plugin README](plugins/codestory/README.md).
+The plugin launches a managed MCP adapter that starts
+`codestory-cli serve --stdio --refresh none` on your machine. It does not edit
+your repository. Other local MCP-style clients can run the same stdio surface
+directly. Install details, binary bootstrap, and uninstall notes live in the
+[plugin README](plugins/codestory/README.md).
 
 **Verify without the agent:**
 

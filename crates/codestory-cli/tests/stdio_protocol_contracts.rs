@@ -1967,6 +1967,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         json!(env!("CARGO_PKG_VERSION")),
         "status should identify the serving package version: {status}"
     );
+    assert_eq!(
+        status["cli_version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "status should identify the active CLI version: {status}"
+    );
+    assert!(
+        status["sidecar_contract_version"].is_number(),
+        "status should expose the sidecar contract version: {status}"
+    );
+    assert!(
+        status["sidecar_retrieval"]["sidecar_contract_version"].is_number(),
+        "sidecar status should expose the sidecar contract version: {status}"
+    );
     assert!(
         status["server_executable"]
             .as_str()
@@ -1975,6 +1988,22 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
                 .as_array()
                 .is_some_and(|warnings| !warnings.is_empty()),
         "status should expose server_executable or an explicit warning: {status}"
+    );
+    assert!(
+        status["server_executable_sha256"]
+            .as_str()
+            .is_some_and(|sha256| sha256.len() == 64),
+        "status should expose the active server executable checksum: {status}"
+    );
+    assert_eq!(
+        status["runtime_boundary"]["restart_required_for_runtime_change"],
+        json!(true),
+        "status should make the MCP restart boundary explicit: {status}"
+    );
+    assert_eq!(
+        status["plugin_runtime"]["cli_source"],
+        json!("direct_cli_launch"),
+        "direct cargo stdio tests should label the non-plugin launch boundary: {status}"
     );
     assert!(
         status

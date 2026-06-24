@@ -2,16 +2,20 @@
 
 Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready.
 
-For the installed plugin, `.mcp.json` starts:
+For direct MCP-style clients:
 
 ```text
 codestory-cli serve --stdio --refresh none
 ```
 
-The process resolves `codestory-cli` from the agent host `PATH`. Once MCP is
-live, `codestory://status` is the runtime truth: use `server_version`,
-`server_executable`, and `allowed_surfaces` from status before any local
-grounding, packet, or search call.
+The installed plugin starts `scripts/codestory-mcp.cjs`, which prefers a
+checksummed plugin-managed CLI, provisions the current version from
+`github_release` when needed, and only falls back to `PATH` when no managed
+binary is available. Once MCP is live, `codestory://status` is the runtime
+truth: use `server_version`, `cli_version`, `server_executable`,
+`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
+`allowed_surfaces` from status before any local grounding, packet, or search
+call.
 
 ## Usage
 
@@ -54,13 +58,18 @@ grounding, packet, or search call.
 | Status field | Use |
 |--------------|-----|
 | `server_version` | Active MCP server version. Prefer this over source checkout or package version once MCP is live. |
-| `server_executable` | Active MCP server executable path. Use it to diagnose stale PATH or binary drift. |
+| `cli_version` | Active CLI runtime version. |
+| `server_executable` / `server_executable_sha256` | Active MCP server executable path and checksum. Use them to diagnose stale runtime or binary drift. |
+| `sidecar_contract_version` | Active sidecar schema contract version compiled into the CLI. |
+| `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. Provisioned records include `build_source=github_release` and `repo_ref`. |
+| `runtime_boundary` | Restart/reload reminder for changes to the managed binary, override, or PATH. |
 | `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is not
-registered, status is unavailable, or the status executable/version indicates a
-stale binary. If PATH changes during repair, start a fresh Codex host/app session before checking status again.
+registered, status is unavailable, status reports `path_fallback`, or the status
+executable/version indicates a stale binary. If launch inputs change during
+repair, start a fresh Codex host/app session before checking status again.
 
 ## Notes
 
