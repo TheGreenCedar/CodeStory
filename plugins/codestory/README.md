@@ -44,7 +44,7 @@ or non-code folders.
 | Give me a compact repo map. | `codestory://grounding` | Start from current local files. |
 | Inspect indexed file inventory and coverage. | `files` tool | Use for scope, language mix, and missing coverage. |
 | Map changed files to likely impact. | `affected` tool | Use for review planning and focused test choice. |
-| Follow a local graph target. | `symbol`, `definition`, `trail`, `references`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph` | Check each surface's own allowed bit. |
+| Follow a local graph target. | `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph` | Check each surface's own allowed bit. |
 | Find candidate symbols, paths, or behavior terms. | `search` tool, only when status allows search | Requires `retrieval_mode=full`. |
 | Answer a broad repo question or build an evidence context. | `packet` or `context`, only when status allows that surface | Requires `retrieval_mode=full`. |
 
@@ -57,7 +57,7 @@ running server.
 
 | Status lane | Allows | Does not allow |
 | --- | --- | --- |
-| `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
+| `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
 | `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, and `allowed_surfaces`. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when the plugin launcher is active. | Guessing active runtime from source checkout or PATH alone. |
 
@@ -236,7 +236,7 @@ codestory-cli ready --goal agent --repair --project <repo> --format json
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-Do not treat `ground`, `symbol`, `trail`, `snippet`, or local graph readiness as
+Do not treat `ground`, `symbol`, `callers`, `callees`, `trail`, `trace`, `snippet`, or local graph readiness as
 proof that `packet`, `search`, or `context` is ready.
 
 ### Agent runtime repair

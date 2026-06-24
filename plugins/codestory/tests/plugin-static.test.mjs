@@ -954,7 +954,10 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "files",
     "symbol",
     "definition",
+    "callers",
+    "callees",
     "trail",
+    "trace",
     "references",
     "snippet",
     "affected",
@@ -966,7 +969,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
   ];
   const sidecarSurfaceNames = ["packet", "search", "context"];
   const publicSurfaceRequired = [
-    "`allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`",
+    "`allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`",
     "check each surface's own `.allowed` bit",
     "`allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full`",
     "`context` is not a local-only browse surface",

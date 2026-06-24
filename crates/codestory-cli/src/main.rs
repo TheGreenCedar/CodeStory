@@ -61,13 +61,13 @@ mod stdio_transport;
 use args::{
     AffectedChangeSource, AffectedCommand, AffectedStdinFormat, BookmarkAction, BookmarkAddCommand,
     BookmarkAddOutput, BookmarkCommand, BookmarkListCommand, BookmarkListOutput, BookmarkOutput,
-    BookmarkRemoveCommand, BookmarkRemoveOutput, CacheAction, CacheCommand, Cli, Command,
-    CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand, DoctorOutput,
-    DoctorSidecarStatusOutput, DrillAnchorConsumerOutput, DrillAnchorConsumerSummaryOutput,
-    DrillAnchorOutput, DrillAnchorTextConsumerHintOutput, DrillAnchorTimingsOutput,
-    DrillAnswerQualityContractOutput, DrillBridgeEvidenceOutput, DrillBridgeGraphPathOutput,
-    DrillBridgeOutput, DrillClaimLedgerEntryOutput, DrillClaimLedgerOutput,
-    DrillClaimLedgerScoringOutput, DrillCommand, DrillCommandStatusOutput,
+    BookmarkRemoveCommand, BookmarkRemoveOutput, CacheAction, CacheCommand, Cli, CliDirection,
+    CliTrailMode, Command, CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand,
+    DoctorOutput, DoctorSidecarStatusOutput, DrillAnchorConsumerOutput,
+    DrillAnchorConsumerSummaryOutput, DrillAnchorOutput, DrillAnchorTextConsumerHintOutput,
+    DrillAnchorTimingsOutput, DrillAnswerQualityContractOutput, DrillBridgeEvidenceOutput,
+    DrillBridgeGraphPathOutput, DrillBridgeOutput, DrillClaimLedgerEntryOutput,
+    DrillClaimLedgerOutput, DrillClaimLedgerScoringOutput, DrillCommand, DrillCommandStatusOutput,
     DrillExecutionBoundaryOutput, DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput,
     DrillSuiteAnswerQualityOutput, DrillSuiteCommand, DrillSuiteExpectationOutput,
     DrillSuiteLayerFindingOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
@@ -195,6 +195,9 @@ fn main() -> Result<()> {
         Command::DrillSuite(cmd) => run_drill_suite(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
         Command::Trail(cmd) => run_trail(cmd),
+        Command::Callers(cmd) => run_callers(cmd),
+        Command::Callees(cmd) => run_callees(cmd),
+        Command::Trace(cmd) => run_trace(cmd),
         Command::Snippet(cmd) => run_snippet(cmd),
         Command::Query(cmd) => run_query(cmd),
         Command::Explore(cmd) => explore::run_explore(cmd),
@@ -8329,6 +8332,25 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         notes,
     };
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_callers(mut cmd: TrailCommand) -> Result<()> {
+    cmd.mode = CliTrailMode::Referencing;
+    cmd.direction = Some(CliDirection::Incoming);
+    run_trail(cmd)
+}
+
+fn run_callees(mut cmd: TrailCommand) -> Result<()> {
+    cmd.mode = CliTrailMode::Referenced;
+    cmd.direction = Some(CliDirection::Outgoing);
+    run_trail(cmd)
+}
+
+fn run_trace(mut cmd: TrailCommand) -> Result<()> {
+    if !cmd.mermaid && cmd.format != args::OutputFormat::Dot {
+        cmd.story = true;
+    }
+    run_trail(cmd)
 }
 
 fn trail_guidance_notes(context: &codestory_contracts::api::TrailContextDto) -> Vec<String> {

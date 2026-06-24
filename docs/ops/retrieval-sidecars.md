@@ -12,7 +12,7 @@ packet-runtime, drill, or benchmark evidence tier.
 | Runtime truth | Allows | Blocks |
 | --- | --- | --- |
 | `codestory://status` | Current MCP `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, `build_source`, `repo_ref`, and `allowed_surfaces`; `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Use this first when plugin MCP is live. | Guessing the active runtime from source checkout, marketplace cache, or PATH alone. |
-| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
+| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
 
 For local-only audits, do not run sidecar repair just because `packet`, `search`,

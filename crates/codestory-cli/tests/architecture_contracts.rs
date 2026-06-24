@@ -330,6 +330,9 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
             ".references_context(",
             "pub fn references_context",
         ),
+        ("callers", ".trail_context(", "pub fn trail_context"),
+        ("callees", ".trail_context(", "pub fn trail_context"),
+        ("trace", ".trail_context(", "pub fn trail_context"),
         ("symbols", ".list_root_symbols(", "pub fn list_root_symbols"),
         (
             "symbols",
