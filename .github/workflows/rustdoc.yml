@@ -9,6 +9,18 @@ on:
       - docs/contributors/getting-started.md
       - docs/contributors/testing-matrix.md
       - .github/workflows/rustdoc.yml
+  # Base-branch runs seed caches that sibling PRs are allowed to restore.
+  push:
+    branches:
+      - main
+      - dev/codestory-next
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - docs/contributors/getting-started.md
+      - docs/contributors/testing-matrix.md
+      - .github/workflows/rustdoc.yml
   workflow_dispatch:
 
 permissions:
