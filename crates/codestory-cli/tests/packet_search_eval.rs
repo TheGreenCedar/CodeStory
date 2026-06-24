@@ -360,7 +360,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
     let runs = vec![
         EvalRun {
             fixture_id: "readiness-boundary".to_string(),
-            readiness_mode: "full".to_string(),
+            readiness_mode: "ready".to_string(),
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
                 "crates/codestory-cli/src/main.rs".to_string(),
@@ -380,7 +380,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
         },
         EvalRun {
             fixture_id: "packet-anchor-placement".to_string(),
-            readiness_mode: "full".to_string(),
+            readiness_mode: "ready".to_string(),
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
                 "crates/codestory-cli/src/main.rs".to_string(),
@@ -437,6 +437,56 @@ fn packet_search_eval_does_not_count_non_full_retrieval_as_full() {
     assert_eq!(report.overall.recall_at_k, 0.0);
     assert_eq!(report.overall.anchor_in_packet, 0.0);
     assert_eq!(report.overall.anchor_before_budget, 0.0);
+}
+
+#[test]
+fn packet_search_eval_readiness_mode_uses_verdict_status_not_sidecar_mode() {
+    let readiness = serde_json::json!({
+        "verdicts": [
+            {
+                "goal": "agent_packet_search",
+                "status": "repair_index",
+                "sidecar": {
+                    "retrieval_mode": "full"
+                }
+            }
+        ]
+    });
+
+    assert_eq!(readiness_mode(&readiness), "repair_index");
+}
+
+#[test]
+fn packet_search_eval_reads_production_search_hit_fields() {
+    let search = serde_json::json!({
+        "indexed_symbol_hits": [
+            {
+                "file_path": "crates/codestory-cli/src/main.rs",
+                "display_name": "run_packet"
+            }
+        ],
+        "repo_text_hits": [
+            {
+                "file_path": "docs/testing/search-quality-eval.md",
+                "display_name": "Search Quality Eval Harness"
+            }
+        ]
+    });
+
+    assert_eq!(
+        ranked_files(&search),
+        vec![
+            "crates/codestory-cli/src/main.rs".to_string(),
+            "docs/testing/search-quality-eval.md".to_string()
+        ]
+    );
+    assert_eq!(
+        ranked_symbols(&search),
+        vec![
+            "run_packet".to_string(),
+            "Search Quality Eval Harness".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -568,7 +618,7 @@ fn readiness_mode(json: &Value) -> String {
         .and_then(|verdicts| {
             verdicts.iter().find_map(|verdict| {
                 (verdict["goal"].as_str() == Some("agent_packet_search"))
-                    .then(|| verdict["sidecar"]["retrieval_mode"].as_str())
+                    .then(|| verdict["status"].as_str())
                     .flatten()
             })
         })
@@ -578,13 +628,13 @@ fn readiness_mode(json: &Value) -> String {
 
 fn ranked_files(json: &Value) -> Vec<String> {
     hits(json)
-        .filter_map(|hit| hit["path"].as_str().map(str::to_string))
+        .filter_map(|hit| hit["file_path"].as_str().map(str::to_string))
         .collect()
 }
 
 fn ranked_symbols(json: &Value) -> Vec<String> {
     hits(json)
-        .filter_map(|hit| hit["name"].as_str().map(str::to_string))
+        .filter_map(|hit| hit["display_name"].as_str().map(str::to_string))
         .collect()
 }
 

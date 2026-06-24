@@ -4,7 +4,7 @@
   "k": 5,
   "packet_anchor_budget": 1200,
   "required_full_modes": {
-    "readiness_mode": "full",
+    "readiness_mode": "ready",
     "retrieval_mode": "full"
   },
   "tolerances": {
