@@ -44,6 +44,11 @@ function pluginVersion() {
   return manifest && typeof manifest.version === 'string' ? manifest.version : null;
 }
 
+function pluginCacheVersion() {
+  const parent = path.basename(path.dirname(pluginRoot)).toLowerCase();
+  return parent === 'codestory' ? path.basename(pluginRoot) : null;
+}
+
 function pluginDataDir() {
   return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || null;
 }
@@ -384,6 +389,254 @@ async function resolveCli() {
   };
 }
 
+function normalizeVersion(value) {
+  const match = String(value || '').match(/\b[vV]?(\d+\.\d+\.\d+)\b/u);
+  return match ? match[1] : null;
+}
+
+function semverParts(version) {
+  const normalized = normalizeVersion(version);
+  if (!normalized) return null;
+  return normalized.split('.').map((part) => Number.parseInt(part, 10));
+}
+
+function compareSemver(left, right) {
+  const leftParts = semverParts(left);
+  const rightParts = semverParts(right);
+  if (!leftParts || !rightParts) return null;
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) {
+      return leftParts[index] < rightParts[index] ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function probePathFallbackCli(resolved) {
+  const result = spawnSync(resolved.path, ['--version'], {
+    encoding: 'utf8',
+    shell: false,
+    timeout: 3000,
+    windowsHide: true,
+  });
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  return {
+    status: result.status,
+    error: result.error ? result.error.message : null,
+    version: normalizeVersion(output),
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+  };
+}
+
+function fallbackDiagnostic(resolved, probe, reason) {
+  const projectRoot = process.cwd();
+  const minimumNext = [
+    'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
+    process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
+    'codestory-cli --version',
+  ];
+  const plugin = {
+    plugin_version: resolved.version,
+    plugin_root: pluginRoot,
+    plugin_cache_version: pluginCacheVersion(),
+    plugin_data: pluginDataDir(),
+    cli_source: resolved.source,
+    cli_path: resolved.path,
+    cli_sha256: resolved.sha256,
+    build_source: resolved.buildSource,
+    repo_ref: resolved.repoRef,
+    local_dev_override: resolved.source === 'local_dev_override',
+    path_fallback: resolved.source === 'path_fallback',
+    managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
+    managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
+    managed_manifest_path: resolved.manifestPath || null,
+    warnings: [...resolved.warnings, reason].filter(Boolean),
+  };
+  const repair = {
+    goal: 'local_navigation',
+    status: 'repair_setup',
+    summary: 'CodeStory plugin MCP could not start a compatible codestory-cli stdio runtime.',
+    repair_reason: reason,
+    minimum_next: minimumNext,
+    full_repair: minimumNext,
+    setup: {
+      active_path: resolved.path,
+      active_version: probe.version,
+      expected_version: resolved.version,
+      probe_error: probe.error,
+      probe_status: probe.status,
+    },
+  };
+  const localSurfaces = [
+    'ground',
+    'files',
+    'symbol',
+    'definition',
+    'trail',
+    'references',
+    'snippet',
+    'affected',
+    'symbols',
+    'get_node',
+    'neighbors',
+    'shortest_path',
+    'query_subgraph',
+  ];
+  const sidecarSurfaces = ['packet', 'search', 'context'];
+  const blockedSurface = (surface, goal) => ({
+    allowed: false,
+    readiness_goal: goal,
+    status: 'repair_setup',
+    repair_reason: reason,
+    minimum_next: minimumNext,
+    full_repair: minimumNext,
+  });
+  const allowedSurfaces = Object.fromEntries([
+    ...localSurfaces.map((surface) => [surface, blockedSurface(surface, 'local_navigation')]),
+    ...sidecarSurfaces.map((surface) => [surface, blockedSurface(surface, 'agent_packet_search')]),
+  ]);
+  return {
+    server_version: null,
+    cli_version: probe.version,
+    server_executable: null,
+    server_executable_sha256: null,
+    sidecar_contract_version: null,
+    plugin_runtime: plugin,
+    runtime_boundary: {
+      restart_required_for_runtime_change: true,
+      message: 'A running MCP server keeps using the CLI process it was launched with; plugin refresh, managed runtime provisioning, CODESTORY_CLI, or PATH changes require a host reload/restart and fresh codestory://status readback.',
+    },
+    warnings: plugin.warnings,
+    project_root: projectRoot,
+    retrieval_mode: 'unavailable',
+    degraded_reason: reason,
+    readiness: [repair],
+    allowed_surfaces: allowedSurfaces,
+    recommended_next_calls: [
+      { method: 'resources/read', uri: 'codestory://status' },
+      { method: 'host/restart', instruction: minimumNext[0] },
+      { method: 'cli', command: minimumNext[1] },
+      { method: 'cli', command: minimumNext[2] },
+    ],
+  };
+}
+
+function diagnosticText(status) {
+  const setup = status.readiness[0].setup;
+  return [
+    'CodeStory MCP runtime is not ready.',
+    `reason: ${status.degraded_reason}`,
+    `plugin_version: ${status.plugin_runtime.plugin_version || '<unknown>'}`,
+    `plugin_root: ${status.plugin_runtime.plugin_root}`,
+    `cli_source: ${status.plugin_runtime.cli_source}`,
+    `cli_path: ${setup.active_path}`,
+    `cli_version: ${setup.active_version || '<unknown>'}`,
+    `next: ${status.readiness[0].minimum_next[0]}`,
+  ].join('\n');
+}
+
+function jsonrpcResult(id, result) {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function jsonrpcError(id, code, message) {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+function resourceContents(uri, value) {
+  return {
+    contents: [{
+      uri,
+      mimeType: 'application/json',
+      text: JSON.stringify(value),
+    }],
+  };
+}
+
+function failOpenToolResult(status) {
+  return {
+    isError: true,
+    content: [{ type: 'text', text: diagnosticText(status) }],
+    structuredContent: {
+      code: 'codestory_mcp_runtime_unavailable',
+      status: 'repair_setup',
+      repair_reason: status.degraded_reason,
+      plugin_runtime: status.plugin_runtime,
+      setup: status.readiness[0].setup,
+      minimum_next: status.readiness[0].minimum_next,
+      full_repair: status.readiness[0].full_repair,
+      recommended_next_calls: status.recommended_next_calls,
+    },
+  };
+}
+
+function runFailOpenMcp(status) {
+  const tools = ['ground', 'files', 'packet', 'search', 'context'].map((name) => ({
+    name,
+    description: 'CodeStory diagnostic fail-open surface; runtime repair is required before this tool can return repository grounding.',
+    inputSchema: { type: 'object', additionalProperties: true },
+    outputSchema: { type: 'object', additionalProperties: true },
+  }));
+  const resources = [
+    { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
+    { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
+  ];
+  const guide = {
+    status: 'repair_setup',
+    message: 'Read codestory://status, follow recommended_next_calls, restart/reload the host, then retry grounding.',
+    recommended_next_calls: status.recommended_next_calls,
+  };
+  let buffer = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/u);
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let request;
+      try {
+        request = JSON.parse(line);
+      } catch {
+        process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
+        continue;
+      }
+      if (request.id === undefined) continue;
+      let response;
+      if (request.method === 'initialize') {
+        response = jsonrpcResult(request.id, {
+          protocolVersion: request.params?.protocolVersion || '2024-11-05',
+          capabilities: { tools: {}, resources: {} },
+          serverInfo: { name: 'codestory', version: resolvedVersionForStatus(status) },
+        });
+      } else if (request.method === 'tools/list') {
+        response = jsonrpcResult(request.id, { tools });
+      } else if (request.method === 'resources/list') {
+        response = jsonrpcResult(request.id, { resources });
+      } else if (request.method === 'resources/read') {
+        const uri = request.params?.uri;
+        if (uri === 'codestory://status') {
+          response = jsonrpcResult(request.id, resourceContents(uri, status));
+        } else if (uri === 'codestory://agent-guide') {
+          response = jsonrpcResult(request.id, resourceContents(uri, guide));
+        } else {
+          response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
+        }
+      } else if (request.method === 'tools/call') {
+        response = jsonrpcResult(request.id, failOpenToolResult(status));
+      } else {
+        response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
+      }
+      process.stdout.write(`${JSON.stringify(response)}\n`);
+    }
+  });
+}
+
+function resolvedVersionForStatus(status) {
+  return status.plugin_runtime.plugin_version || 'unknown';
+}
+
 function rememberLaunch(resolved) {
   const dataDir = pluginDataDir();
   if (!dataDir) return;
@@ -393,6 +646,8 @@ function rememberLaunch(resolved) {
       source: resolved.source,
       path: resolved.path,
       sha256: resolved.sha256,
+      pluginRoot,
+      pluginCacheVersion: pluginCacheVersion(),
       pluginVersion: resolved.version,
       manifestPath: resolved.manifestPath || null,
       cliVersion: resolved.cliVersion || null,
@@ -412,6 +667,17 @@ async function main() {
   handleSidecarPolicyCommand(process.argv);
   const resolved = await resolveCli();
   rememberLaunch(resolved);
+  if (resolved.source === 'path_fallback') {
+    const probe = probePathFallbackCli(resolved);
+    const comparison = compareSemver(probe.version, resolved.version);
+    if (!probe.version || comparison === null || comparison < 0) {
+      const reason = probe.version
+        ? 'path_fallback_cli_stale'
+        : 'path_fallback_cli_unavailable';
+      runFailOpenMcp(fallbackDiagnostic(resolved, probe, reason));
+      return;
+    }
+  }
   const sidecarPolicy = readSidecarPolicy();
   scheduleSidecarRepair(resolved, sidecarPolicy);
   const sidecarStatus = readSidecarPolicy();
@@ -423,6 +689,8 @@ async function main() {
     env: {
       ...process.env,
       CODESTORY_PLUGIN_VERSION: resolved.version || '',
+      CODESTORY_PLUGIN_ROOT: pluginRoot,
+      CODESTORY_PLUGIN_CACHE_VERSION: pluginCacheVersion() || '',
       CODESTORY_PLUGIN_CLI_VERSION: resolved.cliVersion || resolved.version || '',
       CODESTORY_PLUGIN_CLI_SOURCE: resolved.source,
       CODESTORY_PLUGIN_CLI_PATH: resolved.path,

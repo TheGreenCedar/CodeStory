@@ -49,14 +49,14 @@ async function writeFakeCli(cliPath) {
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
-      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))" %*\r\n`,
+      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))" %*\r\n`,
       "utf8",
     );
     return;
   }
   await writeFile(
     cliPath,
-    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))' "$@"\n`,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))' "$@"\n`,
     "utf8",
   );
   await chmod(cliPath, 0o755);
@@ -165,6 +165,8 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.source, "managed");
     assert.equal(observed.path, cliPath);
     assert.equal(observed.sha256, sha256);
+    assert.equal(observed.pluginRoot, pluginRoot);
+    assert.equal(observed.pluginCacheVersion, "");
     assert.equal(observed.sidecarPolicy, "ask");
     assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
     assert.match(observed.sidecarEnable, /--policy-file/u);
@@ -184,6 +186,53 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
     );
     assert.equal(policy.state, "enabled");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-mcp-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const input = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
+  ].join("\n") + "\n";
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: "",
+        COPILOT_PLUGIN_DATA: "",
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.equal(responses.length, 3, result.stdout);
+    const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.plugin_runtime.plugin_version, "0.11.17");
+    assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
+    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
+    assert.equal(status.readiness[0].status, "repair_setup");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+    assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
+    assert.equal(responses[2].result.isError, true);
+    assert.equal(
+      responses[2].result.structuredContent.code,
+      "codestory_mcp_runtime_unavailable",
+    );
+    assert.equal(
+      responses[2].result.structuredContent.plugin_runtime.plugin_root,
+      pluginRoot,
+    );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -649,6 +698,8 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "server_executable_sha256",
     "sidecar_contract_version",
     "plugin_runtime",
+    "plugin_runtime.plugin_root",
+    "plugin_cache_version",
     "sidecar_setup",
     "build_source",
     "repo_ref",
@@ -660,6 +711,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "scripts/codestory-mcp.cjs",
     "github_release",
     "path_fallback",
+    "closing transport",
   ];
   const marketplaceSourceRequired = [
     "The marketplace catalog repo is `TheGreenCedar/AgentPluginMarketplace`",
