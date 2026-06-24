@@ -56,7 +56,7 @@ This checklist provides guidelines for maintaining high-quality, consistent docu
 - **docs/README.md**: True routing document
 - **docs/usage.md**: Operator journey and workflows
 - **docs/architecture/**: System architecture and design
-- **docs/concepts/**: Core concepts and terminology
+- **docs/glossary.md**: Core concepts and terminology
 - **docs/contributors/**: Contributor guidelines and setup
 - **docs/testing/**: Testing procedures and benchmarks
 - **docs/ops/**: Operational procedures and maintenance

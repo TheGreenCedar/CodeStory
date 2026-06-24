@@ -42,8 +42,8 @@ Keyword index for CodeStory documentation. For routing by job, start at
 - **language-support.md**: Language support claims and coverage
 - **subsystems/**: Subsystem-specific documentation
 
-#### docs/concepts/
-- **how-codestory-works.md**: Core concepts and functionality
+#### docs/glossary.md
+- **glossary.md**: Canonical terminology across operator, architecture, and verification docs
 
 #### docs/contributors/
 - **getting-started.md**: Contributor setup and verification
