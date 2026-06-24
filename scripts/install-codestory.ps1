@@ -185,13 +185,24 @@ function Find-ExistingCli {
     return $null
 }
 
-function Test-WindowsX64 {
-    $hostIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
-        [System.Runtime.InteropServices.OSPlatform]::Windows
+function Get-WindowsReleaseTarget {
+    param(
+        [bool]$HostIsWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+            [System.Runtime.InteropServices.OSPlatform]::Windows
+        ),
+        [System.Runtime.InteropServices.Architecture]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
     )
-    $isX64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq `
-        [System.Runtime.InteropServices.Architecture]::X64
-    return ($hostIsWindows -and $isX64)
+
+    if (-not $HostIsWindows) {
+        return $null
+    }
+    if ($Architecture -eq [System.Runtime.InteropServices.Architecture]::X64) {
+        return "windows-x64"
+    }
+    if ($Architecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+        return "windows-arm64"
+    }
+    return $null
 }
 
 function Normalize-PathListEntry {
@@ -358,11 +369,12 @@ function Install-ReleaseCli {
         [string]$ReleaseVersion
     )
 
-    if (-not (Test-WindowsX64)) {
-        throw "Automatic download currently supports Windows x64 only. Pass -CodestoryCli or set CODESTORY_CLI to reuse an existing $script:RequiredVersion binary."
+    $releaseTarget = Get-WindowsReleaseTarget
+    if (-not $releaseTarget) {
+        throw "Automatic download currently supports Windows x64 and Windows ARM64 only. Pass -CodestoryCli or set CODESTORY_CLI to reuse an existing $script:RequiredVersion binary."
     }
 
-    $archiveName = "codestory-cli-v$ReleaseVersion-windows-x64.zip"
+    $archiveName = "codestory-cli-v$ReleaseVersion-$releaseTarget.zip"
     $baseUrl = "https://github.com/TheGreenCedar/CodeStory/releases/download/v$ReleaseVersion"
     $archiveUrl = "$baseUrl/$archiveName"
     $sumsUrl = "$baseUrl/SHA256SUMS.txt"
@@ -532,7 +544,9 @@ function Assert-SelfTest {
 
 function Invoke-SelfTest {
     Set-RequiredVersion "v0.11.4"
-    Test-WindowsX64 | Out-Null
+    Assert-SelfTest ((Get-WindowsReleaseTarget $true ([System.Runtime.InteropServices.Architecture]::X64)) -eq "windows-x64") "Windows x64 should map to windows-x64 release assets"
+    Assert-SelfTest ((Get-WindowsReleaseTarget $true ([System.Runtime.InteropServices.Architecture]::Arm64)) -eq "windows-arm64") "Windows ARM64 should map to windows-arm64 release assets"
+    Assert-SelfTest (-not (Get-WindowsReleaseTarget $false ([System.Runtime.InteropServices.Architecture]::X64))) "non-Windows hosts should not auto-download Windows assets"
     Assert-SelfTest (Test-PathListContains "C:\Tools;C:\CodeStory\bin\" "C:\CodeStory\bin") "path-list check should ignore trailing slash"
     Assert-SelfTest (-not (Test-PathListContains "C:\Tools" "C:\CodeStory\bin")) "path-list check should reject missing directory"
     Assert-SelfTest ((Set-PathListDirectoryFirst "C:\Old;C:\CodeStory\bin" "C:\CodeStory\bin") -eq "C:\CodeStory\bin;C:\Old") "path ordering should put current install first"
@@ -714,7 +728,7 @@ Set-RequiredVersion $Version
 $cliInfo = Find-ExistingCli $CodestoryCli $InstallDir
 if (-not $cliInfo) {
     if ($NoDownload) {
-        throw "No existing codestory-cli $script:RequiredVersion found. Pass -CodestoryCli, set CODESTORY_CLI, add codestory-cli to PATH, or rerun without -NoDownload on Windows x64."
+        throw "No existing codestory-cli $script:RequiredVersion found. Pass -CodestoryCli, set CODESTORY_CLI, add codestory-cli to PATH, or rerun without -NoDownload on Windows x64 or Windows ARM64."
     }
     $cliInfo = Install-ReleaseCli $InstallDir $Version
 }
