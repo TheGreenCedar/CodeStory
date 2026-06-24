@@ -1,5 +1,5 @@
 use crate::config::{
-    SidecarLayout, ZOEKT_REAL_VERSION_PIN, dir_size_bytes, qdrant_enabled,
+    SidecarLayout, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, dir_size_bytes, qdrant_enabled,
     qdrant_semantic_vectors_enabled, zoekt_enabled,
 };
 use crate::generation::{
@@ -182,7 +182,17 @@ pub fn repair_project_qdrant_collection(
 }
 
 pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<FinalizeIndexOutcome> {
-    let layout = SidecarLayout::from_env_for_project(project_root);
+    let runtime = crate::config::sidecar_runtime_auto(project_root);
+    finalize_index_for_runtime(project_root, storage_path, &runtime)
+}
+
+pub fn finalize_index_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<FinalizeIndexOutcome> {
+    runtime.activate_embed_url_default();
+    let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
 
     let project_id = sidecar_project_id_for_root(project_root);
