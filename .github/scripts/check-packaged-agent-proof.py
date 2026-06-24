@@ -179,9 +179,28 @@ def require_packet_ready(payload: object, artifact: Path) -> None:
 
 def require_context_ready(payload: object, artifact: Path) -> None:
     require(isinstance(payload, dict), "context", artifact, "context output is not a JSON object")
-    require("retrieval_trace" in payload, "context", artifact, "context output missing retrieval trace")
-    retrieval_version = payload.get("retrieval_version")
-    require(retrieval_version == "sidecar", "context", artifact, f"context retrieval_version is {retrieval_version!r}")
+    context = payload.get("context")
+    require(isinstance(context, dict), "context", artifact, "context output missing context object")
+    retrieval_version = context.get("retrieval_version")
+    require(
+        retrieval_version == "sidecar",
+        "context",
+        artifact,
+        f"context retrieval_version is {retrieval_version!r}",
+    )
+    trace = context.get("retrieval_trace")
+    require(isinstance(trace, dict), "context", artifact, "context output missing context retrieval trace")
+    steps = trace.get("steps")
+    require(
+        isinstance(steps, list) and len(steps) > 0,
+        "context",
+        artifact,
+        "context retrieval trace has no steps",
+    )
+    shadow = trace.get("retrieval_shadow")
+    require(isinstance(shadow, dict), "context", artifact, "context retrieval trace missing retrieval shadow")
+    mode = shadow.get("retrieval_mode")
+    require(mode == "full", "context", artifact, f"context retrieval_shadow.retrieval_mode is {mode!r}")
 
 
 def write_stdio_artifact(artifact: Path, transcript: list[dict], stdout: str, stderr_path: Path, extra: dict | None = None) -> None:
@@ -578,8 +597,27 @@ def write_fake_cli(path: Path) -> None:
             elif layer == "context":
                 if fail == "context_weak":
                     emit({"retrieval_trace": {"resolved_profile": "investigate"}})
+                elif fail == "context_fallback":
+                    emit({
+                        "context": {
+                            "retrieval_version": "sidecar",
+                            "retrieval_trace": {
+                                "steps": [{}],
+                                "retrieval_shadow": {"retrieval_mode": "fallback"},
+                            },
+                        },
+                    })
                 else:
-                    emit({"retrieval_version": "sidecar", "retrieval_trace": {"resolved_profile": "investigate"}})
+                    emit({
+                        "context": {
+                            "retrieval_version": "sidecar",
+                            "retrieval_trace": {
+                                "resolved_profile": "investigate",
+                                "steps": [{}],
+                                "retrieval_shadow": {"retrieval_mode": "full"},
+                            },
+                        },
+                    })
             elif layer == "packet":
                 if fail == "packet_weak":
                     emit({"sufficiency": {"status": "supported"}, "answer": {"retrieval_version": "fallback"}, "retrieval_trace_summary": {}})
@@ -689,6 +727,18 @@ def self_test() -> None:
                 assert "context.json" in str(exc.artifact)
             else:
                 raise AssertionError("weak fake context should fail the gate")
+        finally:
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "context_fallback"
+        try:
+            try:
+                run_gate(args)
+            except GateFailure as exc:
+                assert exc.layer == "context"
+                assert "context.json" in str(exc.artifact)
+            else:
+                raise AssertionError("fallback fake context should fail the gate")
         finally:
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
 
