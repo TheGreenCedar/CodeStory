@@ -8,6 +8,9 @@ use crate::agent::packet_claim_profiles::{
     packet_source_derived_claim_for_role, packet_source_derived_claims_for_citation,
 };
 use crate::agent::packet_command_profiles::packet_append_command_flow_template_claims;
+use crate::agent::packet_evidence::{
+    citation_sufficiency_eligible, evidence_resolution_for_citation, evidence_tier_for_citation,
+};
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
@@ -18,7 +21,10 @@ use crate::agent::packet_scoring::{
 };
 use crate::agent::packet_terms::{packet_probe_terms, packet_terms_indicate_sql_schema_flow};
 use crate::query_mentions_non_primary_source;
-use codestory_contracts::api::{AgentAnswerDto, AgentCitationDto, PacketClaimDto};
+use codestory_contracts::api::{
+    AgentAnswerDto, AgentCitationDto, PacketClaimDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, PacketProofStatusDto,
+};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -56,7 +62,59 @@ pub(crate) fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClai
         &mut claims,
         &mut seen_claims,
     );
+    decorate_packet_claims_proof_metadata(&mut claims);
     claims
+}
+
+pub(crate) fn decorate_packet_claims_proof_metadata(claims: &mut [PacketClaimDto]) {
+    for claim in claims {
+        decorate_packet_claim_proof_metadata(claim);
+    }
+}
+
+fn decorate_packet_claim_proof_metadata(claim: &mut PacketClaimDto) {
+    let proven_tier = claim
+        .citations
+        .iter()
+        .find(|citation| citation_sufficiency_eligible(citation))
+        .map(evidence_tier_for_citation);
+    claim.required_evidence_role = Some(proven_tier.unwrap_or(PacketEvidenceTierDto::ExactSource));
+    claim.proof_status = Some(packet_claim_proof_status(claim, proven_tier.is_some()));
+}
+
+fn packet_claim_proof_status(
+    claim: &PacketClaimDto,
+    has_proof_bearing_citation: bool,
+) -> PacketProofStatusDto {
+    if claim.citations.is_empty() {
+        return PacketProofStatusDto::Unsupported;
+    }
+    if has_proof_bearing_citation && claim.eligible_for_sufficiency != Some(false) {
+        return PacketProofStatusDto::Proven;
+    }
+    if claim
+        .citations
+        .iter()
+        .all(packet_citation_is_diagnostic_only)
+    {
+        return PacketProofStatusDto::Diagnostic;
+    }
+    PacketProofStatusDto::Likely
+}
+
+fn packet_citation_is_diagnostic_only(citation: &AgentCitationDto) -> bool {
+    if citation.eligible_for_sufficiency == Some(false) {
+        return true;
+    }
+    matches!(
+        evidence_tier_for_citation(citation),
+        PacketEvidenceTierDto::DenseSemantic
+            | PacketEvidenceTierDto::GeneratedSummary
+            | PacketEvidenceTierDto::SyntheticSourceScan
+    ) || matches!(
+        evidence_resolution_for_citation(citation),
+        PacketEvidenceResolutionDto::DiagnosticOnly
+    )
 }
 
 pub(crate) fn append_flow_template_claims(
@@ -504,6 +562,8 @@ fn packet_push_flow_template_claim_with_citations(
     }
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
+        proof_status: None,
+        required_evidence_role: None,
         citations,
         coverage_role: Some("flow template".to_string()),
         eligible_for_sufficiency: Some(true),
@@ -534,6 +594,8 @@ pub(crate) fn append_ranked_citation_claims(
             if seen_claims.insert(key) {
                 claims.push(PacketClaimDto {
                     claim: shaped,
+                    proof_status: None,
+                    required_evidence_role: None,
                     citations: vec![citation.clone()],
                     coverage_role: citation.coverage_role.clone(),
                     eligible_for_sufficiency: Some(false),
@@ -563,6 +625,8 @@ pub(crate) fn append_ranked_citation_claims(
         }
         claims.push(PacketClaimDto {
             claim: packet_claim_for_role(role, citation, prompt, rank_terms),
+            proof_status: None,
+            required_evidence_role: None,
             citations: vec![citation.clone()],
             coverage_role: Some(role.as_str().to_string()),
             eligible_for_sufficiency: Some(true),
@@ -819,6 +883,8 @@ fn packet_push_claim(
     }
     claims.push(PacketClaimDto {
         claim: claim_text.to_string(),
+        proof_status: None,
+        required_evidence_role: None,
         citations: citation.map(|value| vec![value]).unwrap_or_default(),
         coverage_role: Some("source definition".to_string()),
         eligible_for_sufficiency: Some(false),
@@ -947,7 +1013,7 @@ mod tests {
     use super::*;
     use codestory_contracts::api::{
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
-        NodeKind, RetrievalScoreBreakdownDto, SearchHitOrigin,
+        NodeKind, PacketProofStatusDto, RetrievalScoreBreakdownDto, SearchHitOrigin,
     };
 
     fn test_answer(prompt: &str, citations: Vec<AgentCitationDto>) -> AgentAnswerDto {
@@ -1008,6 +1074,53 @@ mod tests {
             coverage_role: None,
             eligible_for_sufficiency: Some(true),
         }
+    }
+
+    #[test]
+    fn generated_summary_and_dense_claims_need_backing_source_proof() {
+        let mut generated = test_citation("generated summary", "target/generated/summary.md", 0.9);
+        generated.evidence_tier = Some(PacketEvidenceTierDto::GeneratedSummary);
+        generated.resolution_status = Some(PacketEvidenceResolutionDto::DiagnosticOnly);
+        generated.eligible_for_sufficiency = None;
+
+        let mut dense = test_citation("dense anchor", "src/runtime.rs", 0.8);
+        dense.evidence_tier = Some(PacketEvidenceTierDto::DenseSemantic);
+        dense.resolution_status = Some(PacketEvidenceResolutionDto::Resolved);
+        dense.eligible_for_sufficiency = None;
+
+        let mut claims = vec![PacketClaimDto {
+            claim: "Runtime dispatch is covered.".to_string(),
+            proof_status: None,
+            required_evidence_role: None,
+            citations: vec![generated, dense],
+            coverage_role: Some("source evidence".to_string()),
+            eligible_for_sufficiency: Some(true),
+        }];
+
+        decorate_packet_claims_proof_metadata(&mut claims);
+
+        assert_eq!(
+            claims[0].proof_status,
+            Some(PacketProofStatusDto::Diagnostic)
+        );
+        assert_eq!(
+            claims[0].required_evidence_role,
+            Some(PacketEvidenceTierDto::ExactSource)
+        );
+
+        let mut exact_source = test_citation("dispatch", "src/runtime.rs", 1.0);
+        exact_source.evidence_tier = Some(PacketEvidenceTierDto::ExactSource);
+        exact_source.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        exact_source.eligible_for_sufficiency = Some(true);
+        claims[0].citations.push(exact_source);
+
+        decorate_packet_claims_proof_metadata(&mut claims);
+
+        assert_eq!(claims[0].proof_status, Some(PacketProofStatusDto::Proven));
+        assert_eq!(
+            claims[0].required_evidence_role,
+            Some(PacketEvidenceTierDto::ExactSource)
+        );
     }
 
     fn write_sql_fixture(name: &str) -> std::path::PathBuf {

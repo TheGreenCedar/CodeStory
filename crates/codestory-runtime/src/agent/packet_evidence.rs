@@ -199,9 +199,12 @@ pub(crate) fn evidence_producer_for_hit(hit: &SearchHit) -> String {
     }
 }
 
-fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
+pub(crate) fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier {
     if citation_is_diagnostic_source_proof(citation) {
         return PacketEvidenceTier::ExactSource;
+    }
+    if let Some(tier) = citation.evidence_tier {
+        return tier;
     }
     if let Some(breakdown) = citation.retrieval_score_breakdown.as_ref() {
         if breakdown.provenance.iter().any(|value| {
@@ -227,13 +230,18 @@ fn evidence_tier_for_citation(citation: &AgentCitationDto) -> PacketEvidenceTier
     }
 }
 
-fn evidence_resolution_for_citation(citation: &AgentCitationDto) -> PacketEvidenceResolution {
+pub(crate) fn evidence_resolution_for_citation(
+    citation: &AgentCitationDto,
+) -> PacketEvidenceResolution {
     if citation_is_diagnostic_source_proof(citation) {
         return if citation.file_path.is_some() && citation.line.is_some() {
             PacketEvidenceResolution::SourceRangeOnly
         } else {
             PacketEvidenceResolution::Unresolved
         };
+    }
+    if let Some(resolution) = citation.resolution_status {
+        return resolution;
     }
     if citation.resolvable {
         PacketEvidenceResolution::Resolved

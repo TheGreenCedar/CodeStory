@@ -1089,7 +1089,7 @@ fn stdio_mandatory_sidecar_fingerprint(
     project_root: &std::path::Path,
     storage_path: &std::path::Path,
 ) -> String {
-    let layout = SidecarLayout::from_env();
+    let layout = SidecarLayout::from_env_for_project(project_root);
     let status = codestory_retrieval::strict_sidecar_status(project_root, Some(storage_path)).map(
         |report| StdioSidecarStatusFingerprint {
             retrieval_mode: report.retrieval_mode,
@@ -1949,7 +1949,7 @@ fn read_stdio_status_resource_cached(
 }
 
 fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
-    let layout = SidecarLayout::from_env();
+    let layout = SidecarLayout::from_env_for_project(&runtime.project_root);
     [
         format!("project:{}", runtime.project_root.display()),
         format!("storage:{}", runtime.storage_path.display()),
@@ -1972,7 +1972,7 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
     let summary = runtime.open_project_summary()?;
     let retrieval = summary.retrieval.as_ref();
-    let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash) =
+    let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash, ownership) =
         match codestory_retrieval::strict_sidecar_status(
             &runtime.project_root,
             Some(&runtime.storage_path),
@@ -1991,11 +1991,13 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
                     report.degraded_reason,
                     manifest_generation,
                     manifest_input_hash,
+                    report.ownership,
                 )
             }
             Err(error) => (
                 "unavailable".to_string(),
                 Some(format!("sidecar_status_error: {error}")),
+                None,
                 None,
                 None,
             ),
@@ -2006,6 +2008,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "manifest_generation": manifest_generation.clone(),
         "manifest_input_hash": manifest_input_hash.clone(),
+        "ownership": ownership,
     });
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
@@ -2403,6 +2406,8 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         .unwrap_or_default();
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
+        "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
+        "plugin_cache_version": env_nonempty("CODESTORY_PLUGIN_CACHE_VERSION"),
         "cli_version": env_nonempty("CODESTORY_PLUGIN_CLI_VERSION"),
         "cli_source": cli_source,
         "cli_path": env_nonempty("CODESTORY_PLUGIN_CLI_PATH"),

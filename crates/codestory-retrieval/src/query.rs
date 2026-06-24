@@ -240,7 +240,7 @@ struct QueryContext {
 }
 
 fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryContext> {
-    let layout = SidecarLayout::from_env();
+    let layout = SidecarLayout::from_env_for_project(project_root);
     let project_id = sidecar_project_id_for_root(project_root);
     let (manifest, file_roles) = if storage_path.exists() {
         let storage = Store::open(storage_path).context("open storage for query")?;
