@@ -17,7 +17,7 @@ use codestory_contracts::api::{
 };
 use codestory_retrieval::SidecarLayout;
 use sha2::{Digest, Sha256};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2088,6 +2088,8 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     });
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
+    let path_candidates = stdio_path_cli_candidate_statuses(server_executable.as_deref());
+    let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
     let plugin_runtime = stdio_plugin_runtime_status();
     let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
@@ -2110,6 +2112,8 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "cli_version": env!("CARGO_PKG_VERSION"),
         "server_executable": server_executable,
         "server_executable_sha256": server_executable_sha256,
+        "source_checkout_version": source_checkout_version,
+        "path_candidates": path_candidates,
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "plugin_runtime": plugin_runtime,
         "runtime_boundary": {
@@ -2249,6 +2253,87 @@ fn stdio_cli_version(candidate: &str) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     text.split_whitespace().find_map(normalize_release_version)
+}
+
+fn stdio_path_cli_candidate_statuses(active_path: Option<&str>) -> serde_json::Value {
+    serde_json::Value::Array(
+        stdio_path_cli_candidates()
+            .into_iter()
+            .map(|path| {
+                serde_json::json!({
+                    "path": crate::display::clean_path_string(&path),
+                    "version": stdio_cli_version(&path),
+                    "active": active_path.is_some_and(|active| same_path_text(&path, active)),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn stdio_path_cli_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            push_existing_path_cli_candidates(&mut candidates, &directory);
+        }
+    }
+    dedupe_path_text(candidates)
+}
+
+fn push_existing_path_cli_candidates(candidates: &mut Vec<String>, directory: &Path) {
+    for binary in stdio_cli_binary_names() {
+        let candidate = directory.join(binary);
+        if candidate.is_file() {
+            candidates.push(candidate.to_string_lossy().to_string());
+        }
+    }
+}
+
+fn stdio_cli_binary_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "codestory-cli.exe",
+            "codestory-cli.cmd",
+            "codestory-cli.bat",
+            "codestory-cli",
+        ]
+    } else {
+        &["codestory-cli"]
+    }
+}
+
+fn stdio_source_checkout_version(project_root: &Path) -> Option<String> {
+    fs::read_to_string(project_root.join("crates/codestory-cli/Cargo.toml"))
+        .ok()
+        .and_then(|manifest| cargo_package_version(&manifest))
+}
+
+fn cargo_package_version(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(version) = trimmed.strip_prefix("version") else {
+            continue;
+        };
+        let Some(version) = version.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if let Some(version) = version.trim().strip_prefix('"').and_then(|value| {
+            value
+                .split_once('"')
+                .map(|(version, _)| version.to_string())
+        }) {
+            return Some(version);
+        }
+    }
+    None
 }
 
 fn same_path_text(left: &str, right: &str) -> bool {
@@ -2928,6 +3013,21 @@ mod tests {
             calls[0].get("command").is_none(),
             "restart boundary should not be exposed as a CLI command: {calls}"
         );
+    }
+
+    #[test]
+    fn cargo_package_version_reads_only_package_section() {
+        let manifest = r#"
+[workspace]
+version = "9.9.9"
+
+[package]
+name = "codestory-cli"
+edition = "2024"
+version = "0.11.20"
+"#;
+
+        assert_eq!(cargo_package_version(manifest), Some("0.11.20".to_string()));
     }
 
     #[test]
