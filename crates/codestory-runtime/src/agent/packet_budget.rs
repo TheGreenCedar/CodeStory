@@ -822,6 +822,8 @@ mod tests {
             covered_claims: vec![PacketClaimDto {
                 claim: "Packet budget ownership is covered by cited runtime and contract anchors."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: answer.citations.clone(),
                 coverage_role: Some("source evidence".to_string()),
                 eligible_for_sufficiency: Some(true),

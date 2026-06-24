@@ -1,4 +1,4 @@
-use crate::agent::packet_claims::packet_supported_claims;
+use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use crate::agent::packet_flow_requirements::{
@@ -87,10 +87,12 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         task_class,
         answer,
         budget,
-        supported_claims,
+        mut supported_claims,
         missing_required_probe_queries,
         targeted_follow_up_queries,
     } = input;
+
+    decorate_packet_claims_proof_metadata(&mut supported_claims);
 
     let has_errors = answer
         .retrieval_trace
@@ -2174,6 +2176,8 @@ mod tests {
     fn claim(text: &str) -> PacketClaimDto {
         PacketClaimDto {
             claim: text.to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: Vec::new(),
             coverage_role: None,
             eligible_for_sufficiency: None,
@@ -2228,6 +2232,8 @@ mod tests {
     ) -> PacketClaimDto {
         PacketClaimDto {
             claim: text.to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: vec![citation],
             coverage_role: coverage_role.map(str::to_string),
             eligible_for_sufficiency,
@@ -3817,12 +3823,16 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "Selected callback invocation happens.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: Some("dispatch".to_string()),
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Selected handler invocation happens.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: Some("dispatch".to_string()),
                 eligible_for_sufficiency: None,
@@ -3873,12 +3883,16 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "Selected callback invocation happens.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: Some("dispatch".to_string()),
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Selected handler invocation happens.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: Some("dispatch".to_string()),
                 eligible_for_sufficiency: None,

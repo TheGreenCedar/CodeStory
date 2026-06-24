@@ -1985,9 +1985,22 @@ pub enum PacketSufficiencyStatusDto {
     Insufficient,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketProofStatusDto {
+    Proven,
+    Likely,
+    Diagnostic,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketClaimDto {
     pub claim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_status: Option<PacketProofStatusDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_evidence_role: Option<PacketEvidenceTierDto>,
     #[serde(default)]
     pub citations: Vec<AgentCitationDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2311,6 +2324,28 @@ mod packet_tests {
         let legacy: PacketSufficiencyStatusDto =
             serde_json::from_str("\"insufficient\"").expect("deserialize legacy status");
         assert_eq!(legacy, PacketSufficiencyStatusDto::Insufficient);
+    }
+
+    #[test]
+    fn packet_claim_serializes_machine_checkable_proof_metadata() {
+        let value = serde_json::to_value(PacketClaimDto {
+            claim: "Dense hits need backing source proof.".to_string(),
+            proof_status: Some(PacketProofStatusDto::Diagnostic),
+            required_evidence_role: Some(PacketEvidenceTierDto::ExactSource),
+            citations: Vec::new(),
+            coverage_role: Some("source evidence".to_string()),
+            eligible_for_sufficiency: Some(false),
+        })
+        .expect("serialize packet claim");
+
+        assert_eq!(value["proof_status"], "diagnostic");
+        assert_eq!(value["required_evidence_role"], "exact_source");
+
+        let legacy: PacketClaimDto =
+            serde_json::from_str(r#"{"claim":"legacy claim","citations":[]}"#)
+                .expect("deserialize legacy packet claim");
+        assert_eq!(legacy.proof_status, None);
+        assert_eq!(legacy.required_evidence_role, None);
     }
 
     #[test]

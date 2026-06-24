@@ -35,7 +35,7 @@ pub use dto::{
     NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
     PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetModeDto, PacketBudgetUsageDto,
     PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto,
+    PacketPlanDto, PacketPlanQueryDto, PacketProofStatusDto, PacketRetrievalTraceSummaryDto,
     PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto, PacketSufficiencyStatusDto,
     PacketTaskClassDto, ProjectSummary, ReadFileTextRequest, ReadFileTextResponse,
     ReadinessGoalDto, ReadinessIndexSnapshotDto, ReadinessSetupSnapshotDto,

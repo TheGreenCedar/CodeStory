@@ -9216,6 +9216,8 @@ mod tests {
         let generic = PacketClaimDto {
             claim: "Runtime orchestration is anchored by `RuntimeCoordinator`; inspect it there."
                 .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: vec![test_packet_citation(
                 "RuntimeCoordinator",
                 "src/runtime.rs",
@@ -9227,6 +9229,8 @@ mod tests {
         let causal = PacketClaimDto {
             claim: "`RuntimeCoordinator` coordinates runtime state transitions and downstream service calls."
                 .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: vec![test_packet_citation(
                 "RuntimeCoordinator",
                 "src/runtime.rs",
@@ -9239,6 +9243,8 @@ mod tests {
             claim:
                 "`Session.send` in `src/requests/sessions.py` ties request, session in this flow to cited definitions and adjacent ownership."
                     .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: vec![test_packet_citation(
                 "Session.send",
                 "src/requests/sessions.py",
@@ -9251,6 +9257,8 @@ mod tests {
             claim:
                 "`PreparedRequest` is defined in cited source `src/requests/models.py` and should be treated as an exact source anchor for this flow."
                     .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: vec![test_packet_citation(
                 "PreparedRequest",
                 "src/requests/models.py",
@@ -9272,6 +9280,8 @@ mod tests {
             PacketClaimDto {
                 claim: "The public useSWR export wraps useSWRHandler with argument normalization."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "useSWRHandler",
                     "src/index/use-swr.ts",
@@ -9282,6 +9292,8 @@ mod tests {
             },
             PacketClaimDto {
                 claim: "useSWRHandler serializes the key before reading cache state.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "serialize",
                     "src/_internal/utils/serialize.ts",
@@ -9294,6 +9306,8 @@ mod tests {
                 claim:
                     "createCacheHelper provides cache get, set, subscribe, and snapshot helpers."
                         .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "createCacheHelper",
                     "src/_internal/utils/helper.ts",
@@ -9305,6 +9319,8 @@ mod tests {
             PacketClaimDto {
                 claim: "internalMutate routes mutate behavior through the mutation helper."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "internalMutate",
                     "src/_internal/utils/mutate.ts",
@@ -9348,6 +9364,8 @@ mod tests {
                 claim:
                     "StringUtils.isBlank treats null, empty, and whitespace-only inputs as blank."
                         .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "StringUtils.isBlank",
                     "src/main/java/org/apache/commons/lang3/StringUtils.java",
@@ -9359,6 +9377,8 @@ mod tests {
             PacketClaimDto {
                 claim: "StringUtils.isEmpty does not trim whitespace before deciding emptiness."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "StringUtils.isEmpty",
                     "src/main/java/org/apache/commons/lang3/StringUtils.java",
@@ -9370,6 +9390,8 @@ mod tests {
             PacketClaimDto {
                 claim: "Strings delegates region matching work to CharSequenceUtils.regionMatches."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: vec![test_packet_citation(
                     "Strings.regionMatches",
                     "src/main/java/org/apache/commons/lang3/Strings.java",

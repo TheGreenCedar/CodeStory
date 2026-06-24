@@ -109,11 +109,15 @@ and may be dense anchors with reason `component_report`.
   to promote answer quality or language quality without packet-runtime or drill
   evidence at the matching proof tier.
 
-Packet citations may expose optional JSON fields: `evidence_tier`,
-`evidence_producer`, `resolution_status`, `coverage_role`, and
-`eligible_for_sufficiency`. Sufficiency is role-bearing: a citation can help
-prove a packet claim only when the evidence tier, resolved/source-range status,
-and coverage role match the claim being covered.
+Packet claims expose `proof_status` and `required_evidence_role`.
+`proof_status` is `proven`, `likely`, `diagnostic`, or `unsupported`.
+`required_evidence_role` reuses the packet evidence tier taxonomy below; dense
+semantic hits and generated summaries stay diagnostic unless another
+proof-bearing citation backs the claim. Packet citations may expose optional
+JSON fields: `evidence_tier`, `evidence_producer`, `resolution_status`,
+`coverage_role`, and `eligible_for_sufficiency`. Sufficiency is role-bearing:
+a citation can help prove a packet claim only when the evidence tier,
+resolved/source-range status, and coverage role match the claim being covered.
 
 | Evidence tier | Proof role | Sufficiency rule |
 | --- | --- | --- |
