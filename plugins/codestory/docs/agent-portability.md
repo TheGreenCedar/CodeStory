@@ -1,10 +1,17 @@
 # Agent Portability
 
-CodeStory ships one grounding skill and thin host adapters. The skill owns the
-runtime rules; adapters make the rules ambient in hosts that support lifecycle
-hooks or project instruction files. Where the host exposes prompt input, the
-hook attempts request-aware packet grounding before the agent opens source
-files.
+CodeStory ships one grounding skill and thin host adapters. The user-facing
+path is one flow: run agent preflight, install the plugin or adapter, then let
+MCP plus hooks keep CodeStory ambient.
+
+```sh
+codestory-cli agent preflight --project <repo> --format json
+```
+
+The skill owns the runtime rules; adapters make the rules ambient in hosts that
+support lifecycle hooks or project instruction files. Where the host exposes
+prompt input, the hook attempts request-aware packet grounding before the agent
+opens source files.
 
 | Host | Files | Behavior |
 | --- | --- | --- |
@@ -21,4 +28,6 @@ instructions, keep the copied rule text aligned with the root instruction file.
 Every adapter should preserve the same first check: read `codestory://status`
 when MCP is live, then trust only the surfaces allowed by status. Broad
 `packet`, `search`, and `context` use still requires `retrieval_mode=full`.
-Hooks are best-effort startup context, not a blocking dependency.
+Hooks ground on session start, resume, clear, and compact handoff; attempt
+request-aware grounding on user prompts; and fail open with the next CodeStory
+check instead of blocking the host.

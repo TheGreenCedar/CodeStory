@@ -6,17 +6,19 @@ last turn. CodeStory indexes once and serves evidence from that map so the agent
 can answer from citations instead of re-exploring the tree.
 
 Start with the human task, then run the smallest path that proves the state you
-need. The agent plugin is the normal path. The CLI is for setup, repair,
-debugging, transcripts, and direct stdio integration.
+need. The golden path is CLI preflight first, then the agent plugin/MCP/hooks
+path. The CLI is otherwise for repair, debugging, transcripts, and direct stdio
+integration.
 
 ## Operator Journey
 
 | Stage | Human action | Agent/CLI action | Trust check |
 | --- | --- | --- | --- |
+| Preflight | Run `codestory-cli agent preflight --project <target-workspace> --format json`. | Reports local graph readiness, full retrieval readiness, safe/blocked surfaces, and repair command. | Local graph surfaces are safe before source work; sidecar surfaces require `retrieval_mode=full`. |
 | Install | Install the `codestory` agent plugin from `TheGreenCedar`. | Plugin starts its managed MCP adapter, then `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
-| First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | Status reports `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and `allowed_surfaces`. |
+| First grounding | Start a fresh thread in the repo. | Hooks attempt startup grounding; the agent reads `codestory://status`, then `codestory://grounding` or `ground`. | Status reports `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and `allowed_surfaces`. |
 | Source work | Ask for a plan, review, or code path. | Use allowed local graph surfaces such as `files`, `symbol`, `trail`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
-| Broad discovery | Ask a repo-wide question. | Use `packet`, `search`, or `context`. | Trust only when that surface is allowed and `retrieval_mode=full`. |
+| Broad discovery | Ask a repo-wide question. | Hooks may attempt request-aware packets; the agent may use `packet`, `search`, or `context`. | Trust only when that surface is allowed and `retrieval_mode=full`. |
 | Repair | Ask for a transcript or run CLI directly. | Use `ready --goal local --repair` or `ready --goal agent --repair`. | Repeat readiness checks after repair. |
 
 Packet/search output from degraded retrieval, missing sidecars, stale manifests,
@@ -25,6 +27,11 @@ or any non-`full` retrieval mode is navigation help only. It is not proof.
 Most humans should start from the plugin flow in
 [README - Quick start](../README.md#quick-start). Use the CLI when you need the
 exact setup, repair, or debug record.
+
+Hook-enabled hosts keep CodeStory ambient. Hooks attempt strict grounding on
+session start, resume, clear, and compact handoff; they attempt request-aware
+packet grounding on each user prompt; and they fail open with the next
+CodeStory check instead of blocking the host.
 
 ### Example prompts
 
@@ -72,8 +79,19 @@ environment variables with `$env:NAME = "value"`.
 
 ## Install And Ground A Repo
 
-Install the CodeStory plugin once, then start a fresh agent thread for the
-workspace you want to ground. The canonical skill package lives at
+Run the CLI preflight in the workspace first:
+
+```sh
+codestory-cli agent preflight --project <target-workspace> --format json
+```
+
+Use its `safe_surfaces`, `blocked_surfaces`, and `repair_command` fields as the
+agent handoff. If local graph surfaces are blocked, run the repair command
+before source work. If only `packet`, `search`, or `context` is blocked, local
+navigation can continue while sidecars are repaired later.
+
+Install the CodeStory plugin once, then start a fresh agent thread for that
+workspace. The canonical skill package lives at
 [../plugins/codestory/skills/codestory-grounding/SKILL.md](../plugins/codestory/skills/codestory-grounding/SKILL.md).
 
 **Codex plugin installation flow:**
@@ -89,6 +107,7 @@ workspace you want to ground. The canonical skill package lives at
 **Direct CLI transcript (for setup, repair, or debugging):**
 
 ```sh
+codestory-cli agent preflight --project <target-workspace> --format json
 codestory-cli ready --goal local --repair --project <target-workspace> --format json
 codestory-cli ground --project <target-workspace> --why
 ```
