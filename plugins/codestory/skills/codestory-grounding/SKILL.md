@@ -142,18 +142,21 @@ behavior and [doctor](references/doctor.md) for health and repair evidence.
 
 ## Command Routing
 
-| Need | Route |
+Route by the situation where the agent is stuck. Do not run a generic command
+inventory when one status field or one graph target will answer the question.
+
+| Stuck situation | Route |
 | --- | --- |
-| Setup and health | `setup embeddings`, `doctor`, `ready`, `index`, `cache` |
-| Agent orientation | MCP `ground` / `codestory://grounding` or CLI `ground` |
-| Broad task packet | MCP/CLI `packet` |
-| Candidate discovery | MCP/CLI `search --why` |
-| Focused source view | `symbol`, `trail`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, `explore` |
-| Sidecar-backed evidence packet | `packet`, `search`, `context` |
-| Coverage and impact | MCP/CLI `files`, `affected` |
-| Reusable targets | `bookmark` |
-| Structured evaluation | `drill`, `drill-suite` |
-| Local integration surface | `serve --stdio` |
+| Orientation: "What is in this checkout?" | MCP `ground` / `codestory://grounding` or CLI `ground`; use `files` for language mix or incomplete coverage. |
+| Implementation start: "Where do I edit?" | `symbol` for a concrete feature/type, then `trail --story --hide-speculative` after a node is selected. |
+| Symbol impact: "What might this change touch?" | `affected` with changed files from git; treat output as review/test planning, not proof. |
+| Test choice: "Which verification is smallest?" | `affected`, nearby repo docs, and touched test names before broader test lanes. |
+| Source snippet: "Show me the relevant code." | `snippet --id <node-id> --function-body --lines <n>`; follow truncation guidance or read source directly if capped. |
+| Readiness: "Can I trust CodeStory now?" | `codestory://status` when MCP is live; CLI `agent preflight --project <target-workspace> --format json` when MCP is unavailable. |
+| Repair: "A surface is blocked." | `ready --goal local --repair` for local graph; `ready --goal agent --repair` for `packet`, `search`, or `context`; use `doctor` and `retrieval status` as proof after repair. |
+| Broad evidence: "I need a packet/search answer." | `packet`, `search`, or `context` only when that surface is allowed and `retrieval_mode=full`. |
+| Reusable target or structured evaluation | `bookmark` for repeated targets; `drill` / `drill-suite` for evaluation lanes. |
+| Local integration surface | `serve --stdio`. |
 
 Load the matching reference only when detailed flags, examples, or
 troubleshooting rules are needed:
