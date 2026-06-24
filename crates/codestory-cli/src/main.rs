@@ -1646,7 +1646,7 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    codestory_retrieval::bootstrap_sidecars_with_profile(
+    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_profile(
         Some(runtime.project_root.as_path()),
         &storage_scope,
         None,
@@ -1655,6 +1655,7 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
         codestory_retrieval::SidecarProfile::Agent,
     )
     .context("ready repair retrieval bootstrap")?;
+    ensure_ready_repair_embed_liveness(&bootstrap.infrastructure)?;
     codestory_retrieval::repair_project_qdrant_collection(
         &runtime.project_root,
         &runtime.storage_path,
@@ -1670,6 +1671,22 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
     codestory_retrieval::strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
         .context("ready repair final retrieval status")?;
     Ok(())
+}
+
+fn ensure_ready_repair_embed_liveness(
+    infrastructure: &codestory_retrieval::InfrastructureHealth,
+) -> Result<()> {
+    if infrastructure.embed_reachable {
+        return Ok(());
+    }
+    bail!(
+        "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; zoekt_reachable={} ({}); qdrant_reachable={} ({})",
+        infrastructure.embed_detail,
+        infrastructure.zoekt_reachable,
+        infrastructure.zoekt_detail,
+        infrastructure.qdrant_reachable,
+        infrastructure.qdrant_detail
+    )
 }
 
 const LOCAL_GRAPH_AGENT_SURFACES: &[&str] =
@@ -10534,6 +10551,28 @@ mod tests {
             eligible_for_sufficiency: None,
             score_breakdown: None,
         }
+    }
+
+    #[test]
+    fn ready_repair_embed_liveness_blocks_before_semantic_smoke() {
+        let infrastructure = codestory_retrieval::InfrastructureHealth {
+            zoekt_reachable: true,
+            qdrant_reachable: true,
+            embed_reachable: false,
+            zoekt_detail: "http 200".into(),
+            qdrant_detail: "http 200".into(),
+            embed_detail:
+                "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
+                    .into(),
+        };
+
+        let error = ensure_ready_repair_embed_liveness(&infrastructure)
+            .expect_err("unreachable embedding endpoint must stop ready repair");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("embedding sidecar liveness failed"));
+        assert!(message.contains("before mandatory Qdrant semantic smoke"));
+        assert!(message.contains("http://127.0.0.1:55280/v1/embeddings"));
     }
 
     #[test]
