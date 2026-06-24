@@ -769,14 +769,15 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         preflight["full_retrieval"]["status"], "repair_retrieval",
         "{preflight:#}"
     );
-    assert!(
-        preflight["safe_surfaces"]
-            .as_array()
-            .expect("safe surfaces")
-            .iter()
-            .any(|surface| surface == "ground"),
-        "local graph surfaces should be safe: {preflight:#}"
-    );
+    let safe_surfaces = preflight["safe_surfaces"]
+        .as_array()
+        .expect("safe surfaces");
+    for surface in ["ground", "callers", "callees", "trace"] {
+        assert!(
+            safe_surfaces.iter().any(|candidate| candidate == surface),
+            "local graph surface {surface} should be safe: {preflight:#}"
+        );
+    }
     assert!(
         preflight["blocked_surfaces"]
             .as_array()

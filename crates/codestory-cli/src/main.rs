@@ -1985,7 +1985,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         repair_ready_state(&runtime, cmd.goal)?;
     }
     let summary = runtime.open_project_summary()?;
-    let sidecar = doctor_sidecar_status(&runtime);
+    let sidecar = ready_sidecar_status(&runtime, cmd.goal, cmd.repair);
     let mut verdicts = build_summary_readiness(
         &summary.root,
         &summary.stats,
@@ -2087,8 +2087,9 @@ fn ensure_ready_repair_embed_liveness(
     )
 }
 
-const LOCAL_GRAPH_AGENT_SURFACES: &[&str] =
-    &["ground", "files", "symbol", "trail", "snippet", "affected"];
+const LOCAL_GRAPH_AGENT_SURFACES: &[&str] = &[
+    "ground", "files", "symbol", "callers", "callees", "trail", "trace", "snippet", "affected",
+];
 const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "context_full"];
 
 fn build_agent_preflight_output(
@@ -9468,40 +9469,7 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
         Some(&runtime.storage_path),
     ) {
         Ok(report) => {
-            let manifest_generation = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_generation.clone());
-            let manifest_input_hash = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.sidecar_input_hash.clone());
-            let precise_semantic_import_status = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.precise_semantic_import_status.clone());
-            let precise_semantic_import_reason = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.precise_semantic_import_reason.clone());
-            let precise_semantic_import_revision = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.precise_semantic_import_revision.clone());
-            let precise_semantic_import_producer = report
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
-            let status = DoctorSidecarStatusOutput {
-                retrieval_mode: report.retrieval_mode,
-                degraded_reason: report.degraded_reason,
-                manifest_generation,
-                manifest_input_hash,
-                precise_semantic_import_status,
-                precise_semantic_import_reason,
-                precise_semantic_import_revision,
-                precise_semantic_import_producer,
-            };
+            let status = doctor_sidecar_status_from_report(report);
             let handoff_failure = (status.retrieval_mode == "full")
                 .then(|| doctor_sidecar_profile_handoff_failure(runtime))
                 .flatten();
@@ -9517,6 +9485,83 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
             precise_semantic_import_revision: None,
             precise_semantic_import_producer: None,
         },
+    }
+}
+
+fn ready_sidecar_status(
+    runtime: &RuntimeContext,
+    goal: Option<args::ReadyGoal>,
+    repaired: bool,
+) -> DoctorSidecarStatusOutput {
+    if repaired && matches!(goal, None | Some(args::ReadyGoal::Agent)) {
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project(
+            &runtime.project_root,
+            codestory_retrieval::SidecarProfile::Agent,
+        );
+        return doctor_sidecar_status_for_runtime(runtime, sidecar);
+    }
+    doctor_sidecar_status(runtime)
+}
+
+fn doctor_sidecar_status_for_runtime(
+    runtime: &RuntimeContext,
+    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+) -> DoctorSidecarStatusOutput {
+    match codestory_retrieval::strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        sidecar,
+    ) {
+        Ok(report) => doctor_sidecar_status_from_report(report),
+        Err(error) => DoctorSidecarStatusOutput {
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            manifest_generation: None,
+            manifest_input_hash: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        },
+    }
+}
+
+fn doctor_sidecar_status_from_report(
+    report: codestory_retrieval::RetrievalStatusReport,
+) -> DoctorSidecarStatusOutput {
+    let manifest_generation = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_generation.clone());
+    let manifest_input_hash = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.sidecar_input_hash.clone());
+    let precise_semantic_import_status = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.precise_semantic_import_status.clone());
+    let precise_semantic_import_reason = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.precise_semantic_import_reason.clone());
+    let precise_semantic_import_revision = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.precise_semantic_import_revision.clone());
+    let precise_semantic_import_producer = report
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
+    DoctorSidecarStatusOutput {
+        retrieval_mode: report.retrieval_mode,
+        degraded_reason: report.degraded_reason,
+        manifest_generation,
+        manifest_input_hash,
+        precise_semantic_import_status,
+        precise_semantic_import_reason,
+        precise_semantic_import_revision,
+        precise_semantic_import_producer,
     }
 }
 
