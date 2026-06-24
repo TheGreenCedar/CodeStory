@@ -71,6 +71,19 @@ pub fn schedule_index(project_path: &str) -> usize {
     .expect("write runtime.rs");
 }
 
+fn write_docker_compose_fixture(root: &Path) {
+    let docker = root.join("docker");
+    fs::create_dir_all(&docker).expect("create docker dir");
+    fs::write(
+        docker.join("app-compose.yml"),
+        r#"services:
+  app:
+    image: tiny-browser-fixture:latest
+"#,
+    )
+    .expect("write docker compose");
+}
+
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
     command
@@ -1221,6 +1234,40 @@ fn app_controller_opens_project() {
     );
 
     search_dir_snapshot.assert_unchanged();
+}
+
+#[test]
+fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    write_docker_compose_fixture(workspace.path());
+    index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
+
+    let files = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["files", "--refresh", "none", "--format", "json"],
+    );
+
+    assert!(
+        files["summary"]["language_counts"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["language"] == "cargo_manifest"
+                        && item["support_mode"] == "structural_collector"
+                        && item["evidence_tier"] == "structural_only"
+                        && item["claim_label"] == "structural collector only"
+                }) && items.iter().any(|item| {
+                    item["language"] == "docker_compose"
+                        && item["support_mode"] == "structural_collector"
+                        && item["evidence_tier"] == "structural_only"
+                        && item["claim_label"] == "structural collector only"
+                })
+            }),
+        "files JSON should expose path-scoped structural support tiers for manifests and Compose: {files:#}"
+    );
 }
 
 struct SearchDirSnapshot {
