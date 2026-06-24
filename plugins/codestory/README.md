@@ -41,23 +41,26 @@ or non-code folders.
 
 The status resource is the contract. When MCP is live, read
 `codestory://status` first and obey `allowed_surfaces`. Treat
-`server_version` and `server_executable` from status as the active runtime
-evidence; source docs, marketplace cache contents, and local build outputs can
-all differ from the running server.
+`server_version`, `server_executable`, `server_executable_sha256`, and
+`plugin_runtime` from status as the active runtime evidence; source docs,
+marketplace cache contents, and local build outputs can all differ from the
+running server.
 
 | Status lane | Allows | Does not allow |
 | --- | --- | --- |
 | `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
-| `codestory://status` fields | Current `server_version`, `server_executable`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
+| `codestory://status` fields | Current `server_version`, `server_executable`, `server_executable_sha256`, `plugin_runtime`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
 
 ## How It Runs
 
 This package stays thin:
 
 - `.codex-plugin/plugin.json` describes the Codex plugin package.
-- `.mcp.json` launches `codestory-cli serve --stdio --refresh none` from the
-  agent host `PATH`.
+- `.mcp.json` launches `scripts/codestory-mcp.cjs`, which prefers a
+  checksummed plugin-managed CLI from plugin data, labels `CODESTORY_CLI` as a
+  local-dev override, and only falls back to `PATH` when no managed binary is
+  available.
 - `hooks/` keeps CodeStory ambient for host adapters that support lifecycle
   hooks: `SessionStart` attempts strict startup grounding and
   `UserPromptSubmit` attempts request-aware packet grounding.
@@ -99,7 +102,8 @@ rather than the terminal. Use the UI path when the CLI marketplace command is
 unavailable.
 
 Start a new Codex thread after installation or refresh. The installed package
-launches `codestory-cli serve --stdio --refresh none` from `PATH`.
+launches the managed MCP adapter, which then starts
+`codestory-cli serve --stdio --refresh none`.
 
 ### After install
 
@@ -118,8 +122,9 @@ If the host does not expose lifecycle hooks yet, use the explicit prompt:
 
 The first run should be agent-owned. The skill checks whether `codestory-cli` is
 live through MCP by reading `codestory://status`. If MCP is live, the agent uses
-`server_version`, `server_executable`, and `allowed_surfaces` from status
-instead of rechecking PATH or release metadata.
+`server_version`, `server_executable`, `server_executable_sha256`,
+`plugin_runtime`, and `allowed_surfaces` from status instead of rechecking PATH
+or release metadata.
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
 missing, status reports a suspect runtime, or you are debugging/repairing the
@@ -211,21 +216,22 @@ proof that `packet`, `search`, or `context` is ready.
 
 ### Agent runtime repair
 
-The plugin does not bundle the binary. The installed MCP runtime launches
-`codestory-cli serve --stdio --refresh none` from the agent host `PATH`. Once
-MCP is live, `codestory://status` is the runtime proof. Use
-`where.exe codestory-cli`, `codestory-cli --version`, and release repair checks
-only when MCP is missing or the status fields show stale binary drift.
+The plugin launches through `scripts/codestory-mcp.cjs`. That adapter prefers a
+checksummed CLI under plugin-managed data, labels `CODESTORY_CLI` as a
+local-dev override, and reports `path_fallback` if it had to use
+`codestory-cli` from `PATH`. Once MCP is live, `codestory://status` is the
+runtime proof. Use `where.exe codestory-cli`, `codestory-cli --version`, and
+release repair checks only when MCP is missing or status shows `path_fallback`
+or stale binary drift.
 
 If status reports `repair_setup`, the active CLI is older than the latest
 release. The agent runs the installer command from `recommended_next_calls`
 before using local navigation, packet, search, or context.
 If a running `codestory-cli serve --stdio --refresh none` process locks the old
-binary, install the current release into a versioned directory and put that
-directory before stale entries on `PATH`; verify the command that MCP will
-launch with `codestory-cli --version`. If `PATH` changed, mention restart only
-after the current binary is installed and verified; a Codex host/app restart may
-be needed before a fresh agent thread sees the new `PATH`.
+binary, install the current release into versioned managed storage or a
+versioned directory before stale `PATH` entries. A Codex host/app restart may be
+needed before a fresh agent thread sees the new launch choice; confirm with a
+fresh `codestory://status` readback.
 
 Use source fallback only when no release asset fits the host:
 
@@ -233,9 +239,9 @@ Use source fallback only when no release asset fits the host:
 cargo build --release -p codestory-cli
 ```
 
-Then put `target/release` on the agent host `PATH` for installed MCP runtime
-use. Set `CODESTORY_CLI` only for manual CLI fallback commands or source-build
-debugging; `.mcp.json` does not launch through that variable.
+Then set `CODESTORY_CLI` to the source-built binary for local-dev MCP testing or
+manual CLI fallback commands. Status labels this as `local_dev_override`; do
+not treat it as the installed managed runtime.
 
 Source docs, marketplace source checkout/cache, and the active installed MCP
 runtime can differ. Before claiming an installed behavior is live, verify the

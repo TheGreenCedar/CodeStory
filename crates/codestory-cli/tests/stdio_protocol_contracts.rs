@@ -1977,6 +1977,22 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should expose server_executable or an explicit warning: {status}"
     );
     assert!(
+        status["server_executable_sha256"]
+            .as_str()
+            .is_some_and(|sha256| sha256.len() == 64),
+        "status should expose the active server executable checksum: {status}"
+    );
+    assert_eq!(
+        status["runtime_boundary"]["restart_required_for_runtime_change"],
+        json!(true),
+        "status should make the MCP restart boundary explicit: {status}"
+    );
+    assert_eq!(
+        status["plugin_runtime"]["cli_source"],
+        json!("direct_cli_launch"),
+        "direct cargo stdio tests should label the non-plugin launch boundary: {status}"
+    );
+    assert!(
         status
             .get("project_root")
             .or_else(|| status.get("root"))

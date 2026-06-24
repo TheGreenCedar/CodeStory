@@ -16,6 +16,8 @@ use codestory_contracts::api::{
     TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
+use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2004,7 +2006,9 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "manifest_generation": manifest_generation.clone(),
         "manifest_input_hash": manifest_input_hash.clone(),
     });
-    let (server_executable, server_warnings) = stdio_server_executable_status();
+    let (server_executable, server_executable_sha256, server_warnings) =
+        stdio_server_executable_status();
+    let plugin_runtime = stdio_plugin_runtime_status();
     let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
@@ -2023,6 +2027,12 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "server_executable": server_executable,
+        "server_executable_sha256": server_executable_sha256,
+        "plugin_runtime": plugin_runtime,
+        "runtime_boundary": {
+            "restart_required_for_runtime_change": true,
+            "message": "A running MCP server keeps using the CLI process it was launched with; install, override, or PATH changes require a host reload/restart and a fresh codestory://status readback."
+        },
         "warnings": server_warnings,
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
@@ -2297,17 +2307,65 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     })
 }
 
-fn stdio_server_executable_status() -> (Option<String>, Vec<String>) {
+fn stdio_server_executable_status() -> (Option<String>, Option<String>, Vec<String>) {
     match std::env::current_exe() {
-        Ok(path) => (
-            Some(crate::display::clean_path_string(&path.to_string_lossy())),
-            Vec::new(),
-        ),
+        Ok(path) => {
+            let display = crate::display::clean_path_string(&path.to_string_lossy());
+            match sha256_file(&path) {
+                Ok(sha256) => (Some(display), Some(sha256), Vec::new()),
+                Err(error) => (
+                    Some(display),
+                    None,
+                    vec![format!("server_executable_checksum_unavailable: {error}")],
+                ),
+            }
+        }
         Err(error) => (
+            None,
             None,
             vec![format!("server_executable_unavailable: {error}")],
         ),
     }
+}
+
+fn stdio_plugin_runtime_status() -> serde_json::Value {
+    let cli_source = env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE")
+        .unwrap_or_else(|| "direct_cli_launch".to_string());
+    let warnings = env_nonempty("CODESTORY_PLUGIN_CLI_WARNINGS")
+        .map(|value| {
+            value
+                .split(';')
+                .filter(|item| !item.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
+        "cli_source": cli_source,
+        "cli_path": env_nonempty("CODESTORY_PLUGIN_CLI_PATH"),
+        "cli_sha256": env_nonempty("CODESTORY_PLUGIN_CLI_SHA256"),
+        "local_dev_override": cli_source == "local_dev_override",
+        "path_fallback": cli_source == "path_fallback",
+        "managed_binary_path": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_PATH") } else { None },
+        "managed_binary_sha256": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_SHA256") } else { None },
+        "managed_manifest_path": env_nonempty("CODESTORY_PLUGIN_CLI_MANIFEST_PATH"),
+        "warnings": warnings
+    })
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hash {}", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
