@@ -46,7 +46,7 @@ grounding, packet, or search call.
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
-| Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `ready --goal local --repair --project <target-workspace> --format json`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
+| Failure path | For HTTP serve, if serve reports missing index, run `doctor --project <target-workspace>` and `ready --goal local --repair --project <target-workspace> --format json`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. For `serve --stdio`, read `codestory://status`: missing index is reported as `repair_index` with repair commands instead of closing the MCP transport. | Distinguishes cache readiness from port conflicts and keeps MCP diagnostics fail-open. |
 | Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
 
 ## Stdio Runtime Contract
@@ -66,5 +66,6 @@ stale binary. If PATH changes during repair, start a fresh Codex host/app sessio
 
 - `serve` is local by default on `127.0.0.1`; do not bind wider unless the user explicitly needs remote access.
 - HTTP only accepts GET requests for the documented routes.
-- Start it after a successful index or with an intentional refresh mode.
+- HTTP serve starts after a successful index or with an intentional refresh mode.
+- `serve --stdio` may start without an index so MCP clients can read `codestory://status` and receive repair guidance.
 - In one `serve --stdio` process, identical successful `packet` and search-fragment requests are cached with small LRUs keyed by request arguments, the current SQLite/WAL fingerprint, and a mandatory sidecar-readiness fingerprint. The sidecar fingerprint includes the active embedding backend, sidecar state-file metadata, strict retrieval mode, degraded reason, manifest generation/input hash/backend/dimension, and status errors. This is for repeated agent calls only; changed index files, sidecar state drift, and strict stale/unavailable readiness bypass the cache.

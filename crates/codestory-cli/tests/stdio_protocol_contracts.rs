@@ -103,6 +103,20 @@ fn indexed_fixture() -> StdioFixture {
     indexed_fixture_with_embedding_mode(true)
 }
 
+fn unindexed_fixture() -> StdioFixture {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    StdioFixture {
+        workspace,
+        cache_dir,
+        hash_embeddings: true,
+        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        disable_installed_cli_probe: false,
+    }
+}
+
 fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
     let workspace = tempfile::tempdir().expect("workspace dir");
     let cache_dir = tempfile::tempdir().expect("cache dir");
@@ -2096,6 +2110,72 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .and_then(Value::as_array)
             .is_some_and(|calls| !calls.is_empty()),
         "status should include recommended next calls: {status}"
+    );
+}
+
+#[test]
+fn stdio_starts_without_index_and_reports_repair_status() {
+    let fixture = unindexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let init_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-unindexed",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    assert_success_envelope(&init_response, json!("init-unindexed"));
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-unindexed",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(&status_response, json!("status-unindexed"));
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_index",
+    );
+    assert!(
+        status["recommended_next_calls"]
+            .to_string()
+            .contains("codestory-cli ready --goal local --repair"),
+        "unindexed stdio status should recommend local index repair: {status}"
+    );
+
+    let ground_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-unindexed",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "balanced"}}
+        }),
+    );
+    let error = assert_tool_error(&ground_response, json!("ground-unindexed"));
+    assert_eq!(
+        error.pointer("/code").and_then(Value::as_str),
+        Some("codestory_tool_blocked")
+    );
+    assert_eq!(
+        error.pointer("/status").and_then(Value::as_str),
+        Some("repair_index")
     );
 }
 
