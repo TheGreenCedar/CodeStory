@@ -62,6 +62,7 @@ call.
 | `server_executable` / `server_executable_sha256` | Active MCP server executable path and checksum. Use them to diagnose stale runtime or binary drift. |
 | `sidecar_contract_version` | Active sidecar schema contract version compiled into the CLI. |
 | `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. Provisioned records include `build_source=github_release` and `repo_ref`. |
+| `sidecar_setup` | Plugin sidecar setup policy (`ask`, `enabled`, or `disabled`) plus last repair state and opt-in/disable commands. |
 | `runtime_boundary` | Restart/reload reminder for changes to the managed binary, override, or PATH. |
 | `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |

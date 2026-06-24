@@ -49,16 +49,26 @@ async function writeFakeCli(cliPath) {
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
-      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,args:process.argv.slice(1)}))" %*\r\n`,
+      `@echo off\r\n"${process.execPath}" -e "require('fs').writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))" %*\r\n`,
       "utf8",
     );
     return;
   }
   await writeFile(
     cliPath,
-    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,args:process.argv.slice(1)}))' "$@"\n`,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(process.env.TEST_OUT, JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args:process.argv.slice(1)}))' "$@"\n`,
     "utf8",
   );
+  await chmod(cliPath, 0o755);
+}
+
+async function writeRecordingCli(cliPath) {
+  const script = "const fs=require('fs');fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args:process.argv.slice(1)})+'\\n')";
+  if (process.platform === "win32") {
+    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`, "utf8");
+    return;
+  }
+  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`, "utf8");
   await chmod(cliPath, 0o755);
 }
 
@@ -155,7 +165,110 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.source, "managed");
     assert.equal(observed.path, cliPath);
     assert.equal(observed.sha256, sha256);
+    assert.equal(observed.sidecarPolicy, "ask");
+    assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
+    assert.match(observed.sidecarEnable, /--policy-file/u);
     assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none"]);
+
+    const enable = spawnSync(observed.sidecarEnable, {
+      shell: true,
+      env: {
+        ...process.env,
+        PLUGIN_DATA: "",
+        COPILOT_PLUGIN_DATA: "",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(enable.status, 0, enable.stderr);
+    const policy = JSON.parse(
+      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
+    );
+    assert.equal(policy.state, "enabled");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher persists sidecar setup policy in plugin data", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-policy-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+
+  try {
+    const enable = spawnSync(process.execPath, [launcher, "sidecar-policy", "enable"], {
+      env: { PLUGIN_DATA: dataDir },
+      encoding: "utf8",
+    });
+    assert.equal(enable.status, 0, enable.stderr);
+    assert.equal(JSON.parse(enable.stdout).state, "enabled");
+
+    const disable = spawnSync(process.execPath, [launcher, "sidecar-policy", "disable"], {
+      env: { PLUGIN_DATA: dataDir },
+      encoding: "utf8",
+    });
+    assert.equal(disable.status, 0, disable.stderr);
+    assert.equal(JSON.parse(disable.stdout).state, "disabled");
+
+    const policy = JSON.parse(
+      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
+    );
+    assert.equal(policy.state, "disabled");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("enabled sidecar policy schedules existing agent repair path", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
+  const logFile = join(dataDir, "calls.jsonl");
+  const cliDir = join(dataDir, "codestory-cli", "0.11.15");
+  const cliPath = join(
+    cliDir,
+    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+  );
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+
+  try {
+    await mkdir(cliDir, { recursive: true });
+    await writeRecordingCli(cliPath);
+    const sha256 = createHash("sha256")
+      .update(await readFile(cliPath))
+      .digest("hex");
+    await writeFile(
+      join(cliDir, "manifest.json"),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      "utf8",
+    );
+    await writeFile(
+      join(dataDir, "sidecar-setup-policy.json"),
+      JSON.stringify({ state: "enabled" }),
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: dataDir,
+        TEST_LOG: logFile,
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const text = await readFile(logFile, "utf8").catch(() => "");
+      const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+      if (calls.some((call) => call.repair)) {
+        assert.ok(calls.some((call) => call.args.includes("serve")), text);
+        const repair = calls.find((call) => call.repair);
+        assert.deepEqual(repair.args.slice(0, 4), ["ready", "--goal", "agent", "--repair"]);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.fail(`repair call was not recorded:\n${await readFile(logFile, "utf8").catch(() => "")}`);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -533,6 +646,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "server_executable_sha256",
     "sidecar_contract_version",
     "plugin_runtime",
+    "sidecar_setup",
     "build_source",
     "repo_ref",
     "allowed_surfaces",

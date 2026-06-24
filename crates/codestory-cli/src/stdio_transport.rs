@@ -2023,8 +2023,9 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             manifest_input_hash: manifest_input_hash.as_deref(),
         }),
     });
+    let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
-    let recommended_next_calls = stdio_status_recommended_next_calls(&readiness);
+    let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -2043,6 +2044,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         "retrieval_mode": sidecar_mode,
         "degraded_reason": degraded_reason,
         "sidecar_retrieval": sidecar,
+        "sidecar_setup": sidecar_setup,
         "legacy_semantic_diagnostics": {
             "mode": retrieval.map(|state| state.mode),
             "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
@@ -2234,8 +2236,64 @@ fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 
-fn stdio_status_recommended_next_calls(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+fn stdio_status_recommended_next_calls(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: &serde_json::Value,
+) -> serde_json::Value {
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
+        if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
+            match sidecar_setup
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ask")
+            {
+                "ask" => {
+                    return serde_json::json!([
+                        {
+                            "method": "host/confirm",
+                            "instruction": sidecar_setup["prompt"]
+                        },
+                        {
+                            "method": "cli",
+                            "command": sidecar_setup["enable_command"]
+                        },
+                        {
+                            "method": "cli",
+                            "command": sidecar_setup["disable_command"]
+                        },
+                        {
+                            "method": "resources/read",
+                            "uri": "codestory://status"
+                        },
+                        {
+                            "method": "resources/read",
+                            "uri": "codestory://agent-guide"
+                        }
+                    ]);
+                }
+                "disabled" => {
+                    return serde_json::json!([
+                        {
+                            "method": "host/instruction",
+                            "instruction": "Automatic sidecar setup is disabled for this plugin install."
+                        },
+                        {
+                            "method": "cli",
+                            "command": sidecar_setup["enable_command"]
+                        },
+                        {
+                            "method": "resources/read",
+                            "uri": "codestory://status"
+                        },
+                        {
+                            "method": "resources/read",
+                            "uri": "codestory://agent-guide"
+                        }
+                    ]);
+                }
+                _ => {}
+            }
+        }
         return serde_json::Value::Array(
             non_ready
                 .full_repair
@@ -2360,6 +2418,39 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         "managed_binary_sha256": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_SHA256") } else { None },
         "managed_manifest_path": env_nonempty("CODESTORY_PLUGIN_CLI_MANIFEST_PATH"),
         "warnings": warnings
+    })
+}
+
+pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Value {
+    let state = match env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE").as_deref() {
+        Some("enabled") => "enabled",
+        Some("disabled") => "disabled",
+        Some(_) => "ask",
+        None => "unmanaged",
+    };
+    let prompt_required = matches!(state, "ask");
+    let auto_repair = matches!(state, "enabled");
+    let project = crate::display::clean_path_string(&project_root.to_string_lossy());
+    let default_repair =
+        format!("codestory-cli ready --goal agent --repair --project \"{project}\" --format json");
+    let next_repair_command =
+        env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
+    serde_json::json!({
+        "state": state,
+        "auto_repair": auto_repair,
+        "prompt_required": prompt_required,
+        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. Enable automatic sidecar setup for this plugin install?") } else { None },
+        "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
+        "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
+        "next_repair_command": next_repair_command,
+        "policy_path": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH"),
+        "policy_updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT"),
+        "last_repair": {
+            "state": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE"),
+            "updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT"),
+            "project_root": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT"),
+            "command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND")
+        }
     })
 }
 
@@ -2733,17 +2824,20 @@ mod tests {
         let restart =
             "Restart/reload the Codex host/app so MCP relaunches codestory-cli 0.11.11 from C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe; then open a fresh agent thread and read codestory://status."
                 .to_string();
-        let calls = stdio_status_recommended_next_calls(&[ReadinessVerdictDto {
-            goal: ReadinessGoalDto::LocalNavigation,
-            status: ReadinessStatusDto::RepairSetup,
-            summary: "A newer installed codestory-cli exists outside the active process."
-                .to_string(),
-            minimum_next: vec![restart.clone()],
-            full_repair: vec![restart.clone()],
-            setup: None,
-            index: None,
-            sidecar: None,
-        }]);
+        let calls = stdio_status_recommended_next_calls(
+            &[ReadinessVerdictDto {
+                goal: ReadinessGoalDto::LocalNavigation,
+                status: ReadinessStatusDto::RepairSetup,
+                summary: "A newer installed codestory-cli exists outside the active process."
+                    .to_string(),
+                minimum_next: vec![restart.clone()],
+                full_repair: vec![restart.clone()],
+                setup: None,
+                index: None,
+                sidecar: None,
+            }],
+            &json!({"state": "enabled"}),
+        );
 
         assert_eq!(calls[0]["method"], json!("host/restart"));
         assert_eq!(calls[0]["instruction"], json!(restart));

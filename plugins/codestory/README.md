@@ -59,7 +59,7 @@ running server.
 | --- | --- | --- |
 | `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
-| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
+| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
 
 ## How It Runs
 
@@ -144,8 +144,9 @@ If the host does not expose lifecycle hooks yet, use the explicit prompt:
 The first run should be agent-owned. The skill checks whether `codestory-cli` is
 live through MCP by reading `codestory://status`. If MCP is live, the agent uses
 `server_version`, `cli_version`, `server_executable`,
-`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
-`allowed_surfaces` from status instead of rechecking PATH or release metadata.
+`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`,
+`sidecar_setup`, and `allowed_surfaces` from status instead of rechecking PATH
+or release metadata.
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
 missing, status reports a suspect runtime, or you are debugging/repairing the
