@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Phase 2 lexical shard pin (local index + optional Zoekt webserver).
 pub const ZOEKT_REAL_VERSION_PIN: &str = "zoekt-20250506123554";
@@ -27,6 +28,7 @@ pub const DEFAULT_EMBED_HTTP_PORT: u16 = 8080;
 
 pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
+static AGENT_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SidecarLayout {
@@ -80,6 +82,7 @@ pub struct SidecarOwnership {
 pub struct SidecarRuntimeConfig {
     pub layout: SidecarLayout,
     pub profile: SidecarProfile,
+    pub run_id: Option<String>,
     pub namespace: String,
     pub compose_project: String,
     pub embed_http_port: u16,
@@ -124,20 +127,35 @@ impl SidecarRuntimeConfig {
     }
 
     pub fn for_project_auto(project_root: &Path) -> Self {
+        let env_run_id = env_agent_run_id();
+        let latest_run_id = env_run_id
+            .is_none()
+            .then(|| latest_agent_run_id(project_root))
+            .flatten();
         let profile = if env_profile() == Some(SidecarProfile::Agent)
-            || agent_state_file(project_root).is_file()
+            || latest_run_id.is_some()
             || running_in_ci_agent()
         {
             SidecarProfile::Agent
         } else {
             SidecarProfile::Local
         };
-        Self::for_project_profile(Some(project_root), profile)
+        let run_id = env_run_id.or(latest_run_id);
+        Self::for_project_profile_with_run_id(Some(project_root), profile, run_id.as_deref())
     }
 
     pub fn for_project_profile(project_root: Option<&Path>, profile: SidecarProfile) -> Self {
+        Self::for_project_profile_with_run_id(project_root, profile, None)
+    }
+
+    pub fn for_project_profile_with_run_id(
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+    ) -> Self {
         let base = user_cache_root();
-        let namespace = namespace_for(project_root, profile);
+        let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id));
+        let namespace = namespace_for(project_root, profile, run_id.as_deref());
         let state_file = match profile {
             SidecarProfile::Local => base.join("retrieval-sidecars.json"),
             SidecarProfile::Agent => base
@@ -151,7 +169,7 @@ impl SidecarRuntimeConfig {
             .or_else(|| stored.as_ref().map(|ports| ports.zoekt_http))
             .unwrap_or_else(|| {
                 if dynamic {
-                    free_local_port()
+                    dynamic_agent_port(&namespace, "zoekt")
                 } else {
                     DEFAULT_ZOEKT_HTTP_PORT
                 }
@@ -160,7 +178,7 @@ impl SidecarRuntimeConfig {
             .or_else(|| stored.as_ref().map(|ports| ports.qdrant_http))
             .unwrap_or_else(|| {
                 if dynamic {
-                    free_local_port()
+                    dynamic_agent_port(&namespace, "qdrant-http")
                 } else {
                     DEFAULT_QDRANT_HTTP_PORT
                 }
@@ -169,7 +187,7 @@ impl SidecarRuntimeConfig {
             .or_else(|| stored.as_ref().map(|ports| ports.qdrant_grpc))
             .unwrap_or_else(|| {
                 if dynamic {
-                    free_local_port()
+                    dynamic_agent_port(&namespace, "qdrant-grpc")
                 } else {
                     DEFAULT_QDRANT_GRPC_PORT
                 }
@@ -178,7 +196,7 @@ impl SidecarRuntimeConfig {
             .or_else(|| stored.as_ref().map(|ports| ports.embed_http))
             .unwrap_or_else(|| {
                 if dynamic {
-                    free_local_port()
+                    dynamic_agent_port(&namespace, "embed")
                 } else {
                     DEFAULT_EMBED_HTTP_PORT
                 }
@@ -197,13 +215,7 @@ impl SidecarRuntimeConfig {
             state_file: state_file.clone(),
         };
         let cleanup_command = project_root
-            .map(|path| {
-                format!(
-                    "codestory-cli retrieval down --project {} --profile {}",
-                    quote_command_path(path),
-                    profile.as_str()
-                )
-            })
+            .map(|path| retrieval_command("down", path, profile, run_id.as_deref(), None))
             .unwrap_or_else(|| "codestory-cli retrieval down".to_string());
         let mut labels = BTreeMap::new();
         labels.insert("dev.codestory.owner".into(), "codestory".into());
@@ -212,6 +224,7 @@ impl SidecarRuntimeConfig {
         Self {
             layout,
             profile,
+            run_id,
             namespace: namespace.clone(),
             compose_project: namespace,
             embed_http_port,
@@ -285,6 +298,14 @@ pub fn sidecar_runtime_for_project(
     SidecarRuntimeConfig::for_project_profile(Some(project_root), profile)
 }
 
+pub fn sidecar_runtime_for_project_with_run_id(
+    project_root: &Path,
+    profile: SidecarProfile,
+    run_id: Option<&str>,
+) -> SidecarRuntimeConfig {
+    SidecarRuntimeConfig::for_project_profile_with_run_id(Some(project_root), profile, run_id)
+}
+
 pub fn sidecar_runtime_auto(project_root: &Path) -> SidecarRuntimeConfig {
     SidecarRuntimeConfig::for_project_auto(project_root)
 }
@@ -300,6 +321,13 @@ fn env_profile() -> Option<SidecarProfile> {
         })
 }
 
+fn env_agent_run_id() -> Option<String> {
+    std::env::var("CODESTORY_SIDECAR_RUN_ID")
+        .ok()
+        .or_else(|| std::env::var("CODESTORY_AGENT_RUN_ID").ok())
+        .and_then(|value| normalized_label_component(&value))
+}
+
 fn running_in_ci_agent() -> bool {
     env_flag("CODESTORY_AGENT", false)
         || env_flag("CODESTORY_AGENT_RUN", false)
@@ -307,24 +335,110 @@ fn running_in_ci_agent() -> bool {
         || env_flag("GITHUB_ACTIONS", false)
 }
 
-fn namespace_for(project_root: Option<&Path>, profile: SidecarProfile) -> String {
+fn namespace_for(
+    project_root: Option<&Path>,
+    profile: SidecarProfile,
+    run_id: Option<&str>,
+) -> String {
     match (profile, project_root) {
         (SidecarProfile::Local, _) => "codestory".into(),
         (SidecarProfile::Agent, Some(path)) => {
             format!(
-                "codestory-agent-{}",
-                fnv1a_hex(path.to_string_lossy().as_bytes())
+                "codestory-agent-{}-{}",
+                project_hash(path),
+                run_id.unwrap_or("run")
             )
         }
-        (SidecarProfile::Agent, None) => format!("codestory-agent-{}", std::process::id()),
+        (SidecarProfile::Agent, None) => format!(
+            "codestory-agent-{}-{}",
+            std::process::id(),
+            run_id.unwrap_or("run")
+        ),
     }
 }
 
-fn agent_state_file(project_root: &Path) -> PathBuf {
-    user_cache_root()
-        .join("sidecars")
-        .join(namespace_for(Some(project_root), SidecarProfile::Agent))
-        .join("retrieval-sidecars.json")
+fn project_hash(project_root: &Path) -> String {
+    fnv1a_hex(project_root.to_string_lossy().as_bytes())
+}
+
+fn agent_namespace_prefix(project_root: &Path) -> String {
+    format!("codestory-agent-{}-", project_hash(project_root))
+}
+
+fn latest_agent_run_id(project_root: &Path) -> Option<String> {
+    let prefix = agent_namespace_prefix(project_root);
+    let sidecars_root = user_cache_root().join("sidecars");
+    let entries = std::fs::read_dir(sidecars_root).ok()?;
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let namespace = entry.file_name().to_string_lossy().to_string();
+        let Some(run_id) = namespace
+            .strip_prefix(&prefix)
+            .and_then(normalized_label_component)
+        else {
+            continue;
+        };
+        let state_file = entry.path().join("retrieval-sidecars.json");
+        if !state_file.is_file() {
+            continue;
+        }
+        let modified = state_file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest
+            .as_ref()
+            .is_none_or(|(current, _)| modified > *current)
+        {
+            newest = Some((modified, run_id));
+        }
+    }
+    newest.map(|(_, run_id)| run_id)
+}
+
+fn agent_run_id(explicit: Option<&str>) -> String {
+    explicit
+        .and_then(normalized_label_component)
+        .or_else(env_agent_run_id)
+        .unwrap_or_else(default_agent_run_id)
+}
+
+fn default_agent_run_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = AGENT_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos:x}-{counter:x}", std::process::id())
+}
+
+fn normalized_label_component(value: &str) -> Option<String> {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_dash = false;
+    for ch in value.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        normalized.push(next);
+    }
+    let normalized = normalized.trim_matches('-').to_string();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
@@ -347,6 +461,23 @@ fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     })
 }
 
+fn dynamic_agent_port(namespace: &str, salt: &str) -> u16 {
+    let seed = fnv1a_hex(format!("{namespace}:{salt}").as_bytes());
+    let parsed = u64::from_str_radix(&seed, 16).unwrap_or(0);
+    let base = 20_000 + u16::try_from(parsed % 40_000).unwrap_or(0);
+    for offset in 0..1000 {
+        let port = 20_000 + ((u32::from(base - 20_000) + offset) % 40_000) as u16;
+        if local_port_available(port) {
+            return port;
+        }
+    }
+    free_local_port()
+}
+
+fn local_port_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 fn free_local_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr())
@@ -365,6 +496,31 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
 
 fn quote_command_path(path: &Path) -> String {
     format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
+}
+
+pub fn retrieval_command(
+    action: &str,
+    project_root: &Path,
+    profile: SidecarProfile,
+    run_id: Option<&str>,
+    extra_args: Option<&str>,
+) -> String {
+    let mut command = format!(
+        "codestory-cli retrieval {action} --project {}",
+        quote_command_path(project_root)
+    );
+    if profile == SidecarProfile::Agent {
+        command.push_str(" --profile agent");
+        if let Some(run_id) = run_id.and_then(normalized_label_component) {
+            command.push_str(" --run-id ");
+            command.push_str(&run_id);
+        }
+    }
+    if let Some(extra_args) = extra_args {
+        command.push(' ');
+        command.push_str(extra_args);
+    }
+    command
 }
 
 pub fn user_cache_root() -> PathBuf {
@@ -427,4 +583,61 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn agent_profile_default_runtime_isolates_same_project_runs() {
+        let project = tempdir().expect("project");
+
+        let first =
+            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+        let second =
+            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+
+        assert_ne!(first.run_id, second.run_id);
+        assert_ne!(first.namespace, second.namespace);
+        assert_ne!(first.layout.state_file, second.layout.state_file);
+        assert_ne!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
+        assert_ne!(
+            first.layout.qdrant_http_port,
+            second.layout.qdrant_http_port
+        );
+        assert_ne!(
+            first.layout.qdrant_grpc_port,
+            second.layout.qdrant_grpc_port
+        );
+        assert_ne!(first.embed_http_port, second.embed_http_port);
+    }
+
+    #[test]
+    fn agent_profile_run_id_reuses_namespace_state_and_ports() {
+        let project = tempdir().expect("project");
+
+        let first = SidecarRuntimeConfig::for_project_profile_with_run_id(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("review-fix"),
+        );
+        let second = SidecarRuntimeConfig::for_project_profile_with_run_id(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("review-fix"),
+        );
+
+        assert_eq!(first.run_id.as_deref(), Some("review-fix"));
+        assert_eq!(first.namespace, second.namespace);
+        assert_eq!(first.layout.state_file, second.layout.state_file);
+        assert_eq!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
+        assert_eq!(
+            first.layout.qdrant_http_port,
+            second.layout.qdrant_http_port
+        );
+        assert!(first.cleanup_command.contains("--profile agent"));
+        assert!(first.cleanup_command.contains("--run-id review-fix"));
+    }
 }

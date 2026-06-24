@@ -5,8 +5,8 @@ use std::time::Duration;
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    bootstrap_sidecars_with_profile, execute_retrieval_query, sidecar_down_for_project,
-    sidecar_up_with_runtime, strict_sidecar_status,
+    bootstrap_sidecars_with_runtime, execute_retrieval_query, sidecar_down_for_runtime,
+    sidecar_up_with_runtime, strict_sidecar_status, strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
@@ -36,22 +36,33 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    let report = bootstrap_sidecars_with_profile(
+    let sidecar_profile = cmd.profile;
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        sidecar_profile.into(),
+        cmd.run_id.as_deref(),
+    );
+    let report = bootstrap_sidecars_with_runtime(
+        &sidecar,
         Some(&runtime.project_root),
         &storage_scope,
         cmd.compose_file.as_deref(),
         cmd.skip_compose,
         Duration::from_secs(cmd.wait_secs),
-        cmd.profile.into(),
     )
     .context("retrieval bootstrap")?;
+    activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
     let project_qdrant_repair = codestory_retrieval::repair_project_qdrant_collection(
         &runtime.project_root,
         &runtime.storage_path,
     )
     .context("retrieval project qdrant repair")?;
-    let status = strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
-        .context("retrieval status after bootstrap")?;
+    let status = strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        sidecar,
+    )
+    .context("retrieval status after bootstrap")?;
     emit_retrieval_bootstrap(
         cmd.format,
         &report,
@@ -63,8 +74,11 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
 
 fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar =
-        codestory_retrieval::sidecar_runtime_for_project(&runtime.project_root, cmd.profile.into());
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        cmd.profile.into(),
+        cmd.run_id.as_deref(),
+    );
     let state = sidecar_up_with_runtime(&sidecar, None).context("retrieval up")?;
     println!("{}", serde_json::to_string_pretty(&state)?);
     Ok(())
@@ -72,8 +86,12 @@ fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
 
 fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    sidecar_down_for_project(&runtime.project_root, cmd.profile.into())
-        .context("retrieval down")?;
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        cmd.profile.into(),
+        cmd.run_id.as_deref(),
+    );
+    sidecar_down_for_runtime(&sidecar).context("retrieval down")?;
     println!("retrieval sidecar state cleared");
     Ok(())
 }
@@ -82,10 +100,15 @@ fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let report = if let Some(profile) = cmd.profile {
-        codestory_retrieval::strict_sidecar_status_for_profile(
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            &runtime.project_root,
+            profile.into(),
+            cmd.run_id.as_deref(),
+        );
+        codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
-            profile.into(),
+            sidecar,
         )
     } else {
         strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
@@ -110,6 +133,7 @@ fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
 
 fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
+    activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
@@ -126,6 +150,29 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
             .context("retrieval index finalize after semantic-doc contract repair")
     })?;
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
+}
+
+fn activate_retrieval_profile_env(
+    profile: Option<crate::args::CliSidecarProfile>,
+    run_id: Option<&str>,
+) {
+    if let Some(profile) = profile {
+        let profile = match profile {
+            crate::args::CliSidecarProfile::Local => "local",
+            crate::args::CliSidecarProfile::Agent => "agent",
+        };
+        // SAFETY: retrieval CLI commands are short-lived processes and set this before sidecar
+        // layout resolution or worker threads are started.
+        unsafe {
+            std::env::set_var("CODESTORY_RETRIEVAL_PROFILE", profile);
+        }
+    }
+    if let Some(run_id) = run_id {
+        // SAFETY: see the profile environment setup above.
+        unsafe {
+            std::env::set_var("CODESTORY_SIDECAR_RUN_ID", run_id);
+        }
+    }
 }
 
 fn run_retrieval_index_refresh(

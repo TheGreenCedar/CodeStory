@@ -193,6 +193,8 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
             cache_arg,
             "--profile",
             "agent",
+            "--run-id",
+            "contract-a",
             "--skip-compose",
             "--wait-secs",
             "0",
@@ -205,6 +207,11 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
     assert_eq!(state["profile"].as_str(), Some("agent"));
     let namespace = state["namespace"].as_str().expect("namespace");
     assert!(namespace.starts_with("codestory-agent-"));
+    assert!(
+        namespace.ends_with("-contract-a"),
+        "agent namespace should carry the run id: {namespace}"
+    );
+    assert_eq!(state["run_id"].as_str(), Some("contract-a"));
     assert!(
         state["zoekt_http_port"]
             .as_u64()
@@ -242,6 +249,8 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
             cache_arg,
             "--profile",
             "agent",
+            "--run-id",
+            "contract-a",
             "--format",
             "json",
         ],
@@ -259,11 +268,64 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
 
     run_down(
         project.path(),
-        &["--cache-dir", cache_arg, "--profile", "agent"],
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--profile",
+            "agent",
+            "--run-id",
+            "contract-a",
+        ],
     );
     assert!(
         !state_path.exists(),
         "down should remove only the owned state file"
+    );
+}
+
+#[test]
+fn agent_profile_status_repair_hints_are_profile_aware() {
+    let project = tempdir().expect("project");
+    fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    let cache = tempdir().expect("cache");
+    let cache_arg = cache.path().to_str().expect("utf8 cache");
+
+    let status = run_status(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--profile",
+            "agent",
+            "--run-id",
+            "repair-a",
+            "--format",
+            "json",
+        ],
+    );
+
+    let repair = &status["repair"];
+    assert_eq!(
+        repair["reason"].as_str(),
+        Some("retrieval_manifest_missing")
+    );
+    assert!(
+        repair["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile agent")
+                && command.contains("--run-id repair-a")),
+        "agent status repair command should keep the profile/run id: {status}"
+    );
+    let full_repair = repair["full_repair"]
+        .as_array()
+        .expect("full repair commands");
+    assert!(
+        full_repair
+            .iter()
+            .all(|command| command.as_str().is_some_and(
+                |text| text.contains("--profile agent") && text.contains("--run-id repair-a")
+            )),
+        "agent full repair commands should keep the profile/run id: {status}"
     );
 }
 

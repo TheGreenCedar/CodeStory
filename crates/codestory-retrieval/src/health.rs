@@ -1,7 +1,7 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
-    QDRANT_HEALTH_BUDGET, SidecarLayout, SidecarOwnership, ZOEKT_HEALTH_BUDGET,
-    qdrant_semantic_vectors_enabled,
+    QDRANT_HEALTH_BUDGET, SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig,
+    ZOEKT_HEALTH_BUDGET, qdrant_semantic_vectors_enabled, retrieval_command,
 };
 use crate::embeddings::manifest_embedding_backend_is_product;
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
@@ -113,6 +113,7 @@ pub fn attach_manifest_contract(
 pub fn attach_repair_hint(
     mut report: RetrievalStatusReport,
     project_root: &Path,
+    runtime: Option<&SidecarRuntimeConfig>,
 ) -> RetrievalStatusReport {
     if report.retrieval_mode == "full" {
         return report;
@@ -123,11 +124,32 @@ pub fn attach_repair_hint(
             .as_deref()
             .unwrap_or("sidecar_retrieval_not_full"),
     );
-    let project = quote_command_path(project_root);
+    let profile = runtime
+        .map(|runtime| runtime.profile)
+        .unwrap_or(SidecarProfile::Local);
+    let run_id = runtime.and_then(|runtime| runtime.run_id.as_deref());
     let full_repair = vec![
-        format!("codestory-cli retrieval bootstrap --project {project} --format json"),
-        format!("codestory-cli retrieval index --project {project} --refresh full --format json"),
-        format!("codestory-cli retrieval status --project {project} --format json"),
+        retrieval_command(
+            "bootstrap",
+            project_root,
+            profile,
+            run_id,
+            Some("--format json"),
+        ),
+        retrieval_command(
+            "index",
+            project_root,
+            profile,
+            run_id,
+            Some("--refresh full --format json"),
+        ),
+        retrieval_command(
+            "status",
+            project_root,
+            profile,
+            run_id,
+            Some("--format json"),
+        ),
     ];
     report.repair = Some(RetrievalRepairHint {
         reason,
@@ -145,10 +167,6 @@ fn repair_reason_code(degraded_reason: &str) -> String {
         return "sidecar_manifest_stale".into();
     }
     degraded_reason.to_string()
-}
-
-fn quote_command_path(path: &Path) -> String {
-    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
 }
 
 fn manifest_contract_report(
@@ -606,6 +624,7 @@ mod tests {
         let report = attach_repair_hint(
             unavailable_status_report("retrieval_manifest_missing", None),
             Path::new("C:/repo with spaces"),
+            None,
         );
         let repair = report.repair.expect("repair hint");
 
@@ -634,6 +653,7 @@ mod tests {
         let report = attach_repair_hint(
             unavailable_status_report(detailed, None),
             Path::new("C:/repo"),
+            None,
         );
         let repair = report.repair.expect("repair hint");
 

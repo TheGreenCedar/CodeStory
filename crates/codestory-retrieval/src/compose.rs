@@ -53,6 +53,24 @@ pub fn bootstrap_sidecars_with_profile(
     profile: SidecarProfile,
 ) -> Result<BootstrapReport> {
     let runtime = SidecarRuntimeConfig::for_project_profile(repo_root, profile);
+    bootstrap_sidecars_with_runtime(
+        &runtime,
+        repo_root,
+        storage_scope,
+        compose_file,
+        skip_compose,
+        wait_timeout,
+    )
+}
+
+pub fn bootstrap_sidecars_with_runtime(
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+    storage_scope: &BootstrapStorageScope,
+    compose_file: Option<&Path>,
+    skip_compose: bool,
+    wait_timeout: Duration,
+) -> Result<BootstrapReport> {
     let layout = runtime.layout.clone();
     runtime.activate_embed_url_default();
     layout.ensure_data_dirs()?;
@@ -66,13 +84,13 @@ pub fn bootstrap_sidecars_with_profile(
     };
 
     let compose_started = if let Some(path) = resolved_compose.as_ref() {
-        docker_compose_up(path, repo_root, &runtime)?;
+        docker_compose_up(path, repo_root, runtime)?;
         true
     } else {
         false
     };
 
-    let state = sidecar_up_with_runtime(&runtime, resolved_compose.as_deref())?;
+    let state = sidecar_up_with_runtime(runtime, resolved_compose.as_deref())?;
     let infrastructure = if wait_timeout.is_zero() {
         probe_infrastructure_health(&layout)
     } else {

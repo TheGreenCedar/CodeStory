@@ -641,6 +641,12 @@ pub(crate) struct RetrievalSidecarStateCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
     pub(crate) profile: CliSidecarProfile,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for status or cleanup. If omitted, agent profile creates a fresh run namespace."
+    )]
+    pub(crate) run_id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -667,6 +673,12 @@ pub(crate) struct RetrievalBootstrapCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
     pub(crate) profile: CliSidecarProfile,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for status or cleanup. If omitted, agent profile creates a fresh run namespace."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(
         long,
         help = "Skip docker compose even when Docker is installed (dirs + state file only)."
@@ -697,6 +709,12 @@ pub(crate) struct RetrievalStatusCommand {
     pub(crate) project: ProjectArgs,
     #[arg(long, value_enum)]
     pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to inspect. If omitted, agent profile creates a fresh status namespace."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -707,6 +725,14 @@ pub(crate) struct RetrievalStatusCommand {
 pub(crate) struct RetrievalIndexCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse while finalizing sidecar artifacts."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_enum, default_value_t = RefreshMode::Auto, help = INDEX_REFRESH_HELP)]
     pub(crate) refresh: RefreshMode,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]

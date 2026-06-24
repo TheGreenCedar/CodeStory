@@ -33,6 +33,8 @@ pub struct SidecarStateFile {
     pub namespace: String,
     #[serde(default = "default_sidecar_namespace")]
     pub compose_project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub zoekt_http_port: u16,
     pub qdrant_http_port: u16,
     pub qdrant_grpc_port: u16,
@@ -65,6 +67,7 @@ pub fn sidecar_up_with_runtime(
         profile: runtime.profile.as_str().into(),
         namespace: runtime.namespace.clone(),
         compose_project: runtime.compose_project.clone(),
+        run_id: runtime.run_id.clone(),
         zoekt_http_port: layout.zoekt_http_port,
         qdrant_http_port: layout.qdrant_http_port,
         qdrant_grpc_port: layout.qdrant_grpc_port,
@@ -133,12 +136,19 @@ pub fn strict_sidecar_status_for_profile(
     storage_path: Option<&Path>,
     profile: SidecarProfile,
 ) -> Result<RetrievalStatusReport> {
-    sidecar_status_inner_with_runtime(
+    strict_sidecar_status_for_runtime(
         project_root,
         storage_path,
-        true,
         sidecar_runtime_for_project(project_root, profile),
     )
+}
+
+pub fn strict_sidecar_status_for_runtime(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    runtime: SidecarRuntimeConfig,
+) -> Result<RetrievalStatusReport> {
+    sidecar_status_inner_with_runtime(project_root, storage_path, true, runtime)
 }
 
 fn sidecar_status_inner(
@@ -186,6 +196,7 @@ fn sidecar_status_inner_with_runtime(
                             project_root,
                         ),
                         project_root,
+                        Some(&runtime),
                     ),
                     &storage,
                 ),
@@ -206,6 +217,7 @@ fn sidecar_status_inner_with_runtime(
                             project_root,
                         ),
                         project_root,
+                        Some(&runtime),
                     ),
                     &storage,
                 ),
@@ -215,7 +227,11 @@ fn sidecar_status_inner_with_runtime(
         let report = probe_sidecar_health(&layout, &project_id, manifest);
         return Ok(attach_status_ownership(
             enrich_status_with_semantic_doc_stats(
-                attach_repair_hint(attach_manifest_contract(report, project_root), project_root),
+                attach_repair_hint(
+                    attach_manifest_contract(report, project_root),
+                    project_root,
+                    Some(&runtime),
+                ),
                 &storage,
             ),
             &runtime,
@@ -230,6 +246,7 @@ fn sidecar_status_inner_with_runtime(
                 project_root,
             ),
             project_root,
+            Some(&runtime),
         ),
         &runtime,
     ))
