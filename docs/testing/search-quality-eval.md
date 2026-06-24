@@ -48,8 +48,8 @@ requires `retrieval_mode=full` agent sidecars for the checkout:
 cargo test -p codestory-cli --test packet_search_eval -- --ignored --nocapture packet_search_eval_live_runs_production_cli_path
 ```
 
-Rows where readiness or retrieval mode is not `full` stay diagnostic and do not
-count toward the full-retrieval baseline.
+Rows where readiness is not `ready` or retrieval mode is not `full` stay
+diagnostic and do not count toward the full-retrieval baseline.
 
 ## When To Run
 

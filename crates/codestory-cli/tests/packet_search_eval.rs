@@ -363,18 +363,18 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             readiness_mode: "ready".to_string(),
             retrieval_mode: "full".to_string(),
             ranked_files: vec![
-                "crates/codestory-retrieval/src/mode.rs".to_string(),
-                "crates/codestory-retrieval/src/executor.rs".to_string(),
+                "crates/codestory-retrieval/src/sidecar_search.rs".to_string(),
+                "crates/codestory-retrieval/src/lib.rs".to_string(),
             ],
             ranked_symbols: vec![
-                "RetrievalDegradedMode::Full".to_string(),
-                "QueryTrace".to_string(),
+                "LiveSidecarSearch::qdrant_search".to_string(),
+                "LiveSidecarSearch::layout".to_string(),
             ],
-            packet_text: "append_search_evidence_packet cites TrackingSidecars::qdrant_search"
+            packet_text: "LiveSidecarSearch::qdrant_search is defined in sidecar_search"
                 .to_string(),
             anchor_offsets: BTreeMap::from([
-                ("append_search_evidence_packet".to_string(), 10),
-                ("TrackingSidecars::qdrant_search".to_string(), 52),
+                ("LiveSidecarSearch::qdrant_search".to_string(), 10),
+                ("sidecar_search".to_string(), 52),
             ]),
         },
         EvalRun {
