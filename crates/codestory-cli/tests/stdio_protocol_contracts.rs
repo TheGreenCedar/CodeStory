@@ -1986,6 +1986,17 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should identify the active CLI version: {status}"
     );
     assert!(
+        status["source_checkout_version"].is_null()
+            || status["source_checkout_version"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty()),
+        "status should distinguish source checkout version from active runtime version: {status}"
+    );
+    assert!(
+        status["path_candidates"].is_array(),
+        "status should report competing PATH candidates even when none are present: {status}"
+    );
+    assert!(
         status["sidecar_contract_version"].is_number(),
         "status should expose the sidecar contract version: {status}"
     );

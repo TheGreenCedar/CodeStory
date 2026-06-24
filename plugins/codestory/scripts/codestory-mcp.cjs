@@ -374,9 +374,10 @@ async function resolveCli() {
   }
 
   warnings.push('managed_cli_unavailable_using_path_fallback');
+  const pathFallback = pathCliCandidates()[0] || 'codestory-cli';
   return {
     source: 'path_fallback',
-    path: 'codestory-cli',
+    path: pathFallback,
     sha256: null,
     version,
     cliVersion: null,
@@ -512,6 +513,11 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   const projectRoot = process.cwd();
+  const pathCandidates = pathCliCandidates().map((candidate) => ({
+    path: candidate,
+    version: cliVersion(candidate),
+    active: samePathText(candidate, resolved.path),
+  }));
   const minimumNext = options.minimumNext || [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
     process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
@@ -587,6 +593,8 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     cli_version: probe.version,
     server_executable: null,
     server_executable_sha256: null,
+    source_checkout_version: sourceCheckoutVersion(projectRoot),
+    path_candidates: pathCandidates,
     sidecar_contract_version: null,
     plugin_runtime: plugin,
     runtime_boundary: {
@@ -608,6 +616,75 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   };
 }
 
+function pathCliCandidates() {
+  const pathValue = process.env.PATH || '';
+  const candidates = [];
+  for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
+    for (const name of cliBinaryNames()) {
+      const candidate = path.join(directory, name);
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        candidates.push(candidate);
+      }
+    }
+  }
+  return dedupePaths(candidates);
+}
+
+function cliBinaryNames() {
+  return process.platform === 'win32'
+    ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli.bat', 'codestory-cli']
+    : ['codestory-cli'];
+}
+
+function cliVersion(candidate) {
+  const result = spawnSync(candidate, ['--version'], {
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(candidate),
+    timeout: 3000,
+    windowsHide: true,
+  });
+  if (result.status !== 0 || result.error) return null;
+  return normalizeVersion(`${result.stdout || ''}\n${result.stderr || ''}`);
+}
+
+function samePathText(left, right) {
+  const normalize = (value) => String(value || '').replace(/[\\/]+$/u, '').toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
+function dedupePaths(paths) {
+  const deduped = [];
+  for (const candidate of paths) {
+    if (!deduped.some((seen) => samePathText(seen, candidate))) {
+      deduped.push(candidate);
+    }
+  }
+  return deduped;
+}
+
+function sourceCheckoutVersion(projectRoot) {
+  try {
+    return cargoPackageVersion(fs.readFileSync(path.join(projectRoot, 'crates', 'codestory-cli', 'Cargo.toml'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function cargoPackageVersion(manifest) {
+  let inPackage = false;
+  for (const line of manifest.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (/^\[[^\]]+\]$/u.test(trimmed)) {
+      inPackage = trimmed === '[package]';
+      continue;
+    }
+    if (!inPackage) continue;
+    const match = trimmed.match(/^version\s*=\s*"([^"]+)"/u);
+    if (match) return match[1];
+  }
+  return null;
+}
+
 function diagnosticText(status) {
   const setup = status.readiness[0].setup;
   return [
@@ -618,6 +695,8 @@ function diagnosticText(status) {
     `cli_source: ${status.plugin_runtime.cli_source}`,
     `cli_path: ${setup.active_path}`,
     `cli_version: ${setup.active_version || '<unknown>'}`,
+    `source_checkout_version: ${status.source_checkout_version || '<none>'}`,
+    `path_candidates: ${(status.path_candidates || []).map((candidate) => `${candidate.path}@${candidate.version || '<unknown>'}`).join(', ') || '<none>'}`,
     `next: ${status.readiness[0].minimum_next[0]}`,
   ].join('\n');
 }

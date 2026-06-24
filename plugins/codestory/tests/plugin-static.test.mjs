@@ -204,7 +204,17 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
 test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
+  const sourceVersion = readCargoVersion(await readFile(join(repoRoot, "crates", "codestory-cli", "Cargo.toml"), "utf8"));
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-mcp-"));
+  const pathDir = await mkdtemp(join(tmpdir(), "codestory-path-candidate-"));
+  const fakeCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  await writeFile(
+    fakeCli,
+    process.platform === "win32"
+      ? "@echo off\r\necho codestory-cli 0.0.1\r\n"
+      : "#!/bin/sh\necho codestory-cli 0.0.1\n",
+  );
+  await chmod(fakeCli, 0o755);
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = [
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
@@ -217,9 +227,10 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
       env: {
         PLUGIN_DATA: "",
         COPILOT_PLUGIN_DATA: "",
-        PATH: "",
+        PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
+      cwd: repoRoot,
       input,
       encoding: "utf8",
       timeout: 5000,
@@ -230,8 +241,17 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     assert.equal(responses.length, 3, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.plugin_version, version);
+    assert.equal(status.source_checkout_version, sourceVersion);
+    assert.deepEqual(status.path_candidates, [
+      {
+        path: fakeCli,
+        version: "0.0.1",
+        active: true,
+      },
+    ]);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "path_fallback");
+    assert.equal(status.plugin_runtime.cli_path, fakeCli);
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
@@ -246,6 +266,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+    await rm(pathDir, { recursive: true, force: true });
   }
 });
 
