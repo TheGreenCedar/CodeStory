@@ -159,6 +159,9 @@ jobs:
           & $bin --version
           & $bin --help
 
+      - name: Clear release asset output
+        run: python -c "import shutil; shutil.rmtree('target/release-dist', ignore_errors=True)"
+
       - name: Package release asset
         if: runner.os != 'Windows'
         run: |
