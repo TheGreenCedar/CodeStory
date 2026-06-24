@@ -66,8 +66,8 @@ pub use health::{
     probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
-    FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, project_id_for_root,
-    repair_project_qdrant_collection, sidecar_project_id_for_root,
+    FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, finalize_index_for_runtime,
+    project_id_for_root, repair_project_qdrant_collection, sidecar_project_id_for_root,
 };
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;

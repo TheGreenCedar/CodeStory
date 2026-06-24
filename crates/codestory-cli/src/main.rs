@@ -2033,13 +2033,17 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_profile(
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project(
+        &runtime.project_root,
+        codestory_retrieval::SidecarProfile::Agent,
+    );
+    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime(
+        &sidecar,
         Some(runtime.project_root.as_path()),
         &storage_scope,
         None,
         false,
         Duration::from_secs(90),
-        codestory_retrieval::SidecarProfile::Agent,
     )
     .context("ready repair retrieval bootstrap")?;
     ensure_ready_repair_embed_liveness(&bootstrap.infrastructure)?;
@@ -2053,10 +2057,14 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
         .run_indexing_blocking(IndexMode::Full)
         .map_err(map_api_error)
         .context("ready repair retrieval index refresh")?;
-    retrieval::finalize_retrieval_index_for_runtime(runtime)
+    retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar)
         .context("ready repair retrieval index finalize")?;
-    codestory_retrieval::strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
-        .context("ready repair final retrieval status")?;
+    codestory_retrieval::strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        sidecar,
+    )
+    .context("ready repair final retrieval status")?;
     Ok(())
 }
 
@@ -9462,7 +9470,7 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
                 .manifest
                 .as_ref()
                 .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
-            DoctorSidecarStatusOutput {
+            let status = DoctorSidecarStatusOutput {
                 retrieval_mode: report.retrieval_mode,
                 degraded_reason: report.degraded_reason,
                 manifest_generation,
@@ -9471,7 +9479,11 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
                 precise_semantic_import_reason,
                 precise_semantic_import_revision,
                 precise_semantic_import_producer,
-            }
+            };
+            let handoff_failure = (status.retrieval_mode == "full")
+                .then(|| doctor_sidecar_profile_handoff_failure(runtime))
+                .flatten();
+            apply_sidecar_profile_handoff(status, handoff_failure)
         }
         Err(error) => DoctorSidecarStatusOutput {
             retrieval_mode: "unavailable".to_string(),
@@ -9483,6 +9495,46 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
             precise_semantic_import_revision: None,
             precise_semantic_import_producer: None,
         },
+    }
+}
+
+fn apply_sidecar_profile_handoff(
+    mut status: DoctorSidecarStatusOutput,
+    handoff_failure: Option<String>,
+) -> DoctorSidecarStatusOutput {
+    if status.retrieval_mode == "full"
+        && let Some(reason) = handoff_failure
+    {
+        status.retrieval_mode = "unavailable".to_string();
+        status.degraded_reason = Some(reason);
+    }
+    status
+}
+
+fn doctor_sidecar_profile_handoff_failure(runtime: &RuntimeContext) -> Option<String> {
+    let active = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    if active.profile == codestory_retrieval::SidecarProfile::Local {
+        return None;
+    }
+    let local = codestory_retrieval::strict_sidecar_status_for_profile(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        codestory_retrieval::SidecarProfile::Local,
+    );
+    match local {
+        Ok(report) if report.retrieval_mode == "full" => None,
+        Ok(report) => Some(format!(
+            "profile_handoff_mismatch: active profile={} namespace={} is full but local/default profile is mode={} reason={}",
+            active.profile.as_str(),
+            active.namespace,
+            report.retrieval_mode,
+            report.degraded_reason.as_deref().unwrap_or("unknown")
+        )),
+        Err(error) => Some(format!(
+            "profile_handoff_mismatch: active profile={} namespace={} is full but local/default status failed: {error}",
+            active.profile.as_str(),
+            active.namespace
+        )),
     }
 }
 
@@ -10962,6 +11014,36 @@ mod tests {
         assert!(message.contains("embedding sidecar liveness failed"));
         assert!(message.contains("before mandatory Qdrant semantic smoke"));
         assert!(message.contains("http://127.0.0.1:55280/v1/embeddings"));
+    }
+
+    #[test]
+    fn sidecar_profile_handoff_downgrades_full_readiness() {
+        let status = DoctorSidecarStatusOutput {
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+
+        let downgraded = apply_sidecar_profile_handoff(
+            status,
+            Some(
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                    .to_string(),
+            ),
+        );
+
+        assert_eq!(downgraded.retrieval_mode, "unavailable");
+        assert_eq!(
+            downgraded.degraded_reason.as_deref(),
+            Some(
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+            )
+        );
     }
 
     #[test]
