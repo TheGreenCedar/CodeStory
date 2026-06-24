@@ -17,7 +17,7 @@ integration.
 | Preflight | Run `codestory-cli agent preflight --project <target-workspace> --format json`. | Reports local graph readiness, full retrieval readiness, safe/blocked surfaces, and repair command. | Local graph surfaces are safe before source work; sidecar surfaces require `retrieval_mode=full`. |
 | Install | Install the `codestory` agent plugin from `TheGreenCedar`. | Plugin starts its managed MCP adapter, then `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
 | First grounding | Start a fresh thread in the repo. | Hooks attempt startup grounding; the agent reads `codestory://status`, then `codestory://grounding` or `ground`. | Status reports `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, and `allowed_surfaces`. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. |
-| Source work | Ask for a plan, review, or code path. | Use allowed local graph surfaces such as `files`, `symbol`, `trail`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
+| Source work | Ask for a plan, review, or code path. | Use allowed local graph surfaces such as `files`, `symbol`, `callers`, `callees`, `trail`, `trace`, `snippet`, `symbols`, `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
 | Broad discovery | Ask a repo-wide question. | Hooks may attempt request-aware packets; the agent may use `packet`, `search`, or `context`. | Trust only when that surface is allowed and `retrieval_mode=full`. |
 | Repair | Ask for a transcript or run CLI directly. | Use `ready --goal local --repair` or `ready --goal agent --repair`. | Repeat readiness checks after repair. |
 
@@ -182,7 +182,7 @@ explicit ref, setup fetches and builds the remote default branch.
 | Runtime truth | Allows | Blocks |
 | --- | --- | --- |
 | `codestory://status` | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, `build_source`, `repo_ref`, and `allowed_surfaces`; `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Use this first when MCP is live. | Guessing active runtime from source checkout, marketplace cache, or `PATH` alone. |
-| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
+| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without matching packet-runtime, drill, benchmark, or source evidence. |
 
 `context` is not a local-only browse surface. Even when the target is concrete,
@@ -308,22 +308,22 @@ summary endpoints/models or embedding endpoints in trusted environment
 variables such as `CODESTORY_SUMMARY_ENDPOINT`, `CODESTORY_SUMMARY_MODEL`, or
 `CODESTORY_EMBED_LLAMACPP_URL`.
 
-## Command Cheat Sheet
+## Command By Situation
 
-| Command | Use |
-| --- | --- |
-| `doctor` | Read-only health check for project, cache, index, retrieval, and environment readiness. |
-| `index` | Build or refresh the SQLite graph and derived local read models. |
-| `ground` | Broad repo-level orientation snapshot. |
-| `report` | Derived Markdown repo report or JSON graph export from the current SQLite store. |
-| `files` | Indexed file inventory, language counts, roles, and coverage notes. |
-| `symbol`, `trail`, `snippet`, `explore` | Cache-local exact-target source inspection once you have a node id or target. |
-| `context --id`, `context --query <exact target>`, `context --bookmark` | Target-first Investigate context packet; target selection is local/index-first, answer/evidence retrieval needs full sidecar primary. |
-| `affected` | Changed-file impact hints for review planning. |
-| `packet`, `search` | Broad sidecar-backed discovery; trust only with `retrieval_mode=full`. |
-| `retrieval bootstrap`, `retrieval index`, `retrieval status` | Sidecar setup, indexing, and readiness checks. |
-| `serve --stdio` | Persistent local read surface for repeated agent queries. |
-| `generate-completions` | Shell completions from the command model. |
+Use the command that matches where the agent is stuck. Do not run a generic
+inventory sweep when one status field or one graph target will answer the
+question.
+
+| Stuck situation | First command | Use next when |
+| --- | --- | --- |
+| Orientation: "What is in this checkout?" | `codestory-cli ground --project <repo> --why` | Use `files --project <repo>` when the question is about language mix, generated/vendor files, or incomplete coverage. |
+| Implementation start: "Where do I edit?" | `codestory-cli symbol --project <repo> --query "<feature-or-type>"` | Use `callers`, `callees`, `trace`, or `trail --story --hide-speculative` after choosing a concrete node. |
+| Symbol impact: "What might this change touch?" | `git diff --name-only HEAD | codestory-cli affected --project <repo> --stdin --format json` | Use the output to choose focused tests; it is not a test result. |
+| Test choice: "Which verification is smallest?" | `codestory-cli affected --project <repo> --format markdown` | Use repo docs or touched test names to pick one narrow test before broader lanes. |
+| Source snippet: "Show me the relevant code." | `codestory-cli snippet --project <repo> --id <node-id> --function-body --lines 80` | Use `callers`, `callees`, or `trace` when relationships matter; if snippet truncates, follow its truncation guidance or read the source file directly. |
+| Readiness: "Can I trust CodeStory now?" | `codestory-cli agent preflight --project <repo> --format json` | Use `codestory://status` instead when MCP is live; branch on `allowed_surfaces`. |
+| Repair: "A surface is blocked." | `codestory-cli ready --goal local --repair --project <repo> --format json` for local graph, or `codestory-cli ready --goal agent --repair --project <repo> --format json` for packet/search/context | Rerun `agent preflight`, `doctor`, or `retrieval status` after repair; do not retry a failed live surface until the failing layer changes. |
+| Broad evidence: "I need a packet/search answer." | `codestory-cli retrieval status --project <repo> --format json` | Run `packet`, `search`, or `context` only after `retrieval_mode` is `full` and the matching surface is allowed. |
 
 ## Verification
 

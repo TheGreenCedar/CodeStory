@@ -63,6 +63,8 @@ pub(crate) enum Command {
     Context(ContextCommand),
     #[command(about = "Answer a broad repository question with evidence.")]
     Packet(PacketCommand),
+    #[command(about = "Build owner-directed task workflow packets.")]
+    Task(TaskCommand),
     #[command(about = "Check cache, index, and retrieval health.")]
     Doctor(DoctorCommand),
     #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
@@ -85,6 +87,12 @@ pub(crate) enum Command {
     Symbol(SymbolCommand),
     #[command(about = "Trace calls, refs, and related symbols.")]
     Trail(TrailCommand),
+    #[command(about = "Show incoming callers for a symbol.")]
+    Callers(TrailCommand),
+    #[command(about = "Show outgoing callees for a symbol.")]
+    Callees(TrailCommand),
+    #[command(about = "Show a readable trace around a symbol.")]
+    Trace(TrailCommand),
     #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
     #[command(about = "Run structured graph queries.")]
@@ -485,6 +493,64 @@ pub(crate) struct PacketCommand {
         help = "Write per-step packet retrieval trace JSON for golden scoring."
     )]
     pub(crate) step_trace_out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaskCommand {
+    #[command(subcommand)]
+    pub(crate) action: TaskAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum TaskAction {
+    #[command(about = "Build an implementation brief from packet evidence.")]
+    Brief(TaskBriefCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaskBriefCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        alias = "question",
+        help = "Implementation task or issue brief to ground."
+    )]
+    pub(crate) prompt: String,
+    #[arg(long, value_enum, default_value_t = CliPacketBudget::Compact)]
+    pub(crate) budget: CliPacketBudget,
+    #[arg(
+        long = "extra-probe",
+        value_name = "QUERY",
+        help = "Add an explicit file, symbol, or file-scoped symbol probe to the underlying packet plan."
+    )]
+    pub(crate) extra_probes: Vec<String>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Omit citation edge ids and score breakdowns from the underlying packet."
+    )]
+    pub(crate) no_evidence: bool,
+    #[arg(
+        long,
+        value_name = "MS",
+        help = "Optional packet-level latency budget in milliseconds."
+    )]
+    pub(crate) latency_budget_ms: Option<u32>,
 }
 
 #[derive(Args, Debug)]
@@ -2418,8 +2484,8 @@ mod tests {
     #[test]
     fn read_commands_explain_refresh_none_default() {
         for name in [
-            "ground", "context", "search", "symbol", "trail", "snippet", "query", "explore",
-            "serve",
+            "ground", "context", "search", "symbol", "trail", "callers", "callees", "trace",
+            "snippet", "query", "explore", "serve",
         ] {
             let help = render_subcommand_help(name);
             assert!(
