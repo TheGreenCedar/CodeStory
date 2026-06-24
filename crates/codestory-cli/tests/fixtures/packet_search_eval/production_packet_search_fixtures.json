@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "id": "readiness-boundary",
+      "prompt": "Explain how LiveSidecarSearch::qdrant_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
+      "query": "LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable",
+      "category": "readiness_boundary",
+      "mode": "packet_search",
+      "expected": {
+        "files": [
+          "crates/codestory-retrieval/src/sidecar_search.rs",
+          "crates/codestory-retrieval/src/lib.rs"
+        ],
+        "symbols": [
+          "LiveSidecarSearch::qdrant_search",
+          "LiveSidecarSearch::layout"
+        ],
+        "anchors": [
+          "LiveSidecarSearch::qdrant_search",
+          "sidecar_search"
+        ]
+      },
+      "provenance": {
+        "issue": "#510",
+        "owner": "CodeStory evaluation quality",
+        "source": "owner-directed production packet/search acceptance fixture",
+        "refs": [
+          "#475",
+          "#469"
+        ]
+      }
+    },
+    {
+      "id": "packet-anchor-placement",
+      "prompt": "Find the production packet/search path that surfaces search results and packet evidence for agent handoff.",
+      "query": "packet search output evidence packet indexed symbol hits retrieval shadow",
+      "category": "anchor_placement",
+      "mode": "packet_search",
+      "expected": {
+        "files": [
+          "crates/codestory-cli/src/output.rs",
+          "crates/codestory-runtime/src/agent/packet_evidence.rs"
+        ],
+        "symbols": [
+          "append_search_evidence_packet",
+          "decorate_search_hit_evidence"
+        ],
+        "anchors": [
+          "decorate_search_hit_evidence",
+          "evidence_candidate_from_hit"
+        ]
+      },
+      "provenance": {
+        "issue": "#510",
+        "owner": "CodeStory evaluation quality",
+        "source": "owner-directed production packet/search acceptance fixture",
+        "refs": [
+          "#475",
+          "#469"
+        ]
+      }
+    }
+  ]
+}
