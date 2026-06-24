@@ -205,6 +205,10 @@ fn main() -> Result<()> {
     }
 }
 
+fn new_agent_surface_runtime(project: &ProjectArgs) -> Result<RuntimeContext> {
+    RuntimeContext::new_agent_sidecar(project)
+}
+
 fn run_cache(cmd: CacheCommand) -> Result<()> {
     match cmd.action {
         CacheAction::Identity(cmd) => run_cache_identity(cmd),
@@ -1002,7 +1006,7 @@ struct ResolvedContextTarget {
 fn run_context(cmd: ContextCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "context")?;
 
@@ -1049,7 +1053,7 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "packet")?;
 
@@ -1580,7 +1584,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = if cmd.repair {
         if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
-            RuntimeContext::new_agent_sidecar(&cmd.project)?
+            new_agent_surface_runtime(&cmd.project)?
         } else {
             RuntimeContext::new(&cmd.project)?
         }
@@ -1788,7 +1792,7 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
     let search_results = runtime
@@ -8636,7 +8640,7 @@ fn render_affected_footer(
 }
 
 fn run_serve(cmd: ServeCommand) -> Result<()> {
-    let runtime = RuntimeContext::new_agent_sidecar(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
     if cmd.stdio {
