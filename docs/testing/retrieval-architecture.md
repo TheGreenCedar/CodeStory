@@ -34,6 +34,118 @@ counts, degraded modes, and lane provenance. It is readiness/freshness evidence
 only. Packet-quality promotion still needs role-bearing packet sufficiency plus
 the matching drill or benchmark tier.
 
+## Published Schema and Evidence Examples
+
+These are the safe public surfaces for agents, docs, and PR evidence. Prefer
+these DTOs and status fields over internal SQL tables, cache paths, sidecar
+payloads, dense vectors, or generated summaries.
+
+| Need | Safe surface | Owner boundary |
+|------|--------------|----------------|
+| Local graph shape | `NodeId`, `EdgeId`, `NodeKind`, `EdgeKind`, `ResolutionCertainty` in `crates/codestory-contracts/src/graph.rs`; route DTOs in `crates/codestory-contracts/src/api/dto.rs` | Store-local ids and extracted graph facts. `NodeId` is not a cross-repo identity; use `canonical_id`, file path, or qualified name for durable references. |
+| Project/index readiness | `ProjectSummary`, `StorageStatsDto`, `IndexFreshnessDto`, `ReadinessVerdictDto`, `ReadinessSidecarSnapshotDto` | Runtime truth for this workspace and this invocation. A fresh local graph does not imply packet/search readiness. |
+| Support tier | `IndexedFileLanguageCountDto` plus `LANGUAGE_SUPPORT_PROFILES` in `language_support.rs` | Language claim tier only: parser-backed graph or structural source-proof. It does not claim typed semantic edges or packet answer quality. |
+| Search and packet evidence | `SearchHit`, `AgentCitationDto`, `PacketEvidenceTierDto`, `PacketEvidenceResolutionDto`, `coverage_role`, `eligible_for_sufficiency` | Role-bearing evidence for packet sufficiency. Ranking fields explain why a hit appeared; they do not prove sufficiency alone. |
+| Sidecar freshness | `retrieval status --format json` `retrieval_mode`, `degraded_reason`, and `manifest_contract`; persisted source is `RetrievalIndexManifest` | Full sidecar retrieval requires a current manifest contract for the same source root, input hash, schema, generation, graph hash, and counts. |
+| Blocked retrieval | `agent preflight` `safe_surfaces`, `blocked_surfaces`, `repair_command`; API error `retrieval_unavailable` with recovery commands | Fail closed for `packet`, `search`, and `context`; continue only with allowed local graph surfaces. |
+
+Local graph evidence example:
+
+```json
+{
+  "node_id": "2754485059345548338",
+  "node_ref": "crates/codestory-contracts/src/api/dto.rs:43:ProjectSummary",
+  "display_name": "ProjectSummary",
+  "kind": "STRUCT",
+  "evidence_tier": "resolved_graph",
+  "resolution_status": "resolved",
+  "eligible_for_sufficiency": true
+}
+```
+
+Support tier example:
+
+```json
+{
+  "language": "rust",
+  "file_count": 118,
+  "support_mode": "parser_backed_graph",
+  "evidence_tier": "graph_fidelity",
+  "claim_label": "parser-backed graph, fidelity-gated"
+}
+```
+
+Sidecar manifest example:
+
+```json
+{
+  "retrieval_mode": "full",
+  "degraded_reason": null,
+  "manifest_contract": {
+    "source_root": "/repo",
+    "project_id": "1a2b3c",
+    "input_hash": "sha256:...",
+    "generation": "project-input",
+    "schema_version": 3,
+    "graph_hash": "sha256:...",
+    "symbol_doc_count": 2213,
+    "dense_anchor_count": 0,
+    "degraded_modes": [],
+    "retrieval_mode": "full",
+    "degraded_reason": null,
+    "lanes": [
+      { "lane": "graph", "status": "ready", "count": 2213 }
+    ]
+  }
+}
+```
+
+Packet evidence example:
+
+```json
+{
+  "display_name": "sidecar_retrieval_primary_enabled",
+  "file_path": "crates/codestory-runtime/src/agent/retrieval_primary.rs",
+  "line": 74,
+  "evidence_tier": "resolved_graph",
+  "evidence_producer": "route_endpoint",
+  "resolution_status": "resolved",
+  "coverage_role": "runtime_orchestration",
+  "eligible_for_sufficiency": true
+}
+```
+
+Blocked retrieval example:
+
+```json
+{
+  "usable": false,
+  "local_graph": { "ready": true, "status": "ready" },
+  "full_retrieval": {
+    "ready": false,
+    "status": "repair_retrieval",
+    "summary": "Full retrieval is unavailable for agent packet/search."
+  },
+  "safe_surfaces": ["ground", "files", "symbol", "trail", "snippet", "affected"],
+  "blocked_surfaces": ["packet_full", "search_full", "context_full"],
+  "repair_command": "codestory-cli ready --goal agent --repair --project \"<repo>\" --format json"
+}
+```
+
+Non-claims:
+
+- `semantic_suggestion`, `dense_semantic`, repo-text, generated summary, and
+  synthetic source-scan evidence can help navigation, but they are not source
+  truth without an exact source or resolved graph follow-up.
+- `retrieval_mode=full` proves infrastructure eligibility only. It is not
+  answer-quality, agent-usefulness, language-support, or public savings proof.
+- A support tier row proves the named language/profile boundary only. It does
+  not upgrade structural collectors to parser-backed graphs or parser-backed
+  graphs to typed semantic edge coverage.
+- A blocked `packet`, `search`, or `context` surface must not be worked around
+  by treating legacy semantic fallback or local graph readiness as sidecar
+  packet/search evidence.
+
 ## Implemented Stack
 
 | Layer | Location | Role |

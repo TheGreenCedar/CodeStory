@@ -308,22 +308,22 @@ summary endpoints/models or embedding endpoints in trusted environment
 variables such as `CODESTORY_SUMMARY_ENDPOINT`, `CODESTORY_SUMMARY_MODEL`, or
 `CODESTORY_EMBED_LLAMACPP_URL`.
 
-## Command Cheat Sheet
+## Command By Situation
 
-| Command | Use |
-| --- | --- |
-| `doctor` | Read-only health check for project, cache, index, retrieval, and environment readiness. |
-| `index` | Build or refresh the SQLite graph and derived local read models. |
-| `ground` | Broad repo-level orientation snapshot. |
-| `report` | Derived Markdown repo report or JSON graph export from the current SQLite store. |
-| `files` | Indexed file inventory, language counts, roles, and coverage notes. |
-| `symbol`, `callers`, `callees`, `trail`, `trace`, `snippet`, `explore` | Cache-local exact-target source inspection once you have a node id or target. |
-| `context --id`, `context --query <exact target>`, `context --bookmark` | Target-first Investigate context packet; target selection is local/index-first, answer/evidence retrieval needs full sidecar primary. |
-| `affected` | Changed-file impact hints for review planning. |
-| `packet`, `search` | Broad sidecar-backed discovery; trust only with `retrieval_mode=full`. |
-| `retrieval bootstrap`, `retrieval index`, `retrieval status` | Sidecar setup, indexing, and readiness checks. |
-| `serve --stdio` | Persistent local read surface for repeated agent queries. |
-| `generate-completions` | Shell completions from the command model. |
+Use the command that matches where the agent is stuck. Do not run a generic
+inventory sweep when one status field or one graph target will answer the
+question.
+
+| Stuck situation | First command | Use next when |
+| --- | --- | --- |
+| Orientation: "What is in this checkout?" | `codestory-cli ground --project <repo> --why` | Use `files --project <repo>` when the question is about language mix, generated/vendor files, or incomplete coverage. |
+| Implementation start: "Where do I edit?" | `codestory-cli symbol --project <repo> --query "<feature-or-type>"` | Use `callers`, `callees`, `trace`, or `trail --story --hide-speculative` after choosing a concrete node. |
+| Symbol impact: "What might this change touch?" | `git diff --name-only HEAD | codestory-cli affected --project <repo> --stdin --format json` | Use the output to choose focused tests; it is not a test result. |
+| Test choice: "Which verification is smallest?" | `codestory-cli affected --project <repo> --format markdown` | Use repo docs or touched test names to pick one narrow test before broader lanes. |
+| Source snippet: "Show me the relevant code." | `codestory-cli snippet --project <repo> --id <node-id> --function-body --lines 80` | Use `callers`, `callees`, or `trace` when relationships matter; if snippet truncates, follow its truncation guidance or read the source file directly. |
+| Readiness: "Can I trust CodeStory now?" | `codestory-cli agent preflight --project <repo> --format json` | Use `codestory://status` instead when MCP is live; branch on `allowed_surfaces`. |
+| Repair: "A surface is blocked." | `codestory-cli ready --goal local --repair --project <repo> --format json` for local graph, or `codestory-cli ready --goal agent --repair --project <repo> --format json` for packet/search/context | Rerun `agent preflight`, `doctor`, or `retrieval status` after repair; do not retry a failed live surface until the failing layer changes. |
+| Broad evidence: "I need a packet/search answer." | `codestory-cli retrieval status --project <repo> --format json` | Run `packet`, `search`, or `context` only after `retrieval_mode` is `full` and the matching surface is allowed. |
 
 ## Verification
 
