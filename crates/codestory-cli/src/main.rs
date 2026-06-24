@@ -1320,52 +1320,54 @@ fn task_brief_follow_up_commands(
     first_files: &[TaskBriefFileOutput],
     symbols: &[TaskBriefSymbolOutput],
 ) -> Vec<String> {
-    let project = project_root.display();
-    let prompt = shell_double_quote(&packet.question);
+    let project = quote_command_path(project_root);
+    let prompt = quote_command_value(&packet.question);
     let mut commands = Vec::new();
     commands.push(format!(
-        "codestory-cli packet --project \"{project}\" --question \"{prompt}\" --task-class edit-planning --budget {}",
+        "codestory-cli packet --project {project} --question {prompt} --task-class edit-planning --budget {}",
         packet_budget_mode_label(packet.budget.requested)
     ));
     if let Some(file) = first_files.first() {
         commands.push(format!(
-            "codestory-cli snippet --project \"{project}\" --query \"{}\"",
-            shell_double_quote(&file.path)
+            "codestory-cli snippet --project {project} --query {}",
+            quote_command_value(&file.path)
         ));
     }
     if let Some(symbol) = symbols.first() {
         commands.push(format!(
-            "codestory-cli trail --project \"{project}\" --query \"{}\" --story --hide-speculative",
-            shell_double_quote(&symbol.name)
+            "codestory-cli trail --project {project} --query {} --story --hide-speculative",
+            quote_command_value(&symbol.name)
         ));
     }
-    commands.push(format!(
-        "codestory-cli affected --project \"{project}\" <path>"
-    ));
+    commands.push(format!("codestory-cli affected --project {project} <path>"));
     commands.extend(packet.sufficiency.follow_up_commands.iter().cloned());
     commands
-}
-
-fn shell_double_quote(value: &str) -> String {
-    value.replace('"', "\\\"").replace('\n', " ")
 }
 
 fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Task Brief");
-    let _ = writeln!(markdown, "status: `{}`", brief.status);
     let _ = writeln!(
         markdown,
-        "task_brief_version: `{}`",
-        brief.task_brief_version
+        "status: {}",
+        task_brief_inline_code(&brief.status)
     );
-    let _ = writeln!(markdown, "source_packet_id: `{}`", brief.source_packet_id);
+    let _ = writeln!(markdown, "task_brief_version: {}", brief.task_brief_version);
     let _ = writeln!(
         markdown,
-        "source_packet_sufficiency: `{}`",
-        brief.source_packet_sufficiency
+        "source_packet_id: {}",
+        task_brief_inline_code(&brief.source_packet_id)
     );
-    let _ = writeln!(markdown, "prompt: `{}`", brief.prompt.replace('\n', " "));
+    let _ = writeln!(
+        markdown,
+        "source_packet_sufficiency: {}",
+        task_brief_inline_code(&brief.source_packet_sufficiency)
+    );
+    let _ = writeln!(
+        markdown,
+        "prompt: {}",
+        task_brief_inline_code(&brief.prompt)
+    );
     append_task_brief_files(&mut markdown, "First Files", &brief.first_files);
     append_task_brief_symbols(&mut markdown, "Relevant Symbols", &brief.relevant_symbols);
     append_task_brief_files(&mut markdown, "Likely Tests", &brief.likely_tests);
@@ -1380,6 +1382,14 @@ fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
     markdown
 }
 
+fn task_brief_inline_code(value: &str) -> String {
+    format!("`{}`", task_brief_markdown_text(value))
+}
+
+fn task_brief_markdown_text(value: &str) -> String {
+    value.replace('`', "'").replace(['\r', '\n'], " ")
+}
+
 fn append_task_brief_files(markdown: &mut String, title: &str, files: &[TaskBriefFileOutput]) {
     let _ = writeln!(markdown, "\n## {title}");
     if files.is_empty() {
@@ -1388,7 +1398,13 @@ fn append_task_brief_files(markdown: &mut String, title: &str, files: &[TaskBrie
     }
     for file in files {
         let line = file.line.map(|line| format!(":{line}")).unwrap_or_default();
-        let _ = writeln!(markdown, "- `{}`{} - {}", file.path, line, file.reason);
+        let _ = writeln!(
+            markdown,
+            "- {}{} - {}",
+            task_brief_inline_code(&file.path),
+            line,
+            task_brief_markdown_text(&file.reason)
+        );
     }
 }
 
@@ -1411,13 +1427,16 @@ fn append_task_brief_symbols(
                     .line
                     .map(|line| format!(":{line}"))
                     .unwrap_or_default();
-                format!(" `{path}`{line}")
+                format!(" {}{line}", task_brief_inline_code(path))
             })
             .unwrap_or_default();
         let _ = writeln!(
             markdown,
-            "- `{}` ({}){} - {}",
-            symbol.name, symbol.kind, location, symbol.reason
+            "- {} ({}){} - {}",
+            task_brief_inline_code(&symbol.name),
+            task_brief_markdown_text(&symbol.kind),
+            location,
+            task_brief_markdown_text(&symbol.reason)
         );
     }
 }
@@ -1429,14 +1448,15 @@ fn append_task_brief_strings(markdown: &mut String, title: &str, values: &[Strin
         return;
     }
     for value in values {
-        let _ = writeln!(markdown, "- {value}");
+        let _ = writeln!(markdown, "- {}", task_brief_markdown_text(value));
     }
 }
 
 fn append_task_brief_commands(markdown: &mut String, title: &str, values: &[String]) {
     let _ = writeln!(markdown, "\n## {title}");
     for value in values {
-        let _ = writeln!(markdown, "- `{value}`");
+        let _ = writeln!(markdown, "- command:");
+        let _ = writeln!(markdown, "    {}", value.replace(['\r', '\n'], " "));
     }
 }
 
@@ -11097,20 +11117,20 @@ mod tests {
 
     fn sample_task_brief_packet() -> AgentPacketDto {
         let source = sample_task_brief_citation(
-            "run_packet",
+            "run_`packet_$env:SECRET$('x')",
             NodeKind::FUNCTION,
-            "crates/codestory-cli/src/main.rs",
+            "crates/codestory-cli/src/`main_$env:SECRET$('x').rs",
             1053,
         );
         let test = sample_task_brief_citation(
             "packet_tool_returns_budgeted_sufficiency_contract",
             NodeKind::FUNCTION,
-            "crates/codestory-cli/tests/stdio_protocol_contracts.rs",
+            "crates/codestory-cli/tests/stdio`$env:SECRET$('x')_protocol_contracts.rs",
             2909,
         );
         AgentPacketDto {
             packet_id: "packet-task-brief".to_string(),
-            question: "Add a task brief packet surface".to_string(),
+            question: "Add `$env:SECRET $(Get-ChildItem) 'literal' task brief".to_string(),
             task_class: Some(PacketTaskClassDto::EditPlanning),
             plan: PacketPlanDto {
                 task_class: PacketTaskClassDto::EditPlanning,
@@ -11123,7 +11143,7 @@ mod tests {
             },
             answer: AgentAnswerDto {
                 answer_id: "answer-task-brief".to_string(),
-                prompt: "Add a task brief packet surface".to_string(),
+                prompt: "Add `$env:SECRET $(Get-ChildItem) 'literal' task brief".to_string(),
                 summary: "Use the packet command path.".to_string(),
                 freshness: None,
                 sections: Vec::new(),
@@ -11179,7 +11199,7 @@ mod tests {
                 open_next: Vec::new(),
                 avoid_opening: Vec::new(),
                 avoid_opening_paths: Vec::new(),
-                gaps: vec!["verify changed files after editing".to_string()],
+                gaps: vec!["verify `changed` files after editing".to_string()],
                 follow_up_commands: vec![
                     "codestory-cli ready --goal agent --repair --project . --format json"
                         .to_string(),
@@ -12824,12 +12844,15 @@ mod tests {
         assert_eq!(brief.source_packet_sufficiency, "partial");
         assert_eq!(
             brief.first_files[0].path,
-            "crates/codestory-cli/src/main.rs"
+            "crates/codestory-cli/src/`main_$env:SECRET$('x').rs"
         );
-        assert_eq!(brief.relevant_symbols[0].name, "run_packet");
+        assert_eq!(
+            brief.relevant_symbols[0].name,
+            "run_`packet_$env:SECRET$('x')"
+        );
         assert_eq!(
             brief.likely_tests[0].path,
-            "crates/codestory-cli/tests/stdio_protocol_contracts.rs"
+            "crates/codestory-cli/tests/stdio`$env:SECRET$('x')_protocol_contracts.rs"
         );
         assert!(
             brief
@@ -12839,7 +12862,7 @@ mod tests {
         assert!(
             brief
                 .risks_unknowns
-                .contains(&"verify changed files after editing".to_string())
+                .contains(&"verify `changed` files after editing".to_string())
         );
         for expected in [
             "codestory-cli packet",
@@ -12856,6 +12879,37 @@ mod tests {
             );
         }
         assert_eq!(brief.future_sections, ["scout", "where", "onboard"]);
+
+        let packet_command = brief
+            .follow_up_codestory_commands
+            .iter()
+            .find(|command| command.contains("codestory-cli packet"))
+            .expect("packet follow-up command");
+        assert!(
+            packet_command.contains(&format!(
+                "--question {}",
+                quote_command_value(&packet.question)
+            )),
+            "packet follow-up should quote prompt safely: {packet_command}"
+        );
+        let snippet_command = brief
+            .follow_up_codestory_commands
+            .iter()
+            .find(|command| command.contains("codestory-cli snippet"))
+            .expect("snippet follow-up command");
+        assert!(
+            snippet_command.contains(&quote_command_value(&brief.first_files[0].path)),
+            "snippet follow-up should quote path safely: {snippet_command}"
+        );
+        let trail_command = brief
+            .follow_up_codestory_commands
+            .iter()
+            .find(|command| command.contains("codestory-cli trail"))
+            .expect("trail follow-up command");
+        assert!(
+            trail_command.contains(&quote_command_value(&brief.relevant_symbols[0].name)),
+            "trail follow-up should quote symbol safely: {trail_command}"
+        );
 
         let json = serde_json::to_value(&brief).expect("brief should serialize");
         for key in [
@@ -12874,6 +12928,34 @@ mod tests {
         }
 
         let markdown = render_task_brief_markdown(&brief);
+        assert!(
+            markdown.contains("prompt: `Add '$env:SECRET $(Get-ChildItem) 'literal' task brief`"),
+            "brief markdown should replace prompt backticks inside inline code: {markdown}"
+        );
+        assert!(
+            markdown.contains("`crates/codestory-cli/src/'main_$env:SECRET$('x').rs`"),
+            "brief markdown should replace path backticks inside inline code: {markdown}"
+        );
+        assert!(
+            markdown.contains("`run_'packet_$env:SECRET$('x')`"),
+            "brief markdown should replace symbol backticks inside inline code: {markdown}"
+        );
+        assert!(
+            markdown.contains("- verify 'changed' files after editing"),
+            "brief markdown should replace risk backticks in bullets: {markdown}"
+        );
+        assert!(
+            markdown.contains("- command:\n    codestory-cli packet"),
+            "brief markdown should render commands as indented code blocks: {markdown}"
+        );
+        assert!(
+            !markdown.contains("- `codestory-cli"),
+            "brief markdown should not render follow-up commands as inline code: {markdown}"
+        );
+        assert!(
+            !markdown.contains("```"),
+            "brief markdown should not use fences that embedded backticks can split: {markdown}"
+        );
         for heading in [
             "# Task Brief",
             "## First Files",
