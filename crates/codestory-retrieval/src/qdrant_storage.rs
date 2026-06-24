@@ -114,6 +114,7 @@ pub fn repair_qdrant_storage(
             &protected,
             &scan.recency_by_collection,
             max_keep,
+            &mut scan.scan_errors,
         )?
     };
 
@@ -473,6 +474,7 @@ fn execute_retention_on_disk(
     protected: &HashSet<String>,
     recency_by_collection: &HashMap<String, i64>,
     max_keep: usize,
+    repair_errors: &mut Vec<String>,
 ) -> Result<(usize, usize, usize, bool)> {
     let all = list_on_disk_codestory_collections(qdrant_data_dir, recency_by_collection)?;
     let collections_seen = all.len();
@@ -482,14 +484,22 @@ fn execute_retention_on_disk(
     for name in plan.to_prune {
         let path = qdrant_data_dir.join("collections").join(&name);
         if path.is_dir() {
-            std::fs::remove_dir_all(&path).with_context(|| {
-                format!(
-                    "remove stale qdrant collection dir beyond retention {}",
-                    path.display()
-                )
-            })?;
-            QdrantClient::clear_stub_marker_files(qdrant_data_dir, &name);
-            removed += 1;
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    QdrantClient::clear_stub_marker_files(qdrant_data_dir, &name);
+                    removed += 1;
+                }
+                Err(error) => {
+                    warn!(
+                        collection = %name,
+                        %error,
+                        "failed to prune stale Qdrant collection dir; continuing bootstrap repair"
+                    );
+                    repair_errors.push(format!(
+                        "remove stale qdrant collection dir {name}: {error}"
+                    ));
+                }
+            }
         }
     }
     Ok((
@@ -612,8 +622,14 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        let (pruned, seen, _, overflow) =
-            execute_retention_on_disk(root.path(), &protected, &HashMap::new(), 64).expect("prune");
+        let (pruned, seen, _, overflow) = execute_retention_on_disk(
+            root.path(),
+            &protected,
+            &HashMap::new(),
+            64,
+            &mut Vec::new(),
+        )
+        .expect("prune");
         assert!(pruned > 0);
         assert_eq!(seen, 65);
         assert!(!overflow);

@@ -43,12 +43,14 @@ pub use capabilities::SidecarCapabilities;
 #[allow(deprecated)]
 pub use compose::bootstrap_sidecars_without_storage_scope;
 pub use compose::{
-    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, bootstrap_sidecars, docker_available,
-    resolve_compose_file,
+    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, bootstrap_sidecars, bootstrap_sidecars_with_profile,
+    docker_available, resolve_compose_file,
 };
 pub use config::{
-    DEFAULT_QDRANT_GRPC_PORT, DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN,
-    SidecarLayout, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
+    DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT, DEFAULT_QDRANT_HTTP_PORT,
+    DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN, SidecarLayout, SidecarOwnership, SidecarPorts,
+    SidecarProfile, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
+    sidecar_runtime_auto, sidecar_runtime_for_project,
 };
 pub use config::{qdrant_enabled, qdrant_semantic_vectors_enabled};
 pub use embeddings::qdrant_vector_dim;
@@ -86,7 +88,8 @@ pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;
 pub use scip_client::ScipClient;
 pub use sidecar::{
-    SidecarStateFile, sidecar_down, sidecar_status, sidecar_up, strict_sidecar_status,
+    SidecarStateFile, sidecar_down, sidecar_down_for_project, sidecar_status, sidecar_up,
+    sidecar_up_with_runtime, strict_sidecar_status, strict_sidecar_status_for_profile,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
 pub use zoekt_client::ZoektClient;

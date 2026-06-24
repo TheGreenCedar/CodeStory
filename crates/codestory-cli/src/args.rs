@@ -609,15 +609,38 @@ pub(crate) enum RetrievalAction {
     /// Start Docker Compose sidecars (when available), prepare cache dirs, and wait for health.
     Bootstrap(RetrievalBootstrapCommand),
     /// Prepare local sidecar data directories and write sidecar state (does not start Docker).
-    Up,
+    Up(RetrievalSidecarStateCommand),
     /// Remove local sidecar state file (does not stop external processes).
-    Down,
+    Down(RetrievalSidecarStateCommand),
     /// Probe Zoekt, Qdrant, and SCIP availability for the project.
     Status(RetrievalStatusCommand),
     /// Run workspace index then persist retrieval_index_manifest sidecar metadata.
     Index(RetrievalIndexCommand),
     /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
     Query(RetrievalQueryCommand),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CliSidecarProfile {
+    Local,
+    Agent,
+}
+
+impl From<CliSidecarProfile> for codestory_retrieval::SidecarProfile {
+    fn from(value: CliSidecarProfile) -> Self {
+        match value {
+            CliSidecarProfile::Local => Self::Local,
+            CliSidecarProfile::Agent => Self::Agent,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalSidecarStateCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
+    pub(crate) profile: CliSidecarProfile,
 }
 
 #[derive(Args, Debug)]
@@ -642,6 +665,8 @@ pub(crate) struct RetrievalQueryCommand {
 pub(crate) struct RetrievalBootstrapCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
+    pub(crate) profile: CliSidecarProfile,
     #[arg(
         long,
         help = "Skip docker compose even when Docker is installed (dirs + state file only)."
@@ -670,6 +695,8 @@ pub(crate) struct RetrievalBootstrapCommand {
 pub(crate) struct RetrievalStatusCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]

@@ -1,4 +1,7 @@
-use crate::config::SidecarLayout;
+use crate::config::{
+    SidecarLayout, SidecarProfile, SidecarRuntimeConfig, sidecar_runtime_auto,
+    sidecar_runtime_for_project,
+};
 use crate::generation::{
     SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
     manifest_staleness_reason, manifest_unavailable_reason,
@@ -22,25 +25,56 @@ use std::path::Path;
 /// The file records local sidecar endpoints and data roots only. It is not a readiness manifest;
 /// callers must use `sidecar_status` or `strict_sidecar_status` before trusting retrieval output.
 pub struct SidecarStateFile {
+    #[serde(default = "default_sidecar_owner")]
+    pub owner: String,
+    #[serde(default = "default_sidecar_profile")]
+    pub profile: String,
+    #[serde(default = "default_sidecar_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_sidecar_namespace")]
+    pub compose_project: String,
     pub zoekt_http_port: u16,
     pub qdrant_http_port: u16,
     pub qdrant_grpc_port: u16,
+    #[serde(default = "default_embed_http_port")]
+    pub embed_http_port: u16,
+    #[serde(default = "default_embed_url")]
+    pub embed_url: String,
     pub zoekt_data_dir: String,
     pub qdrant_data_dir: String,
     pub scip_artifacts_root: String,
+    #[serde(default)]
+    pub compose_file: Option<String>,
+    #[serde(default)]
+    pub cleanup_command: String,
     pub started_at_epoch_ms: i64,
 }
 
 pub fn sidecar_up() -> Result<SidecarStateFile> {
-    let layout = SidecarLayout::from_env();
+    sidecar_up_with_runtime(&SidecarRuntimeConfig::local(), None)
+}
+
+pub fn sidecar_up_with_runtime(
+    runtime: &SidecarRuntimeConfig,
+    compose_file: Option<&Path>,
+) -> Result<SidecarStateFile> {
+    let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
     let state = SidecarStateFile {
+        owner: "codestory".into(),
+        profile: runtime.profile.as_str().into(),
+        namespace: runtime.namespace.clone(),
+        compose_project: runtime.compose_project.clone(),
         zoekt_http_port: layout.zoekt_http_port,
         qdrant_http_port: layout.qdrant_http_port,
         qdrant_grpc_port: layout.qdrant_grpc_port,
+        embed_http_port: runtime.embed_http_port,
+        embed_url: SidecarLayout::embed_base_url(runtime.embed_http_port),
         zoekt_data_dir: layout.zoekt_data_dir.display().to_string(),
         qdrant_data_dir: layout.qdrant_data_dir.display().to_string(),
         scip_artifacts_root: layout.scip_artifacts_root.display().to_string(),
+        compose_file: compose_file.map(|path| path.display().to_string()),
+        cleanup_command: runtime.cleanup_command.clone(),
         started_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
     let json = serde_json::to_string_pretty(&state).context("serialize sidecar state")?;
@@ -49,8 +83,25 @@ pub fn sidecar_up() -> Result<SidecarStateFile> {
 }
 
 pub fn sidecar_down() -> Result<()> {
-    let layout = SidecarLayout::from_env();
+    sidecar_down_for_runtime(&SidecarRuntimeConfig::local())
+}
+
+pub fn sidecar_down_for_project(project_root: &Path, profile: SidecarProfile) -> Result<()> {
+    sidecar_down_for_runtime(&sidecar_runtime_for_project(project_root, profile))
+}
+
+pub fn sidecar_down_for_runtime(runtime: &SidecarRuntimeConfig) -> Result<()> {
+    let layout = &runtime.layout;
     if layout.state_file.exists() {
+        if runtime.profile == SidecarProfile::Agent
+            && let Some(state) = std::fs::read_to_string(&layout.state_file)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
+            && state.owner == "codestory"
+            && state.namespace == runtime.namespace
+        {
+            crate::compose::docker_compose_down_for_state(&state)?;
+        }
         std::fs::remove_file(&layout.state_file).context("remove retrieval-sidecars.json")?;
     }
     Ok(())
@@ -77,12 +128,36 @@ pub fn strict_sidecar_status(
     sidecar_status_inner(project_root, storage_path, true)
 }
 
+pub fn strict_sidecar_status_for_profile(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    profile: SidecarProfile,
+) -> Result<RetrievalStatusReport> {
+    sidecar_status_inner_with_runtime(
+        project_root,
+        storage_path,
+        true,
+        sidecar_runtime_for_project(project_root, profile),
+    )
+}
+
 fn sidecar_status_inner(
     project_root: &Path,
     storage_path: Option<&Path>,
     strict: bool,
 ) -> Result<RetrievalStatusReport> {
-    let layout = SidecarLayout::from_env();
+    let runtime = sidecar_runtime_auto(project_root);
+    sidecar_status_inner_with_runtime(project_root, storage_path, strict, runtime)
+}
+
+fn sidecar_status_inner_with_runtime(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    strict: bool,
+    runtime: SidecarRuntimeConfig,
+) -> Result<RetrievalStatusReport> {
+    runtime.activate_embed_url_default();
+    let layout = runtime.layout.clone();
     let project_id = sidecar_project_id_for_root(project_root);
     let manifest = if let Some(path) = storage_path.filter(|path| path.exists()) {
         let storage = Store::open(path).context("open storage for manifest")?;
@@ -100,49 +175,72 @@ fn sidecar_status_inner(
             )
             .context("check strict sidecar readiness")?
         {
-            return Ok(enrich_status_with_semantic_doc_stats(
-                attach_repair_hint(
-                    attach_manifest_contract(
-                        crate::health::unavailable_status_report(
-                            format!("sidecar_manifest_stale: {reason}"),
-                            Some(manifest.clone()),
+            return Ok(attach_status_ownership(
+                enrich_status_with_semantic_doc_stats(
+                    attach_repair_hint(
+                        attach_manifest_contract(
+                            crate::health::unavailable_status_report(
+                                format!("sidecar_manifest_stale: {reason}"),
+                                Some(manifest.clone()),
+                            ),
+                            project_root,
                         ),
                         project_root,
                     ),
-                    project_root,
+                    &storage,
                 ),
-                &storage,
+                &runtime,
             ));
         }
         if let Some(manifest) = manifest.as_ref()
             && let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest)
         {
-            return Ok(enrich_status_with_semantic_doc_stats(
-                attach_repair_hint(
-                    attach_manifest_contract(
-                        crate::health::unavailable_status_report(reason, Some(manifest.clone())),
+            return Ok(attach_status_ownership(
+                enrich_status_with_semantic_doc_stats(
+                    attach_repair_hint(
+                        attach_manifest_contract(
+                            crate::health::unavailable_status_report(
+                                reason,
+                                Some(manifest.clone()),
+                            ),
+                            project_root,
+                        ),
                         project_root,
                     ),
-                    project_root,
+                    &storage,
                 ),
-                &storage,
+                &runtime,
             ));
         }
         let report = probe_sidecar_health(&layout, &project_id, manifest);
-        return Ok(enrich_status_with_semantic_doc_stats(
-            attach_repair_hint(attach_manifest_contract(report, project_root), project_root),
-            &storage,
+        return Ok(attach_status_ownership(
+            enrich_status_with_semantic_doc_stats(
+                attach_repair_hint(attach_manifest_contract(report, project_root), project_root),
+                &storage,
+            ),
+            &runtime,
         ));
     } else {
         None
     };
-    Ok(attach_repair_hint(
-        attach_manifest_contract(
-            probe_sidecar_health(&layout, &project_id, manifest),
+    Ok(attach_status_ownership(
+        attach_repair_hint(
+            attach_manifest_contract(
+                probe_sidecar_health(&layout, &project_id, manifest),
+                project_root,
+            ),
             project_root,
         ),
-        project_root,
+        &runtime,
     ))
+}
+
+fn attach_status_ownership(
+    mut report: RetrievalStatusReport,
+    runtime: &SidecarRuntimeConfig,
+) -> RetrievalStatusReport {
+    report.ownership = Some(runtime.ownership());
+    report
 }
 
 fn enrich_status_with_semantic_doc_stats(
@@ -291,6 +389,26 @@ fn manifest_contract_drift_should_win(reason: &str) -> bool {
     reason.contains("sidecar_embedding_backend_changed")
         || reason.contains("sidecar_embedding_dim_changed")
         || reason == SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED
+}
+
+fn default_sidecar_owner() -> String {
+    "codestory".into()
+}
+
+fn default_sidecar_profile() -> String {
+    "local".into()
+}
+
+fn default_sidecar_namespace() -> String {
+    "codestory".into()
+}
+
+fn default_embed_http_port() -> u16 {
+    crate::config::DEFAULT_EMBED_HTTP_PORT
+}
+
+fn default_embed_url() -> String {
+    SidecarLayout::embed_base_url(crate::config::DEFAULT_EMBED_HTTP_PORT)
 }
 
 #[cfg(test)]

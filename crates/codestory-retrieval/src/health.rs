@@ -1,6 +1,7 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
-    QDRANT_HEALTH_BUDGET, SidecarLayout, ZOEKT_HEALTH_BUDGET, qdrant_semantic_vectors_enabled,
+    QDRANT_HEALTH_BUDGET, SidecarLayout, SidecarOwnership, ZOEKT_HEALTH_BUDGET,
+    qdrant_semantic_vectors_enabled,
 };
 use crate::embeddings::manifest_embedding_backend_is_product;
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
@@ -72,6 +73,8 @@ pub struct RetrievalRepairHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<SidecarOwnership>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,6 +304,7 @@ pub fn unavailable_status_report(
         .and_then(|manifest| manifest.embedding_dim);
     RetrievalStatusReport {
         retrieval_mode: "unavailable".into(),
+        ownership: None,
         degraded_reason: Some(reason.clone()),
         repair: None,
         query_embedding_backend: crate::embeddings::embedding_runtime_id(),
@@ -575,6 +579,7 @@ pub fn probe_sidecar_health(
 
     RetrievalStatusReport {
         retrieval_mode: mode.as_str().into(),
+        ownership: None,
         degraded_reason,
         repair: None,
         query_embedding_backend: current_embedding_backend,
@@ -789,6 +794,7 @@ mod tests {
         };
         let report = RetrievalStatusReport {
             retrieval_mode: "full".into(),
+            ownership: None,
             degraded_reason: None,
             query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
             manifest_vector_embedding_backend: manifest.embedding_backend.clone(),

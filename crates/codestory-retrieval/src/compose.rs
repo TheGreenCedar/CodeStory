@@ -1,10 +1,12 @@
-use crate::config::{SidecarLayout, retrieval_compose_profile, user_cache_root};
+use crate::config::{
+    SidecarLayout, SidecarProfile, SidecarRuntimeConfig, retrieval_compose_profile, user_cache_root,
+};
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
 use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
     repair_qdrant_storage,
 };
-use crate::sidecar::{SidecarStateFile, sidecar_up};
+use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,7 +34,27 @@ pub fn bootstrap_sidecars(
     skip_compose: bool,
     wait_timeout: Duration,
 ) -> Result<BootstrapReport> {
-    let layout = SidecarLayout::from_env();
+    bootstrap_sidecars_with_profile(
+        repo_root,
+        storage_scope,
+        compose_file,
+        skip_compose,
+        wait_timeout,
+        SidecarProfile::Local,
+    )
+}
+
+pub fn bootstrap_sidecars_with_profile(
+    repo_root: Option<&Path>,
+    storage_scope: &BootstrapStorageScope,
+    compose_file: Option<&Path>,
+    skip_compose: bool,
+    wait_timeout: Duration,
+    profile: SidecarProfile,
+) -> Result<BootstrapReport> {
+    let runtime = SidecarRuntimeConfig::for_project_profile(repo_root, profile);
+    let layout = runtime.layout.clone();
+    runtime.activate_embed_url_default();
     layout.ensure_data_dirs()?;
     let storage_repair =
         repair_qdrant_storage(&layout, storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
@@ -44,13 +66,13 @@ pub fn bootstrap_sidecars(
     };
 
     let compose_started = if let Some(path) = resolved_compose.as_ref() {
-        docker_compose_up(path, repo_root, &layout)?;
+        docker_compose_up(path, repo_root, &runtime)?;
         true
     } else {
         false
     };
 
-    let state = sidecar_up()?;
+    let state = sidecar_up_with_runtime(&runtime, resolved_compose.as_deref())?;
     let infrastructure = if wait_timeout.is_zero() {
         probe_infrastructure_health(&layout)
     } else {
@@ -155,8 +177,9 @@ pub fn docker_available() -> bool {
 fn docker_compose_up(
     compose_file: &Path,
     repo_root: Option<&Path>,
-    layout: &SidecarLayout,
+    runtime: &SidecarRuntimeConfig,
 ) -> Result<()> {
+    let layout = &runtime.layout;
     if !docker_available() {
         bail!(
             "docker is not available on PATH. Install Docker Desktop (Windows) or Docker Engine, \
@@ -190,6 +213,8 @@ fn docker_compose_up(
     remove_container_if_present("codestory-zoekt-stub")?;
     command
         .arg("compose")
+        .arg("-p")
+        .arg(&runtime.compose_project)
         .arg("-f")
         .arg(compose_file)
         .arg("up")
@@ -216,6 +241,14 @@ fn docker_compose_up(
             "CODESTORY_EMBED_MODEL_DIR",
             docker_bind_path(&embed_model_dir(repo_root, layout)),
         )
+        .env("CODESTORY_EMBED_PORT", runtime.embed_http_port.to_string())
+        .env(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            SidecarLayout::embed_base_url(runtime.embed_http_port),
+        )
+        .env("CODESTORY_SIDECAR_NAMESPACE", &runtime.namespace)
+        .env("CODESTORY_SIDECAR_PROFILE", runtime.profile.as_str())
+        .env("CODESTORY_SIDECAR_OWNER", "codestory")
         .env("COMPOSE_PROFILES", compose_profile);
 
     let output = command.output().context("spawn docker compose")?;
@@ -224,6 +257,38 @@ fn docker_compose_up(
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
             "docker compose up failed (exit {:?}):\n{stdout}{stderr}",
+            output.status.code()
+        );
+    }
+    Ok(())
+}
+
+pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
+    if state.owner != "codestory" || state.profile != SidecarProfile::Agent.as_str() {
+        return Ok(());
+    }
+    let Some(compose_file) = state.compose_file.as_ref().map(PathBuf::from) else {
+        return Ok(());
+    };
+    if !compose_file.is_file() || !docker_available() {
+        return Ok(());
+    }
+    let output = docker_compose_command()?
+        .arg("compose")
+        .arg("-p")
+        .arg(&state.compose_project)
+        .arg("-f")
+        .arg(&compose_file)
+        .arg("down")
+        .arg("--remove-orphans")
+        .output()
+        .context("spawn docker compose down")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "docker compose down failed for owned sidecar namespace {} (exit {:?}):\n{stdout}{stderr}",
+            state.namespace,
             output.status.code()
         );
     }
@@ -355,7 +420,7 @@ mod tests {
 
         assert_eq!(path, cache.path().join("retrieval-compose.yml"));
         let contents = std::fs::read_to_string(path).expect("read bundled compose");
-        assert!(contents.contains("name: codestory-retrieval"));
+        assert!(contents.contains("name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}"));
         assert!(contents.contains("qdrant/qdrant:v1.12.5"));
     }
 

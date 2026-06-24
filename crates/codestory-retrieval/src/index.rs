@@ -115,7 +115,7 @@ pub fn repair_project_qdrant_collection(
         }));
     }
 
-    let layout = SidecarLayout::from_env();
+    let layout = SidecarLayout::from_env_for_project(project_root);
     layout.ensure_data_dirs()?;
     let qdrant_client = QdrantClient::new(&layout);
     let probe = qdrant_client.health_probe(&manifest.qdrant_collection);
@@ -179,7 +179,7 @@ pub fn repair_project_qdrant_collection(
 }
 
 pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<FinalizeIndexOutcome> {
-    let layout = SidecarLayout::from_env();
+    let layout = SidecarLayout::from_env_for_project(project_root);
     layout.ensure_data_dirs()?;
 
     let project_id = sidecar_project_id_for_root(project_root);
