@@ -731,11 +731,28 @@ fn handle_stdio_tool_call(
         "files" => handle_stdio_files(runtime, request),
         "affected" => handle_stdio_affected(runtime, request),
         "symbol" => handle_stdio_symbol(runtime, request),
-        "trail" => handle_stdio_trail(runtime, request),
+        "trail" => handle_stdio_trail(runtime, request, false),
+        "callers" => handle_stdio_neighbors(
+            runtime,
+            request,
+            "callers",
+            1,
+            50,
+            Some(TrailDirection::Incoming),
+        ),
+        "callees" => handle_stdio_neighbors(
+            runtime,
+            request,
+            "callees",
+            1,
+            50,
+            Some(TrailDirection::Outgoing),
+        ),
+        "trace" => handle_stdio_trail(runtime, request, true),
         "get_node" => handle_stdio_get_node(runtime, request),
-        "neighbors" => handle_stdio_neighbors(runtime, request, "neighbors", 1, 50),
+        "neighbors" => handle_stdio_neighbors(runtime, request, "neighbors", 1, 50, None),
         "shortest_path" => handle_stdio_shortest_path(runtime, request),
-        "query_subgraph" => handle_stdio_neighbors(runtime, request, "query_subgraph", 2, 80),
+        "query_subgraph" => handle_stdio_neighbors(runtime, request, "query_subgraph", 2, 80, None),
         "definition" => handle_stdio_definition(runtime, request),
         "references" => handle_stdio_references(runtime, request),
         "symbols" => handle_stdio_symbols(runtime, request),
@@ -1457,7 +1474,11 @@ fn handle_stdio_symbol(runtime: &RuntimeContext, request: &serde_json::Value) ->
         )
 }
 
-fn handle_stdio_trail(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
+fn handle_stdio_trail(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+    default_story: bool,
+) -> serde_json::Value {
     let direction = match request
         .pointer("/params/arguments/direction")
         .and_then(|value| value.as_str())
@@ -1471,21 +1492,16 @@ fn handle_stdio_trail(runtime: &RuntimeContext, request: &serde_json::Value) -> 
         .and_then(|value| value.as_u64())
         .map(|value| value.min(BROWSER_TRAIL_MAX_DEPTH as u64) as u32)
         .unwrap_or(BROWSER_TRAIL_DEFAULT_DEPTH);
+    let max_nodes = stdio_graph_u32_arg(request, "max_nodes", 120, 1, 120);
     let story = request
         .pointer("/params/arguments/story")
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(default_story);
     resolve_target(runtime, stdio_target_selection(request), None)
         .and_then(|target| {
-            runtime
-                .browser
-                .trail_context(browser_trail_config(
-                    target.selected.node_id,
-                    depth,
-                    direction,
-                    story,
-                ))
-                .map_err(map_api_error)
+            let mut config = browser_trail_config(target.selected.node_id, depth, direction, story);
+            config.max_nodes = max_nodes;
+            runtime.browser.trail_context(config).map_err(map_api_error)
         })
         .map(|result| serde_json::json!({"result": result}))
         .unwrap_or_else(
@@ -1575,8 +1591,9 @@ fn handle_stdio_neighbors(
     tool_name: &str,
     default_depth: u32,
     default_max_nodes: u32,
+    fixed_direction: Option<TrailDirection>,
 ) -> serde_json::Value {
-    let direction = stdio_graph_direction(request);
+    let direction = fixed_direction.unwrap_or_else(|| stdio_graph_direction(request));
     let depth = stdio_graph_u32_arg(request, "depth", default_depth, 0, 3);
     let max_nodes = stdio_graph_u32_arg(request, "max_nodes", default_max_nodes, 1, 120);
     resolve_target(runtime, stdio_target_selection(request), None)
@@ -2673,10 +2690,13 @@ fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Valu
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
+        "trace",
         "trail",
         "references",
         "snippet",
@@ -2747,7 +2767,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             {
                 "readiness_goal": "local_navigation",
                 "condition": "Use only surfaces whose codestory://status allowed_surfaces.<surface>.allowed value is true.",
-                "surfaces": ["ground", "files", "symbol", "definition", "get_node", "neighbors", "shortest_path", "query_subgraph", "symbols", "snippet", "references", "trail", "affected"],
+                "surfaces": ["ground", "files", "symbol", "definition", "get_node", "callers", "callees", "neighbors", "shortest_path", "query_subgraph", "symbols", "snippet", "references", "trace", "trail", "affected"],
                 "calls": [
                     {
                         "method": "tools/call",

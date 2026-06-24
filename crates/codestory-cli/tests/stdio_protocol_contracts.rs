@@ -840,6 +840,8 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         tool_names,
         vec![
             "affected",
+            "callees",
+            "callers",
             "context",
             "definition",
             "files",
@@ -854,6 +856,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             "snippet",
             "symbol",
             "symbols",
+            "trace",
             "trail",
         ],
         "stdio browser tool names should stay stable and read-only: {tools}"
@@ -1216,6 +1219,11 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "trail.depth should document the stdio default: {trail}"
     );
     assert_eq!(
+        schema_property(trail, "max_nodes").get("maximum"),
+        Some(&json!(120)),
+        "trail.max_nodes should document the stdio hard cap: {trail}"
+    );
+    assert_eq!(
         schema_property(trail, "story")["type"],
         "boolean",
         "trail.story should be a boolean opt-in: {trail}"
@@ -1224,6 +1232,30 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         schema_property(trail, "story").get("default"),
         Some(&json!(false)),
         "trail.story should document the stdio default: {trail}"
+    );
+    for name in ["callers", "callees"] {
+        let alias = tool_input_schema(&tools, name);
+        assert_eq!(
+            schema_property(alias, "depth").get("default"),
+            Some(&json!(1)),
+            "{name}.depth should document the bounded alias default: {alias}"
+        );
+        assert_eq!(
+            schema_property(alias, "max_nodes").get("maximum"),
+            Some(&json!(120)),
+            "{name}.max_nodes should document the stdio hard cap: {alias}"
+        );
+    }
+    let trace = tool_input_schema(&tools, "trace");
+    assert_eq!(
+        schema_property(trace, "story").get("default"),
+        Some(&json!(true)),
+        "trace.story should default to readable output: {trace}"
+    );
+    assert_eq!(
+        schema_property(trace, "max_nodes").get("maximum"),
+        Some(&json!(120)),
+        "trace.max_nodes should document the stdio hard cap: {trace}"
     );
 
     let context = tool_input_schema(&tools, "context");
@@ -1271,6 +1303,8 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
 
     for name in [
         "affected",
+        "callees",
+        "callers",
         "context",
         "definition",
         "files",
@@ -1281,6 +1315,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "snippet",
         "symbol",
         "symbols",
+        "trace",
         "trail",
     ] {
         let tool = tool_by_name(&tools, name);
@@ -2087,10 +2122,13 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
+        "trace",
         "trail",
         "references",
         "snippet",
@@ -2507,12 +2545,15 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
         "snippet",
         "references",
+        "trace",
         "trail",
         "affected",
     ] {

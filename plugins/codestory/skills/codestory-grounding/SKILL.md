@@ -49,7 +49,7 @@ Use status fields this way:
 | `sidecar_contract_version` | Sidecar schema contract compiled into the active CLI. | Use to diagnose sidecar/runtime contract drift. |
 | `plugin_runtime` | Plugin launch source and managed CLI metadata, including `plugin_runtime.plugin_root`, `plugin_cache_version`, `build_source`, and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `path_fallback` as degraded launch evidence. |
 | `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Ask before first automatic sidecar setup; respect `enabled` and `disabled`. |
-| `allowed_surfaces.<surface>.allowed` | A concrete MCP surface is allowed. | Use local graph entries such as `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` only when their surface is allowed. |
+| `allowed_surfaces.<surface>.allowed` | A concrete MCP surface is allowed. | Use local graph entries such as `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` only when their surface is allowed. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Sidecar-backed agent surfaces are allowed. | Use `packet`, `search`, and `context` confidently when their own allowed bit is true and `retrieval_mode=full`. |
 
 Use `where.exe codestory-cli`, `codestory-cli --version`, release install, or
@@ -78,7 +78,7 @@ When the plugin MCP server is available:
    calls.
 5. Read `codestory://grounding` or call `ground` when
    `allowed_surfaces.ground.allowed` is true.
-6. Use `files`, `symbol`, `definition`, `trail`, `references`, `snippet`,
+6. Use `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`,
    `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and
    `query_subgraph` only when each corresponding surface is allowed.
 7. Use `packet` only when `allowed_surfaces.packet.allowed` is true and
@@ -109,7 +109,7 @@ CLI directly:
 4. `ground --project <target-workspace> --why` for compact orientation.
 5. `files --project <target-workspace>` for indexed file inventory.
 6. `symbol`, `trail --story --hide-speculative`, `snippet`, `files`, `symbols`,
-   `get_node`, `neighbors`, `shortest_path`, `query_subgraph`, and `affected`
+   `get_node`, `callers`, `callees`, `neighbors`, `shortest_path`, `query_subgraph`, `trace`, and `affected`
    for concrete local graph follow-up.
 7. `search --project <target-workspace> --query ... --why` for candidate
    discovery after sidecars are full.
@@ -148,10 +148,10 @@ inventory when one status field or one graph target will answer the question.
 | Stuck situation | Route |
 | --- | --- |
 | Orientation: "What is in this checkout?" | MCP `ground` / `codestory://grounding` or CLI `ground`; use `files` for language mix or incomplete coverage. |
-| Implementation start: "Where do I edit?" | `symbol` for a concrete feature/type, then `trail --story --hide-speculative` after a node is selected. |
+| Implementation start: "Where do I edit?" | `symbol` for a concrete feature/type, then `callers`, `callees`, `trace`, or `trail --story --hide-speculative` after a node is selected. |
 | Symbol impact: "What might this change touch?" | `affected` with changed files from git; treat output as review/test planning, not proof. |
 | Test choice: "Which verification is smallest?" | `affected`, nearby repo docs, and touched test names before broader test lanes. |
-| Source snippet: "Show me the relevant code." | `snippet --id <node-id> --function-body --lines <n>`; follow truncation guidance or read source directly if capped. |
+| Source snippet: "Show me the relevant code." | `snippet --id <node-id> --function-body --lines <n>`; use `callers`, `callees`, or `trace` when relationships matter; follow truncation guidance or read source directly if capped. |
 | Readiness: "Can I trust CodeStory now?" | `codestory://status` when MCP is live; CLI `agent preflight --project <target-workspace> --format json` when MCP is unavailable. |
 | Repair: "A surface is blocked." | `ready --goal local --repair` for local graph; `ready --goal agent --repair` for `packet`, `search`, or `context`; use `doctor` and `retrieval status` as proof after repair. |
 | Broad evidence: "I need a packet/search answer." | `packet`, `search`, or `context` only when that surface is allowed and `retrieval_mode=full`. |

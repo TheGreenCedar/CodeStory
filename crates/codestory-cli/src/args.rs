@@ -87,6 +87,12 @@ pub(crate) enum Command {
     Symbol(SymbolCommand),
     #[command(about = "Trace calls, refs, and related symbols.")]
     Trail(TrailCommand),
+    #[command(about = "Show incoming callers for a symbol.")]
+    Callers(TrailCommand),
+    #[command(about = "Show outgoing callees for a symbol.")]
+    Callees(TrailCommand),
+    #[command(about = "Show a readable trace around a symbol.")]
+    Trace(TrailCommand),
     #[command(about = "Show source around a symbol.")]
     Snippet(SnippetCommand),
     #[command(about = "Run structured graph queries.")]
@@ -2478,8 +2484,8 @@ mod tests {
     #[test]
     fn read_commands_explain_refresh_none_default() {
         for name in [
-            "ground", "context", "search", "symbol", "trail", "snippet", "query", "explore",
-            "serve",
+            "ground", "context", "search", "symbol", "trail", "callers", "callees", "trace",
+            "snippet", "query", "explore", "serve",
         ] {
             let help = render_subcommand_help(name);
             assert!(
