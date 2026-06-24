@@ -1431,12 +1431,16 @@ fn resolve_sidecar_candidates_with_stats(
 
 fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
     let provenance = candidate_provenance_labels(candidate);
-    let (lexical, semantic, graph) = match candidate.source {
-        CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
-        CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
-        CandidateSource::Scip => (0.0, 0.0, candidate.score),
-        CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
-    };
+    let (lexical, semantic, graph) = candidate
+        .rank_features
+        .as_ref()
+        .map(|features| (features.lexical, features.semantic, features.scip_distance))
+        .unwrap_or_else(|| match candidate.source {
+            CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+            CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
+            CandidateSource::Scip => (0.0, 0.0, candidate.score),
+            CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
+        });
     RetrievalScoreBreakdownDto {
         lexical,
         semantic,
@@ -1723,6 +1727,43 @@ mod tests {
         assert_eq!(shadow.stage_timings[0].stage, "stage1_zoekt_lexical");
         assert_eq!(shadow.candidates.len(), 2);
         assert_eq!(shadow.would_rank, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn score_breakdown_reports_fused_rank_features_and_provenance() {
+        let mut candidate = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.91,
+            CandidateSource::Zoekt,
+        );
+        candidate.provenance = vec![
+            "lexical_source".into(),
+            "dense_anchor".into(),
+            "graph_neighbor".into(),
+        ];
+        candidate.rank_features = Some(codestory_retrieval::RankFeatures {
+            lexical: 0.91,
+            semantic: 0.82,
+            scip_distance: 0.5,
+            file_role_prior: 0.72,
+            definition_quality: 0.85,
+            token_overlap: 0.25,
+        });
+
+        let breakdown = score_breakdown_for_candidate(&candidate);
+
+        assert_eq!(breakdown.lexical, 0.91);
+        assert_eq!(breakdown.semantic, 0.82);
+        assert_eq!(breakdown.graph, 0.5);
+        assert_eq!(
+            breakdown.provenance,
+            vec![
+                "lexical_source".to_string(),
+                "dense_anchor".to_string(),
+                "graph_neighbor".to_string()
+            ]
+        );
     }
 
     #[test]

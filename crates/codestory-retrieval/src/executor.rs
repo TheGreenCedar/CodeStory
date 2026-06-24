@@ -546,6 +546,12 @@ fn merge_candidates(acc: &mut Vec<CandidateHit>, incoming: Vec<CandidateHit>) ->
             if existing.start_line.is_none() {
                 existing.start_line = hit.start_line;
             }
+            if existing.file_role.is_none() {
+                existing.file_role = hit.file_role;
+            }
+            if existing.scip_hop_distance.is_none() {
+                existing.scip_hop_distance = hit.scip_hop_distance;
+            }
             for label in hit.provenance {
                 existing.add_provenance(label);
             }
@@ -1485,6 +1491,13 @@ mod tests {
     #[test]
     fn executor_merges_duplicate_candidate_provenance() {
         let query = "how extension service starts";
+        let mut graph_hit = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.75,
+            CandidateSource::Scip,
+        );
+        graph_hit.scip_hop_distance = Some(1);
         let mock = MockSidecarSearch {
             zoekt: Mutex::new(HashMap::from([(
                 query.into(),
@@ -1504,12 +1517,7 @@ mod tests {
                     CandidateSource::Qdrant,
                 )],
             )])),
-            scip_expand: Mutex::new(vec![CandidateHit::with_source(
-                "src/service.rs",
-                Some("ExtensionService".into()),
-                0.75,
-                CandidateSource::Scip,
-            )]),
+            scip_expand: Mutex::new(vec![graph_hit]),
             ..Default::default()
         };
         let mut cache = RetrievalCache::new();
@@ -1531,8 +1539,13 @@ mod tests {
             hit.score > 0.70,
             "merged candidate should keep ranker-adjusted score above lexical-only input: {hit:?}"
         );
+        assert!(hit.provenance.iter().any(|label| label == "lexical_source"));
         assert!(hit.provenance.iter().any(|label| label == "graph_neighbor"));
         assert!(hit.provenance.iter().any(|label| label == "dense_anchor"));
+        let rank_features = hit.rank_features.as_ref().expect("rank features");
+        assert!(rank_features.lexical >= 0.85);
+        assert!(rank_features.semantic >= 0.85);
+        assert_eq!(rank_features.scip_distance, 0.5);
     }
 
     #[test]

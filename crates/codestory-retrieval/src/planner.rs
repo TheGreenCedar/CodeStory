@@ -31,7 +31,7 @@ impl RetrievalStageKind {
     pub fn provenance_label(self) -> Option<&'static str> {
         match self {
             RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
-            RetrievalStageKind::Stage1ZoektLexical => None,
+            RetrievalStageKind::Stage1ZoektLexical => Some("lexical_source"),
             RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
             RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
             RetrievalStageKind::Stage3RepoTextFallback => None,
@@ -232,7 +232,11 @@ mod tests {
     fn stage_kind_metadata_matches_sidecar_stage_contract() {
         let cases = [
             (RetrievalStageKind::Stage0ScipAnchor, Some("exact"), true),
-            (RetrievalStageKind::Stage1ZoektLexical, None, true),
+            (
+                RetrievalStageKind::Stage1ZoektLexical,
+                Some("lexical_source"),
+                true,
+            ),
             (
                 RetrievalStageKind::Stage1bQdrantSemantic,
                 Some("dense_anchor"),
