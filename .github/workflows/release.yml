@@ -122,6 +122,25 @@ jobs:
           rustup default stable
           rustup target add "${{ matrix.rust_target }}"
 
+      - name: Capture Rust cache key
+        id: rust-cache-key
+        shell: bash
+        run: |
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo registry, git sources, and build output
+        id: cargo-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-stable-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-stable-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
+
       - name: Build codestory-cli
         run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
 
@@ -162,7 +181,7 @@ jobs:
             --out-dir target/release-dist
 
       - name: Upload release asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: codestory-cli-${{ matrix.asset_target }}
           path: |
@@ -170,6 +189,17 @@ jobs:
             target/release-dist/*.zip
             target/release-dist/*.sha256
           if-no-files-found: error
+
+      - name: Save Cargo registry, git sources, and build output
+        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
 
   publish:
     name: Publish GitHub release
@@ -187,7 +217,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: target/release-assets
           pattern: codestory-cli-*
