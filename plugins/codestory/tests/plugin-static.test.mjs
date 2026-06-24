@@ -121,7 +121,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
   const { spawnSync } = await import("node:child_process");
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-cli-"));
   const outFile = join(dataDir, "env.json");
-  const cliDir = join(dataDir, "codestory-cli", "0.11.15");
+  const cliDir = join(dataDir, "codestory-cli", "0.11.16");
   const cliPath = join(
     cliDir,
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
@@ -169,7 +169,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     return;
   }
 
-  const version = "0.11.15";
+  const version = "0.11.16";
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
   const outFile = join(dataDir, "env.json");
@@ -215,7 +215,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     assert.equal(observed.repoRef, `v${version}`);
     assert.equal(observed.buildSource, "github_release");
     assert.equal(observed.archiveSha256, archiveSha256);
-    assert.match(observed.path, /codestory-cli[\\/]+0\.11\.15[\\/]bin[\\/]codestory-cli/u);
+    assert.match(observed.path, /codestory-cli[\\/]+0\.11\.16[\\/]bin[\\/]codestory-cli/u);
     assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none"]);
 
     const manifest = JSON.parse(
