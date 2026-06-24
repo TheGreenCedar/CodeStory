@@ -1981,11 +1981,13 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     } else {
         RuntimeContext::new_inspect_only(&cmd.project)?
     };
-    if cmd.repair {
-        repair_ready_state(&runtime, cmd.goal)?;
-    }
+    let repaired_sidecar = if cmd.repair {
+        repair_ready_state(&runtime, cmd.goal)?
+    } else {
+        None
+    };
     let summary = runtime.open_project_summary()?;
-    let sidecar = ready_sidecar_status(&runtime, cmd.goal, cmd.repair);
+    let sidecar = ready_sidecar_status(&runtime, repaired_sidecar);
     let mut verdicts = build_summary_readiness(
         &summary.root,
         &summary.stats,
@@ -2024,11 +2026,14 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -> Result<()> {
+fn repair_ready_state(
+    runtime: &RuntimeContext,
+    goal: Option<args::ReadyGoal>,
+) -> Result<Option<codestory_retrieval::SidecarRuntimeConfig>> {
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
     if !matches!(goal, None | Some(args::ReadyGoal::Agent)) {
-        return Ok(());
+        return Ok(None);
     }
 
     let storage_scope = codestory_retrieval::BootstrapStorageScope::from_parts(
@@ -2065,10 +2070,10 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
     codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
-        sidecar,
+        sidecar.clone(),
     )
     .context("ready repair final retrieval status")?;
-    Ok(())
+    Ok(Some(sidecar))
 }
 
 fn ensure_ready_repair_embed_liveness(
@@ -9490,14 +9495,9 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
 
 fn ready_sidecar_status(
     runtime: &RuntimeContext,
-    goal: Option<args::ReadyGoal>,
-    repaired: bool,
+    repaired_sidecar: Option<codestory_retrieval::SidecarRuntimeConfig>,
 ) -> DoctorSidecarStatusOutput {
-    if repaired && matches!(goal, None | Some(args::ReadyGoal::Agent)) {
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project(
-            &runtime.project_root,
-            codestory_retrieval::SidecarProfile::Agent,
-        );
+    if let Some(sidecar) = repaired_sidecar {
         return doctor_sidecar_status_for_runtime(runtime, sidecar);
     }
     doctor_sidecar_status(runtime)

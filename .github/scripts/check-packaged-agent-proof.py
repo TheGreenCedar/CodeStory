@@ -153,6 +153,13 @@ def require_retrieval_full(payload: object, layer: str, artifact: Path) -> None:
     require(mode == "full", layer, artifact, f"retrieval_mode is {mode!r}, expected 'full'")
 
 
+def require_retrieval_index_ready(payload: object, layer: str, artifact: Path) -> None:
+    require(isinstance(payload, dict), layer, artifact, "retrieval index output is not a JSON object")
+    for field in ["zoekt_stubbed", "qdrant_stubbed", "scip_stubbed"]:
+        value = payload.get(field)
+        require(value is False, layer, artifact, f"{field} is {value!r}, expected False")
+
+
 def require_search_full(payload: object, artifact: Path) -> None:
     shadow = payload.get("retrieval_shadow") if isinstance(payload, dict) else None
     mode = shadow.get("retrieval_mode") if isinstance(shadow, dict) else None
@@ -422,6 +429,76 @@ def run_gate(args: argparse.Namespace) -> None:
         summary["artifacts"]["version"] = str(version_artifact)
         write_json(out_dir / "summary.json", summary)
 
+        local_bootstrap_artifact = out_dir / "local-retrieval-bootstrap.json"
+        run_command(
+            cli,
+            "local_retrieval_bootstrap",
+            [
+                "retrieval",
+                "bootstrap",
+                "--project",
+                str(project),
+                "--profile",
+                "local",
+                "--format",
+                "json",
+                "--output-file",
+                str(local_bootstrap_artifact),
+            ],
+            local_bootstrap_artifact,
+            args.timeout_secs,
+        )
+        summary["artifacts"]["local_retrieval_bootstrap"] = str(local_bootstrap_artifact)
+        write_json(out_dir / "summary.json", summary)
+
+        local_index_artifact = out_dir / "local-retrieval-index.json"
+        local_index = run_command(
+            cli,
+            "local_retrieval_index",
+            [
+                "retrieval",
+                "index",
+                "--project",
+                str(project),
+                "--profile",
+                "local",
+                "--refresh",
+                "full",
+                "--format",
+                "json",
+                "--output-file",
+                str(local_index_artifact),
+            ],
+            local_index_artifact,
+            args.timeout_secs,
+        )
+        require_retrieval_index_ready(local_index, "local_retrieval_index", local_index_artifact)
+        summary["artifacts"]["local_retrieval_index"] = str(local_index_artifact)
+        write_json(out_dir / "summary.json", summary)
+
+        local_status_artifact = out_dir / "local-retrieval-status.json"
+        local_status = run_command(
+            cli,
+            "local_retrieval_status",
+            [
+                "retrieval",
+                "status",
+                "--project",
+                str(project),
+                "--profile",
+                "local",
+                "--format",
+                "json",
+                "--output-file",
+                str(local_status_artifact),
+            ],
+            local_status_artifact,
+            args.timeout_secs,
+        )
+        require_retrieval_full(local_status, "local_retrieval_status", local_status_artifact)
+        summary["artifacts"]["local_retrieval_status"] = str(local_status_artifact)
+        write_json(out_dir / "summary.json", summary)
+
         ready_artifact = out_dir / "ready.json"
         ready = run_command(
             cli,
@@ -534,7 +611,7 @@ def run_gate(args: argparse.Namespace) -> None:
                 "--question",
                 args.question,
                 "--budget",
-                "tiny",
+                "compact",
                 "--format",
                 "json",
                 "--output-file",
@@ -579,7 +656,7 @@ def write_fake_cli(path: Path) -> None:
                 raise SystemExit(0)
             layer = sys.argv[1]
             if layer == "retrieval" and len(sys.argv) > 2:
-                layer = "retrieval_status"
+                layer = "retrieval_" + sys.argv[2].replace("-", "_")
             if fail == f"{layer}_stderr":
                 print("forced stderr failure", file=sys.stderr)
                 raise SystemExit(3)
@@ -590,6 +667,10 @@ def write_fake_cli(path: Path) -> None:
                 emit({"verdicts": [{"goal": "agent_packet_search", "status": "ready"}]})
             elif layer == "doctor":
                 emit({"retrieval_mode": "full"})
+            elif layer == "retrieval_bootstrap":
+                emit({"project_status": {"retrieval_mode": "unavailable"}})
+            elif layer == "retrieval_index":
+                emit({"zoekt_stubbed": False, "qdrant_stubbed": False, "scip_stubbed": False})
             elif layer == "retrieval_status":
                 emit({"retrieval_mode": "full"})
             elif layer == "search":
