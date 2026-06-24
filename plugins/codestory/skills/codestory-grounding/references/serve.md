@@ -9,11 +9,13 @@ codestory-cli serve --stdio --refresh none
 ```
 
 The installed plugin starts `scripts/codestory-mcp.cjs`, which prefers a
-checksummed plugin-managed CLI and only falls back to `PATH` when no managed
+checksummed plugin-managed CLI, provisions the current version from
+`github_release` when needed, and only falls back to `PATH` when no managed
 binary is available. Once MCP is live, `codestory://status` is the runtime
-truth: use `server_version`, `server_executable`, `server_executable_sha256`,
-`plugin_runtime`, and `allowed_surfaces` from status before any local grounding,
-packet, or search call.
+truth: use `server_version`, `cli_version`, `server_executable`,
+`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
+`allowed_surfaces` from status before any local grounding, packet, or search
+call.
 
 ## Usage
 
@@ -56,8 +58,10 @@ packet, or search call.
 | Status field | Use |
 |--------------|-----|
 | `server_version` | Active MCP server version. Prefer this over source checkout or package version once MCP is live. |
+| `cli_version` | Active CLI runtime version. |
 | `server_executable` / `server_executable_sha256` | Active MCP server executable path and checksum. Use them to diagnose stale runtime or binary drift. |
-| `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. |
+| `sidecar_contract_version` | Active sidecar schema contract version compiled into the CLI. |
+| `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. Provisioned records include `build_source=github_release` and `repo_ref`. |
 | `runtime_boundary` | Restart/reload reminder for changes to the managed binary, override, or PATH. |
 | `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |

@@ -1967,6 +1967,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         json!(env!("CARGO_PKG_VERSION")),
         "status should identify the serving package version: {status}"
     );
+    assert_eq!(
+        status["cli_version"],
+        json!(env!("CARGO_PKG_VERSION")),
+        "status should identify the active CLI version: {status}"
+    );
+    assert!(
+        status["sidecar_contract_version"].is_number(),
+        "status should expose the sidecar contract version: {status}"
+    );
+    assert!(
+        status["sidecar_retrieval"]["sidecar_contract_version"].is_number(),
+        "sidecar status should expose the sidecar contract version: {status}"
+    );
     assert!(
         status["server_executable"]
             .as_str()

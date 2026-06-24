@@ -2003,6 +2003,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     let sidecar = serde_json::json!({
         "retrieval_mode": sidecar_mode.clone(),
         "degraded_reason": degraded_reason.clone(),
+        "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "manifest_generation": manifest_generation.clone(),
         "manifest_input_hash": manifest_input_hash.clone(),
     });
@@ -2026,8 +2027,10 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness);
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
+        "cli_version": env!("CARGO_PKG_VERSION"),
         "server_executable": server_executable,
         "server_executable_sha256": server_executable_sha256,
+        "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "plugin_runtime": plugin_runtime,
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
@@ -2342,9 +2345,15 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         .unwrap_or_default();
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
+        "cli_version": env_nonempty("CODESTORY_PLUGIN_CLI_VERSION"),
         "cli_source": cli_source,
         "cli_path": env_nonempty("CODESTORY_PLUGIN_CLI_PATH"),
         "cli_sha256": env_nonempty("CODESTORY_PLUGIN_CLI_SHA256"),
+        "build_source": env_nonempty("CODESTORY_PLUGIN_CLI_BUILD_SOURCE"),
+        "repo_ref": env_nonempty("CODESTORY_PLUGIN_CLI_REPO_REF"),
+        "archive_sha256": env_nonempty("CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256"),
+        "archive_url": env_nonempty("CODESTORY_PLUGIN_CLI_ARCHIVE_URL"),
+        "provisioned_at": env_nonempty("CODESTORY_PLUGIN_CLI_PROVISIONED_AT"),
         "local_dev_override": cli_source == "local_dev_override",
         "path_fallback": cli_source == "path_fallback",
         "managed_binary_path": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_PATH") } else { None },

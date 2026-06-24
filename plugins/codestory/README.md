@@ -50,7 +50,7 @@ running server.
 | --- | --- | --- |
 | `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
-| `codestory://status` fields | Current `server_version`, `server_executable`, `server_executable_sha256`, `plugin_runtime`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
+| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and `allowed_surfaces`. | Guessing active runtime from source checkout or PATH alone. |
 
 ## How It Runs
 
@@ -58,9 +58,11 @@ This package stays thin:
 
 - `.codex-plugin/plugin.json` describes the Codex plugin package.
 - `.mcp.json` launches `scripts/codestory-mcp.cjs`, which prefers a
-  checksummed plugin-managed CLI from plugin data, labels `CODESTORY_CLI` as a
-  local-dev override, and only falls back to `PATH` when no managed binary is
-  available.
+  checksummed plugin-managed CLI from plugin data. If none exists, the adapter
+  provisions the current plugin version from the GitHub release
+  `SHA256SUMS.txt`, records `build_source=github_release` and `repo_ref`, labels
+  `CODESTORY_CLI` as a local-dev override, and only falls back to `PATH` when
+  provisioning is unavailable.
 - `hooks/` keeps CodeStory ambient for host adapters that support lifecycle
   hooks: `SessionStart` attempts strict startup grounding and
   `UserPromptSubmit` attempts request-aware packet grounding.
@@ -122,9 +124,9 @@ If the host does not expose lifecycle hooks yet, use the explicit prompt:
 
 The first run should be agent-owned. The skill checks whether `codestory-cli` is
 live through MCP by reading `codestory://status`. If MCP is live, the agent uses
-`server_version`, `server_executable`, `server_executable_sha256`,
-`plugin_runtime`, and `allowed_surfaces` from status instead of rechecking PATH
-or release metadata.
+`server_version`, `cli_version`, `server_executable`,
+`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
+`allowed_surfaces` from status instead of rechecking PATH or release metadata.
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
 missing, status reports a suspect runtime, or you are debugging/repairing the
@@ -217,10 +219,12 @@ proof that `packet`, `search`, or `context` is ready.
 ### Agent runtime repair
 
 The plugin launches through `scripts/codestory-mcp.cjs`. That adapter prefers a
-checksummed CLI under plugin-managed data, labels `CODESTORY_CLI` as a
-local-dev override, and reports `path_fallback` if it had to use
-`codestory-cli` from `PATH`. Once MCP is live, `codestory://status` is the
-runtime proof. Use `where.exe codestory-cli`, `codestory-cli --version`, and
+checksummed CLI under plugin-managed data and provisions the current plugin
+version from GitHub release assets when needed. Status reports the plugin
+version, CLI version, binary path/SHA, `build_source`, `repo_ref`, and sidecar
+contract version. `CODESTORY_CLI` stays a local-dev override, and `path_fallback`
+means no managed binary could be used. Once MCP is live, `codestory://status` is
+the runtime proof. Use `where.exe codestory-cli`, `codestory-cli --version`, and
 release repair checks only when MCP is missing or status shows `path_fallback`
 or stale binary drift.
 
@@ -228,10 +232,8 @@ If status reports `repair_setup`, the active CLI is older than the latest
 release. The agent runs the installer command from `recommended_next_calls`
 before using local navigation, packet, search, or context.
 If a running `codestory-cli serve --stdio --refresh none` process locks the old
-binary, install the current release into versioned managed storage or a
-versioned directory before stale `PATH` entries. A Codex host/app restart may be
-needed before a fresh agent thread sees the new launch choice; confirm with a
-fresh `codestory://status` readback.
+binary, let the plugin provision the current release into versioned managed
+storage or install a versioned directory before stale `PATH` entries. Codex host/app restart may be needed before a fresh agent thread sees the new launch choice; confirm with a fresh `codestory://status` readback.
 
 Use source fallback only when no release asset fits the host:
 
