@@ -27,6 +27,14 @@ function readCargoVersion(manifestText) {
   assert.fail("Cargo package must declare version");
 }
 
+async function readPluginVersion() {
+  const manifest = JSON.parse(
+    await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
+  );
+  assert.equal(typeof manifest.version, "string");
+  return manifest.version;
+}
+
 function releaseAssetForPlatform(version) {
   const target = process.platform === "win32" && process.arch === "x64"
     ? "windows-x64"
@@ -129,9 +137,10 @@ test("codestory repo ships plugin source, not marketplace catalog or server adap
 
 test("mcp launcher prefers a checksummed managed cli without PATH", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-cli-"));
   const outFile = join(dataDir, "env.json");
-  const cliDir = join(dataDir, "codestory-cli", "0.11.17");
+  const cliDir = join(dataDir, "codestory-cli", version);
   const cliPath = join(
     cliDir,
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
@@ -193,6 +202,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
 
 test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-mcp-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = [
@@ -218,7 +228,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.equal(responses.length, 3, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
-    assert.equal(status.plugin_runtime.plugin_version, "0.11.17");
+    assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "path_fallback");
     assert.equal(status.readiness[0].status, "repair_setup");
@@ -232,6 +242,104 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     assert.equal(
       responses[2].result.structuredContent.plugin_runtime.plugin_root,
       pluginRoot,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-override-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const missingCli = join(dataDir, process.platform === "win32" ? "missing.exe" : "missing");
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "status",
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  }) + "\n";
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: missingCli,
+        PLUGIN_DATA: dataDir,
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    const status = JSON.parse(response.result.contents[0].text);
+    assert.equal(status.plugin_runtime.plugin_version, version);
+    assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
+    assert.equal(status.readiness[0].repair_reason, "local_dev_override_cli_unspawnable");
+    assert.equal(status.allowed_surfaces.ground.allowed, false);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher fails open when managed cli probe fails", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-managed-"));
+  const cliDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(
+    cliDir,
+    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+  );
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "tool",
+    method: "tools/call",
+    params: { name: "ground", arguments: {} },
+  }) + "\n";
+
+  try {
+    await mkdir(cliDir, { recursive: true });
+    if (process.platform === "win32") {
+      await writeFile(cliPath, "@echo off\r\nexit /b 7\r\n", "utf8");
+    } else {
+      await writeFile(cliPath, "#!/bin/sh\nexit 7\n", "utf8");
+      await chmod(cliPath, 0o755);
+    }
+    const sha256 = createHash("sha256")
+      .update(await readFile(cliPath))
+      .digest("hex");
+    await writeFile(
+      join(cliDir, "manifest.json"),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: dataDir,
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    assert.equal(response.result.isError, true);
+    assert.equal(
+      response.result.structuredContent.repair_reason,
+      "managed_cli_unspawnable",
+    );
+    assert.equal(
+      response.result.structuredContent.plugin_runtime.plugin_version,
+      version,
     );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
@@ -269,9 +377,10 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
 
 test("enabled sidecar policy schedules existing agent repair path", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
   const logFile = join(dataDir, "calls.jsonl");
-  const cliDir = join(dataDir, "codestory-cli", "0.11.17");
+  const cliDir = join(dataDir, "codestory-cli", version);
   const cliPath = join(
     cliDir,
     process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
@@ -331,7 +440,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     return;
   }
 
-  const version = "0.11.17";
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
   const outFile = join(dataDir, "env.json");

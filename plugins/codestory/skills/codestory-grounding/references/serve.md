@@ -11,10 +11,11 @@ codestory-cli serve --stdio --refresh none
 The installed plugin starts `scripts/codestory-mcp.cjs`, which prefers a
 checksummed plugin-managed CLI, provisions the current version from
 `github_release` when needed, and only falls back to `PATH` when no managed
-binary is available. If that fallback is missing, unversioned, or older than
-the plugin package, the adapter returns `repair_setup` MCP diagnostics instead
-of closing transport. Once MCP is live, `codestory://status` is the runtime
-truth: use `server_version`, `cli_version`, `server_executable`,
+binary is available. If the resolved runtime cannot spawn, or if that fallback
+is missing, unversioned, or older than the plugin package, the adapter returns
+`repair_setup` MCP diagnostics instead of closing transport. Once MCP is live,
+`codestory://status` is the runtime truth: use `server_version`, `cli_version`,
+`server_executable`,
 `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
 `allowed_surfaces` from status before any local grounding, packet, or search
 call.

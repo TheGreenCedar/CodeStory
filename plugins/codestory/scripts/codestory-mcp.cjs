@@ -412,10 +412,10 @@ function compareSemver(left, right) {
   return 0;
 }
 
-function probePathFallbackCli(resolved) {
+function probeResolvedCli(resolved) {
   const result = spawnSync(resolved.path, ['--version'], {
     encoding: 'utf8',
-    shell: false,
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: 3000,
     windowsHide: true,
   });
@@ -427,6 +427,17 @@ function probePathFallbackCli(resolved) {
     stdout: result.stdout || '',
     stderr: result.stderr || '',
   };
+}
+
+function failOpenReasonForProbe(resolved, probe) {
+  if (probe.error || probe.status !== 0) {
+    return `${resolved.source}_cli_unspawnable`;
+  }
+  if (resolved.source !== 'path_fallback') return null;
+  const comparison = compareSemver(probe.version, resolved.version);
+  if (!probe.version || comparison === null) return 'path_fallback_cli_unavailable';
+  if (comparison < 0) return 'path_fallback_cli_stale';
+  return null;
 }
 
 function fallbackDiagnostic(resolved, probe, reason) {
@@ -466,6 +477,8 @@ function fallbackDiagnostic(resolved, probe, reason) {
       expected_version: resolved.version,
       probe_error: probe.error,
       probe_status: probe.status,
+      probe_stdout: probe.stdout,
+      probe_stderr: probe.stderr,
     },
   };
   const localSurfaces = [
@@ -667,16 +680,11 @@ async function main() {
   handleSidecarPolicyCommand(process.argv);
   const resolved = await resolveCli();
   rememberLaunch(resolved);
-  if (resolved.source === 'path_fallback') {
-    const probe = probePathFallbackCli(resolved);
-    const comparison = compareSemver(probe.version, resolved.version);
-    if (!probe.version || comparison === null || comparison < 0) {
-      const reason = probe.version
-        ? 'path_fallback_cli_stale'
-        : 'path_fallback_cli_unavailable';
-      runFailOpenMcp(fallbackDiagnostic(resolved, probe, reason));
-      return;
-    }
+  const probe = probeResolvedCli(resolved);
+  const failOpenReason = failOpenReasonForProbe(resolved, probe);
+  if (failOpenReason) {
+    runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason));
+    return;
   }
   const sidecarPolicy = readSidecarPolicy();
   scheduleSidecarRepair(resolved, sidecarPolicy);
@@ -721,12 +729,35 @@ async function main() {
   });
 
   child.on('error', (error) => {
-    process.stderr.write(`codestory mcp launch failed: ${error.message}\n`);
-    process.exit(1);
+    runFailOpenMcp(fallbackDiagnostic(resolved, {
+      status: null,
+      error: error.message,
+      version: null,
+      stdout: '',
+      stderr: '',
+    }, `${resolved.source}_cli_unspawnable`));
   });
 }
 
 main().catch((error) => {
-  process.stderr.write(`codestory mcp launch failed: ${error.message}\n`);
-  process.exit(1);
+  const resolved = {
+    source: 'launcher',
+    path: 'codestory-cli',
+    sha256: null,
+    version: pluginVersion(),
+    cliVersion: null,
+    repoRef: null,
+    buildSource: 'launcher',
+    archiveSha256: null,
+    archiveUrl: null,
+    provisionedAt: null,
+    warnings: [],
+  };
+  runFailOpenMcp(fallbackDiagnostic(resolved, {
+    status: null,
+    error: error.message,
+    version: null,
+    stdout: '',
+    stderr: '',
+  }, 'launcher_error'));
 });

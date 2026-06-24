@@ -57,9 +57,9 @@ source-build checks only when MCP is missing, the plugin needs repair, status
 shows `path_fallback`, or the user asks for a CLI transcript. `CODESTORY_CLI`
 is an explicit local-dev override; installed `.mcp.json` launches the managed
 adapter first, provisions from `github_release` when needed, and records the
-launch source in `plugin_runtime`. If only a missing, unversioned, or stale
-`PATH` fallback is available, the adapter stays up with `repair_setup`
-diagnostics instead of closing transport.
+launch source in `plugin_runtime`. If the resolved runtime cannot spawn, or if
+only a missing, unversioned, or stale `PATH` fallback is available, the adapter
+stays up with `repair_setup` diagnostics instead of closing transport.
 
 If `codestory://status` reports `repair_setup` because the active
 `server_version` is older than the latest release, repair the CLI before local

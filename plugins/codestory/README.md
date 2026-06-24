@@ -71,9 +71,9 @@ This package stays thin:
   provisions the current plugin version from the GitHub release
   `SHA256SUMS.txt`, records `build_source=github_release` and `repo_ref`, labels
   `CODESTORY_CLI` as a local-dev override, and only falls back to `PATH` when
-  provisioning is unavailable. If that `PATH` fallback is missing, unversioned,
-  or older than the plugin package, the adapter stays up as a diagnostic MCP
-  server instead of closing transport.
+  provisioning is unavailable. If the resolved CLI cannot spawn, or if the
+  `PATH` fallback is missing, unversioned, or older than the plugin package, the
+  adapter stays up as a diagnostic MCP server instead of closing transport.
 - `hooks/` keeps CodeStory ambient for host adapters that support lifecycle
   hooks: `SessionStart` attempts strict startup grounding and
   `UserPromptSubmit` attempts request-aware packet grounding.
@@ -247,12 +247,12 @@ version from GitHub release assets when needed. Status reports the plugin
 version, plugin cache path/version, CLI version, binary path/SHA,
 `build_source`, `repo_ref`, and sidecar contract version. `CODESTORY_CLI` stays
 a local-dev override, and `path_fallback` means no managed binary could be used.
-If `path_fallback` is stale or unavailable, MCP still answers
-`codestory://status` and tool calls with `repair_setup` diagnostics instead of
-closing transport. Once MCP is live, `codestory://status` is the runtime proof.
-Use `where.exe codestory-cli`, `codestory-cli --version`, and release repair
-checks only when MCP is missing or status shows `path_fallback` or stale binary
-drift.
+If the resolved runtime cannot spawn, or if `path_fallback` is stale or
+unavailable, MCP still answers `codestory://status` and tool calls with
+`repair_setup` diagnostics instead of closing transport. Once MCP is live,
+`codestory://status` is the runtime proof. Use `where.exe codestory-cli`,
+`codestory-cli --version`, and release repair checks only when MCP is missing or
+status shows `path_fallback` or stale binary drift.
 
 If status reports `repair_setup`, the active CLI is older than the latest
 release. The agent runs the installer command from `recommended_next_calls`
