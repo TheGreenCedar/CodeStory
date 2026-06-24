@@ -367,9 +367,12 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
 fn run_setup_embeddings(cmd: args::SetupEmbeddingsCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "setup embeddings")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    let project_root = runtime::canonicalize_project_root(&cmd.project.project)?;
+    let cache_override =
+        runtime::trusted_cache_override(&project_root, cmd.project.cache_dir.as_deref())?;
     let next_commands =
         setup_embeddings_next_commands(&cmd.project.project, cmd.project.cache_dir.as_deref());
-    let managed_root = managed_embeddings::managed_root(cmd.project.cache_dir.as_deref())?;
+    let managed_root = managed_embeddings::managed_root(cache_override.as_deref())?;
     let mut output = managed_embeddings::setup_embeddings(
         &managed_root,
         cmd.quant,

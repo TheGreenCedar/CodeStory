@@ -122,11 +122,10 @@ impl RuntimeContext {
 
     fn new_with_startup(args: &ProjectArgs, startup: ManagedEmbeddingStartup) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
-        let config = crate::config::load_config(&project_root)?;
-        let cache_override = args.cache_dir.as_deref().or(config.cache_dir.as_deref());
-        let cache_root = cache_root_for_project(&project_root, cache_override)?;
+        let cache_override = trusted_cache_override(&project_root, args.cache_dir.as_deref())?;
+        let cache_root = cache_root_for_project(&project_root, cache_override.as_deref())?;
         let managed_embeddings_root =
-            crate::managed_embeddings::runtime_managed_root(args.cache_dir.as_deref())?;
+            crate::managed_embeddings::runtime_managed_root(cache_override.as_deref())?;
         if startup == ManagedEmbeddingStartup::AutostartIfInstalled {
             crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
         }
@@ -457,6 +456,14 @@ pub(crate) fn cache_root_for_project(
     }
 }
 
+pub(crate) fn trusted_cache_override(
+    project_root: &Path,
+    cli_cache_dir: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let config = crate::config::load_config(project_root)?;
+    Ok(cli_cache_dir.map(Path::to_path_buf).or(config.cache_dir))
+}
+
 /// Small stable hash used for path-derived cache directory names.
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
@@ -775,6 +782,7 @@ fn quote_cli_single_quoted_value(value: &str) -> String {
 mod tests {
     use super::*;
     use std::env;
+    use std::ffi::OsString;
     use std::fs;
     use tempfile::tempdir;
 
@@ -791,16 +799,17 @@ mod tests {
         "CODESTORY_STORED_VECTOR_ENCODING",
         "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
     ];
+    const HOME_ENV_VARS: &[&str] = &["USERPROFILE", "HOME"];
 
     struct EnvSnapshot {
-        values: Vec<(&'static str, Option<String>)>,
+        values: Vec<(&'static str, Option<OsString>)>,
     }
 
     impl EnvSnapshot {
         fn clear(names: &'static [&'static str]) -> Self {
             let values = names
                 .iter()
-                .map(|name| (*name, env::var(name).ok()))
+                .map(|name| (*name, env::var_os(name)))
                 .collect::<Vec<_>>();
             unsafe {
                 for name in names {
@@ -866,6 +875,81 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("project config field `cache_dir` is not trusted"));
         assert!(message.contains("--cache-dir"));
+    }
+
+    #[test]
+    fn home_config_cache_dir_resolves_storage_and_managed_embeddings_under_same_root() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
+        let temp = tempdir().expect("temp dir");
+        let home = temp.path().join("home");
+        let project = temp.path().join("repo");
+        let cache = temp.path().join("trusted-cache");
+        fs::create_dir_all(&home).expect("create home");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            home.join(".codestory.toml"),
+            format!("cache_dir = {:?}\n", cache.to_string_lossy()),
+        )
+        .expect("write home config");
+        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
+        unsafe {
+            env::set_var("USERPROFILE", &home);
+        }
+
+        let runtime = RuntimeContext::new(&ProjectArgs {
+            project,
+            cache_dir: None,
+        })
+        .expect("runtime context");
+
+        assert_eq!(runtime.cache_root, cache);
+        assert_eq!(runtime.storage_path, cache.join("codestory.db"));
+        assert_eq!(
+            runtime.managed_embeddings_root,
+            cache.join("managed-embeddings")
+        );
+        assert_eq!(
+            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
+            Some("onnx")
+        );
+    }
+
+    #[test]
+    fn cli_cache_dir_overrides_home_config_for_storage_and_managed_embeddings() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
+        let temp = tempdir().expect("temp dir");
+        let home = temp.path().join("home");
+        let project = temp.path().join("repo");
+        let home_cache = temp.path().join("home-cache");
+        let cli_cache = temp.path().join("cli-cache");
+        fs::create_dir_all(&home).expect("create home");
+        fs::create_dir_all(&project).expect("create project");
+        fs::write(
+            home.join(".codestory.toml"),
+            format!("cache_dir = {:?}\n", home_cache.to_string_lossy()),
+        )
+        .expect("write home config");
+        write_fake_managed_onnx_assets(&cli_cache.join("managed-embeddings"));
+        unsafe {
+            env::set_var("USERPROFILE", &home);
+        }
+
+        let runtime = RuntimeContext::new(&ProjectArgs {
+            project,
+            cache_dir: Some(cli_cache.clone()),
+        })
+        .expect("runtime context");
+
+        assert_eq!(runtime.cache_root, cli_cache);
+        assert_eq!(runtime.storage_path, cli_cache.join("codestory.db"));
+        assert_eq!(
+            runtime.managed_embeddings_root,
+            cli_cache.join("managed-embeddings")
+        );
     }
 
     #[test]
