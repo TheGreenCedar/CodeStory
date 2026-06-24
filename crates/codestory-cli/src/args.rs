@@ -1407,6 +1407,7 @@ pub(crate) struct ReadyOutput {
 pub(crate) struct AgentPreflightLaneOutput {
     pub(crate) ready: bool,
     pub(crate) status: ReadinessStatusDto,
+    pub(crate) failed_layer: Option<&'static str>,
     pub(crate) summary: String,
 }
 

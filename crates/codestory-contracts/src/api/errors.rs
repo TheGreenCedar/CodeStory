@@ -29,7 +29,7 @@ pub struct ApiErrorDetails {
 
 impl ApiErrorDetails {
     pub fn retrieval_unavailable(project: impl Into<String>, next_commands: Vec<String>) -> Self {
-        let minimum_next = next_commands.iter().take(2).cloned().collect::<Vec<_>>();
+        let minimum_next = next_commands.iter().take(1).cloned().collect::<Vec<_>>();
         Self {
             failed_layer: Some("retrieval_sidecar".to_string()),
             project: Some(project.into()),
@@ -111,12 +111,11 @@ mod tests {
             "sidecar retrieval primary is unavailable or degraded",
             "C:/repo/example",
             vec![
-                "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
-                    .to_string(),
-                "codestory-cli retrieval index --project \"C:/repo/example\" --refresh full --format json"
+                "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
                     .to_string(),
                 "codestory-cli retrieval status --project \"C:/repo/example\" --format json"
                     .to_string(),
+                "codestory-cli doctor --project \"C:/repo/example\" --format markdown".to_string(),
             ],
         );
 
@@ -127,15 +126,15 @@ mod tests {
         assert_eq!(value["details"]["project"], "C:/repo/example");
         assert_eq!(
             value["details"]["next_commands"][0],
-            "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
+            "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
         );
         assert_eq!(
             value["details"]["minimum_next"][0],
-            "codestory-cli retrieval bootstrap --project \"C:/repo/example\" --format json"
+            "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
         );
         assert_eq!(
             value["details"]["full_repair"][1],
-            "codestory-cli retrieval index --project \"C:/repo/example\" --refresh full --format json"
+            "codestory-cli retrieval status --project \"C:/repo/example\" --format json"
         );
     }
 }

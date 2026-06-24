@@ -1741,6 +1741,7 @@ fn agent_preflight_lane(
     args::AgentPreflightLaneOutput {
         ready: verdict.status == ReadinessStatusDto::Ready,
         status: verdict.status,
+        failed_layer: readiness::failed_layer(verdict),
         summary: verdict.summary.clone(),
     }
 }
@@ -1770,11 +1771,17 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
         "local_graph: {}",
         readiness::status_label(output.local_graph.status)
     );
+    if let Some(layer) = output.local_graph.failed_layer {
+        let _ = writeln!(markdown, "local_graph_failed_layer: `{layer}`");
+    }
     let _ = writeln!(
         markdown,
         "full_retrieval: {}",
         readiness::status_label(output.full_retrieval.status)
     );
+    if let Some(layer) = output.full_retrieval.failed_layer {
+        let _ = writeln!(markdown, "full_retrieval_failed_layer: `{layer}`");
+    }
     if let Some(state) = output
         .sidecar_setup
         .get("state")
