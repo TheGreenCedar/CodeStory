@@ -177,6 +177,7 @@ jobs:
         run: |
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
+            --expected-version "${{ needs.preflight.outputs.version }}" \
             --project "${{ github.workspace }}" \
             --out-dir target/packaged-agent-proof
 

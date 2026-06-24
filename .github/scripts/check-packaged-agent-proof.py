@@ -153,6 +153,23 @@ def require_retrieval_full(payload: object, layer: str, artifact: Path) -> None:
     require(mode == "full", layer, artifact, f"retrieval_mode is {mode!r}, expected 'full'")
 
 
+def require_version(output: str, expected_version: str, archive: Path, artifact: Path) -> None:
+    actual = output.strip().removeprefix("codestory-cli ").strip()
+    require(
+        actual == expected_version,
+        "version",
+        artifact,
+        f"codestory-cli version is {actual!r}, expected {expected_version!r}",
+    )
+    expected_archive_prefix = f"codestory-cli-v{expected_version}-"
+    require(
+        archive.name.startswith(expected_archive_prefix),
+        "version",
+        artifact,
+        f"archive name {archive.name!r} does not start with {expected_archive_prefix!r}",
+    )
+
+
 def require_retrieval_index_ready(payload: object, layer: str, artifact: Path) -> None:
     require(isinstance(payload, dict), layer, artifact, "retrieval index output is not a JSON object")
     for field in ["zoekt_stubbed", "qdrant_stubbed", "scip_stubbed"]:
@@ -426,6 +443,7 @@ def run_gate(args: argparse.Namespace) -> None:
 
         version_artifact = out_dir / "version.txt"
         run_command(cli, "version", ["--version"], version_artifact, args.timeout_secs, parse_json=False)
+        require_version(version_artifact.read_text(encoding="utf-8"), args.expected_version, archive, version_artifact)
         summary["artifacts"]["version"] = str(version_artifact)
         write_json(out_dir / "summary.json", summary)
 
@@ -744,7 +762,7 @@ def self_test() -> None:
         stage = root / "pkg" / "codestory-cli-v9.9.9-test"
         stage.mkdir(parents=True)
         write_fake_cli(stage)
-        archive = root / "fake.zip"
+        archive = root / "codestory-cli-v9.9.9-test.zip"
         with zipfile.ZipFile(archive, "w") as handle:
             for path in stage.rglob("*"):
                 handle.write(path, path.relative_to(stage.parent).as_posix())
@@ -758,6 +776,7 @@ def self_test() -> None:
             query=DEFAULT_QUERY,
             context_query=DEFAULT_QUERY,
             question=DEFAULT_QUESTION,
+            expected_version="9.9.9",
             timeout_secs=30,
         )
         run_gate(args)
@@ -774,6 +793,16 @@ def self_test() -> None:
                 raise AssertionError("forced fake search failure should fail the gate")
         finally:
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        mismatch_args = argparse.Namespace(**vars(args))
+        mismatch_args.expected_version = "9.9.8"
+        try:
+            run_gate(mismatch_args)
+        except GateFailure as exc:
+            assert exc.layer == "version"
+            assert "version.txt" in str(exc.artifact)
+        else:
+            raise AssertionError("version mismatch should fail the gate")
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "doctor_stderr"
         try:
@@ -848,11 +877,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query", default=DEFAULT_QUERY, help="Search proof query.")
     parser.add_argument("--context-query", default=DEFAULT_QUERY, help="Context proof target query.")
     parser.add_argument("--question", default=DEFAULT_QUESTION, help="Packet proof question.")
+    parser.add_argument("--expected-version", help="Expected codestory-cli version in the archive.")
     parser.add_argument("--timeout-secs", type=int, default=1800, help="Per-layer timeout.")
     parser.add_argument("--self-test", action="store_true", help="Run script self-tests.")
     args = parser.parse_args()
     if not args.self_test and not args.archive:
         parser.error("--archive is required unless --self-test is set")
+    if not args.self_test and not args.expected_version:
+        parser.error("--expected-version is required unless --self-test is set")
     return args
 
 
