@@ -2680,6 +2680,8 @@ mod tests {
             PacketClaimDto {
                 claim: "FOREIGN KEY constraints define row references between SQL tables."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2688,6 +2690,8 @@ mod tests {
                 claim:
                     "A CHECK constraint validates a column without describing table relationships."
                         .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2708,6 +2712,8 @@ mod tests {
         let non_relationship_claims = vec![PacketClaimDto {
             claim: "A CHECK constraint validates a column without describing table relationships."
                 .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: Vec::new(),
             coverage_role: None,
             eligible_for_sufficiency: None,
@@ -2720,6 +2726,8 @@ mod tests {
         let column_reference_claims = vec![PacketClaimDto {
             claim: "A CHECK constraint references the Price column while validating values."
                 .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: Vec::new(),
             coverage_role: None,
             eligible_for_sufficiency: None,
@@ -2739,6 +2747,8 @@ mod tests {
             claim:
                 "A CHECK constraint references the Price column and validates values between 0 and 100."
                     .to_string(),
+            proof_status: None,
+            required_evidence_role: None,
             citations: Vec::new(),
             coverage_role: None,
             eligible_for_sufficiency: None,
@@ -2760,18 +2770,24 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "app.use registers middleware on the router.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "app.handle delegates request handling to the router.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "res.send prepares and sends the response body.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2791,12 +2807,16 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "Logger owns a stack of handlers registered by pushHandler.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "addRecord creates a log record before passing it to handlers.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2804,6 +2824,8 @@ mod tests {
             PacketClaimDto {
                 claim: "AbstractProcessingHandler handles records by processing and writing them."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2829,18 +2851,24 @@ mod tests {
         let claims = vec![
             PacketClaimDto {
                 claim: "Top-level HTTP helpers delegate to a Client.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "BaseRequest.finalize prepares the request body for sending.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Response.fromStream builds a streamed response boundary.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2866,6 +2894,8 @@ mod tests {
                 claim:
                     "The form validation examples use native required, pattern, min, and max constraints."
                         .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2873,6 +2903,8 @@ mod tests {
             PacketClaimDto {
                 claim: "A custom validation example applies script-driven validity checks before rendering messages."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
@@ -2880,12 +2912,16 @@ mod tests {
             PacketClaimDto {
                 claim: "Custom error rendering branches on ValidityState fields to choose messages."
                     .to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
             },
             PacketClaimDto {
                 claim: "Submit handlers prevent submission when the form is invalid.".to_string(),
+                proof_status: None,
+                required_evidence_role: None,
                 citations: Vec::new(),
                 coverage_role: None,
                 eligible_for_sufficiency: None,
