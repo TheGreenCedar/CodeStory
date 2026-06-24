@@ -175,9 +175,13 @@ impl<'a> QueryExecutor<'a> {
             return (mode, None);
         }
         if let Some(manifest) = self.manifest.as_ref() {
-            let layout = crate::config::SidecarLayout::from_env();
-            let report =
-                probe_sidecar_health(&layout, &manifest.project_id, Some(manifest.clone()));
+            let Some(layout) = self.sidecars.layout() else {
+                return (
+                    RetrievalDegradedMode::Unavailable,
+                    Some("sidecar_layout_missing".into()),
+                );
+            };
+            let report = probe_sidecar_health(layout, &manifest.project_id, Some(manifest.clone()));
             return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
         }
         (
@@ -470,10 +474,14 @@ mod tests {
     use super::*;
     use crate::cache::RetrievalCache;
     use crate::candidate::{CandidateHit, CandidateSource};
-    use crate::sidecar_search::mock::MockSidecarSearch;
+    use crate::config::SidecarLayout;
+    use crate::sidecar_search::{SidecarSearch, mock::MockSidecarSearch};
+    use crate::test_support::retrieval_manifest_fixture;
     use codestory_store::RetrievalIndexManifest;
     use std::collections::HashMap;
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     fn sample_manifest() -> RetrievalIndexManifest {
         RetrievalIndexManifest {
@@ -689,6 +697,32 @@ mod tests {
             .execute("ExtensionService", Some(800))
             .expect_err("non-full modes must fail closed");
         assert!(error.to_string().contains("retrieval sidecar is mandatory"));
+    }
+
+    #[test]
+    fn executor_resolve_mode_probes_live_sidecar_layout_instead_of_env_default() {
+        let mut layout = SidecarLayout::from_env();
+        layout.zoekt_http_port = unused_local_port();
+        let manifest = retrieval_manifest_fixture("testproj", "cafebabedeadbeef");
+        let sidecars = TrackingSidecars {
+            layout,
+            layout_calls: AtomicUsize::new(0),
+        };
+        let mut cache = RetrievalCache::new();
+        let executor = QueryExecutor {
+            sidecars: &sidecars,
+            cache: &mut cache,
+            manifest: Some(manifest),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: None,
+        };
+
+        let (mode, reason) = executor.resolve_mode();
+
+        assert_eq!(sidecars.layout_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(mode, RetrievalDegradedMode::Unavailable);
+        assert_eq!(reason.as_deref(), Some("zoekt_unreachable"));
     }
 
     #[test]
@@ -963,6 +997,43 @@ mod tests {
             result.hits.first().and_then(|hit| hit.file_role),
             Some(codestory_store::FileRole::Generated)
         );
+    }
+
+    struct TrackingSidecars {
+        layout: SidecarLayout,
+        layout_calls: AtomicUsize,
+    }
+
+    impl SidecarSearch for TrackingSidecars {
+        fn layout(&self) -> Option<&SidecarLayout> {
+            self.layout_calls.fetch_add(1, Ordering::Relaxed);
+            Some(&self.layout)
+        }
+
+        fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_expand(
+            &self,
+            _anchors: &[CandidateHit],
+            _limit: usize,
+        ) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn unused_local_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind free port");
+        listener.local_addr().expect("local addr").port()
     }
 
     #[test]
