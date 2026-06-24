@@ -257,7 +257,7 @@ fn docker_compose_up(
         )
         .env(
             "CODESTORY_EMBED_MODEL_DIR",
-            docker_bind_path(&embed_model_dir(repo_root, layout)),
+            docker_bind_path(&embed_model_dir(repo_root, layout)?),
         )
         .env("CODESTORY_EMBED_PORT", runtime.embed_http_port.to_string())
         .env(
@@ -354,32 +354,50 @@ fn docker_bind_path(path: &Path) -> String {
     without_verbatim.replace('\\', "/")
 }
 
-fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> PathBuf {
+fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<PathBuf> {
     if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
         let path = PathBuf::from(path);
-        if path.is_dir() {
-            return path;
+        if embed_model_dir_ready(&path) {
+            return Ok(path);
         }
+        bail!(
+            "CODESTORY_EMBED_MODEL_DIR does not contain {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+            crate::embeddings::BGE_BASE_EN_V1_5_GGUF
+        );
     }
     let workdir = repo_root
         .or_else(|| Some(Path::new(".")))
         .unwrap_or(Path::new("."));
-    for candidate in [
-        workdir.join("target").join("retrieval-models"),
-        workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
-    ] {
-        if candidate
-            .join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
-            .is_file()
-        {
-            return candidate;
-        }
-    }
-    layout
+    let fallback = layout
         .qdrant_data_dir
         .parent()
         .map(|parent| parent.join("embed-models"))
-        .unwrap_or_else(|| layout.qdrant_data_dir.join("embed-models"))
+        .unwrap_or_else(|| layout.qdrant_data_dir.join("embed-models"));
+    embed_model_dir_from_candidates([
+        workdir.join("target").join("retrieval-models"),
+        workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
+        user_cache_root().join("embed-models"),
+        fallback,
+    ])
+}
+
+fn embed_model_dir_from_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<PathBuf> {
+    for candidate in candidates {
+        if embed_model_dir_ready(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "No llama.cpp embedding model directory contains {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+        crate::embeddings::BGE_BASE_EN_V1_5_GGUF
+    )
+}
+
+fn embed_model_dir_ready(path: &Path) -> bool {
+    path.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
+        .is_file()
 }
 
 fn wait_for_infrastructure(
@@ -420,7 +438,43 @@ mod tests {
         .expect("model file");
         let layout = SidecarLayout::from_env();
 
-        assert_eq!(embed_model_dir(Some(project.path()), &layout), model_dir);
+        assert_eq!(
+            embed_model_dir(Some(project.path()), &layout).expect("model dir"),
+            model_dir
+        );
+    }
+
+    #[test]
+    fn embed_model_dir_uses_first_candidate_with_model() {
+        let empty = tempdir().expect("empty");
+        let cache = tempdir().expect("cache");
+        let model_dir = cache.path().join("embed-models");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(
+            model_dir.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
+            b"model placeholder",
+        )
+        .expect("model file");
+
+        assert_eq!(
+            embed_model_dir_from_candidates([empty.path().to_path_buf(), model_dir.clone()])
+                .expect("fallback model dir"),
+            model_dir
+        );
+    }
+
+    #[test]
+    fn embed_model_dir_fails_before_empty_fallback_container() {
+        let empty = tempdir().expect("empty");
+
+        let error = embed_model_dir_from_candidates([empty.path().to_path_buf()])
+            .expect_err("missing model must fail before docker compose");
+
+        assert!(
+            error
+                .to_string()
+                .contains(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
+        );
     }
 
     #[test]
