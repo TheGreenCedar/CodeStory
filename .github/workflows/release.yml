@@ -172,6 +172,22 @@ jobs:
             --binary "$bin" \
             --out-dir target/release-dist
 
+      - name: Packaged full-sidecar agent proof
+        if: matrix.asset_target == 'linux-x64'
+        run: |
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
+            --project "${{ github.workspace }}" \
+            --out-dir target/packaged-agent-proof
+
+      - name: Upload packaged agent proof artifacts
+        if: always() && matrix.asset_target == 'linux-x64'
+        uses: actions/upload-artifact@v5
+        with:
+          name: packaged-agent-proof-${{ matrix.asset_target }}
+          path: target/packaged-agent-proof
+          if-no-files-found: warn
+
       - name: Package release asset on Windows
         if: runner.os == 'Windows'
         shell: pwsh
