@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "id": "readiness-boundary",
+      "prompt": "Explain why packet and search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
+      "query": "retrieval_mode full sidecar retrieval primary unavailable expected mode full",
+      "category": "readiness_boundary",
+      "mode": "packet_search",
+      "expected": {
+        "files": [
+          "crates/codestory-cli/src/main.rs",
+          "crates/codestory-runtime/src/agent/retrieval_primary.rs"
+        ],
+        "symbols": [
+          "run_search",
+          "SidecarPrimarySearchOutcome"
+        ],
+        "anchors": [
+          "retrieval_mode",
+          "expected mode=full"
+        ]
+      },
+      "provenance": {
+        "issue": "#510",
+        "owner": "CodeStory evaluation quality",
+        "source": "owner-directed production packet/search acceptance fixture",
+        "refs": [
+          "#475",
+          "#469"
+        ]
+      }
+    },
+    {
+      "id": "packet-anchor-placement",
+      "prompt": "Find the production packet/search path that surfaces search results and packet evidence for agent handoff.",
+      "query": "packet search output evidence packet indexed symbol hits retrieval shadow",
+      "category": "anchor_placement",
+      "mode": "packet_search",
+      "expected": {
+        "files": [
+          "crates/codestory-cli/src/main.rs",
+          "crates/codestory-cli/src/args.rs"
+        ],
+        "symbols": [
+          "run_packet",
+          "SearchOutput"
+        ],
+        "anchors": [
+          "run_packet",
+          "indexed_symbol_hits"
+        ]
+      },
+      "provenance": {
+        "issue": "#510",
+        "owner": "CodeStory evaluation quality",
+        "source": "owner-directed production packet/search acceptance fixture",
+        "refs": [
+          "#475",
+          "#469"
+        ]
+      }
+    }
+  ]
+}
