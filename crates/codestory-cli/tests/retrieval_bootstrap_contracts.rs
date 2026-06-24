@@ -330,6 +330,43 @@ fn agent_profile_status_repair_hints_are_profile_aware() {
 }
 
 #[test]
+fn run_id_status_implies_agent_profile() {
+    let project = tempdir().expect("project");
+    fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    let cache = tempdir().expect("cache");
+    let cache_arg = cache.path().to_str().expect("utf8 cache");
+
+    let status = run_status(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--run-id",
+            "implicit-agent",
+            "--format",
+            "json",
+        ],
+    );
+
+    let ownership = &status["ownership"];
+    assert_eq!(ownership["profile"].as_str(), Some("agent"));
+    assert!(
+        ownership["namespace"]
+            .as_str()
+            .is_some_and(|namespace| namespace.ends_with("-implicit-agent")),
+        "status --run-id should inspect the named agent namespace: {status}"
+    );
+    let repair = &status["repair"];
+    assert!(
+        repair["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile agent")
+                && command.contains("--run-id implicit-agent")),
+        "status --run-id repair command should keep the inferred agent run id: {status}"
+    );
+}
+
+#[test]
 fn bootstrap_json_surfaces_prune_suppressed_reason_on_scan_errors() {
     let project = tempdir().expect("project");
     fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");

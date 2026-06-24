@@ -10,8 +10,8 @@ use codestory_retrieval::{
 };
 
 use crate::args::{
-    OutputFormat, RefreshMode, RetrievalAction, RetrievalBootstrapCommand, RetrievalCommand,
-    RetrievalIndexCommand, RetrievalQueryCommand, RetrievalSidecarStateCommand,
+    CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalBootstrapCommand,
+    RetrievalCommand, RetrievalIndexCommand, RetrievalQueryCommand, RetrievalSidecarStateCommand,
     RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
@@ -99,7 +99,10 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
 fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let report = if let Some(profile) = cmd.profile {
+    let profile = cmd
+        .profile
+        .or_else(|| cmd.run_id.as_ref().map(|_| CliSidecarProfile::Agent));
+    let report = if let Some(profile) = profile {
         let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
             &runtime.project_root,
             profile.into(),
