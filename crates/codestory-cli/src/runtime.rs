@@ -928,7 +928,7 @@ mod tests {
         write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
 
         RuntimeContext::new_agent_sidecar(&ProjectArgs {
-            project,
+            project: project.clone(),
             cache_dir: Some(cache),
         })
         .expect("runtime context");
@@ -937,10 +937,20 @@ mod tests {
             env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
             Some("llamacpp")
         );
+        assert_eq!(env::var("CODESTORY_EMBED_LLAMACPP_URL").ok(), None);
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            &project,
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("ready-repair-test"),
+        );
+        let expected_url =
+            codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
+        sidecar.activate_embed_url_default();
         assert_eq!(
             env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
-            Some("http://127.0.0.1:8080/v1/embeddings")
+            Some(expected_url.as_str())
         );
+        assert_ne!(expected_url, "http://127.0.0.1:8080/v1/embeddings");
         assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
         assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
     }
