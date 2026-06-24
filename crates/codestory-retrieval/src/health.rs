@@ -506,12 +506,17 @@ pub fn probe_sidecar_health(
     let qdrant = if dense_anchor_count == 0 {
         ComponentHealth {
             name: "qdrant".into(),
-            status: ComponentStatus::Degraded,
+            status: ComponentStatus::Healthy,
             latency_ms: None,
-            detail: "graph_first_v1 selected zero dense anchors; semantic retrieval is unavailable"
-                .into(),
-            degraded_reason: Some("semantic_dense_projection_count_zero".into()),
-            capabilities: SidecarCapabilities::NONE,
+            detail:
+                "graph_first_v1 selected zero dense anchors; semantic retrieval skipped by policy"
+                    .into(),
+            degraded_reason: None,
+            capabilities: SidecarCapabilities {
+                lexical: false,
+                semantic: true,
+                graph: false,
+            },
         }
     } else {
         let collection = manifest.qdrant_collection.clone();
@@ -727,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_dense_manifest_degrades_semantic_lane() {
+    fn zero_dense_manifest_skips_semantic_lane_without_degrading() {
         let layout = SidecarLayout::from_env();
         let project_id = "testproject";
         let input_hash = "ba5eba11cafebeef";
@@ -760,13 +765,13 @@ mod tests {
 
         let report = probe_sidecar_health(&layout, project_id, Some(manifest));
 
-        assert_eq!(report.qdrant.status, ComponentStatus::Degraded);
-        assert_eq!(
-            report.qdrant.degraded_reason.as_deref(),
+        assert_eq!(report.qdrant.status, ComponentStatus::Healthy);
+        assert_eq!(report.qdrant.degraded_reason, None);
+        assert!(report.qdrant.capabilities.semantic);
+        assert_ne!(
+            report.degraded_reason.as_deref(),
             Some("semantic_dense_projection_count_zero")
         );
-        assert!(!report.qdrant.capabilities.semantic);
-        assert_ne!(report.retrieval_mode, "full");
     }
 
     #[test]

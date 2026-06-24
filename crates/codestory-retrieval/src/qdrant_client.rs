@@ -390,17 +390,26 @@ impl QdrantClient {
 
     /// Smoke semantic search used by health probes (requires indexed collection).
     pub fn semantic_search_smoke(&self, collection: &str) -> bool {
+        self.semantic_search_smoke_result(collection).is_ok()
+    }
+
+    /// Smoke semantic search used by finalize paths when failure detail matters.
+    pub fn semantic_search_smoke_result(&self, collection: &str) -> Result<()> {
         if !qdrant_semantic_vectors_enabled() {
-            return false;
+            bail!("qdrant semantic vectors are disabled");
         }
         match self.search(collection, "function", 3) {
-            Ok(hits) => hits.iter().any(|hit| {
-                let path = hit.file_path.trim();
-                !path.is_empty()
-                    && !path.contains(':')
-                    && (path.contains('/') || path.contains('\\') || path.contains('.'))
-            }),
-            Err(_) => false,
+            Ok(hits) => {
+                if hits.iter().any(hit_has_repo_relative_payload_path) {
+                    Ok(())
+                } else {
+                    bail!(
+                        "qdrant semantic smoke returned {} hit(s) without a repo-relative payload path",
+                        hits.len()
+                    );
+                }
+            }
+            Err(error) => Err(error).context("qdrant semantic smoke search failed"),
         }
     }
 
@@ -437,6 +446,13 @@ impl QdrantClient {
         Self::stub_marker_path(qdrant_data_dir, collection).is_file()
             || Self::legacy_stub_marker_path(qdrant_data_dir, collection).is_file()
     }
+}
+
+fn hit_has_repo_relative_payload_path(hit: &super::CandidateHit) -> bool {
+    let path = hit.file_path.trim();
+    !path.is_empty()
+        && !path.contains(':')
+        && (path.contains('/') || path.contains('\\') || path.contains('.'))
 }
 
 fn parse_collection_names(body: &str) -> Result<Vec<String>> {

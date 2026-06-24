@@ -287,9 +287,8 @@ fn search_json_fails_closed_without_full_sidecars() {
     assert!(
         stderr.contains("Minimum next:")
             && stderr.contains("Full repair:")
-            && stderr.contains("codestory-cli retrieval index")
-            && stderr.contains("--refresh full")
-            && stderr.contains("codestory-cli retrieval bootstrap")
+            && stderr.contains("codestory-cli ready --goal agent --repair")
+            && stderr.contains("codestory-cli retrieval status")
             && stderr.contains("codestory-cli doctor"),
         "search should include retrieval repair commands: {stderr}"
     );

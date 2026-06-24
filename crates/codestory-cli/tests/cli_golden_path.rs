@@ -71,6 +71,19 @@ pub fn schedule_index(project_path: &str) -> usize {
     .expect("write runtime.rs");
 }
 
+fn write_docker_compose_fixture(root: &Path) {
+    let docker = root.join("docker");
+    fs::create_dir_all(&docker).expect("create docker dir");
+    fs::write(
+        docker.join("app-compose.yml"),
+        r#"services:
+  app:
+    image: tiny-browser-fixture:latest
+"#,
+    )
+    .expect("write docker compose");
+}
+
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
     command
@@ -678,7 +691,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     let index_next_commands_joined = index_next_commands.join("\n");
     assert!(
         index_next_commands_joined.contains("codestory-cli retrieval status")
-            && index_next_commands_joined.contains("codestory-cli retrieval index"),
+            && index_next_commands_joined.contains("codestory-cli ready --goal agent --repair"),
         "index output should recommend sidecar repair when sidecar retrieval is not full: {index:#}"
     );
     assert_no_agent_proof_commands(&index_next_commands, "index output");
@@ -703,8 +716,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     let joined = next_commands.join("\n");
     assert!(
         joined.contains("codestory-cli retrieval status")
-            && joined.contains("codestory-cli retrieval index")
-            && joined.contains("--refresh full")
+            && joined.contains("codestory-cli ready --goal agent --repair")
             && joined.contains("codestory-cli doctor"),
         "doctor should recommend retrieval repair before packet/search: {doctor:#}"
     );
@@ -757,14 +769,15 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         preflight["full_retrieval"]["status"], "repair_retrieval",
         "{preflight:#}"
     );
-    assert!(
-        preflight["safe_surfaces"]
-            .as_array()
-            .expect("safe surfaces")
-            .iter()
-            .any(|surface| surface == "ground"),
-        "local graph surfaces should be safe: {preflight:#}"
-    );
+    let safe_surfaces = preflight["safe_surfaces"]
+        .as_array()
+        .expect("safe surfaces");
+    for surface in ["ground", "callers", "callees", "trace"] {
+        assert!(
+            safe_surfaces.iter().any(|candidate| candidate == surface),
+            "local graph surface {surface} should be safe: {preflight:#}"
+        );
+    }
     assert!(
         preflight["blocked_surfaces"]
             .as_array()
@@ -859,9 +872,9 @@ fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
         .join("\n");
     assert!(
         first_next_commands.contains("retrieval status")
-            && first_next_commands.contains("retrieval index")
+            && first_next_commands.contains("ready --goal agent --repair")
             && !first_next_commands.contains("packet"),
-        "doctor should recommend sidecar status/index repair before packet/search when mode is not full: {doctor:#}"
+        "doctor should recommend canonical sidecar repair before packet/search when mode is not full: {doctor:#}"
     );
 }
 
@@ -1221,6 +1234,40 @@ fn app_controller_opens_project() {
     );
 
     search_dir_snapshot.assert_unchanged();
+}
+
+#[test]
+fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    write_docker_compose_fixture(workspace.path());
+    index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
+
+    let files = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["files", "--refresh", "none", "--format", "json"],
+    );
+
+    assert!(
+        files["summary"]["language_counts"]
+            .as_array()
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["language"] == "cargo_manifest"
+                        && item["support_mode"] == "structural_collector"
+                        && item["evidence_tier"] == "structural_only"
+                        && item["claim_label"] == "structural collector only"
+                }) && items.iter().any(|item| {
+                    item["language"] == "docker_compose"
+                        && item["support_mode"] == "structural_collector"
+                        && item["evidence_tier"] == "structural_only"
+                        && item["claim_label"] == "structural collector only"
+                })
+            }),
+        "files JSON should expose path-scoped structural support tiers for manifests and Compose: {files:#}"
+    );
 }
 
 struct SearchDirSnapshot {

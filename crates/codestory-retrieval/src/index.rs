@@ -1,5 +1,5 @@
 use crate::config::{
-    SidecarLayout, ZOEKT_REAL_VERSION_PIN, dir_size_bytes, qdrant_enabled,
+    SidecarLayout, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, dir_size_bytes, qdrant_enabled,
     qdrant_semantic_vectors_enabled, zoekt_enabled,
 };
 use crate::generation::{
@@ -20,6 +20,7 @@ use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, Sym
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,6 +64,8 @@ struct SidecarStubFlags {
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = QDRANT_INDEX_UPSERT_BATCH_SIZE * 8;
+const QDRANT_SEMANTIC_SMOKE_RETRY_ATTEMPTS: usize = 2;
+const QDRANT_SEMANTIC_SMOKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub fn project_id_for_root(project_root: &Path) -> String {
     let canonical = project_root
@@ -179,7 +182,17 @@ pub fn repair_project_qdrant_collection(
 }
 
 pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<FinalizeIndexOutcome> {
-    let layout = SidecarLayout::from_env_for_project(project_root);
+    let runtime = crate::config::sidecar_runtime_auto(project_root);
+    finalize_index_for_runtime(project_root, storage_path, &runtime)
+}
+
+pub fn finalize_index_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<FinalizeIndexOutcome> {
+    runtime.activate_embed_url_default();
+    let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
 
     let project_id = sidecar_project_id_for_root(project_root);
@@ -487,10 +500,60 @@ fn ensure_qdrant_collection(
             "Qdrant collection ensured and populated"
         );
     }
-    if !qdrant_client.semantic_search_smoke(collection) {
-        bail!("mandatory Qdrant semantic smoke failed for {project_id} collection {collection}");
-    }
+    ensure_qdrant_semantic_smoke(project_id, collection, qdrant_client)?;
     Ok(qdrant_ready_points.unwrap_or_default())
+}
+
+fn ensure_qdrant_semantic_smoke(
+    project_id: &str,
+    collection: &str,
+    qdrant_client: &QdrantClient,
+) -> Result<()> {
+    ensure_qdrant_semantic_smoke_with(
+        project_id,
+        collection,
+        || qdrant_client.semantic_search_smoke_result(collection),
+        QDRANT_SEMANTIC_SMOKE_RETRY_ATTEMPTS,
+        QDRANT_SEMANTIC_SMOKE_RETRY_DELAY,
+        std::thread::sleep,
+    )
+}
+
+fn ensure_qdrant_semantic_smoke_with<F, S>(
+    project_id: &str,
+    collection: &str,
+    mut smoke: F,
+    retry_attempts: usize,
+    retry_delay: Duration,
+    mut sleep: S,
+) -> Result<()>
+where
+    F: FnMut() -> Result<()>,
+    S: FnMut(Duration),
+{
+    let total_attempts = retry_attempts + 1;
+    for attempt in 1..=total_attempts {
+        match smoke() {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < total_attempts => {
+                warn!(
+                    project_id = %project_id,
+                    collection = %collection,
+                    attempt,
+                    total_attempts,
+                    error = %error,
+                    "Qdrant semantic smoke failed; retrying before finalize"
+                );
+                sleep(retry_delay);
+            }
+            Err(error) => {
+                bail!(
+                    "mandatory Qdrant semantic smoke failed for {project_id} collection {collection} after {attempt} attempt(s): {error:#}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_scip_artifacts(
@@ -1095,6 +1158,71 @@ mod tests {
             error.to_string().contains("mandatory"),
             "expected mandatory-sidecar error, got {error:#}"
         );
+    }
+
+    #[test]
+    fn qdrant_semantic_smoke_gate_succeeds_first_attempt() {
+        let mut calls = 0usize;
+        ensure_qdrant_semantic_smoke_with(
+            "proj",
+            "collection",
+            || {
+                calls += 1;
+                Ok(())
+            },
+            2,
+            Duration::from_millis(1),
+            |_| panic!("sleep should not run after first-pass success"),
+        )
+        .expect("smoke succeeds");
+
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn qdrant_semantic_smoke_gate_retries_transient_failure() {
+        let mut calls = 0usize;
+        let mut sleeps = 0usize;
+        ensure_qdrant_semantic_smoke_with(
+            "proj",
+            "collection",
+            || {
+                calls += 1;
+                if calls == 1 {
+                    anyhow::bail!("qdrant semantic smoke search failed: qdrant query warming");
+                }
+                Ok(())
+            },
+            2,
+            Duration::from_millis(1),
+            |_| sleeps += 1,
+        )
+        .expect("retry succeeds");
+
+        assert_eq!(calls, 2);
+        assert_eq!(sleeps, 1);
+    }
+
+    #[test]
+    fn qdrant_semantic_smoke_gate_fails_closed_with_sublayer_detail() {
+        let mut calls = 0usize;
+        let error = ensure_qdrant_semantic_smoke_with(
+            "proj",
+            "collection",
+            || {
+                calls += 1;
+                anyhow::bail!("qdrant semantic smoke search failed: embedding endpoint refused")
+            },
+            2,
+            Duration::from_millis(1),
+            |_| {},
+        )
+        .expect_err("hard smoke failure must fail finalize");
+
+        let message = format!("{error:#}");
+        assert_eq!(calls, 3);
+        assert!(message.contains("mandatory Qdrant semantic smoke failed"));
+        assert!(message.contains("embedding endpoint refused"));
     }
 
     #[test]

@@ -840,6 +840,8 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         tool_names,
         vec![
             "affected",
+            "callees",
+            "callers",
             "context",
             "definition",
             "files",
@@ -854,6 +856,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             "snippet",
             "symbol",
             "symbols",
+            "trace",
             "trail",
         ],
         "stdio browser tool names should stay stable and read-only: {tools}"
@@ -1216,6 +1219,11 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "trail.depth should document the stdio default: {trail}"
     );
     assert_eq!(
+        schema_property(trail, "max_nodes").get("maximum"),
+        Some(&json!(120)),
+        "trail.max_nodes should document the stdio hard cap: {trail}"
+    );
+    assert_eq!(
         schema_property(trail, "story")["type"],
         "boolean",
         "trail.story should be a boolean opt-in: {trail}"
@@ -1224,6 +1232,30 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         schema_property(trail, "story").get("default"),
         Some(&json!(false)),
         "trail.story should document the stdio default: {trail}"
+    );
+    for name in ["callers", "callees"] {
+        let alias = tool_input_schema(&tools, name);
+        assert_eq!(
+            schema_property(alias, "depth").get("default"),
+            Some(&json!(1)),
+            "{name}.depth should document the bounded alias default: {alias}"
+        );
+        assert_eq!(
+            schema_property(alias, "max_nodes").get("maximum"),
+            Some(&json!(120)),
+            "{name}.max_nodes should document the stdio hard cap: {alias}"
+        );
+    }
+    let trace = tool_input_schema(&tools, "trace");
+    assert_eq!(
+        schema_property(trace, "story").get("default"),
+        Some(&json!(true)),
+        "trace.story should default to readable output: {trace}"
+    );
+    assert_eq!(
+        schema_property(trace, "max_nodes").get("maximum"),
+        Some(&json!(120)),
+        "trace.max_nodes should document the stdio hard cap: {trace}"
     );
 
     let context = tool_input_schema(&tools, "context");
@@ -1271,6 +1303,8 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
 
     for name in [
         "affected",
+        "callees",
+        "callers",
         "context",
         "definition",
         "files",
@@ -1281,6 +1315,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "snippet",
         "symbol",
         "symbols",
+        "trace",
         "trail",
     ] {
         let tool = tool_by_name(&tools, name);
@@ -1986,6 +2021,17 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should identify the active CLI version: {status}"
     );
     assert!(
+        status["source_checkout_version"].is_null()
+            || status["source_checkout_version"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty()),
+        "status should distinguish source checkout version from active runtime version: {status}"
+    );
+    assert!(
+        status["path_candidates"].is_array(),
+        "status should report competing PATH candidates even when none are present: {status}"
+    );
+    assert!(
         status["sidecar_contract_version"].is_number(),
         "status should expose the sidecar contract version: {status}"
     );
@@ -2076,10 +2122,13 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
+        "trace",
         "trail",
         "references",
         "snippet",
@@ -2496,12 +2545,15 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
         "snippet",
         "references",
+        "trace",
         "trail",
         "affected",
     ] {
@@ -2780,6 +2832,10 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         Some("repair_retrieval")
     );
     assert_eq!(
+        error.pointer("/failed_layer").and_then(Value::as_str),
+        Some("retrieval_sidecar")
+    );
+    assert_eq!(
         error.pointer("/repair_reason").and_then(Value::as_str),
         Some("retrieval_manifest_missing")
     );
@@ -2792,6 +2848,11 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
     let minimum_next = error["minimum_next"]
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include minimum_next: {response}"));
+    assert_eq!(
+        minimum_next.len(),
+        1,
+        "stdio search readiness error should expose exactly one canonical minimum repair: {response}"
+    );
     assert!(
         minimum_next.iter().any(|command| command
             .as_str()
@@ -3300,6 +3361,43 @@ fn invalid_json_returns_parse_error_with_null_id() {
         message.contains("parse error") || message.contains("json"),
         "invalid JSON message should mention parsing: {response}"
     );
+}
+
+#[test]
+fn oversized_stdio_frame_returns_structured_protocol_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let oversized = "x".repeat(1024 * 1024 + 1);
+
+    let response = send_line(&mut server, &oversized);
+
+    let error = assert_error_envelope(&response, Value::Null);
+    assert_error_code(error, -32700);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("stdio_frame_too_large"),
+        "oversized frame should use a structured protocol error: {response}"
+    );
+    assert_eq!(
+        error
+            .pointer("/data/max_frame_bytes")
+            .and_then(Value::as_u64),
+        Some(1024 * 1024),
+        "oversized frame error should report the configured byte limit: {response}"
+    );
+    assert!(
+        error
+            .pointer("/data/line_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|bytes| bytes > 1024 * 1024),
+        "oversized frame error should report observed line bytes: {response}"
+    );
+
+    let follow_up = send_json(
+        &mut server,
+        json!({"jsonrpc": "2.0", "id": "after-oversized", "method": "initialize"}),
+    );
+    assert_success_envelope(&follow_up, json!("after-oversized"));
 }
 
 #[test]

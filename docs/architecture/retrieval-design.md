@@ -182,5 +182,5 @@ Promotion requires at least:
 
 Proof tiers, promotion checklist, and north-star SLOs:
 [`retrieval-architecture.md`](../testing/retrieval-architecture.md). Setup,
-version pins, env vars, and CI smoke:
-[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md).
+version pins, agent readiness repair, env vars, and CI smoke:
+[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#agent-readiness-repair).

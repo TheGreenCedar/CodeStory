@@ -75,6 +75,40 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
+fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
+    let main = read("crates/codestory-cli/src/main.rs");
+    let helper = source_between(&main, "fn new_agent_surface_runtime", "fn run_cache");
+    assert!(
+        helper.contains("RuntimeContext::new_agent_sidecar(project)"),
+        "shared agent surface runtime must keep ready/direct CLI/stdio on the agent-sidecar constructor"
+    );
+
+    for (start, end, surface) in [
+        ("fn run_context", "fn run_packet", "context"),
+        ("fn run_packet", "fn run_task", "packet"),
+        (
+            "fn run_task_brief",
+            "fn render_packet_markdown",
+            "task brief",
+        ),
+        ("fn run_search", "fn search_request_from_command", "search"),
+        ("fn run_serve", "fn run_generate_completions", "stdio/serve"),
+    ] {
+        let body = source_between(&main, start, end);
+        assert!(
+            body.contains("new_agent_surface_runtime(&cmd.project)?"),
+            "{surface} must use the same agent-sidecar runtime constructor as stdio status/ready"
+        );
+    }
+
+    let ready = source_between(&main, "fn run_ready", "fn run_agent");
+    assert!(
+        ready.contains("new_agent_surface_runtime(&cmd.project)?"),
+        "ready --goal agent --repair must stay on the shared agent-sidecar runtime constructor"
+    );
+}
+
+#[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
     let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
     assert!(
@@ -296,6 +330,9 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
             ".references_context(",
             "pub fn references_context",
         ),
+        ("callers", ".trail_context(", "pub fn trail_context"),
+        ("callees", ".trail_context(", "pub fn trail_context"),
+        ("trace", ".trail_context(", "pub fn trail_context"),
         ("symbols", ".list_root_symbols(", "pub fn list_root_symbols"),
         (
             "symbols",

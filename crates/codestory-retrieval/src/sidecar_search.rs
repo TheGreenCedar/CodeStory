@@ -7,6 +7,10 @@ use anyhow::Result;
 use codestory_store::RetrievalIndexManifest;
 /// Sidecar search surface used by the executor (mockable in unit tests).
 pub trait SidecarSearch: Send + Sync {
+    fn layout(&self) -> Option<&SidecarLayout> {
+        None
+    }
+
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
@@ -61,6 +65,10 @@ impl LiveSidecarSearch {
 }
 
 impl SidecarSearch for LiveSidecarSearch {
+    fn layout(&self) -> Option<&SidecarLayout> {
+        Some(&self.layout)
+    }
+
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         self.zoekt
             .search(&self.layout, &self.sidecar_generation, query, limit)

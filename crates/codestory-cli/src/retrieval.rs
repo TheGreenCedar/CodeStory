@@ -5,8 +5,9 @@ use std::time::Duration;
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    bootstrap_sidecars_with_runtime, execute_retrieval_query, sidecar_down_for_runtime,
-    sidecar_up_with_runtime, strict_sidecar_status, strict_sidecar_status_for_runtime,
+    SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime, execute_retrieval_query,
+    sidecar_down_for_runtime, sidecar_up_with_runtime, strict_sidecar_status,
+    strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
@@ -136,22 +137,30 @@ fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
 
 fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
-    activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
+    let sidecar_profile = cmd.profile.unwrap_or(CliSidecarProfile::Local);
+    activate_retrieval_profile_env(Some(sidecar_profile), cmd.run_id.as_deref());
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        sidecar_profile.into(),
+        cmd.run_id.as_deref(),
+    );
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
-    let outcome = finalize_retrieval_index_for_runtime(&runtime).or_else(|error| {
-        if !retrieval_index_should_retry_full_refresh(cmd.refresh, &error) {
-            return Err(error);
-        }
-        runtime
-            .index
-            .run_indexing_blocking(IndexMode::Full)
-            .map_err(map_api_error)?;
-        finalize_retrieval_index_for_runtime(&runtime)
-            .context("retrieval index finalize after semantic-doc contract repair")
-    })?;
+    let outcome =
+        finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {
+            if !retrieval_index_should_retry_full_refresh(cmd.refresh, &error) {
+                return Err(error);
+            }
+            runtime
+                .index
+                .run_indexing_blocking(IndexMode::Full)
+                .map_err(map_api_error)?;
+            finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar)
+                .context("retrieval index finalize after semantic-doc contract repair")
+        })?;
+    ensure_local_profile_handoff(&runtime, &sidecar, &outcome)?;
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
 }
 
@@ -207,10 +216,83 @@ fn run_retrieval_index_refresh(
 pub(crate) fn finalize_retrieval_index_for_runtime(
     runtime: &RuntimeContext,
 ) -> Result<FinalizeIndexOutcome> {
+    let sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar)
+}
+
+pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
+    runtime: &RuntimeContext,
+    sidecar: &SidecarRuntimeConfig,
+) -> Result<FinalizeIndexOutcome> {
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "retrieval index")?;
-    codestory_retrieval::finalize_index(&runtime.project_root, &runtime.storage_path)
-        .context("retrieval index finalize")
+    codestory_retrieval::finalize_index_for_runtime(
+        &runtime.project_root,
+        &runtime.storage_path,
+        sidecar,
+    )
+    .context("retrieval index finalize")
+}
+
+fn ensure_local_profile_handoff(
+    runtime: &RuntimeContext,
+    indexed_sidecar: &SidecarRuntimeConfig,
+    outcome: &FinalizeIndexOutcome,
+) -> Result<()> {
+    if indexed_sidecar.profile != SidecarProfile::Local {
+        return Ok(());
+    }
+    let default_sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    if let Some(mismatch) = sidecar_runtime_mismatch(indexed_sidecar, &default_sidecar) {
+        anyhow::bail!("{mismatch}");
+    }
+    let status = strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        default_sidecar,
+    )
+    .context("retrieval local/default status after index")?;
+    if status.retrieval_mode != "full" {
+        anyhow::bail!(
+            "retrieval profile handoff failed: local/default status after index is mode={} reason={}; indexed_project_id={} sidecar={}",
+            status.retrieval_mode,
+            status.degraded_reason.as_deref().unwrap_or("unknown"),
+            outcome.project_id,
+            format_sidecar_runtime(indexed_sidecar)
+        );
+    }
+    Ok(())
+}
+
+fn sidecar_runtime_mismatch(
+    indexed: &SidecarRuntimeConfig,
+    default: &SidecarRuntimeConfig,
+) -> Option<String> {
+    let same_paths = indexed.profile == default.profile
+        && indexed.namespace == default.namespace
+        && indexed.layout.zoekt_data_dir == default.layout.zoekt_data_dir
+        && indexed.layout.qdrant_data_dir == default.layout.qdrant_data_dir
+        && indexed.layout.scip_artifacts_root == default.layout.scip_artifacts_root
+        && indexed.layout.state_file == default.layout.state_file;
+    (!same_paths).then(|| {
+        format!(
+            "retrieval profile handoff mismatch: indexed local artifacts use {}; default bare retrieval resolves to {}; retrieval index must not report success until local/default namespace and paths match",
+            format_sidecar_runtime(indexed),
+            format_sidecar_runtime(default)
+        )
+    })
+}
+
+fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
+    format!(
+        "profile={} namespace={} state={} zoekt={} qdrant={} scip={}",
+        runtime.profile.as_str(),
+        runtime.namespace,
+        runtime.layout.state_file.display(),
+        runtime.layout.zoekt_data_dir.display(),
+        runtime.layout.qdrant_data_dir.display(),
+        runtime.layout.scip_artifacts_root.display()
+    )
 }
 
 fn retrieval_index_should_retry_full_refresh(
@@ -504,5 +586,26 @@ mod tests {
             RefreshMode::Auto,
             &error
         ));
+    }
+
+    #[test]
+    fn local_profile_handoff_reports_default_namespace_path_mismatch() {
+        let project = tempfile::TempDir::new().expect("project");
+        let local =
+            codestory_retrieval::sidecar_runtime_for_project(project.path(), SidecarProfile::Local);
+        let agent = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some("issue-534"),
+        );
+
+        let message = sidecar_runtime_mismatch(&local, &agent).expect("mismatch");
+
+        assert!(message.contains("retrieval profile handoff mismatch"));
+        assert!(message.contains("profile=local"));
+        assert!(message.contains("profile=agent"));
+        assert!(message.contains("namespace=codestory-agent"));
+        assert!(message.contains("zoekt="));
+        assert!(sidecar_runtime_mismatch(&local, &local).is_none());
     }
 }

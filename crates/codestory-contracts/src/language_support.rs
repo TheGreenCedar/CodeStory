@@ -280,6 +280,8 @@ pub const LANGUAGE_SUPPORT_PROFILES: &[LanguageSupportProfile] = &[
     structural_profile("html", &["html", "htm"]),
     structural_profile("css", &["css"]),
     structural_profile("sql", &["sql"]),
+    structural_profile("docker_compose", &[]),
+    structural_profile("cargo_manifest", &[]),
 ];
 
 const fn parser_profile(
@@ -711,6 +713,14 @@ mod tests {
         assert!(!is_docker_compose_file_path("openapi.yaml"));
         assert!(!is_docker_compose_file_path("docs/service.yml"));
         assert!(language_support_profile_for_ext("yaml").is_none());
+        let profile = language_support_profile_for_language_name("docker_compose")
+            .expect("docker compose structural profile");
+        assert_eq!(
+            profile.support_mode,
+            LanguageSupportMode::StructuralCollector
+        );
+        assert_eq!(profile.evidence_tier, LanguageEvidenceTier::StructuralOnly);
+        assert!(profile.extensions.is_empty());
     }
 
     #[test]
@@ -723,5 +733,13 @@ mod tests {
         assert!(!is_cargo_manifest_file_path(".cargo/config.toml"));
         assert!(!is_cargo_manifest_file_path("Cargo.lock"));
         assert!(language_support_profile_for_ext("toml").is_none());
+        let profile = language_support_profile_for_language_name("cargo_manifest")
+            .expect("cargo manifest structural profile");
+        assert_eq!(
+            profile.support_mode,
+            LanguageSupportMode::StructuralCollector
+        );
+        assert_eq!(profile.evidence_tier, LanguageEvidenceTier::StructuralOnly);
+        assert!(profile.extensions.is_empty());
     }
 }

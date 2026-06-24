@@ -190,6 +190,7 @@ fn assemble_packet_sufficiency(input: PacketSufficiencyInput<'_>) -> PacketSuffi
         budget,
         follow_up_probe_queries,
         targeted_follow_up_queries,
+        packet_full_retrieval_available(answer),
     );
     let coverage_report = packet_coverage_report(
         &supported_claims,
@@ -2169,7 +2170,7 @@ mod tests {
         AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId,
         NodeKind, PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto,
         PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto,
-        RetrievalScoreBreakdownDto, SearchHitOrigin,
+        RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHitOrigin,
     };
     use std::path::Path;
 
@@ -2276,6 +2277,26 @@ mod tests {
                 retrieval_shadow: None,
             },
         }
+    }
+
+    fn mark_full_retrieval_unavailable(answer: &mut AgentAnswerDto) {
+        answer.retrieval_trace.retrieval_shadow = Some(RetrievalShadowDto {
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some("retrieval_manifest_missing".to_string()),
+            retrieval_total_ms: 0,
+            total_budget_ms: None,
+            cancel_reason: None,
+            cache_hit: false,
+            stage_timings: Vec::new(),
+            candidates: Vec::new(),
+            would_rank: Vec::new(),
+            error: None,
+            candidate_count: 0,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 0,
+            diagnostic_only: false,
+            candidate_resolution_counts: Vec::new(),
+        });
     }
 
     fn unresolved_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
@@ -3980,6 +4001,92 @@ mod tests {
     }
 
     #[test]
+    fn partial_packets_with_blocked_full_retrieval_recommend_repair_and_local_graph() {
+        let question = "Trace how route registration reaches response finalization.";
+        let mut answer = answer_fixture(question);
+        mark_full_retrieval_unavailable(&mut answer);
+        let budget = budget_fixture();
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: vec![claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            )],
+            missing_required_probe_queries: vec!["route registration".to_string()],
+            targeted_follow_up_queries: vec!["response finalization".to_string()],
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .first()
+                .is_some_and(|command| command.contains("ready --goal agent --repair")),
+            "blocked full retrieval should lead with canonical sidecar repair: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("codestory-cli trail")
+                    && command.contains("--query 'route registration'")),
+            "blocked full retrieval should still offer local graph follow-up: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency.follow_up_commands.iter().all(|command| {
+                !command.contains("codestory-cli search")
+                    && !command.contains("codestory-cli context")
+            }),
+            "blocked full retrieval must not recommend blocked search/context surfaces: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn insufficient_packets_with_blocked_full_retrieval_avoid_search_recovery() {
+        let question = "Explain route dispatch with enough evidence to stop.";
+        let mut answer = answer_fixture(question);
+        answer.citations.clear();
+        mark_full_retrieval_unavailable(&mut answer);
+        let budget = budget_fixture();
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: Vec::new(),
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Insufficient);
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("ready --goal agent --repair")),
+            "blocked insufficient packet should recommend canonical sidecar repair: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("codestory-cli ground")),
+            "blocked insufficient packet should retain a local graph surface: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency.follow_up_commands.iter().all(|command| {
+                !command.contains("codestory-cli search")
+                    && !command.contains("codestory-cli context")
+            }),
+            "blocked insufficient packet must not recommend blocked search/context surfaces: {sufficiency:?}"
+        );
+    }
+
+    #[test]
     fn architecture_html_css_template_prompts_use_structural_roles() {
         let claims = vec![
             claim(
@@ -4300,6 +4407,7 @@ fn packet_follow_up_commands(
     budget: &PacketBudgetDto,
     missing_required_probe_queries: &[String],
     targeted_follow_up_queries: Vec<String>,
+    full_retrieval_available: bool,
 ) -> Vec<String> {
     let project = quote_packet_project_arg(project_root);
     match status {
@@ -4310,6 +4418,12 @@ fn packet_follow_up_commands(
             } else {
                 missing_required_probe_queries.to_vec()
             };
+            if !full_retrieval_available {
+                let mut commands = vec![packet_agent_repair_command(project.as_str())];
+                commands.extend(packet_follow_up_trail_commands(project.as_str(), &queries));
+                commands.truncate(8);
+                return commands;
+            }
             let mut commands = packet_follow_up_search_commands(project.as_str(), &queries);
             commands.truncate(8);
             commands
@@ -4321,14 +4435,49 @@ fn packet_follow_up_commands(
                 )))
                 .collect()
         }
-        PacketSufficiencyStatusDto::Insufficient => vec![
-            format!("codestory-cli index --project {project} --refresh full"),
-            format!(
-                "codestory-cli search --project {project} --query {} --why",
-                quote_packet_command_value(question)
-            ),
-        ],
+        PacketSufficiencyStatusDto::Insufficient => {
+            if full_retrieval_available {
+                vec![
+                    format!("codestory-cli index --project {project} --refresh full"),
+                    format!(
+                        "codestory-cli search --project {project} --query {} --why",
+                        quote_packet_command_value(question)
+                    ),
+                ]
+            } else {
+                vec![
+                    packet_agent_repair_command(project.as_str()),
+                    format!("codestory-cli ground --project {project} --why"),
+                ]
+            }
+        }
     }
+}
+
+fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
+    answer
+        .retrieval_trace
+        .retrieval_shadow
+        .as_ref()
+        .map_or(true, |shadow| shadow.retrieval_mode == "full")
+}
+
+fn packet_agent_repair_command(quoted_project: &str) -> String {
+    format!("codestory-cli ready --goal agent --repair --project {quoted_project} --format json")
+}
+
+fn packet_follow_up_trail_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
+    let mut commands = Vec::new();
+    for query in queries {
+        push_unique_term(
+            &mut commands,
+            &format!(
+                "codestory-cli trail --project {quoted_project} --query {} --story --hide-speculative",
+                quote_packet_command_value(query)
+            ),
+        );
+    }
+    commands
 }
 
 fn packet_follow_up_search_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {
