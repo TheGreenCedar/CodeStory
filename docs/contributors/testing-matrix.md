@@ -168,14 +168,18 @@ only to make that separate drill skip explicit during local release-evidence
 collection. A skipped drill means the release evidence is not real-repo drill
 proof; it does not rename the `proof_tier` emitted by the stats JSON.
 
-Append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`.
-Include graph seconds, semantic seconds, symbol docs written, dense docs skipped,
-dense reason counts, dense docs reused, dense docs embedded, total index
-seconds, `repeat_full_refresh_seconds`, repeat graph/semantic/cache/search
-timings, `retrieval_index_seconds`, `retrieval_status_seconds`,
-`report_seconds`, `proof_tier`, any `warnings`, and whether
+Append the emitted headline and phase metrics to
+`docs/testing/codestory-e2e-stats-log.md`. Include graph seconds, semantic
+seconds, symbol docs written, dense docs skipped, dense reason counts, dense
+docs reused, dense docs embedded, total index seconds,
+`repeat_full_refresh_seconds`, repeat graph/semantic/cache/search timings,
+`retrieval_index_seconds`, `retrieval_status_seconds`, `report_seconds`,
+`proof_tier`, any `warnings`, and whether
 `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode`
-were `full`.
+were `full`. The release stats harness reads the latest valid `Phase Metrics`
+row in that log as its living warning baseline and reads that row's
+`repeat full refresh <seconds>s` scenario text as the repeat full-refresh
+blocker baseline.
 
 Release-readiness evidence is tiered:
 
@@ -195,12 +199,15 @@ remains `full_sidecar`, not `stats_only`. Warning-free full-sidecar stats must
 not be promoted to real-repo drill or promotion-grade evidence by themselves.
 
 The stats JSON also reports `warnings` for performance thresholds that should
-stay visible in logged evidence:
+stay visible in logged evidence. Total index time and semantic phase warnings
+are computed against the latest `Phase Metrics` row in
+[`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md), not
+against older hard-coded timing rows:
 
 | Warning | Threshold |
 | --- | --- |
-| Total index time | `index_seconds > 600` |
-| Semantic phase time | `semantic_phase_seconds > 500` |
+| Total index time | `index_seconds` is more than 25% above the latest stats-log phase baseline |
+| Semantic phase time | `semantic_phase_seconds` is more than 25% above the latest stats-log phase baseline |
 | AST-first cold index gate | cold CodeStory product index is not under 180s or `semantic_embedding_ms` is not at least 70% below same-run baseline |
 
 Preserve those warning strings when copying the run into release evidence. An

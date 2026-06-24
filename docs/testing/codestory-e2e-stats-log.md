@@ -7,7 +7,7 @@ cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
-Keep the full emitted JSON in the test output when reviewing locally, and add the headline metrics here so search/index reuse trends are visible over time. For performance branches, capture the baseline and no-regression threshold from [performance-review-playbook.md](performance-review-playbook.md) before tuning.
+Keep the full emitted JSON in the test output when reviewing locally, and add the headline metrics here so search/index reuse trends are visible over time. The release stats harness reads the latest valid `Phase Metrics` row below as its living warning baseline, so append the phase row with the same evidence update. For performance branches, capture the baseline and no-regression threshold from [performance-review-playbook.md](performance-review-playbook.md) before tuning.
 
 Rows whose commit cell ends in `+wt` were run from the working tree based on that commit before the proof row itself was committed. When a row names the later commit in the result text, the runtime/code state under test is the working tree that became that commit; proof-only commits after the run still need fresh `ready`/`doctor` checks because docs change the sidecar input hash.
 
@@ -103,9 +103,11 @@ New `codestory_repo_e2e_stats` runs emit `repeat_full_refresh_seconds`,
 `repeat_cache_refresh_ms`, `repeat_search_projection_rebuild_ms`,
 `repeat_search_symbol_index_ms`, `repeat_runtime_cache_publish_ms`,
 `report_seconds`, and nested `report.markdown_seconds` / `report.json_seconds`.
-Append the measurement row here when running the release harness. The repeat
-wall-clock value is trend telemetry with a loose smoke cap; graph, semantic,
-and zero-reembedding assertions are the actionable repeat-refresh gates.
+Append the measurement row here when running the release harness. The release
+stats harness reads `repeat full refresh <seconds>s` from the latest valid phase
+row scenario and uses it as the living repeat full-refresh blocker baseline;
+graph, semantic, and zero-reembedding assertions remain explicit repeat-refresh
+gates.
 
 | Date | Commit | Scenario | Repeat full refresh seconds | Report seconds | Report markdown seconds | Report JSON seconds |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
