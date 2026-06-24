@@ -27,24 +27,37 @@ Per-task medians, ranges, reproduction commands, and boundary notes:
 
 ## Quick start
 
-The normal path is an **agent plugin** backed by the local stdio server. The
-CLI is for setup, repair, debugging, and transcripts.
+The golden path is: preflight the repo, install the **agent plugin**, then let
+the plugin's MCP server and hooks keep CodeStory ambient. The CLI is for
+preflight, repair, debugging, and transcripts.
 
 For Codex:
 
-1. Open Codex in the repository you want to ground.
-2. Run `/plugins`, then install **TheGreenCedar → codestory**.
+1. In the repository you want to ground, run:
+
+   ```sh
+   codestory-cli agent preflight --project <repo> --format json
+   ```
+
+   Use `safe_surfaces`, `blocked_surfaces`, and `repair_command` as the
+   handoff. If local graph surfaces are blocked, run the repair command first.
+   If only `packet`, `search`, or `context` is blocked, local navigation can
+   still proceed while sidecars are repaired later.
+
+2. Open Codex in that repository, run `/plugins`, then install
+   **TheGreenCedar → codestory**.
 3. Start a fresh thread and ask:
 
-```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
-```
+   ```text
+   @CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+   ```
 
 Claude Code, GitHub Copilot, and Cursor adapters can load the same
 status-first grounding rules automatically when their host supports hooks or
-project instructions. Hook-enabled hosts keep CodeStory ambient and can attempt
-strict startup grounding plus request-aware packets before the agent opens
-source files. Codex uses the plugin's MCP server plus the
+project instructions. Hook-enabled hosts keep CodeStory ambient: they ground on
+session start, try request-aware grounding on user prompts, carry guidance
+through resume/clear/compact handoffs, and fail open with the next CodeStory
+check to run. Codex uses the plugin's MCP server plus the
 `@CodeStory` skill.
 
 The plugin launches a managed MCP adapter that starts
@@ -56,7 +69,7 @@ directly. Install details, binary bootstrap, and uninstall notes live in the
 **Verify without the agent:**
 
 ```sh
-codestory-cli doctor --project <repo>
+codestory-cli agent preflight --project <repo> --format json
 ```
 
 **If install or MCP fails:** marketplace registration, CLI bootstrap, and host restart notes live in the [plugin README](plugins/codestory/README.md).

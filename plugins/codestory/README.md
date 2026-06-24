@@ -8,14 +8,23 @@ CodeStory gives a coding agent a local, read-only grounding surface before it
 plans, reviews, or edits a repository. Index once; answer from evidence with
 citations instead of re-exploring the tree on every prompt.
 
-The human job is simple: install the plugin and start a fresh thread in the
-repo. Hosts with lifecycle-hook adapters keep CodeStory ambient: on session
-start, resume, clear, and compact, the hook injects CodeStory-first grounding
-rules and attempts a strict `ground` snapshot from the session cwd; on each user
-prompt, it attempts a tiny `packet` using that exact prompt. The agent should
-use CodeStory before source files whenever it needs to verify repository facts,
-plan edits, choose tests, or review changes. The CLI is still there, but it is
-the escape hatch and repair surface, not the main user experience.
+The human job is simple: run agent preflight in the repo, install the plugin,
+and start a fresh thread there.
+
+```sh
+codestory-cli agent preflight --project <repo> --format json
+```
+
+Use `safe_surfaces`, `blocked_surfaces`, and `repair_command` as the handoff.
+Then let the plugin path take over.
+Hosts with lifecycle-hook adapters keep CodeStory ambient. On session start,
+resume, clear, and compact, the hook
+injects CodeStory-first grounding rules and attempts a strict `ground` snapshot
+from the session cwd; on each user prompt, it attempts a tiny `packet` using
+that exact prompt. The agent should use CodeStory before source files whenever
+it needs to verify repository facts, plan edits, choose tests, or review
+changes. The CLI is still there, but it is the escape hatch and repair surface,
+not the main user experience.
 
 This is strict startup grounding plus request-aware packets, not a random
 repository summary. Hooks fail open. Missing `node`, missing `codestory-cli`, missing MCP, degraded
@@ -75,8 +84,18 @@ CLI/MCP runtime.
 
 ## Install For Agent Use
 
-For normal Codex use, install the plugin through the Codex plugin flow for your
-workspace. Open Codex in the repo you want to ground, then use:
+For normal Codex use, first preflight the repo:
+
+```bash
+codestory-cli agent preflight --project <repo> --format json
+```
+
+If local graph surfaces are blocked, run the emitted `repair_command` before
+source work. If only `packet`, `search`, or `context` is blocked, local
+navigation can continue while sidecars are repaired later.
+
+Then install the plugin through the Codex plugin flow for your workspace. Open
+Codex in the repo you want to ground, then use:
 
 ```text
 /plugins
@@ -192,6 +211,7 @@ Use the CLI when the agent needs to repair setup, produce a transcript, or debug
 why the MCP server is not ready:
 
 ```console
+codestory-cli agent preflight --project <repo> --format json
 where.exe codestory-cli
 codestory-cli --version
 codestory-cli ready --goal local --repair --project <repo> --format json
