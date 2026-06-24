@@ -3312,6 +3312,43 @@ fn invalid_json_returns_parse_error_with_null_id() {
 }
 
 #[test]
+fn oversized_stdio_frame_returns_structured_protocol_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let oversized = "x".repeat(1024 * 1024 + 1);
+
+    let response = send_line(&mut server, &oversized);
+
+    let error = assert_error_envelope(&response, Value::Null);
+    assert_error_code(error, -32700);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("stdio_frame_too_large"),
+        "oversized frame should use a structured protocol error: {response}"
+    );
+    assert_eq!(
+        error
+            .pointer("/data/max_frame_bytes")
+            .and_then(Value::as_u64),
+        Some(1024 * 1024),
+        "oversized frame error should report the configured byte limit: {response}"
+    );
+    assert!(
+        error
+            .pointer("/data/line_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|bytes| bytes > 1024 * 1024),
+        "oversized frame error should report observed line bytes: {response}"
+    );
+
+    let follow_up = send_json(
+        &mut server,
+        json!({"jsonrpc": "2.0", "id": "after-oversized", "method": "initialize"}),
+    );
+    assert_success_envelope(&follow_up, json!("after-oversized"));
+}
+
+#[test]
 fn bad_tool_call_args_return_jsonrpc_error() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);

@@ -18,7 +18,7 @@ use codestory_contracts::api::{
 use codestory_retrieval::SidecarLayout;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration as StdDuration;
@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Run the stdio server until stdin closes.
 ///
@@ -50,29 +51,103 @@ const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 /// telemetry on stderr so stdout remains a newline-delimited JSON stream.
 pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
     let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = std::io::stdout();
     let mut state = StdioServerState::default();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = (&mut stdin)
+            .take((STDIO_MAX_FRAME_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        if line.len() > STDIO_MAX_FRAME_BYTES {
+            let tail_bytes = if line.ends_with(b"\n") {
+                0
+            } else {
+                discard_stdio_frame_tail(&mut stdin)?
+            };
+            let response = stdio_frame_too_large_error(line.len() + tail_bytes);
+            write_stdio_response(&mut stdout, &response)?;
+            continue;
+        }
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) => line.trim_end_matches(&['\r', '\n']),
+            Err(error) => {
+                let response = stdio_jsonrpc_error(
+                    serde_json::Value::Null,
+                    -32700,
+                    format!("Parse error: {error}"),
+                );
+                write_stdio_response(&mut stdout, &response)?;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_stdio_message(&runtime, &mut state, &line) {
-            let response_id = stdio_response_id_label(&response);
-            let serialize_started = Instant::now();
-            serde_json::to_writer(&mut stdout, &response)?;
-            let serialization_ms = stdio_elapsed_ms(serialize_started);
-            let newline_started = Instant::now();
-            stdout.write_all(b"\n")?;
-            let newline_write_ms = stdio_elapsed_ms(newline_started);
-            let flush_started = Instant::now();
-            stdout.flush()?;
-            let flush_ms = stdio_elapsed_ms(flush_started);
-            report_stdio_server_phase(&response_id, "response_serialization", serialization_ms);
-            report_stdio_server_phase(&response_id, "newline_write", newline_write_ms);
-            report_stdio_server_phase(&response_id, "flush", flush_ms);
+        if let Some(response) = handle_stdio_message(&runtime, &mut state, line) {
+            write_stdio_response(&mut stdout, &response)?;
         }
     }
+    Ok(())
+}
+
+fn discard_stdio_frame_tail<R: BufRead>(reader: &mut R) -> Result<usize> {
+    let mut discarded = 0;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(discarded);
+        }
+        if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            return Ok(discarded + index + 1);
+        }
+        let len = available.len();
+        reader.consume(len);
+        discarded += len;
+    }
+}
+
+fn stdio_frame_too_large_error(line_bytes: usize) -> serde_json::Value {
+    let mut response = stdio_jsonrpc_error(
+        serde_json::Value::Null,
+        -32700,
+        format!("Parse error: stdio frame exceeded {STDIO_MAX_FRAME_BYTES} byte limit"),
+    );
+    if let Some(error) = response
+        .get_mut("error")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        error.insert(
+            "data".to_string(),
+            serde_json::json!({
+                "code": "stdio_frame_too_large",
+                "max_frame_bytes": STDIO_MAX_FRAME_BYTES,
+                "line_bytes": line_bytes,
+            }),
+        );
+    }
+    response
+}
+
+fn write_stdio_response<W: Write>(stdout: &mut W, response: &serde_json::Value) -> Result<()> {
+    let response_id = stdio_response_id_label(response);
+    let serialize_started = Instant::now();
+    serde_json::to_writer(&mut *stdout, response)?;
+    let serialization_ms = stdio_elapsed_ms(serialize_started);
+    let newline_started = Instant::now();
+    stdout.write_all(b"\n")?;
+    let newline_write_ms = stdio_elapsed_ms(newline_started);
+    let flush_started = Instant::now();
+    stdout.flush()?;
+    let flush_ms = stdio_elapsed_ms(flush_started);
+    report_stdio_server_phase(&response_id, "response_serialization", serialization_ms);
+    report_stdio_server_phase(&response_id, "newline_write", newline_write_ms);
+    report_stdio_server_phase(&response_id, "flush", flush_ms);
     Ok(())
 }
 
