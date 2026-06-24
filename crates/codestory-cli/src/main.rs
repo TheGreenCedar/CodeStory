@@ -1304,12 +1304,13 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    codestory_retrieval::bootstrap_sidecars(
+    codestory_retrieval::bootstrap_sidecars_with_profile(
         Some(runtime.project_root.as_path()),
         &storage_scope,
         None,
         false,
         Duration::from_secs(90),
+        codestory_retrieval::SidecarProfile::Agent,
     )
     .context("ready repair retrieval bootstrap")?;
     codestory_retrieval::repair_project_qdrant_collection(

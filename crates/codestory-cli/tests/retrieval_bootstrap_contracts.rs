@@ -33,6 +33,19 @@ fn run_status(project: &std::path::Path, extra_args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("parse status json")
 }
 
+fn run_down(project: &std::path::Path, extra_args: &[&str]) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command.args(["retrieval", "down", "--project"]);
+    command.arg(project);
+    command.args(extra_args);
+    let output = command.output().expect("run retrieval down");
+    assert!(
+        output.status.success(),
+        "down failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn create_valid_cache_with_cli(project: &std::path::Path, cache: &std::path::Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
         .args(["index", "--project"])
@@ -163,6 +176,193 @@ fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
                             && text.contains("--refresh full")))
             ),
         "manifest-missing status should include full sidecar rebuild guidance: {status}"
+    );
+}
+
+#[test]
+fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
+    let project = tempdir().expect("project");
+    fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    let cache = tempdir().expect("cache");
+    let cache_arg = cache.path().to_str().expect("utf8 cache");
+
+    let bootstrap = run_bootstrap(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--profile",
+            "agent",
+            "--run-id",
+            "contract-a",
+            "--skip-compose",
+            "--wait-secs",
+            "0",
+            "--format",
+            "json",
+        ],
+    );
+    let state = &bootstrap["sidecar_state"];
+    assert_eq!(state["owner"].as_str(), Some("codestory"));
+    assert_eq!(state["profile"].as_str(), Some("agent"));
+    let namespace = state["namespace"].as_str().expect("namespace");
+    assert!(namespace.starts_with("codestory-agent-"));
+    assert!(
+        namespace.ends_with("-contract-a"),
+        "agent namespace should carry the run id: {namespace}"
+    );
+    assert_eq!(state["run_id"].as_str(), Some("contract-a"));
+    assert!(
+        state["zoekt_http_port"]
+            .as_u64()
+            .is_some_and(|port| port > 0)
+    );
+    assert!(
+        state["qdrant_http_port"]
+            .as_u64()
+            .is_some_and(|port| port > 0)
+    );
+    assert!(
+        state["qdrant_grpc_port"]
+            .as_u64()
+            .is_some_and(|port| port > 0)
+    );
+    assert!(
+        state["embed_http_port"]
+            .as_u64()
+            .is_some_and(|port| port > 0)
+    );
+    assert_ne!(state["zoekt_http_port"].as_u64(), Some(6070));
+    assert_ne!(state["qdrant_http_port"].as_u64(), Some(6333));
+    assert_ne!(state["qdrant_grpc_port"].as_u64(), Some(6334));
+    assert_ne!(state["embed_http_port"].as_u64(), Some(8080));
+    assert!(
+        state["cleanup_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile agent")),
+        "agent state should name the cleanup path: {state}"
+    );
+    let status = run_status(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--profile",
+            "agent",
+            "--run-id",
+            "contract-a",
+            "--format",
+            "json",
+        ],
+    );
+    let ownership = &status["ownership"];
+    assert_eq!(ownership["profile"].as_str(), Some("agent"));
+    assert_eq!(ownership["namespace"].as_str(), Some(namespace));
+    assert_eq!(
+        ownership["ports"]["zoekt_http"].as_u64(),
+        state["zoekt_http_port"].as_u64()
+    );
+    let state_path =
+        std::path::PathBuf::from(ownership["state_file"].as_str().expect("state file"));
+    assert!(state_path.is_file(), "state file should exist before down");
+
+    run_down(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--profile",
+            "agent",
+            "--run-id",
+            "contract-a",
+        ],
+    );
+    assert!(
+        !state_path.exists(),
+        "down should remove only the owned state file"
+    );
+}
+
+#[test]
+fn agent_profile_status_repair_hints_are_profile_aware() {
+    let project = tempdir().expect("project");
+    fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    let cache = tempdir().expect("cache");
+    let cache_arg = cache.path().to_str().expect("utf8 cache");
+
+    let status = run_status(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--profile",
+            "agent",
+            "--run-id",
+            "repair-a",
+            "--format",
+            "json",
+        ],
+    );
+
+    let repair = &status["repair"];
+    assert_eq!(
+        repair["reason"].as_str(),
+        Some("retrieval_manifest_missing")
+    );
+    assert!(
+        repair["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile agent")
+                && command.contains("--run-id repair-a")),
+        "agent status repair command should keep the profile/run id: {status}"
+    );
+    let full_repair = repair["full_repair"]
+        .as_array()
+        .expect("full repair commands");
+    assert!(
+        full_repair
+            .iter()
+            .all(|command| command.as_str().is_some_and(
+                |text| text.contains("--profile agent") && text.contains("--run-id repair-a")
+            )),
+        "agent full repair commands should keep the profile/run id: {status}"
+    );
+}
+
+#[test]
+fn run_id_status_implies_agent_profile() {
+    let project = tempdir().expect("project");
+    fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    let cache = tempdir().expect("cache");
+    let cache_arg = cache.path().to_str().expect("utf8 cache");
+
+    let status = run_status(
+        project.path(),
+        &[
+            "--cache-dir",
+            cache_arg,
+            "--run-id",
+            "implicit-agent",
+            "--format",
+            "json",
+        ],
+    );
+
+    let ownership = &status["ownership"];
+    assert_eq!(ownership["profile"].as_str(), Some("agent"));
+    assert!(
+        ownership["namespace"]
+            .as_str()
+            .is_some_and(|namespace| namespace.ends_with("-implicit-agent")),
+        "status --run-id should inspect the named agent namespace: {status}"
+    );
+    let repair = &status["repair"];
+    assert!(
+        repair["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile agent")
+                && command.contains("--run-id implicit-agent")),
+        "status --run-id repair command should keep the inferred agent run id: {status}"
     );
 }
 

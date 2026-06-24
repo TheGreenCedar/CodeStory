@@ -6,13 +6,17 @@
 # or:
 #   cargo run -p codestory-cli -- retrieval bootstrap
 
-name: codestory-retrieval
+name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}
 
 services:
   qdrant:
     image: qdrant/qdrant:v1.12.5
-    container_name: codestory-qdrant
+    container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-qdrant
     restart: unless-stopped
+    labels:
+      dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
+      dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
+      dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
     ports:
       - "127.0.0.1:${CODESTORY_QDRANT_HTTP_PORT:-6333}:6333"
       - "127.0.0.1:${CODESTORY_QDRANT_GRPC_PORT:-6334}:6334"
@@ -24,8 +28,12 @@ services:
   # Zoekt webserver (mount index dir populated by `retrieval index`).
   zoekt:
     image: sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4
-    container_name: codestory-zoekt
+    container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-zoekt
     restart: unless-stopped
+    labels:
+      dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
+      dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
+      dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
     ports:
       - "127.0.0.1:${CODESTORY_ZOEKT_PORT:-6070}:6070"
     volumes:
@@ -37,8 +45,12 @@ services:
   # Model GGUF must exist under CODESTORY_EMBED_MODEL_DIR (see setup-retrieval-env.mjs).
   embed:
     image: ghcr.io/ggml-org/llama.cpp:server
-    container_name: codestory-embed
+    container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-embed
     restart: unless-stopped
+    labels:
+      dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
+      dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
+      dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
     ports:
       - "127.0.0.1:${CODESTORY_EMBED_PORT:-8080}:8080"
     volumes:
