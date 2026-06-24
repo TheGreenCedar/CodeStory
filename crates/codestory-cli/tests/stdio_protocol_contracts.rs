@@ -14,6 +14,7 @@ struct StdioFixture {
     hash_embeddings: bool,
     latest_release_version: String,
     disable_installed_cli_probe: bool,
+    sidecar_policy_state: Option<String>,
 }
 
 struct StdioServer {
@@ -134,6 +135,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         hash_embeddings,
         latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
         disable_installed_cli_probe: false,
+        sidecar_policy_state: None,
     }
 }
 
@@ -226,6 +228,17 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
     );
     if fixture.disable_installed_cli_probe {
         command.env("CODESTORY_DISABLE_INSTALLED_CLI_PROBE", "1");
+    }
+    if let Some(state) = &fixture.sidecar_policy_state {
+        command.env("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE", state);
+        command.env(
+            "CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND",
+            "node codestory-mcp.cjs sidecar-policy enable",
+        );
+        command.env(
+            "CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND",
+            "node codestory-mcp.cjs sidecar-policy disable",
+        );
     }
     let mut child = command.spawn().expect("spawn stdio server");
 
@@ -2125,6 +2138,95 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .and_then(Value::as_array)
             .is_some_and(|calls| !calls.is_empty()),
         "status should include recommended next calls: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("ask".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-sidecar-ask",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-sidecar-ask"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["sidecar_setup"]["state"], json!("ask"));
+    assert_eq!(status["sidecar_setup"]["prompt_required"], json!(true));
+    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(next_call_text.contains("host/confirm"), "{status}");
+    assert!(next_call_text.contains("sidecar-policy enable"), "{status}");
+    assert!(
+        !next_call_text.contains("ready --goal agent --repair"),
+        "ask policy should not recommend heavy sidecar repair before consent: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_recommends_sidecar_repair_when_policy_enabled() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-sidecar-enabled",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-sidecar-enabled"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["sidecar_setup"]["state"], json!("enabled"));
+    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(true));
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        next_call_text.contains("codestory-cli ready --goal agent --repair"),
+        "enabled policy should keep the existing agent repair path visible: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("disabled".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-sidecar-disabled",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-sidecar-disabled"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["sidecar_setup"]["state"], json!("disabled"));
+    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        next_call_text.contains("Automatic sidecar setup is disabled"),
+        "{status}"
+    );
+    assert!(next_call_text.contains("sidecar-policy enable"), "{status}");
+    assert!(
+        !next_call_text.contains("ready --goal agent --repair"),
+        "disabled policy should not recommend automatic sidecar repair: {status}"
     );
 }
 

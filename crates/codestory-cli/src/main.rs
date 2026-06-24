@@ -34,6 +34,7 @@ use std::{
     fs,
     io::{IsTerminal, Read},
     net::TcpListener,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1286,7 +1287,7 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &sidecar,
     );
-    let output = build_agent_preflight_output(&readiness);
+    let output = build_agent_preflight_output(&readiness, Path::new(&summary.root));
     let markdown = render_agent_preflight_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -1334,6 +1335,7 @@ const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "
 
 fn build_agent_preflight_output(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
+    project_root: &Path,
 ) -> args::AgentPreflightOutput {
     let local = readiness
         .iter()
@@ -1375,6 +1377,7 @@ fn build_agent_preflight_output(
         mode: mode.to_string(),
         local_graph: agent_preflight_lane(local),
         full_retrieval: agent_preflight_lane(agent),
+        sidecar_setup: stdio_transport::stdio_sidecar_setup_status(project_root),
         safe_surfaces,
         blocked_surfaces,
         repair_command,
@@ -1429,6 +1432,13 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
         "full_retrieval: {}",
         readiness::status_label(output.full_retrieval.status)
     );
+    if let Some(state) = output
+        .sidecar_setup
+        .get("state")
+        .and_then(|value| value.as_str())
+    {
+        let _ = writeln!(markdown, "sidecar_setup: `{state}`");
+    }
     let _ = writeln!(markdown, "human_summary: {}", output.human_summary);
     if let Some(command) = output.repair_command.as_deref() {
         let _ = writeln!(markdown, "repair_command: `{command}`");

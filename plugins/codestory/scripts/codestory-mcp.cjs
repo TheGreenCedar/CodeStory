@@ -48,6 +48,127 @@ function pluginDataDir() {
   return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || null;
 }
 
+function sidecarPolicyPath(dataDir = pluginDataDir()) {
+  return dataDir ? path.join(dataDir, 'sidecar-setup-policy.json') : null;
+}
+
+function sidecarPolicyCommand(action, policyFile = sidecarPolicyPath()) {
+  const policyArg = policyFile ? ` --policy-file ${JSON.stringify(policyFile)}` : '';
+  return `node ${JSON.stringify(__filename)} sidecar-policy ${action}${policyArg}`;
+}
+
+function normalizeSidecarPolicyState(value) {
+  const state = String(value || '').trim().toLowerCase();
+  if (state === 'enabled' || state === 'disabled' || state === 'ask' || state === 'unknown') {
+    return state === 'unknown' ? 'ask' : state;
+  }
+  return 'ask';
+}
+
+function readSidecarPolicy(file = sidecarPolicyPath()) {
+  const policy = file ? readJson(file) : null;
+  const state = normalizeSidecarPolicyState(process.env.CODESTORY_PLUGIN_SIDECAR_POLICY || policy?.state);
+  return {
+    state,
+    path: file,
+    updatedAt: policy?.updated_at || null,
+    lastRepair: policy?.last_repair || null,
+  };
+}
+
+function writeSidecarPolicy(state, patch = {}, file = sidecarPolicyPath()) {
+  if (!file) return null;
+  const current = readJson(file) || {};
+  const next = {
+    ...current,
+    ...patch,
+    state: normalizeSidecarPolicyState(state),
+    updated_at: new Date().toISOString(),
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(next, null, 2));
+  return next;
+}
+
+function handleSidecarPolicyCommand(argv) {
+  if (argv[2] !== 'sidecar-policy') return;
+  const action = argv[3] || 'status';
+  const policyFileFlag = argv.indexOf('--policy-file');
+  const policyFile = policyFileFlag >= 0 ? argv[policyFileFlag + 1] : sidecarPolicyPath();
+  if (!['enable', 'disable', 'ask', 'status'].includes(action)) {
+    process.stderr.write('usage: codestory-mcp.cjs sidecar-policy [enable|disable|ask|status] [--policy-file PATH]\n');
+    process.exit(2);
+  }
+  if (policyFileFlag >= 0 && !policyFile) {
+    process.stderr.write('sidecar-policy --policy-file requires a path\n');
+    process.exit(2);
+  }
+  if (action !== 'status') {
+    if (!policyFile) {
+      process.stderr.write('sidecar-policy needs PLUGIN_DATA or --policy-file to remember the setting\n');
+      process.exit(2);
+    }
+    writeSidecarPolicy(action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'ask', {}, policyFile);
+  }
+  process.stdout.write(`${JSON.stringify(readSidecarPolicy(policyFile), null, 2)}\n`);
+  process.exit(0);
+}
+
+function repairCommandForProject(projectRoot = process.cwd()) {
+  return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json`;
+}
+
+function recordSidecarRepair(state, patch = {}) {
+  const policy = readSidecarPolicy();
+  if (policy.state !== 'enabled') return;
+  writeSidecarPolicy('enabled', {
+    last_repair: {
+      ...(policy.lastRepair || {}),
+      ...patch,
+      state,
+      updated_at: new Date().toISOString(),
+    },
+  });
+}
+
+function scheduleSidecarRepair(resolved, policy) {
+  if (policy.state !== 'enabled') return;
+  const projectRoot = process.cwd();
+  const args = ['ready', '--goal', 'agent', '--repair', '--project', projectRoot, '--format', 'json'];
+  recordSidecarRepair('scheduled', {
+    project_root: projectRoot,
+    command: repairCommandForProject(projectRoot),
+    started_at: new Date().toISOString(),
+  });
+  try {
+    const repair = spawn(resolved.path, args, {
+      stdio: 'ignore',
+      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+      windowsHide: true,
+      env: { ...process.env, CODESTORY_PLUGIN_SIDECAR_REPAIR: '1' },
+    });
+    repair.on('exit', (code, signal) => {
+      recordSidecarRepair(code === 0 ? 'completed' : 'failed', {
+        exit_code: code,
+        signal: signal || null,
+        finished_at: new Date().toISOString(),
+      });
+    });
+    repair.on('error', (error) => {
+      recordSidecarRepair('spawn_failed', {
+        error: error.message,
+        finished_at: new Date().toISOString(),
+      });
+    });
+    repair.unref();
+  } catch (error) {
+    recordSidecarRepair('spawn_failed', {
+      error: error.message,
+      finished_at: new Date().toISOString(),
+    });
+  }
+}
+
 function resolveManifest(manifestPath) {
   const manifest = readJson(manifestPath);
   if (!manifest) return null;
@@ -288,8 +409,12 @@ function rememberLaunch(resolved) {
 }
 
 async function main() {
+  handleSidecarPolicyCommand(process.argv);
   const resolved = await resolveCli();
   rememberLaunch(resolved);
+  const sidecarPolicy = readSidecarPolicy();
+  scheduleSidecarRepair(resolved, sidecarPolicy);
+  const sidecarStatus = readSidecarPolicy();
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
     stdio: 'inherit',
@@ -309,6 +434,16 @@ async function main() {
       CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
       CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
       CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
+      CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
+      CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
+      CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
+      CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
+      CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
+      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: repairCommandForProject(process.cwd()),
+      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
+      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
+      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
+      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
     },
   });
 

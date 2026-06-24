@@ -1339,6 +1339,7 @@ pub(crate) struct AgentPreflightOutput {
     pub(crate) mode: String,
     pub(crate) local_graph: AgentPreflightLaneOutput,
     pub(crate) full_retrieval: AgentPreflightLaneOutput,
+    pub(crate) sidecar_setup: serde_json::Value,
     pub(crate) safe_surfaces: Vec<String>,
     pub(crate) blocked_surfaces: Vec<String>,
     pub(crate) repair_command: Option<String>,
