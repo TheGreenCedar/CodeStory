@@ -101,6 +101,16 @@ pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
     }
 }
 
+pub(crate) fn failed_layer(verdict: &ReadinessVerdictDto) -> Option<&'static str> {
+    match verdict.status {
+        ReadinessStatusDto::Ready => None,
+        ReadinessStatusDto::RepairSetup => Some("runtime_setup"),
+        ReadinessStatusDto::RepairIndex => Some("local_index"),
+        ReadinessStatusDto::CheckIndex => Some("index_freshness"),
+        ReadinessStatusDto::RepairRetrieval => Some("retrieval_sidecar"),
+    }
+}
+
 pub(crate) fn goal_label(goal: ReadinessGoalDto) -> &'static str {
     match goal {
         ReadinessGoalDto::LocalNavigation => "local_navigation",
@@ -217,7 +227,7 @@ fn verdict_state(
                     Some(IndexFreshnessStatusDto::Fresh)
                 ),
             );
-            let minimum_next = full_repair.iter().take(2).cloned().collect();
+            let minimum_next = full_repair.iter().take(1).cloned().collect();
             return (
                 ReadinessStatusDto::RepairRetrieval,
                 format!(
@@ -700,10 +710,38 @@ mod tests {
             degraded
                 .full_repair
                 .iter()
-                .take(2)
+                .take(1)
                 .cloned()
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn non_full_sidecars_report_retrieval_layer_and_one_canonical_repair() {
+        let stats = stats(3);
+        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
+        for sidecar in [
+            None,
+            Some(ReadinessSidecarInput {
+                retrieval_mode: "unavailable",
+                degraded_reason: Some("manifest:<missing>"),
+                manifest_generation: None,
+                manifest_input_hash: None,
+            }),
+        ] {
+            let verdict = build_readiness_verdict(
+                ReadinessGoalDto::AgentPacketSearch,
+                inputs(&stats, Some(&freshness), sidecar),
+            );
+
+            assert_eq!(verdict.status, ReadinessStatusDto::RepairRetrieval);
+            assert_eq!(failed_layer(&verdict), Some("retrieval_sidecar"));
+            assert_eq!(verdict.minimum_next.len(), 1);
+            assert!(
+                verdict.minimum_next[0].contains("ready --goal agent --repair"),
+                "sidecar repair should expose one canonical repair command: {verdict:?}"
+            );
+        }
     }
 
     #[test]

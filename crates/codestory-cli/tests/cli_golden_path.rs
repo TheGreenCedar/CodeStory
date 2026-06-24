@@ -691,7 +691,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     let index_next_commands_joined = index_next_commands.join("\n");
     assert!(
         index_next_commands_joined.contains("codestory-cli retrieval status")
-            && index_next_commands_joined.contains("codestory-cli retrieval index"),
+            && index_next_commands_joined.contains("codestory-cli ready --goal agent --repair"),
         "index output should recommend sidecar repair when sidecar retrieval is not full: {index:#}"
     );
     assert_no_agent_proof_commands(&index_next_commands, "index output");
@@ -716,8 +716,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     let joined = next_commands.join("\n");
     assert!(
         joined.contains("codestory-cli retrieval status")
-            && joined.contains("codestory-cli retrieval index")
-            && joined.contains("--refresh full")
+            && joined.contains("codestory-cli ready --goal agent --repair")
             && joined.contains("codestory-cli doctor"),
         "doctor should recommend retrieval repair before packet/search: {doctor:#}"
     );
@@ -872,9 +871,9 @@ fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
         .join("\n");
     assert!(
         first_next_commands.contains("retrieval status")
-            && first_next_commands.contains("retrieval index")
+            && first_next_commands.contains("ready --goal agent --repair")
             && !first_next_commands.contains("packet"),
-        "doctor should recommend sidecar status/index repair before packet/search when mode is not full: {doctor:#}"
+        "doctor should recommend canonical sidecar repair before packet/search when mode is not full: {doctor:#}"
     );
 }
 

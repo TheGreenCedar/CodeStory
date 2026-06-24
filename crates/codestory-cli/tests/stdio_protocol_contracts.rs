@@ -2780,6 +2780,10 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         Some("repair_retrieval")
     );
     assert_eq!(
+        error.pointer("/failed_layer").and_then(Value::as_str),
+        Some("retrieval_sidecar")
+    );
+    assert_eq!(
         error.pointer("/repair_reason").and_then(Value::as_str),
         Some("retrieval_manifest_missing")
     );
@@ -2792,6 +2796,11 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
     let minimum_next = error["minimum_next"]
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include minimum_next: {response}"));
+    assert_eq!(
+        minimum_next.len(),
+        1,
+        "stdio search readiness error should expose exactly one canonical minimum repair: {response}"
+    );
     assert!(
         minimum_next.iter().any(|command| command
             .as_str()

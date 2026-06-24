@@ -296,16 +296,16 @@ fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
         details
             .next_commands
             .iter()
-            .any(|command| command.contains("codestory-cli retrieval bootstrap")),
-        "retrieval error should include bootstrap recovery command: {error:?}"
+            .next()
+            .is_some_and(|command| command.contains("codestory-cli ready --goal agent --repair")),
+        "retrieval error should start with the canonical agent repair command: {error:?}"
     );
     assert!(
         details
             .next_commands
             .iter()
-            .any(|command| command.contains("codestory-cli retrieval index")
-                && command.contains("--refresh full")),
-        "retrieval error should include sidecar index recovery command: {error:?}"
+            .all(|command| !command.contains("codestory-cli retrieval index")),
+        "retrieval error should not expose a separate sidecar index command before ready repair: {error:?}"
     );
     assert!(
         details

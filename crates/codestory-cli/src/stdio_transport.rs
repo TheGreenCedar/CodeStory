@@ -310,6 +310,7 @@ fn stdio_tool_blocked_error(
         "tool": name,
         "readiness_goal": surface.get("readiness_goal").cloned().unwrap_or(serde_json::Value::Null),
         "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
         "minimum_next": surface.get("minimum_next").cloned().unwrap_or_else(|| serde_json::json!([])),
         "full_repair": surface.get("full_repair").cloned().unwrap_or_else(|| serde_json::json!([])),
@@ -2513,6 +2514,7 @@ fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::V
                 "allowed": allowed,
                 "readiness_goal": crate::readiness::goal_label(verdict.goal),
                 "status": crate::readiness::status_label(verdict.status),
+                "failed_layer": crate::readiness::failed_layer(verdict),
                 "summary": verdict.summary,
                 "repair_reason": stdio_repair_reason(verdict),
                 "blocked_reason": if allowed { None } else { Some(verdict.summary.as_str()) },
@@ -2524,6 +2526,7 @@ fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::V
             "allowed": false,
             "readiness_goal": null,
             "status": "unknown",
+            "failed_layer": null,
             "summary": "Readiness verdict was not available for this surface.",
             "repair_reason": null,
             "blocked_reason": "Readiness verdict was not available for this surface.",
@@ -2849,6 +2852,43 @@ mod tests {
         assert!(
             calls[0].get("command").is_none(),
             "restart boundary should not be exposed as a CLI command: {calls}"
+        );
+    }
+
+    #[test]
+    fn stdio_blocked_agent_surfaces_name_retrieval_layer_and_canonical_repair() {
+        let repair =
+            "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
+                .to_string();
+        let readiness = vec![ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::RepairRetrieval,
+            summary:
+                "Agent packet/search needs full sidecar retrieval; current mode is `unavailable`."
+                    .to_string(),
+            minimum_next: vec![repair.clone()],
+            full_repair: vec![
+                repair.clone(),
+                "codestory-cli retrieval status --project \"C:/repo/example\" --format json"
+                    .to_string(),
+                "codestory-cli doctor --project \"C:/repo/example\" --format markdown".to_string(),
+            ],
+            setup: None,
+            index: None,
+            sidecar: None,
+        }];
+
+        let surfaces = stdio_allowed_surfaces(&readiness);
+        let packet = &surfaces["packet"];
+
+        assert_eq!(packet["allowed"], json!(false));
+        assert_eq!(packet["failed_layer"], json!("retrieval_sidecar"));
+        assert_eq!(packet["minimum_next"], json!([repair]));
+        assert!(
+            packet["full_repair"]
+                .as_array()
+                .is_some_and(|commands| commands.len() == 3),
+            "full repair should keep proof commands behind the canonical minimum repair: {packet}"
         );
     }
 
