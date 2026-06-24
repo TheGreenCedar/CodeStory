@@ -4,12 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import textwrap
+import time
 import zipfile
 from pathlib import Path
 
@@ -157,29 +161,88 @@ def require_search_full(payload: object, artifact: Path) -> None:
 
 def require_packet_ready(payload: object, artifact: Path) -> None:
     require(isinstance(payload, dict), "packet", artifact, "packet output is not a JSON object")
-    require("sufficiency" in payload, "packet", artifact, "packet output missing sufficiency")
+    sufficiency = payload.get("sufficiency")
+    require(isinstance(sufficiency, dict), "packet", artifact, "packet output missing sufficiency")
+    status = sufficiency.get("status")
+    require(status == "sufficient", "packet", artifact, f"packet sufficiency.status is {status!r}")
     require("retrieval_trace_summary" in payload, "packet", artifact, "packet output missing retrieval trace summary")
+    answer = payload.get("answer")
+    require(isinstance(answer, dict), "packet", artifact, "packet output missing answer")
+    retrieval_version = answer.get("retrieval_version")
+    require(
+        retrieval_version == "sidecar",
+        "packet",
+        artifact,
+        f"packet answer.retrieval_version is {retrieval_version!r}",
+    )
 
 
 def require_context_ready(payload: object, artifact: Path) -> None:
     require(isinstance(payload, dict), "context", artifact, "context output is not a JSON object")
     require("retrieval_trace" in payload, "context", artifact, "context output missing retrieval trace")
+    retrieval_version = payload.get("retrieval_version")
+    require(retrieval_version == "sidecar", "context", artifact, f"context retrieval_version is {retrieval_version!r}")
 
 
-def stdio_request(process: subprocess.Popen[str], request: dict, layer: str, artifact: Path) -> dict:
-    assert process.stdin is not None
-    assert process.stdout is not None
-    process.stdin.write(json.dumps(request) + "\n")
-    process.stdin.flush()
-    line = process.stdout.readline()
-    if not line:
-        fail(layer, artifact, "serve --stdio closed before responding")
+def write_stdio_artifact(artifact: Path, transcript: list[dict], stdout: str, stderr_path: Path, extra: dict | None = None) -> None:
+    payload = {
+        "transcript": transcript,
+        "stdout": stdout,
+        "stderr_artifact": str(stderr_path),
+    }
+    if extra:
+        payload.update(extra)
+    write_json(artifact, payload)
+
+
+def stream_lines(stream, lines: list[str], line_queue: queue.Queue[str | None] | None = None) -> None:
     try:
-        response = json.loads(line)
-    except json.JSONDecodeError as exc:
-        artifact.write_text(line, encoding="utf-8")
-        fail(layer, artifact, f"serve --stdio emitted invalid JSON: {exc}")
-    return response
+        for line in iter(stream.readline, ""):
+            lines.append(line)
+            if line_queue is not None:
+                line_queue.put(line)
+    finally:
+        if line_queue is not None:
+            line_queue.put(None)
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+
+
+def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) -> str | None:
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("serve --stdio response", timeout_secs)
+        try:
+            line = stdout_queue.get(timeout=remaining)
+        except queue.Empty as exc:
+            raise subprocess.TimeoutExpired("serve --stdio response", timeout_secs) from exc
+        if line is None:
+            return None
+        if line.strip():
+            return line
 
 
 def stdio_status(cli: Path, project: Path, artifact: Path, timeout_secs: int) -> dict:
@@ -199,32 +262,100 @@ def stdio_status(cli: Path, project: Path, artifact: Path, timeout_secs: int) ->
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        start_new_session=os.name != "nt",
     )
+    requests = [
+        {"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": "status",
+            "method": "resources/read",
+            "params": {"uri": STATUS_URI},
+        },
+    ]
+    transcript: list[dict] = []
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_thread = threading.Thread(target=stream_lines, args=(process.stdout, stdout_lines, stdout_queue), daemon=True)
+    stderr_thread = threading.Thread(target=stream_lines, args=(process.stderr, stderr_lines), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    responses: list[dict] = []
+    process_terminated = False
     try:
-        tools = stdio_request(
-            process,
-            {"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
-            "serve_stdio",
-            artifact,
-        )
-        status_response = stdio_request(
-            process,
-            {
-                "jsonrpc": "2.0",
-                "id": "status",
-                "method": "resources/read",
-                "params": {"uri": STATUS_URI},
-            },
-            "serve_stdio",
-            artifact,
-        )
+        for request in requests:
+            entry = {"request": request}
+            transcript.append(entry)
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            try:
+                line = read_stdio_line(stdout_queue, timeout_secs)
+            except subprocess.TimeoutExpired:
+                entry["timed_out"] = True
+                terminate_process_tree(process)
+                process_terminated = True
+                stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+                write_stdio_artifact(
+                    artifact,
+                    transcript,
+                    "".join(stdout_lines),
+                    stderr_path,
+                    {"timed_out": True, "timeout_secs": timeout_secs},
+                )
+                fail("serve_stdio", artifact, f"serve --stdio timed out after {timeout_secs}s")
+            if line is None:
+                terminate_process_tree(process)
+                process_terminated = True
+                stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+                write_stdio_artifact(artifact, transcript, "".join(stdout_lines), stderr_path)
+                fail("serve_stdio", artifact, "serve --stdio closed before responding")
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as exc:
+                entry["invalid_line"] = line
+                terminate_process_tree(process)
+                process_terminated = True
+                stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+                write_stdio_artifact(
+                    artifact,
+                    transcript,
+                    "".join(stdout_lines),
+                    stderr_path,
+                    {"invalid_line": line},
+                )
+                fail("serve_stdio", artifact, f"serve --stdio emitted invalid JSON: {exc}")
+            entry["response"] = response
+            responses.append(response)
     finally:
-        process.kill()
-        _, stderr = process.communicate(timeout=timeout_secs)
-        stderr_path.write_text(stderr or "", encoding="utf-8")
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        if not process_terminated:
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(process)
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        stdout_thread.join(timeout=0.2)
+        stderr_thread.join(timeout=0.2)
 
-    payload = {"tools": tools, "status_response": status_response}
+    stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+    responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
+    tools = responses_by_id.get("tools")
+    status_response = responses_by_id.get("status")
+    payload = {"tools": tools, "status_response": status_response, "transcript": transcript, "stdout": "".join(stdout_lines)}
     write_json(artifact, payload)
+    require(isinstance(tools, dict), "serve_stdio", artifact, "serve --stdio did not return tools/list response")
+    require(isinstance(status_response, dict), "serve_stdio", artifact, "serve --stdio did not return status response")
     if "error" in tools:
         fail("serve_stdio", artifact, f"tools/list failed: {tools['error']}")
     if "error" in status_response:
@@ -414,6 +545,7 @@ def write_fake_cli(path: Path) -> None:
             import json
             import os
             import sys
+            import time
 
             def emit(value):
                 if "--output-file" in sys.argv:
@@ -444,12 +576,21 @@ def write_fake_cli(path: Path) -> None:
             elif layer == "search":
                 emit({"retrieval_shadow": {"retrieval_mode": "full"}, "indexed_symbol_hits": [{"node_id": "1"}]})
             elif layer == "context":
-                emit({"retrieval_trace": {"resolved_profile": "investigate"}})
+                if fail == "context_weak":
+                    emit({"retrieval_trace": {"resolved_profile": "investigate"}})
+                else:
+                    emit({"retrieval_version": "sidecar", "retrieval_trace": {"resolved_profile": "investigate"}})
             elif layer == "packet":
-                emit({"sufficiency": {"status": "supported"}, "retrieval_trace_summary": {}})
+                if fail == "packet_weak":
+                    emit({"sufficiency": {"status": "supported"}, "answer": {"retrieval_version": "fallback"}, "retrieval_trace_summary": {}})
+                else:
+                    emit({"sufficiency": {"status": "sufficient"}, "answer": {"retrieval_version": "sidecar"}, "retrieval_trace_summary": {}})
             elif layer == "serve":
                 for line in sys.stdin:
                     request = json.loads(line)
+                    if fail == "serve_timeout":
+                        time.sleep(60)
+                        continue
                     if request.get("method") == "tools/list":
                         result = {"tools": [{"name": "packet"}, {"name": "search"}, {"name": "context"}]}
                     else:
@@ -524,6 +665,44 @@ def self_test() -> None:
                 assert "doctor.json.stderr.txt" in str(exc.artifact)
             else:
                 raise AssertionError("stderr fake failure should point at stderr artifact")
+        finally:
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "packet_weak"
+        try:
+            try:
+                run_gate(args)
+            except GateFailure as exc:
+                assert exc.layer == "packet"
+                assert "packet.json" in str(exc.artifact)
+            else:
+                raise AssertionError("weak fake packet should fail the gate")
+        finally:
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "context_weak"
+        try:
+            try:
+                run_gate(args)
+            except GateFailure as exc:
+                assert exc.layer == "context"
+                assert "context.json" in str(exc.artifact)
+            else:
+                raise AssertionError("weak fake context should fail the gate")
+        finally:
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_timeout"
+        timeout_args = argparse.Namespace(**vars(args))
+        timeout_args.timeout_secs = 1
+        try:
+            try:
+                run_gate(timeout_args)
+            except GateFailure as exc:
+                assert exc.layer == "serve_stdio"
+                assert "serve-stdio-status.json" in str(exc.artifact)
+            else:
+                raise AssertionError("silent fake stdio server should fail the gate")
         finally:
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
 
