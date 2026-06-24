@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.17
+
+CodeStory 0.11.17 promotes the current `dev/codestory-next` release slice:
+release workflow artifact actions are upgraded to v5, the release matrix now
+restores and saves Cargo cache entries, and stale `target/release-dist` output
+is cleared before packaging.
+
+The CodeStory plugin now carries the sidecar setup policy surfaces from the
+0.11.17 development slice: `ask`, `enabled`, and `disabled` policy modes,
+`sidecar_setup` status and preflight exposure, background
+`ready --goal agent --repair` scheduling when setup is enabled, disabled-policy
+suppression, and enable/disable commands that persist through `--policy-file`
+outside `PLUGIN_DATA`.
+
+Operator note: Refs #460. Issue #460 required no source change. Public source
+and release metadata were already correct; local operator recovery came from
+refreshing the installed plugin cache with `codex.cmd plugin add
+codestory@TheGreenCedar --json`. Fresh host/plugin `codestory://status` proof
+remains outside this release PR.
+
 ## 0.11.16
 
 CodeStory 0.11.16 promotes the current `dev/codestory-next` release slice:
