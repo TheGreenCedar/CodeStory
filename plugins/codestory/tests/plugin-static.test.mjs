@@ -246,11 +246,12 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
       {
         path: fakeCli,
         version: "0.0.1",
-        active: false,
+        active: true,
       },
     ]);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "path_fallback");
+    assert.equal(status.plugin_runtime.cli_path, fakeCli);
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);

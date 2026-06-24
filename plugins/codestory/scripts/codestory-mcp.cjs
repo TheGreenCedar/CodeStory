@@ -374,9 +374,10 @@ async function resolveCli() {
   }
 
   warnings.push('managed_cli_unavailable_using_path_fallback');
+  const pathFallback = pathCliCandidates()[0] || 'codestory-cli';
   return {
     source: 'path_fallback',
-    path: 'codestory-cli',
+    path: pathFallback,
     sha256: null,
     version,
     cliVersion: null,

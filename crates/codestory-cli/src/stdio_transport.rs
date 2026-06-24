@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration as StdDuration;
 
 use crate::args;
@@ -44,6 +44,8 @@ use std::time::{Duration, Instant};
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+const STDIO_CLI_VERSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Run the stdio server until stdin closes.
 ///
@@ -2247,12 +2249,34 @@ fn push_cli_candidate_paths(candidates: &mut Vec<String>, directory: &Path) {
 }
 
 fn stdio_cli_version(candidate: &str) -> Option<String> {
-    let output = Command::new(candidate).arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
+    stdio_cli_version_with_timeout(candidate, STDIO_CLI_VERSION_TIMEOUT)
+}
+
+fn stdio_cli_version_with_timeout(candidate: &str, timeout: Duration) -> Option<String> {
+    let started_at = Instant::now();
+    let mut child = Command::new(candidate)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    loop {
+        if let Some(status) = child.try_wait().ok()? {
+            let output = child.wait_with_output().ok()?;
+            if !status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            return text.split_whitespace().find_map(normalize_release_version);
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        std::thread::sleep(STDIO_CLI_VERSION_POLL_INTERVAL.min(remaining));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace().find_map(normalize_release_version)
 }
 
 fn stdio_path_cli_candidate_statuses(active_path: Option<&str>) -> serde_json::Value {
@@ -3028,6 +3052,50 @@ version = "0.11.20"
 "#;
 
         assert_eq!(cargo_package_version(manifest), Some("0.11.20".to_string()));
+    }
+
+    #[test]
+    fn stdio_cli_version_returns_none_when_probe_times_out() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "codestory-stdio-cli-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let candidate = temp_dir.join(if cfg!(windows) {
+            "codestory-cli.cmd"
+        } else {
+            "codestory-cli"
+        });
+        fs::write(
+            &candidate,
+            if cfg!(windows) {
+                "@echo off\r\nping -n 6 127.0.0.1 > nul\r\necho codestory-cli 9.9.9\r\n"
+            } else {
+                "#!/bin/sh\nsleep 5\necho codestory-cli 9.9.9\n"
+            },
+        )
+        .expect("write slow cli probe");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&candidate)
+                .expect("candidate metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&candidate, permissions).expect("chmod candidate");
+        }
+
+        let started_at = Instant::now();
+        let version =
+            stdio_cli_version_with_timeout(&candidate.to_string_lossy(), Duration::from_millis(50));
+
+        assert_eq!(version, None);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "version probe should return near the configured timeout"
+        );
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
