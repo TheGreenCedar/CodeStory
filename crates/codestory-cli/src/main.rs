@@ -80,7 +80,8 @@ use args::{
     QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadyCommand, ReadyOutput,
     RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
     SetupCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput, SymbolCommand,
-    SymbolJsonOutput, TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    SymbolJsonOutput, TaskAction, TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput,
+    VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -182,6 +183,7 @@ fn main() -> Result<()> {
         Command::Report(cmd) => report::run_report(cmd),
         Command::Context(cmd) => run_context(cmd),
         Command::Packet(cmd) => run_packet(cmd),
+        Command::Task(cmd) => run_task(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Ready(cmd) => run_ready(cmd),
         Command::Smoke(cmd) => run_smoke(cmd),
@@ -1074,6 +1076,368 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
     }
     let markdown = render_packet_markdown(&runtime.project_root, &packet);
     emit(cmd.format, &packet, markdown, cmd.output_file.as_deref())
+}
+
+fn run_task(cmd: TaskCommand) -> Result<()> {
+    match cmd.action {
+        TaskAction::Brief(cmd) => run_task_brief(cmd),
+    }
+}
+
+fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "task brief")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let opened = runtime.ensure_open(cmd.refresh)?;
+    ensure_index_ready(&opened, "task brief")?;
+
+    let packet = runtime
+        .browser
+        .packet(AgentPacketRequestDto {
+            question: cmd.prompt,
+            budget: cmd.budget.into(),
+            task_class: Some(PacketTaskClassDto::EditPlanning),
+            extra_probes: cmd.extra_probes,
+            include_evidence: !cmd.no_evidence,
+            latency_budget_ms: cmd.latency_budget_ms,
+        })
+        .map_err(map_api_error)?;
+    let brief = build_task_brief_output(&runtime.project_root, &packet);
+    let markdown = render_task_brief_markdown(&brief);
+    emit(cmd.format, &brief, markdown, cmd.output_file.as_deref())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TaskBriefOutput {
+    task_brief_version: u32,
+    prompt: String,
+    status: String,
+    source_packet_id: String,
+    source_packet_sufficiency: String,
+    first_files: Vec<TaskBriefFileOutput>,
+    relevant_symbols: Vec<TaskBriefSymbolOutput>,
+    likely_tests: Vec<TaskBriefFileOutput>,
+    impacted_surfaces: Vec<String>,
+    risks_unknowns: Vec<String>,
+    follow_up_codestory_commands: Vec<String>,
+    future_sections: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TaskBriefFileOutput {
+    path: String,
+    line: Option<u32>,
+    reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TaskBriefSymbolOutput {
+    name: String,
+    kind: String,
+    path: Option<String>,
+    line: Option<u32>,
+    reason: String,
+}
+
+fn build_task_brief_output(
+    project_root: &std::path::Path,
+    packet: &AgentPacketDto,
+) -> TaskBriefOutput {
+    let citations = packet_task_brief_citations(packet);
+    let first_files = task_brief_first_files(&citations);
+    let relevant_symbols = task_brief_relevant_symbols(&citations);
+    let likely_tests = task_brief_likely_tests(&citations);
+    let impacted_surfaces = task_brief_impacted_surfaces(&first_files, &relevant_symbols);
+    let risks_unknowns = task_brief_risks_unknowns(packet, &likely_tests);
+    let follow_up_codestory_commands =
+        task_brief_follow_up_commands(project_root, packet, &first_files, &relevant_symbols);
+
+    TaskBriefOutput {
+        task_brief_version: 1,
+        prompt: packet.question.clone(),
+        status: packet_operator_status(packet.sufficiency.status).to_string(),
+        source_packet_id: packet.packet_id.clone(),
+        source_packet_sufficiency: packet_sufficiency_label(packet.sufficiency.status).to_string(),
+        first_files,
+        relevant_symbols,
+        likely_tests,
+        impacted_surfaces,
+        risks_unknowns,
+        follow_up_codestory_commands,
+        future_sections: vec![
+            "scout".to_string(),
+            "where".to_string(),
+            "onboard".to_string(),
+        ],
+    }
+}
+
+fn packet_task_brief_citations(
+    packet: &AgentPacketDto,
+) -> Vec<&codestory_contracts::api::AgentCitationDto> {
+    let mut citations = Vec::new();
+    for claim in &packet.sufficiency.covered_claims {
+        citations.extend(claim.citations.iter());
+    }
+    citations.extend(packet.answer.citations.iter());
+    citations
+}
+
+fn task_brief_first_files(
+    citations: &[&codestory_contracts::api::AgentCitationDto],
+) -> Vec<TaskBriefFileOutput> {
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    for citation in citations {
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
+        if seen.insert(path.to_string()) {
+            files.push(TaskBriefFileOutput {
+                path: path.to_string(),
+                line: citation.line,
+                reason: "cited by source packet".to_string(),
+            });
+        }
+        if files.len() >= 8 {
+            break;
+        }
+    }
+    files
+}
+
+fn task_brief_relevant_symbols(
+    citations: &[&codestory_contracts::api::AgentCitationDto],
+) -> Vec<TaskBriefSymbolOutput> {
+    let mut seen = BTreeSet::new();
+    let mut symbols = Vec::new();
+    for citation in citations {
+        let key = format!(
+            "{}:{}:{}",
+            citation.display_name,
+            citation.file_path.as_deref().unwrap_or(""),
+            citation.line.unwrap_or(0)
+        );
+        if seen.insert(key) {
+            symbols.push(TaskBriefSymbolOutput {
+                name: citation.display_name.clone(),
+                kind: display::format_kind(citation.kind),
+                path: citation.file_path.clone(),
+                line: citation.line,
+                reason: "cited by source packet".to_string(),
+            });
+        }
+        if symbols.len() >= 12 {
+            break;
+        }
+    }
+    symbols
+}
+
+fn task_brief_likely_tests(
+    citations: &[&codestory_contracts::api::AgentCitationDto],
+) -> Vec<TaskBriefFileOutput> {
+    let mut seen = BTreeSet::new();
+    let mut tests = Vec::new();
+    for citation in citations {
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
+        if task_brief_path_is_test(path) && seen.insert(path.to_string()) {
+            tests.push(TaskBriefFileOutput {
+                path: path.to_string(),
+                line: citation.line,
+                reason: "test-like cited file".to_string(),
+            });
+        }
+        if tests.len() >= 6 {
+            break;
+        }
+    }
+    tests
+}
+
+fn task_brief_path_is_test(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/tests/")
+        || normalized.ends_with("_test.rs")
+        || normalized.ends_with("_tests.rs")
+        || normalized.ends_with(".test.ts")
+        || normalized.ends_with(".spec.ts")
+        || normalized.ends_with(".test.js")
+        || normalized.ends_with(".spec.js")
+}
+
+fn task_brief_impacted_surfaces(
+    first_files: &[TaskBriefFileOutput],
+    symbols: &[TaskBriefSymbolOutput],
+) -> Vec<String> {
+    let mut surfaces = BTreeSet::new();
+    for path in first_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .chain(symbols.iter().filter_map(|symbol| symbol.path.as_deref()))
+    {
+        surfaces.insert(task_brief_surface_for_path(path));
+    }
+    surfaces.into_iter().take(8).collect()
+}
+
+fn task_brief_surface_for_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut parts = normalized.split('/');
+    match (parts.next(), parts.next()) {
+        (Some("crates"), Some(crate_name)) => format!("crates/{crate_name}"),
+        (Some(first), Some(second)) if first == "plugins" => format!("{first}/{second}"),
+        (Some(first), _) if !first.is_empty() => first.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn task_brief_risks_unknowns(
+    packet: &AgentPacketDto,
+    likely_tests: &[TaskBriefFileOutput],
+) -> Vec<String> {
+    let mut risks = packet.sufficiency.gaps.clone();
+    if packet.budget.truncated {
+        risks.push(format!(
+            "source packet was budget-truncated; omitted sections: {}",
+            packet_budget_omitted_sections(packet)
+        ));
+    }
+    if likely_tests.is_empty() {
+        risks.push("no test files were cited by the source packet".to_string());
+    }
+    if risks.is_empty() {
+        risks.push("none from packet sufficiency; verify cited files before editing".to_string());
+    }
+    risks
+}
+
+fn task_brief_follow_up_commands(
+    project_root: &std::path::Path,
+    packet: &AgentPacketDto,
+    first_files: &[TaskBriefFileOutput],
+    symbols: &[TaskBriefSymbolOutput],
+) -> Vec<String> {
+    let project = project_root.display();
+    let prompt = shell_double_quote(&packet.question);
+    let mut commands = Vec::new();
+    commands.push(format!(
+        "codestory-cli packet --project \"{project}\" --question \"{prompt}\" --task-class edit-planning --budget {}",
+        packet_budget_mode_label(packet.budget.requested)
+    ));
+    if let Some(file) = first_files.first() {
+        commands.push(format!(
+            "codestory-cli snippet --project \"{project}\" --query \"{}\"",
+            shell_double_quote(&file.path)
+        ));
+    }
+    if let Some(symbol) = symbols.first() {
+        commands.push(format!(
+            "codestory-cli trail --project \"{project}\" --query \"{}\" --story --hide-speculative",
+            shell_double_quote(&symbol.name)
+        ));
+    }
+    commands.push(format!(
+        "codestory-cli affected --project \"{project}\" <path>"
+    ));
+    commands.extend(packet.sufficiency.follow_up_commands.iter().cloned());
+    commands
+}
+
+fn shell_double_quote(value: &str) -> String {
+    value.replace('"', "\\\"").replace('\n', " ")
+}
+
+fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Task Brief");
+    let _ = writeln!(markdown, "status: `{}`", brief.status);
+    let _ = writeln!(
+        markdown,
+        "task_brief_version: `{}`",
+        brief.task_brief_version
+    );
+    let _ = writeln!(markdown, "source_packet_id: `{}`", brief.source_packet_id);
+    let _ = writeln!(
+        markdown,
+        "source_packet_sufficiency: `{}`",
+        brief.source_packet_sufficiency
+    );
+    let _ = writeln!(markdown, "prompt: `{}`", brief.prompt.replace('\n', " "));
+    append_task_brief_files(&mut markdown, "First Files", &brief.first_files);
+    append_task_brief_symbols(&mut markdown, "Relevant Symbols", &brief.relevant_symbols);
+    append_task_brief_files(&mut markdown, "Likely Tests", &brief.likely_tests);
+    append_task_brief_strings(&mut markdown, "Impacted Surfaces", &brief.impacted_surfaces);
+    append_task_brief_strings(&mut markdown, "Risks And Unknowns", &brief.risks_unknowns);
+    append_task_brief_commands(
+        &mut markdown,
+        "Follow Up CodeStory Commands",
+        &brief.follow_up_codestory_commands,
+    );
+    append_task_brief_strings(&mut markdown, "Future Sections", &brief.future_sections);
+    markdown
+}
+
+fn append_task_brief_files(markdown: &mut String, title: &str, files: &[TaskBriefFileOutput]) {
+    let _ = writeln!(markdown, "\n## {title}");
+    if files.is_empty() {
+        let _ = writeln!(markdown, "- none from source packet");
+        return;
+    }
+    for file in files {
+        let line = file.line.map(|line| format!(":{line}")).unwrap_or_default();
+        let _ = writeln!(markdown, "- `{}`{} - {}", file.path, line, file.reason);
+    }
+}
+
+fn append_task_brief_symbols(
+    markdown: &mut String,
+    title: &str,
+    symbols: &[TaskBriefSymbolOutput],
+) {
+    let _ = writeln!(markdown, "\n## {title}");
+    if symbols.is_empty() {
+        let _ = writeln!(markdown, "- none from source packet");
+        return;
+    }
+    for symbol in symbols {
+        let location = symbol
+            .path
+            .as_ref()
+            .map(|path| {
+                let line = symbol
+                    .line
+                    .map(|line| format!(":{line}"))
+                    .unwrap_or_default();
+                format!(" `{path}`{line}")
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            markdown,
+            "- `{}` ({}){} - {}",
+            symbol.name, symbol.kind, location, symbol.reason
+        );
+    }
+}
+
+fn append_task_brief_strings(markdown: &mut String, title: &str, values: &[String]) {
+    let _ = writeln!(markdown, "\n## {title}");
+    if values.is_empty() {
+        let _ = writeln!(markdown, "- none");
+        return;
+    }
+    for value in values {
+        let _ = writeln!(markdown, "- {value}");
+    }
+}
+
+fn append_task_brief_commands(markdown: &mut String, title: &str, values: &[String]) {
+    let _ = writeln!(markdown, "\n## {title}");
+    for value in values {
+        let _ = writeln!(markdown, "- `{value}`");
+    }
 }
 
 fn render_packet_markdown(project_root: &std::path::Path, packet: &AgentPacketDto) -> String {
@@ -10521,12 +10885,14 @@ mod tests {
     use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
-        AgentAnswerDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
+        AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
         AgentRetrievalTraceDto, EdgeId, EdgeKind, GraphEdgeDto, GraphNodeDto, GraphResponse,
         IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileRoleDto,
         IndexedFilesDto, IndexedFilesSummaryDto, IndexingPhaseTimings, NodeDetailsDto, NodeId,
-        ProjectSummary, RetrievalModeDto, RetrievalStateDto, SearchHit, SemanticModeDto,
-        StorageStatsDto, TrailContextDto,
+        PacketBudgetDto, PacketBudgetLimitsDto, PacketBudgetUsageDto, PacketClaimDto,
+        PacketPlanDto, PacketPlanQueryDto, PacketRetrievalTraceSummaryDto, PacketSufficiencyDto,
+        ProjectSummary, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
+        SemanticModeDto, StorageStatsDto, TrailContextDto,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -10726,6 +11092,146 @@ mod tests {
                 packet_sidecar_diagnostics: Vec::new(),
                 retrieval_shadow: None,
             },
+        }
+    }
+
+    fn sample_task_brief_packet() -> AgentPacketDto {
+        let source = sample_task_brief_citation(
+            "run_packet",
+            NodeKind::FUNCTION,
+            "crates/codestory-cli/src/main.rs",
+            1053,
+        );
+        let test = sample_task_brief_citation(
+            "packet_tool_returns_budgeted_sufficiency_contract",
+            NodeKind::FUNCTION,
+            "crates/codestory-cli/tests/stdio_protocol_contracts.rs",
+            2909,
+        );
+        AgentPacketDto {
+            packet_id: "packet-task-brief".to_string(),
+            question: "Add a task brief packet surface".to_string(),
+            task_class: Some(PacketTaskClassDto::EditPlanning),
+            plan: PacketPlanDto {
+                task_class: PacketTaskClassDto::EditPlanning,
+                inferred_task_class: false,
+                queries: vec![PacketPlanQueryDto {
+                    query: "task brief packet surface".to_string(),
+                    purpose: "find packet entry points".to_string(),
+                }],
+                trace: Vec::new(),
+            },
+            answer: AgentAnswerDto {
+                answer_id: "answer-task-brief".to_string(),
+                prompt: "Add a task brief packet surface".to_string(),
+                summary: "Use the packet command path.".to_string(),
+                freshness: None,
+                sections: Vec::new(),
+                citations: vec![source.clone(), test.clone()],
+                subgraph_ids: Vec::new(),
+                retrieval_version: "sidecar".to_string(),
+                graphs: Vec::new(),
+                retrieval_trace: AgentRetrievalTraceDto {
+                    request_id: "trace-task-brief".to_string(),
+                    resolved_profile: AgentRetrievalPresetDto::Architecture,
+                    policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                    total_latency_ms: 1,
+                    sla_target_ms: None,
+                    sla_missed: false,
+                    semantic_fallback_count: 0,
+                    semantic_fallbacks: Vec::new(),
+                    annotations: Vec::new(),
+                    steps: Vec::new(),
+                    packet_sidecar_diagnostics: Vec::new(),
+                    retrieval_shadow: None,
+                },
+            },
+            budget: PacketBudgetDto {
+                requested: PacketBudgetModeDto::Compact,
+                limits: PacketBudgetLimitsDto {
+                    max_anchors: 8,
+                    max_files: 8,
+                    max_snippets: 4,
+                    max_trail_edges: 12,
+                    max_output_bytes: 32_000,
+                },
+                used: PacketBudgetUsageDto {
+                    anchors: 2,
+                    files: 2,
+                    snippets: 0,
+                    trail_edges: 0,
+                    output_bytes: 1024,
+                },
+                truncated: false,
+                omitted_sections: Vec::new(),
+                next_deeper_command: None,
+            },
+            sufficiency: PacketSufficiencyDto {
+                status: PacketSufficiencyStatusDto::Partial,
+                covered_claims: vec![PacketClaimDto {
+                    claim: "Packet command is the starting point.".to_string(),
+                    proof_status: None,
+                    required_evidence_role: None,
+                    citations: vec![source, test],
+                    coverage_role: None,
+                    eligible_for_sufficiency: None,
+                }],
+                open_next: Vec::new(),
+                avoid_opening: Vec::new(),
+                avoid_opening_paths: Vec::new(),
+                gaps: vec!["verify changed files after editing".to_string()],
+                follow_up_commands: vec![
+                    "codestory-cli ready --goal agent --repair --project . --format json"
+                        .to_string(),
+                ],
+                coverage_report: None,
+            },
+            retrieval_trace_summary: PacketRetrievalTraceSummaryDto {
+                retrieval_trace: AgentRetrievalTraceDto {
+                    request_id: "trace-task-brief".to_string(),
+                    resolved_profile: AgentRetrievalPresetDto::Architecture,
+                    policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
+                    total_latency_ms: 1,
+                    sla_target_ms: None,
+                    sla_missed: false,
+                    semantic_fallback_count: 0,
+                    semantic_fallbacks: Vec::new(),
+                    annotations: Vec::new(),
+                    steps: Vec::new(),
+                    packet_sidecar_diagnostics: Vec::new(),
+                    retrieval_shadow: None,
+                },
+                source_read_steps: 0,
+                search_steps: 1,
+                trail_steps: 0,
+            },
+        }
+    }
+
+    fn sample_task_brief_citation(
+        display_name: &str,
+        kind: NodeKind,
+        file_path: &str,
+        line: u32,
+    ) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(format!("{file_path}:{line}")),
+            display_name: display_name.to_string(),
+            kind,
+            file_path: Some(file_path.to_string()),
+            line: Some(line),
+            score: 1.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
         }
     }
 
@@ -12308,6 +12814,84 @@ mod tests {
     }
 
     #[test]
+    fn task_brief_output_contract_maps_packet_evidence_to_owner_workflow() {
+        let packet = sample_task_brief_packet();
+        let brief = build_task_brief_output(Path::new("C:/repo"), &packet);
+
+        assert_eq!(brief.task_brief_version, 1);
+        assert_eq!(brief.status, "needs_attention");
+        assert_eq!(brief.source_packet_id, "packet-task-brief");
+        assert_eq!(brief.source_packet_sufficiency, "partial");
+        assert_eq!(
+            brief.first_files[0].path,
+            "crates/codestory-cli/src/main.rs"
+        );
+        assert_eq!(brief.relevant_symbols[0].name, "run_packet");
+        assert_eq!(
+            brief.likely_tests[0].path,
+            "crates/codestory-cli/tests/stdio_protocol_contracts.rs"
+        );
+        assert!(
+            brief
+                .impacted_surfaces
+                .contains(&"crates/codestory-cli".to_string())
+        );
+        assert!(
+            brief
+                .risks_unknowns
+                .contains(&"verify changed files after editing".to_string())
+        );
+        for expected in [
+            "codestory-cli packet",
+            "codestory-cli snippet",
+            "codestory-cli trail",
+            "codestory-cli affected",
+        ] {
+            assert!(
+                brief
+                    .follow_up_codestory_commands
+                    .iter()
+                    .any(|command| command.contains(expected)),
+                "brief should include {expected}: {brief:#?}"
+            );
+        }
+        assert_eq!(brief.future_sections, ["scout", "where", "onboard"]);
+
+        let json = serde_json::to_value(&brief).expect("brief should serialize");
+        for key in [
+            "task_brief_version",
+            "prompt",
+            "status",
+            "first_files",
+            "relevant_symbols",
+            "likely_tests",
+            "impacted_surfaces",
+            "risks_unknowns",
+            "follow_up_codestory_commands",
+            "future_sections",
+        ] {
+            assert!(json.get(key).is_some(), "brief JSON should include {key}");
+        }
+
+        let markdown = render_task_brief_markdown(&brief);
+        for heading in [
+            "# Task Brief",
+            "## First Files",
+            "## Relevant Symbols",
+            "## Likely Tests",
+            "## Impacted Surfaces",
+            "## Risks And Unknowns",
+            "## Follow Up CodeStory Commands",
+            "## Future Sections",
+        ] {
+            assert!(
+                markdown.contains(heading),
+                "brief markdown should include {heading}: {markdown}"
+            );
+        }
+    }
+
+    #[test]
     fn all_existing_commands_accept_output_file() {
         let commands = [
             vec!["codestory-cli", "index", "--output-file", "out.md"],
@@ -12344,6 +12928,15 @@ mod tests {
                 "snippet",
                 "--query",
                 "Foo",
+                "--output-file",
+                "out.md",
+            ],
+            vec![
+                "codestory-cli",
+                "task",
+                "brief",
+                "--prompt",
+                "Implement issue 507",
                 "--output-file",
                 "out.md",
             ],

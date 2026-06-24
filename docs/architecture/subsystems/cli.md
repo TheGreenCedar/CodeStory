@@ -80,6 +80,11 @@ remain separate from exact target context (`context`, `symbol`, `trail`,
 `snippet`, and local graph exploration). Generated help is the source of truth
 for the current flags on each command.
 
+`task brief` is an owner-directed implementation workflow view over `packet`.
+It must keep the stable JSON and Markdown brief contracts in the CLI adapter,
+reuse packet sufficiency/citations/follow-up commands, and avoid adding storage
+or separate `scout`, `where`, or `onboard` implementations in this slice.
+
 ## Search And Context Research Boundary
 
 `codestory-cli search` and `codestory-cli context` keep production behavior on

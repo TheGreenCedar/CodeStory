@@ -85,7 +85,12 @@ fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
 
     for (start, end, surface) in [
         ("fn run_context", "fn run_packet", "context"),
-        ("fn run_packet", "fn render_packet_markdown", "packet"),
+        ("fn run_packet", "fn run_task", "packet"),
+        (
+            "fn run_task_brief",
+            "fn render_packet_markdown",
+            "task brief",
+        ),
         ("fn run_search", "fn search_request_from_command", "search"),
         ("fn run_serve", "fn run_generate_completions", "stdio/serve"),
     ] {
