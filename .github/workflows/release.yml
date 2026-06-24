@@ -172,6 +172,10 @@ jobs:
             --binary "$bin" \
             --out-dir target/release-dist
 
+      - name: Fetch retrieval embedding model
+        if: matrix.asset_target == 'linux-x64'
+        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
+
       - name: Packaged full-sidecar agent proof
         if: matrix.asset_target == 'linux-x64'
         run: |
