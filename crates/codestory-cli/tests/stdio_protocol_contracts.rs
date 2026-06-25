@@ -3308,6 +3308,7 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
         "truncated:",
         "unsafe_to_claim:",
         "pagination:",
+        "repo_content_boundary:",
         "gaps:",
         "open_next:",
         "follow_up_commands:",
@@ -3538,6 +3539,14 @@ fn search_tool_does_not_offer_symbol_links_for_non_resolvable_repo_text_hits() {
     assert!(
         non_resolvable_hit.get("links").is_none(),
         "non-resolvable repo-text hits should not advertise symbol/snippet/trail continuations: {non_resolvable_hit}"
+    );
+    assert_eq!(
+        non_resolvable_hit["trust"], "untrusted_repo_evidence",
+        "repo-text hits should carry the trust-boundary marker: {non_resolvable_hit}"
+    );
+    assert!(
+        non_resolvable_hit.get("untrusted_repo_excerpt").is_some(),
+        "repo-text hits with excerpts should expose the labeled excerpt field: {non_resolvable_hit}"
     );
 }
 
