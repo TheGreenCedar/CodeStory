@@ -153,6 +153,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let sidecar_profile = cmd.profile.unwrap_or(CliSidecarProfile::Local);
     activate_retrieval_profile_env(Some(sidecar_profile), cmd.run_id.as_deref());
+    prepare_retrieval_index_embedding_env(sidecar_profile);
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
         &runtime.project_root,
@@ -182,6 +183,12 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
 fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Result<()> {
     codestory_retrieval::ensure_product_embedding_backend_for_runtime(sidecar)
         .context("retrieval index embedding device policy")
+}
+
+fn prepare_retrieval_index_embedding_env(profile: CliSidecarProfile) {
+    if matches!(profile, CliSidecarProfile::Agent) {
+        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+    }
 }
 
 pub(crate) fn activate_retrieval_profile_env(
@@ -760,6 +767,31 @@ mod tests {
             message.contains("embedding_device_unverified"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn agent_retrieval_index_defaults_to_llamacpp_backend() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
+        let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
+
+        prepare_retrieval_index_embedding_env(CliSidecarProfile::Agent);
+
+        assert_eq!(
+            std::env::var("CODESTORY_EMBED_BACKEND").as_deref(),
+            Ok("llamacpp")
+        );
+    }
+
+    #[test]
+    fn local_retrieval_index_does_not_force_llamacpp_backend() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
+        let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
+
+        prepare_retrieval_index_embedding_env(CliSidecarProfile::Local);
+
+        assert!(std::env::var("CODESTORY_EMBED_BACKEND").is_err());
     }
 
     #[test]

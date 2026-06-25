@@ -2156,12 +2156,6 @@ fn repair_ready_state(
             run_id,
         )
     });
-
-    let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
-    ensure_index_ready(&opened, "ready repair")?;
-    if !agent_goal {
-        return Ok(None);
-    }
     if let Some(sidecar) = sidecar.as_ref() {
         if let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
@@ -2181,6 +2175,12 @@ fn repair_ready_state(
                 return Ok(Some(sidecar.clone()));
             }
         }
+    }
+
+    let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
+    ensure_index_ready(&opened, "ready repair")?;
+    if !agent_goal {
+        return Ok(None);
     }
 
     let storage_scope = codestory_retrieval::BootstrapStorageScope::from_parts(
