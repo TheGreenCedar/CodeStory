@@ -1470,7 +1470,7 @@ fn assert_sidecar_failure_output(output: std::process::Output) {
     );
     assert!(
         failure.contains("sidecar retrieval")
-            && (failure.contains("expected mode=full")
+            && (failure.contains("expected profile=agent mode=full")
                 || failure.contains("retrieval_manifest_missing")),
         "command should explain the mandatory sidecar gate, got: {failure}"
     );
