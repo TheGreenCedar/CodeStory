@@ -13,6 +13,11 @@ function pluginDataDir() {
   return null;
 }
 
+function stateFilePath() {
+  const stateDir = pluginDataDir();
+  return stateDir ? path.join(stateDir, STATE_FILE) : null;
+}
+
 function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -115,14 +120,25 @@ function mcpDetectionText(status) {
   ].join('\n');
 }
 
+function readActiveState() {
+  const file = stateFilePath();
+  return file ? readJson(file) : null;
+}
+
 function rememberActiveState(state) {
-  const stateDir = pluginDataDir();
-  if (!stateDir) return;
+  const file = stateFilePath();
+  if (!file) return;
 
   try {
-    fs.mkdirSync(stateDir, { recursive: true });
-    fs.writeFileSync(path.join(stateDir, STATE_FILE), JSON.stringify({
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const previous = readActiveState() || {};
+    fs.writeFileSync(file, JSON.stringify({
+      ...previous,
       ...state,
+      hook: {
+        ...(previous.hook || {}),
+        ...(state.hook || {}),
+      },
       updatedAt: new Date().toISOString(),
     }));
   } catch (e) {
@@ -156,6 +172,7 @@ function writeHookOutput(event, context) {
 module.exports = {
   classifyMcpRuntime,
   mcpDetectionText,
+  readActiveState,
   rememberActiveState,
   writeHookOutput,
 };

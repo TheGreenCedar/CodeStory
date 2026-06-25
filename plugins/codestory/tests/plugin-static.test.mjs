@@ -820,6 +820,35 @@ async function withFakeCodeStoryCli(callback) {
   }
 }
 
+async function withTempHookInstall(callback) {
+  const { cp } = await import("node:fs/promises");
+  const installRoot = await mkdtemp(join(tmpdir(), "codestory-hook-install-"));
+  try {
+    await cp(join(pluginRoot, "hooks"), join(installRoot, "hooks"), {
+      recursive: true,
+    });
+    await callback(installRoot);
+  } finally {
+    await rm(installRoot, { recursive: true, force: true });
+  }
+}
+
+async function writeNodeCli(binDir, source) {
+  const scriptPath = join(binDir, "fake-codestory-cli.cjs");
+  const cliPath = join(
+    binDir,
+    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+  );
+  await writeFile(scriptPath, source, "utf8");
+  if (process.platform === "win32") {
+    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`, "utf8");
+    return cliPath;
+  }
+  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)} "$@"\n`, "utf8");
+  await chmod(cliPath, 0o755);
+  return cliPath;
+}
+
 test("hook output keeps CodeStory ambient and checks MCP before CLI fallback", async () => {
   const { spawnSync } = await import("node:child_process");
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
@@ -881,6 +910,211 @@ test("hook output keeps CodeStory ambient and checks MCP before CLI fallback", a
     });
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("hook degraded output is short when no MCP or managed runtime is usable", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-degraded-"));
+  const pathDir = await mkdtemp(join(tmpdir(), "codestory-hook-path-"));
+
+  try {
+    await writeNodeCli(pathDir, "console.log('FAKE_CODESTORY_CLI');");
+    await withTempHookInstall(async (installRoot) => {
+      const result = spawnSync(process.execPath, [join(installRoot, "hooks", "codestory-activate.cjs")], {
+        env: {
+          ...process.env,
+          COPILOT_PLUGIN_DATA: "",
+          PLUGIN_DATA: dataDir,
+          PATH: pathDir,
+          ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+        },
+        input: JSON.stringify({
+          hook_event_name: "UserPromptSubmit",
+          prompt: "Find the hook failure.",
+          cwd: repoRoot,
+        }),
+        encoding: "utf8",
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+      assert.match(context, /CodeStory degraded mode: no MCP or managed runtime surface is usable/u);
+      assert.match(context, /First failing layer: MCP: no codestory server configured/u);
+      assert.doesNotMatch(context, /CODESTORY BACKGROUND GROUNDING/u);
+      assert.doesNotMatch(context, /FAKE_CODESTORY_CLI/u);
+      assert.ok(context.length < 1600, context);
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(pathDir, { recursive: true, force: true });
+  }
+});
+
+test("hook failed preflight switches degraded guidance to bounded source fallback", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-preflight-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-preflight-bin-"));
+
+  try {
+    const cliPath = await writeNodeCli(
+      binDir,
+      "process.stderr.write('first preflight failed\\n' + 'x'.repeat(8000));process.exit(2);",
+    );
+    await withTempHookInstall(async (installRoot) => {
+      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
+      const first = spawnSync(process.execPath, [hookPath], {
+        env: {
+          ...process.env,
+          CODESTORY_CLI: cliPath,
+          COPILOT_PLUGIN_DATA: "",
+          PLUGIN_DATA: dataDir,
+        },
+        input: JSON.stringify({
+          hook_event_name: "UserPromptSubmit",
+          prompt: "Find the hook failure.",
+          cwd: repoRoot,
+        }),
+        encoding: "utf8",
+      });
+
+      assert.equal(first.status, 0, first.stderr);
+      const firstContext = JSON.parse(first.stdout).hookSpecificOutput.additionalContext;
+      assert.match(firstContext, /Reason: first preflight failed/u);
+      assert.match(firstContext, /CodeStory is unavailable for this session/u);
+      assert.match(firstContext, /hook output truncated by hook budget/u);
+      assert.doesNotMatch(firstContext, /CODESTORY BACKGROUND GROUNDING/u);
+      assert.ok(firstContext.length < 5600, firstContext);
+
+      const second = spawnSync(process.execPath, [hookPath], {
+        env: {
+          ...process.env,
+          CODESTORY_CLI: "",
+          COPILOT_PLUGIN_DATA: "",
+          PLUGIN_DATA: dataDir,
+        },
+        input: JSON.stringify({
+          hook_event_name: "SessionStart",
+          source: "resume",
+          cwd: repoRoot,
+        }),
+        encoding: "utf8",
+      });
+
+      assert.equal(second.status, 0, second.stderr);
+      const secondContext = JSON.parse(second.stdout).hookSpecificOutput.additionalContext;
+      assert.match(secondContext, /CodeStory is unavailable for this session/u);
+      assert.match(secondContext, /bounded source reads/u);
+      assert.doesNotMatch(secondContext, /repair archaeology/u);
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("hook dedupes repeated request grounding instructions within plugin state", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-dedupe-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-dedupe-bin-"));
+
+  try {
+    const cliPath = await writeNodeCli(binDir, "console.log('packet ok');");
+    await withTempHookInstall(async (installRoot) => {
+      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
+      const env = {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        COPILOT_PLUGIN_DATA: "",
+        PLUGIN_DATA: dataDir,
+      };
+      const input = JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        prompt: "Where is RefreshMode defined?",
+        cwd: repoRoot,
+      });
+      const first = spawnSync(process.execPath, [hookPath], {
+        env,
+        input,
+        encoding: "utf8",
+      });
+      const second = spawnSync(process.execPath, [hookPath], {
+        env,
+        input,
+        encoding: "utf8",
+      });
+
+      assert.equal(first.status, 0, first.stderr);
+      assert.equal(second.status, 0, second.stderr);
+      const firstContext = JSON.parse(first.stdout).hookSpecificOutput.additionalContext;
+      const secondContext = JSON.parse(second.stdout).hookSpecificOutput.additionalContext;
+      assert.match(firstContext, /CODESTORY BACKGROUND GROUNDING ACTIVE/u);
+      assert.doesNotMatch(secondContext, /CODESTORY BACKGROUND GROUNDING ACTIVE/u);
+      assert.match(secondContext, /CODESTORY HOOK REQUEST PACKET/u);
+      assert.match(secondContext, /packet ok/u);
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("hook resets instruction dedupe on fresh startup session boundary", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-startup-dedupe-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-startup-dedupe-bin-"));
+
+  try {
+    const cliPath = await writeNodeCli(binDir, "console.log('ground ok');");
+    await withTempHookInstall(async (installRoot) => {
+      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
+      const env = {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        COPILOT_PLUGIN_DATA: "",
+        PLUGIN_DATA: dataDir,
+      };
+      const startupInput = JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "startup",
+        cwd: repoRoot,
+      });
+      const resumeInput = JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "resume",
+        cwd: repoRoot,
+      });
+      const firstStartup = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: startupInput,
+        encoding: "utf8",
+      });
+      const resume = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: resumeInput,
+        encoding: "utf8",
+      });
+      const secondStartup = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: startupInput,
+        encoding: "utf8",
+      });
+
+      assert.equal(firstStartup.status, 0, firstStartup.stderr);
+      assert.equal(resume.status, 0, resume.stderr);
+      assert.equal(secondStartup.status, 0, secondStartup.stderr);
+      const firstContext = JSON.parse(firstStartup.stdout).hookSpecificOutput.additionalContext;
+      const resumeContext = JSON.parse(resume.stdout).hookSpecificOutput.additionalContext;
+      const secondContext = JSON.parse(secondStartup.stdout).hookSpecificOutput.additionalContext;
+      const fullInstructions = /CODESTORY BACKGROUND GROUNDING (?:ACTIVE|RULES)/u;
+      assert.match(firstContext, fullInstructions);
+      assert.doesNotMatch(resumeContext, fullInstructions);
+      assert.match(secondContext, fullInstructions);
+      assert.match(secondContext, /ground ok/u);
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
   }
 });
 
