@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 /// Relative path from repository root to the retrieval compose file.
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
 const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-compose.yml");
+const DOCKER_ADDRESS_POOL_EXHAUSTED_REASON: &str = "docker_address_pool_exhausted";
+const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
+    "all predefined address pools have been fully subnetted";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EmbedModelInventory {
@@ -282,11 +285,39 @@ fn docker_compose_up(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "docker compose up failed (exit {:?}):\n{stdout}{stderr}",
-            output.status.code()
+            "{}",
+            docker_compose_up_failure_message(output.status.code(), &stdout, &stderr, repo_root)
         );
     }
     Ok(())
+}
+
+fn docker_compose_up_failure_message(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    repo_root: Option<&Path>,
+) -> String {
+    if docker_address_pool_exhausted(stdout) || docker_address_pool_exhausted(stderr) {
+        let project = repo_root
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<repo>".to_string());
+        return format!(
+            "docker compose up failed (exit {exit_code:?}): reason={DOCKER_ADDRESS_POOL_EXHAUSTED_REASON}\n\
+Docker's predefined address pools are exhausted. Run read-only inventory: \
+`codestory-cli sidecar inventory --project {project} --format markdown` \
+or `codestory-cli sidecar inventory --project {project} --format json`.\n\
+Raw docker compose output:\n{stdout}{stderr}"
+        );
+    }
+
+    format!("docker compose up failed (exit {exit_code:?}):\n{stdout}{stderr}")
+}
+
+fn docker_address_pool_exhausted(details: &str) -> bool {
+    details
+        .to_ascii_lowercase()
+        .contains(DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE)
 }
 
 pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
@@ -536,6 +567,45 @@ mod tests {
             docker_bind_path(Path::new(r"\\?\C:\Users\alber\codestory\models")),
             "C:/Users/alber/codestory/models"
         );
+    }
+
+    #[test]
+    fn compose_failure_classifies_docker_address_pool_exhaustion() {
+        let project = Path::new("C:/repo/example");
+        let stderr =
+            "failed to create network: all predefined address pools have been fully subnetted";
+
+        let message = docker_compose_up_failure_message(Some(1), "", stderr, Some(project));
+
+        assert!(message.contains("reason=docker_address_pool_exhausted"));
+        assert!(message.contains(stderr));
+        assert!(message.contains(
+            "codestory-cli sidecar inventory --project C:/repo/example --format markdown"
+        ));
+        assert!(
+            message.contains(
+                "codestory-cli sidecar inventory --project C:/repo/example --format json"
+            )
+        );
+        for forbidden in [" prune", " remove", " down", " delete", " restart"] {
+            assert!(
+                !message.to_ascii_lowercase().contains(forbidden),
+                "guidance must stay non-destructive: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_failure_preserves_generic_stderr_without_reason() {
+        let stderr = "compose service failed for another reason";
+
+        let message = docker_compose_up_failure_message(Some(17), "stdout\n", stderr, None);
+
+        assert!(message.contains("docker compose up failed (exit Some(17))"));
+        assert!(message.contains("stdout\n"));
+        assert!(message.contains(stderr));
+        assert!(!message.contains("docker_address_pool_exhausted"));
+        assert!(!message.contains("sidecar inventory"));
     }
 
     #[test]
