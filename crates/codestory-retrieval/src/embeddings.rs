@@ -9,6 +9,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -32,6 +33,11 @@ const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT
 const ALLOW_REMOTE_EMBEDDINGS_ENV: &str = "CODESTORY_ALLOW_REMOTE_EMBEDDINGS";
 const DEVICE_POLICY_ENV: &str = "CODESTORY_EMBED_DEVICE_POLICY";
 const DEVICE_STATE_ENV: &str = "CODESTORY_EMBED_DEVICE_STATE";
+const DEVICE_PROVIDER_ENV: &str = "CODESTORY_EMBED_DEVICE_PROVIDER";
+const DEVICE_NAME_ENV: &str = "CODESTORY_EMBED_DEVICE_NAME";
+const DISABLE_HOST_GPU_DETECT_ENV: &str = "CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT";
+const LLAMACPP_DEVICE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_DEVICE";
+const LLAMACPP_N_GPU_LAYERS_ENV: &str = "CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS";
 const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -49,9 +55,20 @@ pub struct EmbeddingRuntimeProbe {
 pub struct EmbeddingDeviceReadiness {
     pub requested_policy: &'static str,
     pub observed_state: &'static str,
+    pub detected_provider: Option<String>,
+    pub detected_gpu: Option<String>,
+    pub accelerator_requested: bool,
+    pub accelerator_request_provider: Option<String>,
+    pub accelerator_request_device: Option<String>,
     pub cpu_allowed: bool,
     pub full_retrieval_allowed: bool,
     pub degraded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingAcceleratorRequest {
+    pub device: String,
+    pub n_gpu_layers: String,
 }
 
 /// Stable id stored on retrieval manifest rows (backend + model family).
@@ -87,6 +104,12 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
 
 pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
     let cpu_allowed = explicit_cpu_allowed();
+    let detection = host_embedding_device_detection();
+    let accelerator_request = if cpu_allowed {
+        None
+    } else {
+        embedding_accelerator_request_for_detection(detection.as_ref())
+    };
     let observed_state = observed_embedding_device_state();
     let accelerated = observed_state == "accelerated";
     let full_retrieval_allowed = accelerated || cpu_allowed;
@@ -102,10 +125,35 @@ pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
     EmbeddingDeviceReadiness {
         requested_policy,
         observed_state,
+        detected_provider: detection.as_ref().map(|gpu| gpu.provider.clone()),
+        detected_gpu: detection.map(|gpu| gpu.name),
+        accelerator_requested: accelerator_request.is_some(),
+        accelerator_request_provider: accelerator_request.as_ref().map(|_| "vulkan".to_string()),
+        accelerator_request_device: accelerator_request
+            .as_ref()
+            .map(|request| request.device.clone()),
         cpu_allowed,
         full_retrieval_allowed,
         degraded_reason,
     }
+}
+
+pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
+    if explicit_cpu_allowed() {
+        return None;
+    }
+    let detection = host_embedding_device_detection();
+    embedding_accelerator_request_for_detection(detection.as_ref())
+}
+
+fn embedding_accelerator_request_for_detection(
+    detection: Option<&HostGpuDetection>,
+) -> Option<EmbeddingAcceleratorRequest> {
+    let detection = detection?;
+    (detection.provider == "amd").then(|| EmbeddingAcceleratorRequest {
+        device: env_trimmed(LLAMACPP_DEVICE_ENV).unwrap_or_else(|| "Vulkan0".to_string()),
+        n_gpu_layers: env_trimmed(LLAMACPP_N_GPU_LAYERS_ENV).unwrap_or_else(|| "99".to_string()),
+    })
 }
 
 fn explicit_cpu_allowed() -> bool {
@@ -131,6 +179,86 @@ fn observed_embedding_device_state() -> &'static str {
         Some("cpu") => "cpu",
         _ => "unknown",
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostGpuDetection {
+    provider: String,
+    name: String,
+}
+
+fn host_embedding_device_detection() -> Option<HostGpuDetection> {
+    if env_truthy(DISABLE_HOST_GPU_DETECT_ENV) {
+        return None;
+    }
+    let env_provider = env_trimmed(DEVICE_PROVIDER_ENV).map(|value| normalize_gpu_provider(&value));
+    let env_name = env_trimmed(DEVICE_NAME_ENV);
+    if let Some(provider) = env_provider.filter(|provider| provider == "amd") {
+        return Some(HostGpuDetection {
+            provider,
+            name: env_name.unwrap_or_else(|| "AMD GPU".to_string()),
+        });
+    }
+    detect_windows_amd_gpu()
+}
+
+fn detect_windows_amd_gpu() -> Option<HostGpuDetection> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            windows_video_controller_probe_script(),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    detect_amd_gpu_from_windows_video_controller(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn windows_video_controller_probe_script() -> &'static str {
+    r#"$job = Start-Job -ScriptBlock { Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name } }; if (Wait-Job $job -Timeout 2) { Receive-Job $job; Remove-Job $job -Force } else { Stop-Job $job; Remove-Job $job -Force; exit 124 }"#
+}
+
+fn detect_amd_gpu_from_windows_video_controller(output: &str) -> Option<HostGpuDetection> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| {
+            let normalized = line.to_ascii_lowercase();
+            normalized.contains("amd")
+                || normalized.contains("radeon")
+                || normalized.contains("advanced micro devices")
+        })
+        .map(|name| HostGpuDetection {
+            provider: "amd".to_string(),
+            name: name.to_string(),
+        })
+}
+
+fn normalize_gpu_provider(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.contains("amd")
+        || normalized.contains("radeon")
+        || normalized.contains("advanced micro devices")
+    {
+        "amd".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -535,11 +663,15 @@ mod tests {
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
 
         let readiness = embedding_device_readiness();
 
         assert_eq!(readiness.requested_policy, "accelerator_required");
         assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.detected_provider, None);
+        assert_eq!(readiness.detected_gpu, None);
+        assert!(!readiness.accelerator_requested);
         assert!(!readiness.full_retrieval_allowed);
         assert!(
             readiness
@@ -556,14 +688,91 @@ mod tests {
         let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::set(DEVICE_STATE_ENV, "cpu");
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
 
         let readiness = embedding_device_readiness();
 
         assert_eq!(readiness.requested_policy, "cpu_allowed");
         assert_eq!(readiness.observed_state, "cpu");
         assert!(readiness.cpu_allowed);
+        assert!(!readiness.accelerator_requested);
+        assert!(embedding_accelerator_request().is_none());
         assert!(readiness.full_retrieval_allowed);
         assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn windows_video_controller_parser_detects_amd_gpu() {
+        let detection = detect_amd_gpu_from_windows_video_controller(
+            "Intel(R) UHD Graphics\r\nAMD Radeon RX 7800 XT\r\n",
+        )
+        .expect("amd gpu");
+
+        assert_eq!(detection.provider, "amd");
+        assert_eq!(detection.name, "AMD Radeon RX 7800 XT");
+    }
+
+    #[test]
+    fn windows_video_controller_probe_script_has_timeout() {
+        let script = windows_video_controller_probe_script();
+
+        assert!(script.contains("Wait-Job $job -Timeout 2"));
+        assert!(script.contains("Stop-Job $job"));
+        assert!(script.contains("exit 124"));
+    }
+
+    #[test]
+    fn amd_provider_env_detects_and_requests_vulkan_without_observing_acceleration() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7800 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _ngl = EnvGuard::remove(LLAMACPP_N_GPU_LAYERS_ENV);
+
+        let readiness = embedding_device_readiness();
+        let request = embedding_accelerator_request().expect("accelerator request");
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
+        assert_eq!(
+            readiness.detected_gpu.as_deref(),
+            Some("AMD Radeon RX 7800 XT")
+        );
+        assert!(readiness.accelerator_requested);
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("vulkan")
+        );
+        assert_eq!(
+            readiness.accelerator_request_device.as_deref(),
+            Some("Vulkan0")
+        );
+        assert!(!readiness.cpu_allowed);
+        assert!(!readiness.full_retrieval_allowed);
+        assert_eq!(request.device, "Vulkan0");
+        assert_eq!(request.n_gpu_layers, "99");
+    }
+
+    #[test]
+    fn explicit_unknown_device_still_fails_closed_on_amd_host() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "unknown");
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7800 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert!(!readiness.full_retrieval_allowed);
     }
 
     #[test]

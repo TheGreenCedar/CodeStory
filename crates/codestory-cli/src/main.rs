@@ -2316,6 +2316,15 @@ fn agent_preflight_lane(
         embedding_device_policy: sidecar
             .and_then(|sidecar| sidecar.embedding_device_policy.clone()),
         embedding_device_state: sidecar.and_then(|sidecar| sidecar.embedding_device_state.clone()),
+        embedding_detected_provider: sidecar
+            .and_then(|sidecar| sidecar.embedding_detected_provider.clone()),
+        embedding_detected_gpu: sidecar.and_then(|sidecar| sidecar.embedding_detected_gpu.clone()),
+        embedding_accelerator_requested: sidecar
+            .map(|sidecar| sidecar.embedding_accelerator_requested),
+        embedding_accelerator_request_provider: sidecar
+            .and_then(|sidecar| sidecar.embedding_accelerator_request_provider.clone()),
+        embedding_accelerator_request_device: sidecar
+            .and_then(|sidecar| sidecar.embedding_accelerator_request_device.clone()),
         embedding_cpu_allowed: sidecar.map(|sidecar| sidecar.embedding_cpu_allowed),
     }
 }
@@ -2366,9 +2375,40 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
         output.full_retrieval.embedding_device_state.as_deref(),
         output.full_retrieval.embedding_cpu_allowed,
     ) {
+        let detected = output
+            .full_retrieval
+            .embedding_detected_provider
+            .as_deref()
+            .map(|provider| {
+                let gpu = output
+                    .full_retrieval
+                    .embedding_detected_gpu
+                    .as_deref()
+                    .unwrap_or("unknown");
+                format!(" detected_provider=`{provider}` detected_gpu=`{gpu}`")
+            })
+            .unwrap_or_default();
+        let request = output
+            .full_retrieval
+            .embedding_accelerator_requested
+            .filter(|requested| *requested)
+            .map(|_| {
+                let provider = output
+                    .full_retrieval
+                    .embedding_accelerator_request_provider
+                    .as_deref()
+                    .unwrap_or("unknown");
+                let device = output
+                    .full_retrieval
+                    .embedding_accelerator_request_device
+                    .as_deref()
+                    .unwrap_or("unknown");
+                format!(" accelerator_request=`{provider}:{device}`")
+            })
+            .unwrap_or_default();
         let _ = writeln!(
             markdown,
-            "full_retrieval_embedding_device: policy=`{policy}` observed=`{state}` cpu_allowed={cpu_allowed}"
+            "full_retrieval_embedding_device: policy=`{policy}` observed=`{state}`{detected}{request} cpu_allowed={cpu_allowed}"
         );
     }
     if let Some(state) = output
@@ -10216,6 +10256,15 @@ fn readiness_sidecar_input(
         degraded_reason: sidecar.degraded_reason.as_deref(),
         embedding_device_policy: Some(sidecar.embedding_device_policy.as_str()),
         embedding_device_state: Some(sidecar.embedding_device_state.as_str()),
+        embedding_detected_provider: sidecar.embedding_detected_provider.as_deref(),
+        embedding_detected_gpu: sidecar.embedding_detected_gpu.as_deref(),
+        embedding_accelerator_requested: sidecar.embedding_accelerator_requested,
+        embedding_accelerator_request_provider: sidecar
+            .embedding_accelerator_request_provider
+            .as_deref(),
+        embedding_accelerator_request_device: sidecar
+            .embedding_accelerator_request_device
+            .as_deref(),
         embedding_cpu_allowed: sidecar.embedding_cpu_allowed,
         manifest_generation: sidecar.manifest_generation.as_deref(),
         manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
@@ -10318,6 +10367,11 @@ fn doctor_sidecar_status_from_report(
         degraded_reason: report.degraded_reason,
         embedding_device_policy: report.embedding_device_policy,
         embedding_device_state: report.embedding_device_state,
+        embedding_detected_provider: report.embedding_detected_provider,
+        embedding_detected_gpu: report.embedding_detected_gpu,
+        embedding_accelerator_requested: report.embedding_accelerator_requested,
+        embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
+        embedding_accelerator_request_device: report.embedding_accelerator_request_device,
         embedding_cpu_allowed: report.embedding_cpu_allowed,
         manifest_generation,
         manifest_input_hash,
@@ -10339,6 +10393,11 @@ fn doctor_sidecar_status_error(
         degraded_reason: Some(format!("sidecar_status_error: {error}")),
         embedding_device_policy: "accelerator_required".to_string(),
         embedding_device_state: "unknown".to_string(),
+        embedding_detected_provider: None,
+        embedding_detected_gpu: None,
+        embedding_accelerator_requested: false,
+        embedding_accelerator_request_provider: None,
+        embedding_accelerator_request_device: None,
         embedding_cpu_allowed: false,
         manifest_generation: None,
         manifest_input_hash: None,
@@ -12088,6 +12147,11 @@ mod tests {
             embed_reachable: false,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             zoekt_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
@@ -12113,6 +12177,11 @@ mod tests {
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "unknown".into(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             zoekt_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
@@ -12137,6 +12206,11 @@ mod tests {
             degraded_reason: None,
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "accelerated".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: Some("generation".to_string()),
             manifest_input_hash: Some("hash".to_string()),
@@ -12198,6 +12272,11 @@ mod tests {
             degraded_reason: None,
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "accelerated".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: Some("generation".to_string()),
             manifest_input_hash: Some("hash".to_string()),
@@ -12253,6 +12332,11 @@ mod tests {
             ),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,
@@ -12268,6 +12352,11 @@ mod tests {
             degraded_reason: None,
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "accelerated".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: Some("generation".to_string()),
             manifest_input_hash: Some("hash".to_string()),
@@ -12318,6 +12407,11 @@ mod tests {
             degraded_reason: Some("retrieval_manifest_missing".to_string()),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,
@@ -12333,6 +12427,11 @@ mod tests {
             degraded_reason: None,
             embedding_device_policy: "cpu_allowed".to_string(),
             embedding_device_state: "cpu".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: true,
             manifest_generation: Some("generation".to_string()),
             manifest_input_hash: Some("hash".to_string()),
@@ -12426,6 +12525,11 @@ mod tests {
             ),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,
@@ -12441,6 +12545,11 @@ mod tests {
             degraded_reason: Some("sidecar_status_error: missing manifest".to_string()),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,

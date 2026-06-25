@@ -1274,6 +1274,11 @@ fn stdio_mandatory_sidecar_fingerprint(
             degraded_reason: report.degraded_reason,
             embedding_device_policy: report.embedding_device_policy,
             embedding_device_state: report.embedding_device_state,
+            embedding_detected_provider: report.embedding_detected_provider,
+            embedding_detected_gpu: report.embedding_detected_gpu,
+            embedding_accelerator_requested: report.embedding_accelerator_requested,
+            embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
+            embedding_accelerator_request_device: report.embedding_accelerator_request_device,
             embedding_cpu_allowed: report.embedding_cpu_allowed,
             manifest: report.manifest,
         },
@@ -1290,6 +1295,11 @@ struct StdioSidecarStatusFingerprint {
     degraded_reason: Option<String>,
     embedding_device_policy: String,
     embedding_device_state: String,
+    embedding_detected_provider: Option<String>,
+    embedding_detected_gpu: Option<String>,
+    embedding_accelerator_requested: bool,
+    embedding_accelerator_request_provider: Option<String>,
+    embedding_accelerator_request_device: Option<String>,
     embedding_cpu_allowed: bool,
     manifest: Option<codestory_retrieval::RetrievalIndexManifest>,
 }
@@ -1321,6 +1331,30 @@ fn stdio_mandatory_sidecar_fingerprint_from_status(
             parts.push(format!(
                 "embedding_device_state:{}",
                 report.embedding_device_state
+            ));
+            parts.push(format!(
+                "embedding_detected_provider:{}",
+                report.embedding_detected_provider.unwrap_or_default()
+            ));
+            parts.push(format!(
+                "embedding_detected_gpu:{}",
+                report.embedding_detected_gpu.unwrap_or_default()
+            ));
+            parts.push(format!(
+                "embedding_accelerator_requested:{}",
+                report.embedding_accelerator_requested
+            ));
+            parts.push(format!(
+                "embedding_accelerator_request_provider:{}",
+                report
+                    .embedding_accelerator_request_provider
+                    .unwrap_or_default()
+            ));
+            parts.push(format!(
+                "embedding_accelerator_request_device:{}",
+                report
+                    .embedding_accelerator_request_device
+                    .unwrap_or_default()
             ));
             parts.push(format!(
                 "embedding_cpu_allowed:{}",
@@ -2438,6 +2472,11 @@ fn read_stdio_status_resource(
         degraded_reason,
         embedding_device_policy,
         embedding_device_state,
+        embedding_detected_provider,
+        embedding_detected_gpu,
+        embedding_accelerator_requested,
+        embedding_accelerator_request_provider,
+        embedding_accelerator_request_device,
         embedding_cpu_allowed,
         manifest_generation,
         manifest_input_hash,
@@ -2461,6 +2500,11 @@ fn read_stdio_status_resource(
                 report.degraded_reason,
                 report.embedding_device_policy,
                 report.embedding_device_state,
+                report.embedding_detected_provider,
+                report.embedding_detected_gpu,
+                report.embedding_accelerator_requested,
+                report.embedding_accelerator_request_provider,
+                report.embedding_accelerator_request_device,
                 report.embedding_cpu_allowed,
                 manifest_generation,
                 manifest_input_hash,
@@ -2472,6 +2516,11 @@ fn read_stdio_status_resource(
             Some(format!("sidecar_status_error: {error}")),
             "accelerator_required".to_string(),
             "unknown".to_string(),
+            None,
+            None,
+            false,
+            None,
+            None,
             false,
             None,
             None,
@@ -2483,6 +2532,11 @@ fn read_stdio_status_resource(
         "degraded_reason": degraded_reason.clone(),
         "embedding_device_policy": embedding_device_policy.clone(),
         "embedding_device_state": embedding_device_state.clone(),
+        "embedding_detected_provider": embedding_detected_provider.clone(),
+        "embedding_detected_gpu": embedding_detected_gpu.clone(),
+        "embedding_accelerator_requested": embedding_accelerator_requested,
+        "embedding_accelerator_request_provider": embedding_accelerator_request_provider.clone(),
+        "embedding_accelerator_request_device": embedding_accelerator_request_device.clone(),
         "embedding_cpu_allowed": embedding_cpu_allowed,
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "manifest_generation": manifest_generation.clone(),
@@ -2509,6 +2563,12 @@ fn read_stdio_status_resource(
             degraded_reason: degraded_reason.as_deref(),
             embedding_device_policy: Some(&embedding_device_policy),
             embedding_device_state: Some(&embedding_device_state),
+            embedding_detected_provider: embedding_detected_provider.as_deref(),
+            embedding_detected_gpu: embedding_detected_gpu.as_deref(),
+            embedding_accelerator_requested,
+            embedding_accelerator_request_provider: embedding_accelerator_request_provider
+                .as_deref(),
+            embedding_accelerator_request_device: embedding_accelerator_request_device.as_deref(),
             embedding_cpu_allowed,
             manifest_generation: manifest_generation.as_deref(),
             manifest_input_hash: manifest_input_hash.as_deref(),
@@ -2562,6 +2622,11 @@ fn read_stdio_status_resource(
         "degraded_reason": degraded_reason,
         "embedding_device_policy": embedding_device_policy,
         "embedding_device_state": embedding_device_state,
+        "embedding_detected_provider": embedding_detected_provider,
+        "embedding_detected_gpu": embedding_detected_gpu,
+        "embedding_accelerator_requested": embedding_accelerator_requested,
+        "embedding_accelerator_request_provider": embedding_accelerator_request_provider,
+        "embedding_accelerator_request_device": embedding_accelerator_request_device,
         "embedding_cpu_allowed": embedding_cpu_allowed,
         "sidecar_retrieval": sidecar,
         "sidecar_setup": sidecar_setup,
@@ -3806,6 +3871,11 @@ version = "0.11.20"
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("accelerated"),
+                    embedding_detected_provider: None,
+                    embedding_detected_gpu: None,
+                    embedding_accelerator_requested: false,
+                    embedding_accelerator_request_provider: None,
+                    embedding_accelerator_request_device: None,
                     embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
@@ -4118,6 +4188,11 @@ version = "0.11.20"
                 degraded_reason: None,
                 embedding_device_policy: "accelerator_required".into(),
                 embedding_device_state: "accelerated".into(),
+                embedding_detected_provider: None,
+                embedding_detected_gpu: None,
+                embedding_accelerator_requested: false,
+                embedding_accelerator_request_provider: None,
+                embedding_accelerator_request_device: None,
                 embedding_cpu_allowed: false,
                 manifest: Some(manifest.clone()),
             }),
@@ -4147,6 +4222,11 @@ version = "0.11.20"
                 ),
                 embedding_device_policy: "accelerator_required".into(),
                 embedding_device_state: "accelerated".into(),
+                embedding_detected_provider: None,
+                embedding_detected_gpu: None,
+                embedding_accelerator_requested: false,
+                embedding_accelerator_request_provider: None,
+                embedding_accelerator_request_device: None,
                 embedding_cpu_allowed: false,
                 manifest: Some(manifest),
             }),

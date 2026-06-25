@@ -33,6 +33,11 @@ pub(crate) struct ReadinessSidecarInput<'a> {
     pub(crate) degraded_reason: Option<&'a str>,
     pub(crate) embedding_device_policy: Option<&'a str>,
     pub(crate) embedding_device_state: Option<&'a str>,
+    pub(crate) embedding_detected_provider: Option<&'a str>,
+    pub(crate) embedding_detected_gpu: Option<&'a str>,
+    pub(crate) embedding_accelerator_requested: bool,
+    pub(crate) embedding_accelerator_request_provider: Option<&'a str>,
+    pub(crate) embedding_accelerator_request_device: Option<&'a str>,
     pub(crate) embedding_cpu_allowed: bool,
     pub(crate) manifest_generation: Option<&'a str>,
     pub(crate) manifest_input_hash: Option<&'a str>,
@@ -312,13 +317,32 @@ fn verdict_state(
             .unwrap_or("unavailable");
         if sidecar_mode != "full" || sidecar_profile != Some("agent") {
             let device_note = sidecar
-                .and_then(|sidecar| {
-                    sidecar
-                        .embedding_device_policy
-                        .zip(sidecar.embedding_device_state)
-                })
-                .map(|(policy, state)| {
-                    format!(" embedding_device_policy=`{policy}` observed_device=`{state}`.")
+                .and_then(|sidecar| sidecar.embedding_device_policy.zip(sidecar.embedding_device_state).map(|(policy, state)| (sidecar, policy, state)))
+                .map(|(sidecar, policy, state)| {
+                    let detected = sidecar
+                        .embedding_detected_provider
+                        .map(|provider| {
+                            format!(
+                                " detected_provider=`{provider}` detected_gpu=`{}`",
+                                sidecar.embedding_detected_gpu.unwrap_or("unknown")
+                            )
+                        })
+                        .unwrap_or_default();
+                    let request = sidecar
+                        .embedding_accelerator_requested
+                        .then(|| {
+                            format!(
+                                " accelerator_request=`{}:{}`",
+                                sidecar
+                                    .embedding_accelerator_request_provider
+                                    .unwrap_or("unknown"),
+                                sidecar
+                                    .embedding_accelerator_request_device
+                                    .unwrap_or("unknown")
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!(" embedding_device_policy=`{policy}` observed_device=`{state}`{detected}{request}.")
                 })
                 .unwrap_or_default();
             let full_repair = agent_packet_search_repair_commands(project_arg, sidecar_run_id);
@@ -472,6 +496,15 @@ fn readiness_sidecar_snapshot(input: ReadinessSidecarInput<'_>) -> ReadinessSide
         degraded_reason: input.degraded_reason.map(ToOwned::to_owned),
         embedding_device_policy: input.embedding_device_policy.map(ToOwned::to_owned),
         embedding_device_state: input.embedding_device_state.map(ToOwned::to_owned),
+        embedding_detected_provider: input.embedding_detected_provider.map(ToOwned::to_owned),
+        embedding_detected_gpu: input.embedding_detected_gpu.map(ToOwned::to_owned),
+        embedding_accelerator_requested: input.embedding_accelerator_requested,
+        embedding_accelerator_request_provider: input
+            .embedding_accelerator_request_provider
+            .map(ToOwned::to_owned),
+        embedding_accelerator_request_device: input
+            .embedding_accelerator_request_device
+            .map(ToOwned::to_owned),
         embedding_cpu_allowed: input.embedding_cpu_allowed,
         manifest_generation: input.manifest_generation.map(ToOwned::to_owned),
         manifest_input_hash: input.manifest_input_hash.map(ToOwned::to_owned),
@@ -574,6 +607,11 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("accelerated"),
+                embedding_detected_provider: None,
+                embedding_detected_gpu: None,
+                embedding_accelerator_requested: false,
+                embedding_accelerator_request_provider: None,
+                embedding_accelerator_request_device: None,
                 embedding_cpu_allowed: false,
                 manifest_generation: Some("generation"),
                 manifest_input_hash: Some("hash"),
@@ -626,6 +664,11 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("accelerated"),
+                embedding_detected_provider: None,
+                embedding_detected_gpu: None,
+                embedding_accelerator_requested: false,
+                embedding_accelerator_request_provider: None,
+                embedding_accelerator_request_device: None,
                 embedding_cpu_allowed: false,
                 manifest_generation: Some("generation"),
                 manifest_input_hash: Some("hash"),
@@ -672,6 +715,11 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("accelerated"),
+                embedding_detected_provider: None,
+                embedding_detected_gpu: None,
+                embedding_accelerator_requested: false,
+                embedding_accelerator_request_provider: None,
+                embedding_accelerator_request_device: None,
                 embedding_cpu_allowed: false,
                 manifest_generation: Some("generation"),
                 manifest_input_hash: Some("hash"),
@@ -779,6 +827,11 @@ mod tests {
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("accelerated"),
+                    embedding_detected_provider: None,
+                    embedding_detected_gpu: None,
+                    embedding_accelerator_requested: false,
+                    embedding_accelerator_request_provider: None,
+                    embedding_accelerator_request_device: None,
                     embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
@@ -829,6 +882,11 @@ mod tests {
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("accelerated"),
+                    embedding_detected_provider: None,
+                    embedding_detected_gpu: None,
+                    embedding_accelerator_requested: false,
+                    embedding_accelerator_request_provider: None,
+                    embedding_accelerator_request_device: None,
                     embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
@@ -854,6 +912,11 @@ mod tests {
                     degraded_reason: Some("semantic store unavailable"),
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("unknown"),
+                    embedding_detected_provider: None,
+                    embedding_detected_gpu: None,
+                    embedding_accelerator_requested: false,
+                    embedding_accelerator_request_provider: None,
+                    embedding_accelerator_request_device: None,
                     embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
@@ -920,6 +983,11 @@ mod tests {
                 degraded_reason: Some("manifest:<missing>"),
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("unknown"),
+                embedding_detected_provider: None,
+                embedding_detected_gpu: None,
+                embedding_accelerator_requested: false,
+                embedding_accelerator_request_provider: None,
+                embedding_accelerator_request_device: None,
                 embedding_cpu_allowed: false,
                 manifest_generation: None,
                 manifest_input_hash: None,
@@ -955,6 +1023,11 @@ mod tests {
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("unknown"),
+                    embedding_detected_provider: None,
+                    embedding_detected_gpu: None,
+                    embedding_accelerator_requested: false,
+                    embedding_accelerator_request_provider: None,
+                    embedding_accelerator_request_device: None,
                     embedding_cpu_allowed: false,
                     manifest_generation: None,
                     manifest_input_hash: None,
