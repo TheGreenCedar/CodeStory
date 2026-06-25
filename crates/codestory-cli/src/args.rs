@@ -828,6 +828,11 @@ pub(crate) struct RetrievalStatusCommand {
 pub(crate) struct RetrievalInventoryCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Apply cleanup for CodeStory-owned inventory safe candidates. Omit for dry-run inventory only."
+    )]
+    pub(crate) apply: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -2827,6 +2832,27 @@ mod tests {
                 action: SetupAction::Embeddings(cmd),
             }) => assert_eq!(cmd.variant, CliLlamaVariant::Vulkan),
             _ => panic!("expected setup embeddings command"),
+        }
+    }
+
+    #[test]
+    fn retrieval_inventory_apply_is_explicit_opt_in() {
+        let dry_run = Cli::try_parse_from(["codestory-cli", "retrieval", "inventory"])
+            .expect("retrieval inventory should parse");
+        match dry_run.command {
+            Command::Retrieval(RetrievalCommand {
+                action: RetrievalAction::Inventory(cmd),
+            }) => assert!(!cmd.apply),
+            _ => panic!("expected retrieval inventory command"),
+        }
+
+        let apply = Cli::try_parse_from(["codestory-cli", "sidecar", "inventory", "--apply"])
+            .expect("sidecar inventory --apply should parse");
+        match apply.command {
+            Command::Sidecar(SidecarCommand {
+                action: SidecarAction::Inventory(cmd),
+            }) => assert!(cmd.apply),
+            _ => panic!("expected sidecar inventory command"),
         }
     }
 

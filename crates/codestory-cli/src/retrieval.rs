@@ -125,6 +125,11 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
 pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    if cmd.apply {
+        let report = codestory_retrieval::sidecar_gc_apply(&runtime.project_root)
+            .context("retrieval inventory apply")?;
+        return emit_retrieval_gc(cmd.format, &report, cmd.output_file.as_deref());
+    }
     let report = codestory_retrieval::sidecar_inventory(&runtime.project_root)
         .context("retrieval inventory")?;
     emit_retrieval_inventory(cmd.format, &report, cmd.output_file.as_deref())
@@ -613,6 +618,53 @@ fn emit_retrieval_inventory(
         if let Some(reason) = namespace.blocking_reason.as_deref() {
             markdown.push_str(&format!("- blocking_reason: `{reason}`\n"));
         }
+    }
+    emit(format, report, markdown, output_file)
+}
+
+fn emit_retrieval_gc(
+    format: OutputFormat,
+    report: &codestory_retrieval::SidecarGcReport,
+    output_file: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut markdown = format!(
+        "# Retrieval sidecar GC\n\n- dry_run: {}\n- docker_available: {}\n- cache_root: `{}`\n- removed: {}\n- blocked: {}\n",
+        report.dry_run,
+        report.docker_available,
+        report.cache_root,
+        report.removed.len(),
+        report.blocked.len()
+    );
+    if let Some(error) = report.docker_error.as_deref() {
+        markdown.push_str(&format!("- docker_error: `{error}`\n"));
+    }
+    markdown.push_str("\n## Removed namespaces\n");
+    if report.removed.is_empty() {
+        markdown.push_str("\nNone.\n");
+    }
+    for namespace in &report.removed {
+        markdown.push_str(&format!(
+            "\n- `{}` ({:?}): {}; paths={} docker_resources={}\n",
+            namespace.namespace,
+            namespace.state,
+            namespace.reason,
+            namespace.removed_paths.len(),
+            namespace.removed_docker_resources.len()
+        ));
+    }
+    markdown.push_str("\n## Blocked namespaces\n");
+    if report.blocked.is_empty() {
+        markdown.push_str("\nNone.\n");
+    }
+    for namespace in &report.blocked {
+        markdown.push_str(&format!(
+            "\n- `{}` ({:?}): {}",
+            namespace.namespace, namespace.state, namespace.reason
+        ));
+        if !namespace.errors.is_empty() {
+            markdown.push_str(&format!("; errors={}", namespace.errors.join("; ")));
+        }
+        markdown.push('\n');
     }
     emit(format, report, markdown, output_file)
 }
