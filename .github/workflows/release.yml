@@ -179,6 +179,7 @@ jobs:
             --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
             --expected-version "${{ needs.preflight.outputs.version }}" \
             --project "${{ github.workspace }}" \
+            --plugin-root plugins/codestory \
             --out-dir target/packaged-agent-proof
 
       - name: Upload packaged agent proof artifacts
@@ -288,3 +289,53 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "CodeStory $TAG" \
             --generate-notes
+
+  post-publish-smoke:
+    name: Post-publish release asset smoke
+    needs:
+      - preflight
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download published Linux asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/post-publish-release-assets
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "codestory-cli-v${VERSION}-linux-x64.tar.gz" \
+            --pattern "SHA256SUMS.txt" \
+            --dir target/post-publish-release-assets \
+            --clobber
+          grep "  codestory-cli-v${VERSION}-linux-x64.tar.gz$" \
+            target/post-publish-release-assets/SHA256SUMS.txt \
+            > target/post-publish-release-assets/linux-x64.sha256
+          (cd target/post-publish-release-assets && sha256sum -c linux-x64.sha256)
+
+      - name: Prove published agent runtime
+        run: |
+          set -euo pipefail
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/post-publish-release-assets/codestory-cli-v${{ needs.preflight.outputs.version }}-linux-x64.tar.gz" \
+            --expected-version "${{ needs.preflight.outputs.version }}" \
+            --project "${{ github.workspace }}" \
+            --plugin-root plugins/codestory \
+            --out-dir target/post-publish-agent-proof
+
+      - name: Upload post-publish agent proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: post-publish-agent-proof-linux-x64
+          path: target/post-publish-agent-proof
+          if-no-files-found: warn
