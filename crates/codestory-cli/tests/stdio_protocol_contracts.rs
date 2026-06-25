@@ -521,41 +521,6 @@ fn freshness_count(value: &Value, aliases: &[&str]) -> Option<u64> {
         .find_map(|alias| value.get(*alias).and_then(Value::as_u64))
 }
 
-fn assert_stale_freshness_counts(value: &Value, context: &str) {
-    let freshness = find_index_freshness(value)
-        .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &["changed_file_count", "changed_count", "changed"]
-        ),
-        Some(1),
-        "{context} freshness should report one changed file: {freshness:#}"
-    );
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &["new_file_count", "new_count", "new", "added_count", "added"]
-        ),
-        Some(1),
-        "{context} freshness should report one new file: {freshness:#}"
-    );
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &[
-                "removed_file_count",
-                "removed_count",
-                "removed",
-                "deleted_count",
-                "deleted"
-            ]
-        ),
-        Some(1),
-        "{context} freshness should report one removed file: {freshness:#}"
-    );
-}
-
 fn assert_fresh_freshness_counts(value: &Value, context: &str) {
     let freshness = find_index_freshness(value)
         .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
@@ -2437,8 +2402,22 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
 }
 
 #[test]
-fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
+fn resources_read_status_refreshes_long_lived_stale_index_with_bounded_latency() {
     let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let warmup = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-freshness-warmup",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let warmup_result = assert_success_envelope(&warmup, json!("status-freshness-warmup"));
+    let warmup_status = json_resource_content(warmup_result, "codestory://status");
+    assert_fresh_freshness_counts(&warmup_status, "warm codestory://status");
+
     thread::sleep(Duration::from_millis(25));
     fs::write(
         fixture.workspace.path().join("src").join("runtime.rs"),
@@ -2460,20 +2439,48 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
         .expect("remove indexed file after indexing");
 
-    let mut server = spawn_stdio_server(&fixture);
-    let warmup = send_json(
+    let refreshed = send_json(
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "status-freshness-warmup",
+            "id": "status-freshness-after-mutation",
             "method": "resources/read",
             "params": {"uri": "codestory://status"}
         }),
     );
-    assert_success_envelope(&warmup, json!("status-freshness-warmup"));
+    let refreshed_result =
+        assert_success_envelope(&refreshed, json!("status-freshness-after-mutation"));
+    let refreshed_status = json_resource_content(refreshed_result, "codestory://status");
+    assert_fresh_freshness_counts(&refreshed_status, "codestory://status after mutation");
+    assert_eq!(
+        refreshed_status["local_refresh"]["reason"],
+        json!("refreshed"),
+        "long-lived status must not return the cached warm freshness result after source mutation: {refreshed_status}"
+    );
+    assert_eq!(
+        refreshed_status["local_refresh"]["blocks_local_surfaces"],
+        json!(false),
+        "successful local refresh should keep local graph surfaces usable: {refreshed_status}"
+    );
+    assert_eq!(
+        refreshed_status["allowed_surfaces"]["ground"]["allowed"],
+        json!(true),
+        "fresh local graph should allow local graph surfaces: {refreshed_status}"
+    );
+    assert_eq!(
+        refreshed_status["allowed_surfaces"]["packet"]["status"],
+        json!("repair_retrieval"),
+        "packet/search should stay gated by the agent retrieval lane after local refresh: {refreshed_status}"
+    );
+    let status_next_call_text = refreshed_status["recommended_next_calls"].to_string();
+    assert!(
+        !status_next_call_text.contains("\"tool\":\"packet\"")
+            && !status_next_call_text.contains("\"tool\":\"search\""),
+        "local freshness repair should not recommend packet/search calls while sidecars are unavailable: {refreshed_status}"
+    );
 
     let mut elapsed = Vec::new();
-    let mut last_status = Value::Null;
+    let mut last_status = refreshed_status;
     for index in 0..12 {
         let started = Instant::now();
         let response = send_json(
@@ -2490,37 +2497,13 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         last_status = json_resource_content(result, "codestory://status");
     }
 
-    assert_stale_freshness_counts(&last_status, "codestory://status");
-    assert_eq!(
-        last_status["local_refresh"]["state"],
-        json!("stale"),
-        "stale local graph state should be compactly exposed: {last_status}"
-    );
-    assert_eq!(
-        last_status["local_refresh"]["blocks_local_surfaces"],
-        json!(true),
-        "stale local graph state should block only local graph surfaces: {last_status}"
-    );
-    assert_eq!(
-        last_status["allowed_surfaces"]["ground"]["allowed"],
-        json!(false),
-        "stale local graph should block local graph surfaces: {last_status}"
-    );
-    assert_eq!(
-        last_status["allowed_surfaces"]["packet"]["status"],
-        json!("repair_retrieval"),
-        "packet/search should stay gated by the agent retrieval lane while local graph is stale: {last_status}"
-    );
-    let status_next_call_text = last_status["recommended_next_calls"].to_string();
+    assert_fresh_freshness_counts(&last_status, "cached codestory://status after refresh");
     assert!(
-        !status_next_call_text.contains("\"tool\":\"packet\"")
-            && !status_next_call_text.contains("\"tool\":\"search\""),
-        "stale index readiness should recommend repair, not packet/search calls: {last_status}"
-    );
-    assert!(
-        status_next_call_text.contains("codestory-cli ready --goal local --repair")
-            && status_next_call_text.contains("codestory://status"),
-        "stale index readiness should recommend index repair and a status recheck: {last_status}"
+        matches!(
+            last_status["local_refresh"]["reason"].as_str(),
+            Some("refreshed" | "already_fresh")
+        ),
+        "status should stay fresh without stale cache masking after the bounded refresh: {last_status}"
     );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];

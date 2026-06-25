@@ -2029,7 +2029,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn wait_for_local_freshness(
+pub(crate) fn wait_for_local_freshness(
     project: &ProjectArgs,
     inspect_runtime: &RuntimeContext,
 ) -> Result<(ProjectSummary, Option<readiness::LocalRefreshOutput>)> {
