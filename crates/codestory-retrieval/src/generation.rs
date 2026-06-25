@@ -218,7 +218,7 @@ fn sidecar_stored_embedding_is_product_compatible(doc: &LlmSymbolDoc) -> bool {
             .as_deref()
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("onnx" | "llamacpp" | "llama_cpp")
+        Some("llamacpp" | "llama_cpp" | "llama.cpp" | "llama-cpp")
     )
 }
 

@@ -1348,7 +1348,7 @@ mod tests {
             updated_at_epoch_ms: 123,
         };
 
-        assert!(qdrant_semantic_doc_row(&doc(
+        assert!(!qdrant_semantic_doc_row(&doc(
             NodeKind::FUNCTION,
             Some("onnx"),
             768

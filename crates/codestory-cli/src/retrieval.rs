@@ -160,6 +160,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
+    prepare_retrieval_index_sidecar_env(&sidecar);
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     ensure_retrieval_index_embedding_policy(&sidecar)?;
@@ -189,6 +190,10 @@ fn prepare_retrieval_index_embedding_env(profile: CliSidecarProfile) {
     if matches!(profile, CliSidecarProfile::Agent) {
         crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
     }
+}
+
+fn prepare_retrieval_index_sidecar_env(sidecar: &SidecarRuntimeConfig) {
+    sidecar.activate_embed_url_default();
 }
 
 pub(crate) fn activate_retrieval_profile_env(
@@ -792,6 +797,26 @@ mod tests {
         prepare_retrieval_index_embedding_env(CliSidecarProfile::Local);
 
         assert!(std::env::var("CODESTORY_EMBED_BACKEND").is_err());
+    }
+
+    #[test]
+    fn retrieval_index_activates_selected_sidecar_embed_url_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
+        let project = tempfile::TempDir::new().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some("packet-search-eval"),
+        );
+        let expected = codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
+
+        prepare_retrieval_index_sidecar_env(&sidecar);
+
+        assert_eq!(
+            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").as_deref(),
+            Ok(expected.as_str())
+        );
     }
 
     #[test]
