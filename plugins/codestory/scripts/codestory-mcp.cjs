@@ -14,6 +14,7 @@ const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codesto
 const fallbackBinaryNames = process.platform === 'win32'
   ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
   : ['codestory-cli'];
+const sharedAgentRunId = 'shared-agent';
 
 function readJson(file) {
   try {
@@ -121,7 +122,7 @@ function handleSidecarPolicyCommand(argv) {
 }
 
 function repairCommandForProject(projectRoot = process.cwd()) {
-  return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json`;
+  return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
 
 function dirtyMarkerEnv(projectRoot = process.cwd()) {

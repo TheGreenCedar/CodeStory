@@ -7,6 +7,7 @@ use std::process::Command;
 
 const FIXTURE_FILE: &str = "production_packet_search_fixtures.json";
 const BASELINE_FILE: &str = "production_packet_search_baseline.json";
+const LIVE_EVAL_RUN_ID: &str = "packet-search-eval";
 
 #[derive(Debug, Deserialize)]
 struct FixtureSet {
@@ -545,15 +546,41 @@ fn packet_search_eval_reads_production_search_hit_fields() {
 }
 
 #[test]
+fn packet_search_live_eval_uses_fixed_run_id() {
+    assert_ne!(LIVE_EVAL_RUN_ID, "shared-agent");
+    assert_eq!(
+        live_eval_ready_args(),
+        [
+            "ready",
+            "--goal",
+            "agent",
+            "--repair",
+            "--run-id",
+            LIVE_EVAL_RUN_ID,
+            "--format",
+            "json"
+        ]
+    );
+    assert_eq!(
+        live_eval_status_args(),
+        [
+            "retrieval",
+            "status",
+            "--run-id",
+            LIVE_EVAL_RUN_ID,
+            "--format",
+            "json"
+        ]
+    );
+}
+
+#[test]
 #[ignore = "live production packet/search eval; requires retrieval_mode=full sidecars for this checkout"]
 fn packet_search_eval_live_runs_production_cli_path() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     let project = repo_root();
-    let readiness = run_cli(
-        &project,
-        &["ready", "--goal", "agent", "--repair", "--format", "json"],
-    );
+    let readiness = run_cli(&project, &live_eval_ready_args());
     assert!(
         readiness.status.success(),
         "agent readiness failed: {}",
@@ -563,7 +590,7 @@ fn packet_search_eval_live_runs_production_cli_path() {
         serde_json::from_slice(&readiness.stdout).expect("parse readiness json");
     let readiness_mode = readiness_mode(&readiness_json);
 
-    let status = run_cli(&project, &["retrieval", "status", "--format", "json"]);
+    let status = run_cli(&project, &live_eval_status_args());
     assert!(
         status.status.success(),
         "retrieval status failed: {}",
@@ -661,6 +688,30 @@ fn packet_search_eval_live_runs_production_cli_path() {
         report.overall.anchor_before_budget,
         report.categories
     );
+}
+
+fn live_eval_ready_args() -> [&'static str; 8] {
+    [
+        "ready",
+        "--goal",
+        "agent",
+        "--repair",
+        "--run-id",
+        LIVE_EVAL_RUN_ID,
+        "--format",
+        "json",
+    ]
+}
+
+fn live_eval_status_args() -> [&'static str; 6] {
+    [
+        "retrieval",
+        "status",
+        "--run-id",
+        LIVE_EVAL_RUN_ID,
+        "--format",
+        "json",
+    ]
 }
 
 fn run_cli(project: &Path, args: &[&str]) -> std::process::Output {
