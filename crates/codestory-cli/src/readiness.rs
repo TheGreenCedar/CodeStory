@@ -33,6 +33,7 @@ pub(crate) struct ReadinessSidecarInput<'a> {
     pub(crate) degraded_reason: Option<&'a str>,
     pub(crate) embedding_device_policy: Option<&'a str>,
     pub(crate) embedding_device_state: Option<&'a str>,
+    pub(crate) embedding_device_observation_source: Option<&'a str>,
     pub(crate) embedding_detected_provider: Option<&'a str>,
     pub(crate) embedding_detected_gpu: Option<&'a str>,
     pub(crate) embedding_accelerator_requested: bool,
@@ -342,7 +343,11 @@ fn verdict_state(
                             )
                         })
                         .unwrap_or_default();
-                    format!(" embedding_device_policy=`{policy}` observed_device=`{state}`{detected}{request}.")
+                    let source = sidecar
+                        .embedding_device_observation_source
+                        .map(|source| format!(" observation_source=`{source}`"))
+                        .unwrap_or_default();
+                    format!(" embedding_device_policy=`{policy}` observed_device=`{state}`{source}{detected}{request}.")
                 })
                 .unwrap_or_default();
             let full_repair = agent_packet_search_repair_commands(project_arg, sidecar_run_id);
@@ -496,6 +501,9 @@ fn readiness_sidecar_snapshot(input: ReadinessSidecarInput<'_>) -> ReadinessSide
         degraded_reason: input.degraded_reason.map(ToOwned::to_owned),
         embedding_device_policy: input.embedding_device_policy.map(ToOwned::to_owned),
         embedding_device_state: input.embedding_device_state.map(ToOwned::to_owned),
+        embedding_device_observation_source: input
+            .embedding_device_observation_source
+            .map(ToOwned::to_owned),
         embedding_detected_provider: input.embedding_detected_provider.map(ToOwned::to_owned),
         embedding_detected_gpu: input.embedding_detected_gpu.map(ToOwned::to_owned),
         embedding_accelerator_requested: input.embedding_accelerator_requested,
@@ -607,6 +615,7 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("accelerated"),
+                embedding_device_observation_source: Some("manual_env"),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,
@@ -664,6 +673,7 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("accelerated"),
+                embedding_device_observation_source: Some("manual_env"),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,
@@ -715,6 +725,7 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("accelerated"),
+                embedding_device_observation_source: Some("manual_env"),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,
@@ -827,6 +838,7 @@ mod tests {
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("accelerated"),
+                    embedding_device_observation_source: Some("manual_env"),
                     embedding_detected_provider: None,
                     embedding_detected_gpu: None,
                     embedding_accelerator_requested: false,
@@ -882,6 +894,7 @@ mod tests {
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("accelerated"),
+                    embedding_device_observation_source: Some("manual_env"),
                     embedding_detected_provider: None,
                     embedding_detected_gpu: None,
                     embedding_accelerator_requested: false,
@@ -912,6 +925,7 @@ mod tests {
                     degraded_reason: Some("semantic store unavailable"),
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("unknown"),
+                    embedding_device_observation_source: Some("sidecar_unobserved"),
                     embedding_detected_provider: None,
                     embedding_detected_gpu: None,
                     embedding_accelerator_requested: false,
@@ -937,6 +951,12 @@ mod tests {
                 .summary
                 .contains("embedding_device_policy=`accelerator_required`"),
             "blocked full retrieval should expose device policy: {degraded:?}"
+        );
+        assert!(
+            degraded
+                .summary
+                .contains("observation_source=`sidecar_unobserved`"),
+            "blocked full retrieval should expose device observation source: {degraded:?}"
         );
         assert!(
             degraded
@@ -983,6 +1003,7 @@ mod tests {
                 degraded_reason: Some("manifest:<missing>"),
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("unknown"),
+                embedding_device_observation_source: Some("sidecar_unobserved"),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,
@@ -1023,6 +1044,7 @@ mod tests {
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("unknown"),
+                    embedding_device_observation_source: Some("sidecar_unobserved"),
                     embedding_detected_provider: None,
                     embedding_detected_gpu: None,
                     embedding_accelerator_requested: false,

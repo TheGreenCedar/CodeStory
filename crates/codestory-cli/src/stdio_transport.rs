@@ -1274,6 +1274,7 @@ fn stdio_mandatory_sidecar_fingerprint(
             degraded_reason: report.degraded_reason,
             embedding_device_policy: report.embedding_device_policy,
             embedding_device_state: report.embedding_device_state,
+            embedding_device_observation_source: report.embedding_device_observation_source,
             embedding_detected_provider: report.embedding_detected_provider,
             embedding_detected_gpu: report.embedding_detected_gpu,
             embedding_accelerator_requested: report.embedding_accelerator_requested,
@@ -1295,6 +1296,7 @@ struct StdioSidecarStatusFingerprint {
     degraded_reason: Option<String>,
     embedding_device_policy: String,
     embedding_device_state: String,
+    embedding_device_observation_source: String,
     embedding_detected_provider: Option<String>,
     embedding_detected_gpu: Option<String>,
     embedding_accelerator_requested: bool,
@@ -1331,6 +1333,10 @@ fn stdio_mandatory_sidecar_fingerprint_from_status(
             parts.push(format!(
                 "embedding_device_state:{}",
                 report.embedding_device_state
+            ));
+            parts.push(format!(
+                "embedding_device_observation_source:{}",
+                report.embedding_device_observation_source
             ));
             parts.push(format!(
                 "embedding_detected_provider:{}",
@@ -2472,6 +2478,7 @@ fn read_stdio_status_resource(
         degraded_reason,
         embedding_device_policy,
         embedding_device_state,
+        embedding_device_observation_source,
         embedding_detected_provider,
         embedding_detected_gpu,
         embedding_accelerator_requested,
@@ -2500,6 +2507,7 @@ fn read_stdio_status_resource(
                 report.degraded_reason,
                 report.embedding_device_policy,
                 report.embedding_device_state,
+                report.embedding_device_observation_source,
                 report.embedding_detected_provider,
                 report.embedding_detected_gpu,
                 report.embedding_accelerator_requested,
@@ -2516,6 +2524,7 @@ fn read_stdio_status_resource(
             Some(format!("sidecar_status_error: {error}")),
             "accelerator_required".to_string(),
             "unknown".to_string(),
+            "sidecar_unobserved".to_string(),
             None,
             None,
             false,
@@ -2532,6 +2541,7 @@ fn read_stdio_status_resource(
         "degraded_reason": degraded_reason.clone(),
         "embedding_device_policy": embedding_device_policy.clone(),
         "embedding_device_state": embedding_device_state.clone(),
+        "embedding_device_observation_source": embedding_device_observation_source.clone(),
         "embedding_detected_provider": embedding_detected_provider.clone(),
         "embedding_detected_gpu": embedding_detected_gpu.clone(),
         "embedding_accelerator_requested": embedding_accelerator_requested,
@@ -2563,6 +2573,7 @@ fn read_stdio_status_resource(
             degraded_reason: degraded_reason.as_deref(),
             embedding_device_policy: Some(&embedding_device_policy),
             embedding_device_state: Some(&embedding_device_state),
+            embedding_device_observation_source: Some(&embedding_device_observation_source),
             embedding_detected_provider: embedding_detected_provider.as_deref(),
             embedding_detected_gpu: embedding_detected_gpu.as_deref(),
             embedding_accelerator_requested,
@@ -2622,6 +2633,7 @@ fn read_stdio_status_resource(
         "degraded_reason": degraded_reason,
         "embedding_device_policy": embedding_device_policy,
         "embedding_device_state": embedding_device_state,
+        "embedding_device_observation_source": embedding_device_observation_source,
         "embedding_detected_provider": embedding_detected_provider,
         "embedding_detected_gpu": embedding_detected_gpu,
         "embedding_accelerator_requested": embedding_accelerator_requested,
@@ -3871,6 +3883,7 @@ version = "0.11.20"
                     degraded_reason: None,
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("accelerated"),
+                    embedding_device_observation_source: Some("manual_env"),
                     embedding_detected_provider: None,
                     embedding_detected_gpu: None,
                     embedding_accelerator_requested: false,
@@ -4188,6 +4201,7 @@ version = "0.11.20"
                 degraded_reason: None,
                 embedding_device_policy: "accelerator_required".into(),
                 embedding_device_state: "accelerated".into(),
+                embedding_device_observation_source: "manual_env".into(),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,
@@ -4222,6 +4236,7 @@ version = "0.11.20"
                 ),
                 embedding_device_policy: "accelerator_required".into(),
                 embedding_device_state: "accelerated".into(),
+                embedding_device_observation_source: "manual_env".into(),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,

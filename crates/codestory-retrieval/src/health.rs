@@ -92,6 +92,7 @@ pub struct RetrievalStatusReport {
     pub stored_doc_vector_mixed_backends: Option<bool>,
     pub embedding_device_policy: String,
     pub embedding_device_state: String,
+    pub embedding_device_observation_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_detected_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +309,7 @@ pub struct InfrastructureHealth {
     pub embed_reachable: bool,
     pub embedding_device_policy: String,
     pub embedding_device_state: String,
+    pub embedding_device_observation_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_detected_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,6 +362,7 @@ pub fn unavailable_status_report(
         stored_doc_vector_mixed_backends: None,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_device_observation_source: embedding_device.observation_source.into(),
         embedding_detected_provider: embedding_device.detected_provider,
         embedding_detected_gpu: embedding_device.detected_gpu,
         embedding_accelerator_requested: embedding_device.accelerator_requested,
@@ -387,6 +390,7 @@ pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHeal
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_device_observation_source: embedding_device.observation_source.into(),
         embedding_detected_provider: embedding_device.detected_provider,
         embedding_detected_gpu: embedding_device.detected_gpu,
         embedding_accelerator_requested: embedding_device.accelerator_requested,
@@ -659,6 +663,7 @@ pub fn probe_sidecar_health(
         stored_doc_vector_mixed_backends: None,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_device_observation_source: embedding_device.observation_source.into(),
         embedding_detected_provider: embedding_device.detected_provider,
         embedding_detected_gpu: embedding_device.detected_gpu,
         embedding_accelerator_requested: embedding_device.accelerator_requested,
@@ -819,6 +824,7 @@ mod tests {
         let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "unknown",
+            observation_source: "sidecar_unobserved",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,
@@ -842,6 +848,7 @@ mod tests {
         let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "cpu_allowed",
             observed_state: "cpu",
+            observation_source: "cpu_policy",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,
@@ -912,6 +919,7 @@ mod tests {
             stored_doc_vector_mixed_backends: None,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
+            embedding_device_observation_source: "manual_env".into(),
             embedding_detected_provider: None,
             embedding_detected_gpu: None,
             embedding_accelerator_requested: false,

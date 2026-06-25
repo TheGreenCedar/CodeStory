@@ -55,6 +55,7 @@ pub struct EmbeddingRuntimeProbe {
 pub struct EmbeddingDeviceReadiness {
     pub requested_policy: &'static str,
     pub observed_state: &'static str,
+    pub observation_source: &'static str,
     pub detected_provider: Option<String>,
     pub detected_gpu: Option<String>,
     pub accelerator_requested: bool,
@@ -110,7 +111,9 @@ pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
     } else {
         embedding_accelerator_request_for_detection(detection.as_ref())
     };
-    let observed_state = observed_embedding_device_state();
+    let accelerator_requested = accelerator_request.is_some();
+    let observation = observed_embedding_device_state(cpu_allowed, accelerator_requested);
+    let observed_state = observation.state;
     let accelerated = observed_state == "accelerated";
     let full_retrieval_allowed = accelerated || cpu_allowed;
     let requested_policy = if cpu_allowed {
@@ -119,15 +122,21 @@ pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
         "accelerator_required"
     };
     let degraded_reason = (!full_retrieval_allowed).then(|| {
-        format!("embedding_device_unverified: requested_policy={requested_policy} observed_device={observed_state}; set {ALLOW_CPU_ENV}=1 or {DEVICE_POLICY_ENV}=allow_cpu for intentional CPU-backed retrieval")
+        let request_note = if accelerator_requested {
+            " host accelerator was detected/requested, but the embedding sidecar did not prove accelerator execution;"
+        } else {
+            ""
+        };
+        format!("embedding_device_unverified: requested_policy={requested_policy} observed_device={observed_state} observation_source={};{request_note} set {ALLOW_CPU_ENV}=1 or {DEVICE_POLICY_ENV}=allow_cpu for intentional CPU-backed retrieval", observation.source)
     });
 
     EmbeddingDeviceReadiness {
         requested_policy,
         observed_state,
+        observation_source: observation.source,
         detected_provider: detection.as_ref().map(|gpu| gpu.provider.clone()),
         detected_gpu: detection.map(|gpu| gpu.name),
-        accelerator_requested: accelerator_request.is_some(),
+        accelerator_requested,
         accelerator_request_provider: accelerator_request.as_ref().map(|_| "vulkan".to_string()),
         accelerator_request_device: accelerator_request
             .as_ref()
@@ -169,15 +178,46 @@ fn explicit_cpu_allowed() -> bool {
             .unwrap_or(false)
 }
 
-fn observed_embedding_device_state() -> &'static str {
-    match std::env::var(DEVICE_STATE_ENV)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmbeddingDeviceObservation {
+    state: &'static str,
+    source: &'static str,
+}
+
+fn observed_embedding_device_state(
+    cpu_allowed: bool,
+    accelerator_requested: bool,
+) -> EmbeddingDeviceObservation {
+    if let Some(state) = std::env::var(DEVICE_STATE_ENV)
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
+        .and_then(|value| match value.as_str() {
+            "accelerated" | "gpu" | "vulkan" | "cuda" | "metal" => Some("accelerated"),
+            "cpu" => Some("cpu"),
+            "unknown" => Some("unknown"),
+            _ => None,
+        })
     {
-        Some("accelerated" | "gpu" | "vulkan" | "cuda" | "metal") => "accelerated",
-        Some("cpu") => "cpu",
-        _ => "unknown",
+        return EmbeddingDeviceObservation {
+            state,
+            source: "manual_env",
+        };
+    }
+    if cpu_allowed {
+        return EmbeddingDeviceObservation {
+            state: "cpu",
+            source: "cpu_policy",
+        };
+    }
+    if accelerator_requested {
+        return EmbeddingDeviceObservation {
+            state: "unknown",
+            source: "accelerator_request_unobserved",
+        };
+    }
+    EmbeddingDeviceObservation {
+        state: "unknown",
+        source: "sidecar_unobserved",
     }
 }
 
@@ -669,6 +709,7 @@ mod tests {
 
         assert_eq!(readiness.requested_policy, "accelerator_required");
         assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.observation_source, "sidecar_unobserved");
         assert_eq!(readiness.detected_provider, None);
         assert_eq!(readiness.detected_gpu, None);
         assert!(!readiness.accelerator_requested);
@@ -694,6 +735,7 @@ mod tests {
 
         assert_eq!(readiness.requested_policy, "cpu_allowed");
         assert_eq!(readiness.observed_state, "cpu");
+        assert_eq!(readiness.observation_source, "manual_env");
         assert!(readiness.cpu_allowed);
         assert!(!readiness.accelerator_requested);
         assert!(embedding_accelerator_request().is_none());
@@ -738,6 +780,10 @@ mod tests {
 
         assert_eq!(readiness.requested_policy, "accelerator_required");
         assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(
+            readiness.observation_source,
+            "accelerator_request_unobserved"
+        );
         assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
         assert_eq!(
             readiness.detected_gpu.as_deref(),
@@ -754,6 +800,13 @@ mod tests {
         );
         assert!(!readiness.cpu_allowed);
         assert!(!readiness.full_retrieval_allowed);
+        assert!(
+            readiness
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sidecar did not prove accelerator execution")
+        );
         assert_eq!(request.device, "Vulkan0");
         assert_eq!(request.n_gpu_layers, "99");
     }
@@ -772,7 +825,42 @@ mod tests {
 
         assert_eq!(readiness.requested_policy, "accelerator_required");
         assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.observation_source, "manual_env");
         assert!(!readiness.full_retrieval_allowed);
+    }
+
+    #[test]
+    fn explicit_accelerated_device_allows_retrieval_with_manual_observation_source() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "vulkan");
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.observation_source, "manual_env");
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn cpu_policy_without_device_state_reports_cpu_policy_source() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "cpu_allowed");
+        assert_eq!(readiness.observed_state, "cpu");
+        assert_eq!(readiness.observation_source, "cpu_policy");
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct SidecarStateFile {
     pub embedding_device_policy: String,
     #[serde(default = "default_embedding_device_state")]
     pub embedding_device_state: String,
+    #[serde(default = "default_embedding_device_observation_source")]
+    pub embedding_device_observation_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_detected_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +94,7 @@ pub fn sidecar_up_with_runtime(
         embed_url: SidecarLayout::embed_base_url(runtime.embed_http_port),
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_device_observation_source: embedding_device.observation_source.into(),
         embedding_detected_provider: embedding_device.detected_provider,
         embedding_detected_gpu: embedding_device.detected_gpu,
         embedding_accelerator_requested: embedding_device.accelerator_requested,
@@ -459,6 +462,10 @@ fn default_embedding_device_policy() -> String {
 
 fn default_embedding_device_state() -> String {
     "unknown".into()
+}
+
+fn default_embedding_device_observation_source() -> String {
+    "sidecar_unobserved".into()
 }
 
 #[cfg(test)]
