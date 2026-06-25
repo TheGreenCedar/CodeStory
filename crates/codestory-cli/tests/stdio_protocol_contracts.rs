@@ -2030,6 +2030,25 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         json!("direct_cli_launch"),
         "direct cargo stdio tests should label the non-plugin launch boundary: {status}"
     );
+    assert_eq!(
+        status["runtime_truth"]["runtime_source"],
+        json!("direct_cli_launch"),
+        "runtime truth should group the launch source classification: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["launcher_source"], status["plugin_runtime"]["cli_source"],
+        "runtime truth should reuse plugin runtime launch evidence: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_policy"],
+        json!("unmanaged"),
+        "direct stdio status should make unmanaged sidecar policy explicit: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_status"]["mode"],
+        status["sidecar_retrieval"]["retrieval_mode"],
+        "runtime truth should reuse sidecar retrieval mode: {status}"
+    );
     assert!(
         status
             .get("project_root")
@@ -2137,6 +2156,21 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .as_str()
             .is_some_and(|command| command.contains("ready --goal agent --repair")),
         "agent lane should expose the agent-scoped next command: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["local_graph"]["status"],
+        json!("ready"),
+        "runtime truth should include the local graph readiness lane: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["local_graph"]["refresh_state"],
+        json!("fresh"),
+        "runtime truth should include local refresh state: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
+        json!("repair_retrieval"),
+        "runtime truth should include the agent packet/search readiness lane: {status}"
     );
     for surface in [
         "ground",

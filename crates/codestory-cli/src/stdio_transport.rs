@@ -2213,11 +2213,25 @@ fn read_stdio_status_resource(
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness);
+    let readiness_lanes_json =
+        serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
     let local = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
         .expect("local_navigation readiness verdict");
+    let local_refresh_status =
+        local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(local));
+    let local_refresh_json =
+        serde_json::to_value(&local_refresh_status).expect("serialize local refresh");
+    let runtime_truth = stdio_runtime_truth_status(
+        &plugin_runtime,
+        &sidecar_setup,
+        &sidecar,
+        &readiness_lanes_json,
+        local,
+        &local_refresh_json,
+    );
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -2227,6 +2241,7 @@ fn read_stdio_status_resource(
         "path_candidates": path_candidates,
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "plugin_runtime": plugin_runtime,
+        "runtime_truth": runtime_truth,
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
             "message": "A running MCP server keeps using the CLI process it was launched with; install, override, or PATH changes require a host reload/restart and a fresh codestory://status readback."
@@ -2248,12 +2263,99 @@ fn read_stdio_status_resource(
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
-        "local_refresh": local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(local)),
+        "local_refresh": local_refresh_json,
         "readiness": readiness,
-        "readiness_lanes": readiness_lanes,
+        "readiness_lanes": readiness_lanes_json,
         "allowed_surfaces": allowed_surfaces,
         "recommended_next_calls": recommended_next_calls
     }))
+}
+
+fn stdio_runtime_truth_status(
+    plugin_runtime: &serde_json::Value,
+    sidecar_setup: &serde_json::Value,
+    sidecar: &serde_json::Value,
+    readiness_lanes: &serde_json::Value,
+    local: &ReadinessVerdictDto,
+    local_refresh: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "runtime_source": plugin_runtime
+            .get("cli_source")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unavailable")),
+        "plugin_root": plugin_runtime.get("plugin_root").cloned().unwrap_or(serde_json::Value::Null),
+        "managed_cli_path": plugin_runtime
+            .get("managed_binary_path")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "launcher_source": plugin_runtime
+            .get("cli_source")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unavailable")),
+        "sidecar_policy": sidecar_setup
+            .get("state")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unavailable")),
+        "sidecar_status": {
+            "profile": readiness_lanes
+                .pointer("/agent_packet_search/profile")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unavailable")),
+            "run_id": readiness_lanes
+                .pointer("/agent_packet_search/run_id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unavailable")),
+            "mode": sidecar
+                .get("retrieval_mode")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("unavailable")),
+            "degraded_reason": sidecar
+                .get("degraded_reason")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        },
+        "readiness_lanes": {
+            "local_graph": {
+                "status": local.status,
+                "refresh_state": local_refresh
+                    .get("state")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!("unavailable")),
+                "blocks_local_surfaces": local_refresh
+                    .get("blocks_local_surfaces")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            },
+            "local_default": readiness_lanes
+                .pointer("/local_default")
+                .map(stdio_runtime_truth_sidecar_lane)
+                .unwrap_or(serde_json::Value::Null),
+            "agent_packet_search": readiness_lanes
+                .pointer("/agent_packet_search")
+                .map(stdio_runtime_truth_sidecar_lane)
+                .unwrap_or(serde_json::Value::Null),
+        }
+    })
+}
+
+fn stdio_runtime_truth_sidecar_lane(lane: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "status": lane
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unavailable")),
+        "profile": lane
+            .get("profile")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unavailable")),
+        "run_id": lane.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "sidecar_mode": lane
+            .get("sidecar_mode")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unavailable")),
+        "degraded_reason": lane.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
+    })
 }
 
 fn stdio_setup_repair_input(

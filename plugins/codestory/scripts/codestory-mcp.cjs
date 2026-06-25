@@ -123,6 +123,42 @@ function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
+function runtimeTruthStatus(plugin, repair, options = {}) {
+  return {
+    runtime_source: plugin.cli_source || 'unavailable',
+    plugin_root: plugin.plugin_root || null,
+    managed_cli_path: plugin.managed_binary_path || null,
+    launcher_source: plugin.cli_source || 'unavailable',
+    sidecar_policy: options.sidecarPolicy || 'unavailable',
+    sidecar_status: {
+      profile: 'agent',
+      run_id: 'unavailable',
+      mode: 'unavailable',
+      degraded_reason: options.degradedReason || repair.repair_reason || null,
+    },
+    readiness_lanes: {
+      local_graph: {
+        status: repair.status || 'unavailable',
+        refresh_state: options.localRefresh?.state || 'unavailable',
+        blocks_local_surfaces: options.localRefresh?.blocks_local_surfaces ?? null,
+      },
+      local_default: {
+        status: 'unavailable',
+        profile: 'local',
+        sidecar_mode: 'unavailable',
+        degraded_reason: 'unavailable',
+      },
+      agent_packet_search: {
+        status: 'unavailable',
+        profile: 'agent',
+        run_id: 'unavailable',
+        sidecar_mode: 'unavailable',
+        degraded_reason: options.degradedReason || repair.repair_reason || null,
+      },
+    },
+  };
+}
+
 function resolveManifest(manifestPath) {
   const manifest = readJson(manifestPath);
   if (!manifest) return null;
@@ -539,6 +575,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   ];
   const fullRepair = options.fullRepair || minimumNext;
   const recommendedNext = options.recommendedNext || fullRepair;
+  const sidecarPolicy = readSidecarPolicy();
   const plugin = {
     plugin_version: resolved.version,
     plugin_root: pluginRoot,
@@ -615,6 +652,11 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     path_candidates: pathCandidates,
     sidecar_contract_version: null,
     plugin_runtime: plugin,
+    runtime_truth: runtimeTruthStatus(plugin, repair, {
+      sidecarPolicy: sidecarPolicy.state || 'unavailable',
+      localRefresh: options.localRefresh || null,
+      degradedReason: reason,
+    }),
     runtime_boundary: {
       restart_required_for_runtime_change: true,
       message: 'A running MCP server keeps using the CLI process it was launched with; plugin refresh, managed runtime provisioning, CODESTORY_CLI, or PATH changes require a host reload/restart and fresh codestory://status readback.',
