@@ -12,6 +12,8 @@ const BASELINE_FILE: &str = "production_packet_search_baseline.json";
 struct FixtureSet {
     schema_version: u32,
     fixtures: Vec<EvalFixture>,
+    #[serde(default)]
+    diagnostic_fixtures: Vec<EvalFixture>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -351,6 +353,15 @@ fn packet_search_eval_fixture_schema_is_owner_directed_and_complete() {
             "baseline missing category {category}"
         );
     }
+    let diagnostic_ids = fixtures
+        .diagnostic_fixtures
+        .iter()
+        .map(|fixture| fixture.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        diagnostic_ids.contains("readiness-boundary-broad-query-diagnostic"),
+        "broad readiness query diagnostic fixture must stay visible"
+    );
 }
 
 #[test]
@@ -366,8 +377,32 @@ fn packet_search_eval_readiness_fixture_uses_exact_symbol_search_anchor() {
         fixture
             .query
             .as_deref()
-            .is_some_and(|query| query.contains("LiveSidecarSearch::qdrant_search")),
+            .is_some_and(|query| query == "LiveSidecarSearch::qdrant_search"),
         "readiness fixture search query must preserve the exact symbol anchor"
+    );
+}
+
+#[test]
+fn packet_search_eval_preserves_broad_readiness_query_diagnostic() {
+    let fixtures = load_fixture_set();
+    let fixture = fixtures
+        .diagnostic_fixtures
+        .iter()
+        .find(|fixture| fixture.id == "readiness-boundary-broad-query-diagnostic")
+        .expect("readiness broad-query diagnostic fixture");
+
+    assert_eq!(
+        fixture.query.as_deref(),
+        Some("LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable")
+    );
+    assert_eq!(fixture.provenance.issue, "#569");
+    assert!(
+        fixture
+            .expected
+            .symbols
+            .iter()
+            .any(|symbol| symbol == "LiveSidecarSearch::qdrant_search"),
+        "broad diagnostic must keep the missed symbol visible"
     );
 }
 
@@ -405,7 +440,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             ],
             ranked_symbols: vec![
                 "append_search_evidence_packet".to_string(),
-                "evidence_candidate_from_hit".to_string(),
+                "decorate_search_hit_evidence".to_string(),
             ],
             packet_text: "decorate_search_hit_evidence uses evidence_candidate_from_hit"
                 .to_string(),
