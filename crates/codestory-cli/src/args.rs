@@ -1566,6 +1566,16 @@ pub(crate) struct AgentPreflightLaneOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_device_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_gpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_requested: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_cpu_allowed: Option<bool>,
 }
 
@@ -2387,6 +2397,15 @@ pub(crate) struct DoctorSidecarStatusOutput {
     pub(crate) degraded_reason: Option<String>,
     pub(crate) embedding_device_policy: String,
     pub(crate) embedding_device_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_gpu: Option<String>,
+    pub(crate) embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_device: Option<String>,
     pub(crate) embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_generation: Option<String>,

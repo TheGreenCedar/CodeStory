@@ -362,6 +362,16 @@ pub struct ReadinessSidecarSnapshotDto {
     #[serde(default)]
     pub embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_gpu: Option<String>,
+    #[serde(default)]
+    pub embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_input_hash: Option<String>,

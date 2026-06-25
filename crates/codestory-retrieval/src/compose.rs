@@ -240,6 +240,7 @@ fn docker_compose_up(
         );
     }
     remove_container_if_present("codestory-zoekt-stub")?;
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     command
         .arg("compose")
         .arg("-p")
@@ -275,10 +276,33 @@ fn docker_compose_up(
             "CODESTORY_EMBED_LLAMACPP_URL",
             SidecarLayout::embed_base_url(runtime.embed_http_port),
         )
+        .env(
+            "CODESTORY_EMBED_DEVICE_STATE",
+            embedding_device.observed_state,
+        )
         .env("CODESTORY_SIDECAR_NAMESPACE", &runtime.namespace)
         .env("CODESTORY_SIDECAR_PROFILE", runtime.profile.as_str())
         .env("CODESTORY_SIDECAR_OWNER", "codestory")
         .env("COMPOSE_PROFILES", compose_profile);
+    if let Some(provider) = embedding_device.detected_provider.as_deref() {
+        command.env("CODESTORY_EMBED_DEVICE_PROVIDER", provider);
+    }
+    if let Some(gpu) = embedding_device.detected_gpu.as_deref() {
+        command.env("CODESTORY_EMBED_DEVICE_NAME", gpu);
+    }
+    if let Some(request) = crate::embeddings::embedding_accelerator_request() {
+        let device = request.device;
+        let n_gpu_layers = request.n_gpu_layers;
+        command
+            .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
+            .env("CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS", &n_gpu_layers)
+            .env("LLAMA_ARG_DEVICE", device)
+            .env("LLAMA_ARG_N_GPU_LAYERS", n_gpu_layers);
+    } else {
+        command
+            .env_remove("LLAMA_ARG_DEVICE")
+            .env_remove("LLAMA_ARG_N_GPU_LAYERS");
+    }
 
     let output = command.output().context("spawn docker compose")?;
     if !output.status.success() {
@@ -621,6 +645,14 @@ mod tests {
         let contents = std::fs::read_to_string(path).expect("read bundled compose");
         assert!(contents.contains("name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}"));
         assert!(contents.contains("qdrant/qdrant:v1.12.5"));
+    }
+
+    #[test]
+    fn bundled_compose_keeps_llamacpp_device_env_request_only() {
+        assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_DEVICE"));
+        assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_N_GPU_LAYERS"));
+        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("LLAMA_ARG_DEVICE:"));
+        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains(":-none"));
     }
 
     #[test]

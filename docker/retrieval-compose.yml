@@ -58,6 +58,9 @@ services:
         source: ${CODESTORY_EMBED_MODEL_DIR:?set CODESTORY_EMBED_MODEL_DIR}
         target: /models
         read_only: true
+    environment:
+      - LLAMA_ARG_DEVICE
+      - LLAMA_ARG_N_GPU_LAYERS
     command:
       - --embeddings
       - --host

@@ -92,6 +92,16 @@ pub struct RetrievalStatusReport {
     pub stored_doc_vector_mixed_backends: Option<bool>,
     pub embedding_device_policy: String,
     pub embedding_device_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_gpu: Option<String>,
+    #[serde(default)]
+    pub embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
     pub zoekt: ComponentHealth,
     pub qdrant: ComponentHealth,
@@ -298,6 +308,16 @@ pub struct InfrastructureHealth {
     pub embed_reachable: bool,
     pub embedding_device_policy: String,
     pub embedding_device_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_gpu: Option<String>,
+    #[serde(default)]
+    pub embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
     pub zoekt_detail: String,
     pub qdrant_detail: String,
@@ -340,6 +360,11 @@ pub fn unavailable_status_report(
         stored_doc_vector_mixed_backends: None,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_detected_provider: embedding_device.detected_provider,
+        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_accelerator_requested: embedding_device.accelerator_requested,
+        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt: unavailable_component("zoekt", &reason),
         qdrant: unavailable_component("qdrant", &reason),
@@ -362,6 +387,11 @@ pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHeal
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_detected_provider: embedding_device.detected_provider,
+        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_accelerator_requested: embedding_device.accelerator_requested,
+        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt_detail: zoekt_probe.detail,
         qdrant_detail: qdrant_probe.detail,
@@ -629,6 +659,11 @@ pub fn probe_sidecar_health(
         stored_doc_vector_mixed_backends: None,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
+        embedding_detected_provider: embedding_device.detected_provider,
+        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_accelerator_requested: embedding_device.accelerator_requested,
+        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt,
         qdrant,
@@ -784,6 +819,11 @@ mod tests {
         let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "unknown",
+            detected_provider: None,
+            detected_gpu: None,
+            accelerator_requested: false,
+            accelerator_request_provider: None,
+            accelerator_request_device: None,
             cpu_allowed: false,
             full_retrieval_allowed: false,
             degraded_reason: Some("embedding_device_unverified".into()),
@@ -802,6 +842,11 @@ mod tests {
         let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "cpu_allowed",
             observed_state: "cpu",
+            detected_provider: None,
+            detected_gpu: None,
+            accelerator_requested: false,
+            accelerator_request_provider: None,
+            accelerator_request_device: None,
             cpu_allowed: true,
             full_retrieval_allowed: true,
             degraded_reason: None,
@@ -867,6 +912,11 @@ mod tests {
             stored_doc_vector_mixed_backends: None,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             zoekt: ComponentHealth {
                 name: "zoekt".into(),
