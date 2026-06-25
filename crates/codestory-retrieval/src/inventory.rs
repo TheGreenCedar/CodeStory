@@ -868,6 +868,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
+            embedding_launch: None,
             zoekt_data_dir: root.join("zoekt").display().to_string(),
             qdrant_data_dir: root.join("qdrant").display().to_string(),
             scip_artifacts_root: root.join("scip").display().to_string(),
