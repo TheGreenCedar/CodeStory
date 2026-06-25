@@ -8469,6 +8469,7 @@ fn run_symbol_workflow(kind: SymbolWorkflowKind, cmd: SymbolWorkflowCommand) -> 
         depth,
         max_nodes,
         kind,
+        include_tests,
     );
     let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
     let caps = SymbolWorkflowCapsOutput {
@@ -8548,7 +8549,10 @@ fn symbol_workflow_transitive_callers(
         .nodes
         .iter()
         .filter(|node| {
-            node.id != trail.focus.id && node.depth > 1 && !direct_ids.contains(&node.id.0)
+            node.id != trail.focus.id
+                && node.depth > 1
+                && !direct_ids.contains(&node.id.0)
+                && symbol_workflow_has_call_path_to_focus(trail, &node.id)
         })
         .map(symbol_workflow_node_output)
         .collect::<Vec<_>>();
@@ -8560,6 +8564,25 @@ fn symbol_workflow_transitive_callers(
     });
     callers.truncate(50);
     callers
+}
+
+fn symbol_workflow_has_call_path_to_focus(trail: &TrailContextDto, start: &NodeId) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start.clone()];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.0.clone()) {
+            continue;
+        }
+        for edge in trail.trail.edges.iter().filter(|edge| {
+            edge.kind == codestory_contracts::api::EdgeKind::CALL && edge.source == current
+        }) {
+            if edge.target == trail.focus.id {
+                return true;
+            }
+            stack.push(edge.target.clone());
+        }
+    }
+    false
 }
 
 fn symbol_workflow_node_output(
@@ -8707,13 +8730,19 @@ fn symbol_workflow_next_commands(
     depth: u32,
     max_nodes: u32,
     kind: SymbolWorkflowKind,
+    include_tests: bool,
 ) -> Vec<String> {
     let project = quote_command_path(project_root);
     let id = quote_command_value(&node_id.0);
+    let caller_scope_flag = if include_tests {
+        " --include-tests"
+    } else {
+        ""
+    };
     let mut commands = vec![
         format!("codestory-cli symbol --project {project} --id {id}"),
         format!(
-            "codestory-cli callers --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}"
+            "codestory-cli callers --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}{caller_scope_flag}"
         ),
     ];
     if let Some(path) = affected_seed {
@@ -8727,7 +8756,7 @@ fn symbol_workflow_next_commands(
         SymbolWorkflowKind::TestMap => "impact",
     };
     commands.push(format!(
-        "codestory-cli {paired} --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}"
+        "codestory-cli {paired} --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}{caller_scope_flag}"
     ));
     commands
 }
@@ -12106,11 +12135,21 @@ mod tests {
         target: &str,
         certainty: Option<&str>,
     ) -> GraphEdgeDto {
+        sample_graph_edge_with_kind(id, source, target, EdgeKind::CALL, certainty)
+    }
+
+    fn sample_graph_edge_with_kind(
+        id: &str,
+        source: &str,
+        target: &str,
+        kind: EdgeKind,
+        certainty: Option<&str>,
+    ) -> GraphEdgeDto {
         GraphEdgeDto {
             id: EdgeId(id.to_string()),
             source: NodeId(source.to_string()),
             target: NodeId(target.to_string()),
-            kind: EdgeKind::CALL,
+            kind,
             confidence: None,
             certainty: certainty.map(ToOwned::to_owned),
             callsite_identity: None,
@@ -12197,6 +12236,112 @@ mod tests {
             },
             story: None,
         }
+    }
+
+    #[test]
+    fn symbol_workflow_transitive_callers_render_only_call_paths() {
+        let focus = sample_graph_node("focus", "Focus");
+        let mut direct = sample_graph_node("direct", "DirectCaller");
+        let mut transitive = sample_graph_node("transitive", "TransitiveCaller");
+        let mut reference = sample_graph_node("reference", "ReferenceOnly");
+        direct.depth = 1;
+        transitive.depth = 2;
+        reference.depth = 2;
+        let trail = TrailContextDto {
+            focus: sample_node_details("focus", "Focus"),
+            trail: GraphResponse {
+                center_id: NodeId("focus".to_string()),
+                nodes: vec![focus, direct, transitive, reference],
+                edges: vec![
+                    sample_graph_edge("direct-focus", "direct", "focus", Some("certain")),
+                    sample_graph_edge("transitive-direct", "transitive", "direct", Some("certain")),
+                    sample_graph_edge_with_kind(
+                        "reference-direct",
+                        "reference",
+                        "direct",
+                        EdgeKind::USAGE,
+                        Some("certain"),
+                    ),
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+            story: None,
+        };
+        let symbol = codestory_contracts::api::SymbolContextDto {
+            node: sample_node_details("focus", "Focus"),
+            summary: None,
+            children: Vec::new(),
+            related_hits: Vec::new(),
+            edge_digest: Vec::new(),
+        };
+        let direct_callers = symbol_workflow_direct_callers(&trail);
+        let transitive_callers = symbol_workflow_transitive_callers(&trail, &direct_callers);
+        let output = SymbolWorkflowOutput {
+            workflow: SymbolWorkflowKind::Impact.label(),
+            project_root: "C:/repo".to_string(),
+            resolution: QueryResolutionOutput {
+                selector: QuerySelectorOutput::Id,
+                requested: "focus".to_string(),
+                file_filter: None,
+                resolved: sample_search_hit_output("focus", "Focus"),
+                alternatives: Vec::new(),
+            },
+            symbol: &symbol,
+            direct_callers,
+            transitive_callers,
+            impacted_files: Vec::new(),
+            impacted_routes: Vec::new(),
+            likely_tests: Vec::new(),
+            caps: SymbolWorkflowCapsOutput {
+                caller_depth: 3,
+                caller_max_nodes: 20,
+                affected_depth: 3,
+                impacted_symbols_cap: 200,
+                impacted_routes_cap: 100,
+                affected_seed: "none".to_string(),
+            },
+            unknowns: Vec::new(),
+            next_commands: Vec::new(),
+            affected: None,
+            trail: &trail,
+        };
+
+        let markdown = render_symbol_workflow_markdown(SymbolWorkflowKind::Impact, &output);
+
+        assert!(markdown.contains("transitive_callers:"));
+        assert!(markdown.contains("TransitiveCaller"));
+        assert!(
+            !markdown.contains("ReferenceOnly"),
+            "non-CALL depth-2 nodes must not render as transitive callers:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn symbol_workflow_next_commands_preserve_include_tests_scope() {
+        let commands = symbol_workflow_next_commands(
+            Path::new("C:/repo"),
+            &NodeId("focus".to_string()),
+            None,
+            3,
+            20,
+            SymbolWorkflowKind::Impact,
+            true,
+        );
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("callers") && command.contains("--include-tests")),
+            "callers next command should preserve include-tests scope: {commands:#?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("test-map") && command.contains("--include-tests")),
+            "paired workflow next command should preserve include-tests scope: {commands:#?}"
+        );
     }
 
     fn sample_drill_output_with_source_truth_files(paths: Vec<&str>) -> DrillOutput {
