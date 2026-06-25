@@ -57,10 +57,14 @@ pub fn execute_retrieval_query_with_cache(
         manifest,
         file_roles,
     } = load_query_context(request.project_root, request.storage_path)?;
-    let sidecars = LiveSidecarSearch::new(layout, project_id, manifest.as_ref());
+    let sidecars = Arc::new(LiveSidecarSearch::new(
+        layout,
+        project_id,
+        manifest.as_ref(),
+    ));
     let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
     let mut executor = QueryExecutor {
-        sidecars: &sidecars,
+        sidecars,
         cache,
         manifest,
         file_roles,
@@ -83,9 +87,13 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
         manifest,
         file_roles,
     } = load_query_context(request.project_root, request.storage_path)?;
-    let sidecars = LiveSidecarSearch::new(layout, project_id, manifest.as_ref());
+    let sidecars = Arc::new(LiveSidecarSearch::new(
+        layout,
+        project_id,
+        manifest.as_ref(),
+    ));
     let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
-    let (mode, degraded_reason) = resolve_batch_mode(&sidecars, manifest.as_ref());
+    let (mode, degraded_reason) = resolve_batch_mode(sidecars.as_ref(), manifest.as_ref());
     if mode != RetrievalDegradedMode::Full {
         bail!(
             "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
@@ -94,7 +102,7 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
         );
     }
     execute_strict_retrieval_query_batch_against_sidecars(
-        &sidecars,
+        sidecars,
         manifest,
         file_roles,
         cancelled,
@@ -107,7 +115,7 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_strict_retrieval_query_batch_against_sidecars(
-    sidecars: &dyn SidecarSearch,
+    sidecars: Arc<dyn SidecarSearch>,
     manifest: Option<RetrievalIndexManifest>,
     file_roles: HashMap<String, FileRole>,
     cancelled: Arc<AtomicBool>,
@@ -140,6 +148,7 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
                 let manifest = manifest.clone();
                 let file_roles = file_roles.clone();
                 let cancelled = Arc::clone(&cancelled);
+                let sidecars = Arc::clone(&sidecars);
                 handles.push(scope.spawn(move || {
                     let mut worker_cache = RetrievalCache::new();
                     let mut executor = QueryExecutor {
@@ -288,15 +297,17 @@ fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryC
 }
 
 fn resolve_batch_mode(
-    sidecars: &LiveSidecarSearch,
+    sidecars: &dyn SidecarSearch,
     manifest: Option<&RetrievalIndexManifest>,
 ) -> (RetrievalDegradedMode, Option<String>) {
     if let Some(manifest) = manifest {
-        let report = probe_sidecar_health(
-            sidecars.layout(),
-            &manifest.project_id,
-            Some(manifest.clone()),
-        );
+        let Some(layout) = sidecars.layout() else {
+            return (
+                RetrievalDegradedMode::Unavailable,
+                Some("sidecar_layout_missing".into()),
+            );
+        };
+        let report = probe_sidecar_health(layout, &manifest.project_id, Some(manifest.clone()));
         return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
     }
     (
@@ -396,10 +407,10 @@ mod tests {
             }
         }
 
-        let sidecars = CountingSidecars {
+        let sidecars = Arc::new(CountingSidecars {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
-        };
+        });
         let mut cache = RetrievalCache::new();
         let manifest = manifest_for("testproj", "cafebabedeadbeef", 3);
         let queries = [
@@ -418,7 +429,7 @@ mod tests {
         ];
 
         let results = execute_strict_retrieval_query_batch_against_sidecars(
-            &sidecars,
+            sidecars.clone(),
             Some(manifest),
             HashMap::new(),
             cancellation_flag(),
@@ -454,7 +465,7 @@ mod tests {
         }];
 
         let error = execute_strict_retrieval_query_batch_against_sidecars(
-            &sidecars,
+            Arc::new(sidecars),
             Some(manifest),
             HashMap::new(),
             cancellation_flag(),
