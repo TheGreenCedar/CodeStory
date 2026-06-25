@@ -49,10 +49,11 @@ pub use compose::{
     embed_model_inventory, resolve_compose_file,
 };
 pub use config::{
-    DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT, DEFAULT_QDRANT_HTTP_PORT,
-    DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN, SidecarLayout, SidecarOwnership, SidecarPorts,
-    SidecarProfile, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
-    sidecar_runtime_auto, sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
+    DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
+    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN, SidecarLayout,
+    SidecarOwnership, SidecarPorts, SidecarProfile, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN,
+    ZOEKT_WEBSERVER_IMAGE_PIN, sidecar_runtime_auto, sidecar_runtime_for_project,
+    sidecar_runtime_for_project_with_run_id,
 };
 pub use config::{qdrant_enabled, qdrant_semantic_vectors_enabled};
 pub use embeddings::qdrant_vector_dim;
