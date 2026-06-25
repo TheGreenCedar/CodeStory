@@ -1103,6 +1103,11 @@ impl WorkspaceIndexer {
                 .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
         }
 
+        if Self::is_cancelled(cancel_token) {
+            event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
+            return Ok(stats);
+        }
+
         // 3.5 Resolve call/import edges post-pass
         if had_edges {
             let resolver = resolution::ResolutionPass::new();
@@ -19689,6 +19694,77 @@ public:
         // Each file should contribute at least one file node and one symbol node.
         let nodes = storage.get_nodes()?;
         assert!(nodes.len() >= 24);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_indexing_cancel_after_flush_skips_resolution() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use codestory_workspace::RefreshInfo;
+        use std::fs;
+        use std::time::Duration;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let mut files = Vec::new();
+        for index in 0..64 {
+            let path = dir.path().join(format!("module_{index}.rs"));
+            fs::write(
+                &path,
+                format!("fn caller_{index}() {{ callee_{index}(); }}\nfn callee_{index}() {{}}\n"),
+            )?;
+            files.push(path);
+        }
+
+        let mut storage = Storage::new_in_memory().unwrap();
+        let bus = EventBus::new();
+        let rx = bus.receiver();
+        let cancel_token = CancellationToken::new();
+        let cancel_from_progress = cancel_token.clone();
+        let canceller = std::thread::spawn(move || {
+            while let Ok(event) = rx.recv_timeout(Duration::from_secs(2)) {
+                if let Event::IndexingProgress { current, total } = event
+                    && current == total
+                {
+                    cancel_from_progress.cancel();
+                    return;
+                }
+            }
+        });
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf()).with_batch_config(
+            IncrementalIndexingConfig {
+                file_batch_size: 64,
+                node_batch_size: usize::MAX,
+                edge_batch_size: usize::MAX,
+                occurrence_batch_size: usize::MAX,
+                error_batch_size: 128,
+            },
+        );
+
+        let refresh_info = RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: files,
+            files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
+        };
+
+        let stats =
+            indexer.run_incremental(&mut storage, &refresh_info, &bus, Some(&cancel_token))?;
+        canceller.join().expect("progress canceller should finish");
+
+        assert!(
+            cancel_token.is_cancelled(),
+            "expected progress to cancel token"
+        );
+        assert!(
+            !stats.resolution_ran,
+            "cancellation after indexing flush should skip resolution"
+        );
+        assert!(
+            !storage.get_edges()?.is_empty(),
+            "indexing should flush edges"
+        );
 
         Ok(())
     }
