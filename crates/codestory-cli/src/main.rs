@@ -2001,8 +2001,9 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     } else {
         RuntimeContext::new_inspect_only(&cmd.project)?
     };
+    let agent_run_id = cmd.run_id.as_deref();
     let repaired_sidecar = if cmd.repair {
-        repair_ready_state(&runtime, cmd.goal)?
+        repair_ready_state(&runtime, cmd.goal, agent_run_id)?
     } else {
         None
     };
@@ -2011,8 +2012,11 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     } else {
         (runtime.open_project_summary()?, None)
     };
-    let sidecar = ready_sidecar_status(&runtime, repaired_sidecar);
-    let readiness_sidecar = if !cmd.repair && matches!(cmd.goal, Some(args::ReadyGoal::Agent)) {
+    let sidecar = ready_sidecar_status(&runtime, repaired_sidecar, cmd.goal, agent_run_id);
+    let readiness_sidecar = if !cmd.repair
+        && agent_run_id.is_none()
+        && matches!(cmd.goal, Some(args::ReadyGoal::Agent))
+    {
         agent_goal_readiness_sidecar_status(&runtime, &sidecar)
     } else {
         sidecar
@@ -2023,7 +2027,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &verdicts);
+    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &verdicts, agent_run_id);
     if let Some(goal) = cmd.goal {
         let goal = goal.as_dto();
         verdicts.retain(|verdict| verdict.goal == goal);
@@ -2129,7 +2133,7 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &readiness);
+    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &readiness, None);
     let output =
         build_agent_preflight_output(&readiness, Path::new(&summary.root), readiness_lanes);
     let markdown = render_agent_preflight_markdown(&output);
@@ -2139,6 +2143,7 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
 fn repair_ready_state(
     runtime: &RuntimeContext,
     goal: Option<args::ReadyGoal>,
+    run_id: Option<&str>,
 ) -> Result<Option<codestory_retrieval::SidecarRuntimeConfig>> {
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
@@ -2151,9 +2156,16 @@ fn repair_ready_state(
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project(
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
         &runtime.project_root,
         codestory_retrieval::SidecarProfile::Agent,
+        run_id,
+    );
+    eprintln!(
+        "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
+        sidecar.run_id.as_deref().unwrap_or("none"),
+        sidecar.namespace,
+        sidecar.compose_project
     );
     let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime(
         &sidecar,
@@ -2212,7 +2224,6 @@ const LOCAL_GRAPH_AGENT_SURFACES: &[&str] = &[
     "ground", "files", "symbol", "callers", "callees", "trail", "trace", "snippet", "affected",
 ];
 const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "context_full"];
-const AGENT_RUN_MISSING_ID: &str = "agent-run-missing";
 
 fn build_agent_preflight_output(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
@@ -10058,7 +10069,7 @@ fn build_doctor_output(
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(runtime, &readiness);
+    let readiness_lanes = build_readiness_lanes_for_runtime(runtime, &readiness, None);
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -10205,8 +10216,20 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
 fn ready_sidecar_status(
     runtime: &RuntimeContext,
     repaired_sidecar: Option<codestory_retrieval::SidecarRuntimeConfig>,
+    goal: Option<args::ReadyGoal>,
+    run_id: Option<&str>,
 ) -> DoctorSidecarStatusOutput {
     if let Some(sidecar) = repaired_sidecar {
+        return doctor_sidecar_status_for_runtime(runtime, sidecar);
+    }
+    if matches!(goal, Some(args::ReadyGoal::Agent))
+        && let Some(run_id) = run_id
+    {
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            &runtime.project_root,
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(run_id),
+        );
         return doctor_sidecar_status_for_runtime(runtime, sidecar);
     }
     doctor_sidecar_status(runtime)
@@ -10297,7 +10320,7 @@ fn agent_goal_readiness_sidecar_status(
     runtime: &RuntimeContext,
     fallback: &DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root);
+    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, None);
     let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
     lane_scoped_agent_readiness_sidecar(fallback, agent_status)
 }
@@ -10307,15 +10330,23 @@ fn lane_scoped_agent_readiness_sidecar(
     agent_status: DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
     if agent_status.retrieval_mode == "full" {
-        agent_status
-    } else {
-        fallback.clone()
+        return agent_status;
     }
+    if fallback.profile.as_deref() == Some("agent")
+        && fallback
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("profile_handoff_mismatch:"))
+    {
+        return fallback.clone();
+    }
+    agent_status
 }
 
 pub(crate) fn build_readiness_lanes_for_runtime(
     runtime: &RuntimeContext,
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
+    agent_run_id: Option<&str>,
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
@@ -10323,7 +10354,7 @@ pub(crate) fn build_readiness_lanes_for_runtime(
         &runtime.project_root,
         codestory_retrieval::SidecarProfile::Local,
     );
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root);
+    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, agent_run_id);
     let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
     let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
     let agent_verdict = readiness
@@ -10348,15 +10379,12 @@ pub(crate) fn build_readiness_lanes_for_runtime(
 
 fn agent_readiness_sidecar_runtime(
     project_root: &Path,
+    run_id: Option<&str>,
 ) -> codestory_retrieval::SidecarRuntimeConfig {
-    let active = codestory_retrieval::sidecar_runtime_auto(project_root);
-    if active.profile == codestory_retrieval::SidecarProfile::Agent {
-        return active;
-    }
     codestory_retrieval::sidecar_runtime_for_project_with_run_id(
         project_root,
         codestory_retrieval::SidecarProfile::Agent,
-        Some(AGENT_RUN_MISSING_ID),
+        run_id,
     )
 }
 
@@ -10414,14 +10442,24 @@ fn lane_next_command(
         return Some(command.clone());
     }
     match lane {
-        "agent_packet_search" if sidecar.retrieval_mode != "full" => Some(format!(
-            "codestory-cli ready --goal agent --repair --project {project_arg} --format json"
-        )),
+        "agent_packet_search" if sidecar.retrieval_mode != "full" => Some(
+            agent_ready_repair_command(project_arg, sidecar.run_id.as_deref()),
+        ),
         "local_default" if sidecar.retrieval_mode != "full" => Some(format!(
             "codestory-cli retrieval index --project {project_arg} --profile local --refresh full --format json"
         )),
         _ => Some(retrieval_status_command(sidecar, project_arg)),
     }
+}
+
+fn agent_ready_repair_command(project_arg: &str, run_id: Option<&str>) -> String {
+    let mut command =
+        format!("codestory-cli ready --goal agent --repair --project {project_arg} --format json");
+    if let Some(run_id) = run_id {
+        command.push_str(" --run-id ");
+        command.push_str(&display::quote_command_argument_value(run_id));
+    }
+    command
 }
 
 fn retrieval_status_command(sidecar: &DoctorSidecarStatusOutput, project_arg: &str) -> String {
@@ -12064,10 +12102,13 @@ mod tests {
         let project = temp.path().join("repo");
         fs::create_dir_all(&project).expect("create project");
 
-        let runtime = agent_readiness_sidecar_runtime(&project);
+        let runtime = agent_readiness_sidecar_runtime(&project, None);
 
         assert_eq!(runtime.profile, codestory_retrieval::SidecarProfile::Agent);
-        assert_eq!(runtime.run_id.as_deref(), Some(AGENT_RUN_MISSING_ID));
+        assert_eq!(
+            runtime.run_id.as_deref(),
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+        );
     }
 
     #[test]

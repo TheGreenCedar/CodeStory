@@ -7,6 +7,7 @@ use std::process::Command;
 
 const FIXTURE_FILE: &str = "production_packet_search_fixtures.json";
 const BASELINE_FILE: &str = "production_packet_search_baseline.json";
+const LIVE_EVAL_RUN_ID: &str = "packet-search-eval";
 
 #[derive(Debug, Deserialize)]
 struct FixtureSet {
@@ -545,15 +546,83 @@ fn packet_search_eval_reads_production_search_hit_fields() {
 }
 
 #[test]
+fn packet_search_live_eval_uses_fixed_run_id() {
+    assert_ne!(LIVE_EVAL_RUN_ID, "shared-agent");
+    assert_eq!(
+        live_eval_env(),
+        [
+            ("CODESTORY_RETRIEVAL_PROFILE", "agent"),
+            ("CODESTORY_SIDECAR_RUN_ID", LIVE_EVAL_RUN_ID)
+        ]
+    );
+    assert_eq!(
+        live_eval_ready_args(),
+        [
+            "ready",
+            "--goal",
+            "agent",
+            "--repair",
+            "--run-id",
+            LIVE_EVAL_RUN_ID,
+            "--format",
+            "json"
+        ]
+    );
+    assert_eq!(
+        live_eval_status_args(),
+        [
+            "retrieval",
+            "status",
+            "--run-id",
+            LIVE_EVAL_RUN_ID,
+            "--format",
+            "json"
+        ]
+    );
+    let search = live_eval_command(
+        Path::new("C:/repo"),
+        &[
+            "search",
+            "--query",
+            "LiveSidecarSearch::qdrant_search",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(search.get_envs().count(), live_eval_env().len());
+    assert!(
+        search
+            .get_envs()
+            .any(|(name, value)| name == "CODESTORY_SIDECAR_RUN_ID"
+                && value == Some(std::ffi::OsStr::new(LIVE_EVAL_RUN_ID))),
+        "search subprocess must inherit the fixed live eval run id"
+    );
+    let packet = live_eval_command(
+        Path::new("C:/repo"),
+        &[
+            "packet",
+            "--question",
+            "How does packet search work?",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        packet
+            .get_envs()
+            .any(|(name, value)| name == "CODESTORY_RETRIEVAL_PROFILE"
+                && value == Some(std::ffi::OsStr::new("agent"))),
+        "packet subprocess must inherit the fixed live eval profile"
+    );
+}
+
+#[test]
 #[ignore = "live production packet/search eval; requires retrieval_mode=full sidecars for this checkout"]
 fn packet_search_eval_live_runs_production_cli_path() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     let project = repo_root();
-    let readiness = run_cli(
-        &project,
-        &["ready", "--goal", "agent", "--repair", "--format", "json"],
-    );
+    let readiness = live_eval_run_cli(&project, &live_eval_ready_args());
     assert!(
         readiness.status.success(),
         "agent readiness failed: {}",
@@ -563,7 +632,7 @@ fn packet_search_eval_live_runs_production_cli_path() {
         serde_json::from_slice(&readiness.stdout).expect("parse readiness json");
     let readiness_mode = readiness_mode(&readiness_json);
 
-    let status = run_cli(&project, &["retrieval", "status", "--format", "json"]);
+    let status = live_eval_run_cli(&project, &live_eval_status_args());
     assert!(
         status.status.success(),
         "retrieval status failed: {}",
@@ -580,7 +649,7 @@ fn packet_search_eval_live_runs_production_cli_path() {
     let mut runs = Vec::new();
     for fixture in &fixtures.fixtures {
         let query = fixture.query.as_deref().unwrap_or(&fixture.prompt);
-        let search = run_cli(
+        let search = live_eval_run_cli(
             &project,
             &[
                 "search",
@@ -603,7 +672,7 @@ fn packet_search_eval_live_runs_production_cli_path() {
         );
         let search_json: Value = serde_json::from_slice(&search.stdout).expect("parse search json");
 
-        let packet = run_cli(
+        let packet = live_eval_run_cli(
             &project,
             &[
                 "packet",
@@ -663,11 +732,54 @@ fn packet_search_eval_live_runs_production_cli_path() {
     );
 }
 
-fn run_cli(project: &Path, args: &[&str]) -> std::process::Output {
+fn live_eval_ready_args() -> [&'static str; 8] {
+    [
+        "ready",
+        "--goal",
+        "agent",
+        "--repair",
+        "--run-id",
+        LIVE_EVAL_RUN_ID,
+        "--format",
+        "json",
+    ]
+}
+
+fn live_eval_status_args() -> [&'static str; 6] {
+    [
+        "retrieval",
+        "status",
+        "--run-id",
+        LIVE_EVAL_RUN_ID,
+        "--format",
+        "json",
+    ]
+}
+
+fn live_eval_env() -> [(&'static str, &'static str); 2] {
+    [
+        ("CODESTORY_RETRIEVAL_PROFILE", "agent"),
+        ("CODESTORY_SIDECAR_RUN_ID", LIVE_EVAL_RUN_ID),
+    ]
+}
+
+fn live_eval_command(project: &Path, args: &[&str]) -> Command {
+    let mut command = base_cli_command(project, args);
+    command.envs(live_eval_env());
+    command
+}
+
+fn live_eval_run_cli(project: &Path, args: &[&str]) -> std::process::Output {
+    live_eval_command(project, args)
+        .output()
+        .expect("run codestory-cli")
+}
+
+fn base_cli_command(project: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
     command.args(args);
     command.arg("--project").arg(project);
-    command.output().expect("run codestory-cli")
+    command
 }
 
 fn readiness_mode(json: &Value) -> String {

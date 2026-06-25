@@ -86,6 +86,8 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert!(markdown.contains("minimum_next:"));
     assert!(markdown.contains("full_repair:"));
     assert!(markdown.contains("codestory-cli ready --goal agent --repair --project"));
+    assert!(markdown.contains("--run-id"));
+    assert!(markdown.contains("shared-agent"));
     assert!(markdown.contains("codestory-cli retrieval status --project"));
     assert!(markdown.contains("codestory-cli doctor --project"));
     assert!(markdown.contains("--format markdown"));
@@ -109,9 +111,13 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert!(
         agent["minimum_next"]
             .as_array()
-            .is_some_and(|commands| commands.iter().any(|command| command
-                .as_str()
-                .is_some_and(|text| text.contains("ready --goal agent --repair")))),
+            .is_some_and(
+                |commands| commands.iter().any(|command| command
+                    .as_str()
+                    .is_some_and(|text| text.contains("ready --goal agent --repair")
+                        && text.contains("--run-id")
+                        && text.contains("shared-agent")))
+            ),
         "missing sidecars should point at the agent-owned repair command: {agent_json_text}"
     );
     assert!(
@@ -134,6 +140,42 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert_eq!(
         agent_json["readiness_lanes"]["agent_packet_search"]["profile"],
         "agent"
+    );
+    assert_eq!(
+        agent_json["readiness_lanes"]["agent_packet_search"]["run_id"],
+        "shared-agent"
+    );
+
+    let explicit_agent_json_text = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ready",
+            "--goal",
+            "agent",
+            "--run-id",
+            "isolated-proof",
+            "--format",
+            "json",
+        ],
+    );
+    let explicit_agent_json: Value =
+        serde_json::from_str(&explicit_agent_json_text).expect("explicit ready agent json");
+    assert_eq!(
+        explicit_agent_json["readiness_lanes"]["agent_packet_search"]["run_id"],
+        "isolated-proof"
+    );
+    assert!(
+        explicit_agent_json["verdicts"][0]["minimum_next"]
+            .as_array()
+            .is_some_and(
+                |commands| commands.iter().any(|command| command
+                    .as_str()
+                    .is_some_and(|text| text.contains("ready --goal agent --repair")
+                        && text.contains("--run-id")
+                        && text.contains("isolated-proof")))
+            ),
+        "explicit run id should stay in agent repair guidance: {explicit_agent_json_text}"
     );
 }
 

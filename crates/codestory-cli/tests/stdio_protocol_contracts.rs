@@ -2335,10 +2335,22 @@ fn resources_read_status_recommends_sidecar_repair_when_policy_enabled() {
 
     assert_eq!(status["sidecar_setup"]["state"], json!("enabled"));
     assert_eq!(status["sidecar_setup"]["auto_repair"], json!(true));
+    let sidecar_repair_command = status["sidecar_setup"]["next_repair_command"]
+        .as_str()
+        .expect("sidecar setup next repair command");
+    assert!(
+        sidecar_repair_command.contains("--run-id")
+            && sidecar_repair_command.contains("shared-agent"),
+        "sidecar setup should point at the shared agent run id: {status}"
+    );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
         next_call_text.contains("codestory-cli ready --goal agent --repair"),
         "enabled policy should keep the existing agent repair path visible: {status}"
+    );
+    assert!(
+        next_call_text.contains("--run-id") && next_call_text.contains("shared-agent"),
+        "enabled policy should point at the shared agent run id: {status}"
     );
 }
 

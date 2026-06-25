@@ -589,6 +589,12 @@ pub(crate) struct ReadyCommand {
         help = "For local graph freshness, no-op when fresh and run at most one incremental refresh when stale or unchecked."
     )]
     pub(crate) wait_fresh: bool,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Use a specific agent sidecar run id when checking or repairing agent readiness."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(

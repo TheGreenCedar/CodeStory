@@ -737,13 +737,15 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
         "agent lane must not collapse to local when no agent run exists: {doctor:#}"
     );
     assert_eq!(
-        doctor["readiness_lanes"]["agent_packet_search"]["run_id"], "agent-run-missing",
+        doctor["readiness_lanes"]["agent_packet_search"]["run_id"], "shared-agent",
         "agent lane should make the missing-run repair state explicit: {doctor:#}"
     );
     assert!(
         doctor["readiness_lanes"]["agent_packet_search"]["next_command"]
             .as_str()
-            .is_some_and(|command| command.contains("ready --goal agent --repair")),
+            .is_some_and(|command| command.contains("ready --goal agent --repair")
+                && command.contains("--run-id")
+                && command.contains("shared-agent")),
         "agent lane should expose the agent-scoped repair command: {doctor:#}"
     );
 
@@ -835,13 +837,15 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         "agent preflight lane must not collapse to local when no agent run exists: {preflight:#}"
     );
     assert_eq!(
-        preflight["agent_packet_search"]["run_id"], "agent-run-missing",
+        preflight["agent_packet_search"]["run_id"], "shared-agent",
         "agent preflight lane should make the missing-run repair state explicit: {preflight:#}"
     );
     assert!(
         preflight["readiness_lanes"]["agent_packet_search"]["next_command"]
             .as_str()
-            .is_some_and(|command| command.contains("ready --goal agent --repair")),
+            .is_some_and(|command| command.contains("ready --goal agent --repair")
+                && command.contains("--run-id")
+                && command.contains("shared-agent")),
         "agent lane should expose the agent-scoped repair command: {preflight:#}"
     );
     let safe_surfaces = preflight["safe_surfaces"]
