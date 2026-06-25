@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +15,8 @@ struct StdioFixture {
     latest_release_version: String,
     disable_installed_cli_probe: bool,
     sidecar_policy_state: Option<String>,
+    dirty_marker_path: Option<PathBuf>,
+    dirty_marker_project_root: Option<PathBuf>,
 }
 
 struct StdioServer {
@@ -104,6 +106,35 @@ fn indexed_fixture() -> StdioFixture {
     indexed_fixture_with_embedding_mode(true)
 }
 
+fn write_dirty_marker_fixture(fixture: &StdioFixture, name: &str, marker: Value) -> PathBuf {
+    let marker_path = fixture.cache_dir.path().join(name);
+    thread::sleep(Duration::from_millis(25));
+    fs::write(&marker_path, marker.to_string()).expect("write dirty marker");
+    marker_path
+}
+
+fn refresh_fixture_index(fixture: &StdioFixture) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("incremental")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(fixture.workspace.path())
+        .arg("--cache-dir")
+        .arg(fixture.cache_dir.path());
+    apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
+    let output = command.output().expect("run index refresh");
+    assert!(
+        output.status.success(),
+        "index refresh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
     let workspace = tempfile::tempdir().expect("workspace dir");
     let cache_dir = tempfile::tempdir().expect("cache dir");
@@ -136,6 +167,8 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
         disable_installed_cli_probe: false,
         sidecar_policy_state: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
     }
 }
 
@@ -239,6 +272,12 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
             "CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND",
             "node codestory-mcp.cjs sidecar-policy disable",
         );
+    }
+    if let Some(path) = &fixture.dirty_marker_path {
+        command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PATH", path);
+    }
+    if let Some(root) = &fixture.dirty_marker_project_root {
+        command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT", root);
     }
     let mut child = command.spawn().expect("spawn stdio server");
 
@@ -519,41 +558,6 @@ fn freshness_count(value: &Value, aliases: &[&str]) -> Option<u64> {
     aliases
         .iter()
         .find_map(|alias| value.get(*alias).and_then(Value::as_u64))
-}
-
-fn assert_stale_freshness_counts(value: &Value, context: &str) {
-    let freshness = find_index_freshness(value)
-        .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &["changed_file_count", "changed_count", "changed"]
-        ),
-        Some(1),
-        "{context} freshness should report one changed file: {freshness:#}"
-    );
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &["new_file_count", "new_count", "new", "added_count", "added"]
-        ),
-        Some(1),
-        "{context} freshness should report one new file: {freshness:#}"
-    );
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &[
-                "removed_file_count",
-                "removed_count",
-                "removed",
-                "deleted_count",
-                "deleted"
-            ]
-        ),
-        Some(1),
-        "{context} freshness should report one removed file: {freshness:#}"
-    );
 }
 
 fn assert_fresh_freshness_counts(value: &Value, context: &str) {
@@ -840,6 +844,8 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         tool_names,
         vec![
             "affected",
+            "callees",
+            "callers",
             "context",
             "definition",
             "files",
@@ -854,6 +860,7 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             "snippet",
             "symbol",
             "symbols",
+            "trace",
             "trail",
         ],
         "stdio browser tool names should stay stable and read-only: {tools}"
@@ -895,20 +902,21 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         .expect("files description");
     assert!(
         files_description.contains("indexed files")
-            && files_description.contains("existing local index")
-            && files_description.contains("never refreshes"),
-        "files description should make the read-only index boundary explicit: {files_description}"
+            && files_description.contains("locally fresh index")
+            && files_description.contains("refreshes local graph")
+            && files_description.contains("never bootstraps sidecars"),
+        "files description should make the local-refresh boundary explicit: {files_description}"
     );
     let affected_description = tool_by_name(&tools, "affected")["description"]
         .as_str()
         .expect("affected description");
     assert!(
         affected_description.contains("changed paths")
-            && affected_description.contains("existing local index")
+            && affected_description.contains("locally fresh index")
             && affected_description.contains("never discovers git changes")
-            && affected_description.contains("never")
-            && affected_description.contains("indexes"),
-        "affected description should make the explicit-read-only boundary clear: {affected_description}"
+            && affected_description.contains("refreshes local graph")
+            && affected_description.contains("never bootstraps sidecars"),
+        "affected description should make the explicit-path local-refresh boundary clear: {affected_description}"
     );
     let snippet_description = tool_by_name(&tools, "snippet")["description"]
         .as_str()
@@ -1216,6 +1224,11 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         "trail.depth should document the stdio default: {trail}"
     );
     assert_eq!(
+        schema_property(trail, "max_nodes").get("maximum"),
+        Some(&json!(120)),
+        "trail.max_nodes should document the stdio hard cap: {trail}"
+    );
+    assert_eq!(
         schema_property(trail, "story")["type"],
         "boolean",
         "trail.story should be a boolean opt-in: {trail}"
@@ -1224,6 +1237,30 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         schema_property(trail, "story").get("default"),
         Some(&json!(false)),
         "trail.story should document the stdio default: {trail}"
+    );
+    for name in ["callers", "callees"] {
+        let alias = tool_input_schema(&tools, name);
+        assert_eq!(
+            schema_property(alias, "depth").get("default"),
+            Some(&json!(1)),
+            "{name}.depth should document the bounded alias default: {alias}"
+        );
+        assert_eq!(
+            schema_property(alias, "max_nodes").get("maximum"),
+            Some(&json!(120)),
+            "{name}.max_nodes should document the stdio hard cap: {alias}"
+        );
+    }
+    let trace = tool_input_schema(&tools, "trace");
+    assert_eq!(
+        schema_property(trace, "story").get("default"),
+        Some(&json!(true)),
+        "trace.story should default to readable output: {trace}"
+    );
+    assert_eq!(
+        schema_property(trace, "max_nodes").get("maximum"),
+        Some(&json!(120)),
+        "trace.max_nodes should document the stdio hard cap: {trace}"
     );
 
     let context = tool_input_schema(&tools, "context");
@@ -1271,6 +1308,8 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
 
     for name in [
         "affected",
+        "callees",
+        "callers",
         "context",
         "definition",
         "files",
@@ -1281,6 +1320,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "snippet",
         "symbol",
         "symbols",
+        "trace",
         "trail",
     ] {
         let tool = tool_by_name(&tools, name);
@@ -1986,6 +2026,17 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should identify the active CLI version: {status}"
     );
     assert!(
+        status["source_checkout_version"].is_null()
+            || status["source_checkout_version"]
+                .as_str()
+                .is_some_and(|version| !version.is_empty()),
+        "status should distinguish source checkout version from active runtime version: {status}"
+    );
+    assert!(
+        status["path_candidates"].is_array(),
+        "status should report competing PATH candidates even when none are present: {status}"
+    );
+    assert!(
         status["sidecar_contract_version"].is_number(),
         "status should expose the sidecar contract version: {status}"
     );
@@ -2018,6 +2069,25 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         json!("direct_cli_launch"),
         "direct cargo stdio tests should label the non-plugin launch boundary: {status}"
     );
+    assert_eq!(
+        status["runtime_truth"]["runtime_source"],
+        json!("direct_cli_launch"),
+        "runtime truth should group the launch source classification: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["launcher_source"], status["plugin_runtime"]["cli_source"],
+        "runtime truth should reuse plugin runtime launch evidence: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_policy"],
+        json!("unmanaged"),
+        "direct stdio status should make unmanaged sidecar policy explicit: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_status"]["mode"],
+        status["sidecar_retrieval"]["retrieval_mode"],
+        "runtime truth should reuse sidecar retrieval mode: {status}"
+    );
     assert!(
         status
             .get("project_root")
@@ -2041,6 +2111,16 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     assert_ne!(
         status["retrieval_mode"], "full",
         "hash-mode indexed fixture must not report mandatory sidecar retrieval as full: {status}"
+    );
+    assert_eq!(
+        status["local_refresh"]["state"],
+        json!("fresh"),
+        "fresh local graph state should be explicit even when sidecar retrieval is unavailable: {status}"
+    );
+    assert_eq!(
+        status["local_refresh"]["blocks_local_surfaces"],
+        json!(false),
+        "fresh local graph state should not block local graph surfaces: {status}"
     );
     assert!(
         status["sidecar_retrieval"]["retrieval_mode"].is_string(),
@@ -2070,16 +2150,80 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     let readiness = status["readiness"]
         .as_array()
         .unwrap_or_else(|| panic!("status should include readiness verdicts: {status}"));
+    let readiness_lanes = status["readiness_lanes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("status should include readiness lanes: {status}"));
+    let local_default = readiness_lanes
+        .get("local_default")
+        .unwrap_or_else(|| panic!("status should include local_default lane: {status}"));
+    assert_eq!(
+        local_default["profile"],
+        json!("local"),
+        "local/default lane should report the local profile: {status}"
+    );
+    assert!(
+        local_default["sidecar_mode"].is_string(),
+        "local/default lane should report sidecar mode: {status}"
+    );
+    assert!(
+        local_default["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile local")),
+        "local/default lane should expose a local-scoped next command: {status}"
+    );
+    let agent_lane = readiness_lanes
+        .get("agent_packet_search")
+        .unwrap_or_else(|| panic!("status should include agent_packet_search lane: {status}"));
+    assert_eq!(
+        agent_lane["status"],
+        json!("repair_retrieval"),
+        "agent lane should report blocked packet/search readiness: {status}"
+    );
+    assert_eq!(
+        agent_lane["profile"],
+        json!("agent"),
+        "agent lane must not collapse to local when no agent run exists: {status}"
+    );
+    assert!(
+        agent_lane["run_id"]
+            .as_str()
+            .is_some_and(|run_id| !run_id.is_empty()),
+        "agent lane should report a non-empty agent run id: {status}"
+    );
+    assert!(
+        agent_lane["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("ready --goal agent --repair")),
+        "agent lane should expose the agent-scoped next command: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["local_graph"]["status"],
+        json!("ready"),
+        "runtime truth should include the local graph readiness lane: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["local_graph"]["refresh_state"],
+        json!("fresh"),
+        "runtime truth should include local refresh state: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
+        json!("repair_retrieval"),
+        "runtime truth should include the agent packet/search readiness lane: {status}"
+    );
     for surface in [
         "ground",
         "files",
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
+        "trace",
         "trail",
         "references",
         "snippet",
@@ -2231,6 +2375,265 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
 }
 
 #[test]
+fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
+    let mut fixture = indexed_fixture();
+    let marker_path = write_dirty_marker_fixture(
+        &fixture,
+        "dirty-marker.json",
+        json!({
+            "schema_version": 1,
+            "project_root": fixture.workspace.path().to_string_lossy(),
+            "dirty": true,
+            "updated_at": "2026-06-25T00:00:00.000Z",
+            "source": "test-hook",
+            "path_sample": ["src/runtime.rs"]
+        }),
+    );
+    fixture.dirty_marker_path = Some(marker_path.clone());
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-dirty-marker",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-dirty-marker"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("dirty_stale"));
+    assert_eq!(status["dirty_marker"]["dirty"], json!(true));
+    assert_eq!(
+        status["dirty_marker"]["reason"],
+        json!("dirty_marker_newer_than_index")
+    );
+    assert_eq!(
+        status["index_freshness"]["status"],
+        json!("fresh"),
+        "computed inventory freshness should remain visible: {status}"
+    );
+    assert_eq!(
+        status["effective_index_freshness"]["status"],
+        json!("stale")
+    );
+    assert_eq!(status["local_refresh"]["state"], json!("stale"));
+    assert_eq!(
+        status["local_refresh"]["blocks_local_surfaces"],
+        json!(true)
+    );
+    assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
+    );
+}
+
+#[test]
+fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
+    let mut fixture = indexed_fixture();
+    let marker_path = write_dirty_marker_fixture(
+        &fixture,
+        "dirty-marker-wal-indexed.json",
+        json!({
+            "schema_version": 1,
+            "project_root": fixture.workspace.path().to_string_lossy(),
+            "dirty": true,
+            "updated_at": "2026-06-25T00:00:00.000Z",
+            "source": "test-hook",
+            "path_sample": ["src/runtime.rs"]
+        }),
+    );
+    thread::sleep(Duration::from_millis(1200));
+    refresh_fixture_index(&fixture);
+    fixture.dirty_marker_path = Some(marker_path.clone());
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-dirty-marker-indexed",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-dirty-marker-indexed"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("dirty_indexed"));
+    assert_eq!(status["dirty_marker"]["dirty"], json!(true));
+    assert_eq!(
+        status["dirty_marker"]["blocks_local_surfaces"],
+        json!(false)
+    );
+    assert_fresh_freshness_counts(&status, "dirty marker older than full storage state");
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
+    );
+}
+
+#[test]
+fn resources_read_status_reports_unknown_dirty_marker_without_blocking_local_index() {
+    let mut fixture = indexed_fixture();
+    let marker_path = fixture.cache_dir.path().join("dirty-marker-invalid.json");
+    fs::write(&marker_path, "{not-json").expect("write invalid marker");
+    fixture.dirty_marker_path = Some(marker_path);
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-unknown-marker",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-unknown-marker"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("unknown"));
+    assert_eq!(
+        status["dirty_marker"]["blocks_local_surfaces"],
+        json!(false)
+    );
+    assert!(
+        status["dirty_marker"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("marker_json_error")),
+        "unknown marker should explain the parse failure: {status}"
+    );
+    assert_fresh_freshness_counts(&status, "status with unknown dirty marker");
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
+    );
+}
+
+#[test]
+fn resources_read_status_dirty_marker_fail_open_matrix() {
+    let cases = [
+        ("missing", None, json!("missing"), None, None),
+        (
+            "schema",
+            Some(json!({
+                "schema_version": 99,
+                "project_root": "__PROJECT_ROOT__",
+                "dirty": true,
+                "updated_at": "2026-06-25T00:00:00.000Z",
+                "source": "test-hook",
+                "path_sample": []
+            })),
+            json!("unknown"),
+            Some(json!("schema_version_unsupported")),
+            None,
+        ),
+        (
+            "root",
+            Some(json!({
+                "schema_version": 1,
+                "project_root": "C:/different/project",
+                "dirty": true,
+                "updated_at": "2026-06-25T00:00:00.000Z",
+                "source": "test-hook",
+                "path_sample": []
+            })),
+            json!("unknown"),
+            Some(json!("project_root_mismatch")),
+            None,
+        ),
+        (
+            "clean",
+            Some(json!({
+                "schema_version": 1,
+                "project_root": "__PROJECT_ROOT__",
+                "dirty": false,
+                "updated_at": "2026-06-25T00:00:00.000Z",
+                "source": "test-hook",
+                "path_sample": []
+            })),
+            json!("clean"),
+            None,
+            Some(json!(false)),
+        ),
+    ];
+
+    for (name, marker, expected_status, expected_reason, expected_dirty) in cases {
+        let mut fixture = indexed_fixture();
+        let marker_path = fixture
+            .cache_dir
+            .path()
+            .join(format!("dirty-marker-{name}.json"));
+        if let Some(mut marker) = marker {
+            if marker["project_root"] == json!("__PROJECT_ROOT__") {
+                marker["project_root"] = json!(fixture.workspace.path().to_string_lossy());
+            }
+            fs::write(&marker_path, marker.to_string()).expect("write marker");
+        }
+        fixture.dirty_marker_path = Some(marker_path);
+        fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+        let mut server = spawn_stdio_server(&fixture);
+
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("status-dirty-marker-{name}"),
+                "method": "resources/read",
+                "params": {"uri": "codestory://status"}
+            }),
+        );
+        let result =
+            assert_success_envelope(&response, json!(format!("status-dirty-marker-{name}")));
+        let status = json_resource_content(result, "codestory://status");
+
+        assert_eq!(
+            status["dirty_marker"]["status"], expected_status,
+            "{name}: {status}"
+        );
+        assert_eq!(
+            status["dirty_marker"]["blocks_local_surfaces"],
+            json!(false),
+            "{name}: {status}"
+        );
+        if let Some(reason) = expected_reason {
+            assert_eq!(status["dirty_marker"]["reason"], reason, "{name}: {status}");
+        }
+        if let Some(dirty) = expected_dirty {
+            assert_eq!(status["dirty_marker"]["dirty"], dirty, "{name}: {status}");
+        }
+        assert_fresh_freshness_counts(&status, name);
+        assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+        assert_allowed_surface(
+            &status,
+            "packet",
+            false,
+            "agent_packet_search",
+            "repair_retrieval",
+        );
+    }
+}
+
+#[test]
 fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
     let mut fixture = indexed_fixture();
     fixture.latest_release_version = "999.0.0".to_string();
@@ -2332,8 +2735,22 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
 }
 
 #[test]
-fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
+fn resources_read_status_refreshes_long_lived_stale_index_with_bounded_latency() {
     let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let warmup = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-freshness-warmup",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let warmup_result = assert_success_envelope(&warmup, json!("status-freshness-warmup"));
+    let warmup_status = json_resource_content(warmup_result, "codestory://status");
+    assert_fresh_freshness_counts(&warmup_status, "warm codestory://status");
+
     thread::sleep(Duration::from_millis(25));
     fs::write(
         fixture.workspace.path().join("src").join("runtime.rs"),
@@ -2355,20 +2772,48 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
         .expect("remove indexed file after indexing");
 
-    let mut server = spawn_stdio_server(&fixture);
-    let warmup = send_json(
+    let refreshed = send_json(
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "status-freshness-warmup",
+            "id": "status-freshness-after-mutation",
             "method": "resources/read",
             "params": {"uri": "codestory://status"}
         }),
     );
-    assert_success_envelope(&warmup, json!("status-freshness-warmup"));
+    let refreshed_result =
+        assert_success_envelope(&refreshed, json!("status-freshness-after-mutation"));
+    let refreshed_status = json_resource_content(refreshed_result, "codestory://status");
+    assert_fresh_freshness_counts(&refreshed_status, "codestory://status after mutation");
+    assert_eq!(
+        refreshed_status["local_refresh"]["reason"],
+        json!("refreshed"),
+        "long-lived status must not return the cached warm freshness result after source mutation: {refreshed_status}"
+    );
+    assert_eq!(
+        refreshed_status["local_refresh"]["blocks_local_surfaces"],
+        json!(false),
+        "successful local refresh should keep local graph surfaces usable: {refreshed_status}"
+    );
+    assert_eq!(
+        refreshed_status["allowed_surfaces"]["ground"]["allowed"],
+        json!(true),
+        "fresh local graph should allow local graph surfaces: {refreshed_status}"
+    );
+    assert_eq!(
+        refreshed_status["allowed_surfaces"]["packet"]["status"],
+        json!("repair_retrieval"),
+        "packet/search should stay gated by the agent retrieval lane after local refresh: {refreshed_status}"
+    );
+    let status_next_call_text = refreshed_status["recommended_next_calls"].to_string();
+    assert!(
+        !status_next_call_text.contains("\"tool\":\"packet\"")
+            && !status_next_call_text.contains("\"tool\":\"search\""),
+        "local freshness repair should not recommend packet/search calls while sidecars are unavailable: {refreshed_status}"
+    );
 
     let mut elapsed = Vec::new();
-    let mut last_status = Value::Null;
+    let mut last_status = refreshed_status;
     for index in 0..12 {
         let started = Instant::now();
         let response = send_json(
@@ -2385,17 +2830,13 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         last_status = json_resource_content(result, "codestory://status");
     }
 
-    assert_stale_freshness_counts(&last_status, "codestory://status");
-    let status_next_call_text = last_status["recommended_next_calls"].to_string();
+    assert_fresh_freshness_counts(&last_status, "cached codestory://status after refresh");
     assert!(
-        !status_next_call_text.contains("\"tool\":\"packet\"")
-            && !status_next_call_text.contains("\"tool\":\"search\""),
-        "stale index readiness should recommend repair, not packet/search calls: {last_status}"
-    );
-    assert!(
-        status_next_call_text.contains("codestory-cli ready --goal local --repair")
-            && status_next_call_text.contains("codestory://status"),
-        "stale index readiness should recommend index repair and a status recheck: {last_status}"
+        matches!(
+            last_status["local_refresh"]["reason"].as_str(),
+            Some("refreshed" | "already_fresh")
+        ),
+        "status should stay fresh without stale cache masking after the bounded refresh: {last_status}"
     );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];
@@ -2443,6 +2884,225 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
     let refreshed_status = json_resource_content(result, "codestory://status");
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after reindex");
+}
+
+#[test]
+fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ground_before = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-ground-before",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let ground_before = assert_tool_success(&ground_before, json!("tool-refresh-ground-before"));
+    let node_count_before = ground_before
+        .pointer("/stats/node_count")
+        .and_then(Value::as_u64)
+        .expect("ground before mutation node count");
+
+    let files_before = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-files-before",
+            "method": "tools/call",
+            "params": {
+                "name": "files",
+                "arguments": {"path": "src/runtime.rs", "limit": 5}
+            }
+        }),
+    );
+    let files_before = assert_tool_success(&files_before, json!("tool-refresh-files-before"));
+    assert_eq!(
+        files_before.pointer("/summary/visible_file_count"),
+        Some(&json!(1)),
+        "files tool should work before mutation: {files_before}"
+    );
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture
+            .workspace
+            .path()
+            .join("src")
+            .join("live_tool_added.rs"),
+        "pub fn stdio_tool_added_after_mutation() -> usize {\n    7\n}\n",
+    )
+    .expect("write file after stdio server startup");
+
+    let files_after = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-files-after",
+            "method": "tools/call",
+            "params": {
+                "name": "files",
+                "arguments": {"path": "live_tool_added.rs", "limit": 5}
+            }
+        }),
+    );
+    let files_after = assert_tool_success(&files_after, json!("tool-refresh-files-after"));
+    assert!(
+        files_after["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("live_tool_added.rs")))),
+        "files tool should refresh the local graph before serving post-mutation evidence: {files_after}"
+    );
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(&status_response, json!("tool-refresh-status"));
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_fresh_freshness_counts(&status, "codestory://status after local graph tool refresh");
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("refreshed"),
+        "tool dispatch should have refreshed the long-lived server before status was reread: {status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["search"]["status"],
+        json!("repair_retrieval"),
+        "local graph refresh must not make packet/search readiness claims: {status}"
+    );
+
+    let ground_after = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-ground-after",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let ground_after = assert_tool_success(&ground_after, json!("tool-refresh-ground-after"));
+    let node_count_after = ground_after
+        .pointer("/stats/node_count")
+        .and_then(Value::as_u64)
+        .expect("ground after mutation node count");
+    assert!(
+        node_count_after > node_count_before,
+        "ground should serve refreshed graph stats after mutation; before={node_count_before}, after={node_count_after}, snapshot={ground_after}"
+    );
+
+    let symbol_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-symbol",
+            "method": "tools/call",
+            "params": {
+                "name": "symbol",
+                "arguments": {"query": "stdio_tool_added_after_mutation"}
+            }
+        }),
+    );
+    let symbol = assert_tool_success(&symbol_response, json!("tool-refresh-symbol"));
+    let node_id = symbol
+        .pointer("/node/id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            symbol
+                .pointer("/resolution/resolved/node_id")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_else(|| panic!("symbol should resolve the post-mutation function: {symbol}"))
+        .to_string();
+
+    for (tool, id) in [
+        ("snippet", "tool-refresh-snippet"),
+        ("trail", "tool-refresh-trail"),
+        ("trace", "tool-refresh-trace"),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": {"id": node_id, "depth": 1, "max_nodes": 20}
+                }
+            }),
+        );
+        let result = assert_tool_success(&response, json!(id));
+        assert!(
+            result
+                .to_string()
+                .contains("stdio_tool_added_after_mutation"),
+            "{tool} should serve refreshed graph evidence for the post-mutation symbol: {result}"
+        );
+    }
+
+    let affected_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-affected",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "changed_paths": ["src/live_tool_added.rs"],
+                    "change_records": [
+                        {
+                            "path": "src/live_tool_added.rs",
+                            "kind": "added",
+                            "status": "A"
+                        }
+                    ]
+                }
+            }
+        }),
+    );
+    let affected = assert_tool_success(&affected_response, json!("tool-refresh-affected"));
+    assert_eq!(
+        affected["matched_file_count"],
+        json!(1),
+        "affected should use the refreshed local graph for the added file: {affected}"
+    );
+
+    let search_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-search-still-blocked",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": "stdio_tool_added_after_mutation"}
+            }
+        }),
+    );
+    let search_error =
+        assert_tool_error(&search_response, json!("tool-refresh-search-still-blocked"));
+    assert_eq!(
+        search_error.pointer("/code").and_then(Value::as_str),
+        Some("codestory_tool_blocked"),
+        "packet/search readiness should remain separately gated after local graph refresh: {search_response}"
+    );
 }
 
 #[test]
@@ -2496,12 +3156,15 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "symbol",
         "definition",
         "get_node",
+        "callers",
+        "callees",
         "neighbors",
         "shortest_path",
         "query_subgraph",
         "symbols",
         "snippet",
         "references",
+        "trace",
         "trail",
         "affected",
     ] {
@@ -2610,6 +3273,51 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
             }),
         "agent guide should include safety notes: {guide}"
     );
+}
+
+#[test]
+#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
+fn resources_read_status_keeps_dirty_marker_separate_from_full_sidecar_readiness() {
+    let Some(mut fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}"))
+    else {
+        return;
+    };
+    let marker_path = write_dirty_marker_fixture(
+        &fixture,
+        "dirty-marker-full-sidecar.json",
+        json!({
+            "schema_version": 1,
+            "project_root": fixture.workspace.path().to_string_lossy(),
+            "dirty": true,
+            "updated_at": "2026-06-25T00:00:00.000Z",
+            "source": "test-hook",
+            "path_sample": ["src/runtime.rs"]
+        }),
+    );
+    fixture.dirty_marker_path = Some(marker_path);
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "full-retrieval-dirty-marker-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(
+        &status_response,
+        json!("full-retrieval-dirty-marker-status"),
+    );
+    let status = json_resource_content(status_result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("dirty_stale"));
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    for surface in ["packet", "search", "context"] {
+        assert_allowed_surface(&status, surface, true, "agent_packet_search", "ready");
+    }
 }
 
 #[test]
@@ -2943,6 +3651,7 @@ fn packet_tool_returns_budgeted_sufficiency_contract() {
         "truncated:",
         "unsafe_to_claim:",
         "pagination:",
+        "repo_content_boundary:",
         "gaps:",
         "open_next:",
         "follow_up_commands:",
@@ -3174,6 +3883,14 @@ fn search_tool_does_not_offer_symbol_links_for_non_resolvable_repo_text_hits() {
         non_resolvable_hit.get("links").is_none(),
         "non-resolvable repo-text hits should not advertise symbol/snippet/trail continuations: {non_resolvable_hit}"
     );
+    assert_eq!(
+        non_resolvable_hit["trust"], "untrusted_repo_evidence",
+        "repo-text hits should carry the trust-boundary marker: {non_resolvable_hit}"
+    );
+    assert!(
+        non_resolvable_hit.get("untrusted_repo_excerpt").is_some(),
+        "repo-text hits with excerpts should expose the labeled excerpt field: {non_resolvable_hit}"
+    );
 }
 
 #[test]
@@ -3309,6 +4026,43 @@ fn invalid_json_returns_parse_error_with_null_id() {
         message.contains("parse error") || message.contains("json"),
         "invalid JSON message should mention parsing: {response}"
     );
+}
+
+#[test]
+fn oversized_stdio_frame_returns_structured_protocol_error() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let oversized = "x".repeat(1024 * 1024 + 1);
+
+    let response = send_line(&mut server, &oversized);
+
+    let error = assert_error_envelope(&response, Value::Null);
+    assert_error_code(error, -32700);
+    assert_eq!(
+        error.pointer("/data/code").and_then(Value::as_str),
+        Some("stdio_frame_too_large"),
+        "oversized frame should use a structured protocol error: {response}"
+    );
+    assert_eq!(
+        error
+            .pointer("/data/max_frame_bytes")
+            .and_then(Value::as_u64),
+        Some(1024 * 1024),
+        "oversized frame error should report the configured byte limit: {response}"
+    );
+    assert!(
+        error
+            .pointer("/data/line_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|bytes| bytes > 1024 * 1024),
+        "oversized frame error should report observed line bytes: {response}"
+    );
+
+    let follow_up = send_json(
+        &mut server,
+        json!({"jsonrpc": "2.0", "id": "after-oversized", "method": "initialize"}),
+    );
+    assert_success_envelope(&follow_up, json!("after-oversized"));
 }
 
 #[test]

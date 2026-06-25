@@ -17,11 +17,14 @@ pub(super) fn resolve_calls_on_conn(
     prepared: &PreparedResolutionState,
     telemetry: &mut ResolutionPhaseTelemetry,
     strategy_counters: &mut ResolutionStrategyCounters,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<usize> {
+    ResolutionPass::check_cancelled(cancel_token)?;
     if scope_context.is_empty() {
         return Ok(0);
     }
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let prepare_started = Instant::now();
     let mut prepare_query = String::from(
         "UPDATE edge SET resolved_source_node_id = source_node_id
@@ -37,6 +40,7 @@ pub(super) fn resolve_calls_on_conn(
         .call_prepare_ms
         .saturating_add(duration_ms_u64(prepare_started.elapsed()));
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let cleanup_started = Instant::now();
     sql::cleanup_stale_call_resolutions(conn, pass.flags, pass.policy, scope_context)?;
     telemetry.call_cleanup_ms = telemetry
@@ -60,6 +64,7 @@ pub(super) fn resolve_calls_on_conn(
             strategy_counters,
         },
         ResolutionPass::compute_call_resolution,
+        cancel_token,
     )?;
     telemetry.record_semantic_request_stats(EdgeKind::CALL, semantic_request_stats);
     Ok(resolved)
@@ -72,11 +77,14 @@ pub(super) fn resolve_imports_on_conn(
     prepared: &PreparedResolutionState,
     telemetry: &mut ResolutionPhaseTelemetry,
     strategy_counters: &mut ResolutionStrategyCounters,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<usize> {
+    ResolutionPass::check_cancelled(cancel_token)?;
     if scope_context.is_empty() {
         return Ok(0);
     }
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let prepare_started = Instant::now();
     let mut prepare_query = String::from(
         "UPDATE edge SET resolved_source_node_id = source_node_id
@@ -92,6 +100,7 @@ pub(super) fn resolve_imports_on_conn(
         .import_prepare_ms
         .saturating_add(duration_ms_u64(prepare_started.elapsed()));
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let mut semantic_request_stats = SemanticRequestStats::default();
     let resolved = resolve_edges_after_prepare(
         pass,
@@ -109,6 +118,7 @@ pub(super) fn resolve_imports_on_conn(
             strategy_counters,
         },
         ResolutionPass::compute_import_resolution,
+        cancel_token,
     )?;
     telemetry.record_semantic_request_stats(EdgeKind::IMPORT, semantic_request_stats);
     Ok(resolved)
@@ -120,11 +130,14 @@ pub(super) fn resolve_overrides_on_conn(
     scope_context: &ScopeCallerContext,
     prepared: &PreparedResolutionState,
     telemetry: &mut ResolutionPhaseTelemetry,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<usize> {
+    ResolutionPass::check_cancelled(cancel_token)?;
     if scope_context.is_empty() {
         return Ok(0);
     }
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let override_started = Instant::now();
     let mut prepare_query = String::from(
         "UPDATE edge
@@ -142,6 +155,7 @@ pub(super) fn resolve_overrides_on_conn(
     }
     conn.execute(&prepare_query, params![EdgeKind::OVERRIDE as i32])?;
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let rows = unresolved_override_edges(conn, scope_context)?;
     if rows.is_empty() {
         return Ok(0);
@@ -157,6 +171,7 @@ pub(super) fn resolve_overrides_on_conn(
     let mut updates = Vec::with_capacity(rows.len());
 
     for (edge_id, source_id, source_name) in rows {
+        ResolutionPass::check_cancelled(cancel_token)?;
         let method_name = short_member_name(&source_name);
         if let Some(owner_name) = owner_name_from_member_name(&source_name) {
             let mut candidate_ids = collect_override_candidates_by_owner_name(
@@ -253,6 +268,7 @@ pub(super) fn resolve_overrides_on_conn(
         )?);
     }
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     sql::apply_resolution_updates(conn, &updates)?;
     telemetry.override_resolution_ms = telemetry
         .override_resolution_ms
@@ -268,6 +284,7 @@ fn resolve_edges_after_prepare<F>(
     semantic_index: &SemanticCandidateIndex,
     job: PreparedResolutionJob<'_>,
     compute: F,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<usize>
 where
     F: Fn(
@@ -278,6 +295,7 @@ where
         ) -> Result<ComputedResolution>
         + Sync,
 {
+    ResolutionPass::check_cancelled(cancel_token)?;
     let rows_started = Instant::now();
     let rows = sql::unresolved_edges(conn, job.edge_kind, scope_context)?;
     *job.unresolved_load_ms = job
@@ -287,6 +305,7 @@ where
         return Ok(0);
     }
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let semantic_candidates_started = Instant::now();
     let (semantic_candidates_by_row, semantic_request_stats) =
         pass.semantic_candidates_for_rows(semantic_index, &rows, job.edge_kind)?;
@@ -295,6 +314,7 @@ where
         .semantic_candidates_ms
         .saturating_add(duration_ms_u64(semantic_candidates_started.elapsed()));
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let compute_started = Instant::now();
     let computed_results: Vec<Result<ComputedResolution>> =
         if pass.flags.parallel_compute && rows.len() > 1 {
@@ -316,6 +336,7 @@ where
         .compute_ms
         .saturating_add(duration_ms_u64(compute_started.elapsed()));
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let mut resolved = 0usize;
     let mut updates = Vec::with_capacity(rows.len());
     for computed in computed_results {
@@ -327,6 +348,7 @@ where
         updates.push(computed.update);
     }
 
+    ResolutionPass::check_cancelled(cancel_token)?;
     let apply_started = Instant::now();
     sql::apply_resolution_updates(conn, &updates)?;
     *job.apply_ms = job
@@ -481,6 +503,116 @@ fn collect_override_candidates(
     }
 
     candidates.into_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Connection, params};
+
+    #[test]
+    fn cancellation_after_compute_stops_before_apply() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE node (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                serialized_name TEXT NOT NULL,
+                qualified_name TEXT,
+                canonical_id TEXT,
+                file_node_id INTEGER,
+                start_line INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE edge (
+                id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                file_node_id INTEGER,
+                resolved_source_node_id INTEGER,
+                resolved_target_node_id INTEGER,
+                confidence REAL,
+                certainty TEXT,
+                candidate_target_node_ids TEXT,
+                callsite_identity TEXT
+            );",
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                1_i64,
+                NodeKind::FUNCTION as i32,
+                "caller",
+                "pkg::caller",
+                10_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO node (id, kind, serialized_name, qualified_name, file_node_id, start_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                2_i64,
+                NodeKind::FUNCTION as i32,
+                "target",
+                "pkg::target",
+                10_i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO edge (id, kind, source_node_id, target_node_id, file_node_id, resolved_target_node_id, confidence, certainty, callsite_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL)",
+            params![100_i64, EdgeKind::CALL as i32, 1_i64, 2_i64, 10_i64],
+        )?;
+
+        let pass = ResolutionPass::new();
+        let scope_context = ScopeCallerContext::prepare(&conn, None)?;
+        let cancel_token = CancellationToken::new();
+        let cancel_from_compute = cancel_token.clone();
+        let mut semantic_request_stats = SemanticRequestStats::default();
+        let mut unresolved_load_ms = 0;
+        let mut semantic_candidates_ms = 0;
+        let mut compute_ms = 0;
+        let mut apply_ms = 0;
+        let mut strategy_counters = ResolutionStrategyCounters::default();
+
+        let result = resolve_edges_after_prepare(
+            &pass,
+            &conn,
+            &scope_context,
+            &CandidateIndex::default(),
+            &SemanticCandidateIndex::default(),
+            PreparedResolutionJob {
+                edge_kind: EdgeKind::CALL,
+                semantic_request_stats: &mut semantic_request_stats,
+                unresolved_load_ms: &mut unresolved_load_ms,
+                semantic_candidates_ms: &mut semantic_candidates_ms,
+                compute_ms: &mut compute_ms,
+                apply_ms: &mut apply_ms,
+                strategy_counters: &mut strategy_counters,
+            },
+            move |_pass, _candidate_index, row, _semantic_candidates| {
+                cancel_from_compute.cancel();
+                Ok(ComputedResolution {
+                    update: build_resolved_edge_update(row.0, Some((2_i64, 1.0_f32)), &[])?,
+                    strategy: Some(ResolutionStrategy::CallGlobalUnique),
+                })
+            },
+            Some(&cancel_token),
+        );
+
+        assert!(result.is_err(), "cancelled resolution should stop");
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(apply_ms, 0, "apply phase should not run after cancellation");
+        let resolved_target: Option<i64> = conn.query_row(
+            "SELECT resolved_target_node_id FROM edge WHERE id = ?1",
+            params![100_i64],
+            |row| row.get(0),
+        )?;
+        assert_eq!(resolved_target, None);
+
+        Ok(())
+    }
 }
 
 fn collect_override_candidates_by_owner_name(

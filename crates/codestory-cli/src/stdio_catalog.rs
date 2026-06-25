@@ -1016,8 +1016,58 @@ static TRAIL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::integer("depth", "Trail depth.")
             .with_default(ValueLiteral::Integer(2))
             .with_bounds(0, 10),
+        SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
+            .with_default(ValueLiteral::Integer(120))
+            .with_bounds(1, 120),
         SchemaProperty::boolean("story", "Include a readable trail story DTO.")
             .with_default(ValueLiteral::Boolean(false)),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
+
+static LOCAL_GRAPH_ALIAS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return a bounded local graph alias around one node.",
+    &[
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
+        SchemaProperty::integer("depth", "Graph depth.")
+            .with_default(ValueLiteral::Integer(1))
+            .with_bounds(0, 3),
+        SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
+            .with_default(ValueLiteral::Integer(50))
+            .with_bounds(1, 120),
+    ],
+    &[],
+)
+.with_any_of_required(&[&["query"], &["id"]]);
+
+static TRACE_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Return a readable trace around a symbol id or query.",
+    &[
+        SchemaProperty::string("query", "Symbol query.").with_min_length(1),
+        SchemaProperty::string("id", "Stable node id.").with_min_length(1),
+        SchemaProperty::integer(
+            "choose",
+            "Resolve by the 1-based alternative number from an ambiguity error.",
+        )
+        .with_bounds(1, 50),
+        SchemaProperty::string("direction", "Trail direction.")
+            .with_enum(&["incoming", "outgoing", "both"])
+            .with_default(ValueLiteral::String("both")),
+        SchemaProperty::integer("depth", "Trail depth.")
+            .with_default(ValueLiteral::Integer(2))
+            .with_bounds(0, 10),
+        SchemaProperty::integer("max_nodes", "Maximum graph nodes returned.")
+            .with_default(ValueLiteral::Integer(120))
+            .with_bounds(1, 120),
+        SchemaProperty::boolean("story", "Include a readable trail story DTO.")
+            .with_default(ValueLiteral::Boolean(true)),
     ],
     &[],
 )
@@ -1240,14 +1290,14 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "files",
-        description: "List indexed files and coverage from the existing local index; never refreshes, indexes, or bootstraps sidecars.",
+        description: "List indexed files and coverage from a locally fresh index; refreshes local graph before dispatch and never bootstraps sidecars.",
         input_schema: FILES_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(INDEXED_FILES_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
         name: "affected",
-        description: "Analyze explicit changed paths against the existing local index; never discovers git changes, refreshes, indexes, or bootstraps sidecars.",
+        description: "Analyze explicit changed paths against a locally fresh index; uses provided paths only, refreshes local graph before dispatch, never discovers git changes, and never bootstraps sidecars.",
         input_schema: AFFECTED_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AFFECTED_ANALYSIS_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
@@ -1263,6 +1313,27 @@ static TOOLS: &[ToolSpec] = &[
         name: "trail",
         description: "Return a graph trail around a symbol.",
         input_schema: TRAIL_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(TRAIL_CONTEXT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "callers",
+        description: "Return a bounded incoming caller graph around a symbol.",
+        input_schema: LOCAL_GRAPH_ALIAS_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "callees",
+        description: "Return a bounded outgoing callee graph around a symbol.",
+        input_schema: LOCAL_GRAPH_ALIAS_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
+    ToolSpec {
+        name: "trace",
+        description: "Return a readable trace around a symbol.",
+        input_schema: TRACE_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(TRAIL_CONTEXT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },

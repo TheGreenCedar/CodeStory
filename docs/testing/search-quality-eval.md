@@ -33,9 +33,28 @@ The test prints a line like:
 search_quality_eval recall=1.000 mrr=0.833 max_latency_ms=42 anchor_buckets=indexed_symbol_hits=3,repo_text_hits=1
 ```
 
+Production packet/search fixture schema and anchor baselines live in
+`crates/codestory-cli/tests/fixtures/packet_search_eval/`. Run the lightweight
+schema, category, baseline, and non-full-mode gating checks with:
+
+```
+cargo test -p codestory-cli --test packet_search_eval
+```
+
+The live production-path check is ignored by default because it repairs and
+requires `retrieval_mode=full` agent sidecars for the checkout:
+
+```
+cargo test -p codestory-cli --test packet_search_eval -- --ignored --nocapture packet_search_eval_live_runs_production_cli_path
+```
+
+Rows where readiness is not `ready` or retrieval mode is not `full` stay
+diagnostic and do not count toward the full-retrieval baseline.
+
 ## When To Run
 
 - Search ranking changes.
+- Packet/search fixture or anchor-baseline changes.
 - Framework route extraction changes.
 - `explore`, `context`, `files`, or `affected` output changes that depend on
   search ranking or route discovery.

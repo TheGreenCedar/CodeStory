@@ -348,6 +348,10 @@ pub struct ReadinessIndexSnapshotDto {
 /// Sidecar state snapshot used inside readiness verdicts.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ReadinessSidecarSnapshotDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,

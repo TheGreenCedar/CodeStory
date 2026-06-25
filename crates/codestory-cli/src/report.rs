@@ -154,6 +154,8 @@ fn attach_report_handoff(
         freshness: summary.freshness.as_ref(),
         setup: None,
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
+            profile: Some("local"),
+            run_id: None,
             retrieval_mode: &sidecar.retrieval_mode,
             degraded_reason: sidecar.degraded_reason.as_deref(),
             embedding_device_policy: Some(&sidecar.embedding_device_policy),

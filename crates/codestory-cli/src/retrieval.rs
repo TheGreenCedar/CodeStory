@@ -5,14 +5,15 @@ use std::time::Duration;
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    bootstrap_sidecars_with_runtime, execute_retrieval_query, sidecar_down_for_runtime,
-    sidecar_up_with_runtime, strict_sidecar_status, strict_sidecar_status_for_runtime,
+    SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime, execute_retrieval_query,
+    sidecar_down_for_runtime, sidecar_up_with_runtime, strict_sidecar_status,
+    strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
     CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalBootstrapCommand,
-    RetrievalCommand, RetrievalIndexCommand, RetrievalQueryCommand, RetrievalSidecarStateCommand,
-    RetrievalStatusCommand,
+    RetrievalCommand, RetrievalIndexCommand, RetrievalInventoryCommand, RetrievalQueryCommand,
+    RetrievalSidecarStateCommand, RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
 use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error, resolve_refresh_request};
@@ -23,6 +24,7 @@ pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
         RetrievalAction::Up(up_cmd) => run_retrieval_up(up_cmd),
         RetrievalAction::Down(down_cmd) => run_retrieval_down(down_cmd),
         RetrievalAction::Status(status_cmd) => run_retrieval_status(status_cmd),
+        RetrievalAction::Inventory(inventory_cmd) => run_retrieval_inventory(inventory_cmd),
         RetrievalAction::Index(index_cmd) => run_retrieval_index(index_cmd),
         RetrievalAction::Query(query_cmd) => run_retrieval_query(query_cmd),
     }
@@ -96,7 +98,7 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
+pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let profile = cmd
@@ -120,6 +122,19 @@ fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
 }
 
+pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
+    preflight_output(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    if cmd.apply {
+        let report = codestory_retrieval::sidecar_gc_apply(&runtime.project_root)
+            .context("retrieval inventory apply")?;
+        return emit_retrieval_gc(cmd.format, &report, cmd.output_file.as_deref());
+    }
+    let report = codestory_retrieval::sidecar_inventory(&runtime.project_root)
+        .context("retrieval inventory")?;
+    emit_retrieval_inventory(cmd.format, &report, cmd.output_file.as_deref())
+}
+
 fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
@@ -136,23 +151,31 @@ fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
 
 fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
-    activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
+    let sidecar_profile = cmd.profile.unwrap_or(CliSidecarProfile::Local);
+    activate_retrieval_profile_env(Some(sidecar_profile), cmd.run_id.as_deref());
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        sidecar_profile.into(),
+        cmd.run_id.as_deref(),
+    );
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     ensure_retrieval_index_embedding_policy()?;
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
-    let outcome = finalize_retrieval_index_for_runtime(&runtime).or_else(|error| {
-        if !retrieval_index_should_retry_full_refresh(cmd.refresh, &error) {
-            return Err(error);
-        }
-        runtime
-            .index
-            .run_indexing_blocking(IndexMode::Full)
-            .map_err(map_api_error)?;
-        finalize_retrieval_index_for_runtime(&runtime)
-            .context("retrieval index finalize after semantic-doc contract repair")
-    })?;
+    let outcome =
+        finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {
+            if !retrieval_index_should_retry_full_refresh(cmd.refresh, &error) {
+                return Err(error);
+            }
+            runtime
+                .index
+                .run_indexing_blocking(IndexMode::Full)
+                .map_err(map_api_error)?;
+            finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar)
+                .context("retrieval index finalize after semantic-doc contract repair")
+        })?;
+    ensure_local_profile_handoff(&runtime, &sidecar, &outcome)?;
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
 }
 
@@ -213,10 +236,83 @@ fn run_retrieval_index_refresh(
 pub(crate) fn finalize_retrieval_index_for_runtime(
     runtime: &RuntimeContext,
 ) -> Result<FinalizeIndexOutcome> {
+    let sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar)
+}
+
+pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
+    runtime: &RuntimeContext,
+    sidecar: &SidecarRuntimeConfig,
+) -> Result<FinalizeIndexOutcome> {
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "retrieval index")?;
-    codestory_retrieval::finalize_index(&runtime.project_root, &runtime.storage_path)
-        .context("retrieval index finalize")
+    codestory_retrieval::finalize_index_for_runtime(
+        &runtime.project_root,
+        &runtime.storage_path,
+        sidecar,
+    )
+    .context("retrieval index finalize")
+}
+
+fn ensure_local_profile_handoff(
+    runtime: &RuntimeContext,
+    indexed_sidecar: &SidecarRuntimeConfig,
+    outcome: &FinalizeIndexOutcome,
+) -> Result<()> {
+    if indexed_sidecar.profile != SidecarProfile::Local {
+        return Ok(());
+    }
+    let default_sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    if let Some(mismatch) = sidecar_runtime_mismatch(indexed_sidecar, &default_sidecar) {
+        anyhow::bail!("{mismatch}");
+    }
+    let status = strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        default_sidecar,
+    )
+    .context("retrieval local/default status after index")?;
+    if status.retrieval_mode != "full" {
+        anyhow::bail!(
+            "retrieval profile handoff failed: local/default status after index is mode={} reason={}; indexed_project_id={} sidecar={}",
+            status.retrieval_mode,
+            status.degraded_reason.as_deref().unwrap_or("unknown"),
+            outcome.project_id,
+            format_sidecar_runtime(indexed_sidecar)
+        );
+    }
+    Ok(())
+}
+
+fn sidecar_runtime_mismatch(
+    indexed: &SidecarRuntimeConfig,
+    default: &SidecarRuntimeConfig,
+) -> Option<String> {
+    let same_paths = indexed.profile == default.profile
+        && indexed.namespace == default.namespace
+        && indexed.layout.zoekt_data_dir == default.layout.zoekt_data_dir
+        && indexed.layout.qdrant_data_dir == default.layout.qdrant_data_dir
+        && indexed.layout.scip_artifacts_root == default.layout.scip_artifacts_root
+        && indexed.layout.state_file == default.layout.state_file;
+    (!same_paths).then(|| {
+        format!(
+            "retrieval profile handoff mismatch: indexed local artifacts use {}; default bare retrieval resolves to {}; retrieval index must not report success until local/default namespace and paths match",
+            format_sidecar_runtime(indexed),
+            format_sidecar_runtime(default)
+        )
+    })
+}
+
+pub(crate) fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
+    format!(
+        "profile={} namespace={} state={} zoekt={} qdrant={} scip={}",
+        runtime.profile.as_str(),
+        runtime.namespace,
+        runtime.layout.state_file.display(),
+        runtime.layout.zoekt_data_dir.display(),
+        runtime.layout.qdrant_data_dir.display(),
+        runtime.layout.scip_artifacts_root.display()
+    )
 }
 
 fn retrieval_index_should_retry_full_refresh(
@@ -483,6 +579,108 @@ fn emit_retrieval_status(
     emit(format, report, markdown, output_file)
 }
 
+fn emit_retrieval_inventory(
+    format: OutputFormat,
+    report: &codestory_retrieval::SidecarInventoryReport,
+    output_file: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut markdown = format!(
+        "# Retrieval sidecar inventory\n\n- dry_run: {}\n- docker_available: {}\n- cache_root: `{}`\n",
+        report.dry_run, report.docker_available, report.cache_root
+    );
+    if let Some(error) = report.docker_error.as_deref() {
+        markdown.push_str(&format!("- docker_error: `{error}`\n"));
+    }
+    if report.namespaces.is_empty() {
+        markdown.push_str("\nNo sidecar namespaces found.\n");
+    }
+    for namespace in &report.namespaces {
+        let ports = namespace
+            .containers
+            .iter()
+            .filter_map(|container| container.ports.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        markdown.push_str(&format!(
+            "\n## {}\n\n- state: `{:?}`\n- owner/profile: `{}` / `{}`\n- state_path: `{}`\n- cleanup_command: `{}`\n- age_ms: `{}`\n- compose_project: `{}`\n- containers: {}\n- networks: {}\n- ports: `{}`\n- model_dir: `{}` required_gguf=`{}` present={}\n",
+            namespace.namespace,
+            namespace.state,
+            namespace.owner.as_deref().unwrap_or("<unknown>"),
+            namespace.profile.as_deref().unwrap_or("<unknown>"),
+            namespace.state_path,
+            namespace.cleanup_command.as_deref().unwrap_or("<none>"),
+            namespace
+                .age_ms
+                .map(|age| age.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            namespace.compose_project.as_deref().unwrap_or("<unknown>"),
+            namespace.containers.len(),
+            namespace.networks.len(),
+            if ports.is_empty() { "<none>" } else { &ports },
+            namespace.model.model_dir.as_deref().unwrap_or("<none>"),
+            namespace.model.required_gguf,
+            namespace.model.required_gguf_present,
+        ));
+        if !namespace.reasons.is_empty() {
+            markdown.push_str(&format!("- reasons: `{}`\n", namespace.reasons.join("; ")));
+        }
+        if let Some(reason) = namespace.safe_candidate_reason.as_deref() {
+            markdown.push_str(&format!("- safe_candidate_reason: `{reason}`\n"));
+        }
+        if let Some(reason) = namespace.blocking_reason.as_deref() {
+            markdown.push_str(&format!("- blocking_reason: `{reason}`\n"));
+        }
+    }
+    emit(format, report, markdown, output_file)
+}
+
+fn emit_retrieval_gc(
+    format: OutputFormat,
+    report: &codestory_retrieval::SidecarGcReport,
+    output_file: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut markdown = format!(
+        "# Retrieval sidecar GC\n\n- dry_run: {}\n- docker_available: {}\n- cache_root: `{}`\n- removed: {}\n- blocked: {}\n",
+        report.dry_run,
+        report.docker_available,
+        report.cache_root,
+        report.removed.len(),
+        report.blocked.len()
+    );
+    if let Some(error) = report.docker_error.as_deref() {
+        markdown.push_str(&format!("- docker_error: `{error}`\n"));
+    }
+    markdown.push_str("\n## Removed namespaces\n");
+    if report.removed.is_empty() {
+        markdown.push_str("\nNone.\n");
+    }
+    for namespace in &report.removed {
+        markdown.push_str(&format!(
+            "\n- `{}` ({:?}): {}; paths={} docker_resources={}\n",
+            namespace.namespace,
+            namespace.state,
+            namespace.reason,
+            namespace.removed_paths.len(),
+            namespace.removed_docker_resources.len()
+        ));
+    }
+    markdown.push_str("\n## Blocked namespaces\n");
+    if report.blocked.is_empty() {
+        markdown.push_str("\nNone.\n");
+    }
+    for namespace in &report.blocked {
+        markdown.push_str(&format!(
+            "\n- `{}` ({:?}): {}",
+            namespace.namespace, namespace.state, namespace.reason
+        ));
+        if !namespace.errors.is_empty() {
+            markdown.push_str(&format!("; errors={}", namespace.errors.join("; ")));
+        }
+        markdown.push('\n');
+    }
+    emit(format, report, markdown, output_file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +741,27 @@ mod tests {
             message.contains("embedding_device_unverified"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn local_profile_handoff_reports_default_namespace_path_mismatch() {
+        let project = tempfile::TempDir::new().expect("project");
+        let local =
+            codestory_retrieval::sidecar_runtime_for_project(project.path(), SidecarProfile::Local);
+        let agent = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some("issue-534"),
+        );
+
+        let message = sidecar_runtime_mismatch(&local, &agent).expect("mismatch");
+
+        assert!(message.contains("retrieval profile handoff mismatch"));
+        assert!(message.contains("profile=local"));
+        assert!(message.contains("profile=agent"));
+        assert!(message.contains("namespace=codestory-agent"));
+        assert!(message.contains("zoekt="));
+        assert!(sidecar_runtime_mismatch(&local, &local).is_none());
     }
 
     struct EnvGuard {

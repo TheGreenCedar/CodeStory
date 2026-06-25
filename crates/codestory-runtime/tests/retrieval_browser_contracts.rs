@@ -280,8 +280,8 @@ fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
         "error should name mandatory sidecar unavailability: {error:?}"
     );
     assert!(
-        error.message.contains("expected mode=full"),
-        "error should name the full-mode requirement: {error:?}"
+        error.message.contains("expected profile=agent mode=full"),
+        "error should name the agent full-mode requirement: {error:?}"
     );
     let details = error.details.as_ref().expect("retrieval error details");
     assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));

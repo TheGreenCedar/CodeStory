@@ -7,6 +7,7 @@ const fs = require('fs');
 const https = require('https');
 const os = require('os');
 const path = require('path');
+const { dirtyMarkerPathForProject } = require('../hooks/codestory-runtime.cjs');
 
 const pluginRoot = path.dirname(__dirname);
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
@@ -123,55 +124,55 @@ function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
-function recordSidecarRepair(state, patch = {}) {
-  const policy = readSidecarPolicy();
-  if (policy.state !== 'enabled') return;
-  writeSidecarPolicy('enabled', {
-    last_repair: {
-      ...(policy.lastRepair || {}),
-      ...patch,
-      state,
-      updated_at: new Date().toISOString(),
-    },
-  });
+function dirtyMarkerEnv(projectRoot = process.cwd()) {
+  const markerPath = dirtyMarkerPathForProject(projectRoot, pluginDataDir());
+  const normalizedRoot = (() => {
+    try {
+      return fs.realpathSync(path.resolve(projectRoot));
+    } catch {
+      return path.resolve(projectRoot);
+    }
+  })();
+  return {
+    path: markerPath || '',
+    projectRoot: markerPath ? normalizedRoot : '',
+  };
 }
 
-function scheduleSidecarRepair(resolved, policy) {
-  if (policy.state !== 'enabled') return;
-  const projectRoot = process.cwd();
-  const args = ['ready', '--goal', 'agent', '--repair', '--project', projectRoot, '--format', 'json'];
-  recordSidecarRepair('scheduled', {
-    project_root: projectRoot,
-    command: repairCommandForProject(projectRoot),
-    started_at: new Date().toISOString(),
-  });
-  try {
-    const repair = spawn(resolved.path, args, {
-      stdio: 'ignore',
-      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
-      windowsHide: true,
-      env: { ...process.env, CODESTORY_PLUGIN_SIDECAR_REPAIR: '1' },
-    });
-    repair.on('exit', (code, signal) => {
-      recordSidecarRepair(code === 0 ? 'completed' : 'failed', {
-        exit_code: code,
-        signal: signal || null,
-        finished_at: new Date().toISOString(),
-      });
-    });
-    repair.on('error', (error) => {
-      recordSidecarRepair('spawn_failed', {
-        error: error.message,
-        finished_at: new Date().toISOString(),
-      });
-    });
-    repair.unref();
-  } catch (error) {
-    recordSidecarRepair('spawn_failed', {
-      error: error.message,
-      finished_at: new Date().toISOString(),
-    });
-  }
+function runtimeTruthStatus(plugin, repair, options = {}) {
+  return {
+    runtime_source: plugin.cli_source || 'unavailable',
+    plugin_root: plugin.plugin_root || null,
+    managed_cli_path: plugin.managed_binary_path || null,
+    launcher_source: plugin.cli_source || 'unavailable',
+    sidecar_policy: options.sidecarPolicy || 'unavailable',
+    sidecar_status: {
+      profile: 'agent',
+      run_id: 'unavailable',
+      mode: 'unavailable',
+      degraded_reason: options.degradedReason || repair.repair_reason || null,
+    },
+    readiness_lanes: {
+      local_graph: {
+        status: repair.status || 'unavailable',
+        refresh_state: options.localRefresh?.state || 'unavailable',
+        blocks_local_surfaces: options.localRefresh?.blocks_local_surfaces ?? null,
+      },
+      local_default: {
+        status: 'unavailable',
+        profile: 'local',
+        sidecar_mode: 'unavailable',
+        degraded_reason: 'unavailable',
+      },
+      agent_packet_search: {
+        status: 'unavailable',
+        profile: 'agent',
+        run_id: 'unavailable',
+        sidecar_mode: 'unavailable',
+        degraded_reason: options.degradedReason || repair.repair_reason || null,
+      },
+    },
+  };
 }
 
 function resolveManifest(manifestPath) {
@@ -374,9 +375,10 @@ async function resolveCli() {
   }
 
   warnings.push('managed_cli_unavailable_using_path_fallback');
+  const pathFallback = pathCliCandidates()[0] || 'codestory-cli';
   return {
     source: 'path_fallback',
-    path: 'codestory-cli',
+    path: pathFallback,
     sha256: null,
     version,
     cliVersion: null,
@@ -440,63 +442,80 @@ function failOpenReasonForProbe(resolved, probe) {
   return null;
 }
 
-function localRepairCommand(projectRoot = process.cwd()) {
-  return `codestory-cli ready --goal local --repair --project ${JSON.stringify(projectRoot)} --format json`;
+function localWaitFreshCommand(projectRoot = process.cwd()) {
+  return `codestory-cli ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
-function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
-  const result = spawnSync(resolved.path, ['ready', '--goal', 'local', '--project', projectRoot, '--format', 'json'], {
+function localWaitFreshTimeoutMs() {
+  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
+}
+
+function runLocalNavigationWaitFresh(resolved, projectRoot) {
+  const args = ['ready', '--goal', 'local', '--wait-fresh'];
+  args.push('--project', projectRoot, '--format', 'json');
+  const result = spawnSync(resolved.path, args, {
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
-    timeout: 10000,
+    timeout: localWaitFreshTimeoutMs(),
     windowsHide: true,
   });
-  const setup = {
-    ready_probe_status: result.status,
-    ready_probe_error: result.error ? result.error.message : null,
-    ready_probe_stdout: result.stdout || '',
-    ready_probe_stderr: result.stderr || '',
+  return { args, result };
+}
+
+function localReadySetup(prefix, args, result) {
+  return {
+    [`${prefix}_args`]: args,
+    [`${prefix}_status`]: result.status,
+    [`${prefix}_error`]: result.error ? result.error.message : null,
+    [`${prefix}_stdout`]: result.stdout || '',
+    [`${prefix}_stderr`]: result.stderr || '',
   };
-  if (result.error || result.status !== 0) {
-    const repair = localRepairCommand(projectRoot);
-    return {
-      ready: false,
-      reason: 'local_navigation_probe_failed',
-      status: 'repair_setup',
-      summary: 'CodeStory MCP could not verify local navigation readiness before starting stdio.',
-      minimumNext: [repair],
-      fullRepair: [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
-      setup,
-    };
-  }
+}
+
+function parseLocalReadyResult(result) {
   let parsed;
   try {
     parsed = JSON.parse(result.stdout || '{}');
   } catch (error) {
-    const repair = localRepairCommand(projectRoot);
     return {
-      ready: false,
-      reason: 'local_navigation_probe_invalid_json',
-      status: 'repair_setup',
-      summary: `CodeStory MCP local readiness probe returned invalid JSON: ${error.message}`,
-      minimumNext: [repair],
-      fullRepair: [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
-      setup,
+      ok: false,
+      invalidJson: error.message,
+      verdict: null,
     };
   }
   const verdict = Array.isArray(parsed.verdicts)
     ? parsed.verdicts.find((item) => item && item.goal === 'local_navigation') || parsed.verdicts[0]
     : null;
-  if (verdict && verdict.status === 'ready') {
-    return { ready: true };
-  }
-  const repair = localRepairCommand(projectRoot);
-  const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
+  return {
+    ok: Boolean(verdict && verdict.status === 'ready'),
+    invalidJson: null,
+    verdict,
+    localRefresh: parsed.local_refresh || null,
+  };
+}
+
+function localRefreshFailure(state, reason, readinessStatus = 'repair_setup') {
+  return {
+    state,
+    blocks_local_surfaces: true,
+    readiness_status: readinessStatus,
+    reason,
+    changed_file_count: 0,
+    new_file_count: 0,
+    removed_file_count: 0,
+    fatal_error_count: 0,
+  };
+}
+
+function localNavigationFailure(projectRoot, reason, status, summary, setup, verdict = null, localRefresh = null) {
+  const repair = localWaitFreshCommand(projectRoot);
   return {
     ready: false,
-    reason: `local_navigation_${status}`,
+    reason,
     status,
-    summary: verdict?.summary || 'CodeStory local navigation is not ready.',
+    summary,
+    localRefresh,
     minimumNext: Array.isArray(verdict?.minimum_next) && verdict.minimum_next.length > 0
       ? verdict.minimum_next
       : [repair],
@@ -505,13 +524,66 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
       : [repair, `codestory-cli doctor --project ${JSON.stringify(projectRoot)}`],
     setup: {
       ...setup,
-      readiness_verdict: verdict || null,
+      readiness_verdict: verdict,
     },
   };
 }
 
+function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
+  const probe = runLocalNavigationWaitFresh(resolved, projectRoot);
+  const setup = {
+    ...localReadySetup('local_wait_fresh', probe.args, probe.result),
+  };
+  if (probe.result.error || probe.result.status !== 0) {
+    const timeout = probe.result.error && probe.result.error.code === 'ETIMEDOUT';
+    return localNavigationFailure(
+      projectRoot,
+      timeout ? 'local_navigation_wait_fresh_timeout' : 'local_navigation_wait_fresh_failed',
+      'repair_setup',
+      timeout
+        ? 'CodeStory MCP timed out while refreshing local navigation before starting stdio.'
+        : 'CodeStory MCP could not refresh local navigation before starting stdio.',
+      setup,
+      null,
+      localRefreshFailure('failed', timeout ? 'wait_fresh_timeout' : 'wait_fresh_failed'),
+    );
+  }
+  const parsedProbe = parseLocalReadyResult(probe.result);
+  if (parsedProbe.invalidJson) {
+    return localNavigationFailure(
+      projectRoot,
+      'local_navigation_wait_fresh_invalid_json',
+      'repair_setup',
+      `CodeStory MCP local wait-fresh returned invalid JSON: ${parsedProbe.invalidJson}`,
+      setup,
+      null,
+      localRefreshFailure('failed', `invalid_json:${parsedProbe.invalidJson}`),
+    );
+  }
+  if (parsedProbe.ok) {
+    return { ready: true };
+  }
+  const verdict = parsedProbe.verdict || null;
+  const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
+  const state = typeof parsedProbe.localRefresh?.state === 'string' ? parsedProbe.localRefresh.state : status;
+  return localNavigationFailure(
+    projectRoot,
+    `local_navigation_wait_fresh_${state}`,
+    status,
+    verdict?.summary || 'CodeStory local navigation is not ready after wait-fresh.',
+    setup,
+    verdict,
+    parsedProbe.localRefresh || null,
+  );
+}
+
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   const projectRoot = process.cwd();
+  const pathCandidates = pathCliCandidates().map((candidate) => ({
+    path: candidate,
+    version: cliVersion(candidate),
+    active: samePathText(candidate, resolved.path),
+  }));
   const minimumNext = options.minimumNext || [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
     process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
@@ -519,6 +591,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   ];
   const fullRepair = options.fullRepair || minimumNext;
   const recommendedNext = options.recommendedNext || fullRepair;
+  const sidecarPolicy = readSidecarPolicy();
   const plugin = {
     plugin_version: resolved.version,
     plugin_root: pluginRoot,
@@ -541,6 +614,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     status: options.status || 'repair_setup',
     summary: options.summary || 'CodeStory plugin MCP could not start a compatible codestory-cli stdio runtime.',
     repair_reason: reason,
+    local_refresh: options.localRefresh || null,
     minimum_next: minimumNext,
     full_repair: fullRepair,
     setup: {
@@ -559,7 +633,10 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'files',
     'symbol',
     'definition',
+    'callers',
+    'callees',
     'trail',
+    'trace',
     'references',
     'snippet',
     'affected',
@@ -587,8 +664,15 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     cli_version: probe.version,
     server_executable: null,
     server_executable_sha256: null,
+    source_checkout_version: sourceCheckoutVersion(projectRoot),
+    path_candidates: pathCandidates,
     sidecar_contract_version: null,
     plugin_runtime: plugin,
+    runtime_truth: runtimeTruthStatus(plugin, repair, {
+      sidecarPolicy: sidecarPolicy.state || 'unavailable',
+      localRefresh: options.localRefresh || null,
+      degradedReason: reason,
+    }),
     runtime_boundary: {
       restart_required_for_runtime_change: true,
       message: 'A running MCP server keeps using the CLI process it was launched with; plugin refresh, managed runtime provisioning, CODESTORY_CLI, or PATH changes require a host reload/restart and fresh codestory://status readback.',
@@ -597,6 +681,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     project_root: projectRoot,
     retrieval_mode: 'unavailable',
     degraded_reason: reason,
+    local_refresh: options.localRefresh || null,
     readiness: [repair],
     allowed_surfaces: allowedSurfaces,
     recommended_next_calls: [
@@ -606,6 +691,75 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
         : { method: 'cli', command }),
     ],
   };
+}
+
+function pathCliCandidates() {
+  const pathValue = process.env.PATH || '';
+  const candidates = [];
+  for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
+    for (const name of cliBinaryNames()) {
+      const candidate = path.join(directory, name);
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        candidates.push(candidate);
+      }
+    }
+  }
+  return dedupePaths(candidates);
+}
+
+function cliBinaryNames() {
+  return process.platform === 'win32'
+    ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli.bat', 'codestory-cli']
+    : ['codestory-cli'];
+}
+
+function cliVersion(candidate) {
+  const result = spawnSync(candidate, ['--version'], {
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(candidate),
+    timeout: 3000,
+    windowsHide: true,
+  });
+  if (result.status !== 0 || result.error) return null;
+  return normalizeVersion(`${result.stdout || ''}\n${result.stderr || ''}`);
+}
+
+function samePathText(left, right) {
+  const normalize = (value) => String(value || '').replace(/[\\/]+$/u, '').toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
+function dedupePaths(paths) {
+  const deduped = [];
+  for (const candidate of paths) {
+    if (!deduped.some((seen) => samePathText(seen, candidate))) {
+      deduped.push(candidate);
+    }
+  }
+  return deduped;
+}
+
+function sourceCheckoutVersion(projectRoot) {
+  try {
+    return cargoPackageVersion(fs.readFileSync(path.join(projectRoot, 'crates', 'codestory-cli', 'Cargo.toml'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function cargoPackageVersion(manifest) {
+  let inPackage = false;
+  for (const line of manifest.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (/^\[[^\]]+\]$/u.test(trimmed)) {
+      inPackage = trimmed === '[package]';
+      continue;
+    }
+    if (!inPackage) continue;
+    const match = trimmed.match(/^version\s*=\s*"([^"]+)"/u);
+    if (match) return match[1];
+  }
+  return null;
 }
 
 function diagnosticText(status) {
@@ -618,6 +772,8 @@ function diagnosticText(status) {
     `cli_source: ${status.plugin_runtime.cli_source}`,
     `cli_path: ${setup.active_path}`,
     `cli_version: ${setup.active_version || '<unknown>'}`,
+    `source_checkout_version: ${status.source_checkout_version || '<none>'}`,
+    `path_candidates: ${(status.path_candidates || []).map((candidate) => `${candidate.path}@${candidate.version || '<unknown>'}`).join(', ') || '<none>'}`,
     `next: ${status.readiness[0].minimum_next[0]}`,
   ].join('\n');
 }
@@ -649,6 +805,7 @@ function failOpenToolResult(status) {
       code: 'codestory_mcp_runtime_unavailable',
       status: readiness.status,
       repair_reason: status.degraded_reason,
+      local_refresh: status.local_refresh || null,
       plugin_runtime: status.plugin_runtime,
       setup: readiness.setup,
       minimum_next: readiness.minimum_next,
@@ -770,13 +927,13 @@ async function main() {
         ...localReadiness.fullRepair,
         'Restart/reload the Codex host/app after repairing the local CodeStory index, then read codestory://status in a fresh thread.',
       ],
+      localRefresh: localReadiness.localRefresh,
       setup: localReadiness.setup,
     }));
     return;
   }
-  const sidecarPolicy = readSidecarPolicy();
-  scheduleSidecarRepair(resolved, sidecarPolicy);
   const sidecarStatus = readSidecarPolicy();
+  const dirtyMarker = dirtyMarkerEnv(process.cwd());
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
     stdio: 'inherit',
@@ -808,6 +965,8 @@ async function main() {
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
+      CODESTORY_PLUGIN_DIRTY_MARKER_PATH: dirtyMarker.path,
+      CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT: dirtyMarker.projectRoot,
     },
   });
 

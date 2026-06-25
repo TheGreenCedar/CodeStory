@@ -127,20 +127,19 @@ impl SidecarRuntimeConfig {
     }
 
     pub fn for_project_auto(project_root: &Path) -> Self {
+        let explicit_profile = env_profile();
         let env_run_id = env_agent_run_id();
-        let latest_run_id = env_run_id
-            .is_none()
-            .then(|| latest_agent_run_id(project_root))
-            .flatten();
-        let profile = if env_profile() == Some(SidecarProfile::Agent)
-            || latest_run_id.is_some()
-            || running_in_ci_agent()
-        {
-            SidecarProfile::Agent
+        let latest_run_id = if explicit_profile.is_none() && env_run_id.is_none() {
+            latest_agent_run_id(project_root)
         } else {
-            SidecarProfile::Local
+            None
         };
-        let run_id = env_run_id.or(latest_run_id);
+        let (profile, run_id) = auto_runtime_selection(
+            explicit_profile,
+            env_run_id,
+            latest_run_id,
+            running_in_ci_agent(),
+        );
         Self::for_project_profile_with_run_id(Some(project_root), profile, run_id.as_deref())
     }
 
@@ -333,6 +332,22 @@ fn running_in_ci_agent() -> bool {
         || env_flag("CODESTORY_AGENT_RUN", false)
         || env_flag("CI", false)
         || env_flag("GITHUB_ACTIONS", false)
+}
+
+fn auto_runtime_selection(
+    explicit_profile: Option<SidecarProfile>,
+    env_run_id: Option<String>,
+    latest_run_id: Option<String>,
+    ci_agent: bool,
+) -> (SidecarProfile, Option<String>) {
+    match explicit_profile {
+        Some(SidecarProfile::Local) => (SidecarProfile::Local, None),
+        Some(SidecarProfile::Agent) => (SidecarProfile::Agent, env_run_id.or(latest_run_id)),
+        None if env_run_id.is_some() || latest_run_id.is_some() || ci_agent => {
+            (SidecarProfile::Agent, env_run_id.or(latest_run_id))
+        }
+        None => (SidecarProfile::Local, None),
+    }
 }
 
 fn namespace_for(
@@ -639,5 +654,27 @@ mod tests {
         );
         assert!(first.cleanup_command.contains("--profile agent"));
         assert!(first.cleanup_command.contains("--run-id review-fix"));
+    }
+
+    #[test]
+    fn explicit_local_profile_overrides_latest_agent_run() {
+        let (profile, run_id) = auto_runtime_selection(
+            Some(SidecarProfile::Local),
+            None,
+            Some("latest-agent".to_string()),
+            false,
+        );
+
+        assert_eq!(profile, SidecarProfile::Local);
+        assert_eq!(run_id, None);
+    }
+
+    #[test]
+    fn latest_agent_run_selects_agent_without_explicit_profile() {
+        let (profile, run_id) =
+            auto_runtime_selection(None, None, Some("latest-agent".to_string()), false);
+
+        assert_eq!(profile, SidecarProfile::Agent);
+        assert_eq!(run_id.as_deref(), Some("latest-agent"));
     }
 }

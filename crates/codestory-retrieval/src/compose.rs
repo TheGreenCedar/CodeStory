@@ -16,6 +16,17 @@ use std::time::{Duration, Instant};
 /// Relative path from repository root to the retrieval compose file.
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
 const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-compose.yml");
+const DOCKER_ADDRESS_POOL_EXHAUSTED_REASON: &str = "docker_address_pool_exhausted";
+const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
+    "all predefined address pools have been fully subnetted";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EmbedModelInventory {
+    pub model_dir: Option<String>,
+    pub required_gguf: String,
+    pub required_gguf_present: bool,
+    pub candidate_dirs: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapReport {
@@ -274,11 +285,43 @@ fn docker_compose_up(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "docker compose up failed (exit {:?}):\n{stdout}{stderr}",
-            output.status.code()
+            "{}",
+            docker_compose_up_failure_message(output.status.code(), &stdout, &stderr, repo_root)
         );
     }
     Ok(())
+}
+
+fn docker_compose_up_failure_message(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    repo_root: Option<&Path>,
+) -> String {
+    if docker_address_pool_exhausted(stdout) || docker_address_pool_exhausted(stderr) {
+        let project = repo_root
+            .map(|path| quoted_project_arg(&path.display().to_string()))
+            .unwrap_or_else(|| "<repo>".to_string());
+        return format!(
+            "docker compose up failed (exit {exit_code:?}): reason={DOCKER_ADDRESS_POOL_EXHAUSTED_REASON}\n\
+Docker's predefined address pools are exhausted. Run read-only inventory: \
+`codestory-cli sidecar inventory --project {project} --format markdown` \
+or `codestory-cli sidecar inventory --project {project} --format json`.\n\
+Raw docker compose output:\n{stdout}{stderr}"
+        );
+    }
+
+    format!("docker compose up failed (exit {exit_code:?}):\n{stdout}{stderr}")
+}
+
+fn quoted_project_arg(project: &str) -> String {
+    format!("\"{}\"", project.replace('"', "\\\""))
+}
+
+fn docker_address_pool_exhausted(details: &str) -> bool {
+    details
+        .to_ascii_lowercase()
+        .contains(DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE)
 }
 
 pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
@@ -355,15 +398,53 @@ fn docker_bind_path(path: &Path) -> String {
 }
 
 fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
-        let path = PathBuf::from(path);
-        if embed_model_dir_ready(&path) {
-            return Ok(path);
-        }
-        bail!(
+    let inventory = embed_model_inventory(repo_root, layout);
+    if let Some(model_dir) = inventory
+        .required_gguf_present
+        .then(|| inventory.model_dir.as_ref())
+        .flatten()
+    {
+        return Ok(PathBuf::from(model_dir));
+    }
+    if std::env::var("CODESTORY_EMBED_MODEL_DIR").is_ok() {
+        anyhow::bail!(
             "CODESTORY_EMBED_MODEL_DIR does not contain {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
             crate::embeddings::BGE_BASE_EN_V1_5_GGUF
         );
+    }
+    anyhow::bail!(
+        "No llama.cpp embedding model directory contains {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+        crate::embeddings::BGE_BASE_EN_V1_5_GGUF
+    )
+}
+
+pub fn embed_model_inventory(
+    repo_root: Option<&Path>,
+    layout: &SidecarLayout,
+) -> EmbedModelInventory {
+    let candidates = embed_model_candidates(repo_root, layout);
+    let model_dir = candidates
+        .iter()
+        .find(|candidate| embed_model_dir_ready(candidate))
+        .or_else(|| candidates.first())
+        .map(|path| path.display().to_string());
+    let required_gguf_present = model_dir
+        .as_ref()
+        .is_some_and(|path| embed_model_dir_ready(Path::new(path)));
+    EmbedModelInventory {
+        model_dir,
+        required_gguf: crate::embeddings::BGE_BASE_EN_V1_5_GGUF.to_string(),
+        required_gguf_present,
+        candidate_dirs: candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    }
+}
+
+fn embed_model_candidates(repo_root: Option<&Path>, layout: &SidecarLayout) -> Vec<PathBuf> {
+    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
+        return vec![PathBuf::from(path)];
     }
     let workdir = repo_root
         .or_else(|| Some(Path::new(".")))
@@ -373,14 +454,21 @@ fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<P
         .parent()
         .map(|parent| parent.join("embed-models"))
         .unwrap_or_else(|| layout.qdrant_data_dir.join("embed-models"));
-    embed_model_dir_from_candidates([
+    let mut candidates = Vec::new();
+    for candidate in [
         workdir.join("target").join("retrieval-models"),
         workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
         user_cache_root().join("embed-models"),
         fallback,
-    ])
+    ] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
+#[cfg(test)]
 fn embed_model_dir_from_candidates(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> Result<PathBuf> {
@@ -483,6 +571,45 @@ mod tests {
             docker_bind_path(Path::new(r"\\?\C:\Users\alber\codestory\models")),
             "C:/Users/alber/codestory/models"
         );
+    }
+
+    #[test]
+    fn compose_failure_classifies_docker_address_pool_exhaustion() {
+        let project = Path::new("C:/repo/example project");
+        let stdout = "compose stdout\n";
+        let stderr =
+            "failed to create network: all predefined address pools have been fully subnetted";
+
+        let message = docker_compose_up_failure_message(Some(1), stdout, stderr, Some(project));
+
+        assert!(message.contains("reason=docker_address_pool_exhausted"));
+        assert!(message.contains(stdout));
+        assert!(message.contains(stderr));
+        assert!(message.contains(
+            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format markdown"
+        ));
+        assert!(message.contains(
+            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format json"
+        ));
+        for forbidden in [" prune", " remove", " down", " delete", " restart"] {
+            assert!(
+                !message.to_ascii_lowercase().contains(forbidden),
+                "guidance must stay non-destructive: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_failure_preserves_generic_stderr_without_reason() {
+        let stderr = "compose service failed for another reason";
+
+        let message = docker_compose_up_failure_message(Some(17), "stdout\n", stderr, None);
+
+        assert!(message.contains("docker compose up failed (exit Some(17))"));
+        assert!(message.contains("stdout\n"));
+        assert!(message.contains(stderr));
+        assert!(!message.contains("docker_address_pool_exhausted"));
+        assert!(!message.contains("sidecar inventory"));
     }
 
     #[test]

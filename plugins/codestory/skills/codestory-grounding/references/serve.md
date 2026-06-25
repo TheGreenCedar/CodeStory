@@ -16,9 +16,9 @@ is missing, unversioned, or older than the plugin package, the adapter returns
 `repair_setup` MCP diagnostics instead of closing transport. Once MCP is live,
 `codestory://status` is the runtime truth: use `server_version`, `cli_version`,
 `server_executable`,
-`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
-`allowed_surfaces` from status before any local grounding, packet, or search
-call.
+`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`,
+`runtime_truth`, `dirty_marker`, and `allowed_surfaces` from status before any
+local grounding, packet, or search call.
 
 ## Usage
 
@@ -54,7 +54,7 @@ call.
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
 | Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `ready --goal local --repair --project <target-workspace> --format json`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
-| Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `trail`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
+| Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `callers`, `callees`, `trail`, `trace`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
 
 ## Stdio Runtime Contract
 
@@ -65,9 +65,11 @@ call.
 | `server_executable` / `server_executable_sha256` | Active MCP server executable path and checksum. Use them to diagnose stale runtime or binary drift. |
 | `sidecar_contract_version` | Active sidecar schema contract version compiled into the CLI. |
 | `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Provisioned records include `build_source=github_release` and `repo_ref`. |
+| `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, sidecar policy/status, and local/agent readiness lanes. |
 | `sidecar_setup` | Plugin sidecar setup policy (`ask`, `enabled`, or `disabled`) plus last repair state and opt-in/disable commands. |
+| `dirty_marker` | Optional plugin hook freshness marker. `dirty_stale` means local graph surfaces report `repair_index` until the index is refreshed; packet/search/context readiness remains sidecar-gated. |
 | `runtime_boundary` | Restart/reload reminder for changes to the managed binary, override, or PATH. |
-| `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
+| `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is not

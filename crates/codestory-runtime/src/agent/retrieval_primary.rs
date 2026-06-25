@@ -68,9 +68,9 @@ fn shadow_env_enabled() -> Option<bool> {
 
 /// Whether sidecar retrieval should serve packet/agent results.
 ///
-/// - `CODESTORY_RETRIEVAL=1` forces a sidecar-primary attempt when live mode is `full`.
+/// - `CODESTORY_RETRIEVAL=1` forces a sidecar-primary attempt when the agent sidecar is `full`.
 /// - `CODESTORY_RETRIEVAL=0` is unsupported; packet paths fail closed.
-/// - Unset: sidecar primary when the manifest exists and all sidecars are healthy.
+/// - Unset: sidecar primary when the manifest exists and the agent sidecar is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
     match retrieval_env_override() {
         Some(false) => {
@@ -81,11 +81,13 @@ pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> b
             sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
         }
         None => {
-            // Default product path: sidecar primary when live local state is strong enough to serve.
+            // Default product path: sidecar primary only from full agent-scoped retrieval.
             let auto_on =
                 sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller);
             if auto_on {
-                tracing::info!("retrieval primary auto-on (unset CODESTORY_RETRIEVAL; mode full)");
+                tracing::info!(
+                    "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; agent sidecar full)"
+                );
             }
             auto_on
         }
@@ -110,8 +112,9 @@ pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -
         .degraded_reason
         .map(|reason| format!("; reason={reason}"))
         .unwrap_or_default();
+    let profile = status.profile.as_deref().unwrap_or("unknown");
     Some(format!(
-        "sidecar retrieval primary is unavailable or degraded (mode={}); expected mode=full{reason}",
+        "sidecar retrieval primary is unavailable or degraded (profile={profile} mode={}); expected profile=agent mode=full{reason}",
         status.mode
     ))
 }
@@ -219,17 +222,23 @@ fn sidecar_mode_is_required_full(controller: &AppController) -> bool {
     let Ok(storage_path) = controller.require_storage_path() else {
         return false;
     };
-    sidecar_mode_can_serve_primary(
-        &sidecar_mode_status_for_project(&project_root, &storage_path).mode,
-    )
+    sidecar_status_can_serve_primary(&sidecar_mode_status_for_project(
+        &project_root,
+        &storage_path,
+    ))
 }
 
 fn sidecar_mode_can_serve_primary(mode: &str) -> bool {
     mode == "full"
 }
 
+fn sidecar_status_can_serve_primary(status: &SidecarModeStatus) -> bool {
+    status.profile.as_deref() == Some("agent") && sidecar_mode_can_serve_primary(&status.mode)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidecarModeStatus {
+    profile: Option<String>,
     mode: String,
     degraded_reason: Option<String>,
 }
@@ -237,10 +246,15 @@ struct SidecarModeStatus {
 fn sidecar_mode_status_for_project(project_root: &Path, storage_path: &Path) -> SidecarModeStatus {
     match strict_sidecar_status(project_root, Some(storage_path)) {
         Ok(report) => SidecarModeStatus {
+            profile: report
+                .ownership
+                .as_ref()
+                .map(|ownership| ownership.profile.clone()),
             mode: report.retrieval_mode,
             degraded_reason: report.degraded_reason,
         },
         Err(error) => SidecarModeStatus {
+            profile: None,
             mode: "unavailable".into(),
             degraded_reason: Some(format!("sidecar_status_error: {error}")),
         },
@@ -1980,6 +1994,32 @@ mod tests {
         assert!(!sidecar_mode_can_serve_primary("no_semantic"));
         assert!(!sidecar_mode_can_serve_primary("lexical_only"));
         assert!(!sidecar_mode_can_serve_primary("unavailable"));
+    }
+
+    #[test]
+    fn sidecar_primary_requires_agent_profile_even_when_local_mode_is_full() {
+        let local_full = SidecarModeStatus {
+            profile: Some("local".into()),
+            mode: "full".into(),
+            degraded_reason: None,
+        };
+        let agent_full = SidecarModeStatus {
+            profile: Some("agent".into()),
+            mode: "full".into(),
+            degraded_reason: None,
+        };
+        let missing_profile_full = SidecarModeStatus {
+            profile: None,
+            mode: "full".into(),
+            degraded_reason: None,
+        };
+
+        assert!(
+            !sidecar_status_can_serve_primary(&local_full),
+            "local/default full sidecar must not serve packet/search/context primary retrieval"
+        );
+        assert!(sidecar_status_can_serve_primary(&agent_full));
+        assert!(!sidecar_status_can_serve_primary(&missing_profile_full));
     }
 
     #[test]
