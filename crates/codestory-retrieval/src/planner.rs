@@ -111,28 +111,43 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         });
     }
 
-    if mode.runs_scip_stages() {
-        let stage2_top_k = match features.shape {
-            QueryShape::NaturalLanguage => top_k.min(20),
-            _ => top_k.min(16),
-        };
-        stages.push(PlannedStage {
-            kind: RetrievalStageKind::Stage2ScipExpand,
-            budget_ms: stage2_budget_ms(features.shape),
-            top_k: stage2_top_k,
-        });
-    }
-
-    if mode.runs_qdrant_stage() && features.shape != QueryShape::PathLike {
+    let qdrant_stage = if mode.runs_qdrant_stage() && features.shape != QueryShape::PathLike {
         let semantic_top_k = match features.shape {
             QueryShape::NaturalLanguage | QueryShape::Mixed => top_k.saturating_mul(2).min(40),
             _ => top_k,
         };
-        stages.push(PlannedStage {
+        Some(PlannedStage {
             kind: RetrievalStageKind::Stage1bQdrantSemantic,
             budget_ms: stage1b_budget_ms(features.shape),
             top_k: semantic_top_k,
-        });
+        })
+    } else {
+        None
+    };
+
+    let scip_expand_stage = if mode.runs_scip_stages() {
+        let stage2_top_k = match features.shape {
+            QueryShape::NaturalLanguage => top_k.min(20),
+            _ => top_k.min(16),
+        };
+        Some(PlannedStage {
+            kind: RetrievalStageKind::Stage2ScipExpand,
+            budget_ms: stage2_budget_ms(features.shape),
+            top_k: stage2_top_k,
+        })
+    } else {
+        None
+    };
+
+    if matches!(
+        features.shape,
+        QueryShape::NaturalLanguage | QueryShape::Mixed
+    ) {
+        stages.extend(qdrant_stage);
+        stages.extend(scip_expand_stage);
+    } else {
+        stages.extend(scip_expand_stage);
+        stages.extend(qdrant_stage);
     }
 
     let total_budget_ms = stages
@@ -167,7 +182,7 @@ fn stage0_budget_ms(shape: QueryShape) -> u64 {
 
 fn stage1_budget_ms(shape: QueryShape) -> u64 {
     match shape {
-        QueryShape::NaturalLanguage | QueryShape::Mixed => 120,
+        QueryShape::NaturalLanguage | QueryShape::Mixed => 220,
         _ => 80,
     }
 }
@@ -276,10 +291,10 @@ mod tests {
         assert!(
             kinds
                 .iter()
-                .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+                .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
                 < kinds
                     .iter()
-                    .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+                    .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
         );
     }
 
@@ -295,10 +310,10 @@ mod tests {
         assert!(
             kinds
                 .iter()
-                .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
+                .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
                 < kinds
                     .iter()
-                    .position(|kind| *kind == RetrievalStageKind::Stage1bQdrantSemantic)
+                    .position(|kind| *kind == RetrievalStageKind::Stage2ScipExpand)
         );
     }
 }

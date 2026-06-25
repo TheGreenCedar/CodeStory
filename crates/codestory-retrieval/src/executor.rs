@@ -1105,6 +1105,166 @@ mod tests {
     }
 
     #[test]
+    fn broad_query_expands_dense_anchors_before_ranking_window() {
+        struct DenseAnchorExpandSidecars;
+
+        impl SidecarSearch for DenseAnchorExpandSidecars {
+            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/semantic_anchor.rs",
+                    Some("SemanticAnchor".into()),
+                    0.8,
+                    CandidateSource::Qdrant,
+                )])
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                if anchors
+                    .iter()
+                    .any(|hit| hit.source == CandidateSource::Qdrant)
+                {
+                    return Ok(vec![CandidateHit::with_source(
+                        "src/expanded_from_dense.rs",
+                        Some("ExpandedFromDense".into()),
+                        0.9,
+                        CandidateSource::Scip,
+                    )]);
+                }
+                Ok(Vec::new())
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(DenseAnchorExpandSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor
+            .execute("packet search output evidence retrieval shadow", Some(800))
+            .expect("query");
+
+        let qdrant_index = result
+            .trace
+            .stages
+            .iter()
+            .position(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic)
+            .expect("qdrant stage");
+        let expand_index = result
+            .trace
+            .stages
+            .iter()
+            .position(|stage| stage.stage == RetrievalStageKind::Stage2ScipExpand)
+            .expect("scip expand stage");
+        assert!(
+            qdrant_index < expand_index,
+            "dense anchors should be available before graph expansion: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/expanded_from_dense.rs"),
+            "dense-anchor graph expansion should enter the rank window: {:?}",
+            result.hits
+        );
+    }
+
+    #[test]
+    fn broad_query_lexical_budget_admits_source_anchor_before_dense_distractors() {
+        struct SlowLexicalUsefulSidecars;
+
+        impl SidecarSearch for SlowLexicalUsefulSidecars {
+            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(vec![CandidateHit::with_source(
+                    "crates/codestory-cli/src/output.rs",
+                    Some("append_search_evidence_packet".into()),
+                    0.92,
+                    CandidateSource::Zoekt,
+                )])
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "crates/codestory-contracts/src/api/dto.rs",
+                    Some("PacketRetrievalTraceSummaryDto".into()),
+                    0.99,
+                    CandidateSource::Qdrant,
+                )])
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut roles = HashMap::new();
+        roles.insert(
+            "crates/codestory-cli/src/output.rs".to_string(),
+            codestory_store::FileRole::Source,
+        );
+        roles.insert(
+            "crates/codestory-contracts/src/api/dto.rs".to_string(),
+            codestory_store::FileRole::Source,
+        );
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(SlowLexicalUsefulSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: roles,
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor
+            .execute(
+                "packet search output evidence packet indexed symbol hits retrieval shadow",
+                Some(1_000),
+            )
+            .expect("query");
+
+        assert_eq!(result.trace.cancel_reason, None);
+        assert!(
+            result.trace.stages.iter().any(|stage| {
+                stage.stage == RetrievalStageKind::Stage1ZoektLexical
+                    && stage.candidates_added == 1
+                    && stage.cancel_reason.is_none()
+            }),
+            "broad lexical source anchor should be admitted before ranking: {:?}",
+            result.trace.stages
+        );
+        assert_eq!(
+            result.hits.first().map(|hit| hit.file_path.as_str()),
+            Some("crates/codestory-cli/src/output.rs")
+        );
+    }
+
+    #[test]
     fn non_broad_queries_stop_between_stages_after_total_deadline() {
         struct SlowScipAnchorSidecars;
 
@@ -1177,6 +1337,92 @@ mod tests {
                 .iter()
                 .all(|hit| hit.file_path != "src/late_lexical.rs"),
             "late lexical hit should not be collected after sequence deadline: {:?}",
+            result.hits
+        );
+    }
+
+    #[test]
+    fn symbol_like_queries_expand_scip_before_slow_qdrant_can_consume_window() {
+        struct SlowDenseSymbolSidecars;
+
+        impl SidecarSearch for SlowDenseSymbolSidecars {
+            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(vec![CandidateHit::with_source(
+                    "src/dense_distractor.rs",
+                    Some("DenseDistractor".into()),
+                    0.99,
+                    CandidateSource::Qdrant,
+                )])
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/nearby_anchor.rs",
+                    Some("NearbyAnchor".into()),
+                    0.7,
+                    CandidateSource::Scip,
+                )])
+            }
+
+            fn scip_expand(
+                &self,
+                anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                if anchors
+                    .iter()
+                    .any(|hit| hit.symbol_name.as_deref() == Some("NearbyAnchor"))
+                {
+                    return Ok(vec![CandidateHit::with_source(
+                        "src/expanded_neighbor.rs",
+                        Some("ExpandedNeighbor".into()),
+                        0.9,
+                        CandidateSource::Scip,
+                    )]);
+                }
+                Ok(Vec::new())
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(SlowDenseSymbolSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor.execute("MissingAnchor", Some(50)).expect("query");
+
+        let expand_index = result
+            .trace
+            .stages
+            .iter()
+            .position(|stage| stage.stage == RetrievalStageKind::Stage2ScipExpand)
+            .expect("scip expand stage");
+        let qdrant_index = result
+            .trace
+            .stages
+            .iter()
+            .position(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic)
+            .expect("qdrant stage");
+        assert!(
+            expand_index < qdrant_index,
+            "symbol-like graph expansion must preserve pre-dense ordering: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/expanded_neighbor.rs"),
+            "symbol-like SCIP expansion should not be starved by slow dense search: {:?}",
             result.hits
         );
     }

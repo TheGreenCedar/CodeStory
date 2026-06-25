@@ -61,6 +61,9 @@ pub fn rank_candidates(
                 })
                 .count();
             candidate.score += (strong_token_hits as f32) * 0.06;
+            if candidate.source == CandidateSource::Zoekt && strong_token_hits >= 3 {
+                candidate.score += 0.08;
+            }
         }
         if prefer_primary_code && matches!(file_role, FileRole::Source | FileRole::Entrypoint) {
             candidate.score += primary_source_path_bonus(&candidate.file_path, &query_tokens);
@@ -700,5 +703,33 @@ mod tests {
             Some("workspace/app/tests/event_processor_with_json_output.rs")
         );
         assert_eq!(ranked[0].file_role, Some(FileRole::Test));
+    }
+
+    #[test]
+    fn ranker_prefers_lexical_source_anchor_over_dense_dto_distractor() {
+        let features = classify_query(
+            "packet search output evidence packet indexed symbol hits retrieval shadow",
+        );
+        let mut source = CandidateHit::with_source(
+            "crates/codestory-cli/src/output.rs",
+            Some("append_search_evidence_packet".into()),
+            0.92,
+            CandidateSource::Zoekt,
+        );
+        source.file_role = Some(FileRole::Source);
+        let mut dense_dto = CandidateHit::with_source(
+            "crates/codestory-contracts/src/api/dto.rs",
+            Some("PacketRetrievalTraceSummaryDto".into()),
+            0.99,
+            CandidateSource::Qdrant,
+        );
+        dense_dto.file_role = Some(FileRole::Source);
+
+        let ranked = rank_candidates(&features, vec![dense_dto, source]);
+
+        assert_eq!(
+            ranked.first().map(|hit| hit.file_path.as_str()),
+            Some("crates/codestory-cli/src/output.rs")
+        );
     }
 }
