@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { spawnSync } = require('child_process');
+const { createHash } = require('crypto');
 const { eventHeader, getCodeStoryInstructions } = require('./codestory-instructions.cjs');
 const {
   classifyMcpRuntime,
@@ -51,8 +52,16 @@ function truncate(text, maxChars = MAX_OUTPUT_CHARS) {
   return `${value.slice(0, maxChars)}\n\n... CodeStory hook output truncated by hook budget.`;
 }
 
+function normalizeText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function hashText(text) {
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
 function compactKey(text, maxChars = 160) {
-  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxChars);
+  return normalizeText(text).slice(0, maxChars);
 }
 
 function hookTaxonomy(input, event) {
@@ -72,7 +81,7 @@ function hookTaxonomy(input, event) {
 function hookPolicy(input, event) {
   const taxonomy = hookTaxonomy(input, event);
   const project = input.cwd || process.cwd();
-  const promptKey = compactKey(input.prompt || '');
+  const promptKey = `prompt:${hashText(normalizeText(input.prompt || ''))}`;
   const dedupeBase = `${taxonomy}:${project}`;
   return {
     taxonomy,
@@ -130,6 +139,46 @@ function runtimeStatusBlock(policy, mcp) {
       ? 'Next: read codestory://status before source reads; use packet/search/context only when status allows them with retrieval_mode=full.'
       : 'Next: no sidecar-backed packet/search surface is proven available; use bounded source reads instead of repeated repair attempts.',
   ].join('\n');
+}
+
+function firstFreshness(value) {
+  if (!value || typeof value !== 'object') return null;
+  for (const [key, nested] of Object.entries(value)) {
+    if ((key === 'freshness' || key === 'index_freshness') && nested && typeof nested === 'object') {
+      return nested;
+    }
+    const found = firstFreshness(nested);
+    if (found) return found;
+  }
+  return null;
+}
+
+function freshnessSummary(value) {
+  const freshness = firstFreshness(value);
+  if (!freshness) return 'not_reported';
+  const status = freshness.status || 'unknown';
+  const changed = freshness.changed_file_count ?? freshness.changed_files ?? 'unknown';
+  const added = freshness.new_file_count ?? freshness.new_files ?? 'unknown';
+  const removed = freshness.removed_file_count ?? freshness.removed_files ?? 'unknown';
+  return `${status} changed=${changed} new=${added} removed=${removed}`;
+}
+
+function readinessEvidence(parsed) {
+  const verdicts = Array.isArray(parsed.verdicts) ? parsed.verdicts : [];
+  const statuses = verdicts
+    .map((verdict) => `${verdict?.goal || 'unknown'}=${verdict?.status || 'unknown'}`)
+    .join(' ') || 'none';
+  const evidence = {
+    statuses,
+    freshness: freshnessSummary(parsed),
+  };
+  return {
+    text: [
+      `agent_readiness_evidence: ${evidence.statuses}`,
+      `freshness_evidence: ${evidence.freshness}`,
+    ].join('\n'),
+    fingerprint: hashText(JSON.stringify(evidence)),
+  };
 }
 
 function rememberEmission(policy, contentKey) {
@@ -207,23 +256,55 @@ function runReadinessProbe(cli, project, cwd) {
     windowsHide: true,
   });
   if (result.status !== 0 || !result.stdout.trim()) {
+    const reason = result.error
+      ? result.error.message
+      : truncate(result.stderr || `agent readiness probe exited with status ${result.status}`);
     return {
       ready: false,
-      reason: result.error
-        ? result.error.message
-        : truncate(result.stderr || `agent readiness probe exited with status ${result.status}`),
+      reason,
+      evidence: [
+        'agent_readiness_evidence: unavailable',
+        'freshness_evidence: unavailable',
+      ].join('\n'),
+      fingerprint: `readiness-unavailable:${hashText(reason)}`,
     };
   }
   try {
     const parsed = JSON.parse(result.stdout);
     const verdicts = Array.isArray(parsed.verdicts) ? parsed.verdicts : [];
+    const evidence = readinessEvidence(parsed);
+    const ready = verdicts.some((verdict) => verdict?.goal === 'agent_packet_search' && verdict?.status === 'ready');
     return {
-      ready: verdicts.some((verdict) => verdict?.goal === 'agent_packet_search' && verdict?.status === 'ready'),
-      reason: 'agent_packet_search readiness is not ready',
+      ready,
+      reason: ready ? null : 'agent_packet_search readiness is not ready',
+      evidence: evidence.text,
+      fingerprint: `readiness:${evidence.fingerprint}`,
     };
   } catch {
-    return { ready: false, reason: 'agent readiness probe returned invalid JSON' };
+    return {
+      ready: false,
+      reason: 'agent readiness probe returned invalid JSON',
+      evidence: [
+        'agent_readiness_evidence: invalid_json',
+        'freshness_evidence: unavailable',
+      ].join('\n'),
+      fingerprint: 'readiness-invalid-json',
+    };
   }
+}
+
+function heartbeatReadinessProbe(mcp, project, cwd) {
+  const cli = process.env.CODESTORY_CLI || mcp.managed_cli_path;
+  if (!cli) {
+    return {
+      evidence: [
+        'agent_readiness_evidence: unavailable',
+        'freshness_evidence: unavailable',
+      ].join('\n'),
+      fingerprint: 'readiness-unavailable:no-cli',
+    };
+  }
+  return runReadinessProbe(cli, project, cwd);
 }
 
 function runCodeStory(input, event, policy, state = {}) {
@@ -236,6 +317,9 @@ function runCodeStory(input, event, policy, state = {}) {
 
   const mcp = classifyMcpRuntime();
   if (policy.runtimeOnly) {
+    const heartbeatProbe = policy.heartbeat
+      ? heartbeatReadinessProbe(mcp, policy.project, input.cwd || process.cwd())
+      : null;
     const output = state.hook?.preflight_failed && mcp.degraded_no_surface
       ? [
         `event_taxonomy: ${policy.taxonomy}`,
@@ -246,8 +330,8 @@ function runCodeStory(input, event, policy, state = {}) {
       : runtimeStatusBlock(policy, mcp);
     return {
       kind: 'runtime truth',
-      output: truncate(output, policy.cap),
-      fingerprint: runtimeFingerprint(mcp),
+      output: truncate([output, heartbeatProbe?.evidence].filter(Boolean).join('\n'), policy.cap),
+      fingerprint: [runtimeFingerprint(mcp), heartbeatProbe?.fingerprint].filter(Boolean).join('|'),
     };
   }
 
@@ -400,7 +484,7 @@ function buildContext(input, event, state = {}) {
 
 function freshInstructionBoundary(event, input = {}) {
   const source = String(input.source || input.trigger || '').toLowerCase();
-  return event === 'SessionStart' && (!source || source === 'startup');
+  return event === 'SessionStart' && (!source || source === 'startup' || source === 'clear');
 }
 
 readHookInput().then((input) => {
