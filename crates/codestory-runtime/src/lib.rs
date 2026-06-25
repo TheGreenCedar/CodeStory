@@ -8070,15 +8070,17 @@ impl AppController {
         refresh_runtime_caches: bool,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         let cache_refresh_started = Instant::now();
-        let cache_stats = if refresh_runtime_caches {
-            let mut storage = Storage::open(storage_path)
-                .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
-            refresh_caches(
-                self,
-                &mut storage,
-                storage_path,
-                summary.llm_refresh_scope.as_ref(),
-            )?
+        let cache_stats_result = if refresh_runtime_caches {
+            (|| {
+                let mut storage = Storage::open(storage_path)
+                    .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
+                refresh_caches(
+                    self,
+                    &mut storage,
+                    storage_path,
+                    summary.llm_refresh_scope.as_ref(),
+                )
+            })()
         } else {
             self.finalize_indexing_without_runtime_refresh_with(
                 storage_path,
@@ -8096,7 +8098,15 @@ impl AppController {
                         runtime_cache_publish_ms: None,
                     })
                 },
-            )?
+            )
+        };
+        let cache_stats = match cache_stats_result {
+            Ok(cache_stats) => cache_stats,
+            Err(error) => {
+                self.clear_search_state();
+                self.state.lock().is_indexing = false;
+                return Err(error);
+            }
         };
         summary.phase_timings.cache_refresh_ms = Some(clamp_u128_to_u32(
             cache_refresh_started.elapsed().as_millis(),
@@ -16237,6 +16247,62 @@ fn build_llm_symbol_doc_text() -> String {
 
         assert_eq!(error.code, "internal");
         assert_eq!(error.message, "forced rebuild failure");
+
+        let state = controller.state.lock();
+        assert!(!state.is_indexing);
+        assert!(state.search_engine.is_none());
+        assert!(state.node_names.is_empty());
+    }
+
+    fn empty_indexing_run_summary() -> IndexingRunSummary {
+        IndexingRunSummary {
+            phase_timings: IndexingPhaseTimings::default(),
+            llm_refresh_scope: None,
+        }
+    }
+
+    #[test]
+    fn successful_index_refresh_clears_indexing_state() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("codestory.db");
+        drop(Storage::open(&storage_path).expect("seed storage"));
+        let controller = AppController::new();
+
+        {
+            let mut state = controller.state.lock();
+            state.is_indexing = true;
+        }
+
+        let timings = controller
+            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true)
+            .expect("cache refresh should succeed");
+
+        assert!(timings.cache_refresh_ms.is_some());
+        assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[test]
+    fn successful_index_reopen_failure_does_not_leave_indexing_stuck() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("missing").join("codestory.db");
+        let controller = AppController::new();
+
+        {
+            let mut state = controller.state.lock();
+            state.is_indexing = true;
+            state
+                .node_names
+                .insert(CoreNodeId(999), "stale_symbol".to_string());
+            let engine = SearchEngine::new(None).expect("search engine");
+            publish_search_engine(&mut state, engine);
+        }
+
+        let error = controller
+            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true)
+            .expect_err("storage reopen failure should propagate");
+
+        assert_eq!(error.code, "internal");
+        assert!(error.message.contains("Failed to reopen storage"));
 
         let state = controller.state.lock();
         assert!(!state.is_indexing);
