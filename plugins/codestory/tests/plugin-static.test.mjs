@@ -58,7 +58,7 @@ function releaseAssetForPlatform(version) {
 }
 
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}]}));process.exit(0)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -76,7 +76,7 @@ async function writeFakeCli(cliPath) {
 }
 
 async function writeRecordingCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}]}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'&&args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
   if (process.platform === "win32") {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`, "utf8");
     return;
@@ -274,7 +274,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
   }
 });
 
-test("mcp launcher repairs stale local navigation without agent repair under enabled sidecar policy", async () => {
+test("mcp launcher waits for fresh local navigation without agent repair", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-repair-index-"));
@@ -300,8 +300,8 @@ test("mcp launcher repairs stale local navigation without agent repair under ena
         "fs.appendFileSync(logFile, JSON.stringify({ args, sidecarRepair: process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR === '1' }) + '\\n');",
         "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
         "if (command === 'ready') {",
-        "  const ready = args.includes('--repair');",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: ready ? 'ready' : 'repair_index', summary: ready ? 'ready' : 'stale local graph', minimum_next: [], full_repair: [] }] }));",
+        "  const ready = args.includes('--wait-fresh') && !args.includes('--repair') && !args.includes('agent');",
+        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: ready ? 'ready' : 'repair_index', summary: ready ? 'ready' : 'stale local graph', minimum_next: [], full_repair: [] }], local_refresh: { state: ready ? 'fresh' : 'stale', reason: ready ? 'refreshed' : 'index_changed', blocks_local_surfaces: !ready, readiness_status: ready ? 'ready' : 'repair_index', changed_file_count: ready ? 0 : 1, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
         "  process.exit(0);",
         "}",
         "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(0); }",
@@ -336,19 +336,21 @@ test("mcp launcher repairs stale local navigation without agent repair under ena
     assert.equal(await readFile(marker, "utf8"), "serve-called");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     const readyCalls = calls.filter((call) => call.args[0] === "ready");
-    assert.deepEqual(readyCalls.map((call) => call.args.slice(0, 4)), [
-      ["ready", "--goal", "local", "--project"],
-      ["ready", "--goal", "local", "--repair"],
+    assert.deepEqual(readyCalls.map((call) => call.args.slice(0, 5)), [
+      ["ready", "--goal", "local", "--wait-fresh", "--project"],
     ]);
     assert.equal(calls.some((call) => call.args.includes("agent")), false);
+    assert.equal(calls.some((call) => call.args.includes("--repair")), false);
     assert.equal(calls.some((call) => call.sidecarRepair), false);
-    assert.equal(calls.some((call) => call.args[0] === "serve"), true);
+    assert.ok(calls.some((call) => {
+      return JSON.stringify(call.args) === JSON.stringify(["serve", "--stdio", "--refresh", "none"]);
+    }));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("mcp launcher fails open when local navigation is not ready", async () => {
+test("mcp launcher fails open when wait-fresh skips local refresh", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-index-"));
@@ -375,7 +377,7 @@ test("mcp launcher fails open when local navigation is not ready", async () => {
         "const command = process.argv[2];",
         "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
         "if (command === 'ready') {",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'No indexed symbols are available yet.', minimum_next: ['codestory-cli ready --goal local --repair --project \"fixture\" --format json'], full_repair: ['codestory-cli doctor --project \"fixture\"'] }] }));",
+        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'No indexed symbols are available yet.', minimum_next: ['codestory-cli ready --goal local --wait-fresh --project \"fixture\" --format json'], full_repair: ['codestory-cli doctor --project \"fixture\"'] }], local_refresh: { state: 'skipped_locked', reason: 'index_locked', blocks_local_surfaces: true, readiness_status: 'repair_index', changed_file_count: 1, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
         "  process.exit(0);",
         "}",
         "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(1); }",
@@ -412,15 +414,18 @@ test("mcp launcher fails open when local navigation is not ready", async () => {
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
     assert.equal(status.readiness[0].status, "repair_index");
-    assert.equal(status.readiness[0].repair_reason, "local_navigation_repair_index");
+    assert.equal(status.readiness[0].repair_reason, "local_navigation_wait_fresh_skipped_locked");
+    assert.equal(status.local_refresh.state, "skipped_locked");
+    assert.equal(status.readiness[0].local_refresh.reason, "index_locked");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.equal(status.allowed_surfaces.ground.status, "repair_index");
-    assert.match(status.readiness[0].minimum_next[0], /ready --goal local --repair/u);
-    assert.deepEqual(status.readiness[0].setup.local_repair_args.slice(0, 4), [
+    assert.match(status.readiness[0].minimum_next[0], /ready --goal local --wait-fresh/u);
+    assert.deepEqual(status.readiness[0].setup.local_wait_fresh_args.slice(0, 5), [
       "ready",
       "--goal",
       "local",
-      "--repair",
+      "--wait-fresh",
+      "--project",
     ]);
     assert.equal(responses[2].result.isError, true);
     assert.equal(responses[2].result.structuredContent.status, "repair_index");
@@ -457,7 +462,7 @@ test("mcp launcher fails open when local navigation repair times out", async () 
         "const args = process.argv.slice(2);",
         "const command = args[0];",
         "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
-        "if (command === 'ready' && args.includes('--repair')) { const end = Date.now() + 200; while (Date.now() < end) {} process.exit(0); }",
+        "if (command === 'ready' && args.includes('--wait-fresh')) { const end = Date.now() + 200; while (Date.now() < end) {} process.exit(0); }",
         "if (command === 'ready') { console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'stale local graph', minimum_next: [], full_repair: [] }] })); process.exit(0); }",
         "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(1); }",
         "process.exit(2);",
@@ -491,12 +496,15 @@ test("mcp launcher fails open when local navigation repair times out", async () 
     await assert.rejects(access(marker));
     const response = JSON.parse(result.stdout.trim());
     const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.readiness[0].repair_reason, "local_navigation_repair_timeout");
-    assert.deepEqual(status.readiness[0].setup.local_repair_args.slice(0, 4), [
+    assert.equal(status.readiness[0].repair_reason, "local_navigation_wait_fresh_timeout");
+    assert.equal(status.local_refresh.state, "failed");
+    assert.equal(status.local_refresh.reason, "wait_fresh_timeout");
+    assert.deepEqual(status.readiness[0].setup.local_wait_fresh_args.slice(0, 5), [
       "ready",
       "--goal",
       "local",
-      "--repair",
+      "--wait-fresh",
+      "--project",
     ]);
     assert.equal(status.allowed_surfaces.ground.allowed, false);
   } finally {
@@ -632,7 +640,7 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
   }
 });
 
-test("enabled sidecar policy schedules existing agent repair path", async () => {
+test("enabled sidecar policy does not schedule agent repair at MCP startup", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
@@ -672,18 +680,14 @@ test("enabled sidecar policy schedules existing agent repair path", async () => 
     });
     assert.equal(result.status, 0, result.stderr);
 
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      const text = await readFile(logFile, "utf8").catch(() => "");
-      const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
-      if (calls.some((call) => call.repair)) {
-        assert.ok(calls.some((call) => call.args.includes("serve")), text);
-        const repair = calls.find((call) => call.repair);
-        assert.deepEqual(repair.args.slice(0, 4), ["ready", "--goal", "agent", "--repair"]);
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    assert.fail(`repair call was not recorded:\n${await readFile(logFile, "utf8").catch(() => "")}`);
+    const text = await readFile(logFile, "utf8");
+    const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(calls.some((call) => {
+      return JSON.stringify(call.args) === JSON.stringify(["serve", "--stdio", "--refresh", "none"]);
+    }), text);
+    assert.equal(calls.some((call) => call.repair), false);
+    assert.equal(calls.some((call) => call.args.includes("agent")), false);
+    assert.equal(calls.some((call) => call.args.includes("--repair")), false);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
