@@ -79,6 +79,45 @@ fn sidecar_status_uses_retrieval_status_human_output() {
 }
 
 #[test]
+fn sidecar_inventory_reports_read_only_dry_run_json() {
+    let project = tempdir().expect("project");
+    let cache_dir = tempdir().expect("cache");
+    write_tiny_project(project.path());
+
+    let output = run_cli(
+        project.path(),
+        cache_dir.path(),
+        &["sidecar", "inventory", "--format", "json"],
+    );
+    assert_success(&output, "sidecar inventory failed");
+
+    let json = stdout_json(&output);
+    assert_eq!(json["dry_run"].as_bool(), Some(true));
+    assert!(json["namespaces"].is_array());
+}
+
+#[test]
+fn retrieval_inventory_has_human_output() {
+    let project = tempdir().expect("project");
+    let cache_dir = tempdir().expect("cache");
+    write_tiny_project(project.path());
+
+    let output = run_cli(
+        project.path(),
+        cache_dir.path(),
+        &["retrieval", "inventory", "--format", "markdown"],
+    );
+    assert_success(&output, "retrieval inventory failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("# Retrieval sidecar inventory"),
+        "inventory should have a human-readable heading:\n{stdout}"
+    );
+    assert!(stdout.contains("dry_run"));
+}
+
+#[test]
 fn unknown_sidecar_subcommand_suggests_status_without_runtime_side_effects() {
     let project = tempdir().expect("project");
     let cache_dir = tempdir().expect("cache");
@@ -99,6 +138,7 @@ fn unknown_sidecar_subcommand_suggests_status_without_runtime_side_effects() {
     );
     assert!(combined.contains("unknown sidecar subcommand `frobnicate`"));
     assert!(combined.contains("codestory-cli sidecar status"));
+    assert!(combined.contains("codestory-cli sidecar inventory"));
     assert!(combined.contains("codestory-cli retrieval status"));
     assert!(
         !cache_dir.path().join("codestory.db").exists(),
