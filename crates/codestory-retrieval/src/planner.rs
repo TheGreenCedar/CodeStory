@@ -182,7 +182,7 @@ fn stage0_budget_ms(shape: QueryShape) -> u64 {
 
 fn stage1_budget_ms(shape: QueryShape) -> u64 {
     match shape {
-        QueryShape::NaturalLanguage | QueryShape::Mixed => 220,
+        QueryShape::NaturalLanguage | QueryShape::Mixed => 500,
         _ => 80,
     }
 }

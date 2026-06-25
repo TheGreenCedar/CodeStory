@@ -1192,7 +1192,7 @@ mod tests {
 
         impl SidecarSearch for SlowLexicalUsefulSidecars {
             fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
-                std::thread::sleep(Duration::from_millis(150));
+                std::thread::sleep(Duration::from_millis(350));
                 Ok(vec![CandidateHit::with_source(
                     "crates/codestory-cli/src/output.rs",
                     Some("append_search_evidence_packet".into()),
