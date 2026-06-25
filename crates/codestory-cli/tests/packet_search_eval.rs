@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ const FIXTURE_FILE: &str = "production_packet_search_fixtures.json";
 const BASELINE_FILE: &str = "production_packet_search_baseline.json";
 const LIVE_EVAL_RUN_ID: &str = "packet-search-eval";
 const LIVE_EVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+const LIVE_EVAL_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct FixtureSet {
@@ -599,6 +601,7 @@ fn packet_search_live_eval_uses_fixed_run_id() {
             "json",
         ],
     );
+    assert_eq!(search.get_program(), live_eval_cli_path().as_os_str());
     assert_eq!(search.get_envs().count(), live_eval_env().len());
     assert!(
         search
@@ -651,11 +654,25 @@ fn packet_search_live_eval_uses_fixed_run_id() {
 }
 
 #[test]
+fn packet_search_live_eval_honors_explicit_cli_path() {
+    let explicit = PathBuf::from("C:/tools/codestory-cli.exe");
+    assert_eq!(
+        live_eval_cli_path_from(Some(explicit.clone().into_os_string())),
+        explicit
+    );
+    assert_eq!(
+        live_eval_cli_path_from(None),
+        PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli"))
+    );
+}
+
+#[test]
 #[ignore = "live production packet/search eval; requires retrieval_mode=full sidecars for this checkout"]
 fn packet_search_eval_live_runs_production_cli_path() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
     let project = repo_root();
+    let eval_started = Instant::now();
     let readiness = live_eval_run_cli(&project, &live_eval_ready_args());
     assert!(
         readiness.status.success(),
@@ -682,7 +699,15 @@ fn packet_search_eval_live_runs_production_cli_path() {
     assert_live_eval_device_truth(&status_json);
 
     let mut runs = Vec::new();
-    for fixture in &fixtures.fixtures {
+    for (index, fixture) in fixtures.fixtures.iter().enumerate() {
+        let fixture_started = Instant::now();
+        eprintln!(
+            "packet_search_eval: fixture {}/{} `{}` started after {:.1}s",
+            index + 1,
+            fixtures.fixtures.len(),
+            fixture.id,
+            eval_started.elapsed().as_secs_f64()
+        );
         let query = fixture.query.as_deref().unwrap_or(&fixture.prompt);
         let search = live_eval_run_cli(
             &project,
@@ -755,6 +780,14 @@ fn packet_search_eval_live_runs_production_cli_path() {
             packet_text,
             anchor_offsets,
         });
+        eprintln!(
+            "packet_search_eval: fixture {}/{} `{}` finished in {:.1}s total_elapsed={:.1}s",
+            index + 1,
+            fixtures.fixtures.len(),
+            fixture.id,
+            fixture_started.elapsed().as_secs_f64(),
+            eval_started.elapsed().as_secs_f64()
+        );
     }
 
     let report = score_runs(&fixtures.fixtures, &runs, &baseline);
@@ -823,18 +856,29 @@ fn live_eval_run_cli(project: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn base_cli_command(project: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = Command::new(live_eval_cli_path());
     command.args(args);
     command.arg("--project").arg(project);
     command
 }
 
 fn live_eval_command_line(project: &Path, args: &[&str]) -> String {
-    let mut parts = vec![env!("CARGO_BIN_EXE_codestory-cli").to_string()];
+    let mut parts = vec![live_eval_cli_path().display().to_string()];
     parts.extend(args.iter().map(|arg| (*arg).to_string()));
     parts.push("--project".to_string());
     parts.push(project.display().to_string());
     parts.join(" ")
+}
+
+fn live_eval_cli_path() -> PathBuf {
+    live_eval_cli_path_from(std::env::var_os("CODESTORY_CLI"))
+}
+
+fn live_eval_cli_path_from(explicit: Option<OsString>) -> PathBuf {
+    explicit
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli")))
 }
 
 fn run_command_with_timeout(
@@ -842,17 +886,23 @@ fn run_command_with_timeout(
     command_line: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    eprintln!("packet_search_eval: child started: `{command_line}`");
     let mut child = command.spawn().map_err(|error| {
         format!("spawn codestory-cli live eval command `{command_line}`: {error}")
     })?;
     let stdout = child.stdout.take().map(read_pipe_in_background);
     let stderr = child.stderr.take().map(read_pipe_in_background);
     let started = Instant::now();
+    let mut next_progress = LIVE_EVAL_PROGRESS_INTERVAL;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let stdout = join_pipe(stdout);
                 let stderr = join_pipe(stderr);
+                eprintln!(
+                    "packet_search_eval: child finished in {:.1}s status={status}: `{command_line}`",
+                    started.elapsed().as_secs_f64()
+                );
                 return Ok(Output {
                     status,
                     stdout,
@@ -872,7 +922,17 @@ fn run_command_with_timeout(
                     stderr
                 ));
             }
-            Ok(None) => thread::sleep(Duration::from_millis(250)),
+            Ok(None) => {
+                let elapsed = started.elapsed();
+                if elapsed >= next_progress {
+                    eprintln!(
+                        "packet_search_eval: child still running after {:.1}s: `{command_line}`",
+                        elapsed.as_secs_f64()
+                    );
+                    next_progress += LIVE_EVAL_PROGRESS_INTERVAL;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
             Err(error) => {
                 return Err(format!(
                     "poll codestory-cli live eval command `{command_line}`: {error}"
