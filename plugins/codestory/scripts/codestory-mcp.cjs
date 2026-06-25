@@ -747,6 +747,7 @@ function failOpenToolResult(status) {
       code: 'codestory_mcp_runtime_unavailable',
       status: readiness.status,
       repair_reason: status.degraded_reason,
+      local_refresh: status.local_refresh || null,
       plugin_runtime: status.plugin_runtime,
       setup: readiness.setup,
       minimum_next: readiness.minimum_next,

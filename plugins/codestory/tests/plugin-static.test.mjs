@@ -429,6 +429,10 @@ test("mcp launcher fails open when wait-fresh skips local refresh", async () => 
     ]);
     assert.equal(responses[2].result.isError, true);
     assert.equal(responses[2].result.structuredContent.status, "repair_index");
+    assert.equal(responses[2].result.structuredContent.local_refresh.state, "skipped_locked");
+    assert.equal(responses[2].result.structuredContent.local_refresh.reason, "index_locked");
+    assert.equal(responses[2].result.structuredContent.local_refresh.changed_file_count, 1);
+    assert.equal(responses[2].result.structuredContent.local_refresh.fatal_error_count, 0);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
