@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 /// Phase 2 lexical shard pin (local index + optional Zoekt webserver).
 pub const ZOEKT_REAL_VERSION_PIN: &str = "zoekt-20250506123554";
@@ -25,10 +24,10 @@ pub const DEFAULT_ZOEKT_HTTP_PORT: u16 = 6070;
 pub const DEFAULT_QDRANT_HTTP_PORT: u16 = 6333;
 pub const DEFAULT_QDRANT_GRPC_PORT: u16 = 6334;
 pub const DEFAULT_EMBED_HTTP_PORT: u16 = 8080;
+pub const DEFAULT_AGENT_RUN_ID: &str = "shared-agent";
 
 pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
-static AGENT_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SidecarLayout {
@@ -425,12 +424,7 @@ fn agent_run_id(explicit: Option<&str>) -> String {
 }
 
 fn default_agent_run_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let counter = AGENT_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{nanos:x}-{counter:x}", std::process::id())
+    DEFAULT_AGENT_RUN_ID.to_string()
 }
 
 fn normalized_label_component(value: &str) -> Option<String> {
@@ -606,7 +600,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn agent_profile_default_runtime_isolates_same_project_runs() {
+    fn agent_profile_default_runtime_reuses_project_shared_run() {
         let project = tempdir().expect("project");
 
         let first =
@@ -614,19 +608,21 @@ mod tests {
         let second =
             SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
 
-        assert_ne!(first.run_id, second.run_id);
-        assert_ne!(first.namespace, second.namespace);
-        assert_ne!(first.layout.state_file, second.layout.state_file);
-        assert_ne!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
-        assert_ne!(
+        assert_eq!(first.run_id.as_deref(), Some(DEFAULT_AGENT_RUN_ID));
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(first.namespace, second.namespace);
+        assert_eq!(first.layout.state_file, second.layout.state_file);
+        assert_eq!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
+        assert_eq!(
             first.layout.qdrant_http_port,
             second.layout.qdrant_http_port
         );
-        assert_ne!(
+        assert_eq!(
             first.layout.qdrant_grpc_port,
             second.layout.qdrant_grpc_port
         );
-        assert_ne!(first.embed_http_port, second.embed_http_port);
+        assert_eq!(first.embed_http_port, second.embed_http_port);
+        assert!(first.cleanup_command.contains("--run-id shared-agent"));
     }
 
     #[test]

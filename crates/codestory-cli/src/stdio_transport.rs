@@ -2516,7 +2516,7 @@ fn read_stdio_status_resource(
     });
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
-    let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness);
+    let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness, None);
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
@@ -3008,9 +3008,22 @@ fn stdio_status_recommended_next_calls(
                 _ => {}
             }
         }
+        let full_repair = if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
+            sidecar_setup
+                .get("next_repair_command")
+                .and_then(serde_json::Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .map(|command| {
+                    std::iter::once(command.to_string())
+                        .chain(non_ready.full_repair.iter().skip(1).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| non_ready.full_repair.clone())
+        } else {
+            non_ready.full_repair.clone()
+        };
         return serde_json::Value::Array(
-            non_ready
-                .full_repair
+            full_repair
                 .iter()
                 .map(|command| stdio_recommended_next_call(command))
                 .chain([
@@ -3147,8 +3160,10 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     let prompt_required = matches!(state, "ask");
     let auto_repair = matches!(state, "enabled");
     let project = crate::display::clean_path_string(&project_root.to_string_lossy());
-    let default_repair =
-        format!("codestory-cli ready --goal agent --repair --project \"{project}\" --format json");
+    let default_repair = format!(
+        "codestory-cli ready --goal agent --repair --project \"{project}\" --format json --run-id {}",
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+    );
     let next_repair_command =
         env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
     serde_json::json!({
@@ -3789,6 +3804,9 @@ version = "0.11.20"
                     run_id: None,
                     retrieval_mode: "full",
                     degraded_reason: None,
+                    embedding_device_policy: Some("accelerator_required"),
+                    embedding_device_state: Some("accelerated"),
+                    embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
                 }),

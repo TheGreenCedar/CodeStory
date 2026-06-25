@@ -306,6 +306,7 @@ fn verdict_state(
 
     if goal == ReadinessGoalDto::AgentPacketSearch {
         let sidecar_profile = sidecar.and_then(|sidecar| sidecar.profile);
+        let sidecar_run_id = sidecar.and_then(|sidecar| sidecar.run_id);
         let sidecar_mode = sidecar
             .map(|sidecar| sidecar.retrieval_mode)
             .unwrap_or("unavailable");
@@ -320,7 +321,7 @@ fn verdict_state(
                     format!(" embedding_device_policy=`{policy}` observed_device=`{state}`.")
                 })
                 .unwrap_or_default();
-            let full_repair = agent_packet_search_repair_commands(project_arg);
+            let full_repair = agent_packet_search_repair_commands(project_arg, sidecar_run_id);
             let minimum_next = full_repair.iter().take(1).cloned().collect();
             return (
                 ReadinessStatusDto::RepairRetrieval,
@@ -371,11 +372,12 @@ fn ready_summary_with_errors(base: &str, stats: &StorageStatsDto) -> String {
     }
 }
 
-fn agent_packet_search_repair_commands(project_arg: &str) -> Vec<String> {
+fn agent_packet_search_repair_commands(project_arg: &str, run_id: Option<&str>) -> Vec<String> {
     let mut commands = Vec::new();
     commands.push(ready_repair_command(
         ReadinessGoalDto::AgentPacketSearch,
         project_arg,
+        run_id,
     ));
     commands.extend([
         format!("codestory-cli retrieval status --project {project_arg} --format json"),
@@ -389,7 +391,7 @@ fn index_repair_state(
     reason: &str,
     project_arg: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
-    let command = ready_repair_command(goal, project_arg);
+    let command = ready_repair_command(goal, project_arg, None);
     (
         ReadinessStatusDto::RepairIndex,
         format!(
@@ -405,11 +407,18 @@ fn index_repair_state(
     )
 }
 
-fn ready_repair_command(goal: ReadinessGoalDto, project_arg: &str) -> String {
-    format!(
+fn ready_repair_command(goal: ReadinessGoalDto, project_arg: &str, run_id: Option<&str>) -> String {
+    let mut command = format!(
         "codestory-cli ready --goal {} --repair --project {project_arg} --format json",
         ready_goal_cli_label(goal)
-    )
+    );
+    if goal == ReadinessGoalDto::AgentPacketSearch
+        && let Some(run_id) = run_id
+    {
+        command.push_str(" --run-id ");
+        command.push_str(&quote_command_argument_value(run_id));
+    }
+    command
 }
 
 fn ready_goal_cli_label(goal: ReadinessGoalDto) -> &'static str {
@@ -818,6 +827,9 @@ mod tests {
                     run_id: None,
                     retrieval_mode: "full",
                     degraded_reason: None,
+                    embedding_device_policy: Some("accelerator_required"),
+                    embedding_device_state: Some("accelerated"),
+                    embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
                 }),
