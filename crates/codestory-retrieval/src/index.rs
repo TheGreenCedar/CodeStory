@@ -6,7 +6,7 @@ use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract, manifest_unavailable_reason,
     sidecar_generation_id,
 };
-use crate::health::probe_sidecar_health;
+use crate::health::probe_sidecar_health_with_embedding_device;
 use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
 use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
@@ -221,7 +221,8 @@ pub fn finalize_index_for_runtime(
     if !qdrant_enabled() {
         bail!("Qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
     }
-    crate::embeddings::ensure_product_embedding_backend()?;
+    crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)?;
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
 
     let mut storage =
         Store::open(storage_path).context("open storage for retrieval sidecar input")?;
@@ -255,7 +256,12 @@ pub fn finalize_index_for_runtime(
             &embedding_backend,
             embedding_dim,
         ) {
-            let status = probe_sidecar_health(&layout, &project_id, Some(previous.clone()));
+            let status = probe_sidecar_health_with_embedding_device(
+                &layout,
+                &project_id,
+                Some(previous.clone()),
+                &embedding_device,
+            );
             let qdrant_point_count = qdrant_ready_point_count(
                 &qdrant_client,
                 &previous.qdrant_collection,
@@ -317,7 +323,12 @@ pub fn finalize_index_for_runtime(
     );
     manifest.scip_revision = read_scip_revision(&scip_dir);
 
-    let existing_status = probe_sidecar_health(&layout, &project_id, Some(manifest.clone()));
+    let existing_status = probe_sidecar_health_with_embedding_device(
+        &layout,
+        &project_id,
+        Some(manifest.clone()),
+        &embedding_device,
+    );
     let zoekt_ready = existing_status.zoekt.capabilities.lexical
         && crate::zoekt_index::shard_matches_lexical_input(
             &layout.zoekt_data_dir,
@@ -335,7 +346,12 @@ pub fn finalize_index_for_runtime(
     if zoekt_ready && qdrant_ready_points.is_some() && scip_ready {
         update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
         manifest.disk_bytes = sidecar_disk_bytes(&layout, &scip_dir);
-        let status = probe_sidecar_health(&layout, &project_id, Some(manifest.clone()));
+        let status = probe_sidecar_health_with_embedding_device(
+            &layout,
+            &project_id,
+            Some(manifest.clone()),
+            &embedding_device,
+        );
         if status.retrieval_mode == "full" {
             info!(
                 project_id = %project_id,
@@ -403,6 +419,7 @@ pub fn finalize_index_for_runtime(
             qdrant_stubbed,
             scip_stubbed,
         },
+        &embedding_device,
     )
 }
 
@@ -612,8 +629,14 @@ fn finalize_manifest_after_health_check(
     manifest: RetrievalIndexManifest,
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
+    embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
 ) -> Result<FinalizeIndexOutcome> {
-    let status = probe_sidecar_health(layout, &project_id, Some(manifest.clone()));
+    let status = probe_sidecar_health_with_embedding_device(
+        layout,
+        &project_id,
+        Some(manifest.clone()),
+        embedding_device,
+    );
     if status.retrieval_mode != "full" {
         bail!(
             "mandatory sidecar generation did not reach full mode for {project_id}: {} {:?}",

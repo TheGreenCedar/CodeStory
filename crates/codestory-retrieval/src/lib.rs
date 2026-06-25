@@ -60,6 +60,7 @@ pub use embeddings::qdrant_vector_dim;
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, RETRIEVAL_EMBEDDING_DIM,
     embedding_backend_label, embedding_runtime_id, ensure_product_embedding_backend,
+    ensure_product_embedding_backend_for_runtime,
 };
 pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellation_flag};
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};

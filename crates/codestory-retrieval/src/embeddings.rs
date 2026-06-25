@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// bge-base-en-v1.5 vector width (must match Qdrant collection and llama.cpp model).
 pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
@@ -40,6 +40,9 @@ const DISABLE_HOST_GPU_DETECT_ENV: &str = "CODESTORY_EMBED_DISABLE_HOST_GPU_DETE
 const LLAMACPP_DEVICE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_DEVICE";
 const LLAMACPP_N_GPU_LAYERS_ENV: &str = "CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS";
 const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
+const NATIVE_LLAMA_LOG_START_MARKER: &str = "starting native llama.cpp embedding server:";
+const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_EMBED_DEVICE_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,6 +92,37 @@ pub fn manifest_embedding_backend_is_product(backend: Option<&str>) -> bool {
 }
 
 pub fn ensure_product_embedding_backend() -> Result<()> {
+    ensure_product_embedding_backend_with_device(embedding_device_readiness())
+}
+
+pub fn ensure_product_embedding_backend_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<()> {
+    ensure_product_embedding_backend_static()?;
+    let deadline = Instant::now() + RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT;
+    let mut device = embedding_device_readiness_for_runtime(runtime);
+    loop {
+        if device.full_retrieval_allowed {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("{}", device.degraded_reason.expect("device policy reason"));
+        }
+        thread::sleep((deadline - now).min(RUNTIME_EMBED_DEVICE_OBSERVATION_POLL));
+        device = embedding_device_readiness_for_runtime(runtime);
+    }
+}
+
+fn ensure_product_embedding_backend_with_device(device: EmbeddingDeviceReadiness) -> Result<()> {
+    ensure_product_embedding_backend_static()?;
+    if !device.full_retrieval_allowed {
+        bail!("{}", device.degraded_reason.expect("device policy reason"));
+    }
+    Ok(())
+}
+
+fn ensure_product_embedding_backend_static() -> Result<()> {
     if !super::config::qdrant_semantic_vectors_enabled() {
         bail!("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS=0 is unsupported for product sidecar indexing");
     }
@@ -96,10 +130,6 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
         bail!(
             "llama.cpp embedding sidecar is mandatory; set CODESTORY_EMBED_BACKEND=llamacpp and CODESTORY_EMBED_LLAMACPP_URL"
         );
-    }
-    let device = embedding_device_readiness();
-    if !device.full_retrieval_allowed {
-        bail!("{}", device.degraded_reason.expect("device policy reason"));
     }
     Ok(())
 }
@@ -200,7 +230,7 @@ fn observe_native_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
     let text = std::fs::read_to_string(native_embedding_log_path(runtime)).ok()?;
-    match observed_embedding_device_state_from_text(&text) {
+    match observed_embedding_device_state_from_text(native_embedding_log_current_launch(&text)) {
         "unknown" => None,
         state => Some(EmbeddingDeviceObservation {
             state,
@@ -216,6 +246,12 @@ pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeC
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("llama-server-native.log")
+}
+
+fn native_embedding_log_current_launch(text: &str) -> &str {
+    text.rfind(NATIVE_LLAMA_LOG_START_MARKER)
+        .map(|offset| &text[offset..])
+        .unwrap_or(text)
 }
 
 pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
@@ -733,6 +769,8 @@ pub fn qdrant_vector_dim() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1017,6 +1055,24 @@ mod tests {
     }
 
     #[test]
+    fn native_log_current_launch_ignores_stale_acceleration() {
+        let text = concat!(
+            "starting native llama.cpp embedding server: old --device Vulkan0\n",
+            "using device Vulkan0\n",
+            "offloaded 33/33 layers to GPU\n",
+            "starting native llama.cpp embedding server: current --device Vulkan0\n",
+            "server listening on 0.0.0.0\n",
+            "n_gpu_layers = 0\n",
+        );
+
+        let current = native_embedding_log_current_launch(text);
+
+        assert!(current.contains("current --device Vulkan0"));
+        assert!(!current.contains("old --device Vulkan0"));
+        assert_eq!(observed_embedding_device_state_from_text(current), "cpu");
+    }
+
+    #[test]
     fn explicit_unknown_device_still_fails_closed_on_amd_host() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
@@ -1084,6 +1140,101 @@ mod tests {
             error.to_string().contains("embedding_device_unverified"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn product_embedding_backend_uses_runtime_native_log_observation() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let runtime = SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.path().join("zoekt"),
+                qdrant_data_dir: root.path().join("qdrant"),
+                scip_artifacts_root: root.path().join("scip"),
+                state_file: root.path().join("state").join("retrieval-sidecars.json"),
+            },
+            profile: SidecarProfile::Agent,
+            run_id: Some("shared-agent".into()),
+            namespace: "agent-shared-agent".into(),
+            compose_project: "codestory-agent-shared-agent".into(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".into(),
+            labels: BTreeMap::new(),
+        };
+        std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
+            .expect("create state dir");
+        std::fs::write(
+            native_embedding_log_path(&runtime),
+            "llama_model_load: offloaded 33/33 layers to GPU\n",
+        )
+        .expect("write native log");
+
+        let generic_error = ensure_product_embedding_backend()
+            .expect_err("generic check should not see the runtime native log");
+        assert!(
+            generic_error
+                .to_string()
+                .contains("embedding_device_unverified")
+        );
+
+        ensure_product_embedding_backend_for_runtime(&runtime)
+            .expect("runtime native log should satisfy accelerator policy");
+    }
+
+    #[test]
+    fn product_embedding_backend_for_runtime_waits_for_native_log_observation() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let runtime = SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.path().join("zoekt"),
+                qdrant_data_dir: root.path().join("qdrant"),
+                scip_artifacts_root: root.path().join("scip"),
+                state_file: root.path().join("state").join("retrieval-sidecars.json"),
+            },
+            profile: SidecarProfile::Agent,
+            run_id: Some("shared-agent".into()),
+            namespace: "agent-shared-agent".into(),
+            compose_project: "codestory-agent-shared-agent".into(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".into(),
+            labels: BTreeMap::new(),
+        };
+        std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
+            .expect("create state dir");
+        let log_path = native_embedding_log_path(&runtime);
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            std::fs::write(
+                log_path,
+                "starting native llama.cpp embedding server: test --device Vulkan0\nload_tensors: offloaded 13/13 layers to GPU\n",
+            )
+            .expect("write native log");
+        });
+
+        ensure_product_embedding_backend_for_runtime(&runtime)
+            .expect("runtime helper should wait for native log acceleration");
+        writer.join().expect("native log writer");
     }
 
     #[test]

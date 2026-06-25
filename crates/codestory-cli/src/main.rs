@@ -118,6 +118,8 @@ const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
 const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
+const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
 
 fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
@@ -2176,7 +2178,13 @@ fn repair_ready_state(
         Duration::from_secs(90),
     )
     .context("ready repair retrieval bootstrap")?;
-    ensure_ready_repair_embed_liveness(&bootstrap.infrastructure)?;
+    let infrastructure = ready_repair_infrastructure_with_runtime_observation(
+        &bootstrap.infrastructure,
+        &runtime.project_root,
+        &runtime.storage_path,
+        &sidecar,
+    );
+    ensure_ready_repair_embed_liveness(&infrastructure)?;
     codestory_retrieval::repair_project_qdrant_collection(
         &runtime.project_root,
         &runtime.storage_path,
@@ -2228,6 +2236,64 @@ fn ensure_ready_repair_embed_liveness(
         infrastructure.qdrant_reachable,
         infrastructure.qdrant_detail
     )
+}
+
+fn ready_repair_infrastructure_with_runtime_observation(
+    infrastructure: &codestory_retrieval::InfrastructureHealth,
+    project_root: &Path,
+    storage_path: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> codestory_retrieval::InfrastructureHealth {
+    if infrastructure.embedding_cpu_allowed
+        || infrastructure.embedding_device_state == "accelerated"
+    {
+        return infrastructure.clone();
+    }
+    let deadline = Instant::now() + READY_REPAIR_EMBED_OBSERVATION_TIMEOUT;
+    loop {
+        if let Some(refreshed) = ready_repair_observed_infrastructure(
+            infrastructure,
+            project_root,
+            storage_path,
+            sidecar,
+        ) {
+            return refreshed;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return infrastructure.clone();
+        }
+        std::thread::sleep((deadline - now).min(READY_REPAIR_EMBED_OBSERVATION_POLL));
+    }
+}
+
+fn ready_repair_observed_infrastructure(
+    infrastructure: &codestory_retrieval::InfrastructureHealth,
+    project_root: &Path,
+    storage_path: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Option<codestory_retrieval::InfrastructureHealth> {
+    let report = codestory_retrieval::strict_sidecar_status_for_runtime(
+        project_root,
+        Some(storage_path),
+        sidecar.clone(),
+    )
+    .ok()?;
+    if !report.embedding_cpu_allowed && report.embedding_device_state != "accelerated" {
+        return None;
+    }
+    let mut refreshed = infrastructure.clone();
+    refreshed.embedding_device_policy = report.embedding_device_policy;
+    refreshed.embedding_device_state = report.embedding_device_state;
+    refreshed.embedding_device_observation_source = report.embedding_device_observation_source;
+    refreshed.embedding_detected_provider = report.embedding_detected_provider;
+    refreshed.embedding_detected_gpu = report.embedding_detected_gpu;
+    refreshed.embedding_accelerator_requested = report.embedding_accelerator_requested;
+    refreshed.embedding_accelerator_request_provider =
+        report.embedding_accelerator_request_provider;
+    refreshed.embedding_accelerator_request_device = report.embedding_accelerator_request_device;
+    refreshed.embedding_cpu_allowed = report.embedding_cpu_allowed;
+    Some(refreshed)
 }
 
 fn ensure_ready_repair_full_sidecar(
@@ -12329,6 +12395,83 @@ mod tests {
         assert!(message.contains("embedding device policy failed before long semantic indexing"));
         assert!(message.contains("requested_policy=accelerator_required"));
         assert!(message.contains("observed_device=unknown"));
+    }
+
+    #[test]
+    fn ready_repair_waits_for_native_log_before_liveness_failure() {
+        let _env = EnvVarSnapshot::clear(&[
+            "CODESTORY_EMBED_SERVER_LAUNCH",
+            "CODESTORY_EMBED_ALLOW_CPU",
+            "CODESTORY_EMBED_DEVICE_POLICY",
+            "CODESTORY_EMBED_DEVICE_STATE",
+            "CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT",
+        ]);
+        unsafe {
+            std::env::set_var("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+            std::env::set_var("CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT", "1");
+        }
+        let root = tempdir().expect("temp dir");
+        let sidecar = codestory_retrieval::SidecarRuntimeConfig {
+            layout: codestory_retrieval::SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.path().join("zoekt"),
+                qdrant_data_dir: root.path().join("qdrant"),
+                scip_artifacts_root: root.path().join("scip"),
+                state_file: root.path().join("state").join("retrieval-sidecars.json"),
+            },
+            profile: codestory_retrieval::SidecarProfile::Agent,
+            run_id: Some("shared-agent".into()),
+            namespace: "agent-shared-agent".into(),
+            compose_project: "codestory-agent-shared-agent".into(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".into(),
+            labels: BTreeMap::new(),
+        };
+        let state_dir = sidecar.layout.state_file.parent().expect("state parent");
+        fs::create_dir_all(state_dir).expect("create state dir");
+        let log_path = state_dir.join("llama-server-native.log");
+        let stale = codestory_retrieval::InfrastructureHealth {
+            zoekt_reachable: true,
+            qdrant_reachable: true,
+            embed_reachable: true,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "unknown".into(),
+            embedding_device_observation_source: "sidecar_state".into(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: false,
+            zoekt_detail: "http 200".into(),
+            qdrant_detail: "http 200".into(),
+            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
+        };
+        ensure_ready_repair_embed_liveness(&stale)
+            .expect_err("stale bootstrap observation should fail before re-observation");
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::write(
+                log_path,
+                "using device Vulkan0\noffloaded 13/13 layers to GPU\n",
+            )
+            .expect("write native log");
+        });
+        let refreshed = ready_repair_infrastructure_with_runtime_observation(
+            &stale,
+            root.path(),
+            &root.path().join("missing.db"),
+            &sidecar,
+        );
+        writer.join().expect("native log writer");
+
+        assert_eq!(refreshed.embedding_device_state, "accelerated");
+        assert_eq!(refreshed.embedding_device_observation_source, "native_log");
+        ensure_ready_repair_embed_liveness(&refreshed)
+            .expect("native log observation should allow repair to continue");
     }
 
     #[test]
