@@ -28,6 +28,9 @@ pub(crate) struct ReadinessSetupInput {
 pub(crate) struct ReadinessSidecarInput<'a> {
     pub(crate) retrieval_mode: &'a str,
     pub(crate) degraded_reason: Option<&'a str>,
+    pub(crate) embedding_device_policy: Option<&'a str>,
+    pub(crate) embedding_device_state: Option<&'a str>,
+    pub(crate) embedding_cpu_allowed: bool,
     pub(crate) manifest_generation: Option<&'a str>,
     pub(crate) manifest_input_hash: Option<&'a str>,
 }
@@ -220,6 +223,16 @@ fn verdict_state(
             .map(|sidecar| sidecar.retrieval_mode)
             .unwrap_or("unavailable");
         if sidecar_mode != "full" {
+            let device_note = sidecar
+                .and_then(|sidecar| {
+                    sidecar
+                        .embedding_device_policy
+                        .zip(sidecar.embedding_device_state)
+                })
+                .map(|(policy, state)| {
+                    format!(" embedding_device_policy=`{policy}` observed_device=`{state}`.")
+                })
+                .unwrap_or_default();
             let full_repair = agent_packet_search_repair_commands(
                 project_arg,
                 !matches!(
@@ -231,7 +244,7 @@ fn verdict_state(
             return (
                 ReadinessStatusDto::RepairRetrieval,
                 format!(
-                    "Agent packet/search needs full sidecar retrieval; current mode is `{sidecar_mode}`."
+                    "Agent packet/search needs full sidecar retrieval; current mode is `{sidecar_mode}`.{device_note}"
                 ),
                 minimum_next,
                 full_repair,
@@ -367,6 +380,9 @@ fn readiness_sidecar_snapshot(input: ReadinessSidecarInput<'_>) -> ReadinessSide
     ReadinessSidecarSnapshotDto {
         retrieval_mode: input.retrieval_mode.to_string(),
         degraded_reason: input.degraded_reason.map(ToOwned::to_owned),
+        embedding_device_policy: input.embedding_device_policy.map(ToOwned::to_owned),
+        embedding_device_state: input.embedding_device_state.map(ToOwned::to_owned),
+        embedding_cpu_allowed: input.embedding_cpu_allowed,
         manifest_generation: input.manifest_generation.map(ToOwned::to_owned),
         manifest_input_hash: input.manifest_input_hash.map(ToOwned::to_owned),
     }
@@ -464,6 +480,9 @@ mod tests {
             sidecar: Some(ReadinessSidecarInput {
                 retrieval_mode: "full",
                 degraded_reason: None,
+                embedding_device_policy: Some("accelerator_required"),
+                embedding_device_state: Some("accelerated"),
+                embedding_cpu_allowed: false,
                 manifest_generation: Some("generation"),
                 manifest_input_hash: Some("hash"),
             }),
@@ -511,6 +530,9 @@ mod tests {
             sidecar: Some(ReadinessSidecarInput {
                 retrieval_mode: "full",
                 degraded_reason: None,
+                embedding_device_policy: Some("accelerator_required"),
+                embedding_device_state: Some("accelerated"),
+                embedding_cpu_allowed: false,
                 manifest_generation: Some("generation"),
                 manifest_input_hash: Some("hash"),
             }),
@@ -552,6 +574,9 @@ mod tests {
             Some(ReadinessSidecarInput {
                 retrieval_mode: "full",
                 degraded_reason: None,
+                embedding_device_policy: Some("accelerator_required"),
+                embedding_device_state: Some("accelerated"),
+                embedding_cpu_allowed: false,
                 manifest_generation: Some("generation"),
                 manifest_input_hash: Some("hash"),
             }),
@@ -631,6 +656,9 @@ mod tests {
                 Some(ReadinessSidecarInput {
                     retrieval_mode: "full",
                     degraded_reason: None,
+                    embedding_device_policy: Some("accelerator_required"),
+                    embedding_device_state: Some("accelerated"),
+                    embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
                 }),
@@ -670,6 +698,9 @@ mod tests {
                 Some(ReadinessSidecarInput {
                     retrieval_mode: "no_semantic",
                     degraded_reason: Some("semantic store unavailable"),
+                    embedding_device_policy: Some("accelerator_required"),
+                    embedding_device_state: Some("unknown"),
+                    embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
                 }),
@@ -683,6 +714,12 @@ mod tests {
                 .as_ref()
                 .and_then(|sidecar| sidecar.degraded_reason.as_deref()),
             Some("semantic store unavailable")
+        );
+        assert!(
+            degraded
+                .summary
+                .contains("embedding_device_policy=`accelerator_required`"),
+            "blocked full retrieval should expose device policy: {degraded:?}"
         );
         assert!(
             degraded
@@ -725,6 +762,9 @@ mod tests {
             Some(ReadinessSidecarInput {
                 retrieval_mode: "unavailable",
                 degraded_reason: Some("manifest:<missing>"),
+                embedding_device_policy: Some("accelerator_required"),
+                embedding_device_state: Some("unknown"),
+                embedding_cpu_allowed: false,
                 manifest_generation: None,
                 manifest_input_hash: None,
             }),
@@ -755,6 +795,9 @@ mod tests {
                 Some(ReadinessSidecarInput {
                     retrieval_mode: "unavailable",
                     degraded_reason: None,
+                    embedding_device_policy: Some("accelerator_required"),
+                    embedding_device_state: Some("unknown"),
+                    embedding_cpu_allowed: false,
                     manifest_generation: None,
                     manifest_input_hash: None,
                 }),

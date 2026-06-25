@@ -100,6 +100,9 @@ fn render_report_markdown(output: &RepoReport, profile: ReportProfile) -> String
 struct ReportSidecarStatus {
     retrieval_mode: String,
     degraded_reason: Option<String>,
+    embedding_device_policy: String,
+    embedding_device_state: String,
+    embedding_cpu_allowed: bool,
     manifest_generation: Option<String>,
     manifest_input_hash: Option<String>,
 }
@@ -121,6 +124,9 @@ fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
             ReportSidecarStatus {
                 retrieval_mode: report.retrieval_mode,
                 degraded_reason: report.degraded_reason,
+                embedding_device_policy: report.embedding_device_policy,
+                embedding_device_state: report.embedding_device_state,
+                embedding_cpu_allowed: report.embedding_cpu_allowed,
                 manifest_generation,
                 manifest_input_hash,
             }
@@ -128,6 +134,9 @@ fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
         Err(error) => ReportSidecarStatus {
             retrieval_mode: "unavailable".to_string(),
             degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "unknown".to_string(),
+            embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,
         },
@@ -147,6 +156,9 @@ fn attach_report_handoff(
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
             retrieval_mode: &sidecar.retrieval_mode,
             degraded_reason: sidecar.degraded_reason.as_deref(),
+            embedding_device_policy: Some(&sidecar.embedding_device_policy),
+            embedding_device_state: Some(&sidecar.embedding_device_state),
+            embedding_cpu_allowed: sidecar.embedding_cpu_allowed,
             manifest_generation: sidecar.manifest_generation.as_deref(),
             manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
         }),

@@ -90,6 +90,9 @@ pub struct RetrievalStatusReport {
     pub stored_doc_vector_dim: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stored_doc_vector_mixed_backends: Option<bool>,
+    pub embedding_device_policy: String,
+    pub embedding_device_state: String,
+    pub embedding_cpu_allowed: bool,
     pub zoekt: ComponentHealth,
     pub qdrant: ComponentHealth,
     pub scip: ComponentHealth,
@@ -293,6 +296,9 @@ pub struct InfrastructureHealth {
     pub zoekt_reachable: bool,
     pub qdrant_reachable: bool,
     pub embed_reachable: bool,
+    pub embedding_device_policy: String,
+    pub embedding_device_state: String,
+    pub embedding_cpu_allowed: bool,
     pub zoekt_detail: String,
     pub qdrant_detail: String,
     pub embed_detail: String,
@@ -320,6 +326,7 @@ pub fn unavailable_status_report(
     let manifest_vector_embedding_dim = manifest
         .as_ref()
         .and_then(|manifest| manifest.embedding_dim);
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     RetrievalStatusReport {
         retrieval_mode: "unavailable".into(),
         ownership: None,
@@ -331,6 +338,9 @@ pub fn unavailable_status_report(
         stored_doc_vector_producer_backend: None,
         stored_doc_vector_dim: None,
         stored_doc_vector_mixed_backends: None,
+        embedding_device_policy: embedding_device.requested_policy.into(),
+        embedding_device_state: embedding_device.observed_state.into(),
+        embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt: unavailable_component("zoekt", &reason),
         qdrant: unavailable_component("qdrant", &reason),
         scip: unavailable_component("scip", &reason),
@@ -345,10 +355,14 @@ pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHeal
     let qdrant_client = QdrantClient::new(layout);
     let qdrant_probe = qdrant_client.list_collections_probe();
     let embed_probe = crate::embeddings::probe_product_embedding_runtime();
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     InfrastructureHealth {
         zoekt_reachable: zoekt_probe.reachable,
         qdrant_reachable: qdrant_probe.reachable,
         embed_reachable: embed_probe.reachable,
+        embedding_device_policy: embedding_device.requested_policy.into(),
+        embedding_device_state: embedding_device.observed_state.into(),
+        embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt_detail: zoekt_probe.detail,
         qdrant_detail: qdrant_probe.detail,
         embed_detail: embed_probe.detail,
@@ -499,25 +513,13 @@ pub fn probe_sidecar_health(
     };
 
     let current_embedding_backend = crate::embeddings::embedding_runtime_id();
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     let dense_anchor_count = manifest
         .dense_projection_count
         .or(manifest.projection_count)
         .unwrap_or(0);
     let qdrant = if dense_anchor_count == 0 {
-        ComponentHealth {
-            name: "qdrant".into(),
-            status: ComponentStatus::Healthy,
-            latency_ms: None,
-            detail:
-                "graph_first_v1 selected zero dense anchors; semantic retrieval skipped by policy"
-                    .into(),
-            degraded_reason: None,
-            capabilities: SidecarCapabilities {
-                lexical: false,
-                semantic: true,
-                graph: false,
-            },
-        }
+        zero_dense_qdrant_health(&embedding_device)
     } else {
         let collection = manifest.qdrant_collection.clone();
         let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);
@@ -539,11 +541,19 @@ pub fn probe_sidecar_health(
         let qdrant_semantic_stub = qdrant_probe.reachable
             && qdrant_probe.collection_exists
             && !qdrant_capabilities.semantic;
+        let qdrant_device_unverified = qdrant_probe.reachable
+            && qdrant_probe.collection_exists
+            && product_embedding_backend
+            && current_product_embedding_backend
+            && !embedding_device.full_retrieval_allowed;
         ComponentHealth {
             name: "qdrant".into(),
             status: if !qdrant_probe.reachable {
                 ComponentStatus::Unavailable
-            } else if !qdrant_probe.collection_exists || qdrant_semantic_stub {
+            } else if !qdrant_probe.collection_exists
+                || qdrant_device_unverified
+                || qdrant_semantic_stub
+            {
                 ComponentStatus::Degraded
             } else if qdrant_probe.latency_ms <= QDRANT_HEALTH_BUDGET.as_millis() as u64 {
                 ComponentStatus::Healthy
@@ -562,6 +572,8 @@ pub fn probe_sidecar_health(
                 Some("qdrant_non_product_embedding_backend".into())
             } else if !current_product_embedding_backend {
                 Some("qdrant_current_embedding_backend_not_product".into())
+            } else if qdrant_device_unverified {
+                embedding_device.degraded_reason.clone()
             } else if qdrant_semantic_stub {
                 Some(if qdrant_semantic_vectors_enabled() {
                     "qdrant_semantic_smoke_failed".into()
@@ -571,7 +583,11 @@ pub fn probe_sidecar_health(
             } else {
                 None
             },
-            capabilities: qdrant_capabilities,
+            capabilities: if qdrant_device_unverified {
+                SidecarCapabilities::NONE
+            } else {
+                qdrant_capabilities
+            },
         }
     };
 
@@ -611,11 +627,43 @@ pub fn probe_sidecar_health(
         stored_doc_vector_producer_backend: None,
         stored_doc_vector_dim: None,
         stored_doc_vector_mixed_backends: None,
+        embedding_device_policy: embedding_device.requested_policy.into(),
+        embedding_device_state: embedding_device.observed_state.into(),
+        embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt,
         qdrant,
         scip,
         manifest_contract: None,
         manifest: Some(manifest),
+    }
+}
+
+fn zero_dense_qdrant_health(
+    embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
+) -> ComponentHealth {
+    if !embedding_device.full_retrieval_allowed {
+        return ComponentHealth {
+            name: "qdrant".into(),
+            status: ComponentStatus::Degraded,
+            latency_ms: None,
+            detail: "graph_first_v1 selected zero dense anchors, but embedding device policy is not verified".into(),
+            degraded_reason: embedding_device.degraded_reason.clone(),
+            capabilities: SidecarCapabilities::NONE,
+        };
+    }
+
+    ComponentHealth {
+        name: "qdrant".into(),
+        status: ComponentStatus::Healthy,
+        latency_ms: None,
+        detail: "graph_first_v1 selected zero dense anchors; semantic retrieval skipped by policy"
+            .into(),
+        degraded_reason: None,
+        capabilities: SidecarCapabilities {
+            lexical: false,
+            semantic: true,
+            graph: false,
+        },
     }
 }
 
@@ -732,46 +780,36 @@ mod tests {
     }
 
     #[test]
-    fn zero_dense_manifest_skips_semantic_lane_without_degrading() {
-        let layout = SidecarLayout::from_env();
-        let project_id = "testproject";
-        let input_hash = "ba5eba11cafebeef";
-        let manifest = codestory_store::RetrievalIndexManifest {
-            project_id: project_id.into(),
-            zoekt_version: "zoekt-real-v1".into(),
-            qdrant_collection: crate::generation::sidecar_qdrant_collection(project_id, input_hash),
-            scip_revision: Some("graph-test".into()),
-            built_at_epoch_ms: 1,
-            disk_bytes: None,
-            degraded_modes_json: "[]".into(),
-            embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
-            embedding_dim: Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32),
-            sidecar_schema_version: Some(crate::generation::SIDECAR_SCHEMA_VERSION),
-            sidecar_input_hash: Some(input_hash.into()),
-            sidecar_generation: Some(crate::generation::sidecar_generation_id(
-                project_id, input_hash,
-            )),
-            projection_count: Some(0),
-            symbol_doc_count: Some(14741),
-            dense_projection_count: Some(0),
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            graph_artifact_hash: Some("graph-test-hash".into()),
-            dense_reason_counts_json: Some("{}".into()),
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        };
+    fn zero_dense_manifest_still_requires_verified_embedding_device() {
+        let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "unknown",
+            cpu_allowed: false,
+            full_retrieval_allowed: false,
+            degraded_reason: Some("embedding_device_unverified".into()),
+        });
 
-        let report = probe_sidecar_health(&layout, project_id, Some(manifest));
-
-        assert_eq!(report.qdrant.status, ComponentStatus::Healthy);
-        assert_eq!(report.qdrant.degraded_reason, None);
-        assert!(report.qdrant.capabilities.semantic);
-        assert_ne!(
-            report.degraded_reason.as_deref(),
-            Some("semantic_dense_projection_count_zero")
+        assert_eq!(qdrant.status, ComponentStatus::Degraded);
+        assert_eq!(
+            qdrant.degraded_reason.as_deref(),
+            Some("embedding_device_unverified")
         );
+        assert!(!qdrant.capabilities.semantic);
+    }
+
+    #[test]
+    fn zero_dense_manifest_allows_explicit_cpu_opt_in() {
+        let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "cpu_allowed",
+            observed_state: "cpu",
+            cpu_allowed: true,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        });
+
+        assert_eq!(qdrant.status, ComponentStatus::Healthy);
+        assert_eq!(qdrant.degraded_reason, None);
+        assert!(qdrant.capabilities.semantic);
     }
 
     #[test]
@@ -827,6 +865,9 @@ mod tests {
             stored_doc_vector_producer_backend: None,
             stored_doc_vector_dim: None,
             stored_doc_vector_mixed_backends: None,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "accelerated".into(),
+            embedding_cpu_allowed: false,
             zoekt: ComponentHealth {
                 name: "zoekt".into(),
                 status: ComponentStatus::Healthy,

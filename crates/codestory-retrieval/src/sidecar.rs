@@ -42,6 +42,12 @@ pub struct SidecarStateFile {
     pub embed_http_port: u16,
     #[serde(default = "default_embed_url")]
     pub embed_url: String,
+    #[serde(default = "default_embedding_device_policy")]
+    pub embedding_device_policy: String,
+    #[serde(default = "default_embedding_device_state")]
+    pub embedding_device_state: String,
+    #[serde(default)]
+    pub embedding_cpu_allowed: bool,
     pub zoekt_data_dir: String,
     pub qdrant_data_dir: String,
     pub scip_artifacts_root: String,
@@ -62,6 +68,7 @@ pub fn sidecar_up_with_runtime(
 ) -> Result<SidecarStateFile> {
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     let state = SidecarStateFile {
         owner: "codestory".into(),
         profile: runtime.profile.as_str().into(),
@@ -73,6 +80,9 @@ pub fn sidecar_up_with_runtime(
         qdrant_grpc_port: layout.qdrant_grpc_port,
         embed_http_port: runtime.embed_http_port,
         embed_url: SidecarLayout::embed_base_url(runtime.embed_http_port),
+        embedding_device_policy: embedding_device.requested_policy.into(),
+        embedding_device_state: embedding_device.observed_state.into(),
+        embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt_data_dir: layout.zoekt_data_dir.display().to_string(),
         qdrant_data_dir: layout.qdrant_data_dir.display().to_string(),
         scip_artifacts_root: layout.scip_artifacts_root.display().to_string(),
@@ -426,6 +436,14 @@ fn default_embed_http_port() -> u16 {
 
 fn default_embed_url() -> String {
     SidecarLayout::embed_base_url(crate::config::DEFAULT_EMBED_HTTP_PORT)
+}
+
+fn default_embedding_device_policy() -> String {
+    "accelerator_required".into()
+}
+
+fn default_embedding_device_state() -> String {
+    "unknown".into()
 }
 
 #[cfg(test)]

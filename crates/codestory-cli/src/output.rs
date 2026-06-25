@@ -2164,9 +2164,12 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
     );
     let _ = writeln!(
         markdown,
-        "sidecar_retrieval: mode={} degraded_reason={}",
+        "sidecar_retrieval: mode={} degraded_reason={} embedding_device_policy={} observed_device={} cpu_allowed={}",
         output.retrieval_mode,
-        output.degraded_reason.as_deref().unwrap_or("none")
+        output.degraded_reason.as_deref().unwrap_or("none"),
+        output.sidecar_retrieval.embedding_device_policy,
+        output.sidecar_retrieval.embedding_device_state,
+        output.sidecar_retrieval.embedding_cpu_allowed
     );
     let _ = writeln!(
         markdown,
@@ -2264,11 +2267,13 @@ fn doctor_operator_status(output: &DoctorOutput) -> &'static str {
 
 fn doctor_operator_trust(output: &DoctorOutput) -> String {
     format!(
-        "local_navigation={} agent_packet_search={} sidecar_mode={} degraded_reason={}",
+        "local_navigation={} agent_packet_search={} sidecar_mode={} degraded_reason={} embedding_device_policy={} observed_device={}",
         doctor_local_navigation_readiness(output),
         doctor_agent_packet_search_readiness(output),
         output.retrieval_mode,
-        output.degraded_reason.as_deref().unwrap_or("none")
+        output.degraded_reason.as_deref().unwrap_or("none"),
+        output.sidecar_retrieval.embedding_device_policy,
+        output.sidecar_retrieval.embedding_device_state
     )
 }
 
@@ -3824,6 +3829,9 @@ mod tests {
             sidecar_retrieval: crate::args::DoctorSidecarStatusOutput {
                 retrieval_mode: "full".to_string(),
                 degraded_reason: None,
+                embedding_device_policy: "accelerator_required".to_string(),
+                embedding_device_state: "accelerated".to_string(),
+                embedding_cpu_allowed: false,
                 manifest_generation: None,
                 manifest_input_hash: None,
                 precise_semantic_import_status: None,

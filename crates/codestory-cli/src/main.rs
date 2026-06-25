@@ -1676,6 +1676,15 @@ fn repair_ready_state(runtime: &RuntimeContext, goal: Option<args::ReadyGoal>) -
 fn ensure_ready_repair_embed_liveness(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
 ) -> Result<()> {
+    if !infrastructure.embedding_cpu_allowed
+        && infrastructure.embedding_device_state != "accelerated"
+    {
+        bail!(
+            "ready repair embedding device policy failed before long semantic indexing: requested_policy={} observed_device={}; set CODESTORY_EMBED_ALLOW_CPU=1 or CODESTORY_EMBED_DEVICE_POLICY=allow_cpu for intentional CPU-backed retrieval",
+            infrastructure.embedding_device_policy,
+            infrastructure.embedding_device_state
+        );
+    }
     if infrastructure.embed_reachable {
         return Ok(());
     }
@@ -1755,11 +1764,16 @@ fn surface_strings(surfaces: &[&str]) -> Vec<String> {
 fn agent_preflight_lane(
     verdict: &codestory_contracts::api::ReadinessVerdictDto,
 ) -> args::AgentPreflightLaneOutput {
+    let sidecar = verdict.sidecar.as_ref();
     args::AgentPreflightLaneOutput {
         ready: verdict.status == ReadinessStatusDto::Ready,
         status: verdict.status,
         failed_layer: readiness::failed_layer(verdict),
         summary: verdict.summary.clone(),
+        embedding_device_policy: sidecar
+            .and_then(|sidecar| sidecar.embedding_device_policy.clone()),
+        embedding_device_state: sidecar.and_then(|sidecar| sidecar.embedding_device_state.clone()),
+        embedding_cpu_allowed: sidecar.map(|sidecar| sidecar.embedding_cpu_allowed),
     }
 }
 
@@ -1798,6 +1812,16 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
     );
     if let Some(layer) = output.full_retrieval.failed_layer {
         let _ = writeln!(markdown, "full_retrieval_failed_layer: `{layer}`");
+    }
+    if let (Some(policy), Some(state), Some(cpu_allowed)) = (
+        output.full_retrieval.embedding_device_policy.as_deref(),
+        output.full_retrieval.embedding_device_state.as_deref(),
+        output.full_retrieval.embedding_cpu_allowed,
+    ) {
+        let _ = writeln!(
+            markdown,
+            "full_retrieval_embedding_device: policy=`{policy}` observed=`{state}` cpu_allowed={cpu_allowed}"
+        );
     }
     if let Some(state) = output
         .sidecar_setup
@@ -9040,6 +9064,9 @@ fn readiness_sidecar_input(
     readiness::ReadinessSidecarInput {
         retrieval_mode: sidecar.retrieval_mode.as_str(),
         degraded_reason: sidecar.degraded_reason.as_deref(),
+        embedding_device_policy: Some(sidecar.embedding_device_policy.as_str()),
+        embedding_device_state: Some(sidecar.embedding_device_state.as_str()),
+        embedding_cpu_allowed: sidecar.embedding_cpu_allowed,
         manifest_generation: sidecar.manifest_generation.as_deref(),
         manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
     }
@@ -9078,6 +9105,9 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
             DoctorSidecarStatusOutput {
                 retrieval_mode: report.retrieval_mode,
                 degraded_reason: report.degraded_reason,
+                embedding_device_policy: report.embedding_device_policy,
+                embedding_device_state: report.embedding_device_state,
+                embedding_cpu_allowed: report.embedding_cpu_allowed,
                 manifest_generation,
                 manifest_input_hash,
                 precise_semantic_import_status,
@@ -9089,6 +9119,9 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
         Err(error) => DoctorSidecarStatusOutput {
             retrieval_mode: "unavailable".to_string(),
             degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "unknown".to_string(),
+            embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,
             precise_semantic_import_status: None,
@@ -9369,10 +9402,23 @@ fn doctor_check(
 
 fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutput {
     if sidecar.retrieval_mode == "full" {
+        let device_note = if sidecar.embedding_cpu_allowed {
+            format!(
+                " embedding device policy allows CPU-backed mode (observed_device={}).",
+                sidecar.embedding_device_state
+            )
+        } else {
+            format!(
+                " embedding device policy={} observed_device={}.",
+                sidecar.embedding_device_policy, sidecar.embedding_device_state
+            )
+        };
         return doctor_check(
             "sidecar_retrieval",
             "ok",
-            "mandatory sidecar retrieval is full; packet/search evidence can use sidecar primary.",
+            format!(
+                "mandatory sidecar retrieval is full; packet/search evidence can use sidecar primary.{device_note}"
+            ),
         );
     }
 
@@ -9384,8 +9430,11 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
         "sidecar_retrieval",
         "warn",
         format!(
-            "mandatory sidecar retrieval is not full (mode={} reason={reason}); repair sidecars before trusting packet/search evidence.",
-            sidecar.retrieval_mode
+            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); repair sidecars before trusting packet/search evidence.",
+            sidecar.retrieval_mode,
+            sidecar.embedding_device_policy,
+            sidecar.embedding_device_state,
+            sidecar.embedding_cpu_allowed
         ),
     )
 }
@@ -10559,6 +10608,9 @@ mod tests {
             zoekt_reachable: true,
             qdrant_reachable: true,
             embed_reachable: false,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "accelerated".into(),
+            embedding_cpu_allowed: false,
             zoekt_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail:
@@ -10573,6 +10625,69 @@ mod tests {
         assert!(message.contains("embedding sidecar liveness failed"));
         assert!(message.contains("before mandatory Qdrant semantic smoke"));
         assert!(message.contains("http://127.0.0.1:55280/v1/embeddings"));
+    }
+
+    #[test]
+    fn ready_repair_blocks_unknown_embedding_device_before_indexing() {
+        let infrastructure = codestory_retrieval::InfrastructureHealth {
+            zoekt_reachable: true,
+            qdrant_reachable: true,
+            embed_reachable: true,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "unknown".into(),
+            embedding_cpu_allowed: false,
+            zoekt_detail: "http 200".into(),
+            qdrant_detail: "http 200".into(),
+            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
+        };
+
+        let error = ensure_ready_repair_embed_liveness(&infrastructure)
+            .expect_err("unknown device should stop ready repair before indexing");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("embedding device policy failed before long semantic indexing"));
+        assert!(message.contains("requested_policy=accelerator_required"));
+        assert!(message.contains("observed_device=unknown"));
+    }
+
+    #[test]
+    fn agent_preflight_full_lane_surfaces_embedding_device_policy_when_ready() {
+        let stats = StorageStatsDto {
+            node_count: 3,
+            edge_count: 2,
+            file_count: 1,
+            error_count: 0,
+            fatal_error_count: 0,
+        };
+        let readiness =
+            crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+                project: "C:/repo",
+                stats: &stats,
+                freshness: None,
+                setup: None,
+                sidecar: Some(crate::readiness::ReadinessSidecarInput {
+                    retrieval_mode: "full",
+                    degraded_reason: None,
+                    embedding_device_policy: Some("cpu_allowed"),
+                    embedding_device_state: Some("cpu"),
+                    embedding_cpu_allowed: true,
+                    manifest_generation: Some("generation"),
+                    manifest_input_hash: Some("hash"),
+                }),
+            });
+
+        let output = build_agent_preflight_output(&readiness, Path::new("C:/repo"));
+
+        assert!(output.full_retrieval.ready);
+        assert_eq!(
+            output.full_retrieval.embedding_device_policy.as_deref(),
+            Some("cpu_allowed")
+        );
+        assert_eq!(
+            output.full_retrieval.embedding_device_state.as_deref(),
+            Some("cpu")
+        );
+        assert_eq!(output.full_retrieval.embedding_cpu_allowed, Some(true));
     }
 
     #[test]
