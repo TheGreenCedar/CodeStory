@@ -375,6 +375,23 @@ fn strict_readiness_unavailable_reason(
     }
 
     let embedding_backend = crate::embeddings::embedding_runtime_id();
+    let expected_doc_backend = crate::embeddings::embedding_backend_label();
+    if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
+        if stats.mixed_embedding_backends {
+            return Ok(Some("sidecar_symbol_docs_mixed_embedding_backends".into()));
+        }
+        if stats
+            .embedding_backend
+            .as_deref()
+            .is_some_and(|backend| backend != expected_doc_backend)
+        {
+            return Ok(Some(format!(
+                "sidecar_symbol_doc_embedding_backend_changed: stored={} current={}",
+                stats.embedding_backend.as_deref().unwrap_or("<missing>"),
+                expected_doc_backend
+            )));
+        }
+    }
     let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     let current_input = compute_sidecar_input_fingerprint(
@@ -510,9 +527,14 @@ mod tests {
     };
     use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
     use crate::test_support::retrieval_manifest_fixture;
-    use codestory_store::{FileInfo, FileRole};
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
@@ -532,6 +554,30 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: BTreeMap::new(),
+        }
+    }
+
+    fn semantic_doc_with_backend(backend: &str) -> LlmSymbolDoc {
+        LlmSymbolDoc {
+            node_id: NodeId(1),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "do_work".into(),
+            qualified_name: Some("pkg::do_work".into()),
+            file_path: Some("src/lib.rs".into()),
+            start_line: Some(1),
+            doc_text: "semantic doc".into(),
+            doc_version: 5,
+            doc_hash: "doc-hash".into(),
+            embedding_profile: Some("bge-base-en-v1.5".into()),
+            embedding_model: format!("BAAI/bge-base-en-v1.5-local|backend={backend}"),
+            embedding_backend: Some(backend.into()),
+            embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            doc_shape: Some("semantic_doc_version=5;scope=durable_symbols".into()),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            dense_reason: Some("public_api".into()),
+            embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
+            updated_at_epoch_ms: 123,
         }
     }
 
@@ -592,6 +638,53 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("sidecar_manifest_stale")
+        );
+    }
+
+    #[test]
+    fn strict_readiness_rejects_stored_doc_backend_mismatch() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let project_id = project_id_for_root(project.path());
+        let hash = "badc0ffee0ddf00d";
+        let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+        manifest.projection_count = Some(1);
+        manifest.dense_projection_count = Some(1);
+        manifest.dense_reason_counts_json = Some("{\"public_api\":1}".into());
+
+        let mut storage = Store::open(&storage_path).expect("open db");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "do_work".into(),
+                ..Default::default()
+            }])
+            .expect("node");
+        storage
+            .upsert_llm_symbol_docs_batch(&[semantic_doc_with_backend("onnx")])
+            .expect("semantic doc");
+
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("backend mismatch should degrade");
+
+        assert!(
+            reason.contains("sidecar_symbol_doc_embedding_backend_changed"),
+            "unexpected reason: {reason}"
+        );
+        assert!(
+            reason.contains("stored=onnx current=llamacpp"),
+            "unexpected reason: {reason}"
         );
     }
 
@@ -908,5 +1001,34 @@ mod tests {
             .expect("mtime since epoch")
             .as_millis()
             .min(i64::MAX as u128) as i64
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate process environment hold ENV_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests that mutate process environment hold ENV_LOCK.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }

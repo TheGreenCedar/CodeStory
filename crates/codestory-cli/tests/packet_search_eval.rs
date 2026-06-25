@@ -2,12 +2,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const FIXTURE_FILE: &str = "production_packet_search_fixtures.json";
 const BASELINE_FILE: &str = "production_packet_search_baseline.json";
 const LIVE_EVAL_RUN_ID: &str = "packet-search-eval";
+const LIVE_EVAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Deserialize)]
 struct FixtureSet {
@@ -573,6 +577,8 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         [
             "retrieval",
             "status",
+            "--profile",
+            "agent",
             "--run-id",
             LIVE_EVAL_RUN_ID,
             "--format",
@@ -585,6 +591,10 @@ fn packet_search_live_eval_uses_fixed_run_id() {
             "search",
             "--query",
             "LiveSidecarSearch::qdrant_search",
+            "--profile",
+            "agent",
+            "--run-id",
+            LIVE_EVAL_RUN_ID,
             "--format",
             "json",
         ],
@@ -597,12 +607,26 @@ fn packet_search_live_eval_uses_fixed_run_id() {
                 && value == Some(std::ffi::OsStr::new(LIVE_EVAL_RUN_ID))),
         "search subprocess must inherit the fixed live eval run id"
     );
+    let search_args = search
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        search_args
+            .windows(2)
+            .any(|pair| pair[0] == "--run-id" && pair[1] == LIVE_EVAL_RUN_ID),
+        "search subprocess must pass the fixed live eval run id as a CLI argument"
+    );
     let packet = live_eval_command(
         Path::new("C:/repo"),
         &[
             "packet",
             "--question",
             "How does packet search work?",
+            "--profile",
+            "agent",
+            "--run-id",
+            LIVE_EVAL_RUN_ID,
             "--format",
             "json",
         ],
@@ -613,6 +637,16 @@ fn packet_search_live_eval_uses_fixed_run_id() {
             .any(|(name, value)| name == "CODESTORY_RETRIEVAL_PROFILE"
                 && value == Some(std::ffi::OsStr::new("agent"))),
         "packet subprocess must inherit the fixed live eval profile"
+    );
+    let packet_args = packet
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        packet_args
+            .windows(2)
+            .any(|pair| pair[0] == "--run-id" && pair[1] == LIVE_EVAL_RUN_ID),
+        "packet subprocess must pass the fixed live eval run id as a CLI argument"
     );
 }
 
@@ -645,6 +679,7 @@ fn packet_search_eval_live_runs_production_cli_path() {
         .to_string();
     assert_eq!(readiness_mode, baseline.required_full_modes.readiness_mode);
     assert_eq!(retrieval_mode, baseline.required_full_modes.retrieval_mode);
+    assert_live_eval_device_truth(&status_json);
 
     let mut runs = Vec::new();
     for fixture in &fixtures.fixtures {
@@ -660,6 +695,10 @@ fn packet_search_eval_live_runs_production_cli_path() {
                 "--refresh",
                 "none",
                 "--why",
+                "--profile",
+                "agent",
+                "--run-id",
+                LIVE_EVAL_RUN_ID,
                 "--format",
                 "json",
             ],
@@ -682,6 +721,10 @@ fn packet_search_eval_live_runs_production_cli_path() {
                 "compact",
                 "--refresh",
                 "none",
+                "--profile",
+                "agent",
+                "--run-id",
+                LIVE_EVAL_RUN_ID,
                 "--format",
                 "json",
             ],
@@ -745,10 +788,12 @@ fn live_eval_ready_args() -> [&'static str; 8] {
     ]
 }
 
-fn live_eval_status_args() -> [&'static str; 6] {
+fn live_eval_status_args() -> [&'static str; 8] {
     [
         "retrieval",
         "status",
+        "--profile",
+        "agent",
         "--run-id",
         LIVE_EVAL_RUN_ID,
         "--format",
@@ -770,9 +815,11 @@ fn live_eval_command(project: &Path, args: &[&str]) -> Command {
 }
 
 fn live_eval_run_cli(project: &Path, args: &[&str]) -> std::process::Output {
-    live_eval_command(project, args)
-        .output()
-        .expect("run codestory-cli")
+    let command_line = live_eval_command_line(project, args);
+    let mut command = live_eval_command(project, args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    run_command_with_timeout(&mut command, &command_line, LIVE_EVAL_COMMAND_TIMEOUT)
+        .unwrap_or_else(|message| panic!("{message}"))
 }
 
 fn base_cli_command(project: &Path, args: &[&str]) -> Command {
@@ -780,6 +827,161 @@ fn base_cli_command(project: &Path, args: &[&str]) -> Command {
     command.args(args);
     command.arg("--project").arg(project);
     command
+}
+
+fn live_eval_command_line(project: &Path, args: &[&str]) -> String {
+    let mut parts = vec![env!("CARGO_BIN_EXE_codestory-cli").to_string()];
+    parts.extend(args.iter().map(|arg| (*arg).to_string()));
+    parts.push("--project".to_string());
+    parts.push(project.display().to_string());
+    parts.join(" ")
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    command_line: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let mut child = command.spawn().map_err(|error| {
+        format!("spawn codestory-cli live eval command `{command_line}`: {error}")
+    })?;
+    let stdout = child.stdout.take().map(read_pipe_in_background);
+    let stderr = child.stderr.take().map(read_pipe_in_background);
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = join_pipe(stdout);
+                let stderr = join_pipe(stderr);
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = String::from_utf8_lossy(&join_pipe(stdout)).to_string();
+                let stderr = String::from_utf8_lossy(&join_pipe(stderr)).to_string();
+                return Err(format!(
+                    "codestory-cli live eval command timed out after {}s: `{}`\nstdout:\n{}\nstderr:\n{}",
+                    timeout.as_secs(),
+                    command_line,
+                    stdout,
+                    stderr
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(250)),
+            Err(error) => {
+                return Err(format!(
+                    "poll codestory-cli live eval command `{command_line}`: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn read_pipe_in_background<R>(mut pipe: R) -> thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+fn join_pipe(handle: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
+}
+
+fn assert_live_eval_device_truth(status: &Value) {
+    assert_json_path_str(status, &["ownership", "profile"], "agent");
+    assert_json_path_suffix(
+        status,
+        &["ownership", "namespace"],
+        &format!("-{LIVE_EVAL_RUN_ID}"),
+    );
+    assert_json_path_contains(status, &["ownership", "state_file"], LIVE_EVAL_RUN_ID);
+    assert_json_path_contains(
+        status,
+        &["ownership", "cleanup_command"],
+        "--profile agent --run-id packet-search-eval",
+    );
+    assert_json_path_str(status, &["embedding_device_policy"], "accelerator_required");
+    assert_json_path_str(status, &["embedding_device_state"], "accelerated");
+    assert_json_path_str(
+        status,
+        &["embedding_device_observation_source"],
+        "native_log",
+    );
+    assert_json_path_bool(status, &["embedding_cpu_allowed"], false);
+    assert_json_path_bool(status, &["embedding_accelerator_requested"], true);
+    assert_json_path_str(
+        status,
+        &["embedding_accelerator_request_provider"],
+        "vulkan",
+    );
+    assert_json_path_str(status, &["embedding_accelerator_request_device"], "Vulkan0");
+    assert_json_path_str(status, &["embedding_detected_provider"], "amd");
+    assert_json_path_non_empty(status, &["embedding_detected_gpu"]);
+}
+
+fn assert_json_path_str(status: &Value, path: &[&str], expected: &str) {
+    assert_eq!(
+        json_path(status, path).and_then(Value::as_str),
+        Some(expected),
+        "live eval status must report {}={expected}: {status:#}",
+        path.join(".")
+    );
+}
+
+fn assert_json_path_bool(status: &Value, path: &[&str], expected: bool) {
+    assert_eq!(
+        json_path(status, path).and_then(Value::as_bool),
+        Some(expected),
+        "live eval status must report {}={expected}: {status:#}",
+        path.join(".")
+    );
+}
+
+fn assert_json_path_non_empty(status: &Value, path: &[&str]) {
+    assert!(
+        json_path(status, path)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()),
+        "live eval status must report non-empty {}: {status:#}",
+        path.join(".")
+    );
+}
+
+fn assert_json_path_contains(status: &Value, path: &[&str], expected: &str) {
+    assert!(
+        json_path(status, path)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(expected)),
+        "live eval status must report {} containing {expected}: {status:#}",
+        path.join(".")
+    );
+}
+
+fn assert_json_path_suffix(status: &Value, path: &[&str], expected: &str) {
+    assert!(
+        json_path(status, path)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.ends_with(expected)),
+        "live eval status must report {} ending with {expected}: {status:#}",
+        path.join(".")
+    );
+}
+
+fn json_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(value, |current, field| current.get(*field))
 }
 
 fn readiness_mode(json: &Value) -> String {

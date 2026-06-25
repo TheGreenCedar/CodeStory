@@ -1348,7 +1348,7 @@ mod tests {
             updated_at_epoch_ms: 123,
         };
 
-        assert!(qdrant_semantic_doc_row(&doc(
+        assert!(!qdrant_semantic_doc_row(&doc(
             NodeKind::FUNCTION,
             Some("onnx"),
             768
@@ -1467,8 +1467,8 @@ mod tests {
             doc_version: 4,
             doc_hash: "hash".into(),
             embedding_profile: Some("bge-base-en-v1.5".into()),
-            embedding_model: "BAAI/bge-base-en-v1.5-local|backend=onnx".into(),
-            embedding_backend: Some("onnx".into()),
+            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
+            embedding_backend: Some("llamacpp".into()),
             embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
             semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
