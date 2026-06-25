@@ -102,11 +102,14 @@ pub fn bootstrap_sidecars_with_runtime(
     };
 
     let state = sidecar_up_with_runtime(runtime, resolved_compose.as_deref())?;
-    let infrastructure = if wait_timeout.is_zero() {
-        probe_infrastructure_health(&layout)
-    } else {
-        wait_for_infrastructure(&layout, wait_timeout)?
-    };
+    if !wait_timeout.is_zero() {
+        let _ = wait_for_infrastructure(&layout, wait_timeout)?;
+    }
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
+        &layout,
+        &embedding_device,
+    );
 
     Ok(BootstrapReport {
         state,
