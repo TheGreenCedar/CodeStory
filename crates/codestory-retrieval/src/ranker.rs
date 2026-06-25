@@ -46,20 +46,11 @@ pub fn rank_candidates(
         {
             candidate.score += 0.25;
         }
-        if matches!(features.shape, QueryShape::NaturalLanguage) {
-            let path_lower = candidate.file_path.to_ascii_lowercase();
-            let symbol_lower = candidate
-                .symbol_name
-                .as_deref()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let strong_token_hits = query_tokens
-                .iter()
-                .filter(|token| token.len() >= 4)
-                .filter(|token| {
-                    path_lower.contains(token.as_str()) || symbol_lower.contains(token.as_str())
-                })
-                .count();
+        if matches!(
+            features.shape,
+            QueryShape::NaturalLanguage | QueryShape::Mixed
+        ) {
+            let strong_token_hits = strong_query_token_hits(candidate, &query_tokens);
             candidate.score += (strong_token_hits as f32) * 0.06;
             if candidate.source == CandidateSource::Zoekt && strong_token_hits >= 3 {
                 candidate.score += 0.08;
@@ -84,6 +75,7 @@ pub fn rank_candidates(
     }
     if prefer_primary_code {
         cap_non_primary_below_best_primary(&mut candidates);
+        cap_dense_below_strong_lexical_source(&mut candidates, &query_tokens);
     }
 
     candidates.sort_by(|left, right| {
@@ -372,6 +364,55 @@ fn token_overlap_score(query_tokens: &[String], path_lower: &str, symbol_lower: 
         }
     }
     hits as f32 / query_tokens.len() as f32
+}
+
+fn strong_query_token_hits(candidate: &CandidateHit, query_tokens: &[String]) -> usize {
+    let path_lower = candidate.file_path.to_ascii_lowercase();
+    let symbol_lower = candidate
+        .symbol_name
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    query_tokens
+        .iter()
+        .filter(|token| token.len() >= 4)
+        .filter(|token| {
+            path_lower.contains(token.as_str()) || symbol_lower.contains(token.as_str())
+        })
+        .count()
+}
+
+fn cap_dense_below_strong_lexical_source(candidates: &mut [CandidateHit], query_tokens: &[String]) {
+    let Some((anchor_hits, anchor_score)) = candidates
+        .iter()
+        .filter(|candidate| candidate.source == CandidateSource::Zoekt)
+        .filter(|candidate| {
+            matches!(
+                effective_file_role(candidate),
+                FileRole::Source | FileRole::Entrypoint
+            )
+        })
+        .filter_map(|candidate| {
+            let hits = strong_query_token_hits(candidate, query_tokens);
+            (hits >= 3).then_some((hits, candidate.score))
+        })
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return;
+    };
+
+    for candidate in candidates {
+        if candidate.source == CandidateSource::Qdrant
+            && strong_query_token_hits(candidate, query_tokens) < anchor_hits
+            && candidate.score >= anchor_score
+        {
+            candidate.score = (anchor_score - 0.001).max(0.0);
+        }
+    }
 }
 
 fn apply_exact_code_evidence_anchor(
@@ -730,6 +771,59 @@ mod tests {
         assert_eq!(
             ranked.first().map(|hit| hit.file_path.as_str()),
             Some("crates/codestory-cli/src/output.rs")
+        );
+    }
+
+    #[test]
+    fn ranker_keeps_broad_lexical_source_anchor_inside_resolved_window() {
+        let features = classify_query(
+            "packet search output evidence packet indexed symbol hits retrieval shadow",
+        );
+        let mut source = CandidateHit::with_source(
+            "crates/codestory-runtime/src/agent/packet_evidence.rs",
+            Some("decorate_search_hit_evidence".into()),
+            0.82,
+            CandidateSource::Zoekt,
+        );
+        source.file_role = Some(FileRole::Source);
+        let dense_distractors = [
+            (
+                "PacketTraceDto",
+                "crates/codestory-contracts/src/api/dto.rs",
+            ),
+            (
+                "RetrievalTraceDto",
+                "crates/codestory-contracts/src/api/retrieval.rs",
+            ),
+            (
+                "SearchResultDto",
+                "crates/codestory-contracts/src/api/search.rs",
+            ),
+            (
+                "IndexedSymbolDto",
+                "crates/codestory-contracts/src/api/symbol.rs",
+            ),
+            (
+                "SearchShadowDto",
+                "crates/codestory-contracts/src/api/shadow.rs",
+            ),
+        ]
+        .into_iter()
+        .map(|(symbol, path)| {
+            let mut hit =
+                CandidateHit::with_source(path, Some(symbol.into()), 0.99, CandidateSource::Qdrant);
+            hit.file_role = Some(FileRole::Source);
+            hit
+        });
+
+        let ranked = rank_candidates(&features, dense_distractors.chain([source]).collect());
+
+        assert!(
+            ranked.iter().take(5).any(|hit| {
+                hit.file_path == "crates/codestory-runtime/src/agent/packet_evidence.rs"
+                    && hit.symbol_name.as_deref() == Some("decorate_search_hit_evidence")
+            }),
+            "direct lexical source evidence should stay inside the resolved top-5 window: {ranked:#?}"
         );
     }
 }
