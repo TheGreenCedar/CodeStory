@@ -1059,6 +1059,65 @@ test("hook dedupes repeated request grounding instructions within plugin state",
   }
 });
 
+test("hook resets instruction dedupe on fresh startup session boundary", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-startup-dedupe-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-startup-dedupe-bin-"));
+
+  try {
+    const cliPath = await writeNodeCli(binDir, "console.log('ground ok');");
+    await withTempHookInstall(async (installRoot) => {
+      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
+      const env = {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        COPILOT_PLUGIN_DATA: "",
+        PLUGIN_DATA: dataDir,
+      };
+      const startupInput = JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "startup",
+        cwd: repoRoot,
+      });
+      const resumeInput = JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "resume",
+        cwd: repoRoot,
+      });
+      const firstStartup = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: startupInput,
+        encoding: "utf8",
+      });
+      const resume = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: resumeInput,
+        encoding: "utf8",
+      });
+      const secondStartup = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: startupInput,
+        encoding: "utf8",
+      });
+
+      assert.equal(firstStartup.status, 0, firstStartup.stderr);
+      assert.equal(resume.status, 0, resume.stderr);
+      assert.equal(secondStartup.status, 0, secondStartup.stderr);
+      const firstContext = JSON.parse(firstStartup.stdout).hookSpecificOutput.additionalContext;
+      const resumeContext = JSON.parse(resume.stdout).hookSpecificOutput.additionalContext;
+      const secondContext = JSON.parse(secondStartup.stdout).hookSpecificOutput.additionalContext;
+      const fullInstructions = /CODESTORY BACKGROUND GROUNDING (?:ACTIVE|RULES)/u;
+      assert.match(firstContext, fullInstructions);
+      assert.doesNotMatch(resumeContext, fullInstructions);
+      assert.match(secondContext, fullInstructions);
+      assert.match(secondContext, /ground ok/u);
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
 test("hook MCP classifier distinguishes configured launchable and model-visible states", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-classify-"));
   const version = await readPluginVersion();

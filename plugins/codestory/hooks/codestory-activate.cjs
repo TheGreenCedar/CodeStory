@@ -204,12 +204,26 @@ function buildContext(input, event, state = {}) {
   return parts.join('\n\n');
 }
 
+function freshInstructionBoundary(event, input = {}) {
+  const source = String(input.source || input.trigger || '').toLowerCase();
+  return event === 'SessionStart' && (!source || source === 'startup');
+}
+
 readHookInput().then((input) => {
   const event = input.hook_event_name || 'SessionStart';
   try {
     const state = readActiveState() || {};
-    const context = buildContext(input, event, state);
-    const priorInstructions = (state.hook && state.hook.instructions_emitted) || {};
+    const activeState = freshInstructionBoundary(event, input)
+      ? {
+        ...state,
+        hook: {
+          ...(state.hook || {}),
+          instructions_emitted: {},
+        },
+      }
+      : state;
+    const context = buildContext(input, event, activeState);
+    const priorInstructions = (activeState.hook && activeState.hook.instructions_emitted) || {};
     const emittedFullInstructions = context.includes('CODESTORY BACKGROUND GROUNDING RULES') ||
       context.includes('CODESTORY BACKGROUND GROUNDING ACTIVE');
     const instructions = emittedFullInstructions
