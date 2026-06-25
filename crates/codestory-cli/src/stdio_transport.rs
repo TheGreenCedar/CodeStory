@@ -12,8 +12,8 @@ use codestory_contracts::api::{
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
     IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
     NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
-    ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode, SearchRequest,
-    TrailCallerScope, TrailDirection, TrailMode,
+    ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode,
+    SearchRequest, TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
 use sha2::{Digest, Sha256};
@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 const STDIO_CLI_VERSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -2033,14 +2034,25 @@ fn read_stdio_status_resource_cached(
         return Ok(cached.value.clone());
     }
 
-    let value = read_stdio_status_resource(runtime)?;
-    // ponytail: short stdio snapshot cache; storage/sidecar fingerprints bust it when runtime state changes.
+    let project = stdio_project_args(runtime);
+    let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
+    let (summary, local_refresh) = crate::wait_for_local_freshness(&project, &inspect_runtime)?;
+    let key = stdio_status_cache_key(runtime);
+    let value = read_stdio_status_resource(runtime, summary, local_refresh)?;
+    // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
     state.status_cache = Some(StdioStatusCacheEntry {
         key,
         value: value.clone(),
         cached_at: Instant::now(),
     });
     Ok(value)
+}
+
+fn stdio_project_args(runtime: &RuntimeContext) -> args::ProjectArgs {
+    args::ProjectArgs {
+        project: runtime.project_root.clone(),
+        cache_dir: Some(runtime.cache_root.clone()),
+    }
 }
 
 fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
@@ -2050,11 +2062,15 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
         format!("storage:{}", runtime.storage_path.display()),
         format!(
             "storage_state:{}",
-            stdio_storage_fingerprint(&runtime.storage_path)
+            stdio_path_fingerprint(&runtime.storage_path)
         ),
         format!(
             "sidecar_state:{}",
             stdio_path_fingerprint(&layout.state_file)
+        ),
+        format!(
+            "source_state:{}",
+            stdio_source_fingerprint(&runtime.project_root)
         ),
         format!(
             "active_embedding_backend:{}",
@@ -2064,8 +2080,75 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
     .join("|")
 }
 
-fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
-    let summary = runtime.open_project_summary()?;
+fn stdio_source_fingerprint(project_root: &Path) -> String {
+    let mut stack = vec![project_root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => return format!("read_dir_error:{}:{error}", dir.display()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => return format!("dir_entry_error:{error}"),
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => return format!("file_type_error:{}:{error}", path.display()),
+            };
+            if file_type.is_dir() {
+                if !stdio_source_fingerprint_skip_dir(&path) {
+                    stack.push(path);
+                }
+            } else if file_type.is_file() {
+                files.push(path);
+                if files.len() > STDIO_SOURCE_FINGERPRINT_FILE_CAP {
+                    return "source_files:too_many".to_string();
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(files.len().to_string().as_bytes());
+    for path in files {
+        hasher.update(b"\0path:");
+        hasher.update(path.to_string_lossy().as_bytes());
+        match std::fs::metadata(&path) {
+            Ok(metadata) => {
+                hasher.update(b"\0len:");
+                hasher.update(metadata.len().to_string().as_bytes());
+                hasher.update(b"\0mtime:");
+                let modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or_default();
+                hasher.update(modified_ms.to_string().as_bytes());
+            }
+            Err(error) => {
+                hasher.update(b"\0metadata_error:");
+                hasher.update(error.to_string().as_bytes());
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn stdio_source_fingerprint_skip_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules" | "dist"))
+}
+
+fn read_stdio_status_resource(
+    runtime: &RuntimeContext,
+    summary: ProjectSummary,
+    local_refresh: Option<crate::readiness::LocalRefreshOutput>,
+) -> Result<serde_json::Value> {
     let retrieval = summary.retrieval.as_ref();
     let sidecar_runtime = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
     let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash, ownership) =
@@ -2165,7 +2248,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
-        "local_refresh": crate::readiness::local_refresh_output(local),
+        "local_refresh": local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(local)),
         "readiness": readiness,
         "readiness_lanes": readiness_lanes,
         "allowed_surfaces": allowed_surfaces,
