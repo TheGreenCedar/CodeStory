@@ -715,6 +715,8 @@ pub(crate) enum RetrievalAction {
     Down(RetrievalSidecarStateCommand),
     /// Probe Zoekt, Qdrant, and SCIP availability for the project.
     Status(RetrievalStatusCommand),
+    /// List owned sidecar namespaces and dry-run cleanup eligibility.
+    Inventory(RetrievalInventoryCommand),
     /// Run workspace index then persist retrieval_index_manifest sidecar metadata.
     Index(RetrievalIndexCommand),
     /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
@@ -823,6 +825,16 @@ pub(crate) struct RetrievalStatusCommand {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct RetrievalInventoryCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct SidecarCommand {
     #[command(subcommand)]
     pub(crate) action: SidecarAction,
@@ -832,6 +844,8 @@ pub(crate) struct SidecarCommand {
 pub(crate) enum SidecarAction {
     /// Alias for `retrieval status`.
     Status(RetrievalStatusCommand),
+    /// Alias for `retrieval inventory`.
+    Inventory(RetrievalInventoryCommand),
     #[command(external_subcommand)]
     Unknown(Vec<String>),
 }

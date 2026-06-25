@@ -217,10 +217,13 @@ fn main() -> Result<()> {
 fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
     match cmd.action {
         SidecarAction::Status(status_cmd) => retrieval::run_retrieval_status(status_cmd),
+        SidecarAction::Inventory(inventory_cmd) => {
+            retrieval::run_retrieval_inventory(inventory_cmd)
+        }
         SidecarAction::Unknown(args) => {
             let subcommand = args.first().map(String::as_str).unwrap_or("<unknown>");
             bail!(
-                "unknown sidecar subcommand `{subcommand}`; use `codestory-cli sidecar status` or `codestory-cli retrieval status`"
+                "unknown sidecar subcommand `{subcommand}`; use `codestory-cli sidecar status`, `codestory-cli sidecar inventory`, or `codestory-cli retrieval status`"
             )
         }
     }

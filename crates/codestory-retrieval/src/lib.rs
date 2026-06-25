@@ -19,6 +19,7 @@ mod executor;
 mod generation;
 mod health;
 mod index;
+mod inventory;
 mod mode;
 mod planner;
 mod qdrant_client;
@@ -43,8 +44,9 @@ pub use capabilities::SidecarCapabilities;
 #[allow(deprecated)]
 pub use compose::bootstrap_sidecars_without_storage_scope;
 pub use compose::{
-    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, bootstrap_sidecars, bootstrap_sidecars_with_profile,
-    bootstrap_sidecars_with_runtime, docker_available, resolve_compose_file,
+    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory, bootstrap_sidecars,
+    bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime, docker_available,
+    embed_model_inventory, resolve_compose_file,
 };
 pub use config::{
     DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT, DEFAULT_QDRANT_HTTP_PORT,
@@ -68,6 +70,10 @@ pub use health::{
 pub use index::{
     FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, finalize_index_for_runtime,
     project_id_for_root, repair_project_qdrant_collection, sidecar_project_id_for_root,
+};
+pub use inventory::{
+    SidecarDockerResource, SidecarDockerResourceKind, SidecarInventoryEntry,
+    SidecarInventoryReport, SidecarInventoryState, sidecar_inventory,
 };
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;

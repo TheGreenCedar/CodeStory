@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
 const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-compose.yml");
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EmbedModelInventory {
+    pub model_dir: Option<String>,
+    pub required_gguf: String,
+    pub required_gguf_present: bool,
+    pub candidate_dirs: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapReport {
     pub state: SidecarStateFile,
@@ -355,15 +363,53 @@ fn docker_bind_path(path: &Path) -> String {
 }
 
 fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
-        let path = PathBuf::from(path);
-        if embed_model_dir_ready(&path) {
-            return Ok(path);
-        }
-        bail!(
+    let inventory = embed_model_inventory(repo_root, layout);
+    if let Some(model_dir) = inventory
+        .required_gguf_present
+        .then(|| inventory.model_dir.as_ref())
+        .flatten()
+    {
+        return Ok(PathBuf::from(model_dir));
+    }
+    if std::env::var("CODESTORY_EMBED_MODEL_DIR").is_ok() {
+        anyhow::bail!(
             "CODESTORY_EMBED_MODEL_DIR does not contain {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
             crate::embeddings::BGE_BASE_EN_V1_5_GGUF
         );
+    }
+    anyhow::bail!(
+        "No llama.cpp embedding model directory contains {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+        crate::embeddings::BGE_BASE_EN_V1_5_GGUF
+    )
+}
+
+pub fn embed_model_inventory(
+    repo_root: Option<&Path>,
+    layout: &SidecarLayout,
+) -> EmbedModelInventory {
+    let candidates = embed_model_candidates(repo_root, layout);
+    let model_dir = candidates
+        .iter()
+        .find(|candidate| embed_model_dir_ready(candidate))
+        .or_else(|| candidates.first())
+        .map(|path| path.display().to_string());
+    let required_gguf_present = model_dir
+        .as_ref()
+        .is_some_and(|path| embed_model_dir_ready(Path::new(path)));
+    EmbedModelInventory {
+        model_dir,
+        required_gguf: crate::embeddings::BGE_BASE_EN_V1_5_GGUF.to_string(),
+        required_gguf_present,
+        candidate_dirs: candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    }
+}
+
+fn embed_model_candidates(repo_root: Option<&Path>, layout: &SidecarLayout) -> Vec<PathBuf> {
+    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
+        return vec![PathBuf::from(path)];
     }
     let workdir = repo_root
         .or_else(|| Some(Path::new(".")))
@@ -373,14 +419,21 @@ fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<P
         .parent()
         .map(|parent| parent.join("embed-models"))
         .unwrap_or_else(|| layout.qdrant_data_dir.join("embed-models"));
-    embed_model_dir_from_candidates([
+    let mut candidates = Vec::new();
+    for candidate in [
         workdir.join("target").join("retrieval-models"),
         workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
         user_cache_root().join("embed-models"),
         fallback,
-    ])
+    ] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
+#[cfg(test)]
 fn embed_model_dir_from_candidates(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> Result<PathBuf> {

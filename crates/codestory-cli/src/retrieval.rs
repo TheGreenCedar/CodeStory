@@ -12,8 +12,8 @@ use codestory_retrieval::{
 
 use crate::args::{
     CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalBootstrapCommand,
-    RetrievalCommand, RetrievalIndexCommand, RetrievalQueryCommand, RetrievalSidecarStateCommand,
-    RetrievalStatusCommand,
+    RetrievalCommand, RetrievalIndexCommand, RetrievalInventoryCommand, RetrievalQueryCommand,
+    RetrievalSidecarStateCommand, RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
 use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error, resolve_refresh_request};
@@ -24,6 +24,7 @@ pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
         RetrievalAction::Up(up_cmd) => run_retrieval_up(up_cmd),
         RetrievalAction::Down(down_cmd) => run_retrieval_down(down_cmd),
         RetrievalAction::Status(status_cmd) => run_retrieval_status(status_cmd),
+        RetrievalAction::Inventory(inventory_cmd) => run_retrieval_inventory(inventory_cmd),
         RetrievalAction::Index(index_cmd) => run_retrieval_index(index_cmd),
         RetrievalAction::Query(query_cmd) => run_retrieval_query(query_cmd),
     }
@@ -119,6 +120,14 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     }
     .context("retrieval status")?;
     emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
+}
+
+pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
+    preflight_output(cmd.output_file.as_deref())?;
+    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
+    let report = codestory_retrieval::sidecar_inventory(&runtime.project_root)
+        .context("retrieval inventory")?;
+    emit_retrieval_inventory(cmd.format, &report, cmd.output_file.as_deref())
 }
 
 fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
@@ -550,6 +559,61 @@ fn emit_retrieval_status(
         report.scip.detail,
         report.scip.capabilities.graph,
     );
+    emit(format, report, markdown, output_file)
+}
+
+fn emit_retrieval_inventory(
+    format: OutputFormat,
+    report: &codestory_retrieval::SidecarInventoryReport,
+    output_file: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut markdown = format!(
+        "# Retrieval sidecar inventory\n\n- dry_run: {}\n- docker_available: {}\n- cache_root: `{}`\n",
+        report.dry_run, report.docker_available, report.cache_root
+    );
+    if let Some(error) = report.docker_error.as_deref() {
+        markdown.push_str(&format!("- docker_error: `{error}`\n"));
+    }
+    if report.namespaces.is_empty() {
+        markdown.push_str("\nNo sidecar namespaces found.\n");
+    }
+    for namespace in &report.namespaces {
+        let ports = namespace
+            .containers
+            .iter()
+            .filter_map(|container| container.ports.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        markdown.push_str(&format!(
+            "\n## {}\n\n- state: `{:?}`\n- owner/profile: `{}` / `{}`\n- state_path: `{}`\n- cleanup_command: `{}`\n- age_ms: `{}`\n- compose_project: `{}`\n- containers: {}\n- networks: {}\n- ports: `{}`\n- model_dir: `{}` required_gguf=`{}` present={}\n",
+            namespace.namespace,
+            namespace.state,
+            namespace.owner.as_deref().unwrap_or("<unknown>"),
+            namespace.profile.as_deref().unwrap_or("<unknown>"),
+            namespace.state_path,
+            namespace.cleanup_command.as_deref().unwrap_or("<none>"),
+            namespace
+                .age_ms
+                .map(|age| age.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            namespace.compose_project.as_deref().unwrap_or("<unknown>"),
+            namespace.containers.len(),
+            namespace.networks.len(),
+            if ports.is_empty() { "<none>" } else { &ports },
+            namespace.model.model_dir.as_deref().unwrap_or("<none>"),
+            namespace.model.required_gguf,
+            namespace.model.required_gguf_present,
+        ));
+        if !namespace.reasons.is_empty() {
+            markdown.push_str(&format!("- reasons: `{}`\n", namespace.reasons.join("; ")));
+        }
+        if let Some(reason) = namespace.safe_candidate_reason.as_deref() {
+            markdown.push_str(&format!("- safe_candidate_reason: `{reason}`\n"));
+        }
+        if let Some(reason) = namespace.blocking_reason.as_deref() {
+            markdown.push_str(&format!("- blocking_reason: `{reason}`\n"));
+        }
+    }
     emit(format, report, markdown, output_file)
 }
 

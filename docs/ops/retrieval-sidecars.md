@@ -206,6 +206,21 @@ not an answer-quality claim and not a product packet/search success.
 Generated sidecar artifacts are disposable local cache state. To recover from a
 bad setup:
 
+Start with the read-only inventory dry-run:
+
+```powershell
+codestory-cli retrieval inventory --project <repo> --format markdown
+codestory-cli retrieval inventory --project <repo> --format json
+```
+
+The inventory lists CodeStory-owned sidecar namespaces, state paths, cleanup
+commands, Compose projects, matching containers/networks, visible ports, and
+the required `bge-base-en-v1.5.Q8_0.gguf` model check. It classifies namespaces
+as `live`, `stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate
+and blocking reasons. It is a dry-run status surface only: it does not run
+Docker prune, remove containers, delete networks, or clear state files, and it
+works even when packet/search readiness is unavailable.
+
 1. Stop the relevant Docker/sidecar services.
 2. Move the affected CodeStory-owned Qdrant, Zoekt, or SCIP cache directory
    aside under the cache root.
