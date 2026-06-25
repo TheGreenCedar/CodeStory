@@ -2195,12 +2195,13 @@ fn repair_ready_state(
             )
         },
     )?;
-    codestory_retrieval::strict_sidecar_status_for_runtime(
+    let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
         sidecar.clone(),
     )
     .context("ready repair final retrieval status")?;
+    ensure_ready_repair_full_sidecar(&final_status)?;
     Ok(Some(sidecar))
 }
 
@@ -2226,6 +2227,40 @@ fn ensure_ready_repair_embed_liveness(
         infrastructure.zoekt_detail,
         infrastructure.qdrant_reachable,
         infrastructure.qdrant_detail
+    )
+}
+
+fn ensure_ready_repair_full_sidecar(
+    report: &codestory_retrieval::RetrievalStatusReport,
+) -> Result<()> {
+    if report.retrieval_mode == "full" {
+        return Ok(());
+    }
+    let reason = report.degraded_reason.as_deref().unwrap_or("unknown");
+    let manifest_note = if reason == "retrieval_manifest_missing" {
+        " after finalize; retrieval manifest was not persisted"
+    } else {
+        ""
+    };
+    bail!(
+        "ready repair final retrieval status did not reach full mode{manifest_note}: mode={} degraded_reason={} embedding_device_state={} observation_source={} {}; {}; {}",
+        report.retrieval_mode,
+        reason,
+        report.embedding_device_state,
+        report.embedding_device_observation_source,
+        ready_repair_component_detail(&report.zoekt),
+        ready_repair_component_detail(&report.qdrant),
+        ready_repair_component_detail(&report.scip)
+    )
+}
+
+fn ready_repair_component_detail(component: &codestory_retrieval::ComponentHealth) -> String {
+    format!(
+        "{}={:?} reason={} detail={}",
+        component.name,
+        component.status,
+        component.degraded_reason.as_deref().unwrap_or("none"),
+        component.detail
     )
 }
 
@@ -12150,6 +12185,90 @@ mod tests {
             eligible_for_sufficiency: None,
             score_breakdown: None,
         }
+    }
+
+    fn ready_repair_test_component(
+        name: &str,
+        status: codestory_retrieval::ComponentStatus,
+        reason: &str,
+    ) -> codestory_retrieval::ComponentHealth {
+        codestory_retrieval::ComponentHealth {
+            name: name.into(),
+            status,
+            latency_ms: None,
+            detail: reason.into(),
+            degraded_reason: Some(reason.into()),
+            capabilities: codestory_retrieval::SidecarCapabilities::NONE,
+        }
+    }
+
+    fn ready_repair_test_report(
+        mode: &str,
+        reason: Option<&str>,
+    ) -> codestory_retrieval::RetrievalStatusReport {
+        codestory_retrieval::RetrievalStatusReport {
+            retrieval_mode: mode.into(),
+            ownership: None,
+            degraded_reason: reason.map(str::to_string),
+            repair: None,
+            query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
+            manifest_vector_embedding_backend: None,
+            manifest_vector_embedding_dim: None,
+            stored_doc_vector_producer_backend: None,
+            stored_doc_vector_dim: None,
+            stored_doc_vector_mixed_backends: None,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "accelerated".into(),
+            embedding_device_observation_source: "native_log".into(),
+            embedding_detected_provider: Some("amd".into()),
+            embedding_detected_gpu: Some("Vulkan0".into()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("vulkan".into()),
+            embedding_accelerator_request_device: Some("Vulkan0".into()),
+            embedding_cpu_allowed: false,
+            embedding_launch: None,
+            zoekt: ready_repair_test_component(
+                "zoekt",
+                codestory_retrieval::ComponentStatus::Unavailable,
+                "retrieval_manifest_missing",
+            ),
+            qdrant: ready_repair_test_component(
+                "qdrant",
+                codestory_retrieval::ComponentStatus::Unavailable,
+                "retrieval_manifest_missing",
+            ),
+            scip: ready_repair_test_component(
+                "scip",
+                codestory_retrieval::ComponentStatus::Unavailable,
+                "retrieval_manifest_missing",
+            ),
+            manifest_contract: None,
+            manifest: None,
+        }
+    }
+
+    #[test]
+    fn ready_repair_final_status_accepts_full_mode() {
+        let report = ready_repair_test_report("full", None);
+
+        ensure_ready_repair_full_sidecar(&report).expect("full mode should pass");
+    }
+
+    #[test]
+    fn ready_repair_final_status_blocks_missing_manifest_after_finalize() {
+        let report = ready_repair_test_report("unavailable", Some("retrieval_manifest_missing"));
+
+        let error = ensure_ready_repair_full_sidecar(&report)
+            .expect_err("missing manifest after finalize must fail repair");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("did not reach full mode after finalize"));
+        assert!(message.contains("retrieval manifest was not persisted"));
+        assert!(message.contains("embedding_device_state=accelerated"));
+        assert!(message.contains("observation_source=native_log"));
+        assert!(message.contains("zoekt=Unavailable"));
+        assert!(message.contains("qdrant=Unavailable"));
+        assert!(message.contains("scip=Unavailable"));
     }
 
     #[test]
