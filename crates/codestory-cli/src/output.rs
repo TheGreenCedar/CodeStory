@@ -171,6 +171,22 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
         }
     }
     append_readiness_verdicts(&mut markdown, &output.verdicts, true);
+    if !output.readiness_lanes.is_empty() {
+        let _ = writeln!(markdown, "readiness_lanes:");
+        for (name, lane) in &output.readiness_lanes {
+            let _ = writeln!(
+                markdown,
+                "- {name} [{}]: profile={} mode={} degraded_reason={}",
+                crate::readiness::status_label(lane.status),
+                lane.profile,
+                lane.sidecar_mode,
+                lane.degraded_reason.as_deref().unwrap_or("none")
+            );
+            if let Some(command) = lane.next_command.as_deref() {
+                let _ = writeln!(markdown, "  next_command: `{command}`");
+            }
+        }
+    }
     markdown
 }
 

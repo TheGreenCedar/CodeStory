@@ -127,6 +127,14 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
             ),
         "missing sidecars should finish with status proof guidance: {agent_json_text}"
     );
+    assert_eq!(
+        agent_json["readiness_lanes"]["local_default"]["profile"],
+        "local"
+    );
+    assert_eq!(
+        agent_json["readiness_lanes"]["agent_packet_search"]["profile"],
+        "agent"
+    );
 }
 
 #[test]

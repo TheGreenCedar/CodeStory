@@ -2011,12 +2011,18 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         (runtime.open_project_summary()?, None)
     };
     let sidecar = ready_sidecar_status(&runtime, repaired_sidecar);
+    let readiness_sidecar = if !cmd.repair && matches!(cmd.goal, Some(args::ReadyGoal::Agent)) {
+        agent_goal_readiness_sidecar_status(&runtime, &sidecar)
+    } else {
+        sidecar
+    };
     let mut verdicts = build_summary_readiness(
         &summary.root,
         &summary.stats,
         summary.freshness.as_ref(),
-        &sidecar,
+        &readiness_sidecar,
     );
+    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &verdicts);
     if let Some(goal) = cmd.goal {
         let goal = goal.as_dto();
         verdicts.retain(|verdict| verdict.goal == goal);
@@ -2024,6 +2030,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     let output = ReadyOutput {
         verdicts,
         local_refresh,
+        readiness_lanes,
     };
     let markdown = render_ready_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
@@ -10036,11 +10043,12 @@ fn build_doctor_output(
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
     let sidecar_retrieval = doctor_sidecar_status(runtime);
+    let readiness_sidecar = agent_goal_readiness_sidecar_status(runtime, &sidecar_retrieval);
     let readiness = build_summary_readiness(
         &project,
         &summary.stats,
         summary.freshness.as_ref(),
-        &sidecar_retrieval,
+        &readiness_sidecar,
     );
     let readiness_lanes = build_readiness_lanes_for_runtime(runtime, &readiness);
     let next_commands = readiness::compatibility_next_commands(&readiness);
@@ -10274,6 +10282,26 @@ fn doctor_sidecar_status_error(
         precise_semantic_import_reason: None,
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
+    }
+}
+
+fn agent_goal_readiness_sidecar_status(
+    runtime: &RuntimeContext,
+    fallback: &DoctorSidecarStatusOutput,
+) -> DoctorSidecarStatusOutput {
+    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root);
+    let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
+    lane_scoped_agent_readiness_sidecar(fallback, agent_status)
+}
+
+fn lane_scoped_agent_readiness_sidecar(
+    fallback: &DoctorSidecarStatusOutput,
+    agent_status: DoctorSidecarStatusOutput,
+) -> DoctorSidecarStatusOutput {
+    if agent_status.retrieval_mode == "full" {
+        agent_status
+    } else {
+        fallback.clone()
     }
 }
 
@@ -12067,6 +12095,105 @@ mod tests {
                 && command.contains("--run-id")
                 && command.contains("--format json")),
             "ready agent lane should point at lane-scoped status proof: {lane:?}"
+        );
+    }
+
+    #[test]
+    fn agent_goal_readiness_uses_full_agent_lane_despite_local_handoff_mismatch() {
+        let fallback = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some(
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                    .to_string(),
+            ),
+            manifest_generation: None,
+            manifest_input_hash: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let agent_status = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+
+        let selected = lane_scoped_agent_readiness_sidecar(&fallback, agent_status);
+        let stats = StorageStatsDto {
+            node_count: 1,
+            edge_count: 0,
+            file_count: 1,
+            error_count: 0,
+            fatal_error_count: 0,
+        };
+        let verdicts = build_summary_readiness("C:/repo", &stats, None, &selected);
+        let agent = verdicts
+            .iter()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
+            .expect("agent readiness verdict");
+
+        assert_eq!(agent.status, ReadinessStatusDto::Ready);
+        assert_eq!(
+            agent
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.profile.as_deref()),
+            Some("agent")
+        );
+        assert_eq!(
+            agent
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.retrieval_mode.as_str()),
+            Some("full")
+        );
+    }
+
+    #[test]
+    fn agent_goal_readiness_keeps_handoff_mismatch_when_agent_lane_is_not_full() {
+        let fallback = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some(
+                "profile_handoff_mismatch: local/default is unavailable".to_string(),
+            ),
+            manifest_generation: None,
+            manifest_input_hash: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let agent_status = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some("sidecar_status_error: missing manifest".to_string()),
+            manifest_generation: None,
+            manifest_input_hash: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+
+        let selected = lane_scoped_agent_readiness_sidecar(&fallback, agent_status);
+
+        assert_eq!(selected.retrieval_mode, "unavailable");
+        assert_eq!(
+            selected.degraded_reason.as_deref(),
+            Some("profile_handoff_mismatch: local/default is unavailable")
         );
     }
 
