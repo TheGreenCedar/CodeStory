@@ -2088,6 +2088,16 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         status["retrieval_mode"], "full",
         "hash-mode indexed fixture must not report mandatory sidecar retrieval as full: {status}"
     );
+    assert_eq!(
+        status["local_refresh"]["state"],
+        json!("fresh"),
+        "fresh local graph state should be explicit even when sidecar retrieval is unavailable: {status}"
+    );
+    assert_eq!(
+        status["local_refresh"]["blocks_local_surfaces"],
+        json!(false),
+        "fresh local graph state should not block local graph surfaces: {status}"
+    );
     assert!(
         status["sidecar_retrieval"]["retrieval_mode"].is_string(),
         "status should expose sidecar retrieval diagnostics: {status}"
@@ -2151,7 +2161,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "agent lane must not collapse to local when no agent run exists: {status}"
     );
     assert!(
-        agent_lane["run_id"].as_str().is_some_and(|run_id| !run_id.is_empty()),
+        agent_lane["run_id"]
+            .as_str()
+            .is_some_and(|run_id| !run_id.is_empty()),
         "agent lane should report a non-empty agent run id: {status}"
     );
     assert!(
@@ -2479,6 +2491,26 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     }
 
     assert_stale_freshness_counts(&last_status, "codestory://status");
+    assert_eq!(
+        last_status["local_refresh"]["state"],
+        json!("stale"),
+        "stale local graph state should be compactly exposed: {last_status}"
+    );
+    assert_eq!(
+        last_status["local_refresh"]["blocks_local_surfaces"],
+        json!(true),
+        "stale local graph state should block only local graph surfaces: {last_status}"
+    );
+    assert_eq!(
+        last_status["allowed_surfaces"]["ground"]["allowed"],
+        json!(false),
+        "stale local graph should block local graph surfaces: {last_status}"
+    );
+    assert_eq!(
+        last_status["allowed_surfaces"]["packet"]["status"],
+        json!("repair_retrieval"),
+        "packet/search should stay gated by the agent retrieval lane while local graph is stale: {last_status}"
+    );
     let status_next_call_text = last_status["recommended_next_calls"].to_string();
     assert!(
         !status_next_call_text.contains("\"tool\":\"packet\"")

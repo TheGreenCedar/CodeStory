@@ -2131,6 +2131,10 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness);
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
+    let local = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
+        .expect("local_navigation readiness verdict");
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -2161,6 +2165,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
+        "local_refresh": crate::readiness::local_refresh_output(local),
         "readiness": readiness,
         "readiness_lanes": readiness_lanes,
         "allowed_surfaces": allowed_surfaces,
