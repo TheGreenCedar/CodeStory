@@ -10,12 +10,15 @@ use codestory_contracts::api::{
     AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAskRequest,
     AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
-    IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
-    ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode,
-    SearchRequest, TrailCallerScope, TrailDirection, TrailMode,
+    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
+    IndexFreshnessStatusDto, IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
+    ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, TrailCallerScope, TrailDirection,
+    TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{BufRead, Read, Write};
@@ -49,6 +52,7 @@ const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 const STDIO_CLI_VERSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Run the stdio server until stdin closes.
 ///
@@ -168,6 +172,26 @@ struct StdioStatusCacheEntry {
     key: String,
     value: serde_json::Value,
     cached_at: Instant,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StdioDirtyMarker {
+    schema_version: u32,
+    project_root: String,
+    dirty: bool,
+    updated_at: String,
+    source: String,
+    #[serde(default)]
+    path_sample: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StdioDirtyMarkerStatus {
+    path: Option<PathBuf>,
+    marker: Option<StdioDirtyMarker>,
+    status: &'static str,
+    blocks_local_surfaces: bool,
+    reason: Option<String>,
 }
 
 fn handle_stdio_message(
@@ -1221,6 +1245,24 @@ fn stdio_storage_fingerprint(storage_path: &std::path::Path) -> String {
     parts.join("|")
 }
 
+fn stdio_storage_modified(
+    storage_path: &std::path::Path,
+) -> std::io::Result<std::time::SystemTime> {
+    let paths = [
+        storage_path.to_path_buf(),
+        storage_path.with_extension("db-wal"),
+        storage_path.with_extension("db-shm"),
+    ];
+    let mut newest: Option<std::time::SystemTime> = None;
+    for path in paths {
+        let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        newest = Some(newest.map_or(modified, |current| current.max(modified)));
+    }
+    newest.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "storage state missing"))
+}
+
 fn stdio_mandatory_sidecar_fingerprint(
     project_root: &std::path::Path,
     storage_path: &std::path::Path,
@@ -2097,6 +2139,7 @@ fn stdio_project_args(runtime: &RuntimeContext) -> args::ProjectArgs {
 
 fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
     let layout = SidecarLayout::from_env_for_project(&runtime.project_root);
+    let marker_path = stdio_dirty_marker_env_path(&runtime.project_root);
     [
         format!("project:{}", runtime.project_root.display()),
         format!("storage:{}", runtime.storage_path.display()),
@@ -2111,6 +2154,13 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
         format!(
             "source_state:{}",
             stdio_source_fingerprint(&runtime.project_root)
+        ),
+        format!(
+            "dirty_marker:{}",
+            marker_path
+                .as_ref()
+                .map(|path| stdio_path_fingerprint(path))
+                .unwrap_or_else(|| "not_configured".to_string())
         ),
         format!(
             "active_embedding_backend:{}",
@@ -2184,6 +2234,180 @@ fn stdio_source_fingerprint_skip_dir(path: &Path) -> bool {
         .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules" | "dist"))
 }
 
+fn stdio_dirty_marker_env_path(project_root: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("CODESTORY_PLUGIN_DIRTY_MARKER_PATH").map(PathBuf::from)?;
+    let env_root = std::env::var_os("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project_root.to_path_buf());
+    if !stdio_same_path_text(&env_root, project_root) {
+        return None;
+    }
+    Some(path)
+}
+
+fn stdio_dirty_marker_status(project_root: &Path, storage_path: &Path) -> StdioDirtyMarkerStatus {
+    let Some(path) = stdio_dirty_marker_env_path(project_root) else {
+        return StdioDirtyMarkerStatus {
+            path: None,
+            marker: None,
+            status: "not_configured",
+            blocks_local_surfaces: false,
+            reason: None,
+        };
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return StdioDirtyMarkerStatus {
+                path: Some(path),
+                marker: None,
+                status: "missing",
+                blocks_local_surfaces: false,
+                reason: None,
+            };
+        }
+        Err(error) => {
+            return StdioDirtyMarkerStatus {
+                path: Some(path),
+                marker: None,
+                status: "unknown",
+                blocks_local_surfaces: false,
+                reason: Some(format!("marker_read_error:{error}")),
+            };
+        }
+    };
+    let marker: StdioDirtyMarker = match serde_json::from_str(&text) {
+        Ok(marker) => marker,
+        Err(error) => {
+            return StdioDirtyMarkerStatus {
+                path: Some(path),
+                marker: None,
+                status: "unknown",
+                blocks_local_surfaces: false,
+                reason: Some(format!("marker_json_error:{error}")),
+            };
+        }
+    };
+    if marker.schema_version != DIRTY_MARKER_SCHEMA_VERSION {
+        return StdioDirtyMarkerStatus {
+            path: Some(path),
+            marker: Some(marker),
+            status: "unknown",
+            blocks_local_surfaces: false,
+            reason: Some("schema_version_unsupported".to_string()),
+        };
+    }
+    if !stdio_same_path_text(Path::new(&marker.project_root), project_root) {
+        return StdioDirtyMarkerStatus {
+            path: Some(path),
+            marker: Some(marker),
+            status: "unknown",
+            blocks_local_surfaces: false,
+            reason: Some("project_root_mismatch".to_string()),
+        };
+    }
+    if !marker.dirty {
+        return StdioDirtyMarkerStatus {
+            path: Some(path),
+            marker: Some(marker),
+            status: "clean",
+            blocks_local_surfaces: false,
+            reason: None,
+        };
+    }
+    let marker_modified = fs::metadata(&path).and_then(|metadata| metadata.modified());
+    let storage_modified = stdio_storage_modified(storage_path);
+    match (marker_modified, storage_modified) {
+        (Ok(marker_modified), Ok(storage_modified)) if marker_modified > storage_modified => {
+            StdioDirtyMarkerStatus {
+                path: Some(path),
+                marker: Some(marker),
+                status: "dirty_stale",
+                blocks_local_surfaces: true,
+                reason: Some("dirty_marker_newer_than_index".to_string()),
+            }
+        }
+        (Ok(_), Ok(_)) => StdioDirtyMarkerStatus {
+            path: Some(path),
+            marker: Some(marker),
+            status: "dirty_indexed",
+            blocks_local_surfaces: false,
+            reason: None,
+        },
+        (_, _) => StdioDirtyMarkerStatus {
+            path: Some(path),
+            marker: Some(marker),
+            status: "dirty_unknown",
+            blocks_local_surfaces: false,
+            reason: Some("marker_or_storage_mtime_unavailable".to_string()),
+        },
+    }
+}
+
+fn stdio_same_path_text(left: &Path, right: &Path) -> bool {
+    let clean = |path: &Path| {
+        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        path.to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    clean(left) == clean(right)
+}
+
+fn stdio_effective_freshness(
+    freshness: Option<&IndexFreshnessDto>,
+    marker: &StdioDirtyMarkerStatus,
+) -> Option<IndexFreshnessDto> {
+    if !marker.blocks_local_surfaces {
+        return freshness.cloned();
+    }
+    let mut effective = freshness.cloned().unwrap_or(IndexFreshnessDto {
+        status: IndexFreshnessStatusDto::NotChecked,
+        changed_file_count: 0,
+        new_file_count: 0,
+        removed_file_count: 0,
+        checked_file_count: 0,
+        indexed_file_count: 0,
+        duration_ms: 0,
+        reason: None,
+        samples: Vec::new(),
+    });
+    effective.status = IndexFreshnessStatusDto::Stale;
+    effective.changed_file_count = effective.changed_file_count.max(1);
+    effective.reason = marker.reason.clone();
+    if effective.samples.is_empty()
+        && let Some(marker) = marker.marker.as_ref()
+    {
+        effective.samples = marker
+            .path_sample
+            .iter()
+            .take(5)
+            .map(|path| IndexFreshnessSampleDto {
+                kind: IndexFreshnessChangeKindDto::Changed,
+                path: path.clone(),
+            })
+            .collect();
+    }
+    Some(effective)
+}
+
+fn stdio_dirty_marker_json(marker: &StdioDirtyMarkerStatus) -> serde_json::Value {
+    serde_json::json!({
+        "status": marker.status,
+        "blocks_local_surfaces": marker.blocks_local_surfaces,
+        "reason": marker.reason,
+        "path": marker.path.as_ref().map(|path| crate::display::clean_path_string(&path.to_string_lossy())),
+        "schema_version": marker.marker.as_ref().map(|marker| marker.schema_version),
+        "project_root": marker.marker.as_ref().map(|marker| marker.project_root.as_str()),
+        "dirty": marker.marker.as_ref().map(|marker| marker.dirty),
+        "updated_at": marker.marker.as_ref().map(|marker| marker.updated_at.as_str()),
+        "source": marker.marker.as_ref().map(|marker| marker.source.as_str()),
+        "path_sample": marker.marker.as_ref().map(|marker| marker.path_sample.clone()).unwrap_or_default(),
+    })
+}
+
 fn read_stdio_status_resource(
     runtime: &RuntimeContext,
     summary: ProjectSummary,
@@ -2236,10 +2460,12 @@ fn read_stdio_status_resource(
     let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
     let plugin_runtime = stdio_plugin_runtime_status();
     let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
+    let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
+    let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
         stats: &summary.stats,
-        freshness: summary.freshness.as_ref(),
+        freshness: effective_freshness.as_ref(),
         setup: setup_repair.as_ref(),
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
             profile: Some(sidecar_runtime.profile.as_str()),
@@ -2260,8 +2486,12 @@ fn read_stdio_status_resource(
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
         .expect("local_navigation readiness verdict");
-    let local_refresh_status =
+    let mut local_refresh_status =
         local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(local));
+    if dirty_marker.blocks_local_surfaces {
+        local_refresh_status = crate::readiness::local_refresh_output(local);
+        local_refresh_status.reason = dirty_marker.reason.clone();
+    }
     let local_refresh_json =
         serde_json::to_value(&local_refresh_status).expect("serialize local refresh");
     let runtime_truth = stdio_runtime_truth_status(
@@ -2294,6 +2524,7 @@ fn read_stdio_status_resource(
         "degraded_reason": degraded_reason,
         "sidecar_retrieval": sidecar,
         "sidecar_setup": sidecar_setup,
+        "dirty_marker": stdio_dirty_marker_json(&dirty_marker),
         "legacy_semantic_diagnostics": {
             "mode": retrieval.map(|state| state.mode),
             "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
@@ -2303,6 +2534,7 @@ fn read_stdio_status_resource(
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
+        "effective_index_freshness": effective_freshness,
         "local_refresh": local_refresh_json,
         "readiness": readiness,
         "readiness_lanes": readiness_lanes_json,

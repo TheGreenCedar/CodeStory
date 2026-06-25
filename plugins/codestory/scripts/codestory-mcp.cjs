@@ -7,6 +7,7 @@ const fs = require('fs');
 const https = require('https');
 const os = require('os');
 const path = require('path');
+const { dirtyMarkerPathForProject } = require('../hooks/codestory-runtime.cjs');
 
 const pluginRoot = path.dirname(__dirname);
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
@@ -121,6 +122,21 @@ function handleSidecarPolicyCommand(argv) {
 
 function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json`;
+}
+
+function dirtyMarkerEnv(projectRoot = process.cwd()) {
+  const markerPath = dirtyMarkerPathForProject(projectRoot, pluginDataDir());
+  const normalizedRoot = (() => {
+    try {
+      return fs.realpathSync(path.resolve(projectRoot));
+    } catch {
+      return path.resolve(projectRoot);
+    }
+  })();
+  return {
+    path: markerPath || '',
+    projectRoot: markerPath ? normalizedRoot : '',
+  };
 }
 
 function runtimeTruthStatus(plugin, repair, options = {}) {
@@ -917,6 +933,7 @@ async function main() {
     return;
   }
   const sidecarStatus = readSidecarPolicy();
+  const dirtyMarker = dirtyMarkerEnv(process.cwd());
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
     stdio: 'inherit',
@@ -948,6 +965,8 @@ async function main() {
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
+      CODESTORY_PLUGIN_DIRTY_MARKER_PATH: dirtyMarker.path,
+      CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT: dirtyMarker.projectRoot,
     },
   });
 

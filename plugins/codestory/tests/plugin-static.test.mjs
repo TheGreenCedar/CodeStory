@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -11,7 +11,11 @@ import { fileURLToPath } from "node:url";
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
-const { classifyMcpRuntime } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
+const {
+  classifyMcpRuntime,
+  dirtyMarkerPathForProject,
+  writeDirtyMarker,
+} = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
 function readCargoVersion(manifestText) {
   let inPackage = false;
@@ -58,7 +62,7 @@ function releaseAssetForPlatform(version) {
 }
 
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -140,6 +144,51 @@ test("codestory repo ships plugin source, not marketplace catalog or server adap
   await access(join(pluginRoot, "scripts", "codestory-mcp.cjs"));
 });
 
+test("dirty marker writer stores one project-keyed marker under plugin data", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-dirty-marker-"));
+  const projectRoot = await mkdtemp(join(tmpdir(), "codestory-dirty-project-"));
+
+  try {
+    const realProjectRoot = await realpath(projectRoot);
+    const first = writeDirtyMarker(projectRoot, {
+      pluginDataDir: dataDir,
+      dirty: true,
+      source: "test-hook",
+      pathSample: ["src/lib.rs", "src/changed.rs", ""],
+    });
+    const firstStat = await stat(first.path);
+    const repeat = writeDirtyMarker(projectRoot, {
+      pluginDataDir: dataDir,
+      dirty: true,
+      source: "test-hook",
+      pathSample: ["src/lib.rs", "src/changed.rs", ""],
+    });
+    const repeatStat = await stat(first.path);
+    const second = writeDirtyMarker(projectRoot, {
+      pluginDataDir: dataDir,
+      dirty: false,
+      source: "test-hook",
+    });
+
+    assert.ok(first);
+    assert.ok(repeat);
+    assert.ok(second);
+    assert.equal(repeat.unchanged, true);
+    assert.equal(first.path, second.path);
+    assert.equal(repeatStat.mtimeMs, firstStat.mtimeMs);
+    assert.equal(first.path, dirtyMarkerPathForProject(projectRoot, dataDir));
+    const marker = JSON.parse(await readFile(second.path, "utf8"));
+    assert.equal(marker.schema_version, 1);
+    assert.equal(marker.project_root, realProjectRoot);
+    assert.equal(marker.dirty, false);
+    assert.equal(marker.source, "test-hook");
+    assert.equal(typeof marker.updated_at, "string");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("mcp launcher prefers a checksummed managed cli without PATH", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
@@ -184,6 +233,8 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.sidecarPolicy, "ask");
     assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
     assert.match(observed.sidecarEnable, /--policy-file/u);
+    assert.equal(observed.dirtyMarkerRoot, await realpath(repoRoot));
+    assert.equal(observed.dirtyMarkerPath, dirtyMarkerPathForProject(repoRoot, dataDir));
     assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none"]);
 
     const enable = spawnSync(observed.sidecarEnable, {

@@ -59,7 +59,7 @@ running server.
 | --- | --- | --- |
 | `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
-| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `runtime_truth`, `sidecar_setup`, and `allowed_surfaces`. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when the plugin launcher is active. | Guessing active runtime from source checkout or PATH alone. |
+| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `runtime_truth`, `sidecar_setup`, `dirty_marker`, and `allowed_surfaces`. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when the plugin launcher is active. | Guessing active runtime from source checkout or PATH alone. |
 
 ## How It Runs
 
@@ -147,7 +147,7 @@ The first run should be agent-owned. The skill checks whether `codestory-cli` is
 live through MCP by reading `codestory://status`. If MCP is live, the agent uses
 `server_version`, `cli_version`, `server_executable`,
 `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`,
-`runtime_truth`, `sidecar_setup`, and `allowed_surfaces` from status instead of rechecking PATH
+`runtime_truth`, `sidecar_setup`, `dirty_marker`, and `allowed_surfaces` from status instead of rechecking PATH
 or release metadata.
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
