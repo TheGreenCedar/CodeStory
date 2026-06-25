@@ -10892,13 +10892,15 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
     if sidecar.retrieval_mode == "full" {
         let device_note = if sidecar.embedding_cpu_allowed {
             format!(
-                " embedding device policy allows CPU-backed mode (observed_device={}).",
-                sidecar.embedding_device_state
+                " embedding device policy allows CPU-backed mode (observed_device={} observation_source={}).",
+                sidecar.embedding_device_state, sidecar.embedding_device_observation_source
             )
         } else {
             format!(
-                " embedding device policy={} observed_device={}.",
-                sidecar.embedding_device_policy, sidecar.embedding_device_state
+                " embedding device policy={} observed_device={} observation_source={}.",
+                sidecar.embedding_device_policy,
+                sidecar.embedding_device_state,
+                sidecar.embedding_device_observation_source
             )
         };
         return doctor_check(
@@ -10918,10 +10920,11 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
         "sidecar_retrieval",
         "warn",
         format!(
-            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); repair sidecars before trusting packet/search evidence.",
+            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} observation_source={} cpu_allowed={}); repair sidecars before trusting packet/search evidence.",
             sidecar.retrieval_mode,
             sidecar.embedding_device_policy,
             sidecar.embedding_device_state,
+            sidecar.embedding_device_observation_source,
             sidecar.embedding_cpu_allowed
         ),
     )
