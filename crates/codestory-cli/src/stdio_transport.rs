@@ -2067,10 +2067,12 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
 fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
     let summary = runtime.open_project_summary()?;
     let retrieval = summary.retrieval.as_ref();
+    let sidecar_runtime = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
     let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash, ownership) =
-        match codestory_retrieval::strict_sidecar_status(
+        match codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
+            sidecar_runtime.clone(),
         ) {
             Ok(report) => {
                 let manifest_generation = report
@@ -2117,6 +2119,8 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         freshness: summary.freshness.as_ref(),
         setup: setup_repair.as_ref(),
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
+            profile: Some(sidecar_runtime.profile.as_str()),
+            run_id: sidecar_runtime.run_id.as_deref(),
             retrieval_mode: &sidecar_mode,
             degraded_reason: degraded_reason.as_deref(),
             manifest_generation: manifest_generation.as_deref(),
@@ -2125,6 +2129,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     });
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
+    let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness);
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
@@ -2157,6 +2162,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
         },
         "index_freshness": summary.freshness,
         "readiness": readiness,
+        "readiness_lanes": readiness_lanes,
         "allowed_surfaces": allowed_surfaces,
         "recommended_next_calls": recommended_next_calls
     }))

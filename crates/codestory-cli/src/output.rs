@@ -3822,6 +3822,8 @@ mod tests {
             retrieval_mode: "full".to_string(),
             degraded_reason: None,
             sidecar_retrieval: crate::args::DoctorSidecarStatusOutput {
+                profile: Some("local".to_string()),
+                run_id: None,
                 retrieval_mode: "full".to_string(),
                 degraded_reason: None,
                 manifest_generation: None,
@@ -3834,6 +3836,7 @@ mod tests {
             retrieval: None,
             freshness: None,
             readiness: Vec::new(),
+            readiness_lanes: std::collections::BTreeMap::new(),
             checks: Vec::new(),
             next_commands: Vec::new(),
             environment: Vec::new(),

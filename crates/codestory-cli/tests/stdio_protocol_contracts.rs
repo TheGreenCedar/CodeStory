@@ -2116,6 +2116,50 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     let readiness = status["readiness"]
         .as_array()
         .unwrap_or_else(|| panic!("status should include readiness verdicts: {status}"));
+    let readiness_lanes = status["readiness_lanes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("status should include readiness lanes: {status}"));
+    let local_default = readiness_lanes
+        .get("local_default")
+        .unwrap_or_else(|| panic!("status should include local_default lane: {status}"));
+    assert_eq!(
+        local_default["profile"],
+        json!("local"),
+        "local/default lane should report the local profile: {status}"
+    );
+    assert!(
+        local_default["sidecar_mode"].is_string(),
+        "local/default lane should report sidecar mode: {status}"
+    );
+    assert!(
+        local_default["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--profile local")),
+        "local/default lane should expose a local-scoped next command: {status}"
+    );
+    let agent_lane = readiness_lanes
+        .get("agent_packet_search")
+        .unwrap_or_else(|| panic!("status should include agent_packet_search lane: {status}"));
+    assert_eq!(
+        agent_lane["status"],
+        json!("repair_retrieval"),
+        "agent lane should report blocked packet/search readiness: {status}"
+    );
+    assert_eq!(
+        agent_lane["profile"],
+        json!("agent"),
+        "agent lane must not collapse to local when no agent run exists: {status}"
+    );
+    assert!(
+        agent_lane["run_id"].as_str().is_some_and(|run_id| !run_id.is_empty()),
+        "agent lane should report a non-empty agent run id: {status}"
+    );
+    assert!(
+        agent_lane["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("ready --goal agent --repair")),
+        "agent lane should expose the agent-scoped next command: {status}"
+    );
     for surface in [
         "ground",
         "files",
