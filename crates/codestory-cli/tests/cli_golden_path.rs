@@ -646,14 +646,15 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     let next_commands = doctor_next_commands(&doctor);
     let joined = next_commands.join("\n");
     assert!(
-        joined.contains("codestory-cli index")
-            && joined.contains("--refresh incremental")
+        joined.contains("codestory-cli ready --goal local --repair")
             && joined.contains("codestory-cli doctor"),
-        "stale doctor should recommend index repair then doctor recheck: {doctor:#}"
+        "stale doctor should recommend local graph repair then doctor recheck: {doctor:#}"
     );
     assert!(
-        !joined.contains("retrieval status") && !joined.contains("retrieval index"),
-        "stale doctor should stop before retrieval repair commands: {doctor:#}"
+        !joined.contains("ready --goal agent --repair")
+            && !joined.contains("retrieval status")
+            && !joined.contains("retrieval index"),
+        "stale doctor next_commands should stop before agent retrieval repair commands: {doctor:#}"
     );
     assert_no_agent_proof_commands(&next_commands, "stale doctor");
 
@@ -670,9 +671,10 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     );
     let markdown = String::from_utf8_lossy(&markdown.stdout);
     assert!(
-        markdown
-            .contains("readiness: local_navigation=repair_index agent_packet_search=repair_index"),
-        "doctor markdown should show split readiness with index repair first:\n{markdown}"
+        markdown.contains(
+            "readiness: local_navigation=repair_index agent_packet_search=repair_retrieval"
+        ),
+        "doctor markdown should show local index repair without collapsing agent retrieval readiness:\n{markdown}"
     );
 }
 
@@ -798,6 +800,14 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
     assert_eq!(preflight["usable"], true, "{preflight:#}");
     assert_eq!(preflight["mode"], "local_graph", "{preflight:#}");
     assert_eq!(preflight["local_graph"]["ready"], true, "{preflight:#}");
+    assert_eq!(
+        preflight["local_refresh"]["state"], "fresh",
+        "{preflight:#}"
+    );
+    assert_eq!(
+        preflight["local_refresh"]["blocks_local_surfaces"], false,
+        "{preflight:#}"
+    );
     assert_eq!(
         preflight["full_retrieval"]["status"], "repair_retrieval",
         "{preflight:#}"
@@ -1460,7 +1470,7 @@ fn assert_sidecar_failure_output(output: std::process::Output) {
     );
     assert!(
         failure.contains("sidecar retrieval")
-            && (failure.contains("expected mode=full")
+            && (failure.contains("expected profile=agent mode=full")
                 || failure.contains("retrieval_manifest_missing")),
         "command should explain the mandatory sidecar gate, got: {failure}"
     );

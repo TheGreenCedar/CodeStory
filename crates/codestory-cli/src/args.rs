@@ -1547,6 +1547,7 @@ pub(crate) struct AgentPreflightOutput {
     pub(crate) usable: bool,
     pub(crate) mode: String,
     pub(crate) local_graph: AgentPreflightLaneOutput,
+    pub(crate) local_refresh: crate::readiness::LocalRefreshOutput,
     pub(crate) full_retrieval: AgentPreflightLaneOutput,
     pub(crate) local_default: ReadinessLaneOutput,
     pub(crate) agent_packet_search: ReadinessLaneOutput,

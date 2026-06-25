@@ -167,7 +167,7 @@ fn retrieval_eval_search_fails_closed_without_full_retrieval_sidecars() {
         error.message
     );
     assert!(
-        error.message.contains("expected mode=full"),
+        error.message.contains("expected profile=agent mode=full"),
         "{}",
         error.message
     );

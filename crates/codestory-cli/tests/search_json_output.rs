@@ -281,8 +281,8 @@ fn search_json_fails_closed_without_full_sidecars() {
     assert!(
         stderr.contains(
             "retrieval_unavailable: sidecar retrieval primary is unavailable or degraded"
-        ) && stderr.contains("expected mode=full"),
-        "search should report mandatory sidecar full-mode boundary: {stderr}"
+        ) && stderr.contains("expected profile=agent mode=full"),
+        "search should report mandatory agent sidecar full-mode boundary: {stderr}"
     );
     assert!(
         stderr.contains("Minimum next:")

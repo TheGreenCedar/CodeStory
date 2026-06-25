@@ -2160,6 +2160,7 @@ fn build_agent_preflight_output(
         usable: local_ready || full_ready,
         mode: mode.to_string(),
         local_graph: agent_preflight_lane(local),
+        local_refresh: readiness::local_refresh_output(local),
         full_retrieval: agent_preflight_lane(agent),
         local_default: readiness_lanes
             .get("local_default")
@@ -2220,6 +2221,11 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
         markdown,
         "local_graph: {}",
         readiness::status_label(output.local_graph.status)
+    );
+    let _ = writeln!(
+        markdown,
+        "local_refresh: {}",
+        readiness::local_refresh_state_label(output.local_refresh.state)
     );
     if let Some(layer) = output.local_graph.failed_layer {
         let _ = writeln!(markdown, "local_graph_failed_layer: `{layer}`");

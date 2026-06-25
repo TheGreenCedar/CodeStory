@@ -2131,6 +2131,10 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness);
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
+    let local = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
+        .expect("local_navigation readiness verdict");
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -2161,6 +2165,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
+        "local_refresh": crate::readiness::local_refresh_output(local),
         "readiness": readiness,
         "readiness_lanes": readiness_lanes,
         "allowed_surfaces": allowed_surfaces,
@@ -3159,6 +3164,49 @@ version = "0.11.20"
                 .is_some_and(|commands| commands.len() == 3),
             "full repair should keep proof commands behind the canonical minimum repair: {packet}"
         );
+    }
+
+    #[test]
+    fn stdio_blocks_agent_surfaces_when_only_local_sidecar_is_full() {
+        let stats = codestory_contracts::api::StorageStatsDto {
+            file_count: 1,
+            node_count: 1,
+            edge_count: 0,
+            error_count: 0,
+            fatal_error_count: 0,
+        };
+        let readiness =
+            crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+                project: "C:/repo/example",
+                stats: &stats,
+                freshness: None,
+                setup: None,
+                sidecar: Some(crate::readiness::ReadinessSidecarInput {
+                    profile: Some("local"),
+                    run_id: None,
+                    retrieval_mode: "full",
+                    degraded_reason: None,
+                    manifest_generation: Some("generation"),
+                    manifest_input_hash: Some("hash"),
+                }),
+            });
+
+        let surfaces = stdio_allowed_surfaces(&readiness);
+
+        assert_eq!(surfaces["ground"]["allowed"], json!(true));
+        assert_eq!(surfaces["files"]["allowed"], json!(true));
+        for surface in ["packet", "search", "context"] {
+            assert_eq!(
+                surfaces[surface]["allowed"],
+                json!(false),
+                "local/default full sidecar must not unlock {surface}: {surfaces}"
+            );
+            assert_eq!(
+                surfaces[surface]["status"],
+                json!("repair_retrieval"),
+                "blocked agent surface should stay on the agent retrieval lane: {surfaces}"
+            );
+        }
     }
 
     #[test]
