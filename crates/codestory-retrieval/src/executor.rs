@@ -12,9 +12,12 @@ use codestory_store::RetrievalIndexManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+
+const BROAD_STAGE_WORKER_LIMIT: usize = 16;
+static BROAD_STAGE_WORKERS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Trace for one retrieval stage.
@@ -74,7 +77,7 @@ pub struct QueryResult {
 /// The executor is fail-closed: live degraded modes return an error instead of serving partial
 /// results. Tests may use `mode_override`, but product callers should rely on live health probes.
 pub struct QueryExecutor<'a> {
-    pub sidecars: &'a dyn SidecarSearch,
+    pub sidecars: Arc<dyn SidecarSearch>,
     pub cache: &'a mut RetrievalCache,
     pub manifest: Option<RetrievalIndexManifest>,
     pub file_roles: HashMap<String, codestory_store::FileRole>,
@@ -122,7 +125,11 @@ impl<'a> QueryExecutor<'a> {
         }
 
         let mut plan = crate::planner::plan_query(&features, mode);
+        let planned_budget_ms = plan.stages.iter().map(|stage| stage.budget_ms).sum::<u64>();
         if let Some(budget) = total_budget_ms {
+            if is_broad_query(features.shape) && budget < planned_budget_ms {
+                scale_stage_budgets(&mut plan.stages, budget);
+            }
             plan.total_budget_ms = budget;
         }
 
@@ -191,23 +198,55 @@ impl<'a> QueryExecutor<'a> {
     }
 
     fn run_stage(
-        &self,
+        sidecars: &dyn SidecarSearch,
         stage: &PlannedStage,
         features: &QueryFeatures,
         anchors: &[CandidateHit],
     ) -> Result<Vec<CandidateHit>> {
         let query = &features.raw_query;
         match stage.kind {
-            RetrievalStageKind::Stage0ScipAnchor => self.sidecars.scip_anchor(query, stage.top_k),
-            RetrievalStageKind::Stage1ZoektLexical => {
-                self.sidecars.zoekt_search(query, stage.top_k)
-            }
-            RetrievalStageKind::Stage1bQdrantSemantic => {
-                self.sidecars.qdrant_search(query, stage.top_k)
-            }
-            RetrievalStageKind::Stage2ScipExpand => self.sidecars.scip_expand(anchors, stage.top_k),
+            RetrievalStageKind::Stage0ScipAnchor => sidecars.scip_anchor(query, stage.top_k),
+            RetrievalStageKind::Stage1ZoektLexical => sidecars.zoekt_search(query, stage.top_k),
+            RetrievalStageKind::Stage1bQdrantSemantic => sidecars.qdrant_search(query, stage.top_k),
+            RetrievalStageKind::Stage2ScipExpand => sidecars.scip_expand(anchors, stage.top_k),
             RetrievalStageKind::Stage3RepoTextFallback => {
                 bail!("repo-text diagnostic stage is unsupported in mandatory sidecar retrieval")
+            }
+        }
+    }
+
+    fn run_stage_bounded(
+        &self,
+        stage: &PlannedStage,
+        features: &QueryFeatures,
+        anchors: &[CandidateHit],
+    ) -> Result<StageRun> {
+        if !is_broad_query(features.shape) {
+            return Self::run_stage(self.sidecars.as_ref(), stage, features, anchors)
+                .map(StageRun::Completed);
+        }
+
+        let stage = stage.clone();
+        let timeout_ms = stage.budget_ms.max(1);
+        let features = features.clone();
+        let anchors = anchors.to_vec();
+        let sidecars = Arc::clone(&self.sidecars);
+        let (sender, receiver) = mpsc::channel();
+        let Some(permit) = BroadStageWorkerPermit::try_acquire() else {
+            return Ok(StageRun::TimedOut("stage_worker_limit"));
+        };
+        // ponytail: global cap; use a worker pool if broad-stage timeout volume matters.
+        std::thread::spawn(move || {
+            let _permit = permit;
+            let result = Self::run_stage(sidecars.as_ref(), &stage, &features, &anchors);
+            let _ = sender.send(result);
+        });
+
+        match receiver.recv_timeout(Duration::from_millis(timeout_ms)) {
+            Ok(result) => result.map(StageRun::Completed),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(StageRun::TimedOut("stage_deadline")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("sidecar stage worker disconnected")
             }
         }
     }
@@ -222,11 +261,12 @@ impl<'a> QueryExecutor<'a> {
         options: StageSequenceOptions,
     ) -> Result<Option<String>> {
         let mut low_gain_streak = 0u32;
+        let mut cancel_reason = None;
         for stage in stages {
             if self.cancelled.load(Ordering::Relaxed) {
                 return Ok(Some("cancelled".into()));
             }
-            if Instant::now() >= deadline {
+            if !is_broad_query(features.shape) && Instant::now() >= deadline {
                 return Ok(Some("deadline".into()));
             }
 
@@ -257,7 +297,22 @@ impl<'a> QueryExecutor<'a> {
 
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
-            let mut stage_hits = self.run_stage(stage, features, candidates)?;
+            let mut stage_hits = match self.run_stage_bounded(stage, features, candidates)? {
+                StageRun::Completed(hits) => hits,
+                StageRun::TimedOut(reason) => {
+                    stage_traces.push(stage_trace(
+                        stage,
+                        stage.budget_ms,
+                        0,
+                        0.0,
+                        Some(reason.into()),
+                        false,
+                        None,
+                    ));
+                    cancel_reason.get_or_insert_with(|| reason.into());
+                    continue;
+                }
+            };
             annotate_stage_provenance(stage, &mut stage_hits);
             let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
             let added = merge_candidates(candidates, stage_hits);
@@ -289,7 +344,31 @@ impl<'a> QueryExecutor<'a> {
                 }
             }
         }
-        Ok(None)
+        Ok(cancel_reason)
+    }
+}
+
+enum StageRun {
+    Completed(Vec<CandidateHit>),
+    TimedOut(&'static str),
+}
+
+struct BroadStageWorkerPermit;
+
+impl BroadStageWorkerPermit {
+    fn try_acquire() -> Option<Self> {
+        BROAD_STAGE_WORKERS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < BROAD_STAGE_WORKER_LIMIT).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for BroadStageWorkerPermit {
+    fn drop(&mut self) {
+        BROAD_STAGE_WORKERS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -297,6 +376,35 @@ impl<'a> QueryExecutor<'a> {
 struct StageSequenceOptions {
     stop_marginal_gain_threshold: Option<f32>,
     stop_after_low_gain_streak: u32,
+}
+
+fn is_broad_query(shape: crate::query_features::QueryShape) -> bool {
+    matches!(
+        shape,
+        crate::query_features::QueryShape::NaturalLanguage
+            | crate::query_features::QueryShape::Mixed
+    )
+}
+
+fn scale_stage_budgets(stages: &mut [PlannedStage], total_budget_ms: u64) {
+    let planned_total = stages.iter().map(|stage| stage.budget_ms).sum::<u64>();
+    if stages.is_empty() || planned_total == 0 {
+        return;
+    }
+
+    let mut remaining = total_budget_ms.max(stages.len() as u64);
+    let last = stages.len() - 1;
+    for (index, stage) in stages.iter_mut().enumerate() {
+        if index == last {
+            stage.budget_ms = remaining.max(1);
+            break;
+        }
+        let stages_left = (last - index) as u64;
+        let scaled = stage.budget_ms.saturating_mul(total_budget_ms) / planned_total;
+        let budget = scaled.max(1).min(remaining.saturating_sub(stages_left));
+        stage.budget_ms = budget;
+        remaining = remaining.saturating_sub(budget);
+    }
 }
 
 fn stage_trace(
@@ -480,8 +588,9 @@ mod tests {
     use codestory_store::RetrievalIndexManifest;
     use std::collections::HashMap;
     use std::net::TcpListener;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn sample_manifest() -> RetrievalIndexManifest {
         RetrievalIndexManifest {
@@ -536,7 +645,7 @@ mod tests {
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -560,7 +669,7 @@ mod tests {
         cache.insert(key, vec![CandidateHit::lexical_stub("cached.rs", 1.0)]);
 
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(manifest),
             file_roles: HashMap::new(),
@@ -574,7 +683,7 @@ mod tests {
 
     #[test]
     fn executor_caches_only_complete_query_results() {
-        let mock = MockSidecarSearch {
+        let mock = Arc::new(MockSidecarSearch {
             zoekt: Mutex::new(HashMap::from([(
                 "startup".into(),
                 vec![CandidateHit::with_source(
@@ -585,12 +694,12 @@ mod tests {
                 )],
             )])),
             ..Default::default()
-        };
+        });
         let mut cache = RetrievalCache::new();
         let manifest = sample_manifest();
         {
             let mut executor = QueryExecutor {
-                sidecars: &mock,
+                sidecars: mock.clone(),
                 cache: &mut cache,
                 manifest: Some(manifest.clone()),
                 file_roles: HashMap::new(),
@@ -607,7 +716,7 @@ mod tests {
         let cancelled = cancellation_flag();
         cancelled.store(true, Ordering::Relaxed);
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: mock.clone(),
             cache: &mut cancelled_cache,
             manifest: Some(manifest.clone()),
             file_roles: HashMap::new(),
@@ -650,7 +759,7 @@ mod tests {
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -686,7 +795,7 @@ mod tests {
         let mock = MockSidecarSearch::default();
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -704,13 +813,13 @@ mod tests {
         let mut layout = SidecarLayout::from_env();
         layout.zoekt_http_port = unused_local_port();
         let manifest = retrieval_manifest_fixture("testproj", "cafebabedeadbeef");
-        let sidecars = TrackingSidecars {
+        let sidecars = Arc::new(TrackingSidecars {
             layout,
             layout_calls: AtomicUsize::new(0),
-        };
+        });
         let mut cache = RetrievalCache::new();
         let executor = QueryExecutor {
-            sidecars: &sidecars,
+            sidecars: sidecars.clone(),
             cache: &mut cache,
             manifest: Some(manifest),
             file_roles: HashMap::new(),
@@ -734,7 +843,7 @@ mod tests {
         cache.insert(key, vec![CandidateHit::lexical_stub("cached.rs", 1.0)]);
 
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(manifest),
             file_roles: HashMap::new(),
@@ -763,7 +872,7 @@ mod tests {
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -788,6 +897,276 @@ mod tests {
                 .iter()
                 .any(|hit| hit.file_path == "src/semantic.rs"),
             "expected semantic hit after empty lexical stages: {:?}",
+            result.hits
+        );
+    }
+
+    #[test]
+    fn broad_query_stage_deadline_preserves_later_sidecar_contribution() {
+        struct SlowZoektSidecars;
+
+        impl SidecarSearch for SlowZoektSidecars {
+            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(vec![CandidateHit::with_source(
+                    "src/slow_lexical.rs",
+                    Some("SlowLexical".into()),
+                    0.99,
+                    CandidateSource::Zoekt,
+                )])
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/semantic.rs",
+                    Some("SemanticAnchor".into()),
+                    0.8,
+                    CandidateSource::Qdrant,
+                )])
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(SlowZoektSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let started = Instant::now();
+        let result = executor
+            .execute(
+                "LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable",
+                Some(120),
+            )
+            .expect("query");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(190),
+            "slow Zoekt must not consume the whole broad-query path: {:?}",
+            result.trace.stages
+        );
+        assert_eq!(
+            result.trace.cancel_reason.as_deref(),
+            Some("stage_deadline")
+        );
+        assert!(
+            result.trace.stages.iter().any(|stage| {
+                stage.stage == RetrievalStageKind::Stage1ZoektLexical
+                    && stage.cancel_reason.as_deref() == Some("stage_deadline")
+            }),
+            "Zoekt overrun should be explicit in stage provenance: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result.trace.stages.iter().any(|stage| {
+                stage.stage == RetrievalStageKind::Stage1bQdrantSemantic
+                    && stage.candidates_added > 0
+            }),
+            "Qdrant must still contribute after Zoekt overrun: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/semantic.rs"),
+            "semantic fallback should be rankable after lexical overrun: {:?}",
+            result.hits
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.file_path != "src/slow_lexical.rs"),
+            "timed-out Zoekt hits must not merge late into this query: {:?}",
+            result.hits
+        );
+    }
+
+    #[test]
+    fn broad_query_slow_scip_expand_still_allows_qdrant_contribution() {
+        struct SlowScipExpandSidecars;
+
+        impl SidecarSearch for SlowScipExpandSidecars {
+            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/lexical.rs",
+                    Some("LexicalAnchor".into()),
+                    0.7,
+                    CandidateSource::Zoekt,
+                )])
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/semantic.rs",
+                    Some("SemanticAnchor".into()),
+                    0.8,
+                    CandidateSource::Qdrant,
+                )])
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(vec![CandidateHit::with_source(
+                    "src/slow_graph.rs",
+                    Some("SlowGraph".into()),
+                    0.95,
+                    CandidateSource::Scip,
+                )])
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(SlowScipExpandSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor
+            .execute(
+                "LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable",
+                Some(120),
+            )
+            .expect("query");
+
+        assert_eq!(
+            result.trace.cancel_reason.as_deref(),
+            Some("stage_deadline")
+        );
+        assert!(
+            result.trace.stages.iter().any(|stage| {
+                stage.stage == RetrievalStageKind::Stage2ScipExpand
+                    && stage.cancel_reason.as_deref() == Some("stage_deadline")
+            }),
+            "SCIP expand overrun should be explicit in stage provenance: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result.trace.stages.iter().any(|stage| {
+                stage.stage == RetrievalStageKind::Stage1bQdrantSemantic
+                    && stage.candidates_added > 0
+            }),
+            "Qdrant must still contribute after SCIP expand overrun: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/semantic.rs"),
+            "semantic fallback should be rankable after graph overrun: {:?}",
+            result.hits
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.file_path != "src/slow_graph.rs"),
+            "timed-out graph hits must not merge late into this query: {:?}",
+            result.hits
+        );
+    }
+
+    #[test]
+    fn non_broad_queries_stop_between_stages_after_total_deadline() {
+        struct SlowScipAnchorSidecars;
+
+        impl SidecarSearch for SlowScipAnchorSidecars {
+            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/late_lexical.rs",
+                    Some("LateLexical".into()),
+                    0.99,
+                    CandidateSource::Zoekt,
+                )])
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(vec![CandidateHit::with_source(
+                    "src/anchor.rs",
+                    Some("OtherAnchor".into()),
+                    0.7,
+                    CandidateSource::Scip,
+                )])
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(SlowScipAnchorSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: HashMap::new(),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor.execute("EventProcessor", Some(1)).expect("query");
+
+        assert_eq!(result.trace.cancel_reason.as_deref(), Some("deadline"));
+        assert!(
+            result
+                .trace
+                .stages
+                .iter()
+                .any(|stage| stage.stage == RetrievalStageKind::Stage0ScipAnchor),
+            "first non-broad stage should complete before sequence deadline check: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .trace
+                .stages
+                .iter()
+                .all(|stage| stage.stage != RetrievalStageKind::Stage1ZoektLexical),
+            "later non-broad stages must not start after total budget is spent: {:?}",
+            result.trace.stages
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.file_path != "src/late_lexical.rs"),
+            "late lexical hit should not be collected after sequence deadline: {:?}",
             result.hits
         );
     }
@@ -820,7 +1199,7 @@ mod tests {
         manifest.dense_projection_count = Some(0);
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(manifest),
             file_roles: HashMap::new(),
@@ -879,7 +1258,7 @@ mod tests {
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -907,7 +1286,7 @@ mod tests {
         let cancelled = cancellation_flag();
         cancelled.store(true, Ordering::Relaxed);
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -946,7 +1325,7 @@ mod tests {
             codestory_store::FileRole::Test,
         );
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: roles,
@@ -985,7 +1364,7 @@ mod tests {
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
@@ -1052,7 +1431,7 @@ mod tests {
         };
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: &mock,
+            sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: HashMap::new(),
