@@ -148,6 +148,26 @@ the sidecar lane only when the task needs those sidecar-backed surfaces:
 codestory-cli ready --goal agent --repair --project <target-workspace> --format json
 ```
 
+Optional dirty-marker Git hooks can mark local graph freshness dirty after Git
+checkout, merge, or rewrite operations. Install them only when you want that
+repo-level signal:
+
+```sh
+node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <target-workspace> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <target-workspace> --plugin-data <plugin-data-dir>
+```
+
+Uninstall is safe and removes only CodeStory-managed hook blocks:
+
+```sh
+node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <target-workspace> --plugin-data <plugin-data-dir>
+```
+
+`foreign_hook_present` means existing hook content was preserved.
+`uninstall_required` means an older CodeStory-managed block should be removed
+before reinstalling. Dirty markers affect local graph freshness only; packet,
+search, and context remain gated on full sidecar readiness.
+
 **Common next steps:**
 
 - If `packet`, `search`, or `context` is not allowed: Keep local browse work local; repair retrieval sidecars only when the task needs those surfaces

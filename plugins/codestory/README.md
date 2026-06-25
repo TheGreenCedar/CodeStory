@@ -77,6 +77,9 @@ This package stays thin:
 - `hooks/` keeps CodeStory ambient for host adapters that support lifecycle
   hooks: `SessionStart` attempts strict startup grounding and
   `UserPromptSubmit` attempts request-aware packet grounding.
+- `hooks/codestory-dirty-hook.cjs` is the explicit opt-in Git hook manager for
+  local graph freshness. It installs CodeStory-managed blocks only, preserves
+  existing hook content, and uninstalls only those managed blocks.
 - `skills/codestory-grounding` is the single canonical CodeStory grounding
   skill shipped by this repository.
 
@@ -154,6 +157,28 @@ Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
 missing, status reports a suspect runtime, or you are debugging/repairing the
 installed CLI. If PATH changed during repair, start a fresh Codex host/app
 session before treating a new MCP runtime as live.
+
+### Optional dirty-marker Git hooks
+
+The plugin status path can consume dirty markers written under plugin data. To
+mark a repo dirty after Git checkout/merge/rewrite operations, install the
+optional hook blocks explicitly:
+
+```bash
+node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <repo> --plugin-data <plugin-data-dir>
+```
+
+Uninstall removes only the CodeStory-managed blocks:
+
+```bash
+node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <repo> --plugin-data <plugin-data-dir>
+```
+
+If status reports `foreign_hook_present`, existing hook content was preserved.
+If it reports `uninstall_required`, uninstall the old managed block before
+installing again. Dirty markers affect local graph freshness only; packet,
+search, and context remain gated on full sidecar readiness.
 
 ## What To Ask
 
