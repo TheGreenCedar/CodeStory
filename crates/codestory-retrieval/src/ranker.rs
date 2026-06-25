@@ -62,7 +62,7 @@ pub fn rank_candidates(
         if prefer_primary_code && symbol_name_looks_test_like(candidate.symbol_name.as_deref()) {
             candidate.score *= 0.55;
         }
-        candidate.rank_features = Some(rank_features);
+        candidate.rank_features = Some(export_rank_features(candidate, rank_features));
     }
 
     apply_exact_code_evidence_anchor(features, &query_tokens, &mut candidates);
@@ -156,9 +156,7 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
     let has_semantic = matches!(candidate.source, CandidateSource::Qdrant)
         || candidate_has_provenance(candidate, "dense_anchor")
         || candidate_has_provenance(candidate, "component_report");
-    let has_graph = matches!(candidate.source, CandidateSource::Scip)
-        || candidate_has_provenance(candidate, "graph_neighbor")
-        || candidate_has_provenance(candidate, "exact");
+    let has_graph = candidate_has_graph_provenance(candidate);
 
     let lexical = if matches!(candidate.source, CandidateSource::Legacy) {
         candidate.score * 0.5
@@ -198,6 +196,13 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
     }
 }
 
+fn export_rank_features(candidate: &CandidateHit, mut features: RankFeatures) -> RankFeatures {
+    if !candidate_has_graph_provenance(candidate) {
+        features.scip_distance = 0.0;
+    }
+    features
+}
+
 fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
     weights.lexical * features.lexical
         + weights.semantic * features.semantic
@@ -205,6 +210,12 @@ fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
         + weights.file_role_prior * features.file_role_prior
         + weights.definition_quality * features.definition_quality
         + weights.token_overlap * features.token_overlap
+}
+
+fn candidate_has_graph_provenance(candidate: &CandidateHit) -> bool {
+    matches!(candidate.source, CandidateSource::Scip)
+        || candidate_has_provenance(candidate, "graph_neighbor")
+        || candidate_has_provenance(candidate, "exact")
 }
 
 fn candidate_has_provenance(candidate: &CandidateHit, label: &str) -> bool {
@@ -590,6 +601,33 @@ mod tests {
         let ranked = rank_candidates(&features, vec![hit]);
         let rf = ranked[0].rank_features.as_ref().expect("features");
         assert!(rf.file_role_prior > 0.0);
+    }
+
+    #[test]
+    fn ranker_exports_zero_graph_feature_without_graph_provenance() {
+        let features = classify_query("explain service startup");
+        let lexical = CandidateHit::lexical_stub("src/service.rs", 0.8);
+        let dense = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.9,
+            CandidateSource::Qdrant,
+        );
+
+        let ranked = rank_candidates(&features, vec![lexical, dense]);
+
+        for candidate in ranked {
+            assert_eq!(
+                candidate
+                    .rank_features
+                    .as_ref()
+                    .expect("rank features")
+                    .scip_distance,
+                0.0,
+                "{} should not export graph evidence",
+                candidate.file_path
+            );
+        }
     }
 
     #[test]
