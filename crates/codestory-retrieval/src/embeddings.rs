@@ -9,6 +9,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -114,7 +115,7 @@ pub fn embedding_device_readiness_for_runtime(
 }
 
 fn embedding_device_readiness_with_observed_state(
-    sidecar_observed_state: Option<&'static str>,
+    sidecar_observed_state: Option<EmbeddingDeviceObservation>,
 ) -> EmbeddingDeviceReadiness {
     let cpu_allowed = explicit_cpu_allowed();
     let detection = host_embedding_device_detection();
@@ -125,10 +126,6 @@ fn embedding_device_readiness_with_observed_state(
     };
     let accelerator_requested = accelerator_request.is_some();
     let observation = sidecar_observed_state
-        .map(|state| EmbeddingDeviceObservation {
-            state,
-            source: "sidecar_log",
-        })
         .unwrap_or_else(|| observed_embedding_device_state(cpu_allowed, accelerator_requested));
     let observed_state = observation.state;
     let accelerated = observed_state == "accelerated";
@@ -166,7 +163,13 @@ fn embedding_device_readiness_with_observed_state(
 
 fn observe_sidecar_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
-) -> Option<&'static str> {
+) -> Option<EmbeddingDeviceObservation> {
+    if crate::config::embedding_server_launch_mode()
+        .ok()
+        .is_some_and(|mode| mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned)
+    {
+        return observe_native_embedding_device_state(runtime);
+    }
     let output = Command::new("docker")
         .args([
             "logs",
@@ -186,8 +189,33 @@ fn observe_sidecar_embedding_device_state(
     );
     match observed_embedding_device_state_from_text(&text) {
         "unknown" => None,
-        state => Some(state),
+        state => Some(EmbeddingDeviceObservation {
+            state,
+            source: "sidecar_log",
+        }),
     }
+}
+
+fn observe_native_embedding_device_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<EmbeddingDeviceObservation> {
+    let text = std::fs::read_to_string(native_embedding_log_path(runtime)).ok()?;
+    match observed_embedding_device_state_from_text(&text) {
+        "unknown" => None,
+        state => Some(EmbeddingDeviceObservation {
+            state,
+            source: "native_log",
+        }),
+    }
+}
+
+pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeConfig) -> PathBuf {
+    runtime
+        .layout
+        .state_file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("llama-server-native.log")
 }
 
 pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
@@ -340,7 +368,7 @@ fn detect_windows_amd_gpu() -> Option<HostGpuDetection> {
 }
 
 fn windows_video_controller_probe_script() -> &'static str {
-    r#"$job = Start-Job -ScriptBlock { Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name } }; if (Wait-Job $job -Timeout 2) { Receive-Job $job; Remove-Job $job -Force } else { Stop-Job $job; Remove-Job $job -Force; exit 124 }"#
+    r#"$job = Start-Job -ScriptBlock { Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) $($_.AdapterCompatibility)" } }; if (Wait-Job $job -Timeout 2) { Receive-Job $job; Remove-Job $job -Force } else { Stop-Job $job; Remove-Job $job -Force; exit 124 }"#
 }
 
 fn detect_amd_gpu_from_windows_video_controller(output: &str) -> Option<HostGpuDetection> {
@@ -833,10 +861,22 @@ mod tests {
     }
 
     #[test]
+    fn windows_video_controller_parser_skips_virtual_monitor_before_amd() {
+        let detection = detect_amd_gpu_from_windows_video_controller(
+            "Meta Virtual Monitor Meta Platforms\r\nAMD Radeon RX 7900 XT Advanced Micro Devices, Inc.\r\n",
+        )
+        .expect("amd gpu");
+
+        assert_eq!(detection.provider, "amd");
+        assert!(detection.name.contains("AMD Radeon RX 7900 XT"));
+    }
+
+    #[test]
     fn windows_video_controller_probe_script_has_timeout() {
         let script = windows_video_controller_probe_script();
 
         assert!(script.contains("Wait-Job $job -Timeout 2"));
+        assert!(script.contains("AdapterCompatibility"));
         assert!(script.contains("Stop-Job $job"));
         assert!(script.contains("exit 124"));
     }
@@ -902,7 +942,11 @@ mod tests {
         let observed = observed_embedding_device_state_from_text(
             "llama_model_load: offloaded 33/33 layers to GPU\n",
         );
-        let readiness = embedding_device_readiness_with_observed_state(Some(observed));
+        let readiness =
+            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+                state: observed,
+                source: "sidecar_log",
+            }));
 
         assert_eq!(observed, "accelerated");
         assert_eq!(readiness.requested_policy, "accelerator_required");
@@ -949,6 +993,27 @@ mod tests {
         assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
         assert!(readiness.accelerator_requested);
         assert!(!readiness.full_retrieval_allowed);
+    }
+
+    #[test]
+    fn native_log_observed_acceleration_uses_native_source() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let readiness =
+            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+                state: "accelerated",
+                source: "native_log",
+            }));
+
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.observation_source, "native_log");
+        assert!(readiness.full_retrieval_allowed);
     }
 
     #[test]
