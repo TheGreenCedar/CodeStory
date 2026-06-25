@@ -14,6 +14,9 @@ const require = createRequire(import.meta.url);
 const {
   classifyMcpRuntime,
   dirtyMarkerPathForProject,
+  dirtyHookStatus,
+  installDirtyHooks,
+  uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
@@ -183,6 +186,105 @@ test("dirty marker writer stores one project-keyed marker under plugin data", as
     assert.equal(marker.dirty, false);
     assert.equal(marker.source, "test-hook");
     assert.equal(typeof marker.updated_at, "string");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("dirty marker hook manager installs idempotently and preserves foreign hook content", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-data-"));
+  const projectRoot = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-project-"));
+
+  try {
+    await mkdir(join(projectRoot, ".git", "hooks"), { recursive: true });
+    const postMerge = join(projectRoot, ".git", "hooks", "post-merge");
+    await writeFile(postMerge, "#!/bin/sh\necho foreign\n", "utf8");
+
+    const before = dirtyHookStatus(projectRoot, { pluginDataDir: dataDir });
+    assert.equal(before.status, "foreign_hook_present");
+
+    const installed = installDirtyHooks(projectRoot, { pluginDataDir: dataDir });
+    assert.equal(installed.status, "installed");
+    assert.equal(installed.hooks.every((hook) => hook.state === "installed"), true);
+    assert.equal(installed.hooks.every((hook) => hook.changed === true), true);
+    const firstPostMerge = await readFile(postMerge, "utf8");
+    assert.match(firstPostMerge, /echo foreign/u);
+    assert.match(firstPostMerge, /codestory dirty marker/u);
+
+    const repeated = installDirtyHooks(projectRoot, { pluginDataDir: dataDir });
+    assert.equal(repeated.status, "installed");
+    assert.equal(repeated.hooks.every((hook) => hook.changed === false), true);
+    assert.equal(await readFile(postMerge, "utf8"), firstPostMerge);
+
+    const uninstalled = uninstallDirtyHooks(projectRoot, { pluginDataDir: dataDir });
+    assert.equal(uninstalled.status, "foreign_hook_present");
+    assert.equal(await readFile(postMerge, "utf8"), "#!/bin/sh\necho foreign\n");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("dirty marker hook command reports uninstall-required stale managed blocks", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-cli-data-"));
+  const projectRoot = await mkdtemp(join(tmpdir(), "codestory-dirty-hook-cli-project-"));
+  const script = join(pluginRoot, "hooks", "codestory-dirty-hook.cjs");
+
+  try {
+    await mkdir(join(projectRoot, ".git", "hooks"), { recursive: true });
+    const hookPath = join(projectRoot, ".git", "hooks", "post-checkout");
+    await writeFile(
+      hookPath,
+      [
+        "#!/bin/sh",
+        "# >>> codestory dirty marker >>>",
+        "node old-script.cjs mark --project old --plugin-data old || true",
+        "# <<< codestory dirty marker <<<",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const install = spawnSync(process.execPath, [
+      script,
+      "install",
+      "--project",
+      projectRoot,
+      "--plugin-data",
+      dataDir,
+    ], { encoding: "utf8" });
+    assert.equal(install.status, 0, install.stderr);
+    const installed = JSON.parse(install.stdout);
+    assert.equal(installed.status, "uninstall_required");
+    assert.equal(installed.hooks.find((hook) => hook.hook === "post-checkout").state, "uninstall_required");
+
+    const uninstall = spawnSync(process.execPath, [
+      script,
+      "uninstall",
+      "--project",
+      projectRoot,
+      "--plugin-data",
+      dataDir,
+    ], { encoding: "utf8" });
+    assert.equal(uninstall.status, 0, uninstall.stderr);
+    assert.equal(JSON.parse(uninstall.stdout).status, "not_installed");
+
+    const mark = spawnSync(process.execPath, [
+      script,
+      "mark",
+      "--project",
+      projectRoot,
+      "--plugin-data",
+      dataDir,
+      "--source",
+      "test-command",
+    ], { encoding: "utf8" });
+    assert.equal(mark.status, 0, mark.stderr);
+    const markerResult = JSON.parse(mark.stdout);
+    const marker = JSON.parse(await readFile(markerResult.path, "utf8"));
+    assert.equal(marker.dirty, true);
+    assert.equal(marker.source, "test-command");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
