@@ -863,20 +863,21 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
         .expect("files description");
     assert!(
         files_description.contains("indexed files")
-            && files_description.contains("existing local index")
-            && files_description.contains("never refreshes"),
-        "files description should make the read-only index boundary explicit: {files_description}"
+            && files_description.contains("locally fresh index")
+            && files_description.contains("refreshes local graph")
+            && files_description.contains("never bootstraps sidecars"),
+        "files description should make the local-refresh boundary explicit: {files_description}"
     );
     let affected_description = tool_by_name(&tools, "affected")["description"]
         .as_str()
         .expect("affected description");
     assert!(
         affected_description.contains("changed paths")
-            && affected_description.contains("existing local index")
+            && affected_description.contains("locally fresh index")
             && affected_description.contains("never discovers git changes")
-            && affected_description.contains("never")
-            && affected_description.contains("indexes"),
-        "affected description should make the explicit-read-only boundary clear: {affected_description}"
+            && affected_description.contains("refreshes local graph")
+            && affected_description.contains("never bootstraps sidecars"),
+        "affected description should make the explicit-path local-refresh boundary clear: {affected_description}"
     );
     let snippet_description = tool_by_name(&tools, "snippet")["description"]
         .as_str()
@@ -2551,6 +2552,225 @@ fn resources_read_status_refreshes_long_lived_stale_index_with_bounded_latency()
     let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
     let refreshed_status = json_resource_content(result, "codestory://status");
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after reindex");
+}
+
+#[test]
+fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let ground_before = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-ground-before",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let ground_before = assert_tool_success(&ground_before, json!("tool-refresh-ground-before"));
+    let node_count_before = ground_before
+        .pointer("/stats/node_count")
+        .and_then(Value::as_u64)
+        .expect("ground before mutation node count");
+
+    let files_before = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-files-before",
+            "method": "tools/call",
+            "params": {
+                "name": "files",
+                "arguments": {"path": "src/runtime.rs", "limit": 5}
+            }
+        }),
+    );
+    let files_before = assert_tool_success(&files_before, json!("tool-refresh-files-before"));
+    assert_eq!(
+        files_before.pointer("/summary/visible_file_count"),
+        Some(&json!(1)),
+        "files tool should work before mutation: {files_before}"
+    );
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture
+            .workspace
+            .path()
+            .join("src")
+            .join("live_tool_added.rs"),
+        "pub fn stdio_tool_added_after_mutation() -> usize {\n    7\n}\n",
+    )
+    .expect("write file after stdio server startup");
+
+    let files_after = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-files-after",
+            "method": "tools/call",
+            "params": {
+                "name": "files",
+                "arguments": {"path": "live_tool_added.rs", "limit": 5}
+            }
+        }),
+    );
+    let files_after = assert_tool_success(&files_after, json!("tool-refresh-files-after"));
+    assert!(
+        files_after["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("live_tool_added.rs")))),
+        "files tool should refresh the local graph before serving post-mutation evidence: {files_after}"
+    );
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(&status_response, json!("tool-refresh-status"));
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_fresh_freshness_counts(&status, "codestory://status after local graph tool refresh");
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("refreshed"),
+        "tool dispatch should have refreshed the long-lived server before status was reread: {status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["search"]["status"],
+        json!("repair_retrieval"),
+        "local graph refresh must not make packet/search readiness claims: {status}"
+    );
+
+    let ground_after = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-ground-after",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let ground_after = assert_tool_success(&ground_after, json!("tool-refresh-ground-after"));
+    let node_count_after = ground_after
+        .pointer("/stats/node_count")
+        .and_then(Value::as_u64)
+        .expect("ground after mutation node count");
+    assert!(
+        node_count_after > node_count_before,
+        "ground should serve refreshed graph stats after mutation; before={node_count_before}, after={node_count_after}, snapshot={ground_after}"
+    );
+
+    let symbol_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-symbol",
+            "method": "tools/call",
+            "params": {
+                "name": "symbol",
+                "arguments": {"query": "stdio_tool_added_after_mutation"}
+            }
+        }),
+    );
+    let symbol = assert_tool_success(&symbol_response, json!("tool-refresh-symbol"));
+    let node_id = symbol
+        .pointer("/node/id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            symbol
+                .pointer("/resolution/resolved/node_id")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_else(|| panic!("symbol should resolve the post-mutation function: {symbol}"))
+        .to_string();
+
+    for (tool, id) in [
+        ("snippet", "tool-refresh-snippet"),
+        ("trail", "tool-refresh-trail"),
+        ("trace", "tool-refresh-trace"),
+    ] {
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": {"id": node_id, "depth": 1, "max_nodes": 20}
+                }
+            }),
+        );
+        let result = assert_tool_success(&response, json!(id));
+        assert!(
+            result
+                .to_string()
+                .contains("stdio_tool_added_after_mutation"),
+            "{tool} should serve refreshed graph evidence for the post-mutation symbol: {result}"
+        );
+    }
+
+    let affected_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-affected",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "changed_paths": ["src/live_tool_added.rs"],
+                    "change_records": [
+                        {
+                            "path": "src/live_tool_added.rs",
+                            "kind": "added",
+                            "status": "A"
+                        }
+                    ]
+                }
+            }
+        }),
+    );
+    let affected = assert_tool_success(&affected_response, json!("tool-refresh-affected"));
+    assert_eq!(
+        affected["matched_file_count"],
+        json!(1),
+        "affected should use the refreshed local graph for the added file: {affected}"
+    );
+
+    let search_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "tool-refresh-search-still-blocked",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": "stdio_tool_added_after_mutation"}
+            }
+        }),
+    );
+    let search_error =
+        assert_tool_error(&search_response, json!("tool-refresh-search-still-blocked"));
+    assert_eq!(
+        search_error.pointer("/code").and_then(Value::as_str),
+        Some("codestory_tool_blocked"),
+        "packet/search readiness should remain separately gated after local graph refresh: {search_response}"
+    );
 }
 
 #[test]
