@@ -521,41 +521,6 @@ fn freshness_count(value: &Value, aliases: &[&str]) -> Option<u64> {
         .find_map(|alias| value.get(*alias).and_then(Value::as_u64))
 }
 
-fn assert_stale_freshness_counts(value: &Value, context: &str) {
-    let freshness = find_index_freshness(value)
-        .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &["changed_file_count", "changed_count", "changed"]
-        ),
-        Some(1),
-        "{context} freshness should report one changed file: {freshness:#}"
-    );
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &["new_file_count", "new_count", "new", "added_count", "added"]
-        ),
-        Some(1),
-        "{context} freshness should report one new file: {freshness:#}"
-    );
-    assert_eq!(
-        freshness_count(
-            freshness,
-            &[
-                "removed_file_count",
-                "removed_count",
-                "removed",
-                "deleted_count",
-                "deleted"
-            ]
-        ),
-        Some(1),
-        "{context} freshness should report one removed file: {freshness:#}"
-    );
-}
-
 fn assert_fresh_freshness_counts(value: &Value, context: &str) {
     let freshness = find_index_freshness(value)
         .unwrap_or_else(|| panic!("{context} should include an index freshness signal: {value:#}"));
@@ -2437,7 +2402,7 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
 }
 
 #[test]
-fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
+fn resources_read_status_waits_fresh_with_bounded_latency() {
     let fixture = indexed_fixture();
     thread::sleep(Duration::from_millis(25));
     fs::write(
@@ -2490,48 +2455,47 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
         last_status = json_resource_content(result, "codestory://status");
     }
 
-    assert_stale_freshness_counts(&last_status, "codestory://status");
+    assert_fresh_freshness_counts(&last_status, "codestory://status");
     assert_eq!(
         last_status["local_refresh"]["state"],
-        json!("stale"),
-        "stale local graph state should be compactly exposed: {last_status}"
+        json!("fresh"),
+        "status should report the post-refresh local graph state: {last_status}"
     );
     assert_eq!(
         last_status["local_refresh"]["blocks_local_surfaces"],
-        json!(true),
-        "stale local graph state should block only local graph surfaces: {last_status}"
+        json!(false),
+        "fresh local graph state should allow local graph surfaces: {last_status}"
     );
     assert_eq!(
         last_status["allowed_surfaces"]["ground"]["allowed"],
-        json!(false),
-        "stale local graph should block local graph surfaces: {last_status}"
+        json!(true),
+        "fresh local graph should allow local graph surfaces: {last_status}"
     );
     assert_eq!(
         last_status["allowed_surfaces"]["packet"]["status"],
         json!("repair_retrieval"),
-        "packet/search should stay gated by the agent retrieval lane while local graph is stale: {last_status}"
+        "packet/search should stay gated by the agent retrieval lane after local refresh: {last_status}"
     );
     let status_next_call_text = last_status["recommended_next_calls"].to_string();
     assert!(
         !status_next_call_text.contains("\"tool\":\"packet\"")
             && !status_next_call_text.contains("\"tool\":\"search\""),
-        "stale index readiness should recommend repair, not packet/search calls: {last_status}"
+        "missing retrieval readiness should recommend repair, not packet/search calls: {last_status}"
     );
     assert!(
-        status_next_call_text.contains("codestory-cli ready --goal local --repair")
-            && status_next_call_text.contains("codestory://status"),
-        "stale index readiness should recommend index repair and a status recheck: {last_status}"
+        !status_next_call_text.contains("codestory-cli ready --goal local --repair"),
+        "fresh local readiness should not ask the agent for manual local repair: {last_status}"
     );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];
     let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
     assert!(
-        median < Duration::from_millis(250),
-        "warm status freshness check median should stay under 250ms for a small repo, got median={median:?}, p95={p95:?}"
+        median < Duration::from_millis(750),
+        "warm status freshness check median should stay under 750ms for a small repo, got median={median:?}, p95={p95:?}"
     );
     assert!(
-        p95 < Duration::from_secs(1),
-        "warm status freshness check p95 should stay under 1s for a small repo, got median={median:?}, p95={p95:?}"
+        p95 < Duration::from_secs(2),
+        "warm status freshness check p95 should stay under 2s for a small repo, got median={median:?}, p95={p95:?}"
     );
 
     let mut index_command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
@@ -2568,6 +2532,73 @@ fn resources_read_status_reports_stale_index_freshness_with_bounded_latency() {
     let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
     let refreshed_status = json_resource_content(result, "codestory://status");
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after reindex");
+}
+
+#[test]
+fn resources_read_status_waits_fresh_after_live_source_mutation() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let initial = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-before-live-mutation",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&initial, json!("status-before-live-mutation"));
+    let initial_status = json_resource_content(result, "codestory://status");
+    assert_fresh_freshness_counts(&initial_status, "initial codestory://status");
+    assert_eq!(
+        initial_status["local_refresh"]["reason"],
+        json!("already_fresh"),
+        "initial status should prove the runtime started from a fresh cache: {initial_status}"
+    );
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("live:{project_name}")
+}
+"#,
+    )
+    .expect("modify indexed file while stdio server is running");
+
+    let after_mutation = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-after-live-mutation",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&after_mutation, json!("status-after-live-mutation"));
+    let status = json_resource_content(result, "codestory://status");
+    assert_fresh_freshness_counts(&status, "codestory://status after live mutation");
+    assert_eq!(
+        status["local_refresh"]["state"],
+        json!("fresh"),
+        "live source mutation should be repaired or reported, not hidden by the status cache: {status}"
+    );
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("refreshed"),
+        "live source mutation should trigger the bounded local wait-fresh path: {status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["ground"]["allowed"],
+        json!(true),
+        "fresh local graph after live mutation should keep local surfaces available: {status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["packet"]["status"],
+        json!("repair_retrieval"),
+        "local wait-fresh must stay separate from packet/search sidecar readiness: {status}"
+    );
 }
 
 #[test]

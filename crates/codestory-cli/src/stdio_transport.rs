@@ -12,8 +12,8 @@ use codestory_contracts::api::{
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
     IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
     NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto,
-    ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode, SearchRequest,
-    TrailCallerScope, TrailDirection, TrailMode,
+    ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode,
+    SearchRequest, TrailCallerScope, TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
 use sha2::{Digest, Sha256};
@@ -42,7 +42,6 @@ use crate::{
 use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
-const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 const STDIO_CLI_VERSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -157,14 +156,13 @@ fn write_stdio_response<W: Write>(stdout: &mut W, response: &serde_json::Value) 
 struct StdioServerState {
     packet_cache: StdioPacketCache,
     search_cache: StdioSearchFragmentCache,
-    status_cache: Option<StdioStatusCacheEntry>,
+    local_refresh_attempt: Option<StdioLocalRefreshAttempt>,
 }
 
 #[derive(Clone)]
-struct StdioStatusCacheEntry {
-    key: String,
-    value: serde_json::Value,
-    cached_at: Instant,
+struct StdioLocalRefreshAttempt {
+    signature: String,
+    output: crate::readiness::LocalRefreshOutput,
 }
 
 fn handle_stdio_message(
@@ -351,7 +349,7 @@ fn stdio_tool_blocked_error(
     state: &mut StdioServerState,
     name: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let status = read_stdio_status_resource_cached(runtime, state)?;
+    let status = read_stdio_status_resource_fresh(runtime, state)?;
     let Some(surface) = status.pointer(&format!("/allowed_surfaces/{name}")) else {
         return Ok(None);
     };
@@ -1997,7 +1995,7 @@ fn read_stdio_resource(
     uri: &str,
 ) -> serde_json::Value {
     let result = match uri {
-        "codestory://status" => read_stdio_status_resource_cached(runtime, state),
+        "codestory://status" => read_stdio_status_resource_fresh(runtime, state),
         "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource()),
         "codestory://project" => runtime
             .open_project_summary()
@@ -2021,51 +2019,80 @@ fn read_stdio_resource(
         .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
 }
 
-fn read_stdio_status_resource_cached(
+fn read_stdio_status_resource_fresh(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
 ) -> Result<serde_json::Value> {
-    let key = stdio_status_cache_key(runtime);
-    if let Some(cached) = state.status_cache.as_ref()
-        && cached.key == key
-        && cached.cached_at.elapsed() < STDIO_STATUS_CACHE_TTL
-    {
-        return Ok(cached.value.clone());
-    }
+    let project = args::ProjectArgs {
+        project: runtime.project_root.clone(),
+        cache_dir: Some(runtime.cache_root.clone()),
+    };
+    let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
+    let summary = inspect_runtime.open_project_summary()?;
+    let signature = stdio_local_freshness_signature(&summary);
 
-    let value = read_stdio_status_resource(runtime)?;
-    // ponytail: short stdio snapshot cache; storage/sidecar fingerprints bust it when runtime state changes.
-    state.status_cache = Some(StdioStatusCacheEntry {
-        key,
-        value: value.clone(),
-        cached_at: Instant::now(),
-    });
-    Ok(value)
+    let (summary, local_refresh) = if crate::local_freshness_needs_refresh(&summary) {
+        if let Some(signature) = signature.as_ref()
+            && let Some(attempt) = state.local_refresh_attempt.as_ref()
+            && attempt.signature == *signature
+        {
+            (summary, Some(attempt.output.clone()))
+        } else {
+            let (summary, output) = crate::wait_for_local_freshness(&project, &inspect_runtime)?;
+            if let (Some(signature), Some(output)) = (signature, output.as_ref()) {
+                state.local_refresh_attempt = Some(StdioLocalRefreshAttempt {
+                    signature,
+                    output: output.clone(),
+                });
+            }
+            (summary, output)
+        }
+    } else {
+        let mut output = crate::local_refresh_output_from_summary(&summary);
+        if output.state == crate::readiness::LocalRefreshState::Fresh {
+            output.reason = Some("already_fresh".to_string());
+        }
+        (summary, Some(output))
+    };
+
+    read_stdio_status_resource(runtime, summary, local_refresh)
 }
 
-fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
-    let layout = SidecarLayout::from_env_for_project(&runtime.project_root);
-    [
-        format!("project:{}", runtime.project_root.display()),
-        format!("storage:{}", runtime.storage_path.display()),
-        format!(
-            "storage_state:{}",
-            stdio_storage_fingerprint(&runtime.storage_path)
-        ),
-        format!(
-            "sidecar_state:{}",
-            stdio_path_fingerprint(&layout.state_file)
-        ),
-        format!(
-            "active_embedding_backend:{}",
-            codestory_retrieval::embedding_runtime_id()
-        ),
-    ]
-    .join("|")
+fn stdio_local_freshness_signature(summary: &ProjectSummary) -> Option<String> {
+    let freshness = summary.freshness.as_ref()?;
+    let root = Path::new(&summary.root);
+    let samples = freshness
+        .samples
+        .iter()
+        .map(|sample| {
+            let path = root.join(&sample.path);
+            format!(
+                "{:?}:{}:{}",
+                sample.kind,
+                sample.path,
+                stdio_path_fingerprint(&path)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!(
+        "status:{:?}|changed:{}|new:{}|removed:{}|checked:{}|indexed:{}|fatal:{}|samples:{}",
+        freshness.status,
+        freshness.changed_file_count,
+        freshness.new_file_count,
+        freshness.removed_file_count,
+        freshness.checked_file_count,
+        freshness.indexed_file_count,
+        summary.stats.fatal_error_count,
+        samples
+    ))
 }
 
-fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Value> {
-    let summary = runtime.open_project_summary()?;
+fn read_stdio_status_resource(
+    runtime: &RuntimeContext,
+    summary: ProjectSummary,
+    local_refresh: Option<crate::readiness::LocalRefreshOutput>,
+) -> Result<serde_json::Value> {
     let retrieval = summary.retrieval.as_ref();
     let sidecar_runtime = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
     let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash, ownership) =
@@ -2165,7 +2192,7 @@ fn read_stdio_status_resource(runtime: &RuntimeContext) -> Result<serde_json::Va
             "diagnostic_only": true
         },
         "index_freshness": summary.freshness,
-        "local_refresh": crate::readiness::local_refresh_output(local),
+        "local_refresh": local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(local)),
         "readiness": readiness,
         "readiness_lanes": readiness_lanes,
         "allowed_surfaces": allowed_surfaces,

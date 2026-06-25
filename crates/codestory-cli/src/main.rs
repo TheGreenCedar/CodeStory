@@ -2026,7 +2026,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn wait_for_local_freshness(
+pub(crate) fn wait_for_local_freshness(
     project: &ProjectArgs,
     inspect_runtime: &RuntimeContext,
 ) -> Result<(ProjectSummary, Option<readiness::LocalRefreshOutput>)> {
@@ -2063,7 +2063,7 @@ fn wait_for_local_freshness(
     }
 }
 
-fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
+pub(crate) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
     summary.freshness.as_ref().is_some_and(|freshness| {
         matches!(
             freshness.status,
@@ -2072,7 +2072,9 @@ fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
     })
 }
 
-fn local_refresh_output_from_summary(summary: &ProjectSummary) -> readiness::LocalRefreshOutput {
+pub(crate) fn local_refresh_output_from_summary(
+    summary: &ProjectSummary,
+) -> readiness::LocalRefreshOutput {
     let verdict = readiness::build_readiness_verdict(
         ReadinessGoalDto::LocalNavigation,
         readiness::ReadinessInputs {
