@@ -3893,6 +3893,7 @@ mod tests {
                 degraded_reason: None,
                 embedding_device_policy: "accelerator_required".to_string(),
                 embedding_device_state: "accelerated".to_string(),
+                embedding_device_observation_source: "manual_env".to_string(),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,

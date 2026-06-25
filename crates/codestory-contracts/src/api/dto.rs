@@ -359,6 +359,8 @@ pub struct ReadinessSidecarSnapshotDto {
     pub embedding_device_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_device_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device_observation_source: Option<String>,
     #[serde(default)]
     pub embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

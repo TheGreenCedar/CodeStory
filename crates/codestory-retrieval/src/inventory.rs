@@ -861,6 +861,7 @@ mod tests {
             embed_url: "http://127.0.0.1:21004/v1/embeddings".to_string(),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
+            embedding_device_observation_source: "sidecar_unobserved".to_string(),
             embedding_detected_provider: None,
             embedding_detected_gpu: None,
             embedding_accelerator_requested: false,
