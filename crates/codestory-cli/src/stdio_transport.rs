@@ -1272,6 +1272,9 @@ fn stdio_mandatory_sidecar_fingerprint(
         |report| StdioSidecarStatusFingerprint {
             retrieval_mode: report.retrieval_mode,
             degraded_reason: report.degraded_reason,
+            embedding_device_policy: report.embedding_device_policy,
+            embedding_device_state: report.embedding_device_state,
+            embedding_cpu_allowed: report.embedding_cpu_allowed,
             manifest: report.manifest,
         },
     );
@@ -1285,6 +1288,9 @@ fn stdio_mandatory_sidecar_fingerprint(
 struct StdioSidecarStatusFingerprint {
     retrieval_mode: String,
     degraded_reason: Option<String>,
+    embedding_device_policy: String,
+    embedding_device_state: String,
+    embedding_cpu_allowed: bool,
     manifest: Option<codestory_retrieval::RetrievalIndexManifest>,
 }
 
@@ -1307,6 +1313,18 @@ fn stdio_mandatory_sidecar_fingerprint_from_status(
             parts.push(format!(
                 "degraded_reason:{}",
                 report.degraded_reason.unwrap_or_default()
+            ));
+            parts.push(format!(
+                "embedding_device_policy:{}",
+                report.embedding_device_policy
+            ));
+            parts.push(format!(
+                "embedding_device_state:{}",
+                report.embedding_device_state
+            ));
+            parts.push(format!(
+                "embedding_cpu_allowed:{}",
+                report.embedding_cpu_allowed
             ));
             if let Some(manifest) = report.manifest {
                 parts.push(format!(
@@ -2415,40 +2433,57 @@ fn read_stdio_status_resource(
 ) -> Result<serde_json::Value> {
     let retrieval = summary.retrieval.as_ref();
     let sidecar_runtime = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
-    let (sidecar_mode, degraded_reason, manifest_generation, manifest_input_hash, ownership) =
-        match codestory_retrieval::strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            sidecar_runtime.clone(),
-        ) {
-            Ok(report) => {
-                let manifest_generation = report
-                    .manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.sidecar_generation.clone());
-                let manifest_input_hash = report
-                    .manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.sidecar_input_hash.clone());
-                (
-                    report.retrieval_mode,
-                    report.degraded_reason,
-                    manifest_generation,
-                    manifest_input_hash,
-                    report.ownership,
-                )
-            }
-            Err(error) => (
-                "unavailable".to_string(),
-                Some(format!("sidecar_status_error: {error}")),
-                None,
-                None,
-                None,
-            ),
-        };
+    let (
+        sidecar_mode,
+        degraded_reason,
+        embedding_device_policy,
+        embedding_device_state,
+        embedding_cpu_allowed,
+        manifest_generation,
+        manifest_input_hash,
+        ownership,
+    ) = match codestory_retrieval::strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        sidecar_runtime.clone(),
+    ) {
+        Ok(report) => {
+            let manifest_generation = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_generation.clone());
+            let manifest_input_hash = report
+                .manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_input_hash.clone());
+            (
+                report.retrieval_mode,
+                report.degraded_reason,
+                report.embedding_device_policy,
+                report.embedding_device_state,
+                report.embedding_cpu_allowed,
+                manifest_generation,
+                manifest_input_hash,
+                report.ownership,
+            )
+        }
+        Err(error) => (
+            "unavailable".to_string(),
+            Some(format!("sidecar_status_error: {error}")),
+            "accelerator_required".to_string(),
+            "unknown".to_string(),
+            false,
+            None,
+            None,
+            None,
+        ),
+    };
     let sidecar = serde_json::json!({
         "retrieval_mode": sidecar_mode.clone(),
         "degraded_reason": degraded_reason.clone(),
+        "embedding_device_policy": embedding_device_policy.clone(),
+        "embedding_device_state": embedding_device_state.clone(),
+        "embedding_cpu_allowed": embedding_cpu_allowed,
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "manifest_generation": manifest_generation.clone(),
         "manifest_input_hash": manifest_input_hash.clone(),
@@ -2472,6 +2507,9 @@ fn read_stdio_status_resource(
             run_id: sidecar_runtime.run_id.as_deref(),
             retrieval_mode: &sidecar_mode,
             degraded_reason: degraded_reason.as_deref(),
+            embedding_device_policy: Some(&embedding_device_policy),
+            embedding_device_state: Some(&embedding_device_state),
+            embedding_cpu_allowed,
             manifest_generation: manifest_generation.as_deref(),
             manifest_input_hash: manifest_input_hash.as_deref(),
         }),
@@ -2522,6 +2560,9 @@ fn read_stdio_status_resource(
         "storage_exists": runtime.storage_path.exists(),
         "retrieval_mode": sidecar_mode,
         "degraded_reason": degraded_reason,
+        "embedding_device_policy": embedding_device_policy,
+        "embedding_device_state": embedding_device_state,
+        "embedding_cpu_allowed": embedding_cpu_allowed,
         "sidecar_retrieval": sidecar,
         "sidecar_setup": sidecar_setup,
         "dirty_marker": stdio_dirty_marker_json(&dirty_marker),
@@ -3763,6 +3804,9 @@ version = "0.11.20"
                     run_id: None,
                     retrieval_mode: "full",
                     degraded_reason: None,
+                    embedding_device_policy: Some("accelerator_required"),
+                    embedding_device_state: Some("accelerated"),
+                    embedding_cpu_allowed: false,
                     manifest_generation: Some("generation"),
                     manifest_input_hash: Some("hash"),
                 }),
@@ -4072,6 +4116,9 @@ version = "0.11.20"
             Ok(StdioSidecarStatusFingerprint {
                 retrieval_mode: "full".into(),
                 degraded_reason: None,
+                embedding_device_policy: "accelerator_required".into(),
+                embedding_device_state: "accelerated".into(),
+                embedding_cpu_allowed: false,
                 manifest: Some(manifest.clone()),
             }),
         );
@@ -4098,6 +4145,9 @@ version = "0.11.20"
                     "sidecar_manifest_stale: indexable_file_added_or_changed_after_sidecar_manifest: src/new_module.rs"
                         .into(),
                 ),
+                embedding_device_policy: "accelerator_required".into(),
+                embedding_device_state: "accelerated".into(),
+                embedding_cpu_allowed: false,
                 manifest: Some(manifest),
             }),
         );

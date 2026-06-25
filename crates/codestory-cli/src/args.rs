@@ -1561,6 +1561,12 @@ pub(crate) struct AgentPreflightLaneOutput {
     pub(crate) status: ReadinessStatusDto,
     pub(crate) failed_layer: Option<&'static str>,
     pub(crate) summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_device_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_device_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_cpu_allowed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2379,6 +2385,9 @@ pub(crate) struct DoctorSidecarStatusOutput {
     pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
+    pub(crate) embedding_device_policy: String,
+    pub(crate) embedding_device_state: String,
+    pub(crate) embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

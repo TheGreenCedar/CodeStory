@@ -356,6 +356,12 @@ pub struct ReadinessSidecarSnapshotDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device_state: Option<String>,
+    #[serde(default)]
+    pub embedding_cpu_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_input_hash: Option<String>,

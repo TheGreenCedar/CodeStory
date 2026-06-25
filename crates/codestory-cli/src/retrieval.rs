@@ -161,6 +161,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     );
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
+    ensure_retrieval_index_embedding_policy()?;
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
     let outcome =
         finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {
@@ -176,6 +177,11 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
         })?;
     ensure_local_profile_handoff(&runtime, &sidecar, &outcome)?;
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
+}
+
+fn ensure_retrieval_index_embedding_policy() -> Result<()> {
+    codestory_retrieval::ensure_product_embedding_backend()
+        .context("retrieval index embedding device policy")
 }
 
 fn activate_retrieval_profile_env(
@@ -461,7 +467,7 @@ fn emit_retrieval_bootstrap(
         })
         .unwrap_or_default();
     let markdown = format!(
-        "# Retrieval bootstrap\n\n- compose_started: {}\n- zoekt_reachable: {} ({})\n- qdrant_reachable: {} ({})\n- embed_reachable: {} ({})\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
+        "# Retrieval bootstrap\n\n- compose_started: {}\n- zoekt_reachable: {} ({})\n- qdrant_reachable: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
         payload.compose_started,
         payload.zoekt_reachable,
         payload.zoekt_detail,
@@ -469,6 +475,9 @@ fn emit_retrieval_bootstrap(
         payload.qdrant_detail,
         payload.embed_reachable,
         payload.embed_detail,
+        report.infrastructure.embedding_device_policy,
+        report.infrastructure.embedding_device_state,
+        report.infrastructure.embedding_cpu_allowed,
         payload.project_status.retrieval_mode,
         repair.protected_collections,
         repair.pruned_collections,
@@ -542,10 +551,13 @@ fn emit_retrieval_status(
         })
         .unwrap_or_default();
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
+        report.embedding_device_policy,
+        report.embedding_device_state,
+        report.embedding_cpu_allowed,
         manifest_vector_backend,
         report.manifest_vector_embedding_dim,
         stored_doc_backend,
@@ -673,6 +685,10 @@ fn emit_retrieval_gc(
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn auto_refresh_retries_full_for_semantic_doc_contract_drift() {
@@ -705,6 +721,29 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_index_embedding_policy_blocks_unknown_device_before_refresh() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_DEVICE_STATE");
+
+        let error = ensure_retrieval_index_embedding_policy()
+            .expect_err("unknown embedding device must block retrieval index refresh");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("retrieval index embedding device policy"),
+            "error should preserve direct retrieval-index context: {error:#}"
+        );
+        assert!(
+            message.contains("embedding_device_unverified"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn local_profile_handoff_reports_default_namespace_path_mismatch() {
         let project = tempfile::TempDir::new().expect("project");
         let local =
@@ -723,5 +762,40 @@ mod tests {
         assert!(message.contains("namespace=codestory-agent"));
         assert!(message.contains("zoekt="));
         assert!(sidecar_runtime_mismatch(&local, &local).is_none());
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = self.old.as_ref() {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }

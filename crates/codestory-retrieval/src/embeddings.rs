@@ -30,6 +30,9 @@ const DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX";
 const LLAMACPP_BATCH_SIZE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_BATCH_SIZE";
 const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 const ALLOW_REMOTE_EMBEDDINGS_ENV: &str = "CODESTORY_ALLOW_REMOTE_EMBEDDINGS";
+const DEVICE_POLICY_ENV: &str = "CODESTORY_EMBED_DEVICE_POLICY";
+const DEVICE_STATE_ENV: &str = "CODESTORY_EMBED_DEVICE_STATE";
+const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +43,15 @@ const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 6;
 pub struct EmbeddingRuntimeProbe {
     pub reachable: bool,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingDeviceReadiness {
+    pub requested_policy: &'static str,
+    pub observed_state: &'static str,
+    pub cpu_allowed: bool,
+    pub full_retrieval_allowed: bool,
+    pub degraded_reason: Option<String>,
 }
 
 /// Stable id stored on retrieval manifest rows (backend + model family).
@@ -66,7 +78,68 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
             "llama.cpp embedding sidecar is mandatory; set CODESTORY_EMBED_BACKEND=llamacpp and CODESTORY_EMBED_LLAMACPP_URL"
         );
     }
+    let device = embedding_device_readiness();
+    if !device.full_retrieval_allowed {
+        bail!("{}", device.degraded_reason.expect("device policy reason"));
+    }
     Ok(())
+}
+
+pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
+    let cpu_allowed = explicit_cpu_allowed();
+    let observed_state = observed_embedding_device_state();
+    let accelerated = observed_state == "accelerated";
+    let full_retrieval_allowed = accelerated || cpu_allowed;
+    let requested_policy = if cpu_allowed {
+        "cpu_allowed"
+    } else {
+        "accelerator_required"
+    };
+    let degraded_reason = (!full_retrieval_allowed).then(|| {
+        format!("embedding_device_unverified: requested_policy={requested_policy} observed_device={observed_state}; set {ALLOW_CPU_ENV}=1 or {DEVICE_POLICY_ENV}=allow_cpu for intentional CPU-backed retrieval")
+    });
+
+    EmbeddingDeviceReadiness {
+        requested_policy,
+        observed_state,
+        cpu_allowed,
+        full_retrieval_allowed,
+        degraded_reason,
+    }
+}
+
+fn explicit_cpu_allowed() -> bool {
+    env_truthy(ALLOW_CPU_ENV)
+        || std::env::var(DEVICE_POLICY_ENV)
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "allow_cpu" | "cpu_allowed" | "cpu"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn observed_embedding_device_state() -> &'static str {
+    match std::env::var(DEVICE_STATE_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("accelerated" | "gpu" | "vulkan" | "cuda" | "metal") => "accelerated",
+        Some("cpu") => "cpu",
+        _ => "unknown",
+    }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 pub fn embed_query(text: &str) -> Result<Vec<f32>> {
@@ -454,6 +527,73 @@ mod tests {
                 .contains("llama.cpp embedding sidecar is mandatory"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn default_embedding_device_policy_blocks_unknown_device() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert!(!readiness.full_retrieval_allowed);
+        assert!(
+            readiness
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("embedding_device_unverified")
+        );
+    }
+
+    #[test]
+    fn explicit_cpu_opt_in_allows_cpu_backed_retrieval() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "cpu");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "cpu_allowed");
+        assert_eq!(readiness.observed_state, "cpu");
+        assert!(readiness.cpu_allowed);
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn product_embedding_backend_requires_device_policy() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+
+        let error = ensure_product_embedding_backend()
+            .expect_err("unknown device should not satisfy product readiness");
+
+        assert!(
+            error.to_string().contains("embedding_device_unverified"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn product_embedding_backend_allows_explicit_cpu_policy() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::set(DEVICE_POLICY_ENV, "allow_cpu");
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "cpu");
+
+        ensure_product_embedding_backend().expect("explicit CPU policy should be accepted");
     }
 
     #[test]

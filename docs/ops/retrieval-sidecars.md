@@ -118,9 +118,17 @@ defaults do not match your machine:
 | `CODESTORY_EMBED_MODEL_DIR` | Host path containing `bge-base-en-v1.5.Q8_0.gguf` for the compose embed service |
 | `CODESTORY_EMBED_BACKEND` | `llamacpp`; unset also means product llama.cpp mode for retrieval commands |
 | `CODESTORY_EMBED_LLAMACPP_URL` | Local embedding endpoint, default `http://127.0.0.1:8080/v1/embeddings` |
+| `CODESTORY_EMBED_DEVICE_STATE` | Optional operator assertion for observed device state: `accelerated`, `cpu`, or unset/unknown |
+| `CODESTORY_EMBED_ALLOW_CPU` | Set to `1` only when intentional CPU-backed retrieval is acceptable on this machine |
+| `CODESTORY_EMBED_DEVICE_POLICY` | Optional policy alias; set `allow_cpu` instead of `CODESTORY_EMBED_ALLOW_CPU=1` when CPU mode is intentional |
 | `CODESTORY_ZOEKT_PORT` | Override Zoekt HTTP port when `6070` is unavailable |
 | `CODESTORY_QDRANT_HTTP_PORT` | Override Qdrant HTTP port when `6333` is unavailable |
 | `CODESTORY_QDRANT_GRPC_PORT` | Override Qdrant gRPC port when `6334` is unavailable |
+
+If device state is unknown, full packet/search readiness fails closed by
+default. Use the CPU opt-in only as an explicit operator decision; otherwise
+configure/verify accelerated llama.cpp execution and set
+`CODESTORY_EMBED_DEVICE_STATE=accelerated`.
 
 Keep endpoint and cache-root settings out of project `.codestory.toml` files.
 Use trusted user config, explicit CLI flags, or environment variables for those
