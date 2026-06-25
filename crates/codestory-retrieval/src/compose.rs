@@ -300,7 +300,7 @@ fn docker_compose_up_failure_message(
 ) -> String {
     if docker_address_pool_exhausted(stdout) || docker_address_pool_exhausted(stderr) {
         let project = repo_root
-            .map(|path| path.display().to_string())
+            .map(|path| quoted_project_arg(&path.display().to_string()))
             .unwrap_or_else(|| "<repo>".to_string());
         return format!(
             "docker compose up failed (exit {exit_code:?}): reason={DOCKER_ADDRESS_POOL_EXHAUSTED_REASON}\n\
@@ -312,6 +312,10 @@ Raw docker compose output:\n{stdout}{stderr}"
     }
 
     format!("docker compose up failed (exit {exit_code:?}):\n{stdout}{stderr}")
+}
+
+fn quoted_project_arg(project: &str) -> String {
+    format!("\"{}\"", project.replace('"', "\\\""))
 }
 
 fn docker_address_pool_exhausted(details: &str) -> bool {
@@ -571,22 +575,22 @@ mod tests {
 
     #[test]
     fn compose_failure_classifies_docker_address_pool_exhaustion() {
-        let project = Path::new("C:/repo/example");
+        let project = Path::new("C:/repo/example project");
+        let stdout = "compose stdout\n";
         let stderr =
             "failed to create network: all predefined address pools have been fully subnetted";
 
-        let message = docker_compose_up_failure_message(Some(1), "", stderr, Some(project));
+        let message = docker_compose_up_failure_message(Some(1), stdout, stderr, Some(project));
 
         assert!(message.contains("reason=docker_address_pool_exhausted"));
+        assert!(message.contains(stdout));
         assert!(message.contains(stderr));
         assert!(message.contains(
-            "codestory-cli sidecar inventory --project C:/repo/example --format markdown"
+            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format markdown"
         ));
-        assert!(
-            message.contains(
-                "codestory-cli sidecar inventory --project C:/repo/example --format json"
-            )
-        );
+        assert!(message.contains(
+            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format json"
+        ));
         for forbidden in [" prune", " remove", " down", " delete", " restart"] {
             assert!(
                 !message.to_ascii_lowercase().contains(forbidden),
