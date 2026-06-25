@@ -2148,10 +2148,39 @@ fn repair_ready_state(
     goal: Option<args::ReadyGoal>,
     run_id: Option<&str>,
 ) -> Result<Option<codestory_retrieval::SidecarRuntimeConfig>> {
+    let agent_goal = matches!(goal, None | Some(args::ReadyGoal::Agent));
+    let sidecar = agent_goal.then(|| {
+        codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            &runtime.project_root,
+            codestory_retrieval::SidecarProfile::Agent,
+            run_id,
+        )
+    });
+
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
-    if !matches!(goal, None | Some(args::ReadyGoal::Agent)) {
+    if !agent_goal {
         return Ok(None);
+    }
+    if let Some(sidecar) = sidecar.as_ref() {
+        if let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+            sidecar.clone(),
+        ) {
+            if ready_repair_existing_sidecar_is_reusable(&existing_status) {
+                eprintln!(
+                    "ready repair agent sidecar already full: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
+                    sidecar.run_id.as_deref().unwrap_or("none"),
+                    sidecar.namespace,
+                    sidecar.compose_project,
+                    existing_status.embedding_device_state,
+                    existing_status.embedding_device_observation_source,
+                    existing_status.embedding_cpu_allowed
+                );
+                return Ok(Some(sidecar.clone()));
+            }
+        }
     }
 
     let storage_scope = codestory_retrieval::BootstrapStorageScope::from_parts(
@@ -2159,11 +2188,7 @@ fn repair_ready_state(
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
-        codestory_retrieval::SidecarProfile::Agent,
-        run_id,
-    );
+    let sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
     eprintln!(
         "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
         sidecar.run_id.as_deref().unwrap_or("none"),
@@ -2319,6 +2344,15 @@ fn ensure_ready_repair_full_sidecar(
         ready_repair_component_detail(&report.qdrant),
         ready_repair_component_detail(&report.scip)
     )
+}
+
+fn ready_repair_existing_sidecar_is_reusable(
+    report: &codestory_retrieval::RetrievalStatusReport,
+) -> bool {
+    ensure_ready_repair_full_sidecar(report).is_ok()
+        && report.embedding_device_policy == "accelerator_required"
+        && report.embedding_device_state == "accelerated"
+        && !report.embedding_cpu_allowed
 }
 
 fn ready_repair_component_detail(component: &codestory_retrieval::ComponentHealth) -> String {
@@ -12320,6 +12354,21 @@ mod tests {
         let report = ready_repair_test_report("full", None);
 
         ensure_ready_repair_full_sidecar(&report).expect("full mode should pass");
+    }
+
+    #[test]
+    fn ready_repair_reuses_only_accelerated_cpu_disabled_sidecar() {
+        let full_accelerated = ready_repair_test_report("full", None);
+        assert!(ready_repair_existing_sidecar_is_reusable(&full_accelerated));
+
+        let mut cpu_full = ready_repair_test_report("full", None);
+        cpu_full.embedding_device_state = "cpu".into();
+        cpu_full.embedding_cpu_allowed = true;
+        assert!(!ready_repair_existing_sidecar_is_reusable(&cpu_full));
+
+        let mut unknown_full = ready_repair_test_report("full", None);
+        unknown_full.embedding_device_state = "unknown".into();
+        assert!(!ready_repair_existing_sidecar_is_reusable(&unknown_full));
     }
 
     #[test]

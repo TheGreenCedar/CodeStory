@@ -14,7 +14,7 @@ use codestory_retrieval::{
     CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
     QueryTrace, SidecarProfile, execute_retrieval_query_with_cache,
     execute_strict_retrieval_query_batch_with_cache, is_phantom_sidecar_hit,
-    sidecar_project_id_for_root, sidecar_runtime_auto, strict_sidecar_status,
+    sidecar_project_id_for_root, sidecar_runtime_auto, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
 use std::collections::{BTreeMap, HashMap};
@@ -265,7 +265,8 @@ struct SidecarModeStatus {
 }
 
 fn sidecar_mode_status_for_project(project_root: &Path, storage_path: &Path) -> SidecarModeStatus {
-    match strict_sidecar_status(project_root, Some(storage_path)) {
+    let runtime = sidecar_runtime_auto(project_root);
+    match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime) {
         Ok(report) => SidecarModeStatus {
             profile: report
                 .ownership
