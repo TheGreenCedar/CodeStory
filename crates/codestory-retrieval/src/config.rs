@@ -59,10 +59,20 @@ impl SidecarProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EmbeddingServerLaunchMode {
     DockerComposeEmbed,
     NativeSpawned,
+}
+
+impl EmbeddingServerLaunchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DockerComposeEmbed => "docker_compose_embed",
+            Self::NativeSpawned => "native_spawned",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

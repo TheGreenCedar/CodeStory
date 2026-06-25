@@ -8,7 +8,7 @@ use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
     repair_qdrant_storage,
 };
-use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime};
+use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime_and_launch_metadata};
 use anyhow::{Context, Result, bail};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -44,6 +44,7 @@ pub struct BootstrapReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeEmbeddingServerLaunch {
     executable: PathBuf,
+    model_path: PathBuf,
     args: Vec<String>,
     log_path: PathBuf,
 }
@@ -119,7 +120,13 @@ pub fn bootstrap_sidecars_with_runtime(
         spawn_native_embedding_server(launch)?;
     }
 
-    let state = sidecar_up_with_runtime(runtime, resolved_compose.as_deref())?;
+    let state = sidecar_up_with_runtime_and_launch_metadata(
+        runtime,
+        resolved_compose.as_deref(),
+        native_embedding
+            .as_ref()
+            .map(|launch| embedding_launch_metadata(launch, runtime, repo_root)),
+    )?;
     if !wait_timeout.is_zero() {
         let _ = wait_for_infrastructure(&layout, wait_timeout)?;
     }
@@ -454,9 +461,50 @@ fn native_embedding_server_launch_from_paths(
     }
     NativeEmbeddingServerLaunch {
         executable,
+        model_path,
         args,
         log_path: crate::embeddings::native_embedding_log_path(runtime),
     }
+}
+
+fn embedding_launch_metadata(
+    native_launch: &NativeEmbeddingServerLaunch,
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+) -> crate::health::EmbeddingLaunchMetadata {
+    crate::health::EmbeddingLaunchMetadata {
+        provider: "llamacpp".to_string(),
+        launch_mode: EmbeddingServerLaunchMode::NativeSpawned
+            .as_str()
+            .to_string(),
+        endpoint: SidecarLayout::embed_base_url(runtime.embed_http_port),
+        executable_source: Some(native_llama_executable_source(
+            &native_launch.executable,
+            repo_root,
+        )),
+        executable_path: Some(native_launch.executable.display().to_string()),
+        model_path: Some(native_launch.model_path.display().to_string()),
+        requested_device: crate::embeddings::embedding_accelerator_request()
+            .map(|request| request.device),
+    }
+}
+
+fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> String {
+    if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
+        return "env:CODESTORY_EMBED_NATIVE_LLAMA_SERVER".to_string();
+    }
+    if path == user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
+        return "managed_cache".to_string();
+    }
+    if let Some(root) = repo_root {
+        if path == root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH) {
+            return "source_cache".to_string();
+        }
+        if path == root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
+            return "repo_managed_cache".to_string();
+        }
+    }
+    "resolved_path".to_string()
 }
 
 fn native_llama_server_path(repo_root: Option<&Path>) -> Result<PathBuf> {
@@ -900,6 +948,12 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
         );
+        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
+        assert_eq!(metadata.provider, "llamacpp");
+        assert_eq!(metadata.launch_mode, "native_spawned");
+        assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
+        assert_eq!(metadata.model_path, Some(model.display().to_string()));
+        assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));
     }
 
     #[test]

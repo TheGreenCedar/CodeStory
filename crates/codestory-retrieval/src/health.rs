@@ -70,6 +70,21 @@ pub struct RetrievalRepairHint {
     pub full_repair: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingLaunchMetadata {
+    pub provider: String,
+    pub launch_mode: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_device: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
@@ -104,6 +119,8 @@ pub struct RetrievalStatusReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     pub zoekt: ComponentHealth,
     pub qdrant: ComponentHealth,
     pub scip: ComponentHealth,
@@ -380,6 +397,7 @@ pub fn unavailable_status_report_with_embedding_device(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
+        embedding_launch: None,
         zoekt: unavailable_component("zoekt", &reason),
         qdrant: unavailable_component("qdrant", &reason),
         scip: unavailable_component("scip", &reason),
@@ -706,6 +724,7 @@ pub fn probe_sidecar_health_with_embedding_device(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
+        embedding_launch: None,
         zoekt,
         qdrant,
         scip,
@@ -962,6 +981,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
+            embedding_launch: None,
             zoekt: ComponentHealth {
                 name: "zoekt".into(),
                 status: ComponentStatus::Healthy,

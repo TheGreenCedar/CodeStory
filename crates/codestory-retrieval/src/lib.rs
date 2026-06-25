@@ -64,9 +64,9 @@ pub use embeddings::{
 pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellation_flag};
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
 pub use health::{
-    ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,
-    RetrievalManifestLaneProvenance, RetrievalRepairHint, RetrievalStatusReport,
-    probe_infrastructure_health, probe_sidecar_health,
+    ComponentHealth, ComponentStatus, EmbeddingLaunchMetadata, InfrastructureHealth,
+    RetrievalManifestContractReport, RetrievalManifestLaneProvenance, RetrievalRepairHint,
+    RetrievalStatusReport, probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
     FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, finalize_index_for_runtime,
