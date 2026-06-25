@@ -123,57 +123,6 @@ function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
-function recordSidecarRepair(state, patch = {}) {
-  const policy = readSidecarPolicy();
-  if (policy.state !== 'enabled') return;
-  writeSidecarPolicy('enabled', {
-    last_repair: {
-      ...(policy.lastRepair || {}),
-      ...patch,
-      state,
-      updated_at: new Date().toISOString(),
-    },
-  });
-}
-
-function scheduleSidecarRepair(resolved, policy) {
-  if (policy.state !== 'enabled') return;
-  const projectRoot = process.cwd();
-  const args = ['ready', '--goal', 'agent', '--repair', '--project', projectRoot, '--format', 'json'];
-  recordSidecarRepair('scheduled', {
-    project_root: projectRoot,
-    command: repairCommandForProject(projectRoot),
-    started_at: new Date().toISOString(),
-  });
-  try {
-    const repair = spawn(resolved.path, args, {
-      stdio: 'ignore',
-      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
-      windowsHide: true,
-      env: { ...process.env, CODESTORY_PLUGIN_SIDECAR_REPAIR: '1' },
-    });
-    repair.on('exit', (code, signal) => {
-      recordSidecarRepair(code === 0 ? 'completed' : 'failed', {
-        exit_code: code,
-        signal: signal || null,
-        finished_at: new Date().toISOString(),
-      });
-    });
-    repair.on('error', (error) => {
-      recordSidecarRepair('spawn_failed', {
-        error: error.message,
-        finished_at: new Date().toISOString(),
-      });
-    });
-    repair.unref();
-  } catch (error) {
-    recordSidecarRepair('spawn_failed', {
-      error: error.message,
-      finished_at: new Date().toISOString(),
-    });
-  }
-}
-
 function resolveManifest(manifestPath) {
   const manifest = readJson(manifestPath);
   if (!manifest) return null;
@@ -441,23 +390,22 @@ function failOpenReasonForProbe(resolved, probe) {
   return null;
 }
 
-function localRepairCommand(projectRoot = process.cwd()) {
-  return `codestory-cli ready --goal local --repair --project ${JSON.stringify(projectRoot)} --format json`;
+function localWaitFreshCommand(projectRoot = process.cwd()) {
+  return `codestory-cli ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
-function localRepairTimeoutMs() {
+function localWaitFreshTimeoutMs() {
   const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
 }
 
-function runLocalNavigationReady(resolved, projectRoot, repair) {
-  const args = ['ready', '--goal', 'local'];
-  if (repair) args.push('--repair');
+function runLocalNavigationWaitFresh(resolved, projectRoot) {
+  const args = ['ready', '--goal', 'local', '--wait-fresh'];
   args.push('--project', projectRoot, '--format', 'json');
   const result = spawnSync(resolved.path, args, {
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
-    timeout: repair ? localRepairTimeoutMs() : 10000,
+    timeout: localWaitFreshTimeoutMs(),
     windowsHide: true,
   });
   return { args, result };
@@ -491,16 +439,31 @@ function parseLocalReadyResult(result) {
     ok: Boolean(verdict && verdict.status === 'ready'),
     invalidJson: null,
     verdict,
+    localRefresh: parsed.local_refresh || null,
   };
 }
 
-function localNavigationFailure(projectRoot, reason, status, summary, setup, verdict = null) {
-  const repair = localRepairCommand(projectRoot);
+function localRefreshFailure(state, reason, readinessStatus = 'repair_setup') {
+  return {
+    state,
+    blocks_local_surfaces: true,
+    readiness_status: readinessStatus,
+    reason,
+    changed_file_count: 0,
+    new_file_count: 0,
+    removed_file_count: 0,
+    fatal_error_count: 0,
+  };
+}
+
+function localNavigationFailure(projectRoot, reason, status, summary, setup, verdict = null, localRefresh = null) {
+  const repair = localWaitFreshCommand(projectRoot);
   return {
     ready: false,
     reason,
     status,
     summary,
+    localRefresh,
     minimumNext: Array.isArray(verdict?.minimum_next) && verdict.minimum_next.length > 0
       ? verdict.minimum_next
       : [repair],
@@ -515,74 +478,50 @@ function localNavigationFailure(projectRoot, reason, status, summary, setup, ver
 }
 
 function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
-  const probe = runLocalNavigationReady(resolved, projectRoot, false);
+  const probe = runLocalNavigationWaitFresh(resolved, projectRoot);
   const setup = {
-    ...localReadySetup('ready_probe', probe.args, probe.result),
+    ...localReadySetup('local_wait_fresh', probe.args, probe.result),
   };
   if (probe.result.error || probe.result.status !== 0) {
+    const timeout = probe.result.error && probe.result.error.code === 'ETIMEDOUT';
     return localNavigationFailure(
       projectRoot,
-      'local_navigation_probe_failed',
+      timeout ? 'local_navigation_wait_fresh_timeout' : 'local_navigation_wait_fresh_failed',
       'repair_setup',
-      'CodeStory MCP could not verify local navigation readiness before starting stdio.',
+      timeout
+        ? 'CodeStory MCP timed out while refreshing local navigation before starting stdio.'
+        : 'CodeStory MCP could not refresh local navigation before starting stdio.',
       setup,
+      null,
+      localRefreshFailure('failed', timeout ? 'wait_fresh_timeout' : 'wait_fresh_failed'),
     );
   }
   const parsedProbe = parseLocalReadyResult(probe.result);
   if (parsedProbe.invalidJson) {
     return localNavigationFailure(
       projectRoot,
-      'local_navigation_probe_invalid_json',
+      'local_navigation_wait_fresh_invalid_json',
       'repair_setup',
-      `CodeStory MCP local readiness probe returned invalid JSON: ${parsedProbe.invalidJson}`,
+      `CodeStory MCP local wait-fresh returned invalid JSON: ${parsedProbe.invalidJson}`,
       setup,
+      null,
+      localRefreshFailure('failed', `invalid_json:${parsedProbe.invalidJson}`),
     );
   }
   if (parsedProbe.ok) {
-    return { ready: true, repaired: false };
+    return { ready: true };
   }
-
-  const repair = runLocalNavigationReady(resolved, projectRoot, true);
-  const repairSetup = {
-    ...setup,
-    ...localReadySetup('local_repair', repair.args, repair.result),
-  };
-  if (repair.result.error || repair.result.status !== 0) {
-    const timeout = repair.result.error && repair.result.error.code === 'ETIMEDOUT';
-    return localNavigationFailure(
-      projectRoot,
-      timeout ? 'local_navigation_repair_timeout' : 'local_navigation_repair_failed',
-      'repair_setup',
-      timeout
-        ? 'CodeStory MCP timed out while refreshing local navigation before starting stdio.'
-        : 'CodeStory MCP could not refresh local navigation before starting stdio.',
-      repairSetup,
-      parsedProbe.verdict || null,
-    );
-  }
-  const parsedRepair = parseLocalReadyResult(repair.result);
-  if (parsedRepair.invalidJson) {
-    return localNavigationFailure(
-      projectRoot,
-      'local_navigation_repair_invalid_json',
-      'repair_setup',
-      `CodeStory MCP local repair returned invalid JSON: ${parsedRepair.invalidJson}`,
-      repairSetup,
-      parsedProbe.verdict || null,
-    );
-  }
-  if (parsedRepair.ok) {
-    return { ready: true, repaired: true };
-  }
-  const verdict = parsedRepair.verdict || parsedProbe.verdict || null;
+  const verdict = parsedProbe.verdict || null;
   const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
+  const state = typeof parsedProbe.localRefresh?.state === 'string' ? parsedProbe.localRefresh.state : status;
   return localNavigationFailure(
     projectRoot,
-    `local_navigation_${status}`,
+    `local_navigation_wait_fresh_${state}`,
     status,
-    verdict?.summary || 'CodeStory local navigation is not ready after one bounded repair.',
-    repairSetup,
+    verdict?.summary || 'CodeStory local navigation is not ready after wait-fresh.',
+    setup,
     verdict,
+    parsedProbe.localRefresh || null,
   );
 }
 
@@ -622,6 +561,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     status: options.status || 'repair_setup',
     summary: options.summary || 'CodeStory plugin MCP could not start a compatible codestory-cli stdio runtime.',
     repair_reason: reason,
+    local_refresh: options.localRefresh || null,
     minimum_next: minimumNext,
     full_repair: fullRepair,
     setup: {
@@ -683,6 +623,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     project_root: projectRoot,
     retrieval_mode: 'unavailable',
     degraded_reason: reason,
+    local_refresh: options.localRefresh || null,
     readiness: [repair],
     allowed_surfaces: allowedSurfaces,
     recommended_next_calls: [
@@ -927,13 +868,10 @@ async function main() {
         ...localReadiness.fullRepair,
         'Restart/reload the Codex host/app after repairing the local CodeStory index, then read codestory://status in a fresh thread.',
       ],
+      localRefresh: localReadiness.localRefresh,
       setup: localReadiness.setup,
     }));
     return;
-  }
-  const sidecarPolicy = readSidecarPolicy();
-  if (!localReadiness.repaired) {
-    scheduleSidecarRepair(resolved, sidecarPolicy);
   }
   const sidecarStatus = readSidecarPolicy();
 
