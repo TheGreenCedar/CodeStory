@@ -1994,8 +1994,6 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         } else {
             RuntimeContext::new(&cmd.project)?
         }
-    } else if cmd.wait_fresh {
-        RuntimeContext::new(&cmd.project)?
     } else {
         RuntimeContext::new_inspect_only(&cmd.project)?
     };
@@ -2005,7 +2003,7 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         None
     };
     let (summary, local_refresh) = if cmd.wait_fresh && !cmd.repair {
-        wait_for_local_freshness(&runtime)?
+        wait_for_local_freshness(&cmd.project, &runtime)?
     } else {
         (runtime.open_project_summary()?, None)
     };
@@ -2029,9 +2027,10 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
 }
 
 fn wait_for_local_freshness(
-    runtime: &RuntimeContext,
+    project: &ProjectArgs,
+    inspect_runtime: &RuntimeContext,
 ) -> Result<(ProjectSummary, Option<readiness::LocalRefreshOutput>)> {
-    let summary = runtime.open_project_summary()?;
+    let summary = inspect_runtime.open_project_summary()?;
     if !local_freshness_needs_refresh(&summary) {
         let mut output = local_refresh_output_from_summary(&summary);
         if output.state == readiness::LocalRefreshState::Fresh {
@@ -2040,7 +2039,8 @@ fn wait_for_local_freshness(
         return Ok((summary, Some(output)));
     }
 
-    match runtime.ensure_open_from_summary(args::RefreshMode::Incremental, summary.clone()) {
+    let index_runtime = RuntimeContext::new(project)?;
+    match index_runtime.ensure_open(args::RefreshMode::Incremental) {
         Ok(opened) => {
             let mut output = local_refresh_output_from_summary(&opened.summary);
             if output.state == readiness::LocalRefreshState::Fresh {
