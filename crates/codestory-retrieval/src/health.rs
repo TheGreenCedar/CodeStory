@@ -459,6 +459,11 @@ fn zoekt_capabilities(
     }
 }
 
+struct QdrantCapabilityProbe {
+    capabilities: SidecarCapabilities,
+    semantic_failure_reason: String,
+}
+
 fn qdrant_capabilities(
     layout: &SidecarLayout,
     collection: &str,
@@ -466,23 +471,51 @@ fn qdrant_capabilities(
     expected_points: Option<u64>,
     product_embedding_backend: bool,
     current_product_embedding_backend: bool,
-) -> SidecarCapabilities {
+) -> QdrantCapabilityProbe {
     if !probe.reachable || !probe.collection_exists {
-        return SidecarCapabilities::NONE;
+        return qdrant_capability_failure("qdrant_unreachable");
     }
     if qdrant_point_count_incomplete(probe, expected_points) {
-        return SidecarCapabilities::NONE;
+        return qdrant_capability_failure("qdrant_point_count_incomplete");
+    }
+    if QdrantClient::is_collection_stubbed(&layout.qdrant_data_dir, collection) {
+        return qdrant_capability_failure("qdrant_hash_vectors_only");
+    }
+    if !qdrant_semantic_vectors_enabled() {
+        return qdrant_capability_failure("qdrant_hash_vectors_only");
+    }
+    if !product_embedding_backend {
+        return qdrant_capability_failure("qdrant_non_product_embedding_backend");
+    }
+    if !current_product_embedding_backend {
+        return qdrant_capability_failure("qdrant_current_embedding_backend_not_product");
     }
     let client = QdrantClient::new(layout);
-    let semantic = !QdrantClient::is_collection_stubbed(&layout.qdrant_data_dir, collection)
-        && qdrant_semantic_vectors_enabled()
-        && product_embedding_backend
-        && current_product_embedding_backend
-        && client.semantic_search_smoke(collection);
-    SidecarCapabilities {
-        lexical: false,
-        semantic,
-        graph: false,
+    match client.semantic_search_smoke_result(collection) {
+        Ok(()) => QdrantCapabilityProbe {
+            capabilities: SidecarCapabilities {
+                lexical: false,
+                semantic: true,
+                graph: false,
+            },
+            semantic_failure_reason: "none".into(),
+        },
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let reason = if detail.contains("llama.cpp embeddings") {
+                format!("embedding_runtime_unavailable: {detail}")
+            } else {
+                "qdrant_semantic_smoke_failed".into()
+            };
+            qdrant_capability_failure(reason)
+        }
+    }
+}
+
+fn qdrant_capability_failure(reason: impl Into<String>) -> QdrantCapabilityProbe {
+    QdrantCapabilityProbe {
+        capabilities: SidecarCapabilities::NONE,
+        semantic_failure_reason: reason.into(),
     }
 }
 
@@ -616,7 +649,7 @@ pub fn probe_sidecar_health_with_embedding_device(
             manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref());
         let current_product_embedding_backend =
             manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
-        let qdrant_capabilities = qdrant_capabilities(
+        let qdrant_capability_probe = qdrant_capabilities(
             layout,
             &collection,
             &qdrant_probe,
@@ -626,7 +659,7 @@ pub fn probe_sidecar_health_with_embedding_device(
         );
         let qdrant_semantic_stub = qdrant_probe.reachable
             && qdrant_probe.collection_exists
-            && !qdrant_capabilities.semantic;
+            && !qdrant_capability_probe.capabilities.semantic;
         let qdrant_device_unverified = qdrant_probe.reachable
             && qdrant_probe.collection_exists
             && product_embedding_backend
@@ -661,18 +694,14 @@ pub fn probe_sidecar_health_with_embedding_device(
             } else if qdrant_device_unverified {
                 embedding_device.degraded_reason.clone()
             } else if qdrant_semantic_stub {
-                Some(if qdrant_semantic_vectors_enabled() {
-                    "qdrant_semantic_smoke_failed".into()
-                } else {
-                    "qdrant_hash_vectors_only".into()
-                })
+                Some(qdrant_capability_probe.semantic_failure_reason)
             } else {
                 None
             },
             capabilities: if qdrant_device_unverified {
                 SidecarCapabilities::NONE
             } else {
-                qdrant_capabilities
+                qdrant_capability_probe.capabilities
             },
         }
     };
@@ -766,6 +795,37 @@ fn zero_dense_qdrant_health(
 mod tests {
     use super::*;
     use crate::config::SidecarLayout;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard hold ENV_LOCK and restore the prior value on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard hold ENV_LOCK and restore the prior value on drop.
+            unsafe {
+                if let Some(value) = self.previous.as_ref() {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn repair_hint_names_reason_and_full_sidecar_rebuild_sequence() {
@@ -930,10 +990,51 @@ mod tests {
             detail: "http 200 points_count=10".into(),
         };
 
-        let capabilities =
-            qdrant_capabilities(&layout, "codestory_test", &probe, Some(10), true, false);
+        let result = qdrant_capabilities(&layout, "codestory_test", &probe, Some(10), true, false);
 
-        assert_eq!(capabilities, SidecarCapabilities::NONE);
+        assert_eq!(result.capabilities, SidecarCapabilities::NONE);
+        assert_eq!(
+            result.semantic_failure_reason,
+            "qdrant_current_embedding_backend_not_product"
+        );
+    }
+
+    #[test]
+    fn qdrant_capability_names_dead_embedding_runtime_before_smoke() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
+        let _url = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:9/v1/embeddings",
+        );
+        let root = TempDir::new().expect("temp dir");
+        let layout = SidecarLayout {
+            zoekt_http_port: 16070,
+            qdrant_http_port: 16333,
+            qdrant_grpc_port: 16334,
+            zoekt_data_dir: root.path().join("zoekt"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("retrieval-sidecars.json"),
+        };
+        let probe = crate::qdrant_client::QdrantHealthProbe {
+            reachable: true,
+            latency_ms: 1,
+            collection_exists: true,
+            point_count: Some(10),
+            detail: "http 200 points_count=10".into(),
+        };
+
+        let result = qdrant_capabilities(&layout, "codestory_test", &probe, Some(10), true, true);
+
+        assert_eq!(result.capabilities, SidecarCapabilities::NONE);
+        assert!(
+            result
+                .semantic_failure_reason
+                .starts_with("embedding_runtime_unavailable:"),
+            "unexpected reason: {}",
+            result.semantic_failure_reason
+        );
     }
 
     #[test]
