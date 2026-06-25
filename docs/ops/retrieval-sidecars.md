@@ -221,12 +221,30 @@ and blocking reasons. It is a dry-run status surface only: it does not run
 Docker prune, remove containers, delete networks, or clear state files, and it
 works even when packet/search readiness is unavailable.
 
-1. Stop the relevant Docker/sidecar services.
-2. Move the affected CodeStory-owned Qdrant, Zoekt, or SCIP cache directory
-   aside under the cache root.
-3. Rerun `retrieval bootstrap`.
-4. Rerun `retrieval index --project <repo> --refresh full`.
-5. Delete the backup only after status reports the expected mode.
+To let the CLI remove only CodeStory-owned inventory safe candidates, review the
+dry-run output first and then pass the explicit apply flag:
+
+```powershell
+codestory-cli retrieval inventory --project <repo> --format markdown
+codestory-cli retrieval inventory --project <repo> --format json
+codestory-cli retrieval inventory --project <repo> --apply --format markdown
+codestory-cli retrieval inventory --project <repo> --apply --format json
+```
+
+`--apply` removes only namespaces classified as inventory safe candidates. Live
+namespaces, incomplete state, and unknown ownership stay blocked with
+per-namespace reasons. The apply path removes exact CodeStory-owned state/data
+paths and explicitly matched sidecar resources only; it does not run Docker
+prune, broad Docker cleanup, host/global network deletion, readiness-triggered
+cleanup, or packet/search-triggered cleanup.
+
+1. Run the dry-run inventory in Markdown and JSON.
+2. Confirm the safe candidates and blocked reasons.
+3. Run `retrieval inventory --apply` only for operator-approved cleanup.
+4. Rerun `retrieval bootstrap`.
+5. Rerun `retrieval index --project <repo> --refresh full`.
+6. Confirm `retrieval status --project <repo> --format json` reports the
+   expected mode.
 
 `retrieval down` clears the sidecar state file only. Stop Docker/Compose
 separately if containers must be removed.

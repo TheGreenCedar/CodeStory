@@ -77,6 +77,31 @@ pub struct SidecarInventoryReport {
     pub namespaces: Vec<SidecarInventoryEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarGcNamespaceResult {
+    pub namespace: String,
+    pub state: SidecarInventoryState,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_docker_resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarGcReport {
+    pub dry_run: bool,
+    pub docker_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_error: Option<String>,
+    pub cache_root: String,
+    pub removed: Vec<SidecarGcNamespaceResult>,
+    pub blocked: Vec<SidecarGcNamespaceResult>,
+    pub namespaces: Vec<SidecarInventoryEntry>,
+}
+
 #[derive(Debug, Clone)]
 struct StateCandidate {
     namespace: String,
@@ -107,6 +132,26 @@ pub fn sidecar_inventory_with_cache_root(
         cache_root,
         chrono::Utc::now().timestamp_millis(),
         docker,
+    ))
+}
+
+pub fn sidecar_gc_apply(project_root: &Path) -> Result<SidecarGcReport> {
+    sidecar_gc_apply_with_cache_root(project_root, &user_cache_root())
+}
+
+pub fn sidecar_gc_apply_with_cache_root(
+    project_root: &Path,
+    cache_root: &Path,
+) -> Result<SidecarGcReport> {
+    let docker = read_docker_inventory();
+    let mut remover = FsSidecarGcRemover;
+    Ok(apply_inventory(
+        project_root,
+        cache_root,
+        chrono::Utc::now().timestamp_millis(),
+        docker,
+        None,
+        &mut remover,
     ))
 }
 
@@ -163,6 +208,208 @@ fn build_inventory_with_model(
         docker_error: docker.error,
         cache_root: cache_root.display().to_string(),
         namespaces: entries,
+    }
+}
+
+trait SidecarGcRemover {
+    fn remove_path(&mut self, path: &Path) -> Result<()>;
+    fn remove_docker_resource(&mut self, resource: &SidecarDockerResource) -> Result<()>;
+}
+
+struct FsSidecarGcRemover;
+
+impl SidecarGcRemover for FsSidecarGcRemover {
+    fn remove_path(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+        .with_context(|| format!("remove {}", path.display()))
+    }
+
+    fn remove_docker_resource(&mut self, resource: &SidecarDockerResource) -> Result<()> {
+        let target = if resource.id.trim().is_empty() {
+            resource.name.as_str()
+        } else {
+            resource.id.as_str()
+        };
+        let args = match resource.kind {
+            SidecarDockerResourceKind::Container => ["container", "rm", target],
+            SidecarDockerResourceKind::Network => ["network", "rm", target],
+        };
+        let output = Command::new("docker")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("spawn docker")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "docker {:?} failed: {}{}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn apply_inventory(
+    project_root: &Path,
+    cache_root: &Path,
+    now_ms: i64,
+    docker: DockerInventory,
+    model_override: Option<EmbedModelInventory>,
+    remover: &mut dyn SidecarGcRemover,
+) -> SidecarGcReport {
+    let mut states = discover_state_candidates(cache_root);
+    add_resource_only_candidates(&mut states, cache_root, &docker);
+    let mut compose_projects = BTreeSet::new();
+    for state in &states {
+        if let Some(compose_project) = state
+            .state
+            .as_ref()
+            .and_then(|state| owned_state(state).then(|| state.compose_project.clone()))
+        {
+            compose_projects.insert(compose_project);
+        }
+    }
+
+    let layout = SidecarRuntimeConfig::for_project_auto(project_root).layout;
+    let model =
+        model_override.unwrap_or_else(|| embed_model_inventory(Some(project_root), &layout));
+    let mut rows = states
+        .into_iter()
+        .map(|candidate| {
+            let resources = matching_resources(&candidate, &docker, &compose_projects);
+            let entry = inventory_entry(
+                now_ms,
+                candidate.clone(),
+                resources,
+                docker.available,
+                model.clone(),
+            );
+            (candidate, entry)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.1.namespace.cmp(&b.1.namespace));
+
+    let mut removed = Vec::new();
+    let mut blocked = Vec::new();
+    for (candidate, entry) in &rows {
+        if entry.safe_candidate_reason.is_some() {
+            let result = remove_safe_candidate(candidate, entry, remover);
+            if result.errors.is_empty() {
+                removed.push(result);
+            } else {
+                blocked.push(result);
+            }
+        } else {
+            blocked.push(SidecarGcNamespaceResult {
+                namespace: entry.namespace.clone(),
+                state: entry.state,
+                reason: entry
+                    .blocking_reason
+                    .clone()
+                    .unwrap_or_else(|| "not an inventory safe candidate".to_string()),
+                removed_paths: Vec::new(),
+                removed_docker_resources: Vec::new(),
+                errors: Vec::new(),
+            });
+        }
+    }
+
+    SidecarGcReport {
+        dry_run: false,
+        docker_available: docker.available,
+        docker_error: docker.error,
+        cache_root: cache_root.display().to_string(),
+        removed,
+        blocked,
+        namespaces: rows.into_iter().map(|(_, entry)| entry).collect(),
+    }
+}
+
+fn remove_safe_candidate(
+    candidate: &StateCandidate,
+    entry: &SidecarInventoryEntry,
+    remover: &mut dyn SidecarGcRemover,
+) -> SidecarGcNamespaceResult {
+    let mut result = SidecarGcNamespaceResult {
+        namespace: entry.namespace.clone(),
+        state: entry.state,
+        reason: apply_safe_candidate_reason(entry),
+        removed_paths: Vec::new(),
+        removed_docker_resources: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    for resource in entry.containers.iter().chain(entry.networks.iter()) {
+        if let Err(error) = remover.remove_docker_resource(resource) {
+            result.errors.push(format!(
+                "remove docker {:?} {}: {error}",
+                resource.kind, resource.name
+            ));
+        } else {
+            result
+                .removed_docker_resources
+                .push(format!("{:?}:{}", resource.kind, resource.name));
+        }
+    }
+
+    if let Some(state) = candidate.state.as_ref() {
+        for path in [
+            &state.zoekt_data_dir,
+            &state.qdrant_data_dir,
+            &state.scip_artifacts_root,
+        ] {
+            remove_path(Path::new(path), remover, &mut result);
+        }
+    }
+    if result.errors.is_empty() {
+        remove_path(&candidate.state_path, remover, &mut result);
+    }
+
+    if !result.errors.is_empty() {
+        result.reason = "cleanup partially failed".to_string();
+    }
+    result
+}
+
+fn apply_safe_candidate_reason(entry: &SidecarInventoryEntry) -> String {
+    match entry.state {
+        SidecarInventoryState::Stale => {
+            "owned state/resources are stale; applying approved cleanup".to_string()
+        }
+        SidecarInventoryState::Orphaned => {
+            "owned state/resources have no live match; applying approved cleanup".to_string()
+        }
+        _ => entry
+            .safe_candidate_reason
+            .clone()
+            .unwrap_or_else(|| "inventory safe candidate".to_string()),
+    }
+}
+
+fn remove_path(
+    path: &Path,
+    remover: &mut dyn SidecarGcRemover,
+    result: &mut SidecarGcNamespaceResult,
+) {
+    if !path.exists() {
+        return;
+    }
+    if let Err(error) = remover.remove_path(path) {
+        result
+            .errors
+            .push(format!("remove {}: {error}", path.display()));
+    } else {
+        result.removed_paths.push(path.display().to_string());
     }
 }
 
@@ -272,7 +519,9 @@ fn match_resource(
     resource: &SidecarDockerResource,
     owned_compose_projects: &BTreeSet<String>,
 ) -> Option<SidecarDockerResource> {
-    if resource_namespace(resource).as_deref() == Some(candidate.namespace.as_str()) {
+    if resource_owner(resource).as_deref() == Some("codestory")
+        && resource_namespace(resource).as_deref() == Some(candidate.namespace.as_str())
+    {
         let mut resource = resource.clone();
         resource.match_reason = "matched codestory namespace label".to_string();
         return Some(resource);
@@ -280,6 +529,7 @@ fn match_resource(
     let compose_project = compose_project(resource);
     if let Some(state) = candidate.state.as_ref()
         && owned_state(state)
+        && resource_owner(resource).as_deref() == Some("codestory")
         && compose_project.as_deref() == Some(state.compose_project.as_str())
     {
         let mut resource = resource.clone();
@@ -673,6 +923,17 @@ mod tests {
         }
     }
 
+    fn foreign_container(namespace: &str) -> SidecarDockerResource {
+        let mut container = container(namespace, false);
+        container.labels.insert(
+            "dev.codestory.owner".to_string(),
+            "someone-else".to_string(),
+        );
+        container.id = "foreign-container-id".to_string();
+        container.name = format!("{namespace}-foreign-qdrant");
+        container
+    }
+
     fn unlabeled_compose_network(compose_project: &str) -> SidecarDockerResource {
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -688,6 +949,27 @@ mod tests {
             ports: None,
             labels,
             match_reason: String::new(),
+        }
+    }
+
+    struct FailingPathRemover {
+        fail_fragment: String,
+    }
+
+    impl SidecarGcRemover for FailingPathRemover {
+        fn remove_path(&mut self, path: &Path) -> Result<()> {
+            if path.display().to_string().contains(&self.fail_fragment) {
+                anyhow::bail!("planned remove failure");
+            }
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).context("remove dir")
+            } else {
+                std::fs::remove_file(path).context("remove file")
+            }
+        }
+
+        fn remove_docker_resource(&mut self, _resource: &SidecarDockerResource) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -848,7 +1130,7 @@ mod tests {
         assert_eq!(entry.networks.len(), 1);
         assert_eq!(
             entry.networks[0].match_reason,
-            "matched compose project from owned state"
+            "matched unlabeled compose network via owned state"
         );
         assert!(entry.safe_candidate_reason.is_some());
     }
@@ -905,5 +1187,222 @@ mod tests {
 
         assert!(report.dry_run);
         assert!(state_path.exists(), "inventory must not remove state files");
+    }
+
+    #[test]
+    fn apply_removes_only_safe_candidates() {
+        let project = tempdir().expect("project");
+        let cache = tempdir().expect("cache");
+        let stale_namespace = "codestory-agent-stale-apply";
+        let live_namespace = "codestory-agent-live-apply";
+        let unknown_namespace = "codestory-agent-unknown-apply";
+
+        let stale_root = cache.path().join("sidecars").join(stale_namespace);
+        let stale_path = stale_root.join("retrieval-sidecars.json");
+        let stale = state(stale_namespace, &stale_root, 0);
+        create_state_dirs(&stale);
+        write_state(&stale_path, &stale);
+
+        let live_root = cache.path().join("sidecars").join(live_namespace);
+        let live_path = live_root.join("retrieval-sidecars.json");
+        let live = state(live_namespace, &live_root, 100);
+        create_state_dirs(&live);
+        write_state(&live_path, &live);
+
+        let unknown_root = cache.path().join("sidecars").join(unknown_namespace);
+        let unknown_path = unknown_root.join("retrieval-sidecars.json");
+        let mut unknown = state(unknown_namespace, &unknown_root, 100);
+        unknown.owner = "someone-else".to_string();
+        create_state_dirs(&unknown);
+        write_state(&unknown_path, &unknown);
+
+        let mut remover = FsSidecarGcRemover;
+        let report = apply_inventory(
+            project.path(),
+            cache.path(),
+            STALE_AFTER_MS + 1,
+            DockerInventory {
+                available: true,
+                containers: vec![container(live_namespace, true)],
+                networks: Vec::new(),
+                error: None,
+            },
+            Some(test_model(project.path(), true)),
+            &mut remover,
+        );
+
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].namespace, stale_namespace);
+        assert!(!report.removed[0].reason.contains("dry-run only"));
+        assert!(report.removed[0].reason.contains("approved cleanup"));
+        assert!(
+            !stale_path.exists(),
+            "safe stale state file should be removed"
+        );
+        assert!(!Path::new(&stale.zoekt_data_dir).exists());
+        assert!(!Path::new(&stale.qdrant_data_dir).exists());
+        assert!(!Path::new(&stale.scip_artifacts_root).exists());
+        assert!(live_path.exists(), "live state file must stay blocked");
+        assert!(
+            unknown_path.exists(),
+            "unknown owner state file must stay blocked"
+        );
+        assert!(
+            report
+                .blocked
+                .iter()
+                .any(|blocked| blocked.namespace == live_namespace
+                    && blocked.reason.contains("running containers"))
+        );
+        assert!(
+            report
+                .blocked
+                .iter()
+                .any(|blocked| blocked.namespace == unknown_namespace
+                    && blocked.reason.contains("owner"))
+        );
+    }
+
+    #[test]
+    fn apply_does_not_remove_foreign_resource_with_matching_namespace() {
+        let project = tempdir().expect("project");
+        let cache = tempdir().expect("cache");
+        let namespace = "codestory-agent-foreign-resource";
+        let root = cache.path().join("sidecars").join(namespace);
+        let state = state(namespace, &root, 0);
+        create_state_dirs(&state);
+        write_state(&root.join("retrieval-sidecars.json"), &state);
+
+        let mut remover = FsSidecarGcRemover;
+        let report = apply_inventory(
+            project.path(),
+            cache.path(),
+            STALE_AFTER_MS + 1,
+            DockerInventory {
+                available: true,
+                containers: vec![foreign_container(namespace)],
+                networks: Vec::new(),
+                error: None,
+            },
+            Some(test_model(project.path(), true)),
+            &mut remover,
+        );
+
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].namespace, namespace);
+        assert!(
+            report.removed[0].removed_docker_resources.is_empty(),
+            "foreign-owned matching namespace resource must not be removed: {:?}",
+            report.removed[0]
+        );
+        assert!(report.namespaces[0].containers.is_empty());
+    }
+
+    #[test]
+    fn apply_refuses_live_namespaces() {
+        let project = tempdir().expect("project");
+        let cache = tempdir().expect("cache");
+        let namespace = "codestory-agent-live-refused";
+        let root = cache.path().join("sidecars").join(namespace);
+        let state_path = root.join("retrieval-sidecars.json");
+        let state = state(namespace, &root, 100);
+        create_state_dirs(&state);
+        write_state(&state_path, &state);
+
+        let mut remover = FsSidecarGcRemover;
+        let report = apply_inventory(
+            project.path(),
+            cache.path(),
+            200,
+            DockerInventory {
+                available: true,
+                containers: vec![container(namespace, true)],
+                networks: Vec::new(),
+                error: None,
+            },
+            Some(test_model(project.path(), true)),
+            &mut remover,
+        );
+
+        assert!(report.removed.is_empty());
+        assert_eq!(report.blocked[0].namespace, namespace);
+        assert!(report.blocked[0].reason.contains("running containers"));
+        assert!(state_path.exists(), "live namespace must not be removed");
+    }
+
+    #[test]
+    fn apply_refuses_unknown_ownership() {
+        let project = tempdir().expect("project");
+        let cache = tempdir().expect("cache");
+        let namespace = "codestory-agent-unknown-refused";
+        let root = cache.path().join("sidecars").join(namespace);
+        let state_path = root.join("retrieval-sidecars.json");
+        let mut state = state(namespace, &root, 0);
+        state.owner = "someone-else".to_string();
+        create_state_dirs(&state);
+        write_state(&state_path, &state);
+
+        let mut remover = FsSidecarGcRemover;
+        let report = apply_inventory(
+            project.path(),
+            cache.path(),
+            STALE_AFTER_MS + 1,
+            DockerInventory {
+                available: true,
+                ..DockerInventory::default()
+            },
+            Some(test_model(project.path(), true)),
+            &mut remover,
+        );
+
+        assert!(report.removed.is_empty());
+        assert_eq!(report.blocked[0].namespace, namespace);
+        assert!(report.blocked[0].reason.contains("owner"));
+        assert!(
+            state_path.exists(),
+            "unknown owner state file must not be removed"
+        );
+    }
+
+    #[test]
+    fn apply_reports_partial_failures() {
+        let project = tempdir().expect("project");
+        let cache = tempdir().expect("cache");
+        let namespace = "codestory-agent-partial-failure";
+        let root = cache.path().join("sidecars").join(namespace);
+        let state_path = root.join("retrieval-sidecars.json");
+        let state = state(namespace, &root, 0);
+        create_state_dirs(&state);
+        write_state(&state_path, &state);
+
+        let mut remover = FailingPathRemover {
+            fail_fragment: "qdrant".to_string(),
+        };
+        let report = apply_inventory(
+            project.path(),
+            cache.path(),
+            STALE_AFTER_MS + 1,
+            DockerInventory {
+                available: true,
+                ..DockerInventory::default()
+            },
+            Some(test_model(project.path(), true)),
+            &mut remover,
+        );
+
+        assert!(report.removed.is_empty());
+        assert_eq!(report.blocked.len(), 1);
+        let blocked = &report.blocked[0];
+        assert_eq!(blocked.namespace, namespace);
+        assert_eq!(blocked.reason, "cleanup partially failed");
+        assert!(blocked.errors.iter().any(|error| error.contains("qdrant")));
+        assert!(
+            blocked
+                .removed_paths
+                .iter()
+                .any(|path| path.contains("zoekt")),
+            "partial successes should stay visible: {blocked:?}"
+        );
+        assert!(Path::new(&state.qdrant_data_dir).exists());
     }
 }

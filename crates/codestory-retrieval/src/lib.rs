@@ -72,8 +72,9 @@ pub use index::{
     project_id_for_root, repair_project_qdrant_collection, sidecar_project_id_for_root,
 };
 pub use inventory::{
-    SidecarDockerResource, SidecarDockerResourceKind, SidecarInventoryEntry,
-    SidecarInventoryReport, SidecarInventoryState, sidecar_inventory,
+    SidecarDockerResource, SidecarDockerResourceKind, SidecarGcNamespaceResult, SidecarGcReport,
+    SidecarInventoryEntry, SidecarInventoryReport, SidecarInventoryState, sidecar_gc_apply,
+    sidecar_inventory,
 };
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
