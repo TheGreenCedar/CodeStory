@@ -299,16 +299,18 @@ fn verdict_state(
     }
 
     if goal == ReadinessGoalDto::AgentPacketSearch {
+        let sidecar_profile = sidecar.and_then(|sidecar| sidecar.profile);
         let sidecar_mode = sidecar
             .map(|sidecar| sidecar.retrieval_mode)
             .unwrap_or("unavailable");
-        if sidecar_mode != "full" {
+        if sidecar_mode != "full" || sidecar_profile != Some("agent") {
             let full_repair = agent_packet_search_repair_commands(project_arg);
             let minimum_next = full_repair.iter().take(1).cloned().collect();
             return (
                 ReadinessStatusDto::RepairRetrieval,
                 format!(
-                    "Agent packet/search needs full sidecar retrieval; current mode is `{sidecar_mode}`."
+                    "Agent packet/search needs full agent sidecar retrieval; current profile is `{}` and mode is `{sidecar_mode}`.",
+                    sidecar_profile.unwrap_or("unknown")
                 ),
                 minimum_next,
                 full_repair,
@@ -630,8 +632,8 @@ mod tests {
             &stats,
             Some(&freshness),
             Some(ReadinessSidecarInput {
-                profile: Some("local"),
-                run_id: None,
+                profile: Some("agent"),
+                run_id: Some("run"),
                 retrieval_mode: "full",
                 degraded_reason: None,
                 manifest_generation: Some("generation"),
@@ -763,7 +765,7 @@ mod tests {
         assert!(
             unavailable
                 .summary
-                .contains("current mode is `unavailable`")
+                .contains("current profile is `unknown` and mode is `unavailable`")
         );
         assert!(unavailable.sidecar.is_none());
 
@@ -774,6 +776,28 @@ mod tests {
         let refresh = local_refresh_output(&local);
         assert_eq!(refresh.state, LocalRefreshState::Fresh);
         assert!(!refresh.blocks_local_surfaces);
+
+        let local_full = build_readiness_verdict(
+            ReadinessGoalDto::AgentPacketSearch,
+            inputs(
+                &stats,
+                Some(&freshness),
+                Some(ReadinessSidecarInput {
+                    profile: Some("local"),
+                    run_id: None,
+                    retrieval_mode: "full",
+                    degraded_reason: None,
+                    manifest_generation: Some("generation"),
+                    manifest_input_hash: Some("hash"),
+                }),
+            ),
+        );
+
+        assert_eq!(local_full.status, ReadinessStatusDto::RepairRetrieval);
+        assert!(
+            local_full.summary.contains("current profile is `local`"),
+            "local/default full retrieval must not unlock agent packet/search: {local_full:?}"
+        );
 
         let degraded = build_readiness_verdict(
             ReadinessGoalDto::AgentPacketSearch,
