@@ -6,6 +6,7 @@
 //! fallback. It records telemetry and candidate evidence without changing which
 //! files are fresh.
 
+use crate::CancellationToken;
 use crate::semantic::{
     SemanticCandidateIndex, SemanticCandidateNodeSnapshot, SemanticResolutionCandidate,
     SemanticResolutionRequest, SemanticResolverRegistry,
@@ -636,48 +637,76 @@ impl ResolutionPass {
         storage: &mut Storage,
         caller_scope_file_ids: Option<&HashSet<i64>>,
     ) -> Result<ResolutionStats> {
+        self.run_with_scope_with_cancel(storage, caller_scope_file_ids, None)
+    }
+
+    pub fn run_with_scope_with_cancel(
+        &self,
+        storage: &mut Storage,
+        caller_scope_file_ids: Option<&HashSet<i64>>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<ResolutionStats> {
+        Self::check_cancelled(cancel_token)?;
         let conn = storage.get_connection();
         run_in_immediate_transaction(conn, |conn| {
             let mut telemetry = ResolutionPhaseTelemetry::default();
+            Self::check_cancelled(cancel_token)?;
             let scope_started = Instant::now();
             let scope_context = ScopeCallerContext::prepare(conn, caller_scope_file_ids)?;
             telemetry.scope_prepare_ms = duration_ms_u64(scope_started.elapsed());
 
+            Self::check_cancelled(cancel_token)?;
             let counts_started = Instant::now();
             let unresolved_calls_before =
                 Self::count_unresolved_on_conn(conn, EdgeKind::CALL, &scope_context)?;
+            Self::check_cancelled(cancel_token)?;
             let unresolved_imports_before =
                 Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?;
             telemetry.unresolved_count_start_ms = duration_ms_u64(counts_started.elapsed());
+            Self::check_cancelled(cancel_token)?;
             let override_count_started = Instant::now();
             let _unresolved_overrides_before =
                 Self::count_unresolved_on_conn(conn, EdgeKind::OVERRIDE, &scope_context)?;
             telemetry.unresolved_override_count_ms =
                 duration_ms_u64(override_count_started.elapsed());
 
+            Self::check_cancelled(cancel_token)?;
             let prepared = PreparedResolutionState::load(storage, self.flags, &mut telemetry)?;
+            Self::check_cancelled(cancel_token)?;
 
             let mut strategy_counters = ResolutionStrategyCounters::default();
+            Self::check_cancelled(cancel_token)?;
             let resolved_calls = self.resolve_calls_on_conn(
                 conn,
                 &scope_context,
                 &prepared,
                 &mut telemetry,
                 &mut strategy_counters,
+                cancel_token,
             )?;
+            Self::check_cancelled(cancel_token)?;
             let resolved_imports = self.resolve_imports_on_conn(
                 conn,
                 &scope_context,
                 &prepared,
                 &mut telemetry,
                 &mut strategy_counters,
+                cancel_token,
             )?;
-            let _resolved_overrides =
-                self.resolve_overrides_on_conn(conn, &scope_context, &prepared, &mut telemetry)?;
+            Self::check_cancelled(cancel_token)?;
+            let _resolved_overrides = self.resolve_overrides_on_conn(
+                conn,
+                &scope_context,
+                &prepared,
+                &mut telemetry,
+                cancel_token,
+            )?;
+            Self::check_cancelled(cancel_token)?;
 
             let counts_finished = Instant::now();
             let unresolved_calls =
                 Self::count_unresolved_on_conn(conn, EdgeKind::CALL, &scope_context)?;
+            Self::check_cancelled(cancel_token)?;
             let unresolved_imports =
                 Self::count_unresolved_on_conn(conn, EdgeKind::IMPORT, &scope_context)?;
             telemetry.unresolved_count_end_ms = duration_ms_u64(counts_finished.elapsed());
@@ -693,6 +722,13 @@ impl ResolutionPass {
                 strategy_counters,
             })
         })
+    }
+
+    fn check_cancelled(cancel_token: Option<&CancellationToken>) -> Result<()> {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            anyhow::bail!("resolution cancelled");
+        }
+        Ok(())
     }
 
     pub fn unresolved_counts(&self, storage: &Storage) -> Result<(usize, usize)> {
@@ -765,6 +801,7 @@ impl ResolutionPass {
             &prepared,
             &mut telemetry,
             &mut strategy_counters,
+            None,
         )
     }
 
@@ -775,6 +812,7 @@ impl ResolutionPass {
         prepared: &PreparedResolutionState,
         telemetry: &mut ResolutionPhaseTelemetry,
         strategy_counters: &mut ResolutionStrategyCounters,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<usize> {
         pipeline::resolve_calls_on_conn(
             self,
@@ -783,6 +821,7 @@ impl ResolutionPass {
             prepared,
             telemetry,
             strategy_counters,
+            cancel_token,
         )
     }
 
@@ -806,6 +845,7 @@ impl ResolutionPass {
             &prepared,
             &mut telemetry,
             &mut strategy_counters,
+            None,
         )
     }
 
@@ -816,6 +856,7 @@ impl ResolutionPass {
         prepared: &PreparedResolutionState,
         telemetry: &mut ResolutionPhaseTelemetry,
         strategy_counters: &mut ResolutionStrategyCounters,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<usize> {
         pipeline::resolve_imports_on_conn(
             self,
@@ -824,6 +865,7 @@ impl ResolutionPass {
             prepared,
             telemetry,
             strategy_counters,
+            cancel_token,
         )
     }
 
@@ -833,8 +875,16 @@ impl ResolutionPass {
         scope_context: &ScopeCallerContext,
         prepared: &PreparedResolutionState,
         telemetry: &mut ResolutionPhaseTelemetry,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<usize> {
-        pipeline::resolve_overrides_on_conn(self, conn, scope_context, prepared, telemetry)
+        pipeline::resolve_overrides_on_conn(
+            self,
+            conn,
+            scope_context,
+            prepared,
+            telemetry,
+            cancel_token,
+        )
     }
 
     fn compute_call_resolution(

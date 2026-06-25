@@ -1141,7 +1141,7 @@ impl WorkspaceIndexer {
             });
             let resolution_started = Instant::now();
             let resolution_stats = resolver
-                .run_with_scope(storage, resolution_scope)
+                .run_with_scope_with_cancel(storage, resolution_scope, cancel_token)
                 .map_err(|e| anyhow!("Resolution error: {:?}", e))?;
             stats.edge_resolution_ms = stats
                 .edge_resolution_ms

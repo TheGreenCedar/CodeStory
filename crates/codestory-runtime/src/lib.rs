@@ -10473,6 +10473,10 @@ fn index_full(
             return Err(indexing_cancelled_error());
         }
         Ok(stats) => stats,
+        Err(_) if is_indexing_cancelled(cancel_token) => {
+            let _ = staged.discard();
+            return Err(indexing_cancelled_error());
+        }
         Err(err) => {
             let _ = staged.discard();
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
@@ -10705,6 +10709,7 @@ where
     let index_stats = match result {
         Ok(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
         Ok(stats) => stats,
+        Err(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
         Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
     };
     let snapshot_refresh_stats = store.snapshots().refresh_all_with_stats().map_err(|e| {
