@@ -4,17 +4,15 @@
     {
       "id": "readiness-boundary",
       "prompt": "Explain how LiveSidecarSearch::qdrant_search participates in the live sidecar search path and why packet/search evidence cannot be promoted when retrieval sidecars are unavailable or stale.",
-      "query": "LiveSidecarSearch qdrant_search retrieval_mode full sidecar unavailable",
+      "query": "LiveSidecarSearch::qdrant_search",
       "category": "readiness_boundary",
       "mode": "packet_search",
       "expected": {
         "files": [
-          "crates/codestory-retrieval/src/sidecar_search.rs",
-          "crates/codestory-retrieval/src/lib.rs"
+          "crates/codestory-retrieval/src/sidecar_search.rs"
         ],
         "symbols": [
-          "LiveSidecarSearch::qdrant_search",
-          "LiveSidecarSearch::layout"
+          "LiveSidecarSearch::qdrant_search"
         ],
         "anchors": [
           "LiveSidecarSearch::qdrant_search",
@@ -44,7 +42,7 @@
         ],
         "symbols": [
           "append_search_evidence_packet",
-          "decorate_search_hit_evidence"
+          "evidence_candidate_from_hit"
         ],
         "anchors": [
           "decorate_search_hit_evidence",

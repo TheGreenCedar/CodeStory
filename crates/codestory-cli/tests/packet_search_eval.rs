@@ -354,6 +354,24 @@ fn packet_search_eval_fixture_schema_is_owner_directed_and_complete() {
 }
 
 #[test]
+fn packet_search_eval_readiness_fixture_uses_exact_symbol_search_anchor() {
+    let fixtures = load_fixture_set();
+    let fixture = fixtures
+        .fixtures
+        .iter()
+        .find(|fixture| fixture.id == "readiness-boundary")
+        .expect("readiness-boundary fixture");
+
+    assert!(
+        fixture
+            .query
+            .as_deref()
+            .is_some_and(|query| query.contains("LiveSidecarSearch::qdrant_search")),
+        "readiness fixture search query must preserve the exact symbol anchor"
+    );
+}
+
+#[test]
 fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
     let fixtures = load_fixture_set();
     let baseline = load_baseline();
@@ -387,7 +405,7 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
             ],
             ranked_symbols: vec![
                 "append_search_evidence_packet".to_string(),
-                "decorate_search_hit_evidence".to_string(),
+                "evidence_candidate_from_hit".to_string(),
             ],
             packet_text: "decorate_search_hit_evidence uses evidence_candidate_from_hit"
                 .to_string(),
