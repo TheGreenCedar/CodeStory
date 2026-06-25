@@ -5,10 +5,12 @@ const { createHash } = require('crypto');
 const { eventHeader, getCodeStoryInstructions } = require('./codestory-instructions.cjs');
 const {
   classifyMcpRuntime,
+  dirtyMarkerPathForProject,
   mcpDetectionText,
   readActiveState,
   readHookState,
   rememberActiveState,
+  writeDirtyMarker,
   writeHookState,
   writeHookOutput,
 } = require('./codestory-runtime.cjs');
@@ -92,6 +94,37 @@ function hookPolicy(input, event) {
     runtimeOnly: ['resume', 'compact', 'handoff', 'goal_heartbeat'].includes(taxonomy),
     heartbeat: taxonomy === 'goal_heartbeat',
   };
+}
+
+function gitDirtyState(project) {
+  if (!project) return null;
+  const result = spawnSync('git', ['-C', project, 'status', '--porcelain'], {
+    encoding: 'utf8',
+    timeout: 1000,
+    maxBuffer: 20_000,
+    windowsHide: true,
+  });
+  if (result.status !== 0 || result.error) return null;
+  const paths = result.stdout
+    .split(/\r?\n/u)
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  return {
+    dirty: paths.length > 0,
+    pathSample: paths,
+  };
+}
+
+function writeProjectDirtyMarker(policy) {
+  if (!dirtyMarkerPathForProject(policy.project)) return;
+  const state = gitDirtyState(policy.project);
+  if (!state) return;
+  writeDirtyMarker(policy.project, {
+    dirty: state.dirty,
+    pathSample: state.pathSample,
+    source: `codestory-hook:${policy.taxonomy}`,
+  });
 }
 
 function runtimeFingerprint(mcp) {
@@ -447,6 +480,7 @@ function runCodeStory(input, event, policy, state = {}) {
 
 function buildContext(input, event, state = {}) {
   const policy = hookPolicy(input, event);
+  writeProjectDirtyMarker(policy);
   const runtime = runCodeStory(input, event, policy, state);
   if (runtime && policy.heartbeat && !rememberHeartbeat(policy, runtime.fingerprint || runtime.output)) {
     return null;

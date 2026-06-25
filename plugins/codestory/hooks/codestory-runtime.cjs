@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { createHash } = require('crypto');
 
 const isCopilot = Boolean(process.env.COPILOT_PLUGIN_DATA);
 const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
@@ -7,6 +8,8 @@ const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
 const STATE_FILE = '.codestory-active';
 const HOOK_STATE_FILE = '.codestory-hook-output-state.json';
 const MCP_RUNTIME_FILE = '.codestory-mcp-runtime.json';
+const DIRTY_MARKER_SCHEMA_VERSION = 1;
+const DIRTY_MARKER_SAMPLE_LIMIT = 20;
 
 function pluginDataDir() {
   if (isCodex) return process.env.PLUGIN_DATA;
@@ -29,6 +32,22 @@ function readJson(file) {
 
 function pluginRoot() {
   return path.dirname(__dirname);
+}
+
+function normalizeProjectRoot(projectRoot) {
+  const resolved = path.resolve(projectRoot || process.cwd());
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function dirtyMarkerPathForProject(projectRoot, dataDir = pluginDataDir()) {
+  if (!dataDir || !projectRoot) return null;
+  const normalizedRoot = normalizeProjectRoot(projectRoot);
+  const key = createHash('sha256').update(normalizedRoot).digest('hex').slice(0, 32);
+  return path.join(dataDir, 'dirty-markers', `${key}.json`);
 }
 
 function pluginVersion(root = pluginRoot()) {
@@ -168,6 +187,35 @@ function writeHookState(state) {
   }
 }
 
+function writeDirtyMarker(projectRoot, options = {}) {
+  const markerPath = dirtyMarkerPathForProject(projectRoot, options.pluginDataDir);
+  if (!markerPath) return null;
+  const normalizedRoot = normalizeProjectRoot(projectRoot);
+  const pathSample = Array.isArray(options.pathSample)
+    ? options.pathSample
+      .filter((item) => typeof item === 'string' && item.trim())
+      .slice(0, DIRTY_MARKER_SAMPLE_LIMIT)
+    : [];
+  const marker = {
+    schema_version: DIRTY_MARKER_SCHEMA_VERSION,
+    project_root: normalizedRoot,
+    dirty: Boolean(options.dirty),
+    updated_at: new Date().toISOString(),
+    source: String(options.source || 'codestory-hook'),
+  };
+  if (pathSample.length > 0) {
+    marker.path_sample = pathSample;
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify(marker, null, 2));
+    return { path: markerPath, marker };
+  } catch {
+    return null;
+  }
+}
+
 function writeHookOutput(event, context) {
   if (isCopilot) {
     process.stdout.write(JSON.stringify({ additionalContext: context }));
@@ -193,10 +241,12 @@ function writeHookOutput(event, context) {
 
 module.exports = {
   classifyMcpRuntime,
+  dirtyMarkerPathForProject,
   mcpDetectionText,
   readActiveState,
   readHookState,
   rememberActiveState,
+  writeDirtyMarker,
   writeHookState,
   writeHookOutput,
 };

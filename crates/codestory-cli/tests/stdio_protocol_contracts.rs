@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,6 +15,8 @@ struct StdioFixture {
     latest_release_version: String,
     disable_installed_cli_probe: bool,
     sidecar_policy_state: Option<String>,
+    dirty_marker_path: Option<PathBuf>,
+    dirty_marker_project_root: Option<PathBuf>,
 }
 
 struct StdioServer {
@@ -136,6 +138,8 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
         disable_installed_cli_probe: false,
         sidecar_policy_state: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
     }
 }
 
@@ -239,6 +243,12 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
             "CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND",
             "node codestory-mcp.cjs sidecar-policy disable",
         );
+    }
+    if let Some(path) = &fixture.dirty_marker_path {
+        command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PATH", path);
+    }
+    if let Some(root) = &fixture.dirty_marker_project_root {
+        command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT", root);
     }
     let mut child = command.spawn().expect("spawn stdio server");
 
@@ -2332,6 +2342,114 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
     assert!(
         !next_call_text.contains("ready --goal agent --repair"),
         "disabled policy should not recommend automatic sidecar repair: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
+    let mut fixture = indexed_fixture();
+    let marker_path = fixture.cache_dir.path().join("dirty-marker.json");
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        &marker_path,
+        json!({
+            "schema_version": 1,
+            "project_root": fixture.workspace.path().to_string_lossy(),
+            "dirty": true,
+            "updated_at": "2026-06-25T00:00:00.000Z",
+            "source": "test-hook",
+            "path_sample": ["src/runtime.rs"]
+        })
+        .to_string(),
+    )
+    .expect("write dirty marker");
+    fixture.dirty_marker_path = Some(marker_path.clone());
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-dirty-marker",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-dirty-marker"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("dirty_stale"));
+    assert_eq!(status["dirty_marker"]["dirty"], json!(true));
+    assert_eq!(
+        status["dirty_marker"]["reason"],
+        json!("dirty_marker_newer_than_index")
+    );
+    assert_eq!(
+        status["index_freshness"]["status"],
+        json!("fresh"),
+        "computed inventory freshness should remain visible: {status}"
+    );
+    assert_eq!(
+        status["effective_index_freshness"]["status"],
+        json!("stale")
+    );
+    assert_eq!(status["local_refresh"]["state"], json!("stale"));
+    assert_eq!(
+        status["local_refresh"]["blocks_local_surfaces"],
+        json!(true)
+    );
+    assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
+    );
+}
+
+#[test]
+fn resources_read_status_reports_unknown_dirty_marker_without_blocking_local_index() {
+    let mut fixture = indexed_fixture();
+    let marker_path = fixture.cache_dir.path().join("dirty-marker-invalid.json");
+    fs::write(&marker_path, "{not-json").expect("write invalid marker");
+    fixture.dirty_marker_path = Some(marker_path);
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-unknown-marker",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-unknown-marker"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("unknown"));
+    assert_eq!(
+        status["dirty_marker"]["blocks_local_surfaces"],
+        json!(false)
+    );
+    assert!(
+        status["dirty_marker"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("marker_json_error")),
+        "unknown marker should explain the parse failure: {status}"
+    );
+    assert_fresh_freshness_counts(&status, "status with unknown dirty marker");
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
     );
 }
 
