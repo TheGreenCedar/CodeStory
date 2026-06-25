@@ -273,7 +273,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
   }
 });
 
-test("mcp launcher repairs stale local navigation once before serving", async () => {
+test("mcp launcher repairs stale local navigation without agent repair under enabled sidecar policy", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-repair-index-"));
@@ -322,6 +322,7 @@ test("mcp launcher repairs stale local navigation once before serving", async ()
         ...process.env,
         CODESTORY_CLI: cliPath,
         PLUGIN_DATA: dataDir,
+        CODESTORY_PLUGIN_SIDECAR_POLICY: "enabled",
         TEST_CODESTORY_VERSION: version,
         TEST_LOG: logFile,
         TEST_OUT: marker,

@@ -539,7 +539,7 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
     );
   }
   if (parsedProbe.ok) {
-    return { ready: true };
+    return { ready: true, repaired: false };
   }
 
   const repair = runLocalNavigationReady(resolved, projectRoot, true);
@@ -572,7 +572,7 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
     );
   }
   if (parsedRepair.ok) {
-    return { ready: true };
+    return { ready: true, repaired: true };
   }
   const verdict = parsedRepair.verdict || parsedProbe.verdict || null;
   const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
@@ -932,7 +932,9 @@ async function main() {
     return;
   }
   const sidecarPolicy = readSidecarPolicy();
-  scheduleSidecarRepair(resolved, sidecarPolicy);
+  if (!localReadiness.repaired) {
+    scheduleSidecarRepair(resolved, sidecarPolicy);
+  }
   const sidecarStatus = readSidecarPolicy();
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
