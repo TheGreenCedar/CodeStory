@@ -1082,6 +1082,7 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    retrieval::activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "packet")?;
@@ -2537,6 +2538,7 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    retrieval::activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;

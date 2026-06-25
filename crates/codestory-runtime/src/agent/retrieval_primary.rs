@@ -12,9 +12,9 @@ use codestory_contracts::api::{
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
     CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
-    QueryTrace, execute_retrieval_query_with_cache,
+    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache,
     execute_strict_retrieval_query_batch_with_cache, is_phantom_sidecar_hit,
-    sidecar_project_id_for_root, strict_sidecar_status,
+    sidecar_project_id_for_root, sidecar_runtime_auto, strict_sidecar_status,
 };
 use codestory_store::Store;
 use std::collections::{BTreeMap, HashMap};
@@ -123,23 +123,44 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
     controller: &AppController,
     reason: impl Into<String>,
 ) -> ApiError {
-    let project = controller
-        .require_project_root()
-        .ok()
+    let project_root = controller.require_project_root().ok();
+    let project = project_root
+        .as_ref()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "<project>".to_string());
-    ApiError::retrieval_unavailable(
-        reason,
-        project.clone(),
-        sidecar_retrieval_recovery_commands(&project),
-    )
+    let recovery_commands = project_root
+        .as_deref()
+        .map(sidecar_retrieval_recovery_commands)
+        .unwrap_or_else(|| sidecar_retrieval_recovery_commands_for_project(&project, None));
+    ApiError::retrieval_unavailable(reason, project.clone(), recovery_commands)
 }
 
-fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
+fn sidecar_retrieval_recovery_commands(project_root: &Path) -> Vec<String> {
+    let runtime = sidecar_runtime_auto(project_root);
+    let agent_run_id = (runtime.profile == SidecarProfile::Agent)
+        .then(|| runtime.run_id.as_deref())
+        .flatten();
+    sidecar_retrieval_recovery_commands_for_project(&project_root.to_string_lossy(), agent_run_id)
+}
+
+fn sidecar_retrieval_recovery_commands_for_project(
+    project: &str,
+    agent_run_id: Option<&str>,
+) -> Vec<String> {
     let project = quote_cli_arg(project);
+    let mut ready = format!("codestory-cli ready --goal agent --repair --project {project}");
+    let mut status = format!("codestory-cli retrieval status --project {project}");
+    if let Some(run_id) = agent_run_id {
+        ready.push_str(" --run-id ");
+        ready.push_str(run_id);
+        status.push_str(" --profile agent --run-id ");
+        status.push_str(run_id);
+    }
+    ready.push_str(" --format json");
+    status.push_str(" --format json");
     vec![
-        format!("codestory-cli ready --goal agent --repair --project {project} --format json"),
-        format!("codestory-cli retrieval status --project {project} --format json"),
+        ready,
+        status,
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
@@ -1966,7 +1987,8 @@ mod tests {
 
     #[test]
     fn recovery_commands_quote_shell_sensitive_project_paths() {
-        let commands = sidecar_retrieval_recovery_commands(r"C:\tmp\cost$cache`tick's repo");
+        let commands =
+            sidecar_retrieval_recovery_commands_for_project(r"C:\tmp\cost$cache`tick's repo", None);
 
         #[cfg(windows)]
         let expected_project = r"'C:/tmp/cost$cache`tick''s repo'";
@@ -1984,6 +2006,34 @@ mod tests {
                 .iter()
                 .all(|command| command.contains(&format!("--project {expected_project}"))),
             "all recovery commands should quote the project path literally: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_commands_preserve_agent_run_id_for_readiness_and_status() {
+        let commands =
+            sidecar_retrieval_recovery_commands_for_project("C:/repo", Some("packet-search-eval"));
+
+        assert!(
+            commands
+                .first()
+                .is_some_and(|command| command.contains("ready --goal agent --repair")
+                    && command.contains("--run-id packet-search-eval")),
+            "ready repair should keep the selected agent run id: {commands:?}"
+        );
+        assert!(
+            commands
+                .get(1)
+                .is_some_and(|command| command.contains("retrieval status")
+                    && command.contains("--profile agent --run-id packet-search-eval")),
+            "retrieval status should keep the selected agent profile/run id: {commands:?}"
+        );
+        assert!(
+            commands
+                .get(2)
+                .is_some_and(|command| command
+                    == "codestory-cli doctor --project \"C:/repo\" --format markdown"),
+            "doctor does not accept profile/run-id flags, so the hint should remain parseable: {commands:?}"
         );
     }
 

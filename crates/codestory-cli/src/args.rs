@@ -474,6 +474,14 @@ pub(crate) struct PacketCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for packet retrieval. Passing --run-id implies the agent profile."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -956,6 +964,14 @@ pub(crate) struct SearchCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for search retrieval. Passing --run-id implies the agent profile."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -2639,10 +2655,19 @@ mod tests {
     fn search_help_explains_repo_text_modes() {
         let help = render_subcommand_help("search");
         assert!(help.contains("--repo-text <REPO_TEXT>"));
+        assert!(help.contains("--profile <PROFILE>"));
+        assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("--why"));
         assert!(help.contains("auto"));
         assert!(help.contains("on"));
         assert!(help.contains("off"));
+    }
+
+    #[test]
+    fn packet_help_exposes_agent_runtime_selection() {
+        let help = render_subcommand_help("packet");
+        assert!(help.contains("--profile <PROFILE>"));
+        assert!(help.contains("--run-id <ID>"));
     }
 
     #[test]

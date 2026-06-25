@@ -184,7 +184,7 @@ fn ensure_retrieval_index_embedding_policy() -> Result<()> {
         .context("retrieval index embedding device policy")
 }
 
-fn activate_retrieval_profile_env(
+pub(crate) fn activate_retrieval_profile_env(
     profile: Option<crate::args::CliSidecarProfile>,
     run_id: Option<&str>,
 ) {
