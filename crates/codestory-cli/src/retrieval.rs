@@ -188,10 +188,10 @@ pub(crate) fn activate_retrieval_profile_env(
     profile: Option<crate::args::CliSidecarProfile>,
     run_id: Option<&str>,
 ) {
-    if let Some(profile) = profile {
+    if profile.is_some() || run_id.is_some() {
         let profile = match profile {
-            crate::args::CliSidecarProfile::Local => "local",
-            crate::args::CliSidecarProfile::Agent => "agent",
+            Some(crate::args::CliSidecarProfile::Local) => "local",
+            Some(crate::args::CliSidecarProfile::Agent) | None => "agent",
         };
         // SAFETY: retrieval CLI commands are short-lived processes and set this before sidecar
         // layout resolution or worker threads are started.
@@ -758,6 +758,39 @@ mod tests {
         assert!(
             message.contains("embedding_device_unverified"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn run_id_without_profile_selects_agent_over_ambient_local_profile() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _retrieval_profile = EnvGuard::set("CODESTORY_RETRIEVAL_PROFILE", "local");
+        let _sidecar_profile = EnvGuard::set("CODESTORY_SIDECAR_PROFILE", "local");
+        let _run_id = EnvGuard::remove("CODESTORY_SIDECAR_RUN_ID");
+
+        activate_retrieval_profile_env(None, Some("packet-search-eval"));
+
+        assert_eq!(
+            std::env::var("CODESTORY_RETRIEVAL_PROFILE").as_deref(),
+            Ok("agent")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_SIDECAR_RUN_ID").as_deref(),
+            Ok("packet-search-eval")
+        );
+
+        activate_retrieval_profile_env(
+            Some(crate::args::CliSidecarProfile::Local),
+            Some("explicit-local"),
+        );
+
+        assert_eq!(
+            std::env::var("CODESTORY_RETRIEVAL_PROFILE").as_deref(),
+            Ok("local")
+        );
+        assert_eq!(
+            std::env::var("CODESTORY_SIDECAR_RUN_ID").as_deref(),
+            Ok("explicit-local")
         );
     }
 
