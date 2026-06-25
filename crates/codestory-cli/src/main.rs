@@ -2122,11 +2122,12 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let sidecar = doctor_sidecar_status(&runtime);
+    let readiness_sidecar = agent_goal_readiness_sidecar_status(&runtime, &sidecar);
     let readiness = build_summary_readiness(
         &summary.root,
         &summary.stats,
         summary.freshness.as_ref(),
-        &sidecar,
+        &readiness_sidecar,
     );
     let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &readiness);
     let output =
@@ -10089,7 +10090,7 @@ fn build_doctor_output(
             "No indexed symbols are available yet.".to_string(),
         )
     });
-    checks.push(doctor_sidecar_check(&sidecar_retrieval));
+    checks.push(doctor_sidecar_check(&readiness_sidecar));
     if let Some(retrieval) = retrieval.as_ref() {
         checks.push(semantic_health_check(retrieval, &summary.stats));
         if retrieval.stored_embedding.is_some() {
@@ -10136,8 +10137,8 @@ fn build_doctor_output(
         storage_path,
         indexed,
         stats: summary.stats.clone(),
-        retrieval_mode: sidecar_retrieval.retrieval_mode.clone(),
-        degraded_reason: sidecar_retrieval.degraded_reason.clone(),
+        retrieval_mode: readiness_sidecar.retrieval_mode.clone(),
+        degraded_reason: readiness_sidecar.degraded_reason.clone(),
         sidecar_retrieval,
         retrieval,
         freshness: summary.freshness.clone(),
@@ -12170,6 +12171,98 @@ mod tests {
                 .as_ref()
                 .map(|sidecar| sidecar.retrieval_mode.as_str()),
             Some("full")
+        );
+        assert_eq!(doctor_sidecar_check(&selected).status, "ok");
+    }
+
+    #[test]
+    fn agent_preflight_allows_full_surfaces_from_full_agent_lane() {
+        let local_default = DoctorSidecarStatusOutput {
+            profile: Some("local".to_string()),
+            run_id: None,
+            retrieval_mode: "unavailable".to_string(),
+            degraded_reason: Some("retrieval_manifest_missing".to_string()),
+            manifest_generation: None,
+            manifest_input_hash: None,
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let agent_status = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let stats = StorageStatsDto {
+            node_count: 1,
+            edge_count: 0,
+            file_count: 1,
+            error_count: 0,
+            fatal_error_count: 0,
+        };
+        let verdicts = build_summary_readiness("C:/repo", &stats, None, &agent_status);
+        let agent_verdict = verdicts
+            .iter()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);
+        let mut readiness_lanes = BTreeMap::new();
+        readiness_lanes.insert(
+            "local_default".to_string(),
+            readiness_lane_output("local_default", &local_default, None, "C:/repo"),
+        );
+        readiness_lanes.insert(
+            "agent_packet_search".to_string(),
+            readiness_lane_output(
+                "agent_packet_search",
+                &agent_status,
+                agent_verdict,
+                "C:/repo",
+            ),
+        );
+
+        let output = build_agent_preflight_output(&verdicts, Path::new("C:/repo"), readiness_lanes);
+
+        assert!(output.usable);
+        assert_eq!(output.mode, "full_retrieval");
+        assert_eq!(output.full_retrieval.status, ReadinessStatusDto::Ready);
+        assert_eq!(
+            output.local_default.status,
+            ReadinessStatusDto::RepairRetrieval
+        );
+        assert!(
+            output
+                .local_default
+                .next_command
+                .as_deref()
+                .is_some_and(|command| command.contains("--profile local")),
+            "local/default blocker should name its lane-scoped next action: {output:#?}"
+        );
+        for surface in ["packet_full", "search_full", "context_full"] {
+            assert!(
+                output
+                    .safe_surfaces
+                    .iter()
+                    .any(|candidate| candidate == surface),
+                "{surface} should be safe from the agent readiness lane: {output:#?}"
+            );
+            assert!(
+                !output
+                    .blocked_surfaces
+                    .iter()
+                    .any(|candidate| candidate == surface),
+                "{surface} should not be blocked by local/default retrieval: {output:#?}"
+            );
+        }
+        assert!(
+            output.repair_command.is_none(),
+            "ready local graph plus ready agent retrieval should not emit an aggregate repair command: {output:#?}"
         );
     }
 
