@@ -292,7 +292,7 @@ fn sidecar_runtime_mismatch(
     })
 }
 
-fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
+pub(crate) fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
     format!(
         "profile={} namespace={} state={} zoekt={} qdrant={} scip={}",
         runtime.profile.as_str(),
