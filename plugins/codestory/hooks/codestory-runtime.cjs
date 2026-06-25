@@ -209,6 +209,17 @@ function writeDirtyMarker(projectRoot, options = {}) {
 
   try {
     fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    const existing = readJson(markerPath);
+    const existingSample = Array.isArray(existing?.path_sample) ? existing.path_sample : [];
+    if (
+      existing?.schema_version === marker.schema_version
+      && existing?.project_root === marker.project_root
+      && existing?.dirty === marker.dirty
+      && existing?.source === marker.source
+      && JSON.stringify(existingSample) === JSON.stringify(pathSample)
+    ) {
+      return { path: markerPath, marker: existing, unchanged: true };
+    }
     fs.writeFileSync(markerPath, JSON.stringify(marker, null, 2));
     return { path: markerPath, marker };
   } catch {

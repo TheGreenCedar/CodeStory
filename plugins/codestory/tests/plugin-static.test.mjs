@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -156,6 +156,14 @@ test("dirty marker writer stores one project-keyed marker under plugin data", as
       source: "test-hook",
       pathSample: ["src/lib.rs", "src/changed.rs", ""],
     });
+    const firstStat = await stat(first.path);
+    const repeat = writeDirtyMarker(projectRoot, {
+      pluginDataDir: dataDir,
+      dirty: true,
+      source: "test-hook",
+      pathSample: ["src/lib.rs", "src/changed.rs", ""],
+    });
+    const repeatStat = await stat(first.path);
     const second = writeDirtyMarker(projectRoot, {
       pluginDataDir: dataDir,
       dirty: false,
@@ -163,8 +171,11 @@ test("dirty marker writer stores one project-keyed marker under plugin data", as
     });
 
     assert.ok(first);
+    assert.ok(repeat);
     assert.ok(second);
+    assert.equal(repeat.unchanged, true);
     assert.equal(first.path, second.path);
+    assert.equal(repeatStat.mtimeMs, firstStat.mtimeMs);
     assert.equal(first.path, dirtyMarkerPathForProject(projectRoot, dataDir));
     const marker = JSON.parse(await readFile(second.path, "utf8"));
     assert.equal(marker.schema_version, 1);

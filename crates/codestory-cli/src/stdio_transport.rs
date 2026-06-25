@@ -1245,6 +1245,24 @@ fn stdio_storage_fingerprint(storage_path: &std::path::Path) -> String {
     parts.join("|")
 }
 
+fn stdio_storage_modified(
+    storage_path: &std::path::Path,
+) -> std::io::Result<std::time::SystemTime> {
+    let paths = [
+        storage_path.to_path_buf(),
+        storage_path.with_extension("db-wal"),
+        storage_path.with_extension("db-shm"),
+    ];
+    let mut newest: Option<std::time::SystemTime> = None;
+    for path in paths {
+        let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        newest = Some(newest.map_or(modified, |current| current.max(modified)));
+    }
+    newest.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "storage state missing"))
+}
+
 fn stdio_mandatory_sidecar_fingerprint(
     project_root: &std::path::Path,
     storage_path: &std::path::Path,
@@ -2298,7 +2316,7 @@ fn stdio_dirty_marker_status(project_root: &Path, storage_path: &Path) -> StdioD
         };
     }
     let marker_modified = fs::metadata(&path).and_then(|metadata| metadata.modified());
-    let storage_modified = fs::metadata(storage_path).and_then(|metadata| metadata.modified());
+    let storage_modified = stdio_storage_modified(storage_path);
     match (marker_modified, storage_modified) {
         (Ok(marker_modified), Ok(storage_modified)) if marker_modified > storage_modified => {
             StdioDirtyMarkerStatus {

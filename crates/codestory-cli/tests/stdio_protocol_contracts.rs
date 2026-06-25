@@ -106,6 +106,35 @@ fn indexed_fixture() -> StdioFixture {
     indexed_fixture_with_embedding_mode(true)
 }
 
+fn write_dirty_marker_fixture(fixture: &StdioFixture, name: &str, marker: Value) -> PathBuf {
+    let marker_path = fixture.cache_dir.path().join(name);
+    thread::sleep(Duration::from_millis(25));
+    fs::write(&marker_path, marker.to_string()).expect("write dirty marker");
+    marker_path
+}
+
+fn refresh_fixture_index(fixture: &StdioFixture) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("incremental")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(fixture.workspace.path())
+        .arg("--cache-dir")
+        .arg(fixture.cache_dir.path());
+    apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
+    let output = command.output().expect("run index refresh");
+    assert!(
+        output.status.success(),
+        "index refresh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
     let workspace = tempfile::tempdir().expect("workspace dir");
     let cache_dir = tempfile::tempdir().expect("cache dir");
@@ -2348,10 +2377,9 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
 #[test]
 fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
     let mut fixture = indexed_fixture();
-    let marker_path = fixture.cache_dir.path().join("dirty-marker.json");
-    thread::sleep(Duration::from_millis(25));
-    fs::write(
-        &marker_path,
+    let marker_path = write_dirty_marker_fixture(
+        &fixture,
+        "dirty-marker.json",
         json!({
             "schema_version": 1,
             "project_root": fixture.workspace.path().to_string_lossy(),
@@ -2359,10 +2387,8 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
             "updated_at": "2026-06-25T00:00:00.000Z",
             "source": "test-hook",
             "path_sample": ["src/runtime.rs"]
-        })
-        .to_string(),
-    )
-    .expect("write dirty marker");
+        }),
+    );
     fixture.dirty_marker_path = Some(marker_path.clone());
     fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
     let mut server = spawn_stdio_server(&fixture);
@@ -2401,6 +2427,56 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
     );
     assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
     assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
+    );
+}
+
+#[test]
+fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
+    let mut fixture = indexed_fixture();
+    let marker_path = write_dirty_marker_fixture(
+        &fixture,
+        "dirty-marker-wal-indexed.json",
+        json!({
+            "schema_version": 1,
+            "project_root": fixture.workspace.path().to_string_lossy(),
+            "dirty": true,
+            "updated_at": "2026-06-25T00:00:00.000Z",
+            "source": "test-hook",
+            "path_sample": ["src/runtime.rs"]
+        }),
+    );
+    thread::sleep(Duration::from_millis(1200));
+    refresh_fixture_index(&fixture);
+    fixture.dirty_marker_path = Some(marker_path.clone());
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-dirty-marker-indexed",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-dirty-marker-indexed"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("dirty_indexed"));
+    assert_eq!(status["dirty_marker"]["dirty"], json!(true));
+    assert_eq!(
+        status["dirty_marker"]["blocks_local_surfaces"],
+        json!(false)
+    );
+    assert_fresh_freshness_counts(&status, "dirty marker older than full storage state");
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
     assert_allowed_surface(
         &status,
         "packet",
@@ -2451,6 +2527,110 @@ fn resources_read_status_reports_unknown_dirty_marker_without_blocking_local_ind
         "agent_packet_search",
         "repair_retrieval",
     );
+}
+
+#[test]
+fn resources_read_status_dirty_marker_fail_open_matrix() {
+    let cases = [
+        ("missing", None, json!("missing"), None, None),
+        (
+            "schema",
+            Some(json!({
+                "schema_version": 99,
+                "project_root": "__PROJECT_ROOT__",
+                "dirty": true,
+                "updated_at": "2026-06-25T00:00:00.000Z",
+                "source": "test-hook",
+                "path_sample": []
+            })),
+            json!("unknown"),
+            Some(json!("schema_version_unsupported")),
+            None,
+        ),
+        (
+            "root",
+            Some(json!({
+                "schema_version": 1,
+                "project_root": "C:/different/project",
+                "dirty": true,
+                "updated_at": "2026-06-25T00:00:00.000Z",
+                "source": "test-hook",
+                "path_sample": []
+            })),
+            json!("unknown"),
+            Some(json!("project_root_mismatch")),
+            None,
+        ),
+        (
+            "clean",
+            Some(json!({
+                "schema_version": 1,
+                "project_root": "__PROJECT_ROOT__",
+                "dirty": false,
+                "updated_at": "2026-06-25T00:00:00.000Z",
+                "source": "test-hook",
+                "path_sample": []
+            })),
+            json!("clean"),
+            None,
+            Some(json!(false)),
+        ),
+    ];
+
+    for (name, marker, expected_status, expected_reason, expected_dirty) in cases {
+        let mut fixture = indexed_fixture();
+        let marker_path = fixture
+            .cache_dir
+            .path()
+            .join(format!("dirty-marker-{name}.json"));
+        if let Some(mut marker) = marker {
+            if marker["project_root"] == json!("__PROJECT_ROOT__") {
+                marker["project_root"] = json!(fixture.workspace.path().to_string_lossy());
+            }
+            fs::write(&marker_path, marker.to_string()).expect("write marker");
+        }
+        fixture.dirty_marker_path = Some(marker_path);
+        fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+        let mut server = spawn_stdio_server(&fixture);
+
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("status-dirty-marker-{name}"),
+                "method": "resources/read",
+                "params": {"uri": "codestory://status"}
+            }),
+        );
+        let result =
+            assert_success_envelope(&response, json!(format!("status-dirty-marker-{name}")));
+        let status = json_resource_content(result, "codestory://status");
+
+        assert_eq!(
+            status["dirty_marker"]["status"], expected_status,
+            "{name}: {status}"
+        );
+        assert_eq!(
+            status["dirty_marker"]["blocks_local_surfaces"],
+            json!(false),
+            "{name}: {status}"
+        );
+        if let Some(reason) = expected_reason {
+            assert_eq!(status["dirty_marker"]["reason"], reason, "{name}: {status}");
+        }
+        if let Some(dirty) = expected_dirty {
+            assert_eq!(status["dirty_marker"]["dirty"], dirty, "{name}: {status}");
+        }
+        assert_fresh_freshness_counts(&status, name);
+        assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+        assert_allowed_surface(
+            &status,
+            "packet",
+            false,
+            "agent_packet_search",
+            "repair_retrieval",
+        );
+    }
 }
 
 #[test]
@@ -3093,6 +3273,51 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
             }),
         "agent guide should include safety notes: {guide}"
     );
+}
+
+#[test]
+#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
+fn resources_read_status_keeps_dirty_marker_separate_from_full_sidecar_readiness() {
+    let Some(mut fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}"))
+    else {
+        return;
+    };
+    let marker_path = write_dirty_marker_fixture(
+        &fixture,
+        "dirty-marker-full-sidecar.json",
+        json!({
+            "schema_version": 1,
+            "project_root": fixture.workspace.path().to_string_lossy(),
+            "dirty": true,
+            "updated_at": "2026-06-25T00:00:00.000Z",
+            "source": "test-hook",
+            "path_sample": ["src/runtime.rs"]
+        }),
+    );
+    fixture.dirty_marker_path = Some(marker_path);
+    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "full-retrieval-dirty-marker-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(
+        &status_response,
+        json!("full-retrieval-dirty-marker-status"),
+    );
+    let status = json_resource_content(status_result, "codestory://status");
+
+    assert_eq!(status["dirty_marker"]["status"], json!("dirty_stale"));
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    for surface in ["packet", "search", "context"] {
+        assert_allowed_surface(&status, surface, true, "agent_packet_search", "ready");
+    }
 }
 
 #[test]
