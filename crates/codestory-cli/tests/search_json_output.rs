@@ -355,12 +355,17 @@ fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
 fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());
+    let run_id = "search-json-sidecar";
 
     let bootstrap = run_cli(
         workspace.path(),
         &[
             "retrieval",
             "bootstrap",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
             "--wait-secs",
             "30",
             "--format",
@@ -388,6 +393,10 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
         &[
             "retrieval",
             "index",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
             "--refresh",
             "none",
             "--format",
@@ -402,7 +411,16 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
 
     let status = run_cli(
         workspace.path(),
-        &["retrieval", "status", "--format", "json"],
+        &[
+            "retrieval",
+            "status",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
+            "--format",
+            "json",
+        ],
     );
     assert!(
         status.status.success(),
@@ -413,7 +431,12 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     assert_eq!(
         status_json["retrieval_mode"],
         Value::String("full".to_string()),
-        "live full-sidecar fixture must report retrieval_mode=full: {status_json:#}"
+        "live full-sidecar fixture must report agent retrieval_mode=full: {status_json:#}"
+    );
+    assert_eq!(
+        status_json["ownership"]["profile"],
+        Value::String("agent".to_string()),
+        "live full-sidecar fixture must prepare the agent sidecar profile: {status_json:#}"
     );
 
     let search = run_cli(
@@ -1707,6 +1730,28 @@ fn field_qualified_search_filters_kind_path_name_and_language() {
 fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
+    let run_id = "search-quality-eval";
+
+    let bootstrap = run_cli(
+        workspace.path(),
+        &[
+            "retrieval",
+            "bootstrap",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
+            "--wait-secs",
+            "30",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        bootstrap.status.success(),
+        "retrieval bootstrap failed; search quality eval fixture is blocked: {}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
 
     let index = run_cli(
         workspace.path(),
@@ -1722,6 +1767,10 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         &[
             "retrieval",
             "index",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
             "--refresh",
             "full",
             "--format",
@@ -1732,6 +1781,35 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         retrieval_index.status.success(),
         "retrieval index command failed: {}",
         String::from_utf8_lossy(&retrieval_index.stderr)
+    );
+    let status = run_cli(
+        workspace.path(),
+        &[
+            "retrieval",
+            "status",
+            "--profile",
+            "agent",
+            "--run-id",
+            run_id,
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        status.status.success(),
+        "agent retrieval status failed after retrieval index: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: Value = serde_json::from_slice(&status.stdout).expect("parse status json");
+    assert_eq!(
+        status_json["retrieval_mode"],
+        Value::String("full".to_string()),
+        "search quality eval must report agent retrieval_mode=full before scoring: {status_json:#}"
+    );
+    assert_eq!(
+        status_json["ownership"]["profile"],
+        Value::String("agent".to_string()),
+        "search quality eval must prepare the agent sidecar profile before scoring: {status_json:#}"
     );
 
     let expectations = [
