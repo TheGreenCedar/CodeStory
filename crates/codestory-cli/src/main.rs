@@ -79,9 +79,9 @@ use args::{
     IndexCommand, IndexDryRunOutput, IndexOutput, PacketCommand, ProjectArgs, QueryCommand,
     QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadyCommand, ReadyOutput,
     RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
-    SetupCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput, SymbolCommand,
-    SymbolJsonOutput, TaskAction, TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput,
-    VerificationTargetOutput, build_trail_request,
+    SetupCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand,
+    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, TaskAction, TaskBriefCommand, TaskCommand,
+    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -207,6 +207,19 @@ fn main() -> Result<()> {
         Command::Serve(cmd) => run_serve(cmd),
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
+        Command::Sidecar(cmd) => run_sidecar(cmd),
+    }
+}
+
+fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
+    match cmd.action {
+        SidecarAction::Status(status_cmd) => retrieval::run_retrieval_status(status_cmd),
+        SidecarAction::Unknown(args) => {
+            let subcommand = args.first().map(String::as_str).unwrap_or("<unknown>");
+            bail!(
+                "unknown sidecar subcommand `{subcommand}`; use `codestory-cli sidecar status` or `codestory-cli retrieval status`"
+            )
+        }
     }
 }
 
