@@ -93,6 +93,20 @@ def read_json_file(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def require_plugin_manifest_version(plugin_root: Path, expected_version: str) -> None:
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    require(manifest_path.is_file(), "plugin_manifest", manifest_path, f"plugin manifest is missing: {manifest_path}")
+    manifest = read_json_file(manifest_path)
+    require(isinstance(manifest, dict), "plugin_manifest", manifest_path, "plugin manifest is not a JSON object")
+    actual = manifest.get("version")
+    require(
+        actual == expected_version,
+        "plugin_manifest",
+        manifest_path,
+        f"plugin manifest version is {actual!r}, expected {expected_version!r}",
+    )
+
+
 def run_command(
     cli: Path,
     layer: str,
@@ -312,7 +326,15 @@ def stdio_status(cli: Path, project: Path, artifact: Path, timeout_secs: int) ->
     )
 
 
-def plugin_stdio_status(plugin_root: Path, release_dir: Path, project: Path, artifact: Path, timeout_secs: int) -> dict:
+def plugin_stdio_status(
+    plugin_root: Path,
+    release_dir: Path,
+    project: Path,
+    artifact: Path,
+    timeout_secs: int,
+    expected_version: str,
+) -> dict:
+    require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
     require(launcher.is_file(), "plugin_stdio", artifact, f"plugin launcher is missing: {launcher}")
     with tempfile.TemporaryDirectory(prefix="codestory-plugin-data-", dir=artifact.parent) as data:
@@ -498,6 +520,12 @@ def require_plugin_stdio_ready(status: dict, artifact: Path, expected_version: s
     require_stdio_ready(status, artifact, expected_version)
     plugin_runtime = status.get("plugin_runtime")
     require(isinstance(plugin_runtime, dict), "plugin_stdio", artifact, "status missing plugin_runtime")
+    require(
+        plugin_runtime.get("plugin_version") == expected_version,
+        "plugin_stdio",
+        artifact,
+        f"plugin_runtime.plugin_version is {plugin_runtime.get('plugin_version')!r}, expected {expected_version!r}",
+    )
     require(
         plugin_runtime.get("cli_source") == "managed",
         "plugin_stdio",
@@ -767,6 +795,7 @@ def run_gate(args: argparse.Namespace) -> None:
                 project,
                 plugin_stdio_artifact,
                 args.timeout_secs,
+                args.expected_version,
             )
             require_plugin_stdio_ready(plugin_status, plugin_stdio_artifact, args.expected_version)
             summary["artifacts"]["plugin_stdio"] = str(plugin_stdio_artifact)
@@ -942,6 +971,18 @@ def self_test() -> None:
             assert "version.txt" in str(exc.artifact)
         else:
             raise AssertionError("version mismatch should fail the gate")
+
+        plugin_root = root / "plugin"
+        plugin_manifest = plugin_root / ".codex-plugin" / "plugin.json"
+        plugin_manifest.parent.mkdir(parents=True)
+        plugin_manifest.write_text(json.dumps({"version": "9.9.8"}), encoding="utf-8")
+        try:
+            require_plugin_manifest_version(plugin_root, "9.9.9")
+        except GateFailure as exc:
+            assert exc.layer == "plugin_manifest"
+            assert exc.artifact == plugin_manifest
+        else:
+            raise AssertionError("plugin manifest version mismatch should fail the gate")
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "doctor_stderr"
         try:
