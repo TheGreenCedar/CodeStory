@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -849,6 +850,20 @@ async function writeNodeCli(binDir, source) {
   return cliPath;
 }
 
+function runCodexHook(input, env) {
+  const result = spawnSync(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
+    env: {
+      ...process.env,
+      COPILOT_PLUGIN_DATA: "",
+      ...env,
+    },
+    input: JSON.stringify(input),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
 test("hook output keeps CodeStory ambient and checks MCP before CLI fallback", async () => {
   const { spawnSync } = await import("node:child_process");
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
@@ -1013,7 +1028,7 @@ test("hook failed preflight switches degraded guidance to bounded source fallbac
   }
 });
 
-test("hook dedupes repeated request grounding instructions within plugin state", async () => {
+test("hook dedupes repeated request prompts within plugin state", async () => {
   const { spawnSync } = await import("node:child_process");
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-dedupe-"));
   const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-dedupe-bin-"));
@@ -1047,11 +1062,63 @@ test("hook dedupes repeated request grounding instructions within plugin state",
       assert.equal(first.status, 0, first.stderr);
       assert.equal(second.status, 0, second.stderr);
       const firstContext = JSON.parse(first.stdout).hookSpecificOutput.additionalContext;
-      const secondContext = JSON.parse(second.stdout).hookSpecificOutput.additionalContext;
-      assert.match(firstContext, /CODESTORY BACKGROUND GROUNDING ACTIVE/u);
-      assert.doesNotMatch(secondContext, /CODESTORY BACKGROUND GROUNDING ACTIVE/u);
-      assert.match(secondContext, /CODESTORY HOOK REQUEST PACKET/u);
-      assert.match(secondContext, /packet ok/u);
+      const secondOutput = JSON.parse(second.stdout);
+      assert.match(firstContext, /event_taxonomy: user_prompt/u);
+      assert.match(firstContext, /Packet skipped: sidecar-backed packet\/search readiness is not proven full/u);
+      assert.equal(Object.hasOwn(secondOutput, "hookSpecificOutput"), false);
+    });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("hook invokes packet when agent packet search readiness is ready", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-packet-ready-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-packet-ready-bin-"));
+  const logFile = join(dataDir, "calls.jsonl");
+
+  try {
+    const cliPath = await writeNodeCli(
+      binDir,
+      [
+        "const fs = require('fs');",
+        "const args = process.argv.slice(2);",
+        "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
+        "if (args[0] === 'ready') {",
+        "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', index: { freshness: { status: 'fresh', changed_file_count: 0, new_file_count: 0, removed_file_count: 0 } } }] }));",
+        "  process.exit(0);",
+        "}",
+        "if (args[0] === 'packet') { console.log('packet ok'); process.exit(0); }",
+        "process.exit(2);",
+      ].join("\n"),
+    );
+    await withTempHookInstall(async (installRoot) => {
+      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
+      const result = spawnSync(process.execPath, [hookPath], {
+        env: {
+          ...process.env,
+          CODESTORY_CLI: cliPath,
+          COPILOT_PLUGIN_DATA: "",
+          PLUGIN_DATA: dataDir,
+          TEST_LOG: logFile,
+        },
+        input: JSON.stringify({
+          hook_event_name: "UserPromptSubmit",
+          prompt: "Where is RefreshMode defined?",
+          cwd: repoRoot,
+        }),
+        encoding: "utf8",
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+      assert.match(context, /packet ok/u);
+      const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+      assert.deepEqual(calls.map((args) => args[0]), ["ready", "packet"]);
+      assert.deepEqual(calls[0].slice(0, 4), ["ready", "--goal", "agent", "--project"]);
+      assert.deepEqual(calls[1].slice(0, 4), ["packet", "--project", repoRoot, "--question"]);
     });
   } finally {
     await rm(dataDir, { recursive: true, force: true });
@@ -1084,6 +1151,11 @@ test("hook resets instruction dedupe on fresh startup session boundary", async (
         source: "resume",
         cwd: repoRoot,
       });
+      const clearInput = JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "clear",
+        cwd: repoRoot,
+      });
       const firstStartup = spawnSync(process.execPath, [hookPath], {
         env,
         input: startupInput,
@@ -1094,6 +1166,11 @@ test("hook resets instruction dedupe on fresh startup session boundary", async (
         input: resumeInput,
         encoding: "utf8",
       });
+      const clear = spawnSync(process.execPath, [hookPath], {
+        env,
+        input: clearInput,
+        encoding: "utf8",
+      });
       const secondStartup = spawnSync(process.execPath, [hookPath], {
         env,
         input: startupInput,
@@ -1102,16 +1179,140 @@ test("hook resets instruction dedupe on fresh startup session boundary", async (
 
       assert.equal(firstStartup.status, 0, firstStartup.stderr);
       assert.equal(resume.status, 0, resume.stderr);
+      assert.equal(clear.status, 0, clear.stderr);
       assert.equal(secondStartup.status, 0, secondStartup.stderr);
       const firstContext = JSON.parse(firstStartup.stdout).hookSpecificOutput.additionalContext;
       const resumeContext = JSON.parse(resume.stdout).hookSpecificOutput.additionalContext;
+      const clearContext = JSON.parse(clear.stdout).hookSpecificOutput.additionalContext;
       const secondContext = JSON.parse(secondStartup.stdout).hookSpecificOutput.additionalContext;
       const fullInstructions = /CODESTORY BACKGROUND GROUNDING (?:ACTIVE|RULES)/u;
       assert.match(firstContext, fullInstructions);
       assert.doesNotMatch(resumeContext, fullInstructions);
+      assert.match(clearContext, fullInstructions);
+      assert.match(clearContext, /ground ok/u);
       assert.match(secondContext, fullInstructions);
       assert.match(secondContext, /ground ok/u);
     });
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("hook prompt output dedupes repeated prompts", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-prompt-dedupe-"));
+  const env = {
+    PLUGIN_DATA: dataDir,
+    PATH: "",
+  };
+
+  try {
+    const first = runCodexHook({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Where is RefreshMode defined?",
+      cwd: repoRoot,
+    }, env);
+    const second = runCodexHook({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Where is RefreshMode defined?",
+      cwd: repoRoot,
+    }, env);
+    const third = runCodexHook({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Where is strict_sidecar_status defined?",
+      cwd: repoRoot,
+    }, env);
+
+    assert.match(first.hookSpecificOutput.additionalContext, /event_taxonomy: user_prompt/u);
+    assert.equal(Object.hasOwn(second, "hookSpecificOutput"), false);
+    assert.match(third.hookSpecificOutput.additionalContext, /Where is strict_sidecar_status defined\?/u);
+    const stateText = await readFile(join(dataDir, ".codestory-hook-output-state.json"), "utf8");
+    const promptHash = createHash("sha256")
+      .update("Where is RefreshMode defined?")
+      .digest("hex")
+      .slice(0, 16);
+    assert.match(stateText, new RegExp(`prompt:${promptHash}`, "u"));
+    assert.doesNotMatch(stateText, /Where is RefreshMode defined/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("hook resume and compact output use short runtime caps", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-short-events-"));
+  const env = {
+    PLUGIN_DATA: dataDir,
+    PATH: "",
+  };
+
+  try {
+    for (const source of ["resume", "compact"]) {
+      const output = runCodexHook({
+        hook_event_name: "SessionStart",
+        source,
+        cwd: repoRoot,
+      }, env);
+      const context = output.hookSpecificOutput.additionalContext;
+      assert.match(context, new RegExp(`event_taxonomy: ${source}`, "u"));
+      assert.match(context, /output_cap_chars: 2200/u);
+      assert.equal(context.length <= 2200, true, `${source} context length ${context.length}`);
+      assert.doesNotMatch(context, /CODESTORY BACKGROUND GROUNDING RULES/u);
+      assert.doesNotMatch(context, /attempted session ground/u);
+    }
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("hook goal heartbeat is quiet until readiness or freshness evidence changes", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-bin-"));
+  const cliPath = await writeNodeCli(
+    binDir,
+    [
+      "const status = process.env.TEST_AGENT_STATUS || 'repair_retrieval';",
+      "const freshness = process.env.TEST_FRESHNESS_STATUS || 'stale';",
+      "const changed = Number(process.env.TEST_CHANGED_FILES || 1);",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'ready') {",
+      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status, index: { freshness: { status: freshness, changed_file_count: changed, new_file_count: 0, removed_file_count: 0 } } }] }));",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+    ].join("\n"),
+  );
+  const env = {
+    PLUGIN_DATA: dataDir,
+    CODESTORY_CLI: cliPath,
+    TEST_AGENT_STATUS: "repair_retrieval",
+    TEST_FRESHNESS_STATUS: "stale",
+    TEST_CHANGED_FILES: "1",
+    PATH: "",
+  };
+
+  try {
+    const first = runCodexHook({
+      hook_event_name: "GoalLoopHeartbeat",
+      cwd: repoRoot,
+    }, env);
+    assert.equal(Object.hasOwn(first, "hookSpecificOutput"), false);
+
+    env.TEST_AGENT_STATUS = "ready";
+    env.TEST_FRESHNESS_STATUS = "fresh";
+    env.TEST_CHANGED_FILES = "0";
+    const changed = runCodexHook({
+      hook_event_name: "GoalLoopHeartbeat",
+      cwd: repoRoot,
+    }, env);
+    assert.match(changed.hookSpecificOutput.additionalContext, /event_taxonomy: goal_heartbeat/u);
+    assert.match(changed.hookSpecificOutput.additionalContext, /agent_readiness_evidence: agent_packet_search=ready/u);
+    assert.match(changed.hookSpecificOutput.additionalContext, /freshness_evidence: fresh changed=0 new=0 removed=0/u);
+
+    const repeated = runCodexHook({
+      hook_event_name: "GoalLoopHeartbeat",
+      cwd: repoRoot,
+    }, env);
+    assert.equal(Object.hasOwn(repeated, "hookSpecificOutput"), false);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });

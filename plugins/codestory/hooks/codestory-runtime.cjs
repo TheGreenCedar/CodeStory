@@ -5,6 +5,7 @@ const isCopilot = Boolean(process.env.COPILOT_PLUGIN_DATA);
 const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
 
 const STATE_FILE = '.codestory-active';
+const HOOK_STATE_FILE = '.codestory-hook-output-state.json';
 const MCP_RUNTIME_FILE = '.codestory-mcp-runtime.json';
 
 function pluginDataDir() {
@@ -146,6 +147,27 @@ function rememberActiveState(state) {
   }
 }
 
+function readHookState() {
+  const stateDir = pluginDataDir();
+  if (!stateDir) return {};
+  return readJson(path.join(stateDir, HOOK_STATE_FILE)) || {};
+}
+
+function writeHookState(state) {
+  const stateDir = pluginDataDir();
+  if (!stateDir) return;
+
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, HOOK_STATE_FILE), JSON.stringify({
+      ...state,
+      updatedAt: new Date().toISOString(),
+    }));
+  } catch (e) {
+    // Best effort only. Hook state must not block the host session.
+  }
+}
+
 function writeHookOutput(event, context) {
   if (isCopilot) {
     process.stdout.write(JSON.stringify({ additionalContext: context }));
@@ -173,6 +195,8 @@ module.exports = {
   classifyMcpRuntime,
   mcpDetectionText,
   readActiveState,
+  readHookState,
   rememberActiveState,
+  writeHookState,
   writeHookOutput,
 };
