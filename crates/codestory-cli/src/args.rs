@@ -85,6 +85,10 @@ pub(crate) enum Command {
     DrillSuite(DrillSuiteCommand),
     #[command(about = "Inspect a symbol by query or id.")]
     Symbol(SymbolCommand),
+    #[command(about = "Summarize symbol-centered impact, callers, surfaces, and tests.")]
+    Impact(SymbolWorkflowCommand),
+    #[command(about = "Map a symbol to focused test-like files and caller evidence.")]
+    TestMap(SymbolWorkflowCommand),
     #[command(about = "Trace calls, refs, and related symbols.")]
     Trail(TrailCommand),
     #[command(about = "Show incoming callers for a symbol.")]
@@ -1121,6 +1125,38 @@ pub(crate) struct TrailCommand {
     pub(crate) output_file: Option<PathBuf>,
     #[arg(long, help = "Render a Mermaid graph instead of Markdown/JSON output.")]
     pub(crate) mermaid: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SymbolWorkflowCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+    #[arg(long, default_value_t = 3)]
+    pub(crate) depth: u32,
+    #[arg(long, default_value_t = 120)]
+    pub(crate) max_nodes: u32,
+    #[arg(
+        long,
+        help = "Include test and benchmark callers in caller trail evidence."
+    )]
+    pub(crate) include_tests: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -2485,7 +2521,7 @@ mod tests {
     fn read_commands_explain_refresh_none_default() {
         for name in [
             "ground", "context", "search", "symbol", "trail", "callers", "callees", "trace",
-            "snippet", "query", "explore", "serve",
+            "impact", "test-map", "snippet", "query", "explore", "serve",
         ] {
             let help = render_subcommand_help(name);
             assert!(
@@ -2633,10 +2669,48 @@ mod tests {
     }
 
     #[test]
+    fn symbol_workflow_commands_parse_target_and_caps() {
+        let impact = Cli::try_parse_from([
+            "codestory-cli",
+            "impact",
+            "--query",
+            "AppController::affected_analysis",
+            "--depth",
+            "4",
+            "--max-nodes",
+            "80",
+        ])
+        .expect("impact command should parse");
+        match impact.command {
+            Command::Impact(cmd) => {
+                assert_eq!(
+                    cmd.target.query.as_deref(),
+                    Some("AppController::affected_analysis")
+                );
+                assert_eq!(cmd.depth, 4);
+                assert_eq!(cmd.max_nodes, 80);
+                assert!(!cmd.include_tests);
+            }
+            _ => panic!("expected impact command"),
+        }
+
+        let test_map = Cli::try_parse_from(["codestory-cli", "test-map", "--id", "node-1"])
+            .expect("test-map command should parse");
+        match test_map.command {
+            Command::TestMap(cmd) => {
+                assert_eq!(cmd.target.id.as_deref(), Some("node-1"));
+                assert_eq!(cmd.depth, 3);
+                assert_eq!(cmd.max_nodes, 120);
+            }
+            _ => panic!("expected test-map command"),
+        }
+    }
+
+    #[test]
     fn non_trail_help_does_not_advertise_dot_format() {
         for name in [
-            "index", "ground", "context", "doctor", "search", "symbol", "snippet", "query",
-            "explore",
+            "index", "ground", "context", "doctor", "search", "symbol", "impact", "test-map",
+            "snippet", "query", "explore",
         ] {
             let help = render_subcommand_help(name);
             assert!(
