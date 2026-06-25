@@ -404,7 +404,7 @@ fn detect_windows_amd_gpu() -> Option<HostGpuDetection> {
 }
 
 fn windows_video_controller_probe_script() -> &'static str {
-    r#"$job = Start-Job -ScriptBlock { Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) $($_.AdapterCompatibility)" } }; if (Wait-Job $job -Timeout 2) { Receive-Job $job; Remove-Job $job -Force } else { Stop-Job $job; Remove-Job $job -Force; exit 124 }"#
+    r#"$job = Start-Job -ScriptBlock { Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) $($_.AdapterCompatibility)" } }; if (Wait-Job $job -Timeout 10) { Receive-Job $job; Remove-Job $job -Force } else { Stop-Job $job; Remove-Job $job -Force; exit 124 }"#
 }
 
 fn detect_amd_gpu_from_windows_video_controller(output: &str) -> Option<HostGpuDetection> {
@@ -913,7 +913,7 @@ mod tests {
     fn windows_video_controller_probe_script_has_timeout() {
         let script = windows_video_controller_probe_script();
 
-        assert!(script.contains("Wait-Job $job -Timeout 2"));
+        assert!(script.contains("Wait-Job $job -Timeout 10"));
         assert!(script.contains("AdapterCompatibility"));
         assert!(script.contains("Stop-Job $job"));
         assert!(script.contains("exit 124"));
