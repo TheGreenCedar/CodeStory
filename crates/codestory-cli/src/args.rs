@@ -115,6 +115,8 @@ pub(crate) enum Command {
     GenerateCompletions(GenerateCompletionsCommand),
     #[command(about = "Manage retrieval sidecar data.")]
     Retrieval(RetrievalCommand),
+    #[command(about = "Show retrieval sidecar status.")]
+    Sidecar(SidecarCommand),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -813,6 +815,20 @@ pub(crate) struct RetrievalStatusCommand {
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
     pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SidecarCommand {
+    #[command(subcommand)]
+    pub(crate) action: SidecarAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SidecarAction {
+    /// Alias for `retrieval status`.
+    Status(RetrievalStatusCommand),
+    #[command(external_subcommand)]
+    Unknown(Vec<String>),
 }
 
 #[derive(Args, Debug)]

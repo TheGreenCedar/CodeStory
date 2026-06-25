@@ -97,7 +97,7 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
+pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let profile = cmd

@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 
 const { spawnSync } = require('child_process');
-const { getCodeStoryInstructions } = require('./codestory-instructions.cjs');
-const { rememberActiveState, writeHookOutput } = require('./codestory-runtime.cjs');
+const { eventHeader, getCodeStoryInstructions } = require('./codestory-instructions.cjs');
+const {
+  classifyMcpRuntime,
+  mcpDetectionText,
+  rememberActiveState,
+  writeHookOutput,
+} = require('./codestory-runtime.cjs');
 
 const MAX_OUTPUT_CHARS = 12000;
 const RUNTIME_TIMEOUT_MS = 3500;
@@ -76,6 +81,18 @@ function runCodeStory(input, event) {
 
   const command = hookCommand(input, event);
   if (!command) return null;
+  const mcp = classifyMcpRuntime();
+  if (mcp.mcp_config_installed && mcp.mcp_process_launchable) {
+    return {
+      kind: 'mcp detection',
+      output: [
+        mcpDetectionText(mcp),
+        mcp.mcp_resources_exposed
+          ? 'Use codestory://status as the active runtime truth before CLI fallback.'
+          : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Reload the host/plugin and read codestory://status; do not add CodeStory to PATH.',
+      ].join('\n'),
+    };
+  }
   const cli = process.env.CODESTORY_CLI || 'codestory-cli';
 
   const result = spawnSync(cli, command.args, {
@@ -102,6 +119,7 @@ function runCodeStory(input, event) {
   return {
     kind: command.kind,
     output: [
+      mcpDetectionText(mcp),
       `CodeStory hook attempted ${command.kind} but did not receive usable output.`,
       reason ? `Reason: ${reason}` : null,
       command.next,
@@ -111,14 +129,22 @@ function runCodeStory(input, event) {
 
 function buildContext(input, event) {
   const runtime = runCodeStory(input, event);
-  const parts = [getCodeStoryInstructions(event, input)];
-
-  if (runtime && runtime.output) {
-    parts.push([
+  const runtimeBlock = runtime && runtime.output
+    ? [
       `CODESTORY HOOK ${runtime.kind.toUpperCase()}`,
       runtime.output,
       runtime.next ? `Next: ${runtime.next}` : null,
-    ].filter(Boolean).join('\n\n'));
+    ].filter(Boolean).join('\n\n')
+    : null;
+
+  if (runtime && runtime.kind === 'mcp detection') {
+    return [eventHeader(event, input).trim(), runtimeBlock].filter(Boolean).join('\n\n');
+  }
+
+  const parts = [getCodeStoryInstructions(event, input)];
+
+  if (runtimeBlock) {
+    parts.push(runtimeBlock);
   }
 
   return parts.join('\n\n');
