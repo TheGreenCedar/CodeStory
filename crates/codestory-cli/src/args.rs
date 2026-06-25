@@ -17,7 +17,7 @@ use codestory_contracts::api::{
     TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
 cache already has indexed files.";
@@ -1529,12 +1529,28 @@ pub(crate) struct AgentPreflightLaneOutput {
     pub(crate) summary: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReadinessLaneOutput {
+    pub(crate) status: ReadinessStatusDto,
+    pub(crate) profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) sidecar_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_command: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct AgentPreflightOutput {
     pub(crate) usable: bool,
     pub(crate) mode: String,
     pub(crate) local_graph: AgentPreflightLaneOutput,
     pub(crate) full_retrieval: AgentPreflightLaneOutput,
+    pub(crate) local_default: ReadinessLaneOutput,
+    pub(crate) agent_packet_search: ReadinessLaneOutput,
+    pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     pub(crate) sidecar_setup: serde_json::Value,
     pub(crate) safe_surfaces: Vec<String>,
     pub(crate) blocked_surfaces: Vec<String>,
@@ -2321,6 +2337,10 @@ pub(crate) struct DoctorCheckOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorSidecarStatusOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
     pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
@@ -2358,6 +2378,8 @@ pub(crate) struct DoctorOutput {
     pub(crate) freshness: Option<IndexFreshnessDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) readiness: Vec<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,

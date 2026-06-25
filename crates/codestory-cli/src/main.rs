@@ -77,12 +77,12 @@ use args::{
     DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
     DrillVerificationChecklistItemOutput, FilesCommand, GenerateCompletionsCommand, GroundCommand,
     IndexCommand, IndexDryRunOutput, IndexOutput, PacketCommand, ProjectArgs, QueryCommand,
-    QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadyCommand, ReadyOutput,
-    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction,
-    SetupCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand,
-    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction,
-    TaskBriefCommand, TaskCommand,
-    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand,
+    ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
+    SetupAction, SetupCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile,
+    SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand,
+    TaskAction, TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput,
+    VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -2037,7 +2037,9 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &sidecar,
     );
-    let output = build_agent_preflight_output(&readiness, Path::new(&summary.root));
+    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &readiness);
+    let output =
+        build_agent_preflight_output(&readiness, Path::new(&summary.root), readiness_lanes);
     let markdown = render_agent_preflight_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
@@ -2112,10 +2114,12 @@ const LOCAL_GRAPH_AGENT_SURFACES: &[&str] = &[
     "ground", "files", "symbol", "callers", "callees", "trail", "trace", "snippet", "affected",
 ];
 const FULL_RETRIEVAL_AGENT_SURFACES: &[&str] = &["packet_full", "search_full", "context_full"];
+const AGENT_RUN_MISSING_ID: &str = "agent-run-missing";
 
 fn build_agent_preflight_output(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     project_root: &Path,
+    readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
 ) -> args::AgentPreflightOutput {
     let local = readiness
         .iter()
@@ -2157,6 +2161,15 @@ fn build_agent_preflight_output(
         mode: mode.to_string(),
         local_graph: agent_preflight_lane(local),
         full_retrieval: agent_preflight_lane(agent),
+        local_default: readiness_lanes
+            .get("local_default")
+            .cloned()
+            .expect("local_default readiness lane"),
+        agent_packet_search: readiness_lanes
+            .get("agent_packet_search")
+            .cloned()
+            .expect("agent_packet_search readiness lane"),
+        readiness_lanes,
         sidecar_setup: stdio_transport::stdio_sidecar_setup_status(project_root),
         safe_surfaces,
         blocked_surfaces,
@@ -9940,6 +9953,7 @@ fn build_doctor_output(
         summary.freshness.as_ref(),
         &sidecar_retrieval,
     );
+    let readiness_lanes = build_readiness_lanes_for_runtime(runtime, &readiness);
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -10030,6 +10044,7 @@ fn build_doctor_output(
         retrieval,
         freshness: summary.freshness.clone(),
         readiness,
+        readiness_lanes,
         checks,
         next_commands,
         environment,
@@ -10055,6 +10070,8 @@ fn readiness_sidecar_input(
     sidecar: &DoctorSidecarStatusOutput,
 ) -> readiness::ReadinessSidecarInput<'_> {
     readiness::ReadinessSidecarInput {
+        profile: sidecar.profile.as_deref(),
+        run_id: sidecar.run_id.as_deref(),
         retrieval_mode: sidecar.retrieval_mode.as_str(),
         degraded_reason: sidecar.degraded_reason.as_deref(),
         manifest_generation: sidecar.manifest_generation.as_deref(),
@@ -10063,27 +10080,20 @@ fn readiness_sidecar_input(
 }
 
 fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput {
-    match codestory_retrieval::strict_sidecar_status(
+    let sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
+        sidecar.clone(),
     ) {
         Ok(report) => {
-            let status = doctor_sidecar_status_from_report(report);
+            let status = doctor_sidecar_status_from_report(report, Some(&sidecar));
             let handoff_failure = (status.retrieval_mode == "full")
                 .then(|| doctor_sidecar_profile_handoff_failure(runtime))
                 .flatten();
             apply_sidecar_profile_handoff(status, handoff_failure)
         }
-        Err(error) => DoctorSidecarStatusOutput {
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(format!("sidecar_status_error: {error}")),
-            manifest_generation: None,
-            manifest_input_hash: None,
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        },
+        Err(error) => doctor_sidecar_status_error(error, Some(&sidecar)),
     }
 }
 
@@ -10104,24 +10114,16 @@ fn doctor_sidecar_status_for_runtime(
     match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
-        sidecar,
+        sidecar.clone(),
     ) {
-        Ok(report) => doctor_sidecar_status_from_report(report),
-        Err(error) => DoctorSidecarStatusOutput {
-            retrieval_mode: "unavailable".to_string(),
-            degraded_reason: Some(format!("sidecar_status_error: {error}")),
-            manifest_generation: None,
-            manifest_input_hash: None,
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
-        },
+        Ok(report) => doctor_sidecar_status_from_report(report, Some(&sidecar)),
+        Err(error) => doctor_sidecar_status_error(error, Some(&sidecar)),
     }
 }
 
 fn doctor_sidecar_status_from_report(
     report: codestory_retrieval::RetrievalStatusReport,
+    runtime: Option<&codestory_retrieval::SidecarRuntimeConfig>,
 ) -> DoctorSidecarStatusOutput {
     let manifest_generation = report
         .manifest
@@ -10148,6 +10150,15 @@ fn doctor_sidecar_status_from_report(
         .as_ref()
         .and_then(|manifest| manifest.precise_semantic_import_producer.clone());
     DoctorSidecarStatusOutput {
+        profile: runtime
+            .map(|runtime| runtime.profile.as_str().to_string())
+            .or_else(|| {
+                report
+                    .ownership
+                    .as_ref()
+                    .map(|ownership| ownership.profile.clone())
+            }),
+        run_id: runtime.and_then(|runtime| runtime.run_id.clone()),
         retrieval_mode: report.retrieval_mode,
         degraded_reason: report.degraded_reason,
         manifest_generation,
@@ -10157,6 +10168,148 @@ fn doctor_sidecar_status_from_report(
         precise_semantic_import_revision,
         precise_semantic_import_producer,
     }
+}
+
+fn doctor_sidecar_status_error(
+    error: anyhow::Error,
+    runtime: Option<&codestory_retrieval::SidecarRuntimeConfig>,
+) -> DoctorSidecarStatusOutput {
+    DoctorSidecarStatusOutput {
+        profile: runtime.map(|runtime| runtime.profile.as_str().to_string()),
+        run_id: runtime.and_then(|runtime| runtime.run_id.clone()),
+        retrieval_mode: "unavailable".to_string(),
+        degraded_reason: Some(format!("sidecar_status_error: {error}")),
+        manifest_generation: None,
+        manifest_input_hash: None,
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
+    }
+}
+
+pub(crate) fn build_readiness_lanes_for_runtime(
+    runtime: &RuntimeContext,
+    readiness: &[codestory_contracts::api::ReadinessVerdictDto],
+) -> BTreeMap<String, ReadinessLaneOutput> {
+    let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
+    let project_arg = display::quote_command_argument_value(&project);
+    let local_runtime = codestory_retrieval::sidecar_runtime_for_project(
+        &runtime.project_root,
+        codestory_retrieval::SidecarProfile::Local,
+    );
+    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root);
+    let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
+    let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
+    let agent_verdict = readiness
+        .iter()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);
+    let mut lanes = BTreeMap::new();
+    lanes.insert(
+        "local_default".to_string(),
+        readiness_lane_output("local_default", &local_status, None, &project_arg),
+    );
+    lanes.insert(
+        "agent_packet_search".to_string(),
+        readiness_lane_output(
+            "agent_packet_search",
+            &agent_status,
+            agent_verdict,
+            &project_arg,
+        ),
+    );
+    lanes
+}
+
+fn agent_readiness_sidecar_runtime(
+    project_root: &Path,
+) -> codestory_retrieval::SidecarRuntimeConfig {
+    let active = codestory_retrieval::sidecar_runtime_auto(project_root);
+    if active.profile == codestory_retrieval::SidecarProfile::Agent {
+        return active;
+    }
+    codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(AGENT_RUN_MISSING_ID),
+    )
+}
+
+fn readiness_lane_output(
+    lane: &str,
+    sidecar: &DoctorSidecarStatusOutput,
+    verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
+    project_arg: &str,
+) -> ReadinessLaneOutput {
+    let status = readiness_lane_status(sidecar, verdict);
+    ReadinessLaneOutput {
+        status,
+        profile: sidecar
+            .profile
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        run_id: sidecar.run_id.clone(),
+        sidecar_mode: sidecar.retrieval_mode.clone(),
+        degraded_reason: sidecar.degraded_reason.clone(),
+        next_command: lane_next_command(lane, sidecar, status, verdict, project_arg),
+    }
+}
+
+fn readiness_lane_status(
+    sidecar: &DoctorSidecarStatusOutput,
+    verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
+) -> ReadinessStatusDto {
+    let sidecar_status = if sidecar.retrieval_mode == "full" {
+        ReadinessStatusDto::Ready
+    } else {
+        ReadinessStatusDto::RepairRetrieval
+    };
+    match verdict.map(|verdict| verdict.status) {
+        Some(status @ (ReadinessStatusDto::RepairSetup | ReadinessStatusDto::RepairIndex)) => {
+            status
+        }
+        Some(ReadinessStatusDto::CheckIndex) if sidecar_status == ReadinessStatusDto::Ready => {
+            ReadinessStatusDto::CheckIndex
+        }
+        _ => sidecar_status,
+    }
+}
+
+fn lane_next_command(
+    lane: &str,
+    sidecar: &DoctorSidecarStatusOutput,
+    status: ReadinessStatusDto,
+    verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
+    project_arg: &str,
+) -> Option<String> {
+    if status == ReadinessStatusDto::Ready {
+        return Some(retrieval_status_command(sidecar, project_arg));
+    }
+    if let Some(command) = verdict.and_then(|verdict| verdict.minimum_next.first()) {
+        return Some(command.clone());
+    }
+    match lane {
+        "agent_packet_search" if sidecar.retrieval_mode != "full" => Some(format!(
+            "codestory-cli ready --goal agent --repair --project {project_arg} --format json"
+        )),
+        "local_default" if sidecar.retrieval_mode != "full" => Some(format!(
+            "codestory-cli retrieval index --project {project_arg} --profile local --refresh full --format json"
+        )),
+        _ => Some(retrieval_status_command(sidecar, project_arg)),
+    }
+}
+
+fn retrieval_status_command(sidecar: &DoctorSidecarStatusOutput, project_arg: &str) -> String {
+    let mut command = format!(
+        "codestory-cli retrieval status --project {project_arg} --profile {}",
+        sidecar.profile.as_deref().unwrap_or("local")
+    );
+    if let Some(run_id) = sidecar.run_id.as_deref() {
+        command.push_str(" --run-id ");
+        command.push_str(&display::quote_command_argument_value(run_id));
+    }
+    command.push_str(" --format json");
+    command
 }
 
 fn apply_sidecar_profile_handoff(
@@ -11634,6 +11787,38 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
+    struct EnvVarSnapshot<'a> {
+        values: Vec<(&'a str, Option<std::ffi::OsString>)>,
+    }
+
+    impl<'a> EnvVarSnapshot<'a> {
+        fn clear(names: &'a [&'a str]) -> Self {
+            let values = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            for name in names {
+                unsafe {
+                    std::env::remove_var(name);
+                }
+            }
+            Self { values }
+        }
+    }
+
+    impl Drop for EnvVarSnapshot<'_> {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
     fn test_search_hit_defaults() -> SearchHit {
         SearchHit {
             node_id: NodeId(String::new()),
@@ -11680,6 +11865,8 @@ mod tests {
     #[test]
     fn sidecar_profile_handoff_downgrades_full_readiness() {
         let status = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
             retrieval_mode: "full".to_string(),
             degraded_reason: None,
             manifest_generation: Some("generation".to_string()),
@@ -11704,6 +11891,78 @@ mod tests {
             Some(
                 "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
             )
+        );
+    }
+
+    #[test]
+    fn agent_readiness_runtime_does_not_collapse_to_local_without_agent_run() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _env_snapshot = EnvVarSnapshot::clear(&[
+            "CODESTORY_RETRIEVAL_PROFILE",
+            "CODESTORY_SIDECAR_PROFILE",
+            "CODESTORY_AGENT_RUN_ID",
+            "CODESTORY_SIDECAR_RUN_ID",
+            "CODESTORY_AGENT",
+            "CODESTORY_AGENT_RUN",
+            "CI",
+            "GITHUB_ACTIONS",
+        ]);
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("repo");
+        fs::create_dir_all(&project).expect("create project");
+
+        let runtime = agent_readiness_sidecar_runtime(&project);
+
+        assert_eq!(runtime.profile, codestory_retrieval::SidecarProfile::Agent);
+        assert_eq!(runtime.run_id.as_deref(), Some(AGENT_RUN_MISSING_ID));
+    }
+
+    #[test]
+    fn readiness_lane_keeps_agent_full_separate_from_local_handoff_mismatch() {
+        let sidecar = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let aggregate_verdict = codestory_contracts::api::ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::RepairRetrieval,
+            summary: "profile_handoff_mismatch: local/default is unavailable".to_string(),
+            minimum_next: vec![
+                "codestory-cli ready --goal agent --repair --project C:/repo --format json"
+                    .to_string(),
+            ],
+            full_repair: Vec::new(),
+            setup: None,
+            index: None,
+            sidecar: None,
+        };
+
+        let lane = readiness_lane_output(
+            "agent_packet_search",
+            &sidecar,
+            Some(&aggregate_verdict),
+            "C:/repo",
+        );
+
+        assert_eq!(lane.status, ReadinessStatusDto::Ready);
+        assert_eq!(lane.sidecar_mode, "full");
+        assert_eq!(lane.profile, "agent");
+        assert_eq!(lane.run_id.as_deref(), Some("run"));
+        assert!(
+            lane.next_command.as_deref().is_some_and(|command| command
+                .contains("retrieval status")
+                && command.contains("--profile agent")
+                && command.contains("--run-id")
+                && command.contains("--format json")),
+            "ready agent lane should point at lane-scoped status proof: {lane:?}"
         );
     }
 

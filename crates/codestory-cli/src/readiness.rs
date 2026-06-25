@@ -26,6 +26,8 @@ pub(crate) struct ReadinessSetupInput {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadinessSidecarInput<'a> {
+    pub(crate) profile: Option<&'a str>,
+    pub(crate) run_id: Option<&'a str>,
     pub(crate) retrieval_mode: &'a str,
     pub(crate) degraded_reason: Option<&'a str>,
     pub(crate) manifest_generation: Option<&'a str>,
@@ -365,6 +367,8 @@ fn readiness_setup_snapshot(input: &ReadinessSetupInput) -> ReadinessSetupSnapsh
 
 fn readiness_sidecar_snapshot(input: ReadinessSidecarInput<'_>) -> ReadinessSidecarSnapshotDto {
     ReadinessSidecarSnapshotDto {
+        profile: input.profile.map(ToOwned::to_owned),
+        run_id: input.run_id.map(ToOwned::to_owned),
         retrieval_mode: input.retrieval_mode.to_string(),
         degraded_reason: input.degraded_reason.map(ToOwned::to_owned),
         manifest_generation: input.manifest_generation.map(ToOwned::to_owned),
@@ -462,6 +466,8 @@ mod tests {
                 newer_installed_version: None,
             }),
             sidecar: Some(ReadinessSidecarInput {
+                profile: Some("agent"),
+                run_id: Some("run"),
                 retrieval_mode: "full",
                 degraded_reason: None,
                 manifest_generation: Some("generation"),
@@ -509,6 +515,8 @@ mod tests {
                 newer_installed_version: Some("0.11.11".to_string()),
             }),
             sidecar: Some(ReadinessSidecarInput {
+                profile: Some("agent"),
+                run_id: Some("run"),
                 retrieval_mode: "full",
                 degraded_reason: None,
                 manifest_generation: Some("generation"),
@@ -550,6 +558,8 @@ mod tests {
             &stats,
             Some(&freshness),
             Some(ReadinessSidecarInput {
+                profile: Some("local"),
+                run_id: None,
                 retrieval_mode: "full",
                 degraded_reason: None,
                 manifest_generation: Some("generation"),
@@ -629,6 +639,8 @@ mod tests {
                 &stats,
                 Some(&freshness),
                 Some(ReadinessSidecarInput {
+                    profile: Some("agent"),
+                    run_id: Some("run"),
                     retrieval_mode: "full",
                     degraded_reason: None,
                     manifest_generation: Some("generation"),
@@ -668,6 +680,8 @@ mod tests {
                 &stats,
                 Some(&freshness),
                 Some(ReadinessSidecarInput {
+                    profile: Some("agent"),
+                    run_id: Some("run"),
                     retrieval_mode: "no_semantic",
                     degraded_reason: Some("semantic store unavailable"),
                     manifest_generation: Some("generation"),
@@ -723,6 +737,8 @@ mod tests {
         for sidecar in [
             None,
             Some(ReadinessSidecarInput {
+                profile: Some("local"),
+                run_id: None,
                 retrieval_mode: "unavailable",
                 degraded_reason: Some("manifest:<missing>"),
                 manifest_generation: None,
@@ -753,6 +769,8 @@ mod tests {
                 &stats,
                 None,
                 Some(ReadinessSidecarInput {
+                    profile: Some("agent"),
+                    run_id: Some("run"),
                     retrieval_mode: "unavailable",
                     degraded_reason: None,
                     manifest_generation: None,
