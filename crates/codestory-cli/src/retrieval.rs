@@ -161,7 +161,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     );
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
-    ensure_retrieval_index_embedding_policy()?;
+    ensure_retrieval_index_embedding_policy(&sidecar)?;
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
     let outcome =
         finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {
@@ -179,8 +179,8 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
 }
 
-fn ensure_retrieval_index_embedding_policy() -> Result<()> {
-    codestory_retrieval::ensure_product_embedding_backend()
+fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Result<()> {
+    codestory_retrieval::ensure_product_embedding_backend_for_runtime(sidecar)
         .context("retrieval index embedding device policy")
 }
 
@@ -746,8 +746,9 @@ mod tests {
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
         let _device = EnvGuard::remove("CODESTORY_EMBED_DEVICE_STATE");
+        let sidecar = SidecarRuntimeConfig::local();
 
-        let error = ensure_retrieval_index_embedding_policy()
+        let error = ensure_retrieval_index_embedding_policy(&sidecar)
             .expect_err("unknown embedding device must block retrieval index refresh");
         let message = format!("{error:#}");
 
