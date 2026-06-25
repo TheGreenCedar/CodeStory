@@ -3,7 +3,7 @@ use crate::config::{
     QDRANT_HEALTH_BUDGET, SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig,
     ZOEKT_HEALTH_BUDGET, qdrant_semantic_vectors_enabled, retrieval_command,
 };
-use crate::embeddings::manifest_embedding_backend_is_product;
+use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
 use crate::qdrant_client::QdrantClient;
 use crate::scip_client::{ScipAvailability, ScipClient};
@@ -335,9 +335,19 @@ fn unavailable_component(name: &str, reason: &str) -> ComponentHealth {
     }
 }
 
-pub fn unavailable_status_report(
+#[cfg(test)]
+fn unavailable_status_report(
     reason: impl Into<String>,
     manifest: Option<codestory_store::RetrievalIndexManifest>,
+) -> RetrievalStatusReport {
+    let embedding_device = crate::embeddings::embedding_device_readiness();
+    unavailable_status_report_with_embedding_device(reason, manifest, &embedding_device)
+}
+
+pub fn unavailable_status_report_with_embedding_device(
+    reason: impl Into<String>,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
 ) -> RetrievalStatusReport {
     let reason = reason.into();
     let manifest_vector_embedding_backend = manifest
@@ -346,7 +356,6 @@ pub fn unavailable_status_report(
     let manifest_vector_embedding_dim = manifest
         .as_ref()
         .and_then(|manifest| manifest.embedding_dim);
-    let embedding_device = crate::embeddings::embedding_device_readiness();
     RetrievalStatusReport {
         retrieval_mode: "unavailable".into(),
         ownership: None,
@@ -360,11 +369,13 @@ pub fn unavailable_status_report(
         stored_doc_vector_mixed_backends: None,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
-        embedding_detected_provider: embedding_device.detected_provider,
-        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_detected_provider: embedding_device.detected_provider.clone(),
+        embedding_detected_gpu: embedding_device.detected_gpu.clone(),
         embedding_accelerator_requested: embedding_device.accelerator_requested,
-        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
-        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
+        embedding_accelerator_request_provider: embedding_device
+            .accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt: unavailable_component("zoekt", &reason),
         qdrant: unavailable_component("qdrant", &reason),
@@ -376,22 +387,31 @@ pub fn unavailable_status_report(
 
 /// Zoekt + Qdrant + embedding reachability without a project collection (used during bootstrap).
 pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHealth {
+    let embedding_device = crate::embeddings::embedding_device_readiness();
+    probe_infrastructure_health_with_embedding_device(layout, &embedding_device)
+}
+
+pub fn probe_infrastructure_health_with_embedding_device(
+    layout: &SidecarLayout,
+    embedding_device: &EmbeddingDeviceReadiness,
+) -> InfrastructureHealth {
     let zoekt_probe = ZoektClient::new(layout).health_probe();
     let qdrant_client = QdrantClient::new(layout);
     let qdrant_probe = qdrant_client.list_collections_probe();
     let embed_probe = crate::embeddings::probe_product_embedding_runtime();
-    let embedding_device = crate::embeddings::embedding_device_readiness();
     InfrastructureHealth {
         zoekt_reachable: zoekt_probe.reachable,
         qdrant_reachable: qdrant_probe.reachable,
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
-        embedding_detected_provider: embedding_device.detected_provider,
-        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_detected_provider: embedding_device.detected_provider.clone(),
+        embedding_detected_gpu: embedding_device.detected_gpu.clone(),
         embedding_accelerator_requested: embedding_device.accelerator_requested,
-        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
-        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
+        embedding_accelerator_request_provider: embedding_device
+            .accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt_detail: zoekt_probe.detail,
         qdrant_detail: qdrant_probe.detail,
@@ -497,15 +517,30 @@ pub fn probe_sidecar_health(
     project_id: &str,
     manifest: Option<codestory_store::RetrievalIndexManifest>,
 ) -> RetrievalStatusReport {
+    let embedding_device = crate::embeddings::embedding_device_readiness();
+    probe_sidecar_health_with_embedding_device(layout, project_id, manifest, &embedding_device)
+}
+
+pub fn probe_sidecar_health_with_embedding_device(
+    layout: &SidecarLayout,
+    project_id: &str,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+) -> RetrievalStatusReport {
     if let Some(manifest) = manifest.as_ref() {
         if !manifest_has_current_sidecar_contract(project_id, manifest) {
-            return unavailable_status_report(
+            return unavailable_status_report_with_embedding_device(
                 "sidecar_manifest_generation_contract_missing",
                 Some(manifest.clone()),
+                embedding_device,
             );
         }
     } else {
-        return unavailable_status_report("retrieval_manifest_missing", None);
+        return unavailable_status_report_with_embedding_device(
+            "retrieval_manifest_missing",
+            None,
+            embedding_device,
+        );
     }
 
     let manifest = manifest.expect("manifest validation returned above");
@@ -543,7 +578,6 @@ pub fn probe_sidecar_health(
     };
 
     let current_embedding_backend = crate::embeddings::embedding_runtime_id();
-    let embedding_device = crate::embeddings::embedding_device_readiness();
     let dense_anchor_count = manifest
         .dense_projection_count
         .or(manifest.projection_count)
@@ -659,11 +693,13 @@ pub fn probe_sidecar_health(
         stored_doc_vector_mixed_backends: None,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
-        embedding_detected_provider: embedding_device.detected_provider,
-        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_detected_provider: embedding_device.detected_provider.clone(),
+        embedding_detected_gpu: embedding_device.detected_gpu.clone(),
         embedding_accelerator_requested: embedding_device.accelerator_requested,
-        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
-        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
+        embedding_accelerator_request_provider: embedding_device
+            .accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         zoekt,
         qdrant,

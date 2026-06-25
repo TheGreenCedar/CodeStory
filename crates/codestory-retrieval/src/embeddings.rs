@@ -103,6 +103,18 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
 }
 
 pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
+    embedding_device_readiness_with_observed_state(None)
+}
+
+pub fn embedding_device_readiness_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> EmbeddingDeviceReadiness {
+    embedding_device_readiness_with_observed_state(observe_sidecar_embedding_device_state(runtime))
+}
+
+fn embedding_device_readiness_with_observed_state(
+    sidecar_observed_state: Option<&'static str>,
+) -> EmbeddingDeviceReadiness {
     let cpu_allowed = explicit_cpu_allowed();
     let detection = host_embedding_device_detection();
     let accelerator_request = if cpu_allowed {
@@ -110,7 +122,7 @@ pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
     } else {
         embedding_accelerator_request_for_detection(detection.as_ref())
     };
-    let observed_state = observed_embedding_device_state();
+    let observed_state = sidecar_observed_state.unwrap_or_else(observed_embedding_device_state);
     let accelerated = observed_state == "accelerated";
     let full_retrieval_allowed = accelerated || cpu_allowed;
     let requested_policy = if cpu_allowed {
@@ -135,6 +147,32 @@ pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
         cpu_allowed,
         full_retrieval_allowed,
         degraded_reason,
+    }
+}
+
+fn observe_sidecar_embedding_device_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<&'static str> {
+    let output = Command::new("docker")
+        .args([
+            "logs",
+            "--tail",
+            "200",
+            &format!("{}-embed", runtime.compose_project),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match observed_embedding_device_state_from_text(&text) {
+        "unknown" => None,
+        state => Some(state),
     }
 }
 
@@ -179,6 +217,41 @@ fn observed_embedding_device_state() -> &'static str {
         Some("cpu") => "cpu",
         _ => "unknown",
     }
+}
+
+fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
+    let mut saw_cpu = false;
+    for line in text.lines().map(|line| line.to_ascii_lowercase()) {
+        if line_reports_gpu_offload(&line) == Some(true)
+            || (line.contains("using device")
+                && ["vulkan", "cuda", "metal"]
+                    .iter()
+                    .any(|needle| line.contains(needle)))
+        {
+            return "accelerated";
+        }
+        saw_cpu |= line_reports_gpu_offload(&line) == Some(false)
+            || line.contains("n_gpu_layers = 0")
+            || line.contains("using cpu")
+            || line.contains("no gpu")
+            || line.contains("no vulkan device");
+    }
+    if saw_cpu { "cpu" } else { "unknown" }
+}
+
+fn line_reports_gpu_offload(line: &str) -> Option<bool> {
+    let keyword = if let Some(offset) = line.find("offloaded ") {
+        offset + "offloaded ".len()
+    } else if let Some(offset) = line.find("offloading ") {
+        offset + "offloading ".len()
+    } else {
+        return None;
+    };
+    let digits = line[keyword..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<u32>().ok().map(|count| count > 0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -756,6 +829,63 @@ mod tests {
         assert!(!readiness.full_retrieval_allowed);
         assert_eq!(request.device, "Vulkan0");
         assert_eq!(request.n_gpu_layers, "99");
+    }
+
+    #[test]
+    fn sidecar_log_observed_acceleration_allows_amd_vulkan_request() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let observed = observed_embedding_device_state_from_text(
+            "llama_model_load: offloaded 33/33 layers to GPU\n",
+        );
+        let readiness = embedding_device_readiness_with_observed_state(Some(observed));
+
+        assert_eq!(observed, "accelerated");
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
+        assert_eq!(
+            readiness.detected_gpu.as_deref(),
+            Some("AMD Radeon RX 7900 XT")
+        );
+        assert!(readiness.accelerator_requested);
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("vulkan")
+        );
+        assert_eq!(
+            readiness.accelerator_request_device.as_deref(),
+            Some("Vulkan0")
+        );
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn inconclusive_sidecar_log_keeps_amd_vulkan_request_unknown() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let observed = observed_embedding_device_state_from_text("server listening on 0.0.0.0");
+        let readiness = embedding_device_readiness_with_observed_state(None);
+
+        assert_eq!(observed, "unknown");
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
+        assert!(readiness.accelerator_requested);
+        assert!(!readiness.full_retrieval_allowed);
     }
 
     #[test]

@@ -7,7 +7,8 @@ use crate::generation::{
     manifest_staleness_reason, manifest_unavailable_reason,
 };
 use crate::health::{
-    RetrievalStatusReport, attach_manifest_contract, attach_repair_hint, probe_sidecar_health,
+    RetrievalStatusReport, attach_manifest_contract, attach_repair_hint,
+    probe_sidecar_health_with_embedding_device, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_root};
 use anyhow::{Context, Result};
@@ -193,6 +194,7 @@ fn sidecar_status_inner_with_runtime(
 ) -> Result<RetrievalStatusReport> {
     runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
     let project_id = sidecar_project_id_for_root(project_root);
     let manifest = if let Some(path) = storage_path.filter(|path| path.exists()) {
         let storage = Store::open(path).context("open storage for manifest")?;
@@ -214,9 +216,10 @@ fn sidecar_status_inner_with_runtime(
                 enrich_status_with_semantic_doc_stats(
                     attach_repair_hint(
                         attach_manifest_contract(
-                            crate::health::unavailable_status_report(
+                            unavailable_status_report_with_embedding_device(
                                 format!("sidecar_manifest_stale: {reason}"),
                                 Some(manifest.clone()),
+                                &embedding_device,
                             ),
                             project_root,
                         ),
@@ -235,9 +238,10 @@ fn sidecar_status_inner_with_runtime(
                 enrich_status_with_semantic_doc_stats(
                     attach_repair_hint(
                         attach_manifest_contract(
-                            crate::health::unavailable_status_report(
+                            unavailable_status_report_with_embedding_device(
                                 reason,
                                 Some(manifest.clone()),
+                                &embedding_device,
                             ),
                             project_root,
                         ),
@@ -249,7 +253,12 @@ fn sidecar_status_inner_with_runtime(
                 &runtime,
             ));
         }
-        let report = probe_sidecar_health(&layout, &project_id, manifest);
+        let report = probe_sidecar_health_with_embedding_device(
+            &layout,
+            &project_id,
+            manifest,
+            &embedding_device,
+        );
         return Ok(attach_status_ownership(
             enrich_status_with_semantic_doc_stats(
                 attach_repair_hint(
@@ -267,7 +276,12 @@ fn sidecar_status_inner_with_runtime(
     Ok(attach_status_ownership(
         attach_repair_hint(
             attach_manifest_contract(
-                probe_sidecar_health(&layout, &project_id, manifest),
+                probe_sidecar_health_with_embedding_device(
+                    &layout,
+                    &project_id,
+                    manifest,
+                    &embedding_device,
+                ),
                 project_root,
             ),
             project_root,
