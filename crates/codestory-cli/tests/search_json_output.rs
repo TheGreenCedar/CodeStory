@@ -143,6 +143,75 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.output().expect("run codestory-cli")
 }
 
+fn prepare_agent_retrieval(workspace: &Path) -> Value {
+    let bootstrap = run_cli(
+        workspace,
+        &[
+            "retrieval",
+            "bootstrap",
+            "--profile",
+            "agent",
+            "--wait-secs",
+            "30",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        bootstrap.status.success(),
+        "agent retrieval bootstrap failed; live full-sidecar fixture is blocked: {}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+
+    let index = run_cli(
+        workspace,
+        &[
+            "retrieval",
+            "index",
+            "--profile",
+            "agent",
+            "--refresh",
+            "full",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        index.status.success(),
+        "agent retrieval index failed; live full-sidecar fixture is blocked: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let status = run_cli(
+        workspace,
+        &[
+            "retrieval",
+            "status",
+            "--profile",
+            "agent",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        status.status.success(),
+        "agent retrieval status failed after agent-profile index: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: Value = serde_json::from_slice(&status.stdout).expect("parse status json");
+    assert_eq!(
+        status_json["ownership"]["profile"].as_str(),
+        Some("agent"),
+        "agent-facing search evals must prepare agent-profile sidecars: {status_json:#}"
+    );
+    assert_eq!(
+        status_json["retrieval_mode"].as_str(),
+        Some("full"),
+        "agent-facing search evals require full agent sidecar retrieval: {status_json:#}"
+    );
+    status_json
+}
+
 fn assert_framework_route_metadata(framework: &Value) -> String {
     let route = &framework["symbol"]["node"]["route_endpoint"];
     assert_eq!(route["kind"], "framework_route");
@@ -356,23 +425,6 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());
 
-    let bootstrap = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "bootstrap",
-            "--wait-secs",
-            "30",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        bootstrap.status.success(),
-        "retrieval bootstrap failed; live full-sidecar fixture is blocked: {}",
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
-
     let index = run_cli(
         workspace.path(),
         &["index", "--refresh", "full", "--format", "json"],
@@ -383,38 +435,7 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
         String::from_utf8_lossy(&index.stderr)
     );
 
-    let retrieval_index = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "index",
-            "--refresh",
-            "none",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        retrieval_index.status.success(),
-        "retrieval index failed; live full-sidecar fixture is blocked: {}",
-        String::from_utf8_lossy(&retrieval_index.stderr)
-    );
-
-    let status = run_cli(
-        workspace.path(),
-        &["retrieval", "status", "--format", "json"],
-    );
-    assert!(
-        status.status.success(),
-        "retrieval status failed after retrieval index: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status_json: Value = serde_json::from_slice(&status.stdout).expect("parse status json");
-    assert_eq!(
-        status_json["retrieval_mode"],
-        Value::String("full".to_string()),
-        "live full-sidecar fixture must report retrieval_mode=full: {status_json:#}"
-    );
+    prepare_agent_retrieval(workspace.path());
 
     let search = run_cli(
         workspace.path(),
@@ -1717,22 +1738,7 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         "index command failed: {}",
         String::from_utf8_lossy(&index.stderr)
     );
-    let retrieval_index = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "index",
-            "--refresh",
-            "full",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        retrieval_index.status.success(),
-        "retrieval index command failed: {}",
-        String::from_utf8_lossy(&retrieval_index.stderr)
-    );
+    prepare_agent_retrieval(workspace.path());
 
     let expectations = [
         ("exact_symbol_anchor", "exact_symbol_anchor", "off"),
