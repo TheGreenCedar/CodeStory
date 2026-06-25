@@ -39,8 +39,9 @@ use codestory_contracts::language_support::{
     LanguageSupportProfile, language_support_profile_for_ext,
     language_support_profile_for_language_name,
 };
-use codestory_indexer::IncrementalIndexingStats;
-use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
+use codestory_indexer::{
+    CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
+};
 use codestory_store::{
     FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
@@ -8002,8 +8003,8 @@ impl AppController {
         std::thread::spawn(move || {
             let indexing_started = std::time::Instant::now();
             let result = match req.mode {
-                IndexMode::Full => index_full(&root, &storage_path, &events_tx),
-                IndexMode::Incremental => index_incremental(&root, &storage_path, &events_tx),
+                IndexMode::Full => index_full(&root, &storage_path, &events_tx, None),
+                IndexMode::Incremental => index_incremental(&root, &storage_path, &events_tx, None),
             };
 
             match result {
@@ -8030,6 +8031,7 @@ impl AppController {
         &self,
         mode: IndexMode,
         refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         let (root, storage_path) = {
             let mut s = self.state.lock();
@@ -8048,8 +8050,10 @@ impl AppController {
         };
 
         let result = match mode {
-            IndexMode::Full => index_full(&root, &storage_path, &self.events_tx),
-            IndexMode::Incremental => index_incremental(&root, &storage_path, &self.events_tx),
+            IndexMode::Full => index_full(&root, &storage_path, &self.events_tx, cancel_token),
+            IndexMode::Incremental => {
+                index_incremental(&root, &storage_path, &self.events_tx, cancel_token)
+            }
         };
 
         match result {
@@ -8125,14 +8129,30 @@ impl AppController {
     }
 
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
-        self.run_indexing_blocking_inner(mode, true)
+        self.run_indexing_blocking_inner(mode, true, None)
+    }
+
+    pub fn run_indexing_blocking_with_cancel(
+        &self,
+        mode: IndexMode,
+        cancel_token: &CancellationToken,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner(mode, true, Some(cancel_token))
     }
 
     pub fn run_indexing_blocking_without_runtime_refresh(
         &self,
         mode: IndexMode,
     ) -> Result<IndexingPhaseTimings, ApiError> {
-        self.run_indexing_blocking_inner(mode, false)
+        self.run_indexing_blocking_inner(mode, false, None)
+    }
+
+    pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
+        &self,
+        mode: IndexMode,
+        cancel_token: &CancellationToken,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner(mode, false, Some(cancel_token))
     }
 
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
@@ -10422,6 +10442,7 @@ fn index_full(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<IndexingRunSummary, ApiError> {
     let workspace = Workspace::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
@@ -10441,13 +10462,21 @@ fn index_full(
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-    let result = indexer.run(staged.store_mut(), &execution_plan, &bus, None);
+    let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
     drop(bus);
     let _ = forwarder.join();
 
     let index_stats = match result {
+        Ok(_) if is_indexing_cancelled(cancel_token) => {
+            let _ = staged.discard();
+            return Err(indexing_cancelled_error());
+        }
         Ok(stats) => stats,
+        Err(_) if is_indexing_cancelled(cancel_token) => {
+            let _ = staged.discard();
+            return Err(indexing_cancelled_error());
+        }
         Err(err) => {
             let _ = staged.discard();
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
@@ -10606,12 +10635,19 @@ fn index_incremental(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<IndexingRunSummary, ApiError> {
-    run_incremental_indexing_common(root, storage_path, events_tx, |workspace, inputs| {
-        workspace
-            .build_execution_plan(inputs)
-            .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))
-    })
+    run_incremental_indexing_common(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        |workspace, inputs| {
+            workspace
+                .build_execution_plan(inputs)
+                .map_err(|e| ApiError::internal(format!("Failed to generate refresh info: {e}")))
+        },
+    )
 }
 
 fn spawn_progress_forwarder(
@@ -10640,6 +10676,7 @@ fn run_incremental_indexing_common<F>(
     root: &Path,
     storage_path: &Path,
     events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
     refresh_builder: F,
 ) -> Result<IndexingRunSummary, ApiError>
 where
@@ -10663,13 +10700,18 @@ where
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
 
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-    let result = indexer.run(&mut store, &execution_plan, &bus, None);
+    let result = indexer.run(&mut store, &execution_plan, &bus, cancel_token);
 
     // Drop bus so forwarder unblocks.
     drop(bus);
     let _ = forwarder.join();
 
-    let index_stats = result.map_err(|e| ApiError::internal(format!("Indexing failed: {e}")))?;
+    let index_stats = match result {
+        Ok(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
+        Ok(stats) => stats,
+        Err(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
+        Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+    };
     let snapshot_refresh_stats = store.snapshots().refresh_all_with_stats().map_err(|e| {
         ApiError::internal(format!("Failed to refresh live grounding snapshots: {e}"))
     })?;
@@ -10785,6 +10827,16 @@ where
         },
         llm_refresh_scope: Some(llm_refresh_scope),
     })
+}
+
+fn is_indexing_cancelled(cancel_token: Option<&CancellationToken>) -> bool {
+    cancel_token
+        .map(CancellationToken::is_cancelled)
+        .unwrap_or(false)
+}
+
+fn indexing_cancelled_error() -> ApiError {
+    ApiError::new("cancelled", "Indexing cancelled.")
 }
 
 fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
@@ -16319,6 +16371,30 @@ fn build_llm_symbol_doc_text() -> String {
             .expect_err("missing project should error");
 
         assert_eq!(error.code, "invalid_argument");
+        assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[test]
+    fn cancelled_blocking_index_is_user_visible_and_clears_indexing_state() {
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
+            .expect("open project summary");
+
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh_with_cancel(
+                IndexMode::Full,
+                &cancel_token,
+            )
+            .expect_err("cancelled indexing should be visible");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(error.message.contains("cancelled"));
         assert!(!controller.state.lock().is_indexing);
     }
 
