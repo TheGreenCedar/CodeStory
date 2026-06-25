@@ -6,11 +6,24 @@ const {
   classifyMcpRuntime,
   mcpDetectionText,
   readActiveState,
+  readHookState,
   rememberActiveState,
+  writeHookState,
   writeHookOutput,
 } = require('./codestory-runtime.cjs');
 
 const MAX_OUTPUT_CHARS = 4000;
+const EVENT_CAPS = {
+  startup: 4000,
+  clear: 4000,
+  child_worktree_start: 4000,
+  user_prompt: 4000,
+  resume: 2200,
+  compact: 2200,
+  handoff: 2200,
+  goal_heartbeat: 1400,
+  session: 3000,
+};
 const RUNTIME_TIMEOUT_MS = 3500;
 const SOURCE_FALLBACK = 'CodeStory is unavailable for this session. Use bounded source reads in the target repo; inspect only task-named files and nearby tests.';
 
@@ -32,10 +45,52 @@ function readHookInput() {
   });
 }
 
-function truncate(text) {
+function truncate(text, maxChars = MAX_OUTPUT_CHARS) {
   const value = String(text || '').trim();
-  if (value.length <= MAX_OUTPUT_CHARS) return value;
-  return `${value.slice(0, MAX_OUTPUT_CHARS)}\n\n... CodeStory hook output truncated by hook budget.`;
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n\n... CodeStory hook output truncated by hook budget.`;
+}
+
+function compactKey(text, maxChars = 160) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, maxChars);
+}
+
+function hookTaxonomy(input, event) {
+  const source = compactKey(input.source || input.trigger || input.reason || '').toLowerCase();
+  const combined = `${String(event || '').toLowerCase()} ${source}`;
+  if (event === 'UserPromptSubmit') return 'user_prompt';
+  if (/goal|heartbeat/u.test(combined)) return 'goal_heartbeat';
+  if (/compact/u.test(combined)) return 'compact';
+  if (/resume/u.test(combined)) return 'resume';
+  if (/clear/u.test(combined)) return 'clear';
+  if (/handoff/u.test(combined)) return 'handoff';
+  if (/child|worktree/u.test(combined)) return 'child_worktree_start';
+  if (/start|startup/u.test(combined)) return 'startup';
+  return 'session';
+}
+
+function hookPolicy(input, event) {
+  const taxonomy = hookTaxonomy(input, event);
+  const project = input.cwd || process.cwd();
+  const promptKey = compactKey(input.prompt || '');
+  const dedupeBase = `${taxonomy}:${project}`;
+  return {
+    taxonomy,
+    project,
+    cap: EVENT_CAPS[taxonomy] || EVENT_CAPS.session,
+    dedupeKey: taxonomy === 'user_prompt' ? `${dedupeBase}:${promptKey}` : dedupeBase,
+    resetDedupe: taxonomy === 'startup' || taxonomy === 'clear',
+    runtimeOnly: ['resume', 'compact', 'handoff', 'goal_heartbeat'].includes(taxonomy),
+    heartbeat: taxonomy === 'goal_heartbeat',
+  };
+}
+
+function runtimeFingerprint(mcp) {
+  return [
+    mcp.mcp_resource_status,
+    mcp.managed_cli_present ? 'managed' : 'no-managed',
+    mcp.degraded_no_surface ? 'degraded' : 'surface',
+  ].join('|');
 }
 
 function firstRuntimeFailure(mcp) {
@@ -59,16 +114,54 @@ function shortDegradedNotice(mcp, reason, state = {}) {
   return [
     'CodeStory degraded mode: no MCP or managed runtime surface is usable.',
     `First failing layer: ${firstRuntimeFailure(mcp)}.`,
-    reason ? `Reason: ${truncate(reason)}` : null,
+    reason ? `Reason: ${truncate(reason, 600)}` : null,
     hook.preflight_failed ? SOURCE_FALLBACK : 'Run one bounded managed/local-dev preflight if available; otherwise use bounded source reads.',
   ].filter(Boolean).join('\n');
 }
 
-function hookCommand(input, event) {
-  const project = input.cwd || process.cwd();
+function runtimeStatusBlock(policy, mcp) {
+  return [
+    'CODESTORY HOOK RUNTIME TRUTH',
+    `event_taxonomy: ${policy.taxonomy}`,
+    `output_cap_chars: ${policy.cap}`,
+    `dedupe_key: ${policy.dedupeKey}`,
+    mcpDetectionText(mcp),
+    mcp.mcp_resources_exposed
+      ? 'Next: read codestory://status before source reads; use packet/search/context only when status allows them with retrieval_mode=full.'
+      : 'Next: no sidecar-backed packet/search surface is proven available; use bounded source reads instead of repeated repair attempts.',
+  ].join('\n');
+}
+
+function rememberEmission(policy, contentKey) {
+  const state = readHookState();
+  const emitted = state.emitted || {};
+  const previous = policy.resetDedupe ? undefined : emitted[policy.dedupeKey];
+  if (previous === contentKey) {
+    return false;
+  }
+  state.emitted = {
+    ...(policy.resetDedupe ? {} : emitted),
+    [policy.dedupeKey]: contentKey,
+  };
+  writeHookState(state);
+  return true;
+}
+
+function rememberHeartbeat(policy, contentKey) {
+  const state = readHookState();
+  const previous = state.heartbeatKey;
+  writeHookState({
+    ...state,
+    heartbeatKey: contentKey,
+  });
+  return previous ? previous !== contentKey : false;
+}
+
+function hookCommand(input, event, policy) {
+  const project = policy.project;
   if (!project) return null;
 
-  if (event === 'UserPromptSubmit' && String(input.prompt || '').trim()) {
+  if (policy.taxonomy === 'user_prompt' && String(input.prompt || '').trim()) {
     return {
       kind: 'request packet',
       args: [
@@ -83,7 +176,7 @@ function hookCommand(input, event) {
     };
   }
 
-  if (event === 'SessionStart') {
+  if (['startup', 'clear', 'child_worktree_start'].includes(policy.taxonomy)) {
     return {
       kind: 'session ground',
       args: [
@@ -99,7 +192,41 @@ function hookCommand(input, event) {
   return null;
 }
 
-function runCodeStory(input, event, state = {}) {
+function runReadinessProbe(cli, project, cwd) {
+  const result = spawnSync(cli, [
+    'ready',
+    '--goal', 'agent',
+    '--project', project,
+    '--format', 'json',
+  ], {
+    cwd,
+    encoding: 'utf8',
+    timeout: RUNTIME_TIMEOUT_MS,
+    maxBuffer: MAX_OUTPUT_CHARS * 4,
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli),
+    windowsHide: true,
+  });
+  if (result.status !== 0 || !result.stdout.trim()) {
+    return {
+      ready: false,
+      reason: result.error
+        ? result.error.message
+        : truncate(result.stderr || `agent readiness probe exited with status ${result.status}`),
+    };
+  }
+  try {
+    const parsed = JSON.parse(result.stdout);
+    const verdicts = Array.isArray(parsed.verdicts) ? parsed.verdicts : [];
+    return {
+      ready: verdicts.some((verdict) => verdict?.goal === 'agent_packet_search' && verdict?.status === 'ready'),
+      reason: 'agent_packet_search readiness is not ready',
+    };
+  } catch {
+    return { ready: false, reason: 'agent readiness probe returned invalid JSON' };
+  }
+}
+
+function runCodeStory(input, event, policy, state = {}) {
   if (process.env.CODESTORY_HOOK_DISABLE_RUNTIME === '1') {
     return {
       kind: 'disabled',
@@ -107,29 +234,82 @@ function runCodeStory(input, event, state = {}) {
     };
   }
 
-  const command = hookCommand(input, event);
-  if (!command) return null;
   const mcp = classifyMcpRuntime();
+  if (policy.runtimeOnly) {
+    const output = state.hook?.preflight_failed && mcp.degraded_no_surface
+      ? [
+        `event_taxonomy: ${policy.taxonomy}`,
+        `output_cap_chars: ${policy.cap}`,
+        `dedupe_key: ${policy.dedupeKey}`,
+        shortDegradedNotice(mcp, null, state),
+      ].join('\n')
+      : runtimeStatusBlock(policy, mcp);
+    return {
+      kind: 'runtime truth',
+      output: truncate(output, policy.cap),
+      fingerprint: runtimeFingerprint(mcp),
+    };
+  }
+
+  const command = hookCommand(input, event, policy);
+  if (!command) return null;
   if (mcp.mcp_config_installed && mcp.mcp_process_launchable) {
     return {
       kind: 'mcp detection',
-      output: [
+      output: truncate([
+        `event_taxonomy: ${policy.taxonomy}`,
+        `output_cap_chars: ${policy.cap}`,
+        `dedupe_key: ${policy.dedupeKey}`,
         mcpDetectionText(mcp),
         mcp.mcp_resources_exposed
-          ? 'Use codestory://status as the active runtime truth before CLI fallback.'
+          ? 'Use codestory://status as the active runtime truth. Run packet/search/context only when status allows that surface with retrieval_mode=full.'
           : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Reload the host/plugin and read codestory://status; do not add CodeStory to PATH.',
-      ].join('\n'),
+      ].join('\n'), policy.cap),
+      fingerprint: runtimeFingerprint(mcp),
     };
   }
+
   if (!process.env.CODESTORY_CLI && !mcp.managed_cli_present) {
     return {
       degraded: true,
       kind: 'degraded mode',
-      output: shortDegradedNotice(mcp, null, state),
+      output: truncate([
+        `event_taxonomy: ${policy.taxonomy}`,
+        `output_cap_chars: ${policy.cap}`,
+        `dedupe_key: ${policy.dedupeKey}`,
+        shortDegradedNotice(mcp, null, state),
+      ].join('\n'), policy.cap),
+      fingerprint: `${runtimeFingerprint(mcp)}|no-cli`,
     };
   }
 
   const cli = process.env.CODESTORY_CLI || mcp.managed_cli_path;
+  const readiness = policy.taxonomy === 'user_prompt'
+    ? runReadinessProbe(cli, policy.project, input.cwd || process.cwd())
+    : { ready: true, reason: null };
+  if (policy.taxonomy === 'user_prompt' && !readiness.ready) {
+    const failedState = {
+      ...state,
+      hook: {
+        ...(state.hook || {}),
+        preflight_failed: Boolean(readiness.reason),
+      },
+    };
+    return {
+      degraded: true,
+      kind: 'runtime truth',
+      output: truncate([
+        `event_taxonomy: ${policy.taxonomy}`,
+        `output_cap_chars: ${policy.cap}`,
+        `dedupe_key: ${policy.dedupeKey}`,
+        mcp.degraded_no_surface
+          ? shortDegradedNotice(mcp, readiness.reason, failedState)
+          : runtimeStatusBlock(policy, mcp),
+        'Packet skipped: sidecar-backed packet/search readiness is not proven full for this hook invocation.',
+      ].join('\n'), policy.cap),
+      fingerprint: `${runtimeFingerprint(mcp)}|packet-not-ready`,
+    };
+  }
 
   const result = spawnSync(cli, command.args, {
     cwd: input.cwd || process.cwd(),
@@ -143,15 +323,15 @@ function runCodeStory(input, event, state = {}) {
   if (result.status === 0 && result.stdout.trim()) {
     return {
       kind: command.kind,
-      output: truncate(result.stdout),
+      output: truncate(result.stdout, policy.cap),
       next: command.next,
+      fingerprint: `${runtimeFingerprint(mcp)}|${command.kind}`,
     };
   }
 
   const reason = result.error
     ? result.error.message
     : truncate(result.stderr || `codestory-cli exited with status ${result.status}`);
-
   const failedState = {
     ...state,
     hook: {
@@ -164,19 +344,29 @@ function runCodeStory(input, event, state = {}) {
     degraded: mcp.degraded_no_surface,
     preflightFailed: true,
     kind: command.kind,
-    output: mcp.degraded_no_surface
-      ? shortDegradedNotice(mcp, reason, failedState)
+    output: truncate(mcp.degraded_no_surface
+      ? [
+        `event_taxonomy: ${policy.taxonomy}`,
+        `output_cap_chars: ${policy.cap}`,
+        `dedupe_key: ${policy.dedupeKey}`,
+        shortDegradedNotice(mcp, reason, failedState),
+      ].join('\n')
       : [
         mcpDetectionText(mcp),
         `CodeStory hook attempted ${command.kind} but did not receive usable output.`,
         reason ? `Reason: ${reason}` : null,
         command.next,
-      ].filter(Boolean).join('\n'),
+      ].filter(Boolean).join('\n'), policy.cap),
+    fingerprint: `${runtimeFingerprint(mcp)}|${reason}`,
   };
 }
 
 function buildContext(input, event, state = {}) {
-  const runtime = runCodeStory(input, event, state);
+  const policy = hookPolicy(input, event);
+  const runtime = runCodeStory(input, event, policy, state);
+  if (runtime && policy.heartbeat && !rememberHeartbeat(policy, runtime.fingerprint || runtime.output)) {
+    return null;
+  }
   const runtimeBlock = runtime && runtime.output
     ? [
       `CODESTORY HOOK ${runtime.kind.toUpperCase()}`,
@@ -184,13 +374,17 @@ function buildContext(input, event, state = {}) {
       runtime.next ? `Next: ${runtime.next}` : null,
     ].filter(Boolean).join('\n\n')
     : null;
-
-  if (runtime && runtime.kind === 'mcp detection') {
-    return [eventHeader(event, input).trim(), runtimeBlock].filter(Boolean).join('\n\n');
+  const contentKey = runtime?.fingerprint || runtimeBlock || policy.taxonomy;
+  if (runtimeBlock && !rememberEmission(policy, contentKey)) {
+    return null;
   }
 
-  if (runtime && runtime.degraded) {
-    return [eventHeader(event, input).trim(), runtimeBlock].filter(Boolean).join('\n\n');
+  if (runtime && runtime.kind === 'mcp detection') {
+    return truncate([eventHeader(event, input).trim(), runtimeBlock].filter(Boolean).join('\n\n'), policy.cap);
+  }
+
+  if (policy.runtimeOnly || (runtime && runtime.degraded)) {
+    return truncate([eventHeader(event, input).trim(), runtimeBlock].filter(Boolean).join('\n\n'), policy.cap);
   }
 
   const emitted = state.hook && state.hook.instructions_emitted;
@@ -201,7 +395,7 @@ function buildContext(input, event, state = {}) {
     parts.push(runtimeBlock);
   }
 
-  return parts.join('\n\n');
+  return truncate(parts.join('\n\n'), policy.cap);
 }
 
 function freshInstructionBoundary(event, input = {}) {
@@ -224,8 +418,10 @@ readHookInput().then((input) => {
       : state;
     const context = buildContext(input, event, activeState);
     const priorInstructions = (activeState.hook && activeState.hook.instructions_emitted) || {};
-    const emittedFullInstructions = context.includes('CODESTORY BACKGROUND GROUNDING RULES') ||
-      context.includes('CODESTORY BACKGROUND GROUNDING ACTIVE');
+    const emittedFullInstructions = context && (
+      context.includes('CODESTORY BACKGROUND GROUNDING RULES') ||
+      context.includes('CODESTORY BACKGROUND GROUNDING ACTIVE')
+    );
     const instructions = emittedFullInstructions
       ? { ...priorInstructions, [event]: true }
       : priorInstructions;
@@ -239,7 +435,7 @@ readHookInput().then((input) => {
       },
     });
     const nextState = readActiveState() || {};
-    if (/CodeStory is unavailable for this session/u.test(context)) {
+    if (context && /CodeStory is unavailable for this session/u.test(context)) {
       rememberActiveState({ hook: { ...(nextState.hook || {}), preflight_failed: true } });
     }
     writeHookOutput(event, context);
