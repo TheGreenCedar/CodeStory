@@ -50,6 +50,31 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
         .expect("local ready verdicts");
     assert_eq!(local_verdicts.len(), 1);
     assert_eq!(local_verdicts[0]["goal"], "local_navigation");
+    assert!(
+        local_json["local_refresh"].is_null(),
+        "plain ready should not report a wait-fresh action: {local_json_text}"
+    );
+
+    let wait_json_text = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ready",
+            "--goal",
+            "local",
+            "--wait-fresh",
+            "--format",
+            "json",
+        ],
+    );
+    let wait_json: Value = serde_json::from_str(&wait_json_text).expect("ready wait json");
+    assert_eq!(wait_json["verdicts"][0]["status"], "ready");
+    assert_eq!(wait_json["local_refresh"]["state"], "fresh");
+    assert_eq!(wait_json["local_refresh"]["reason"], "already_fresh");
+    assert_eq!(
+        wait_json["verdicts"][0]["sidecar"]["degraded_reason"], "retrieval_manifest_missing",
+        "local wait-fresh must not bootstrap retrieval sidecars: {wait_json_text}"
+    );
 
     let markdown = run_cli(
         workspace.path(),
@@ -129,6 +154,69 @@ fn ready_repair_indexes_fresh_workspace_for_local_navigation() {
             .expect("minimum next command")
             .contains("codestory-cli ground --project"),
         "repaired local readiness should point at grounding, not another index repair: {json_text}"
+    );
+}
+
+#[test]
+fn ready_wait_fresh_refreshes_stale_local_graph_once() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+    fs::write(
+        workspace.path().join("src").join("lib.rs"),
+        r#"pub fn entry_point() -> String {
+    helper("ready")
+}
+
+pub fn added_after_index() -> String {
+    helper("fresh")
+}
+
+fn helper(value: &str) -> String {
+    format!("ready:{value}")
+}
+"#,
+    )
+    .expect("make index stale");
+
+    let stale_json_text = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["ready", "--goal", "local", "--format", "json"],
+    );
+    let stale_json: Value = serde_json::from_str(&stale_json_text).expect("stale ready json");
+    assert_eq!(stale_json["verdicts"][0]["status"], "repair_index");
+    assert_eq!(stale_json["verdicts"][0]["index"]["status"], "stale");
+
+    let wait_json_text = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "ready",
+            "--goal",
+            "local",
+            "--wait-fresh",
+            "--format",
+            "json",
+        ],
+    );
+    let wait_json: Value = serde_json::from_str(&wait_json_text).expect("wait fresh json");
+    assert_eq!(wait_json["verdicts"][0]["status"], "ready");
+    assert_eq!(wait_json["verdicts"][0]["index"]["status"], "fresh");
+    assert_eq!(wait_json["local_refresh"]["state"], "fresh");
+    assert_eq!(wait_json["local_refresh"]["reason"], "refreshed");
+    assert_eq!(
+        wait_json["verdicts"][0]["sidecar"]["retrieval_mode"],
+        "unavailable"
+    );
+    assert_eq!(
+        wait_json["verdicts"][0]["sidecar"]["degraded_reason"], "retrieval_manifest_missing",
+        "wait-fresh should leave packet/search sidecars separately gated: {wait_json_text}"
     );
 }
 

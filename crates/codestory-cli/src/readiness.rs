@@ -41,6 +41,7 @@ pub(crate) enum LocalRefreshState {
     Fresh,
     Stale,
     NotChecked,
+    SkippedLocked,
     Failed,
 }
 
@@ -156,6 +157,7 @@ pub(crate) fn local_refresh_state_label(state: LocalRefreshState) -> &'static st
         LocalRefreshState::Fresh => "fresh",
         LocalRefreshState::Stale => "stale",
         LocalRefreshState::NotChecked => "not_checked",
+        LocalRefreshState::SkippedLocked => "skipped_locked",
         LocalRefreshState::Failed => "failed",
     }
 }
@@ -178,6 +180,7 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
         LocalRefreshState::Fresh => None,
         LocalRefreshState::Stale => Some("index_changed".to_string()),
         LocalRefreshState::NotChecked => Some("freshness_not_checked".to_string()),
+        LocalRefreshState::SkippedLocked => Some("index_locked".to_string()),
         LocalRefreshState::Failed => Some(verdict.summary.clone()),
     };
 

@@ -22,7 +22,7 @@ use codestory_contracts::api::{
     EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto,
     GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest,
     NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto, PacketSufficiencyStatusDto,
-    PacketTaskClassDto, ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto,
+    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto,
     RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit,
     SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
     SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
@@ -2002,7 +2002,11 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     } else {
         None
     };
-    let summary = runtime.open_project_summary()?;
+    let (summary, local_refresh) = if cmd.wait_fresh && !cmd.repair {
+        wait_for_local_freshness(&cmd.project, &runtime)?
+    } else {
+        (runtime.open_project_summary()?, None)
+    };
     let sidecar = ready_sidecar_status(&runtime, repaired_sidecar);
     let mut verdicts = build_summary_readiness(
         &summary.root,
@@ -2014,9 +2018,85 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         let goal = goal.as_dto();
         verdicts.retain(|verdict| verdict.goal == goal);
     }
-    let output = ReadyOutput { verdicts };
+    let output = ReadyOutput {
+        verdicts,
+        local_refresh,
+    };
     let markdown = render_ready_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn wait_for_local_freshness(
+    project: &ProjectArgs,
+    inspect_runtime: &RuntimeContext,
+) -> Result<(ProjectSummary, Option<readiness::LocalRefreshOutput>)> {
+    let summary = inspect_runtime.open_project_summary()?;
+    if !local_freshness_needs_refresh(&summary) {
+        let mut output = local_refresh_output_from_summary(&summary);
+        if output.state == readiness::LocalRefreshState::Fresh {
+            output.reason = Some("already_fresh".to_string());
+        }
+        return Ok((summary, Some(output)));
+    }
+
+    let index_runtime = RuntimeContext::new(project)?;
+    match index_runtime.ensure_open(args::RefreshMode::Incremental) {
+        Ok(opened) => {
+            let mut output = local_refresh_output_from_summary(&opened.summary);
+            if output.state == readiness::LocalRefreshState::Fresh {
+                output.reason = Some("refreshed".to_string());
+            } else {
+                output.state = readiness::LocalRefreshState::Failed;
+                output.blocks_local_surfaces = true;
+                output.reason = Some("refresh_did_not_reach_fresh".to_string());
+            }
+            Ok((opened.summary, Some(output)))
+        }
+        Err(error) => {
+            let mut output = local_refresh_output_from_summary(&summary);
+            output.state = classify_local_refresh_failure_state(&error);
+            output.blocks_local_surfaces = true;
+            output.readiness_status = ReadinessStatusDto::RepairIndex;
+            output.reason = Some(error.to_string());
+            Ok((summary, Some(output)))
+        }
+    }
+}
+
+fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
+    summary.freshness.as_ref().is_some_and(|freshness| {
+        matches!(
+            freshness.status,
+            IndexFreshnessStatusDto::Stale | IndexFreshnessStatusDto::NotChecked
+        )
+    })
+}
+
+fn local_refresh_output_from_summary(summary: &ProjectSummary) -> readiness::LocalRefreshOutput {
+    let verdict = readiness::build_readiness_verdict(
+        ReadinessGoalDto::LocalNavigation,
+        readiness::ReadinessInputs {
+            project: &summary.root,
+            stats: &summary.stats,
+            freshness: summary.freshness.as_ref(),
+            setup: None,
+            sidecar: None,
+        },
+    );
+    readiness::local_refresh_output(&verdict)
+}
+
+fn classify_local_refresh_failure_state(error: &anyhow::Error) -> readiness::LocalRefreshState {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("cache_busy")
+        || message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("cache is busy")
+    {
+        readiness::LocalRefreshState::SkippedLocked
+    } else {
+        readiness::LocalRefreshState::Failed
+    }
 }
 
 fn run_agent(cmd: args::AgentCommand) -> Result<()> {
@@ -11823,6 +11903,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn classify_local_refresh_failure_state_detects_lock_contention() {
+        let locked = anyhow::anyhow!("cache_busy: database is locked");
+        assert_eq!(
+            classify_local_refresh_failure_state(&locked),
+            readiness::LocalRefreshState::SkippedLocked
+        );
+
+        let failed = anyhow::anyhow!("index refresh failed");
+        assert_eq!(
+            classify_local_refresh_failure_state(&failed),
+            readiness::LocalRefreshState::Failed
+        );
     }
 
     fn test_search_hit_defaults() -> SearchHit {

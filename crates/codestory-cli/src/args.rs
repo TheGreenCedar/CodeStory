@@ -584,6 +584,11 @@ pub(crate) struct ReadyCommand {
         help = "Repair readiness before reporting it. Local repairs refresh the index; agent repairs also bootstrap and rebuild retrieval sidecars."
     )]
     pub(crate) repair: bool,
+    #[arg(
+        long,
+        help = "For local graph freshness, no-op when fresh and run at most one incremental refresh when stale or unchecked."
+    )]
+    pub(crate) wait_fresh: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -1519,6 +1524,8 @@ pub(crate) struct IndexOutput<'a> {
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadyOutput {
     pub(crate) verdicts: Vec<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
 }
 
 #[derive(Debug, Serialize)]

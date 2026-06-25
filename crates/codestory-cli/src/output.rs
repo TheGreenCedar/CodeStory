@@ -160,6 +160,16 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
 pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Readiness");
+    if let Some(refresh) = output.local_refresh.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "local_refresh: `{}`",
+            crate::readiness::local_refresh_state_label(refresh.state)
+        );
+        if let Some(reason) = refresh.reason.as_deref() {
+            let _ = writeln!(markdown, "local_refresh_reason: {reason}");
+        }
+    }
     append_readiness_verdicts(&mut markdown, &output.verdicts, true);
     markdown
 }
