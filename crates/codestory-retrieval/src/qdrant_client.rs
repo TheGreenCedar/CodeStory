@@ -15,6 +15,8 @@ pub const QDRANT_INDEX_UPSERT_BATCH_SIZE: usize = 512;
 
 const QDRANT_MUTATION_BUDGET: Duration = Duration::from_secs(5);
 const QDRANT_UPSERT_BUDGET: Duration = Duration::from_secs(60);
+const QDRANT_CREATE_POSTCONDITION_ATTEMPTS: usize = 10;
+const QDRANT_CREATE_POSTCONDITION_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct QdrantUpsertPoint {
@@ -299,16 +301,18 @@ impl QdrantClient {
             .send_string(&payload)
         {
             Ok(response) => {
-                let status = response.status();
-                if status == 200 || status == 201 {
-                    return Ok(());
-                }
-                if status == 409 {
-                    return Ok(());
-                }
-                bail!("create collection http {status}");
+                create_collection_status_result(response.status())?;
+                Ok(())
             }
-            Err(error) => bail!("create collection request failed: {error}"),
+            Err(ureq::Error::Status(status, _)) => create_collection_status_result(status),
+            Err(error) => wait_for_collection_create_postcondition(
+                collection,
+                &error.to_string(),
+                QDRANT_CREATE_POSTCONDITION_ATTEMPTS,
+                QDRANT_CREATE_POSTCONDITION_DELAY,
+                || self.health_probe(collection),
+                std::thread::sleep,
+            ),
         }
     }
 
@@ -509,6 +513,51 @@ fn collection_probe_from_http_error(error: &ureq::Error) -> Option<(bool, bool, 
         return Some((true, false, format!("http {code}")));
     }
     None
+}
+
+fn create_collection_status_result(status: u16) -> Result<()> {
+    if status == 200 || status == 201 || status == 409 {
+        return Ok(());
+    }
+    bail!("create collection http {status}")
+}
+
+fn wait_for_collection_create_postcondition<F, S>(
+    collection: &str,
+    create_error: &str,
+    attempts: usize,
+    delay: Duration,
+    mut probe: F,
+    mut sleep: S,
+) -> Result<()>
+where
+    F: FnMut() -> QdrantHealthProbe,
+    S: FnMut(Duration),
+{
+    let mut last_probe_detail = String::from("not_probed");
+    for attempt in 1..=attempts {
+        let status = probe();
+        last_probe_detail = status.detail;
+        if status.collection_exists {
+            return Ok(());
+        }
+        if attempt < attempts {
+            sleep(delay);
+        }
+    }
+    let reason = collection_create_failure_reason(create_error);
+    bail!(
+        "qdrant {reason} for collection {collection}: create request did not reach a confirmed collection after {attempts} postcondition probe(s); last_probe={last_probe_detail}; create_error={create_error}"
+    )
+}
+
+fn collection_create_failure_reason(create_error: &str) -> &'static str {
+    let error = create_error.to_ascii_lowercase();
+    if error.contains("timeout") || error.contains("timed out") || error.contains("10060") {
+        "collection_create_timeout"
+    } else {
+        "collection_create_failed"
+    }
 }
 
 /// Parse Qdrant Query API JSON (`result.points[]` with payload paths / symbols).
@@ -729,5 +778,100 @@ mod tests {
         let body = r#"{ "result": { "count": 1234 }, "status": "ok" }"#;
 
         assert_eq!(parse_count_points_response(body).expect("parse"), 1234);
+    }
+
+    #[test]
+    fn create_collection_status_accepts_already_exists() {
+        create_collection_status_result(409).expect("already exists is idempotent");
+    }
+
+    #[test]
+    fn create_collection_status_rejects_non_409_client_error() {
+        let error = create_collection_status_result(403)
+            .expect_err("definite create HTTP errors should not wait for postcondition");
+
+        assert_eq!(error.to_string(), "create collection http 403");
+    }
+
+    #[test]
+    fn create_collection_timeout_accepts_late_collection_postcondition() {
+        let mut probes = vec![
+            QdrantHealthProbe {
+                reachable: true,
+                latency_ms: 1,
+                collection_exists: false,
+                point_count: None,
+                detail: "http 404".into(),
+            },
+            QdrantHealthProbe {
+                reachable: true,
+                latency_ms: 1,
+                collection_exists: true,
+                point_count: Some(0),
+                detail: "http 200 points_count=0".into(),
+            },
+        ]
+        .into_iter();
+        let mut sleeps = 0;
+
+        wait_for_collection_create_postcondition(
+            "codestory_project_hash",
+            "operation timed out",
+            3,
+            Duration::from_millis(1),
+            || probes.next().expect("probe"),
+            |_| sleeps += 1,
+        )
+        .expect("late collection should satisfy create postcondition");
+
+        assert_eq!(sleeps, 1);
+    }
+
+    #[test]
+    fn create_collection_timeout_names_collection_and_last_probe() {
+        let error = wait_for_collection_create_postcondition(
+            "codestory_project_hash",
+            "os error 10060",
+            2,
+            Duration::from_millis(1),
+            || QdrantHealthProbe {
+                reachable: true,
+                latency_ms: 1,
+                collection_exists: false,
+                point_count: Some(0),
+                detail: "http 200 points_count=0".into(),
+            },
+            |_| {},
+        )
+        .expect_err("missing postcondition should fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("collection_create_timeout"));
+        assert!(message.contains("codestory_project_hash"));
+        assert!(message.contains("last_probe=http 200 points_count=0"));
+    }
+
+    #[test]
+    fn create_collection_transport_failure_waits_then_reports_not_ready() {
+        let error = wait_for_collection_create_postcondition(
+            "codestory_project_hash",
+            "connection closed before message completed",
+            1,
+            Duration::from_millis(1),
+            || QdrantHealthProbe {
+                reachable: false,
+                latency_ms: 1,
+                collection_exists: false,
+                point_count: None,
+                detail: "transport closed".into(),
+            },
+            |_| {},
+        )
+        .expect_err("uncertain transport failure should still fail closed when not ready");
+        let message = error.to_string();
+
+        assert!(message.contains("collection_create_failed"));
+        assert!(message.contains("codestory_project_hash"));
+        assert!(message.contains("last_probe=transport closed"));
     }
 }

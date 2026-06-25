@@ -2175,8 +2175,14 @@ fn repair_ready_state(
         .run_indexing_blocking(IndexMode::Full)
         .map_err(map_api_error)
         .context("ready repair retrieval index refresh")?;
-    retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar)
-        .context("ready repair retrieval index finalize")?;
+    retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar).with_context(
+        || {
+            format!(
+                "ready repair retrieval index finalize using {}",
+                retrieval::format_sidecar_runtime(&sidecar)
+            )
+        },
+    )?;
     codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
