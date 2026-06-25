@@ -1540,6 +1540,8 @@ pub(crate) struct ReadyOutput {
     pub(crate) verdicts: Vec<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
 }
 
 #[derive(Debug, Serialize)]
