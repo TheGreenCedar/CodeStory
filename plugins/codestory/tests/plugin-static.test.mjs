@@ -256,6 +256,13 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "path_fallback");
     assert.equal(status.plugin_runtime.cli_path, fakeCli);
+    assert.equal(status.runtime_truth.runtime_source, "path_fallback");
+    assert.equal(status.runtime_truth.plugin_root, pluginRoot);
+    assert.equal(status.runtime_truth.sidecar_policy, "ask");
+    assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
+    assert.equal(status.runtime_truth.sidecar_status.run_id, "unavailable");
+    assert.equal(status.runtime_truth.readiness_lanes.local_graph.status, "repair_setup");
+    assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.profile, "agent");
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
@@ -413,6 +420,9 @@ test("mcp launcher fails open when wait-fresh skips local refresh", async () => 
     assert.equal(responses.length, 3, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
+    assert.equal(status.runtime_truth.runtime_source, "local_dev_override");
+    assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
+    assert.equal(status.runtime_truth.readiness_lanes.local_graph.refresh_state, "skipped_locked");
     assert.equal(status.readiness[0].status, "repair_index");
     assert.equal(status.readiness[0].repair_reason, "local_navigation_wait_fresh_skipped_locked");
     assert.equal(status.local_refresh.state, "skipped_locked");
@@ -1568,6 +1578,7 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
     "server_executable_sha256",
     "sidecar_contract_version",
     "plugin_runtime",
+    "runtime_truth",
     "plugin_runtime.plugin_root",
     "plugin_cache_version",
     "sidecar_setup",
