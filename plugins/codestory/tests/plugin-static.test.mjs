@@ -436,7 +436,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
   }
 });
 
-test("mcp launcher waits for fresh local navigation without agent repair", async () => {
+test("mcp launcher waits for fresh local navigation without unapproved agent repair", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-repair-index-"));
@@ -485,7 +485,7 @@ test("mcp launcher waits for fresh local navigation without agent repair", async
         ...process.env,
         CODESTORY_CLI: cliPath,
         PLUGIN_DATA: dataDir,
-        CODESTORY_PLUGIN_SIDECAR_POLICY: "enabled",
+        CODESTORY_PLUGIN_SIDECAR_POLICY: "disabled",
         TEST_CODESTORY_VERSION: version,
         TEST_LOG: logFile,
         TEST_OUT: marker,
@@ -809,7 +809,7 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
   }
 });
 
-test("enabled sidecar policy does not schedule agent repair at MCP startup", async () => {
+test("enabled sidecar policy schedules agent repair at MCP startup", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
@@ -849,14 +849,38 @@ test("enabled sidecar policy does not schedule agent repair at MCP startup", asy
     });
     assert.equal(result.status, 0, result.stderr);
 
-    const text = await readFile(logFile, "utf8");
-    const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    let text = "";
+    let calls = [];
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      text = await readFile(logFile, "utf8");
+      calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+      if (calls.some((call) => call.repair)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     assert.ok(calls.some((call) => {
       return JSON.stringify(call.args) === JSON.stringify(["serve", "--stdio", "--refresh", "none"]);
     }), text);
-    assert.equal(calls.some((call) => call.repair), false);
-    assert.equal(calls.some((call) => call.args.includes("agent")), false);
-    assert.equal(calls.some((call) => call.args.includes("--repair")), false);
+    const repair = calls.find((call) => call.repair);
+    assert.ok(repair, text);
+    assert.deepEqual(repair.args, [
+      "ready",
+      "--goal",
+      "agent",
+      "--repair",
+      "--project",
+      repoRoot,
+      "--format",
+      "json",
+      "--run-id",
+      "shared-agent",
+    ]);
+    assert.equal(repair.policy, "enabled");
+    const policy = JSON.parse(
+      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
+    );
+    assert.equal(policy.last_repair.project_root, repoRoot);
+    assert.match(policy.last_repair.command, /ready --goal agent --repair/u);
+    assert.ok(["repairing", "completed"].includes(policy.last_repair.state));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

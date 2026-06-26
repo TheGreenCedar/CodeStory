@@ -18,6 +18,7 @@ const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
+const sidecarRepairRecentMs = 30000;
 
 function readJson(file) {
   try {
@@ -128,6 +129,89 @@ function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
 
+function repairArgsForProject(projectRoot = process.cwd()) {
+  return ['ready', '--goal', 'agent', '--repair', '--project', projectRoot, '--format', 'json', '--run-id', sharedAgentRunId];
+}
+
+function normalizeProjectRoot(projectRoot = process.cwd()) {
+  const resolved = path.resolve(projectRoot);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function comparableProjectRoot(projectRoot = process.cwd()) {
+  return normalizeProjectRoot(projectRoot).replace(/[\\/]+$/u, '').toLowerCase();
+}
+
+function sameProjectRoot(left, right) {
+  return comparableProjectRoot(left) === comparableProjectRoot(right);
+}
+
+function recentAutomaticRepair(policy, projectRoot = process.cwd()) {
+  const last = policy?.lastRepair;
+  if (!last?.project_root || !sameProjectRoot(last.project_root, projectRoot)) return false;
+  if (last.state === 'completed' || last.state === 'blocked') return true;
+  if (last.state !== 'repairing') return false;
+  const updatedAt = Date.parse(last.updated_at || '');
+  return Number.isFinite(updatedAt) && Date.now() - updatedAt < sidecarRepairRecentMs;
+}
+
+function writeSidecarRepairState(policy, state, projectRoot, patch = {}) {
+  if (!policy?.path) return null;
+  return writeSidecarPolicy('enabled', {
+    last_repair: {
+      state,
+      updated_at: new Date().toISOString(),
+      project_root: normalizeProjectRoot(projectRoot),
+      command: repairCommandForProject(projectRoot),
+      ...patch,
+    },
+  }, policy.path);
+}
+
+function maybeStartAutomaticSidecarRepair(resolved, projectRoot = process.cwd(), policy = readSidecarPolicy()) {
+  if (policy.state !== 'enabled' || !policy.path) {
+    return { attempted: false, state: policy.state };
+  }
+  if (recentAutomaticRepair(policy, projectRoot)) {
+    return { attempted: false, state: policy.lastRepair?.state || policy.state };
+  }
+
+  try {
+    const child = spawn(resolved.path, repairArgsForProject(projectRoot), {
+      cwd: projectRoot,
+      detached: true,
+      stdio: 'ignore',
+      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+      windowsHide: true,
+      env: {
+        ...process.env,
+        CODESTORY_PLUGIN_SIDECAR_REPAIR: '1',
+        CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: policy.state,
+        CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: policy.path || '',
+      },
+    });
+    writeSidecarRepairState(policy, 'repairing', projectRoot, { pid: child.pid || null });
+    child.on('exit', (code, signal) => {
+      writeSidecarRepairState(policy, code === 0 ? 'completed' : 'blocked', projectRoot, {
+        exit_status: code,
+        signal: signal || null,
+      });
+    });
+    child.on('error', (error) => {
+      writeSidecarRepairState(policy, 'blocked', projectRoot, { error: error.message });
+    });
+    child.unref();
+    return { attempted: true, state: 'repairing', pid: child.pid || null };
+  } catch (error) {
+    writeSidecarRepairState(policy, 'blocked', projectRoot, { error: error.message });
+    return { attempted: true, state: 'blocked', error: error.message };
+  }
+}
+
 function optionValue(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : null;
@@ -135,13 +219,7 @@ function optionValue(argv, name) {
 
 function dirtyMarkerEnv(projectRoot = process.cwd()) {
   const markerPath = dirtyMarkerPathForProject(projectRoot, pluginDataDir());
-  const normalizedRoot = (() => {
-    try {
-      return fs.realpathSync(path.resolve(projectRoot));
-    } catch {
-      return path.resolve(projectRoot);
-    }
-  })();
+  const normalizedRoot = normalizeProjectRoot(projectRoot);
   return {
     path: markerPath || '',
     projectRoot: markerPath ? normalizedRoot : '',
@@ -803,7 +881,9 @@ async function bootstrapStatus(projectRoot = process.cwd()) {
     };
   }
 
-  const sidecarPolicy = readSidecarPolicy();
+  const initialSidecarPolicy = readSidecarPolicy();
+  maybeStartAutomaticSidecarRepair(resolved, projectRoot, initialSidecarPolicy);
+  const sidecarPolicy = readSidecarPolicy(initialSidecarPolicy.path);
   const plugin = pluginRuntimeForResolved(resolved);
   const localRefresh = localReadiness.localRefresh || {
     state: 'fresh',
@@ -1094,7 +1174,9 @@ async function main() {
     }));
     return;
   }
-  const sidecarStatus = readSidecarPolicy();
+  const initialSidecarStatus = readSidecarPolicy();
+  maybeStartAutomaticSidecarRepair(resolved, process.cwd(), initialSidecarStatus);
+  const sidecarStatus = readSidecarPolicy(initialSidecarStatus.path);
   const dirtyMarker = dirtyMarkerEnv(process.cwd());
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
