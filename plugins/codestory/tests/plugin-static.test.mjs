@@ -111,7 +111,7 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.deepEqual(mcp.mcpServers.codestory.args, [
     "./scripts/codestory-mcp.cjs",
   ]);
-  assert.equal(Object.hasOwn(mcp.mcpServers.codestory, "cwd"), false);
+  assert.equal(mcp.mcpServers.codestory.cwd, ".");
 });
 
 test("plugin package version tracks the codestory-cli release version", async () => {
