@@ -937,6 +937,74 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   }
 });
 
+test("startup hook bootstraps managed cli before reporting MCP visibility", async (t) => {
+  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  if (tarProbe.status !== 0) {
+    t.skip("tar unavailable for archive fixture");
+    return;
+  }
+
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-bootstrap-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-hook-release-"));
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
+  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const stageDir = join(releaseDir, archiveBase);
+  const cliPath = join(stageDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const archivePath = join(releaseDir, archiveName);
+
+  try {
+    await mkdir(stageDir, { recursive: true });
+    await writeFakeCli(cliPath);
+    const packArgs = archiveName.endsWith(".zip")
+      ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
+      : ["-czf", archivePath, "-C", releaseDir, archiveBase];
+    const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
+    assert.equal(pack.status, 0, pack.stderr);
+    const archiveSha256 = createHash("sha256")
+      .update(await readFile(archivePath))
+      .digest("hex");
+    await writeFile(join(releaseDir, "SHA256SUMS.txt"), `${archiveSha256}  ${archiveName}\n`, "utf8");
+
+    const result = spawnSync(process.execPath, [hookPath], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        CODESTORY_MCP_RESOURCES_EXPOSED: "",
+        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        COPILOT_PLUGIN_DATA: "",
+        PLUGIN_DATA: dataDir,
+      },
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "startup",
+        cwd: repoRoot,
+      }),
+      encoding: "utf8",
+      timeout: 30000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, /managed_bootstrap: ready/u);
+    assert.match(context, /managed_bootstrap_cli_source: managed/u);
+    assert.match(context, /managed_bootstrap_local_refresh: fresh/u);
+    assert.match(context, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
+    assert.match(context, /managed_cli_present: yes/u);
+    assert.doesNotMatch(context, /where\.exe codestory-cli|command -v codestory-cli|adding CodeStory to PATH/u);
+
+    const manifest = JSON.parse(
+      await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
+    );
+    assert.equal(manifest.version, version);
+    assert.equal(manifest.build_source, "github_release");
+    assert.equal(manifest.archive_sha256, archiveSha256);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
 test("release asset downloader retries a transient failure", async () => {
   const { EventEmitter } = await import("node:events");
   const { PassThrough } = await import("node:stream");
@@ -1066,6 +1134,60 @@ test("session-start hooks are thin and host manifests point at them", async () =
 
   const manifest = JSON.parse(await readFile(hostManifest, "utf8"));
   assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
+});
+
+test("hook manifest timeouts cover managed bootstrap budget", async () => {
+  const hookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "claude-codex-hooks.json"), "utf8"),
+  );
+  const copilotHookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "copilot-hooks.json"), "utf8"),
+  );
+  const runtimeSource = await readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8");
+  const mcpSource = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
+  const numberFrom = (text, pattern, label) => {
+    const match = text.match(pattern);
+    assert.ok(match, `missing ${label}`);
+    return Number.parseInt(match[1], 10);
+  };
+
+  const bootstrapTimeoutMs = numberFrom(
+    runtimeSource,
+    /function bootstrapTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
+    "bootstrap timeout default",
+  );
+  const releaseDownloadTimeoutMs = numberFrom(
+    mcpSource,
+    /const releaseDownloadTimeoutMs = (\d+);/u,
+    "release download timeout",
+  );
+  const releaseDownloadAttempts = numberFrom(
+    mcpSource,
+    /const releaseDownloadAttempts = (\d+);/u,
+    "release download attempts",
+  );
+  const localWaitFreshTimeoutMs = numberFrom(
+    mcpSource,
+    /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
+    "local wait-fresh timeout default",
+  );
+  const requiredTimeoutSec = Math.max(
+    Math.ceil((bootstrapTimeoutMs + 30000) / 1000),
+    Math.ceil((releaseDownloadTimeoutMs * releaseDownloadAttempts + localWaitFreshTimeoutMs) / 1000),
+  );
+  const claudeTimeouts = Object.values(hookConfig.hooks)
+    .flat()
+    .flatMap((entry) => entry.hooks)
+    .map((hook) => hook.timeout);
+  const copilotTimeouts = copilotHookConfig.hooks.sessionStart.map((hook) => hook.timeoutSec);
+
+  for (const timeoutSec of [...claudeTimeouts, ...copilotTimeouts]) {
+    assert.equal(typeof timeoutSec, "number");
+    assert.ok(
+      timeoutSec >= requiredTimeoutSec,
+      `hook timeout ${timeoutSec}s must cover managed bootstrap budget ${requiredTimeoutSec}s`,
+    );
+  }
 });
 
 async function withFakeCodeStoryCli(callback) {

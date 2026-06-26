@@ -6,7 +6,7 @@
         "type": "command",
         "bash": "node \"${PLUGIN_ROOT}/hooks/codestory-activate.cjs\"",
         "powershell": "node \"${PLUGIN_ROOT}\\hooks\\codestory-activate.cjs\"",
-        "timeoutSec": 5
+        "timeoutSec": 300
       }
     ]
   }

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { createHash } = require('crypto');
 
 const isCopilot = Boolean(process.env.COPILOT_PLUGIN_DATA);
@@ -79,6 +80,16 @@ function mcpScriptExists(root, args) {
   return fs.existsSync(path.resolve(root, scriptArg));
 }
 
+function mcpScriptPath(root, args) {
+  const scriptArg = args.find((arg) => typeof arg === 'string' && /codestory-mcp\.cjs$/u.test(arg));
+  return scriptArg ? path.resolve(root, scriptArg) : null;
+}
+
+function bootstrapTimeoutMs() {
+  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_BOOTSTRAP_TIMEOUT_MS || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 240000;
+}
+
 function managedCliInfo(dataDir = pluginDataDir(), version = pluginVersion()) {
   if (!dataDir) return { present: false, path: null, source: null };
   const runtime = readJson(path.join(dataDir, MCP_RUNTIME_FILE));
@@ -128,6 +139,44 @@ function classifyMcpRuntime(options = {}) {
     managed_cli_path: managed.path,
     managed_cli_source: managed.source,
     degraded_no_surface: !resourcesExposed && !managed.present,
+  };
+}
+
+function bootstrapManagedRuntime(options = {}) {
+  const root = options.pluginRoot || pluginRoot();
+  const dataDir = options.pluginDataDir === undefined ? pluginDataDir() : options.pluginDataDir;
+  const projectRoot = normalizeProjectRoot(options.projectRoot || process.cwd());
+  const mcp = configuredMcp(root);
+  const scriptPath = mcpScriptPath(root, mcp.args);
+  if (!dataDir) return { attempted: false, reason: 'plugin_data_required' };
+  if (!mcp.installed || mcp.command !== 'node' || !scriptPath || !fs.existsSync(scriptPath)) {
+    return { attempted: false, reason: 'mcp_launcher_unavailable' };
+  }
+
+  const result = spawnSync(process.execPath, [scriptPath, 'bootstrap-status', '--project', projectRoot], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: bootstrapTimeoutMs(),
+    maxBuffer: 20000,
+    windowsHide: true,
+    env: {
+      ...process.env,
+      PLUGIN_DATA: dataDir,
+    },
+  });
+  let status = null;
+  try {
+    status = JSON.parse(result.stdout || '{}');
+  } catch (error) {
+    status = { ready: false, degraded_reason: `bootstrap_status_invalid_json:${error.message}` };
+  }
+  return {
+    attempted: true,
+    status: result.status,
+    error: result.error ? result.error.message : null,
+    stderr: result.stderr || '',
+    ready: status?.ready === true,
+    parsed: status,
   };
 }
 
@@ -421,6 +470,7 @@ function writeHookOutput(event, context) {
 }
 
 module.exports = {
+  bootstrapManagedRuntime,
   classifyMcpRuntime,
   dirtyMarkerPathForProject,
   dirtyHookStatus,
