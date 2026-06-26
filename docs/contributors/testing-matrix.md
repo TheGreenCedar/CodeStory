@@ -48,6 +48,9 @@ node .github/scripts/check-workflow-policy.mjs
 python .github/scripts/check-codestory-release.py --version <version>
 ```
 
+After a `main` release, run the release version check on `dev/codestory-next`
+with the released version before starting the next release lane.
+
 Do not create or push `v*` tags manually. A synchronized version bump merged to
 `main` runs the auto-release workflow, which creates the GitHub tag, release,
 cross-platform `codestory-cli` archives, and `SHA256SUMS.txt`.

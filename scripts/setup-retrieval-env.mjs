@@ -29,6 +29,7 @@ Options:
   --skip-status             Skip final "retrieval status"
   --with-holdout-clone      Clone holdout-retrieval OSS repos (network; large)
   --fetch-embed-model       Download bge-base-en-v1.5.Q8_0.gguf into target/retrieval-models
+  --fetch-only              With --fetch-embed-model, fetch/verify the model and exit
   --release                 Build and use release CLI (default: debug for speed)
   --project <path>          Project root for status (default: repo root)
   --wait-secs <n>           Bootstrap wait timeout (default: 90)
@@ -48,6 +49,7 @@ function parseArgs(argv) {
     skipStatus: false,
     withHoldoutClone: false,
     fetchEmbedModel: false,
+    fetchOnly: false,
     release: false,
     project: repoRoot,
     waitSecs: 90,
@@ -82,6 +84,10 @@ function parseArgs(argv) {
       opts.fetchEmbedModel = true;
       continue;
     }
+    if (arg === "--fetch-only") {
+      opts.fetchOnly = true;
+      continue;
+    }
     if (arg === "--release") {
       opts.release = true;
       continue;
@@ -98,6 +104,9 @@ function parseArgs(argv) {
   }
   if (!Number.isInteger(opts.waitSecs) || opts.waitSecs < 0) {
     throw new Error("--wait-secs must be a non-negative integer");
+  }
+  if (opts.fetchOnly && !opts.fetchEmbedModel) {
+    throw new Error("--fetch-only requires --fetch-embed-model");
   }
   return opts;
 }
@@ -151,16 +160,22 @@ function printPrereqReport(opts) {
   const cacheRoot = codestoryCacheRoot();
   const checks = [
     ["node", commandExists("node"), "required"],
-    ["cargo", commandExists("cargo"), opts.skipBuild ? "optional (--skip-build)" : "required"],
+    [
+      "cargo",
+      commandExists("cargo"),
+      opts.skipBuild || opts.fetchOnly ? "optional" : "required",
+    ],
     [
       "docker",
       commandExists("docker"),
-      opts.skipCompose ? "optional (--skip-compose)" : "required for live Qdrant",
+      opts.skipCompose || opts.fetchOnly ? "optional" : "required for live Qdrant",
     ],
     [
       `compose file (${composeFile})`,
       fs.existsSync(composeFile),
-      "required unless CODESTORY_RETRIEVAL_COMPOSE_FILE points elsewhere",
+      opts.fetchOnly
+        ? "optional"
+        : "required unless CODESTORY_RETRIEVAL_COMPOSE_FILE points elsewhere",
     ],
   ];
 
@@ -301,6 +316,10 @@ async function main() {
 
   if (opts.fetchEmbedModel) {
     await fetchEmbedModel();
+    if (opts.fetchOnly) {
+      console.log("\nFetch-only setup complete.");
+      return;
+    }
   }
 
   const bootstrapArgs = [
