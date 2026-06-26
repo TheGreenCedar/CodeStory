@@ -507,7 +507,7 @@ impl OnnxModelPaths {
 fn required_path_env(key: &str) -> Result<PathBuf> {
     let raw = std::env::var(key).with_context(|| {
         format!(
-            "{key} is not set; run `codestory-cli setup embeddings` or set {ONNX_MODEL_PATH_ENV} and {ONNX_TOKENIZER_PATH_ENV}"
+            "{key} is not set; ONNX is diagnostic-only, so set {ONNX_MODEL_PATH_ENV} and {ONNX_TOKENIZER_PATH_ENV} explicitly or use product llama.cpp sidecar retrieval"
         )
     })?;
     let path = PathBuf::from(raw.trim());

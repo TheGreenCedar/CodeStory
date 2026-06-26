@@ -421,7 +421,8 @@ fn setup_embeddings_next_commands(
     }
     vec![
         format!("codestory-cli doctor{args}"),
-        format!("codestory-cli index{args} --refresh full"),
+        format!("codestory-cli retrieval bootstrap{args}"),
+        format!("codestory-cli retrieval index{args} --refresh full"),
     ]
 }
 

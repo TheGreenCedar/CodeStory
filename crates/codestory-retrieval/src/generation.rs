@@ -404,17 +404,18 @@ mod tests {
     }
 
     #[test]
-    fn manifest_staleness_rejects_embedding_contract_drift() {
+    fn manifest_staleness_rejects_old_onnx_embedding_contract() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let storage = Store::open(&storage_path).expect("open store");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
-        manifest.embedding_backend = Some("other-backend:768".into());
+        manifest.embedding_backend = Some("onnx:bge".into());
 
         let reason = manifest_staleness_reason(&storage, &manifest)
             .expect("embedding backend drift should stale manifest");
 
         assert!(reason.contains("sidecar_embedding_backend_changed"));
+        assert!(reason.contains("manifest=onnx:bge"));
     }
 
     #[test]

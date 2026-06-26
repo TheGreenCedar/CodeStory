@@ -271,8 +271,9 @@ Default Windows cache locations:
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
 `target/retrieval-models` are accepted only after pinned size and SHA-256
 verification by the setup wrapper. Remove that model directory to uninstall the
-downloaded GGUF. Managed ONNX assets from `setup embeddings` are separate and do
-not substitute for llama.cpp sidecar retrieval.
+downloaded GGUF. Diagnostic ONNX assets from `setup embeddings` are separate,
+are not promoted into product runtime defaults, and do not substitute for
+llama.cpp sidecar retrieval.
 
 ## Operator troubleshooting
 
@@ -357,7 +358,7 @@ sidecars, and partial sidecars are diagnostic only and cannot produce
 
 Qdrant document vectors are copied from managed local `llm_symbol_doc`
 dense-anchor rows when the stored embedding contract is product BGE base profile:
-`bge-base-en-v1.5`, `768` dimensions, ONNX or llama.cpp backend. Query vectors
+`bge-base-en-v1.5`, `768` dimensions, and the llama.cpp product backend. Query vectors
 come from the local llama.cpp sidecar so retrieval remains sidecar-backed and
 can smoke-test the live collection. Wrong model dimensions fail loudly.
 
