@@ -2219,7 +2219,7 @@ pub(crate) fn wait_for_local_freshness(
     }
 }
 
-fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
+pub(crate) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
     summary.freshness.as_ref().is_some_and(|freshness| {
         matches!(
             freshness.status,
@@ -12463,6 +12463,31 @@ mod tests {
             classify_local_refresh_failure_state(&failed),
             readiness::LocalRefreshState::Failed
         );
+    }
+
+    #[test]
+    fn local_freshness_refreshes_stale_and_not_checked_summaries() {
+        let mut summary = summary_with_files(1);
+        assert!(!local_freshness_needs_refresh(&summary));
+
+        summary.freshness = Some(IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::Fresh,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 1,
+            indexed_file_count: 1,
+            duration_ms: 1,
+            reason: None,
+            samples: Vec::new(),
+        });
+        assert!(!local_freshness_needs_refresh(&summary));
+
+        summary.freshness.as_mut().expect("freshness").status = IndexFreshnessStatusDto::Stale;
+        assert!(local_freshness_needs_refresh(&summary));
+
+        summary.freshness.as_mut().expect("freshness").status = IndexFreshnessStatusDto::NotChecked;
+        assert!(local_freshness_needs_refresh(&summary));
     }
 
     fn test_search_hit_defaults() -> SearchHit {

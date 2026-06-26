@@ -795,10 +795,7 @@ fn zero_dense_qdrant_health(
 mod tests {
     use super::*;
     use crate::config::SidecarLayout;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -808,7 +805,7 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard hold ENV_LOCK and restore the prior value on drop.
+            // SAFETY: tests using this guard hold crate::test_support::env_lock() and restore the prior value on drop.
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
@@ -816,7 +813,7 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: tests using this guard hold ENV_LOCK and restore the prior value on drop.
+            // SAFETY: tests using this guard hold crate::test_support::env_lock() and restore the prior value on drop.
             unsafe {
                 if let Some(value) = self.previous.as_ref() {
                     std::env::set_var(self.key, value);
@@ -1001,7 +998,7 @@ mod tests {
 
     #[test]
     fn qdrant_capability_names_dead_embedding_runtime_before_smoke() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let _url = EnvGuard::set(
             "CODESTORY_EMBED_LLAMACPP_URL",

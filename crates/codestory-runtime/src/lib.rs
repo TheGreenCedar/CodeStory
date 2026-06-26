@@ -8073,6 +8073,8 @@ impl AppController {
         storage_path: &Path,
         refresh_runtime_caches: bool,
     ) -> Result<IndexingPhaseTimings, ApiError> {
+        // Drop any existing persisted search-index guard before rebuilding the index.
+        self.clear_search_state();
         let cache_refresh_started = Instant::now();
         let cache_stats_result = if refresh_runtime_caches {
             (|| {
@@ -8121,6 +8123,7 @@ impl AppController {
 
     fn recover_failed_indexing(&self, storage_path: &Path, refresh_runtime_caches: bool) {
         if refresh_runtime_caches && let Ok(mut storage) = Storage::open(storage_path) {
+            self.clear_search_state();
             let _ = refresh_caches(self, &mut storage, storage_path, None);
             return;
         }
@@ -16214,7 +16217,7 @@ fn build_llm_symbol_doc_text() -> String {
             .open_project_with_storage_path(workspace.path().to_path_buf(), storage_path.clone())
             .expect("open project");
         controller
-            .run_indexing_blocking(IndexMode::Full)
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("initial full index");
 
         let storage = Storage::open(&storage_path).expect("open storage after initial index");
@@ -16239,7 +16242,7 @@ fn build_llm_symbol_doc_text() -> String {
 
         write_reindex_semantic_fixture(workspace.path(), "updated compressed digest");
         controller
-            .run_indexing_blocking(IndexMode::Full)
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("rerun full index");
 
         let storage = Storage::open(&storage_path).expect("open storage after rerun");
