@@ -328,6 +328,9 @@ jobs:
             > target/post-publish-release-assets/linux-x64.sha256
           (cd target/post-publish-release-assets && sha256sum -c linux-x64.sha256)
 
+      - name: Fetch retrieval embedding model
+        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
+
       - name: Prove published agent runtime
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
