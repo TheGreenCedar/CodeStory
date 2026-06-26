@@ -908,24 +908,24 @@ pub(crate) struct SetupEmbeddingsCommand {
         long,
         value_enum,
         default_value_t = CliEmbeddingQuant::Q8_0,
-        help = "Legacy GGUF quant selector retained for CLI compatibility; managed setup now installs the pinned ONNX model."
+        help = "Legacy compatibility selector; setup embeddings now installs diagnostic ONNX assets only."
     )]
     pub(crate) quant: CliEmbeddingQuant,
     #[arg(
         long,
         value_enum,
         default_value_t = CliLlamaVariant::Vulkan,
-        help = "Legacy llama.cpp variant selector retained for CLI compatibility; managed setup now uses ONNX Runtime."
+        help = "Legacy compatibility selector; product embeddings use the llama.cpp retrieval sidecar."
     )]
     pub(crate) variant: CliLlamaVariant,
     #[arg(
         long,
-        help = "Show the managed ONNX asset plan without downloading anything."
+        help = "Show the diagnostic ONNX asset plan without downloading anything."
     )]
     pub(crate) dry_run: bool,
     #[arg(
         long,
-        help = "Compatibility flag; managed ONNX setup never starts a server."
+        help = "Compatibility flag; diagnostic ONNX setup never starts a server."
     )]
     pub(crate) no_start: bool,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
@@ -1603,6 +1603,14 @@ pub(crate) struct ReadinessLaneOutput {
     pub(crate) profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repair_updated_at_epoch_ms: Option<i64>,
     pub(crate) sidecar_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,

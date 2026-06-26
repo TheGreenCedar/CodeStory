@@ -19,10 +19,6 @@ const MANAGED_ONNX_PROVIDER: &str = if cfg!(target_os = "windows") {
 } else {
     "cpu"
 };
-const MANAGED_DOC_EMBED_BATCH_SIZE: usize = 2048;
-const MANAGED_SEMANTIC_DOC_MAX_TOKENS: usize = 512;
-const MANAGED_ONNX_BATCH_TOKENS: usize = 32_768;
-const MANAGED_STORED_VECTOR_ENCODING: &str = "int8";
 const BUNDLED_LLAMACPP_BACKEND_LABEL: &str = "llamacpp";
 const MANAGED_DIR_NAME: &str = "managed-embeddings";
 const MANAGED_POOLED_ONNX_MODEL_NAME: &str = "model_optimized_cls_pool.onnx";
@@ -264,7 +260,7 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
         return ManagedEmbeddingsStatus {
             state: "disabled_by_config".to_string(),
             message:
-                "Managed ONNX is skipped because embedding env config selects legacy llama.cpp."
+                "Diagnostic ONNX setup is skipped because embedding env config selects llama.cpp."
                     .to_string(),
             root: clean_path(root),
             endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
@@ -275,9 +271,8 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
     if disabled_by_embedding_env() {
         return ManagedEmbeddingsStatus {
             state: "disabled_by_config".to_string(),
-            message:
-                "Managed ONNX is skipped because embedding env config selects another backend."
-                    .to_string(),
+            message: "Diagnostic ONNX setup is skipped because embedding env config selects another backend."
+                .to_string(),
             root: clean_path(root),
             endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
             model: None,
@@ -289,7 +284,7 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
     if model.is_none() || tokenizer.is_none() {
         return ManagedEmbeddingsStatus {
             state: "missing_managed_assets".to_string(),
-            message: "Managed ONNX assets are not installed. Run `codestory-cli setup embeddings`."
+            message: "Diagnostic ONNX assets are not installed. Product packet/search uses the llama.cpp retrieval sidecar; run `codestory-cli retrieval bootstrap` and `codestory-cli retrieval index --refresh full` for product readiness."
                 .to_string(),
             root: clean_path(root),
             endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
@@ -303,7 +298,7 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
         return ManagedEmbeddingsStatus {
             state: "managed_onnx_unusable".to_string(),
             message: format!(
-                "Managed ONNX assets are installed but failed runtime verification: {error}"
+                "Diagnostic ONNX assets are installed but failed runtime verification: {error}"
             ),
             root: clean_path(root),
             endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
@@ -314,22 +309,13 @@ pub(crate) fn inspect_status(root: &Path) -> ManagedEmbeddingsStatus {
     ManagedEmbeddingsStatus {
         state: "managed_onnx_ready".to_string(),
         message: format!(
-            "Managed ONNX embeddings are installed with model `{}` and tokenizer `{}`.",
+            "Diagnostic ONNX embeddings are installed with model `{}` and tokenizer `{}`. Product packet/search still requires llama.cpp sidecar retrieval.",
             clean_path(&model),
             clean_path(&tokenizer)
         ),
         root: clean_path(root),
         endpoint: MANAGED_ONNX_BACKEND_LABEL.to_string(),
         model: Some(clean_path(&model)),
-    }
-}
-
-pub(crate) fn prepare_runtime_if_installed(root: &Path) {
-    if disabled_by_embedding_env() || legacy_llamacpp_backend_selected() {
-        return;
-    }
-    if managed_endpoint_assets_available(root) {
-        set_managed_endpoint_env(root);
     }
 }
 
@@ -1010,48 +996,6 @@ fn explicit_llama_url() -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn set_managed_endpoint_env(root: &Path) {
-    let Some(model_path) = default_onnx_model_path(root) else {
-        return;
-    };
-    let Some(tokenizer_path) = default_onnx_tokenizer_path(root) else {
-        return;
-    };
-    unsafe {
-        set_env_default_str("CODESTORY_EMBED_BACKEND", MANAGED_ONNX_BACKEND_LABEL);
-        set_env_default_str("CODESTORY_EMBED_ONNX_MODEL", &clean_path(&model_path));
-        set_env_default_str(
-            "CODESTORY_EMBED_ONNX_TOKENIZER",
-            &clean_path(&tokenizer_path),
-        );
-        set_env_default_str("CODESTORY_EMBED_ONNX_PROVIDER", MANAGED_ONNX_PROVIDER);
-        set_env_default(
-            "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
-            MANAGED_ONNX_BATCH_TOKENS,
-        );
-        set_env_default(
-            "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
-            MANAGED_DOC_EMBED_BATCH_SIZE,
-        );
-        set_env_default(
-            "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
-            MANAGED_SEMANTIC_DOC_MAX_TOKENS,
-        );
-        set_env_default_str(
-            "CODESTORY_STORED_VECTOR_ENCODING",
-            MANAGED_STORED_VECTOR_ENCODING,
-        );
-    }
-}
-
-unsafe fn set_env_default(key: &str, value: usize) {
-    if std::env::var_os(key).is_none() {
-        unsafe {
-            std::env::set_var(key, value.to_string());
-        }
-    }
 }
 
 unsafe fn set_env_default_str(key: &str, value: &str) {

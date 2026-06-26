@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.12.0
+
+CodeStory 0.12.0 promotes the managed plugin runtime path for Codex. The
+plugin MCP can expose `codestory://status` in fresh contexts, provision and
+report managed CLI state, repair sidecar onboarding when allowed, and avoid
+falling back to stale ambient PATH binaries when Codex launches the installed
+adapter without plugin data environment variables.
+
+This release also removes the ONNX product embedding runtime, tightens agent
+repair progress/status reporting, adds handoff proof-target status, and trims
+Codex starter prompts so installed plugin manifests load without overlong
+default-prompt warnings.
+
+Supporting PRs: #671, #672, #673, #678.
+
 ## 0.11.22
 
 CodeStory 0.11.22 fixes the plugin-bundled MCP launch directory. The plugin

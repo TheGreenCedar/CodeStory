@@ -15,6 +15,9 @@ const fallbackBinaryNames = process.platform === 'win32'
   ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
   : ['codestory-cli'];
 const sharedAgentRunId = 'shared-agent';
+const releaseDownloadTimeoutMs = 60000;
+const releaseDownloadAttempts = 3;
+const releaseDownloadRetryDelaysMs = [1000, 3000];
 
 function readJson(file) {
   try {
@@ -51,8 +54,38 @@ function pluginCacheVersion() {
   return parent === 'codestory' ? path.basename(pluginRoot) : null;
 }
 
+function inferredCodexPluginDataDir(root = pluginRoot) {
+  const parts = path.resolve(root).split(/[\\/]+/u);
+  for (let index = 0; index <= parts.length - 6; index += 1) {
+    if (
+      parts[index].toLowerCase() !== '.codex' ||
+      parts[index + 1] !== 'plugins' ||
+      parts[index + 2] !== 'cache' ||
+      parts[index + 4] !== 'codestory'
+    ) {
+      continue;
+    }
+    const codexRoot = parts.slice(0, index + 1).join(path.sep);
+    const dataDir = path.join(codexRoot, 'plugins', 'data', `codestory-${parts[index + 3]}`);
+    if (usablePluginDataDir(dataDir)) return dataDir;
+  }
+  return null;
+}
+
+function usablePluginDataDir(dataDir) {
+  try {
+    if (fs.existsSync(dataDir)) return fs.statSync(dataDir).isDirectory();
+    const dataRoot = path.dirname(dataDir);
+    if (fs.existsSync(dataRoot)) return fs.statSync(dataRoot).isDirectory();
+    fs.accessSync(path.dirname(dataRoot), fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function pluginDataDir() {
-  return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || null;
+  return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || inferredCodexPluginDataDir();
 }
 
 function sidecarPolicyPath(dataDir = pluginDataDir()) {
@@ -123,6 +156,15 @@ function handleSidecarPolicyCommand(argv) {
 
 function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
+}
+
+function resolvedRepairCommandForProject(resolved, projectRoot = process.cwd()) {
+  return `${JSON.stringify(resolved.path)} ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
+}
+
+function optionValue(argv, name) {
+  const index = argv.indexOf(name);
+  return index >= 0 ? argv[index + 1] : null;
 }
 
 function dirtyMarkerEnv(projectRoot = process.cwd()) {
@@ -230,12 +272,25 @@ function copyLocalReleaseFile(releaseDir, name, destination) {
   fs.copyFileSync(path.join(releaseDir, name), destination);
 }
 
-function downloadFile(url, destination) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function downloadFileOnce(url, destination, options = {}) {
+  const timeoutMs = options.timeoutMs || releaseDownloadTimeoutMs;
+  const redirectsRemaining = options.redirectsRemaining ?? 5;
+  const get = options.get || https.get;
   return new Promise((resolve, reject) => {
-    const request = https.get(url, (response) => {
+    const request = get(url, (response) => {
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         response.resume();
-        downloadFile(response.headers.location, destination).then(resolve, reject);
+        if (!response.headers.location || redirectsRemaining <= 0) {
+          reject(new Error(`download redirect failed: ${url}`));
+          return;
+        }
+        const nextUrl = new URL(response.headers.location, url).toString();
+        downloadFileOnce(nextUrl, destination, { ...options, redirectsRemaining: redirectsRemaining - 1 })
+          .then(resolve, reject);
         return;
       }
       if (response.statusCode !== 200) {
@@ -248,20 +303,58 @@ function downloadFile(url, destination) {
       output.on('finish', () => output.close(resolve));
       output.on('error', reject);
     });
-    request.setTimeout(15000, () => request.destroy(new Error(`download timed out: ${url}`)));
+    request.setTimeout(timeoutMs, () => request.destroy(new Error(`download timed out after ${timeoutMs}ms: ${url}`)));
     request.on('error', reject);
   });
 }
 
+async function downloadFile(url, destination, options = {}) {
+  const attempts = options.attempts || releaseDownloadAttempts;
+  const startedAt = Date.now();
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await downloadFileOnce(url, destination, options);
+      return;
+    } catch (error) {
+      lastError = error;
+      fs.rmSync(destination, { force: true });
+      if (attempt < attempts) {
+        const delayMs = options.retryDelayMs
+          ? options.retryDelayMs(attempt)
+          : releaseDownloadRetryDelaysMs[attempt - 1] ||
+            releaseDownloadRetryDelaysMs[releaseDownloadRetryDelaysMs.length - 1];
+        if (delayMs > 0) await sleep(delayMs);
+      }
+    }
+  }
+  const elapsedMs = Date.now() - startedAt;
+  throw new Error(`download failed after ${attempts} attempts over ${elapsedMs}ms: ${lastError?.message || 'unknown error'}`);
+}
+
+function releaseAssetFetchFailure(name, startedAt, attempts, error) {
+  const elapsedMs = Date.now() - startedAt;
+  return `managed_cli_asset_fetch_failed:${name}:elapsed_ms=${elapsedMs}:attempts=${attempts}:retry=restart_reload_status:last_error=${error.message}`;
+}
+
 async function fetchReleaseFile(version, name, destination) {
+  const startedAt = Date.now();
   if (process.env.CODESTORY_PLUGIN_RELEASE_DIR) {
-    copyLocalReleaseFile(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name, destination);
+    try {
+      copyLocalReleaseFile(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name, destination);
+    } catch (error) {
+      throw new Error(releaseAssetFetchFailure(name, startedAt, 1, error));
+    }
     return `file://${path.join(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name)}`;
   }
   const baseUrl = process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL ||
     `https://github.com/TheGreenCedar/CodeStory/releases/download/v${version}`;
   const url = `${baseUrl.replace(/\/$/u, '')}/${name}`;
-  await downloadFile(url, destination);
+  try {
+    await downloadFile(url, destination);
+  } catch (error) {
+    throw new Error(releaseAssetFetchFailure(name, startedAt, releaseDownloadAttempts, error));
+  }
   return url;
 }
 
@@ -375,8 +468,12 @@ async function resolveCli() {
     return { source: 'managed', version, warnings, ...managed };
   }
 
-  warnings.push('managed_cli_unavailable_using_path_fallback');
-  const pathFallback = pathCliCandidates()[0] || 'codestory-cli';
+  const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
+  const pathCandidates = pathCliCandidates();
+  warnings.push(pathCandidates.length > 0
+    ? 'managed_cli_unavailable_using_path_fallback'
+    : 'managed_cli_unavailable_no_path_fallback');
+  const pathFallback = pathCandidates[0] || 'codestory-cli';
   return {
     source: 'path_fallback',
     path: pathFallback,
@@ -388,6 +485,7 @@ async function resolveCli() {
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
+    managedProvisionFailure,
     warnings,
   };
 }
@@ -433,6 +531,9 @@ function probeResolvedCli(resolved) {
 }
 
 function failOpenReasonForProbe(resolved, probe) {
+  if (resolved.managedProvisionFailure && resolved.source === 'path_fallback' && pathCliCandidates().length === 0) {
+    return resolved.managedProvisionFailure;
+  }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
   }
@@ -452,6 +553,11 @@ function localWaitFreshTimeoutMs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
 }
 
+function sidecarRepairTimeoutMs() {
+  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR_TIMEOUT_MS || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
+}
+
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
   const args = ['ready', '--goal', 'local', '--wait-fresh'];
   args.push('--project', projectRoot, '--format', 'json');
@@ -462,6 +568,38 @@ function runLocalNavigationWaitFresh(resolved, projectRoot) {
     windowsHide: true,
   });
   return { args, result };
+}
+
+function runSidecarStartupRepair(resolved, sidecarStatus, projectRoot = process.cwd()) {
+  if (sidecarStatus.state !== 'enabled') return sidecarStatus;
+  if (resolved.source !== 'managed' && resolved.source !== 'local_dev_override') return sidecarStatus;
+  const args = ['ready', '--goal', 'agent', '--repair'];
+  args.push('--project', projectRoot, '--format', 'json', '--run-id', sharedAgentRunId);
+  const result = spawnSync(resolved.path, args, {
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+    timeout: sidecarRepairTimeoutMs(),
+    windowsHide: true,
+    env: {
+      ...process.env,
+      CODESTORY_PLUGIN_SIDECAR_REPAIR: '1',
+      CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
+    },
+  });
+  const lastRepair = {
+    state: result.error?.code === 'ETIMEDOUT' ? 'timeout' : result.status === 0 ? 'completed' : 'failed',
+    updated_at: new Date().toISOString(),
+    project_root: projectRoot,
+    command: resolvedRepairCommandForProject(resolved, projectRoot),
+  };
+  if (sidecarStatus.path) {
+    writeSidecarPolicy(sidecarStatus.state, { last_repair: lastRepair }, sidecarStatus.path);
+    return readSidecarPolicy(sidecarStatus.path);
+  }
+  return {
+    ...sidecarStatus,
+    lastRepair,
+  };
 }
 
 function localReadySetup(prefix, args, result) {
@@ -562,7 +700,12 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
     );
   }
   if (parsedProbe.ok) {
-    return { ready: true };
+    return {
+      ready: true,
+      setup,
+      verdict: parsedProbe.verdict || null,
+      localRefresh: parsedProbe.localRefresh || null,
+    };
   }
   const verdict = parsedProbe.verdict || null;
   const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
@@ -578,22 +721,8 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
   );
 }
 
-function fallbackDiagnostic(resolved, probe, reason, options = {}) {
-  const projectRoot = process.cwd();
-  const pathCandidates = pathCliCandidates().map((candidate) => ({
-    path: candidate,
-    version: cliVersion(candidate),
-    active: samePathText(candidate, resolved.path),
-  }));
-  const minimumNext = options.minimumNext || [
-    'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
-    process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
-    'codestory-cli --version',
-  ];
-  const fullRepair = options.fullRepair || minimumNext;
-  const recommendedNext = options.recommendedNext || fullRepair;
-  const sidecarPolicy = readSidecarPolicy();
-  const plugin = {
+function pluginRuntimeForResolved(resolved) {
+  return {
     plugin_version: resolved.version,
     plugin_root: pluginRoot,
     plugin_cache_version: pluginCacheVersion(),
@@ -608,8 +737,31 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
     managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
     managed_manifest_path: resolved.manifestPath || null,
-    warnings: [...resolved.warnings, reason].filter(Boolean),
+    warnings: resolved.warnings.filter(Boolean),
   };
+}
+
+function fallbackDiagnostic(resolved, probe, reason, options = {}) {
+  const projectRoot = options.projectRoot || process.cwd();
+  const pathCandidates = pathCliCandidates().map((candidate) => ({
+    path: candidate,
+    version: cliVersion(candidate),
+    active: samePathText(candidate, resolved.path),
+  }));
+  const managedProvisionFailed = String(reason || '').startsWith('managed_cli_provision_failed:');
+  const managedProvisionNext = [
+    'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
+    'Refresh or reinstall the CodeStory plugin after GitHub release assets are reachable, then restart/reload the Codex host/app and read codestory://status.',
+  ];
+  const minimumNext = options.minimumNext || (managedProvisionFailed && pathCandidates.length === 0 ? managedProvisionNext : [
+    'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
+    process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
+    'codestory-cli --version',
+  ]);
+  const fullRepair = options.fullRepair || minimumNext;
+  const recommendedNext = options.recommendedNext || fullRepair;
+  const sidecarPolicy = readSidecarPolicy();
+  const plugin = pluginRuntimeForResolved({ ...resolved, warnings: [...resolved.warnings, reason] });
   const repair = {
     goal: options.goal || 'local_navigation',
     status: options.status || 'repair_setup',
@@ -692,6 +844,85 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
         : { method: 'cli', command }),
     ],
   };
+}
+
+async function bootstrapStatus(projectRoot = process.cwd()) {
+  const resolved = await resolveCli();
+  rememberLaunch(resolved);
+  const probe = probeResolvedCli(resolved);
+  const failOpenReason = failOpenReasonForProbe(resolved, probe);
+  if (failOpenReason) {
+    return {
+      ready: false,
+      ...fallbackDiagnostic(resolved, probe, failOpenReason, { projectRoot }),
+    };
+  }
+
+  const localReadiness = probeLocalNavigation(resolved, projectRoot);
+  if (!localReadiness.ready) {
+    return {
+      ready: false,
+      ...fallbackDiagnostic(resolved, probe, localReadiness.reason, {
+        projectRoot,
+        status: localReadiness.status,
+        summary: localReadiness.summary,
+        minimumNext: localReadiness.minimumNext,
+        fullRepair: localReadiness.fullRepair,
+        localRefresh: localReadiness.localRefresh,
+        setup: localReadiness.setup,
+      }),
+    };
+  }
+
+  const sidecarPolicy = readSidecarPolicy();
+  const plugin = pluginRuntimeForResolved(resolved);
+  const localRefresh = localReadiness.localRefresh || {
+    state: 'fresh',
+    blocks_local_surfaces: false,
+    readiness_status: 'ready',
+  };
+  const repair = {
+    goal: 'local_navigation',
+    status: 'ready',
+    summary: localReadiness.verdict?.summary || 'CodeStory local navigation is ready.',
+    repair_reason: null,
+    local_refresh: localRefresh,
+    minimum_next: [{ method: 'resources/read', uri: 'codestory://status' }],
+    full_repair: [],
+    setup: {
+      ...localReadiness.setup,
+      readiness_verdict: localReadiness.verdict,
+    },
+  };
+  return {
+    ready: true,
+    project_root: projectRoot,
+    server_version: resolved.version,
+    cli_version: probe.version,
+    plugin_runtime: plugin,
+    runtime_truth: runtimeTruthStatus(plugin, repair, {
+      sidecarPolicy: sidecarPolicy.state || 'unavailable',
+      localRefresh,
+    }),
+    local_refresh: localRefresh,
+    readiness: [repair],
+    recommended_next_calls: [{ method: 'resources/read', uri: 'codestory://status' }],
+  };
+}
+
+async function handleBootstrapStatusCommand(argv) {
+  if (argv[2] !== 'bootstrap-status') return false;
+  const projectRoot = optionValue(argv, '--project') || process.cwd();
+  try {
+    process.stdout.write(`${JSON.stringify(await bootstrapStatus(projectRoot))}\n`);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({
+      ready: false,
+      degraded_reason: `launcher_error:${error.message}`,
+      project_root: projectRoot,
+    })}\n`);
+  }
+  process.exit(0);
 }
 
 function pathCliCandidates() {
@@ -909,6 +1140,7 @@ function rememberLaunch(resolved) {
 }
 
 async function main() {
+  if (await handleBootstrapStatusCommand(process.argv)) return;
   handleSidecarPolicyCommand(process.argv);
   const resolved = await resolveCli();
   rememberLaunch(resolved);
@@ -933,7 +1165,7 @@ async function main() {
     }));
     return;
   }
-  const sidecarStatus = readSidecarPolicy();
+  const sidecarStatus = runSidecarStartupRepair(resolved, readSidecarPolicy(), process.cwd());
   const dirtyMarker = dirtyMarkerEnv(process.cwd());
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
@@ -961,7 +1193,7 @@ async function main() {
       CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
       CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
       CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: repairCommandForProject(process.cwd()),
+      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, process.cwd()),
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
@@ -987,7 +1219,7 @@ async function main() {
   });
 }
 
-main().catch((error) => {
+function runLauncherError(error) {
   const resolved = {
     source: 'launcher',
     path: 'codestory-cli',
@@ -1008,4 +1240,14 @@ main().catch((error) => {
     stdout: '',
     stderr: '',
   }, 'launcher_error'));
-});
+}
+
+if (require.main === module) {
+  main().catch(runLauncherError);
+} else {
+  module.exports = {
+    _test: {
+      downloadFile,
+    },
+  };
+}

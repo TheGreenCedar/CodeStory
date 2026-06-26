@@ -41,9 +41,9 @@ pub(crate) struct OpenedProject {
 
 /// Shared service handles and filesystem roots for a CLI command.
 ///
-/// `RuntimeContext::new` may start installed managed embeddings before runtime
-/// access; use `new_inspect_only` for health and cache commands that should not
-/// mutate or start background dependencies.
+/// Runtime construction never promotes installed managed embedding assets into
+/// product defaults. Product packet/search paths set llama.cpp sidecar defaults
+/// explicitly before opening the runtime.
 pub(crate) struct RuntimeContext {
     pub(crate) project: ProjectService,
     pub(crate) index: IndexService,
@@ -61,13 +61,6 @@ pub(crate) struct RuntimeContext {
 struct ResolutionCandidateRank {
     file_filter_match: u8,
     resolution: ResolutionRank,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Managed embedding startup behavior for runtime construction.
-pub(crate) enum ManagedEmbeddingStartup {
-    AutostartIfInstalled,
-    InspectOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -106,7 +99,7 @@ impl std::error::Error for AmbiguousTargetError {}
 impl RuntimeContext {
     /// Open runtime services for a command that may use managed embeddings.
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
-        Self::new_with_startup(args, ManagedEmbeddingStartup::AutostartIfInstalled)
+        Self::new_with_startup(args)
     }
 
     /// Open runtime services for agent-facing packet/search commands.
@@ -117,18 +110,15 @@ impl RuntimeContext {
 
     /// Open runtime services without starting managed embedding processes.
     pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
-        Self::new_with_startup(args, ManagedEmbeddingStartup::InspectOnly)
+        Self::new_with_startup(args)
     }
 
-    fn new_with_startup(args: &ProjectArgs, startup: ManagedEmbeddingStartup) -> Result<Self> {
+    fn new_with_startup(args: &ProjectArgs) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
         let cache_override = trusted_cache_override(&project_root, args.cache_dir.as_deref())?;
         let cache_root = cache_root_for_project(&project_root, cache_override.as_deref())?;
         let managed_embeddings_root =
             crate::managed_embeddings::runtime_managed_root(cache_override.as_deref())?;
-        if startup == ManagedEmbeddingStartup::AutostartIfInstalled {
-            crate::managed_embeddings::prepare_runtime_if_installed(&managed_embeddings_root);
-        }
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
         let events = runtime.events();
@@ -978,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn autostart_runtime_sets_managed_onnx_defaults_when_assets_exist() {
+    fn default_runtime_does_not_promote_managed_onnx_assets() {
         let _env_lock = crate::config::config_env_test_lock();
         let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let temp = tempdir().expect("temp dir");
@@ -993,12 +983,9 @@ mod tests {
         })
         .expect("runtime context");
 
-        assert_eq!(
-            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
-            Some("onnx")
-        );
-        assert!(env::var("CODESTORY_EMBED_ONNX_MODEL").is_ok());
-        assert!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").is_ok());
+        assert_eq!(env::var("CODESTORY_EMBED_BACKEND").ok(), None);
+        assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
+        assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
     }
 
     #[test]

@@ -138,6 +138,35 @@ codestory-cli agent preflight --project <target-workspace> --format json
 Use its `safe_surfaces`, `blocked_surfaces`, and `repair_command` fields as the
 agent handoff.
 
+## Delegated Worktree Proof Target
+
+Before a delegated CodeStory lane spends time on cache repair, readiness, or
+sidecar proof, verify the Git target. `scripts/codex-worktree-setup.ps1` prints
+this handoff surface first:
+
+```text
+intended_base_ref
+resolved_base_commit
+child_start_head
+child_branch_or_detached
+proof_target
+pr_head_ref
+pr_head_commit
+remote_tip_verification.<target>.command
+remote_tip_verification.<target>.result
+```
+
+Defaults are intentionally narrow: `intended_base_ref` is
+`origin/dev/codestory-next`, and a PR lane with `CODESTORY_PR_HEAD_REF` or
+`-PrHeadRef` proves `base:origin/dev/codestory-next + pr-head:<ref>`. Use
+`-BranchHeadProof` or `CODESTORY_BRANCH_HEAD_PROOF=1` only when the lane is
+explicitly proving the branch head by itself.
+
+The setup script reports stale `main`, stale local `dev/codestory-next`, stale
+PR heads, unresolved refs, and the exact `git ls-remote origin ...` result
+before it runs index, retrieval, or doctor handoff work. Treat those warnings as
+Git proof-target blockers, not packet/search readiness blockers.
+
 **Next steps after installation:**
 
 If the agent reports that local graph surfaces are allowed but `packet`,

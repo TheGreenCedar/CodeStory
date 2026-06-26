@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$Project = ".",
+    [string]$IntendedBaseRef = $(if ($env:CODESTORY_INTENDED_BASE_REF) { $env:CODESTORY_INTENDED_BASE_REF } else { "origin/dev/codestory-next" }),
+    [string]$PrHeadRef = $env:CODESTORY_PR_HEAD_REF,
+    [switch]$BranchHeadProof,
     [switch]$ResolveCliOnly,
     [switch]$SelfTest
 )
@@ -97,6 +100,182 @@ function Invoke-DoctorJson {
     }
 
     return ($json | ConvertFrom-Json)
+}
+
+function Invoke-GitText {
+    param([string[]]$Arguments)
+
+    $output = (& git @Arguments 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        return $null
+    }
+
+    return $output
+}
+
+function Get-GitCommit {
+    param([string]$Ref)
+
+    if (-not $Ref) {
+        return $null
+    }
+
+    $commit = Invoke-GitText @("rev-parse", "--verify", "$Ref^{commit}")
+    if (-not $commit) {
+        return $null
+    }
+
+    return ($commit -split "\r?\n")[0]
+}
+
+function Get-CurrentBranchOrDetached {
+    $branch = Invoke-GitText @("symbolic-ref", "--quiet", "--short", "HEAD")
+    if ($branch) {
+        return $branch
+    }
+
+    $head = Get-GitCommit "HEAD"
+    if ($head) {
+        return "detached:$head"
+    }
+
+    return "unknown"
+}
+
+function Get-RemoteHeadRefName {
+    param([string]$Ref)
+
+    if (-not $Ref) {
+        return $null
+    }
+    if ($Ref -match "^origin/(.+)$") {
+        return "refs/heads/$($Matches[1])"
+    }
+    if ($Ref -match "^refs/heads/(.+)$") {
+        return $Ref
+    }
+    if ($Ref -notmatch "^refs/" -and $Ref -notmatch "^[0-9a-fA-F]{40}$") {
+        return "refs/heads/$Ref"
+    }
+
+    return $null
+}
+
+function Get-RemoteHeadVerification {
+    param([string]$Ref)
+
+    $remoteRef = Get-RemoteHeadRefName $Ref
+    if (-not $remoteRef) {
+        return $null
+    }
+
+    $command = "git ls-remote origin $remoteRef"
+    $result = Invoke-GitText @("ls-remote", "origin", $remoteRef)
+    $commit = $null
+    if ($result) {
+        $commit = (($result -split "\s+") | Select-Object -First 1)
+    }
+
+    return [pscustomobject]@{
+        Command = $command
+        Result = $(if ($result) { $result } else { "<no remote tip>" })
+        Commit = $commit
+    }
+}
+
+function Get-ProofTarget {
+    param(
+        [string]$BaseRef,
+        [string]$HeadRef,
+        [bool]$UseBranchHeadProof
+    )
+
+    if ($HeadRef) {
+        if ($UseBranchHeadProof) {
+            return "branch-head:$HeadRef"
+        }
+        return "base:$BaseRef + pr-head:$HeadRef"
+    }
+
+    return $BaseRef
+}
+
+function Add-StaleRefWarning {
+    param(
+        [string[]]$Warnings,
+        [string]$Label,
+        [string]$LocalCommit,
+        $Remote
+    )
+
+    if ($LocalCommit -and $Remote -and $Remote.Commit -and $LocalCommit -ne $Remote.Commit) {
+        return @($Warnings + "$Label stale: local=$LocalCommit remote=$($Remote.Commit)")
+    }
+
+    return $Warnings
+}
+
+function Write-HandoffProofTargetSummary {
+    param(
+        [string]$BaseRef,
+        [string]$HeadRef,
+        [bool]$UseBranchHeadProof
+    )
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Write-Warning "Git is unavailable; skipping CodeStory handoff proof-target status."
+        return
+    }
+
+    $childHead = Get-GitCommit "HEAD"
+    if (-not $childHead) {
+        Write-Warning "Current directory is not a Git worktree; skipping CodeStory handoff proof-target status."
+        return
+    }
+
+    $baseCommit = Get-GitCommit $BaseRef
+    $headCommit = Get-GitCommit $HeadRef
+    $baseRemote = Get-RemoteHeadVerification $BaseRef
+    $headRemote = Get-RemoteHeadVerification $HeadRef
+    $mainRemote = Get-RemoteHeadVerification "origin/main"
+    $devRemote = Get-RemoteHeadVerification "origin/dev/codestory-next"
+    $warnings = @()
+
+    if (-not $baseCommit) {
+        $warnings += "intended_base_ref unresolved: $BaseRef"
+    }
+    $warnings = Add-StaleRefWarning $warnings "intended_base_ref" $baseCommit $baseRemote
+    $warnings = Add-StaleRefWarning $warnings "main" (Get-GitCommit "main") $mainRemote
+    $warnings = Add-StaleRefWarning $warnings "dev/codestory-next" (Get-GitCommit "dev/codestory-next") $devRemote
+    if ($HeadRef) {
+        if (-not $headCommit) {
+            $warnings += "pr_head_ref unresolved: $HeadRef"
+        }
+        $warnings = Add-StaleRefWarning $warnings "pr_head_ref" $headCommit $headRemote
+        if ($UseBranchHeadProof) {
+            $warnings += "branch-head proof requested; default PR proof is current base plus PR head."
+        }
+    }
+
+    Write-Host "CodeStory handoff proof target"
+    Write-Host ("  intended_base_ref: {0}" -f $BaseRef)
+    Write-Host ("  resolved_base_commit: {0}" -f $(if ($baseCommit) { $baseCommit } else { "unresolved" }))
+    Write-Host ("  child_start_head: {0}" -f $childHead)
+    Write-Host ("  child_branch_or_detached: {0}" -f (Get-CurrentBranchOrDetached))
+    Write-Host ("  proof_target: {0}" -f (Get-ProofTarget $BaseRef $HeadRef $UseBranchHeadProof))
+    Write-Host ("  pr_head_ref: {0}" -f $(if ($HeadRef) { $HeadRef } else { "none" }))
+    Write-Host ("  pr_head_commit: {0}" -f $(if ($headCommit) { $headCommit } else { "none" }))
+    if ($baseRemote) {
+        Write-Host ("  remote_tip_verification.intended_base.command: {0}" -f $baseRemote.Command)
+        Write-Host ("  remote_tip_verification.intended_base.result: {0}" -f $baseRemote.Result)
+    }
+    if ($headRemote) {
+        Write-Host ("  remote_tip_verification.pr_head.command: {0}" -f $headRemote.Command)
+        Write-Host ("  remote_tip_verification.pr_head.result: {0}" -f $headRemote.Result)
+    }
+    foreach ($warning in $warnings) {
+        Write-Warning "CodeStory handoff proof target: $warning"
+    }
 }
 
 function Write-DoctorReadinessSummary {
@@ -346,6 +525,10 @@ function Invoke-SelfTest {
 
         $resolvedCli = Find-CodeStoryCli $projectRoot
         Assert-SelfTest (Same-Path $resolvedCli $currentCli) "stale default install should be rejected and versioned current install should be used"
+        Assert-SelfTest ((Get-RemoteHeadRefName "origin/dev/codestory-next") -eq "refs/heads/dev/codestory-next") "origin branch refs should map to ls-remote heads"
+        Assert-SelfTest ((Get-RemoteHeadRefName "codex/issue-670-handoff-proof-target") -eq "refs/heads/codex/issue-670-handoff-proof-target") "plain branch refs should map to ls-remote heads"
+        Assert-SelfTest ((Get-ProofTarget "origin/dev/codestory-next" "origin/pr-branch" $false) -eq "base:origin/dev/codestory-next + pr-head:origin/pr-branch") "PR proof target should default to base plus PR head"
+        Assert-SelfTest ((Get-ProofTarget "origin/dev/codestory-next" "origin/pr-branch" $true) -eq "branch-head:origin/pr-branch") "branch-head proof should be explicit"
     } finally {
         $env:CODESTORY_HOME = $oldCodeStoryHome
         $env:CODESTORY_CLI = $oldCodeStoryCli
@@ -401,6 +584,9 @@ $projectPath = (Resolve-Path -LiteralPath $Project).Path
 
 Push-Location $projectPath
 try {
+    $branchHeadProofEnabled = $BranchHeadProof.IsPresent -or ($env:CODESTORY_BRANCH_HEAD_PROOF -match "^(1|true|yes)$")
+    Write-HandoffProofTargetSummary $IntendedBaseRef $PrHeadRef $branchHeadProofEnabled
+
     $sccache = Join-Path $env:USERPROFILE ".cargo\bin\sccache.exe"
     if (Test-Path -LiteralPath $sccache) {
         $env:RUSTC_WRAPPER = $sccache

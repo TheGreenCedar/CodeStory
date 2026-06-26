@@ -34,7 +34,7 @@ use std::{
     fs,
     io::{IsTerminal, Read},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -52,6 +52,7 @@ mod managed_embeddings;
 mod output;
 mod query_resolution;
 mod readiness;
+mod ready_repair_status;
 mod report;
 mod retrieval;
 mod runtime;
@@ -118,6 +119,7 @@ const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
 const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
+const READY_REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
@@ -419,7 +421,8 @@ fn setup_embeddings_next_commands(
     }
     vec![
         format!("codestory-cli doctor{args}"),
-        format!("codestory-cli index{args} --refresh full"),
+        format!("codestory-cli retrieval bootstrap{args}"),
+        format!("codestory-cli retrieval index{args} --refresh full"),
     ]
 }
 
@@ -627,6 +630,141 @@ fn format_progress_bar(current: u32, total: u32) -> String {
         "[{}{}]",
         "#".repeat(filled as usize),
         "-".repeat(WIDTH.saturating_sub(filled) as usize)
+    )
+}
+
+struct ReadyRepairProgress {
+    profile: &'static str,
+    run_id: String,
+    namespace: String,
+    project_root: PathBuf,
+    phase: Arc<Mutex<&'static str>>,
+    done: Arc<AtomicBool>,
+    start: Instant,
+    started_at_epoch_ms: i64,
+    pid: u32,
+    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReadyRepairProgress {
+    fn start(sidecar: &codestory_retrieval::SidecarRuntimeConfig, project_root: &Path) -> Self {
+        let phase = Arc::new(Mutex::new("starting"));
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let started_at_epoch_ms = ready_repair_status::now_epoch_ms();
+        let pid = std::process::id();
+        let profile = sidecar.profile.as_str();
+        let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
+        let namespace = sidecar.namespace.clone();
+        let project_root = project_root.to_path_buf();
+        let sidecar_for_worker = sidecar.clone();
+        let worker_phase = Arc::clone(&phase);
+        let worker_done = Arc::clone(&done);
+        let worker_run_id = run_id.clone();
+        let worker_namespace = namespace.clone();
+        let worker_project_root = project_root.clone();
+        let _ = ready_repair_status::write_ready_repair_status(
+            sidecar,
+            &project_root,
+            "starting",
+            started_at_epoch_ms,
+            pid,
+        );
+        let handle = std::thread::spawn(move || {
+            while !worker_done.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+                if start.elapsed() < READY_REPAIR_PROGRESS_INTERVAL {
+                    continue;
+                }
+                let elapsed = start.elapsed().as_secs();
+                if elapsed % READY_REPAIR_PROGRESS_INTERVAL.as_secs() != 0 {
+                    continue;
+                }
+                let phase = *worker_phase.lock().expect("ready repair phase lock");
+                eprintln!(
+                    "{}",
+                    ready_repair_progress_line(
+                        phase,
+                        profile,
+                        &worker_run_id,
+                        &worker_namespace,
+                        elapsed,
+                        "active"
+                    )
+                );
+                let _ = ready_repair_status::write_ready_repair_status(
+                    &sidecar_for_worker,
+                    &worker_project_root,
+                    phase,
+                    started_at_epoch_ms,
+                    pid,
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        Self {
+            profile,
+            run_id,
+            namespace,
+            project_root,
+            phase,
+            done,
+            start,
+            started_at_epoch_ms,
+            pid,
+            sidecar: sidecar.clone(),
+            handle: Some(handle),
+        }
+    }
+
+    fn set_phase(&self, phase: &'static str) {
+        *self.phase.lock().expect("ready repair phase lock") = phase;
+        eprintln!(
+            "{}",
+            ready_repair_progress_line(
+                phase,
+                self.profile,
+                &self.run_id,
+                &self.namespace,
+                self.start.elapsed().as_secs(),
+                "started"
+            )
+        );
+        let _ = ready_repair_status::write_ready_repair_status(
+            &self.sidecar,
+            &self.project_root,
+            phase,
+            self.started_at_epoch_ms,
+            self.pid,
+        );
+    }
+}
+
+impl Drop for ReadyRepairProgress {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        ready_repair_status::clear_ready_repair_status(
+            &self.sidecar,
+            self.started_at_epoch_ms,
+            self.pid,
+        );
+    }
+}
+
+fn ready_repair_progress_line(
+    phase: &str,
+    profile: &str,
+    run_id: &str,
+    namespace: &str,
+    elapsed_s: u64,
+    status: &str,
+) -> String {
+    format!(
+        "[ready-repair] phase=\"{phase}\" profile={profile} run_id={run_id} namespace={namespace} elapsed_s={elapsed_s} status={status}"
     )
 }
 
@@ -2195,13 +2333,15 @@ fn repair_ready_state(
         sidecar.namespace,
         sidecar.compose_project
     );
-    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime(
+    let progress = ReadyRepairProgress::start(&sidecar, &runtime.project_root);
+    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
         &sidecar,
         Some(runtime.project_root.as_path()),
         &storage_scope,
         None,
         false,
         Duration::from_secs(90),
+        |phase| progress.set_phase(phase),
     )
     .context("ready repair retrieval bootstrap")?;
     let infrastructure = ready_repair_infrastructure_with_runtime_observation(
@@ -2211,24 +2351,31 @@ fn repair_ready_state(
         &sidecar,
     );
     ensure_ready_repair_embed_liveness(&infrastructure)?;
+    progress.set_phase("Qdrant finalize");
     codestory_retrieval::repair_project_qdrant_collection(
         &runtime.project_root,
         &runtime.storage_path,
     )
     .context("ready repair project qdrant repair")?;
+    progress.set_phase("graph artifact");
     runtime
         .index
         .run_indexing_blocking(IndexMode::Full)
         .map_err(map_api_error)
         .context("ready repair retrieval index refresh")?;
-    retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar).with_context(
-        || {
-            format!(
-                "ready repair retrieval index finalize using {}",
-                retrieval::format_sidecar_runtime(&sidecar)
-            )
-        },
-    )?;
+    codestory_retrieval::finalize_index_for_runtime_with_progress(
+        &runtime.project_root,
+        &runtime.storage_path,
+        &sidecar,
+        |phase| progress.set_phase(phase),
+    )
+    .with_context(|| {
+        format!(
+            "ready repair retrieval index finalize using {}",
+            retrieval::format_sidecar_runtime(&sidecar)
+        )
+    })?;
+    progress.set_phase("readiness check");
     let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -3863,9 +4010,9 @@ fn drill_suite_retrieval_blockers(
         .into_iter()
         .map(|(status, repos)| {
             let next_action = if status.contains("MissingEmbeddingRuntime") {
-                "run `codestory-cli setup embeddings --project <repo>`, then rebuild with `codestory-cli retrieval index --project <repo> --refresh full` before trusting packet/search evidence".to_string()
+                "run `codestory-cli retrieval bootstrap --project <repo>`, then rebuild with `codestory-cli retrieval index --project <repo> --refresh full` before trusting packet/search evidence".to_string()
             } else if status.contains("MissingSemanticDocs") {
-                "rerun `codestory-cli retrieval index --project <repo> --refresh full` after semantic setup before trusting packet/search evidence".to_string()
+                "rerun `codestory-cli retrieval index --project <repo> --refresh full` after sidecar setup before trusting packet/search evidence".to_string()
             } else {
                 "inspect doctor/retrieval status and repair to retrieval_mode=full before treating broad search quality as repo-specific".to_string()
             };
@@ -10616,6 +10763,12 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
+    apply_ready_repair_status_overlay(
+        &mut lanes,
+        &runtime.project_root,
+        agent_run_id,
+        &project_arg,
+    );
     lanes
 }
 
@@ -10644,10 +10797,40 @@ fn readiness_lane_output(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         run_id: sidecar.run_id.clone(),
+        namespace: None,
+        compose_project: None,
+        phase: None,
+        repair_updated_at_epoch_ms: None,
         sidecar_mode: sidecar.retrieval_mode.clone(),
         degraded_reason: sidecar.degraded_reason.clone(),
         next_command: lane_next_command(lane, sidecar, status, verdict, project_arg),
     }
+}
+
+fn apply_ready_repair_status_overlay(
+    lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
+    project_root: &Path,
+    agent_run_id: Option<&str>,
+    project_arg: &str,
+) {
+    let Some(status) = ready_repair_status::active_ready_repair_status(project_root, agent_run_id)
+    else {
+        return;
+    };
+    let Some(lane) = lanes.get_mut("agent_packet_search") else {
+        return;
+    };
+    lane.status = ReadinessStatusDto::Repairing;
+    lane.profile = status.profile;
+    lane.run_id = status.run_id.clone();
+    lane.namespace = Some(status.namespace);
+    lane.compose_project = Some(status.compose_project);
+    lane.phase = Some(status.phase);
+    lane.repair_updated_at_epoch_ms = Some(status.updated_at_epoch_ms);
+    lane.next_command = Some(retrieval_status_command_for_agent(
+        project_arg,
+        status.run_id.as_deref(),
+    ));
 }
 
 fn readiness_lane_status(
@@ -10701,6 +10884,17 @@ fn agent_ready_repair_command(project_arg: &str, run_id: Option<&str>) -> String
         command.push_str(" --run-id ");
         command.push_str(&display::quote_command_argument_value(run_id));
     }
+    command
+}
+
+fn retrieval_status_command_for_agent(project_arg: &str, run_id: Option<&str>) -> String {
+    let mut command =
+        format!("codestory-cli retrieval status --project {project_arg} --profile agent");
+    if let Some(run_id) = run_id {
+        command.push_str(" --run-id ");
+        command.push_str(&display::quote_command_argument_value(run_id));
+    }
+    command.push_str(" --format json");
     command
 }
 
@@ -10967,7 +11161,7 @@ fn semantic_contract_check(
             "semantic_contract",
             "info",
             format!(
-                "semantic stale: {}. Resolve the embedding runtime first with `codestory-cli setup embeddings`; then run `codestory-cli retrieval index --refresh full` before trusting packet/search evidence.",
+                "semantic stale: {}. Resolve the product embedding sidecar first with `codestory-cli retrieval bootstrap`; then run `codestory-cli retrieval index --refresh full` before trusting packet/search evidence.",
                 gaps.join("; ")
             ),
         )
@@ -11112,7 +11306,10 @@ fn index_next_commands(
         && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
     {
         commands.push(format!(
-            "codestory-cli setup embeddings --project {project}"
+            "codestory-cli retrieval bootstrap --project {project}"
+        ));
+        commands.push(format!(
+            "codestory-cli retrieval index --project {project} --refresh full"
         ));
     }
     commands.push(format!("codestory-cli ground --project {project}"));
@@ -12372,6 +12569,26 @@ mod tests {
     }
 
     #[test]
+    fn ready_repair_progress_line_names_phase_identity_and_status() {
+        let line = ready_repair_progress_line(
+            "Qdrant finalize",
+            "agent",
+            "shared-agent",
+            "codestory-agent",
+            10,
+            "active",
+        );
+
+        assert!(line.starts_with("[ready-repair] "));
+        assert!(line.contains("phase=\"Qdrant finalize\""));
+        assert!(line.contains("profile=agent"));
+        assert!(line.contains("run_id=shared-agent"));
+        assert!(line.contains("namespace=codestory-agent"));
+        assert!(line.contains("elapsed_s=10"));
+        assert!(line.contains("status=active"));
+    }
+
+    #[test]
     fn ready_repair_final_status_blocks_missing_manifest_after_finalize() {
         let report = ready_repair_test_report("unavailable", Some("retrieval_manifest_missing"));
 
@@ -12999,6 +13216,62 @@ mod tests {
                 "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn index_next_commands_use_sidecar_repair_for_missing_embedding_runtime() {
+        let mut retrieval = sample_retrieval();
+        retrieval.semantic_ready = false;
+        retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
+
+        let commands = index_next_commands("C:/repo", Some(&retrieval), None, true);
+        let joined = commands.join("\n");
+
+        assert!(joined.contains("codestory-cli retrieval bootstrap --project"));
+        assert!(
+            joined.contains("codestory-cli retrieval index --project")
+                && joined.contains("--refresh full")
+        );
+        assert!(!joined.contains("setup embeddings"));
+    }
+
+    #[test]
+    fn semantic_contract_check_uses_sidecar_repair_for_missing_embedding_runtime() {
+        let mut retrieval = sample_retrieval();
+        retrieval.semantic_ready = false;
+        retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
+        retrieval.current_embedding = Some(codestory_contracts::api::EmbeddingProfileContractDto {
+            profile: "bge-base-en-v1.5".to_string(),
+            backend: "llamacpp".to_string(),
+            model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
+            cache_key: "current".to_string(),
+            dimension: Some(768),
+            doc_shape: "current-shape".to_string(),
+        });
+        retrieval.stored_embedding =
+            Some(codestory_contracts::api::StoredSemanticDocsContractDto {
+                doc_count: 1,
+                embedding_profile: Some("bge-base-en-v1.5".to_string()),
+                embedding_backend: Some("onnx".to_string()),
+                cache_key: Some("old".to_string()),
+                dimension: Some(768),
+                doc_version: Some(5),
+                mixed_embedding_profiles: false,
+                mixed_embedding_models: false,
+                mixed_embedding_backends: false,
+                mixed_dimensions: false,
+                mixed_doc_versions: false,
+                mixed_doc_shapes: false,
+                doc_shape: Some("old-shape".to_string()),
+                semantic_policy_version: Some("graph_first_v1".to_string()),
+                mixed_semantic_policy_versions: false,
+            });
+
+        let check = semantic_contract_check(&retrieval);
+
+        assert!(check.message.contains("retrieval bootstrap"));
+        assert!(check.message.contains("retrieval index --refresh full"));
+        assert!(!check.message.contains("setup embeddings"));
     }
 
     #[test]
@@ -15983,7 +16256,8 @@ mod tests {
         );
         assert_eq!(blocker.repo_count, 2);
         assert_eq!(blocker.repos, vec!["alpha", "gamma"]);
-        assert!(blocker.next_action.contains("setup embeddings"));
+        assert!(blocker.next_action.contains("retrieval bootstrap"));
+        assert!(!blocker.next_action.contains("setup embeddings"));
 
         let markdown = render_drill_suite_markdown(&output);
         assert!(markdown.contains("## Retrieval Blockers"));

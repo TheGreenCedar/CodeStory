@@ -52,9 +52,9 @@ unstructured docs. On a fresh machine, check the setup plan first:
 <codestory-cli> setup embeddings --project <target-workspace> --dry-run --format json
 ```
 
-Then install assets with `setup embeddings --project <target-workspace>` if the
-plan is acceptable, and rerun `index --project <target-workspace>` unless the
-setup plan explicitly asks for a full refresh.
+Then install assets with `setup embeddings --project <target-workspace>` only
+for explicit ONNX diagnostics. Product packet/search readiness uses the
+llama.cpp retrieval sidecar path.
 
 High-signal environment toggles:
 

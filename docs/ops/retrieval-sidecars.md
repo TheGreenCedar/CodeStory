@@ -54,6 +54,7 @@ from the source checkout, marketplace cache, or PATH when status is available.
 | State | Meaning | Operator action |
 |-------|---------|-----------------|
 | `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
+| `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
 | `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; run the repair command from preflight/status before packet/search claims |
 | `local_navigation=repair_local` | Core index or cache is missing or stale | Run `codestory-cli ready --goal local --repair --project <repo> --format json`, then rerun `doctor` |
 | `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Repair the failing sidecar layer, rerun `retrieval index --refresh full`, then rerun `retrieval status` |
@@ -270,8 +271,9 @@ Default Windows cache locations:
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
 `target/retrieval-models` are accepted only after pinned size and SHA-256
 verification by the setup wrapper. Remove that model directory to uninstall the
-downloaded GGUF. Managed ONNX assets from `setup embeddings` are separate and do
-not substitute for llama.cpp sidecar retrieval.
+downloaded GGUF. Diagnostic ONNX assets from `setup embeddings` are separate,
+are not promoted into product runtime defaults, and do not substitute for
+llama.cpp sidecar retrieval.
 
 ## Operator troubleshooting
 
@@ -356,7 +358,7 @@ sidecars, and partial sidecars are diagnostic only and cannot produce
 
 Qdrant document vectors are copied from managed local `llm_symbol_doc`
 dense-anchor rows when the stored embedding contract is product BGE base profile:
-`bge-base-en-v1.5`, `768` dimensions, ONNX or llama.cpp backend. Query vectors
+`bge-base-en-v1.5`, `768` dimensions, and the llama.cpp product backend. Query vectors
 come from the local llama.cpp sidecar so retrieval remains sidecar-backed and
 can smoke-test the live collection. Wrong model dimensions fail loudly.
 

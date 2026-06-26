@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.11.22",
+  "version": "0.12.0",
   "description": "CodeStory grounding for Codex over the local codestory-cli stdio server.",
   "author": {
     "name": "The Green Cedar",
@@ -24,8 +24,8 @@
     "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
     "termsOfServiceURL": "https://github.com/TheGreenCedar/CodeStory",
     "defaultPrompt": [
-      "@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.",
-      "@CodeStory Where is RefreshMode defined, which codestory-cli commands accept --refresh, and what is the call path from index into codestory-store?",
+      "@CodeStory Check local and agent readiness for this checkout before packet/search.",
+      "@CodeStory Find RefreshMode and the index path into codestory-store.",
       "@CodeStory I am editing a file in this repo. What symbols are affected and what tests should I run first?"
     ],
     "brandColor": "#2563EB",

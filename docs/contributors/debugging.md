@@ -100,9 +100,12 @@ Recovery order:
    `codestory-cli retrieval index --project . --refresh full`.
 5. Require `codestory-cli retrieval status --project . --format json` to report
    `retrieval_mode: "full"` before trusting packet/search evidence.
-6. If `doctor` reports `missing_managed_assets`, use `codestory-cli setup embeddings --project .`
-   only for managed ONNX/local semantic diagnostics. Managed setup installs ONNX assets and should
-   not start a server or create the product retrieval manifest.
+6. If `doctor` reports missing or unreachable embeddings, repair the llama.cpp
+   sidecar path with `codestory-cli retrieval bootstrap` and
+   `codestory-cli retrieval index --project . --refresh full`. Use
+   `codestory-cli setup embeddings --project .` only for explicit ONNX
+   diagnostics; it does not start sidecars or create the product retrieval
+   manifest.
 7. If semantic retrieval is still the only failing part, inspect the reported degraded-state reason before touching lexical ranking or CLI rendering.
 
 ## If Cold Indexing Is Slow

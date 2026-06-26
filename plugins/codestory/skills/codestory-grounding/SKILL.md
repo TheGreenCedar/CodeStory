@@ -119,6 +119,17 @@ CLI directly:
 
 Always pass `--project <target-workspace>` explicitly.
 
+For delegated CodeStory child worktrees, check the Git proof target before
+cache, readiness, or sidecar proof work. `scripts/codex-worktree-setup.ps1`
+prints `intended_base_ref`, `resolved_base_commit`, `child_start_head`,
+`child_branch_or_detached`, `proof_target`, `pr_head_ref`, `pr_head_commit`, and
+the exact `git ls-remote origin ...` command/result when a remote branch is
+applicable. PR lanes default to proving current `origin/dev/codestory-next` plus
+the PR head (`CODESTORY_PR_HEAD_REF` or `-PrHeadRef`); use branch-head proof
+only when explicitly requested. Stale `main`, stale local
+`dev/codestory-next`, stale PR head, unresolved refs, or the wrong proof target
+are Git blockers to fix before expensive readiness evidence.
+
 For binary repair details, use [serve](references/serve.md) for MCP/PATH
 behavior and [doctor](references/doctor.md) for health and repair evidence.
 
