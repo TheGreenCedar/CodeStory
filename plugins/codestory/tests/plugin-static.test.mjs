@@ -1523,10 +1523,26 @@ test("hook MCP classifier distinguishes configured launchable and model-visible 
       JSON.stringify({ source: "managed", path: cliPath }),
       "utf8",
     );
-    const exposed = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
-    assert.equal(exposed.mcp_resources_exposed, true);
-    assert.equal(exposed.mcp_resource_status, "mcp_resources_exposed");
-    assert.equal(exposed.degraded_no_surface, false);
+    const runtimeStateOnly = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
+    assert.equal(runtimeStateOnly.mcp_runtime_state_present, true);
+    assert.equal(runtimeStateOnly.mcp_resources_exposed, false);
+    assert.equal(runtimeStateOnly.mcp_resource_status, "mcp_resources_not_model_visible");
+    assert.equal(runtimeStateOnly.degraded_no_surface, false);
+
+    const previous = process.env.CODESTORY_MCP_RESOURCES_EXPOSED;
+    try {
+      process.env.CODESTORY_MCP_RESOURCES_EXPOSED = "1";
+      const exposed = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
+      assert.equal(exposed.mcp_resources_exposed, true);
+      assert.equal(exposed.mcp_resource_status, "mcp_resources_exposed");
+      assert.equal(exposed.degraded_no_surface, false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CODESTORY_MCP_RESOURCES_EXPOSED;
+      } else {
+        process.env.CODESTORY_MCP_RESOURCES_EXPOSED = previous;
+      }
+    }
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1622,9 +1638,25 @@ test("hook output reports model-invisible MCP instead of PATH setup guidance", a
   const { spawnSync } = await import("node:child_process");
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-resources-"));
+  const version = await readPluginVersion();
+  const cliDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  await mkdir(cliDir, { recursive: true });
+  await writeFakeCli(cliPath);
+  await writeFile(
+    join(cliDir, "manifest.json"),
+    JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
+    "utf8",
+  );
+  await writeFile(
+    join(dataDir, ".codestory-mcp-runtime.json"),
+    JSON.stringify({ source: "managed", path: cliPath }),
+    "utf8",
+  );
   const result = spawnSync(process.execPath, [hookPath], {
     env: {
       ...process.env,
+      CODESTORY_MCP_RESOURCES_EXPOSED: "",
       COPILOT_PLUGIN_DATA: "",
       PLUGIN_DATA: dataDir,
       PATH: "",
@@ -1642,6 +1674,7 @@ test("hook output reports model-invisible MCP instead of PATH setup guidance", a
   const context = output.hookSpecificOutput.additionalContext;
   assert.match(context, /mcp_config_installed: yes/u);
   assert.match(context, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
+  assert.match(context, /managed_cli_present: yes/u);
   assert.match(context, /MCP resources are not visible/u);
   assert.doesNotMatch(context, /codestory-cli ENOENT/u);
   assert.doesNotMatch(context, /attempted request packet/u);
