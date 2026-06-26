@@ -1,5 +1,7 @@
 # Framework Route Coverage Verification
 
+**Audience:** Evidence record — not an install guide.
+
 CodeStory indexes framework routes as graph symbols when extraction is backed by
 fixtures and confidence labels. Do not claim full framework support from a
 single heuristic hit. Language support tiers are defined separately in

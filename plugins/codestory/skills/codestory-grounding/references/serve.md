@@ -1,6 +1,6 @@
 # `serve` - Local Agent Integration Surface
 
-Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready.
+Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready. MCP runtime fields and surface gating: [status-contract.md](status-contract.md).
 
 For direct MCP-style clients:
 
@@ -8,17 +8,7 @@ For direct MCP-style clients:
 codestory-cli serve --stdio --refresh none
 ```
 
-The installed plugin starts `scripts/codestory-mcp.cjs`, which prefers a
-checksummed plugin-managed CLI, provisions the current version from
-`github_release` when needed, and only falls back to `PATH` when no managed
-binary is available. If the resolved runtime cannot spawn, or if that fallback
-is missing, unversioned, or older than the plugin package, the adapter returns
-`repair_setup` MCP diagnostics instead of closing transport. Once MCP is live,
-`codestory://status` is the runtime truth: use `server_version`, `cli_version`,
-`server_executable`,
-`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`,
-`runtime_truth`, `dirty_marker`, and `allowed_surfaces` from status before any
-local grounding, packet, or search call.
+The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap and `repair_setup` diagnostics when spawn fails). Once MCP is live, read `codestory://status` before any grounding, packet, or search call.
 
 ## Usage
 
@@ -56,26 +46,7 @@ local grounding, packet, or search call.
 | Failure path | If serve reports missing index, run `doctor --project <target-workspace>` and `ready --goal local --repair --project <target-workspace> --format json`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
 | Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `callers`, `callees`, `trail`, `trace`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
 
-## Stdio Runtime Contract
-
-| Status field | Use |
-|--------------|-----|
-| `server_version` | Active MCP server version. Prefer this over source checkout or package version once MCP is live. |
-| `cli_version` | Active CLI runtime version. |
-| `server_executable` / `server_executable_sha256` | Active MCP server executable path and checksum. Use them to diagnose stale runtime or binary drift. |
-| `sidecar_contract_version` | Active sidecar schema contract version compiled into the CLI. |
-| `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Provisioned records include `build_source=github_release` and `repo_ref`. |
-| `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, sidecar policy/status, and local/agent readiness lanes. |
-| `sidecar_setup` | Plugin sidecar setup policy (`ask`, `enabled`, or `disabled`) plus last repair state and opt-in/disable commands. |
-| `dirty_marker` | Optional plugin hook freshness marker. `dirty_stale` means local graph surfaces report `repair_index` until the index is refreshed; packet/search/context readiness remains sidecar-gated. |
-| `runtime_boundary` | Restart/reload reminder for changes to the managed binary, override, or PATH. |
-| `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
-| `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |
-
-Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is not
-registered, status is unavailable, status reports `path_fallback`, or the status
-executable/version indicates a stale binary. If launch inputs change during
-repair, start a fresh Codex host/app session before checking status again.
+Stdio MCP status fields and allowed-surface rules: [status-contract.md](status-contract.md).
 
 ## Notes
 

@@ -1,53 +1,63 @@
 # Operator Journey Template
 
-## Overview
+Use this template for host-specific guides and journey pages under `docs/users/`.
 
-This template is for documenting the operator journey through CodeStory.
+## Required sections (host guide skeleton)
 
-## Required Sections
+### 1. What you get
 
-### Journey Overview
-- Brief explanation of the operator journey
-- Key stages and their purposes
-- Trust boundary explanation
+- What the agent gains on this host
+- What you still do manually on this host vs Codex
+- Link to [capability matrix](../users/README.md#capability-matrix) when comparing hosts
 
-### Stage-by-Stage Documentation
-- Use a table to document each stage
-- Include human action, agent/CLI action, and trust check
-- Provide clear examples for each stage
+### 2. Install
 
-### Context and Background
-- Explanation of why this journey exists
-- Background on the problem being solved
-- Rationale for the journey structure
+- Human steps only
+- Approve hooks when your host prompts for them (see [capability matrix](../users/README.md#capability-matrix))
+- No CLI commands unless this host requires manual MCP setup paths
+- Paths to plugin files, hooks, rules, or instructions
 
-### Trust Boundary Documentation
-- Clear explanation of trust boundaries
-- When to trust what output
-- How to verify readiness
+### 3. Install verification
 
-### Examples and Templates
-- Concrete examples for the specific repository
-- Generalizable prompt templates
-- Adaptation guidance for different scenarios
+- Three checks before first real task (adapter present, hooks/MCP live, first status read)
+- Link to first-session prompt in the guide
 
-## Example Structure
+### 4. First session
 
-```markdown
-# Operator Journey
+- What you do: open repo, start fresh session
+- What the agent does: status check, grounding, surface gating
+- One concrete first prompt (portable template allowed)
 
-Brief explanation of the operator journey.
+### 5. Example prompts
 
-## Stage-by-Stage Documentation
+- Three or four portable templates with `[Feature]`, `[path/to/file]`, `[subsystem]`
+- Optional host invocation prefix (`@CodeStory`, rule behavior, etc.)
 
-| Stage | Human action | Agent/CLI action | Trust check |
+### 6. Troubleshooting (host-specific)
+
+- Link to shared [troubleshooting](../users/troubleshooting.md) for common lanes
+- Host-only failures (MCP config, plugin UI, missing hooks)
+
+### 7. Limitations (honest vs Codex)
+
+- Missing auto-start, hooks, skill, or managed CLI bootstrap
+- What still works (local navigation vs packet/search)
+
+## Content rules
+
+- Open with the reader's job, not "agents rediscover the repo"
+- Say what the user does vs what the agent handles
+- One concept one owner: link [glossary](../glossary.md) and [troubleshooting](../users/troubleshooting.md) instead of duplicating
+- CLI only in [CLI reference](../users/cli-reference.md) or troubleshooting step 2
+
+## Example stage table (optional, for journey overview pages)
+
+| Stage | You | Agent | Check |
 | --- | --- | --- | --- |
-| Install | Install the `codestory` plugin from `TheGreenCedar`. | Plugin starts `codestory-cli serve --stdio --refresh none`. | Fresh thread sees the active MCP runtime. |
-| First grounding | Ask the agent to check readiness and ground the repo. | Read `codestory://status`, then `codestory://grounding` or `ground`. | `local_navigation` is ready before using local graph output. |
-| Source work | Ask for a plan, review, or code path. | Use `files`, `symbol`, `trail`, `snippet`, `context`, and `affected`. | Claims cite concrete files, node ids, snippets, or trails. |
-| Broad discovery | Ask a repo-wide question. | Use `packet` or `search`. | Trust only when `agent_packet_search` is ready and `retrieval_mode=full`. |
-| Repair | Ask for a transcript or run CLI directly. | Use `doctor`, `index`, `retrieval status`, and sidecar repair commands. | Repeat readiness checks after repair. |
+| Install | Install plugin or configure MCP | Starts or connects MCP adapter | Fresh session sees `codestory://status` |
+| First grounding | Open repo, ask readiness prompt | Reads status, grounds if allowed | `allowed_surfaces` matches task |
+| Source work | Ask for plan or code path | Uses allowed local graph tools | Claims cite files and symbols |
+| Broad discovery | Ask repo-wide question | Uses packet/search when allowed | `retrieval_mode=full` |
+| Repair | Ask what is blocked | Uses status, agent-guide, sidecar_setup | Repeat status after repair |
 
-Packet/search output from degraded retrieval, missing sidecars, stale manifests,
-or any non-`full` retrieval mode is navigation help only. It is not proof.
-```
+Degraded packet/search is navigation help only, not proof. See [glossary](../glossary.md#retrieval-mode).

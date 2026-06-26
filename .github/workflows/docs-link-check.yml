@@ -1,0 +1,43 @@
+name: docs link check
+
+on:
+  pull_request:
+    paths:
+      - docs/**
+      - README.md
+      - plugins/codestory/README.md
+      - plugins/codestory/docs/**
+      - plugins/codestory/skills/**
+      - .github/scripts/check-doc-links.mjs
+      - .github/workflows/docs-link-check.yml
+  push:
+    branches:
+      - main
+      - dev/codestory-next
+    paths:
+      - docs/**
+      - README.md
+      - plugins/codestory/README.md
+      - plugins/codestory/docs/**
+      - plugins/codestory/skills/**
+      - .github/scripts/check-doc-links.mjs
+      - .github/workflows/docs-link-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-link-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  markdown-links:
+    name: check markdown links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check relative doc links
+        run: node .github/scripts/check-doc-links.mjs

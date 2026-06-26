@@ -1,89 +1,75 @@
 # Documentation Template
 
-## Overview
+Consistent structure for new CodeStory documentation.
 
-This template provides a consistent structure for CodeStory documentation files.
+## Header
 
-## Required Sections
+- File title as H1
+- One sentence stating the reader's job for this page
+- No trust-boundary tables in the opening paragraph
 
-### Header
-- File title as H1 (#)
-- Brief description on the line below
-- Metadata badges if applicable
+## Body structure
 
-### Introduction
-- Clear, concise overview of the document's purpose
-- Key context or problem statement
-- Navigation hints for users
+- H2 for major sections, H3 for subsections
+- ASCII only in new edits unless the file already uses Unicode for a clear reason
+- Two-space list indentation
 
-### Main Content
-- Use H2 (##) for major sections
-- Use H3 (###) for subsections
-- Use H4 (####) for detailed subsections
-- Maintain consistent indentation (2 spaces)
+## Content rules
 
-### Tables
-- Use consistent table formatting
-- Align columns properly
-- Include clear headers
-- Add explanatory notes when needed
+1. Open with the reader's job, not internal architecture unless the page is architecture-owned.
+2. Example prompts use portable templates: `[Feature]`, `[path/to/file]`, `[subsystem]`.
+3. CLI commands belong in [CLI reference](../users/cli-reference.md), troubleshooting step 2, or contributor docs -- not user quick starts.
+4. State what the user does vs what the agent handles.
+5. One concept one owner: link [glossary](../glossary.md) and canonical pages instead of redefining terms.
 
-### Code Blocks
-- Use ```text for command examples
-- Use ```sh for shell commands
-- Use ```powershell for Windows PowerShell commands
-- Include proper syntax highlighting
+## Tables
 
-### Lists
-- Use consistent bullet point formatting
-- Maintain proper indentation
-- Include examples where helpful
+- Clear headers; align columns for readability
+- Capability or routing tables link to canonical owner pages
 
-## Formatting Guidelines
+## Code blocks
 
-### Text Formatting
-- Use **bold** for emphasis
-- Use *italic* for emphasis
-- Use `code` for inline code
-- Use `**code**` for important code elements
+- `text` for agent prompts
+- `sh` for POSIX shell
+- `powershell` for Windows PowerShell
+- `json` for config snippets
 
-### Links
-- Use [text](url) format for internal links
-- Use proper relative paths
-- Validate all links
+## Cross-links
 
-### Images
-- Use ![alt text](path) format
-- Include descriptive alt text
-- Place images strategically
+- User topics: `docs/users/`
+- Terms: `docs/glossary.md`
+- Contributor verification: `docs/contributors/testing-matrix.md`
+- Use relative paths; validate links before merge
 
-## Quality Checks
+## Quality checks
 
-### Before Committing
-- Run `git diff --check` for formatting issues
-- Validate all internal links
-- Check for broken references
-- Ensure consistent formatting
+Before committing:
 
-### Before Merging
-- Review content for completeness
-- Validate examples with current code
-- Check for outdated information
-- Ensure proper cross-referencing
-
-## Example Structure
-
-```markdown
-# Document Title
-
-Brief description of the document.
-
-## Section 1
-
-Content for section 1.
-
-### Subsection 1.1
-
-Detailed content for subsection.
-
+```sh
+git diff --check
+node .github/scripts/check-doc-links.mjs
 ```
+
+- No duplicated readiness definitions (link glossary)
+- No `codestory-cli` in user quick-start sections
+- Examples use reader repo placeholders, not CodeStory-internal names, unless the page is contributor-specific
+
+## Example skeleton
+
+    # Document Title
+
+    One sentence: what job this page helps the reader finish.
+
+    ## Section one
+
+    Content with links to [glossary](../glossary.md) for shared terms.
+
+    ## Section two
+
+    ### Subsection
+
+    Detailed content.
+
+    ## See also
+
+    - Related canonical page (`path/to/page.md`)

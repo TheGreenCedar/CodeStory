@@ -67,10 +67,8 @@ High-signal environment toggles:
 
 Use other embedding, alias, batch-size, tokenizer, provider, hash, ONNX, and
 summary tuning variables only for focused diagnostics or historical comparisons.
-Agent packet/search readiness requires retrieval status to report
-`retrieval_mode=full`. A zero dense-anchor corpus is valid only when the
-manifest reports it explicitly; otherwise stale or unavailable Qdrant state
-fails closed.
+Agent packet/search readiness requires `retrieval_mode=full`; see
+[status-contract.md](status-contract.md) and [retrieval-rollout.md](retrieval-rollout.md).
 
 ## Output
 

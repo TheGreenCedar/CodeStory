@@ -1,33 +1,25 @@
 # Agent Portability
 
-CodeStory ships one grounding skill and thin host adapters. The user-facing
-path is one flow: run agent preflight, install the plugin or adapter, then let
-MCP plus hooks keep CodeStory ambient.
+Maintainer pointer for host adapters. Operator documentation lives in the
+[user guides hub](../../../docs/users/README.md).
 
-```sh
-codestory-cli agent preflight --project <repo> --format json
-```
+## Operators
 
-The skill owns the runtime rules; adapters make the rules ambient in hosts that
-support lifecycle hooks or project instruction files. Where the host exposes
-prompt input, the hook attempts request-aware packet grounding before the agent
-opens source files.
+| Need | Doc |
+| --- | --- |
+| Pick a host and install | [User guides](../../../docs/users/README.md) |
+| Blocked session | [Troubleshooting](../../../docs/users/troubleshooting.md) |
+| CLI repair | [CLI reference](../../../docs/users/cli-reference.md) |
 
-| Host | Files | Behavior |
-| --- | --- | --- |
-| Codex | `.codex-plugin/plugin.json`, `.mcp.json`, `skills/` | Starts the stdio MCP server and ships the grounding skill. |
-| Claude Code | `.claude-plugin/plugin.json`, `hooks/claude-codex-hooks.json` | Attempts strict session grounding and request-aware packet grounding through lifecycle hooks. |
-| GitHub Copilot CLI | `.github/plugin/`, `hooks/copilot-hooks.json`, `skills/` | Injects status-first grounding rules at session start. |
-| GitHub Copilot editor | `.github/copilot-instructions.md` | Repository instruction fallback. |
-| Cursor | `.cursor/rules/codestory.mdc` | Always-on project rule fallback. |
+## Maintainers
 
-Keep adapters thin. When a host supports hooks or skills, point it at the
-existing `hooks/` and `skills/` files. When a host only supports project
-instructions, keep the copied rule text aligned with the root instruction file.
+Adapter layout, MCP script, hooks, and plugin checks:
 
-Every adapter should preserve the same first check: read `codestory://status`
-when MCP is live, then trust only the surfaces allowed by status. Broad
-`packet`, `search`, and `context` use still requires `retrieval_mode=full`.
-Hooks ground on session start, resume, clear, and compact handoff; attempt
-request-aware grounding on user prompts; and fail open with the next CodeStory
-check instead of blocking the host.
+| Topic | Doc |
+| --- | --- |
+| Plugin package and host surfaces | [Plugin README](../README.md) |
+| Optional dirty-marker Git hooks | [Contributor debugging](../../../docs/contributors/debugging.md#optional-dirty-marker-git-hooks) |
+| Status field contract (agent-only) | [status-contract.md](../skills/codestory-grounding/references/status-contract.md) |
+
+Keep adapters thin: point hook-capable hosts at `hooks/` and `skills/`; align
+rule-only hosts with the grounding skill contract.

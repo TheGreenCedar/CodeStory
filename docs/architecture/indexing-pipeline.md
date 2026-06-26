@@ -2,7 +2,10 @@
 
 This page explains how `codestory-cli index` turns a repository into SQLite-backed graph state, projection rows, and grounding snapshots.
 
-Read this page when you need the implementation mental model. Use the CLI grounding workflows after that if you want live evidence from an indexed workspace.
+Read this page when you need the implementation mental model. For live evidence
+from an indexed workspace, use contributor CLI commands in
+[getting-started.md](../contributors/getting-started.md) or operator repair
+paths in [users/troubleshooting.md](../users/troubleshooting.md).
 
 Default `index` includes graph-native symbol docs and selected dense anchors. A successful run returns only after graph indexing, snapshots, lexical search projection, deterministic `symbol_search_doc` rows, component reports, and persisted dense-anchor docs are synchronized. Semantic work is measured separately in the phase timings instead of being hidden behind a later read command.
 

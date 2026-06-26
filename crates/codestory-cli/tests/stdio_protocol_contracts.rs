@@ -273,6 +273,10 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
     if let Some(state) = &fixture.sidecar_policy_state {
         command.env("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE", state);
         command.env(
+            "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH",
+            fixture.cache_dir.path().join("plugin-sidecar-policy.json"),
+        );
+        command.env(
             "CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND",
             "node codestory-mcp.cjs sidecar-policy enable",
         );
@@ -807,6 +811,42 @@ fn assert_read_only_tool_metadata(tool: &Value) {
     );
 }
 
+fn assert_sidecar_setup_tool_metadata(tool: &Value) {
+    let annotations = tool
+        .get("annotations")
+        .unwrap_or_else(|| panic!("sidecar_setup should include MCP-style annotations: {tool}"));
+    let safety = tool
+        .get("safety")
+        .or_else(|| tool.get("metadata"))
+        .unwrap_or_else(|| panic!("sidecar_setup should include safety metadata: {tool}"));
+
+    assert_eq!(
+        annotations.get("readOnlyHint").and_then(Value::as_bool),
+        Some(false),
+        "sidecar_setup should declare local config writes: {tool}"
+    );
+    assert_eq!(
+        annotations.get("destructiveHint").and_then(Value::as_bool),
+        Some(false),
+        "sidecar_setup should declare non-destructive behavior: {tool}"
+    );
+    assert_eq!(
+        annotations.get("idempotentHint").and_then(Value::as_bool),
+        Some(true),
+        "sidecar_setup should declare idempotent behavior: {tool}"
+    );
+    assert!(
+        contains_bool_recursive(safety, &["localOnly", "local_only"], true)
+            && contains_bool_recursive(safety, &["openWorld", "open_world"], false),
+        "sidecar_setup should declare local-only closed-world behavior: {tool}"
+    );
+    assert_eq!(
+        safety.get("mutation").and_then(Value::as_str),
+        Some("local_plugin_configuration"),
+        "sidecar_setup should label the plugin-local mutation: {tool}"
+    );
+}
+
 #[test]
 fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     let fixture = indexed_fixture();
@@ -886,7 +926,7 @@ fn notification_messages_do_not_produce_responses() {
 }
 
 #[test]
-fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
+fn tool_catalog_keeps_stable_browser_and_setup_tool_names() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -917,13 +957,14 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
             "references",
             "search",
             "shortest_path",
+            "sidecar_setup",
             "snippet",
             "symbol",
             "symbols",
             "trace",
             "trail",
         ],
-        "stdio browser tool names should stay stable and read-only: {tools}"
+        "stdio browser/setup tool names should stay stable: {tools}"
     );
     assert!(
         !tool_names.iter().any(|name| name.starts_with("codestory_")),
@@ -987,9 +1028,12 @@ fn tool_catalog_keeps_stable_read_only_browser_tool_names() {
     );
 
     for tool in tools["tools"].as_array().expect("tools array") {
-        assert_read_only_tool_metadata(tool);
-
         let name = tool["name"].as_str().expect("tool name");
+        if name == "sidecar_setup" {
+            assert_sidecar_setup_tool_metadata(tool);
+        } else {
+            assert_read_only_tool_metadata(tool);
+        }
         let looks_like_write_or_system_tool = [
             "write", "edit", "delete", "remove", "create", "update", "patch", "open_", "launch",
             "shell", "exec", "system", "fs.",
@@ -1100,6 +1144,18 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         schema_property(packet, "include_evidence").get("default"),
         Some(&json!(true)),
         "packet.include_evidence should document the stdio default: {packet}"
+    );
+
+    let sidecar_setup = tool_input_schema(&tools, "sidecar_setup");
+    assert_schema_enum_values(
+        sidecar_setup,
+        "/properties/action/enum",
+        &["status", "enable", "disable", "ask", "repair"],
+    );
+    assert_eq!(
+        schema_property(sidecar_setup, "action").get("default"),
+        Some(&json!("status")),
+        "sidecar_setup.action should default to the cheap status probe: {sidecar_setup}"
     );
 
     let ground = tool_input_schema(&tools, "ground");
@@ -2328,11 +2384,17 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         !next_call_text.contains("codestory-cli index --project")
             && !next_call_text.contains("retrieval bootstrap")
             && !next_call_text.contains("retrieval index")
-            && next_call_text.contains("codestory-cli ready --goal agent --repair")
+            && next_call_text.contains("\"tool\":\"sidecar_setup\"")
+            && next_call_text.contains("\"action\":\"repair\"")
+            && next_call_text.contains("\"debug_command\"")
             && next_call_text.contains("retrieval status")
             && next_call_text.contains("codestory://status")
             && next_call_text.contains("codestory://agent-guide"),
-        "status should recommend sidecar repair without repeating a fresh core index when mode is not full: {status}"
+        "status should recommend MCP-managed sidecar repair without repeating a fresh core index when mode is not full: {status}"
+    );
+    assert!(
+        !next_call_text.contains("\"method\":\"cli\""),
+        "status should not expose CLI as the normal user-facing repair method: {status}"
     );
     assert!(
         status
@@ -2425,10 +2487,22 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
     assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(next_call_text.contains("host/confirm"), "{status}");
-    assert!(next_call_text.contains("sidecar-policy enable"), "{status}");
+    assert!(
+        next_call_text.contains("\"tool\":\"sidecar_setup\""),
+        "{status}"
+    );
+    assert!(next_call_text.contains("\"action\":\"enable\""), "{status}");
+    assert!(
+        next_call_text.contains("\"action\":\"disable\""),
+        "{status}"
+    );
     assert!(
         !next_call_text.contains("ready --goal agent --repair"),
         "ask policy should not recommend heavy sidecar repair before consent: {status}"
+    );
+    assert!(
+        !next_call_text.contains("\"method\":\"cli\""),
+        "ask policy should not expose CLI as the normal consent path: {status}"
     );
 }
 
@@ -2462,12 +2536,18 @@ fn resources_read_status_recommends_sidecar_repair_when_policy_enabled() {
     );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
-        next_call_text.contains("codestory-cli ready --goal agent --repair"),
-        "enabled policy should keep the existing agent repair path visible: {status}"
+        next_call_text.contains("\"tool\":\"sidecar_setup\"")
+            && next_call_text.contains("\"action\":\"repair\"")
+            && next_call_text.contains("\"debug_command\""),
+        "enabled policy should route agent repair through the MCP sidecar_setup tool: {status}"
     );
     assert!(
         next_call_text.contains("--run-id") && next_call_text.contains("shared-agent"),
         "enabled policy should point at the shared agent run id: {status}"
+    );
+    assert!(
+        !next_call_text.contains("\"method\":\"cli\""),
+        "enabled policy should not expose CLI as the normal repair path: {status}"
     );
 }
 
@@ -2496,10 +2576,86 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
         next_call_text.contains("Automatic sidecar setup is disabled"),
         "{status}"
     );
-    assert!(next_call_text.contains("sidecar-policy enable"), "{status}");
+    assert!(
+        next_call_text.contains("\"tool\":\"sidecar_setup\""),
+        "{status}"
+    );
+    assert!(next_call_text.contains("\"action\":\"enable\""), "{status}");
     assert!(
         !next_call_text.contains("ready --goal agent --repair"),
         "disabled policy should not recommend automatic sidecar repair: {status}"
+    );
+    assert!(
+        !next_call_text.contains("\"method\":\"cli\""),
+        "disabled policy should not expose CLI as the normal recovery path: {status}"
+    );
+}
+
+#[test]
+fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("ask".to_string());
+    let policy_path = fixture.cache_dir.path().join("plugin-sidecar-policy.json");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-enable",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "enable"}
+            }
+        }),
+    );
+    let setup = assert_tool_success(&response, json!("sidecar-setup-enable"));
+    assert_eq!(
+        setup["state"],
+        json!("enabled"),
+        "sidecar_setup enable should report the updated policy state immediately: {setup}"
+    );
+    assert_eq!(
+        setup["mcp_control"]["repair"],
+        json!({"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}),
+        "sidecar_setup should expose the MCP repair call, not a user CLI step: {setup}"
+    );
+
+    let policy: Value = serde_json::from_str(
+        &fs::read_to_string(&policy_path)
+            .unwrap_or_else(|error| panic!("read sidecar policy {policy_path:?}: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("sidecar policy should be json: {error}"));
+    assert_eq!(policy["state"], json!("enabled"), "{policy}");
+    assert!(
+        policy["updated_at"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("unix:")),
+        "sidecar policy should record an update timestamp: {policy}"
+    );
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&status_response, json!("sidecar-setup-status"));
+    let status = json_resource_content(result, "codestory://status");
+    assert_eq!(
+        status["sidecar_setup"]["state"],
+        json!("enabled"),
+        "{status}"
+    );
+    assert!(
+        status["recommended_next_calls"]
+            .to_string()
+            .contains("\"tool\":\"sidecar_setup\""),
+        "status should keep recovery on MCP tooling after sidecar_setup enable: {status}"
     );
 }
 
@@ -2849,16 +3005,27 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
             .unwrap_or_else(|| panic!("blocked stale CLI tool should include setup: {response}"));
         assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(setup["latest_version"], "999.0.0");
+        let minimum_next = error
+            .pointer("/minimum_next")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("blocked stale CLI tool should include minimum_next: {response}")
+            });
         assert!(
-            error
-                .pointer("/minimum_next")
-                .and_then(Value::as_array)
-                .is_some_and(|commands| commands.iter().any(|command| command
-                    .as_str()
-                    .is_some_and(
-                        |text| text.contains("install-codestory.ps1") && text.contains("999.0.0")
-                    ))),
-            "blocked stale CLI tool should expose installer repair command: {response}"
+            minimum_next.iter().all(|call| call
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method != "cli")),
+            "blocked stale CLI tool should not expose CLI as the normal repair method: {response}"
+        );
+        assert!(
+            minimum_next.iter().any(|call| call
+                .get("debug_command")
+                .and_then(Value::as_str)
+                .is_some_and(
+                    |text| text.contains("install-codestory.ps1") && text.contains("999.0.0")
+                )),
+            "blocked stale CLI tool should keep installer detail as debug metadata: {response}"
         );
     }
 }
@@ -3639,26 +3806,37 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         "stdio search readiness error should expose exactly one canonical minimum repair: {response}"
     );
     assert!(
-        minimum_next.iter().any(|command| command
-            .as_str()
-            .is_some_and(|text| text.contains("codestory-cli ready --goal agent --repair"))),
-        "stdio search readiness error should point at agent-owned repair: {response}"
+        minimum_next.iter().any(|call| call
+            .get("tool")
+            .and_then(Value::as_str)
+            .is_some_and(|tool| tool == "sidecar_setup")
+            && call
+                .pointer("/arguments/action")
+                .and_then(Value::as_str)
+                .is_some_and(|action| action == "repair")
+            && call.get("debug_command").and_then(Value::as_str).is_some()),
+        "stdio search readiness error should point at MCP-managed agent repair: {response}"
     );
     let full_repair = error["full_repair"]
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include full_repair: {response}"));
     assert!(
-        full_repair.iter().all(|command| command
-            .as_str()
-            .is_some_and(|text| !text.contains("codestory-cli index"))),
+        full_repair.iter().all(
+            |call| call.to_string().contains("\"method\":\"cli\"") == false
+                && call
+                    .get("debug_command")
+                    .and_then(Value::as_str)
+                    .is_none_or(|text| !text.contains("codestory-cli index"))
+        ),
         "stdio search sidecar errors should not repeat core index repair commands: {response}"
     );
     assert!(
-        full_repair.iter().any(|command| command
-            .as_str()
+        full_repair.iter().any(|call| call
+            .get("debug_command")
+            .and_then(Value::as_str)
             .is_some_and(|text| text.contains("codestory-cli retrieval status")
                 && text.contains("--format json"))),
-        "stdio search error should include sidecar status proof command: {response}"
+        "stdio search error should include sidecar status proof debug command: {response}"
     );
 }
 

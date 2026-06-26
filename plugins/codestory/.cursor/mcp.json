@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codestory": {
+      "command": "node",
+      "args": ["./plugins/codestory/scripts/codestory-mcp.cjs"],
+      "tool_timeout_sec": 300
+    }
+  }
+}

@@ -32,7 +32,7 @@ semantic indexing behavior and cache reuse.
 
 ### Product Direction
 
-Read [usage.md](usage.md) and [architecture overview](architecture/overview.md)
+Read [User guides](users/README.md) and [architecture overview](architecture/overview.md)
 for current operator workflows and navigation surfaces. Treat roadmap notes as
 direction, not benchmark proof or a changelog.
 

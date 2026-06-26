@@ -1,77 +1,101 @@
 # README Template
 
-## Overview
+Use this template for repository root README files that introduce CodeStory to
+operators.
 
-This template is for main README files that provide an overview of the project.
+## Required sections
 
-## Required Sections
+### Title and badges
 
-### Title and Badges
-- Project title as H1 (#)
-- Brief description on the line below
+- Project title as H1
+- One-line description focused on the reader's job (cited evidence for agents)
 - License and technology badges
 
-### Quick Start
-- Brief overview of the normal user path
-- Key installation and usage steps
-- Link to usage.md for full operator flow and recovery
+### Value proposition
 
-### Example Prompts
-- Concrete examples for the specific repository
-- Link to usage.md for portable templates
+- One paragraph: what the reader gets, not how indexing works internally
+- No trust-boundary tables in the opening
 
-### Key Features
-- Use a table to compare needs with CodeStory surfaces
-- Include readiness lanes explanation
-- Provide clear command examples
+### Pick your host
 
-### CLI Escape Hatch
-- When to use the CLI instead of the plugin
-- Key CLI commands with examples
-- Setup and repair procedures
+- Table linking to `../users/<host>.md` guides
+- Link to [user guides hub](../users/README.md)
 
-### With vs without CodeStory
-- Focused benchmark task row
-- Link to holdout or suite stats for broader evidence
-- Scope and boundary notes
+### Quick start
+
+- Host-specific install in three steps max
+- Approve hooks when your host prompts for them (see [capability matrix](../users/README.md#capability-matrix))
+- No `codestory-cli` commands in quick start
+- Link to host guide for first-session prompt
+
+### Example prompts
+
+- Three portable templates using `[Feature]`, `[path/to/file]`, `[subsystem]`
+- No CodeStory-internal symbol names in the root README examples
+
+### What your agent gets
+
+- Short table: need vs CodeStory surface
+- Link to [glossary](../glossary.md) for readiness lanes
 
 ### Documentation
-- Clear navigation to other documentation
-- Trust boundary guidance
 
-## Example Structure
+- Link to `docs/README.md` for routing
+- Link to [troubleshooting](../users/troubleshooting.md)
 
-Use four-space indentation for nested code blocks inside the example skeleton
-below. Do not nest triple-backtick fences.
+### Evaluation (below the fold)
+
+- Benchmark or holdout summary table
+- Link to stats page with scope and boundary notes
+- Demote evaluation below install and prompts
+
+## Do not include in root README
+
+- CLI command cheat sheets (use [CLI reference](../users/cli-reference.md))
+- Trust-boundary tables duplicating glossary
+- Marketplace maintainer details (use plugin README or host guide)
+
+## Example skeleton
+
+Use four-space indentation for nested code blocks. Do not nest triple-backtick fences.
 
     # Project Name
 
-    **Brief description** — graph-backed context, source citations, and explicit uncertainty.
+    **Brief description** -- graph-backed context, source citations, and explicit uncertainty.
+
+    One paragraph value proposition for the reader's job.
+
+    ## Pick your host
+
+    | Host | Guide |
+    | --- | --- |
+    | Codex | [Codex guide](../users/codex.md) |
 
     ## Quick start
 
-    The normal path is the **Codex plugin**. The CLI and MCP server are for setup, repair, and transcripts.
-
-    1. Open Codex in the repository you want to ground.
-    2. Run `/plugins`, then install **TheGreenCedar → codestory**.
-    3. Start a fresh thread and ask the readiness prompt from usage.md.
-
-    Full operator flow: docs/usage.md
+    1. Install the plugin for your host (see guide above).
+    2. Approve hooks when your host prompts for them.
+    3. Open the repository you want to ground and start a fresh session.
+    4. Ask the readiness prompt from your host guide.
 
     ## Example prompts
 
-    Concrete repo-specific examples here. Portable templates: docs/usage.md#example-prompts
+    ```text
+    Where is [Feature] defined and who calls it?
+    ```
 
     ## What your agent gets
 
     | Need | CodeStory surface |
     | --- | --- |
-    | Repo orientation | Grounding snapshot, file inventory, language coverage |
+    | Repo orientation | Grounding snapshot, file inventory |
 
-    ## With vs without CodeStory
-
-    Focused task comparison table and link to broader benchmark stats.
+    Readiness terms: [Glossary](../glossary.md).
 
     ## Documentation
 
-    Link to docs/README.md for routing.
+    Full routing: [docs/README.md](../README.md).
+
+    ## Evaluation
+
+    Benchmark table and link to stats page.

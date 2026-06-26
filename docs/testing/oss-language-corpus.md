@@ -1,5 +1,7 @@
 # OSS Language Corpus
 
+**Audience:** Evidence record — not an install guide.
+
 The OSS language corpus is an ignored, opt-in test suite for checking each
 public language-support profile against a pinned medium-sized open source project.
 It is intentionally outside the default test lane because it clones external
