@@ -1192,6 +1192,7 @@ test("hook manifest timeouts cover managed bootstrap budget", async () => {
     /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
     "local wait-fresh timeout default",
   );
+  assert.equal(localWaitFreshTimeoutMs, 5000, "local wait-fresh default must stay MCP startup-safe");
   const requiredTimeoutSec = Math.max(
     Math.ceil((bootstrapTimeoutMs + 30000) / 1000),
     Math.ceil((releaseDownloadTimeoutMs * releaseDownloadAttempts + localWaitFreshTimeoutMs) / 1000),
