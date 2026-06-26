@@ -13,7 +13,14 @@ pub(super) fn cleanup_stale_call_resolutions(
     let cutoff = policy.min_call_confidence;
     let mut low_confidence_query = String::from(
         "UPDATE edge SET resolved_target_node_id = NULL, confidence = NULL, certainty = NULL
-         WHERE kind = ?1 AND confidence IS NOT NULL AND confidence < ?2",
+         WHERE kind = ?1 AND confidence IS NOT NULL AND confidence < ?2
+         AND target_node_id NOT IN (
+             SELECT id FROM node
+             WHERE canonical_id LIKE 'tauri:command:%'
+                OR canonical_id LIKE 'openapi:endpoint:%'
+                OR canonical_id LIKE 'route_endpoint:%'
+                OR canonical_id LIKE 'payload:collection:%'
+         )",
     );
     if scope_context.is_scoped() {
         low_confidence_query.push_str(&format!(
