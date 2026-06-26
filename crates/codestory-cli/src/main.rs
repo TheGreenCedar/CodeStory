@@ -4010,9 +4010,9 @@ fn drill_suite_retrieval_blockers(
         .into_iter()
         .map(|(status, repos)| {
             let next_action = if status.contains("MissingEmbeddingRuntime") {
-                "run `codestory-cli setup embeddings --project <repo>`, then rebuild with `codestory-cli retrieval index --project <repo> --refresh full` before trusting packet/search evidence".to_string()
+                "run `codestory-cli retrieval bootstrap --project <repo>`, then rebuild with `codestory-cli retrieval index --project <repo> --refresh full` before trusting packet/search evidence".to_string()
             } else if status.contains("MissingSemanticDocs") {
-                "rerun `codestory-cli retrieval index --project <repo> --refresh full` after semantic setup before trusting packet/search evidence".to_string()
+                "rerun `codestory-cli retrieval index --project <repo> --refresh full` after sidecar setup before trusting packet/search evidence".to_string()
             } else {
                 "inspect doctor/retrieval status and repair to retrieval_mode=full before treating broad search quality as repo-specific".to_string()
             };
@@ -11161,7 +11161,7 @@ fn semantic_contract_check(
             "semantic_contract",
             "info",
             format!(
-                "semantic stale: {}. Resolve the embedding runtime first with `codestory-cli setup embeddings`; then run `codestory-cli retrieval index --refresh full` before trusting packet/search evidence.",
+                "semantic stale: {}. Resolve the product embedding sidecar first with `codestory-cli retrieval bootstrap`; then run `codestory-cli retrieval index --refresh full` before trusting packet/search evidence.",
                 gaps.join("; ")
             ),
         )
@@ -11306,7 +11306,10 @@ fn index_next_commands(
         && retrieval.fallback_reason == Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime)
     {
         commands.push(format!(
-            "codestory-cli setup embeddings --project {project}"
+            "codestory-cli retrieval bootstrap --project {project}"
+        ));
+        commands.push(format!(
+            "codestory-cli retrieval index --project {project} --refresh full"
         ));
     }
     commands.push(format!("codestory-cli ground --project {project}"));
@@ -13213,6 +13216,62 @@ mod tests {
                 "not-checked freshness should stop before `{blocked}` proof/navigation commands: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn index_next_commands_use_sidecar_repair_for_missing_embedding_runtime() {
+        let mut retrieval = sample_retrieval();
+        retrieval.semantic_ready = false;
+        retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
+
+        let commands = index_next_commands("C:/repo", Some(&retrieval), None, true);
+        let joined = commands.join("\n");
+
+        assert!(joined.contains("codestory-cli retrieval bootstrap --project"));
+        assert!(
+            joined.contains("codestory-cli retrieval index --project")
+                && joined.contains("--refresh full")
+        );
+        assert!(!joined.contains("setup embeddings"));
+    }
+
+    #[test]
+    fn semantic_contract_check_uses_sidecar_repair_for_missing_embedding_runtime() {
+        let mut retrieval = sample_retrieval();
+        retrieval.semantic_ready = false;
+        retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
+        retrieval.current_embedding = Some(codestory_contracts::api::EmbeddingProfileContractDto {
+            profile: "bge-base-en-v1.5".to_string(),
+            backend: "llamacpp".to_string(),
+            model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
+            cache_key: "current".to_string(),
+            dimension: Some(768),
+            doc_shape: "current-shape".to_string(),
+        });
+        retrieval.stored_embedding =
+            Some(codestory_contracts::api::StoredSemanticDocsContractDto {
+                doc_count: 1,
+                embedding_profile: Some("bge-base-en-v1.5".to_string()),
+                embedding_backend: Some("onnx".to_string()),
+                cache_key: Some("old".to_string()),
+                dimension: Some(768),
+                doc_version: Some(5),
+                mixed_embedding_profiles: false,
+                mixed_embedding_models: false,
+                mixed_embedding_backends: false,
+                mixed_dimensions: false,
+                mixed_doc_versions: false,
+                mixed_doc_shapes: false,
+                doc_shape: Some("old-shape".to_string()),
+                semantic_policy_version: Some("graph_first_v1".to_string()),
+                mixed_semantic_policy_versions: false,
+            });
+
+        let check = semantic_contract_check(&retrieval);
+
+        assert!(check.message.contains("retrieval bootstrap"));
+        assert!(check.message.contains("retrieval index --refresh full"));
+        assert!(!check.message.contains("setup embeddings"));
     }
 
     #[test]
@@ -16197,7 +16256,8 @@ mod tests {
         );
         assert_eq!(blocker.repo_count, 2);
         assert_eq!(blocker.repos, vec!["alpha", "gamma"]);
-        assert!(blocker.next_action.contains("setup embeddings"));
+        assert!(blocker.next_action.contains("retrieval bootstrap"));
+        assert!(!blocker.next_action.contains("setup embeddings"));
 
         let markdown = render_drill_suite_markdown(&output);
         assert!(markdown.contains("## Retrieval Blockers"));

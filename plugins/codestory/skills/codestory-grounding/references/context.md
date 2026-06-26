@@ -29,7 +29,7 @@ Builds target context around one concrete retrieval target. Target selection is 
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> context --project <target-workspace> --query AppController` | Markdown context packet with resolution metadata, retrieval trace, citations, gaps, and next commands when sidecar-primary retrieval is full. |
-| Failure path | If the target is ambiguous or missing, run `search --project <target-workspace> --query "<target>" --why`, choose a concrete `node_id`, then rerun `context --id <node_id>`. If local navigation readiness is weak, run `doctor --project <target-workspace>`, `setup embeddings --project <target-workspace>` when needed, and `index --project <target-workspace> --refresh full`. | Keeps target context tied to a resolvable target and avoids treating stale retrieval as strong evidence. |
+| Failure path | If the target is ambiguous or missing, run `search --project <target-workspace> --query "<target>" --why`, choose a concrete `node_id`, then rerun `context --id <node_id>`. If local navigation readiness is weak, run `doctor --project <target-workspace>`, `retrieval bootstrap --project <target-workspace>` when needed, and `retrieval index --project <target-workspace> --refresh full`. | Keeps target context tied to a resolvable target and avoids treating stale retrieval as strong evidence. |
 | Integration edge | Use `search --why`, `explore`, or `bookmark list` first, then pass the selected node via `--id <node_id>` or `--bookmark <bookmark_id>`; use `--bundle out/context-AppController` for reviewer handoff. | Converts candidate discovery into a deeper, shareable evidence packet. |
 
 ## Notes
