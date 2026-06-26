@@ -2293,17 +2293,16 @@ fn repair_ready_state(
         sidecar.compose_project
     );
     let progress = ReadyRepairProgress::start(&sidecar);
-    progress.set_phase("container startup");
-    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime(
+    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
         &sidecar,
         Some(runtime.project_root.as_path()),
         &storage_scope,
         None,
         false,
         Duration::from_secs(90),
+        |phase| progress.set_phase(phase),
     )
     .context("ready repair retrieval bootstrap")?;
-    progress.set_phase("model/bootstrap");
     let infrastructure = ready_repair_infrastructure_with_runtime_observation(
         &bootstrap.infrastructure,
         &runtime.project_root,

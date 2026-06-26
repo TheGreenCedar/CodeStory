@@ -45,8 +45,9 @@ pub use capabilities::SidecarCapabilities;
 pub use compose::bootstrap_sidecars_without_storage_scope;
 pub use compose::{
     BootstrapReport, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory, bootstrap_sidecars,
-    bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime, docker_available,
-    embed_model_inventory, resolve_compose_file,
+    bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,
+    bootstrap_sidecars_with_runtime_progress, docker_available, embed_model_inventory,
+    resolve_compose_file,
 };
 pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,

@@ -94,6 +94,26 @@ pub fn bootstrap_sidecars_with_runtime(
     skip_compose: bool,
     wait_timeout: Duration,
 ) -> Result<BootstrapReport> {
+    bootstrap_sidecars_with_runtime_progress(
+        runtime,
+        repo_root,
+        storage_scope,
+        compose_file,
+        skip_compose,
+        wait_timeout,
+        |_| {},
+    )
+}
+
+pub fn bootstrap_sidecars_with_runtime_progress(
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+    storage_scope: &BootstrapStorageScope,
+    compose_file: Option<&Path>,
+    skip_compose: bool,
+    wait_timeout: Duration,
+    mut progress: impl FnMut(&'static str),
+) -> Result<BootstrapReport> {
     let layout = runtime.layout.clone();
     runtime.activate_embed_url_default();
     layout.ensure_data_dirs()?;
@@ -111,13 +131,17 @@ pub fn bootstrap_sidecars_with_runtime(
     };
 
     let compose_started = if let Some(path) = resolved_compose.as_ref() {
-        docker_compose_up(path, repo_root, runtime, launch_mode)?;
+        with_bootstrap_progress(&mut progress, "container startup", || {
+            docker_compose_up(path, repo_root, runtime, launch_mode)
+        })?;
         true
     } else {
         false
     };
     if let Some(launch) = native_embedding.as_ref() {
-        spawn_native_embedding_server(launch)?;
+        with_bootstrap_progress(&mut progress, "model/bootstrap", || {
+            spawn_native_embedding_server(launch)
+        })?;
     }
 
     let state = sidecar_up_with_runtime_and_launch_metadata(
@@ -128,7 +152,9 @@ pub fn bootstrap_sidecars_with_runtime(
             .map(|launch| embedding_launch_metadata(launch, runtime, repo_root)),
     )?;
     if !wait_timeout.is_zero() {
-        let _ = wait_for_infrastructure(&layout, wait_timeout)?;
+        let _ = with_bootstrap_progress(&mut progress, "model/bootstrap", || {
+            wait_for_infrastructure(&layout, wait_timeout)
+        })?;
     }
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
@@ -143,6 +169,15 @@ pub fn bootstrap_sidecars_with_runtime(
         compose_file: resolved_compose,
         storage_repair,
     })
+}
+
+fn with_bootstrap_progress<T>(
+    progress: &mut impl FnMut(&'static str),
+    phase: &'static str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    progress(phase);
+    action()
 }
 
 /// Deprecated: pass [`BootstrapStorageScope::from_parts`] as the second argument to [`bootstrap_sidecars`].
@@ -872,6 +907,25 @@ mod tests {
             docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::DockerComposeEmbed)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn bootstrap_progress_is_emitted_before_blocking_work() {
+        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let progress_phases = std::rc::Rc::clone(&phases);
+        let action_phases = std::rc::Rc::clone(&phases);
+
+        with_bootstrap_progress(
+            &mut |phase| progress_phases.borrow_mut().push(phase),
+            "model/bootstrap",
+            || {
+                assert_eq!(&*action_phases.borrow(), &["model/bootstrap"]);
+                Ok(())
+            },
+        )
+        .expect("progress wrapper should return action result");
+
+        assert_eq!(&*phases.borrow(), &["model/bootstrap"]);
     }
 
     #[test]
