@@ -1,0 +1,77 @@
+name: Post-publish release smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to smoke, with or without a leading v.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Published Linux asset agent proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Normalize release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            echo "::error::version input is required"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download published Linux asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/post-publish-release-assets
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "codestory-cli-v${VERSION}-linux-x64.tar.gz" \
+            --pattern "SHA256SUMS.txt" \
+            --dir target/post-publish-release-assets \
+            --clobber
+          grep "  codestory-cli-v${VERSION}-linux-x64.tar.gz$" \
+            target/post-publish-release-assets/SHA256SUMS.txt \
+            > target/post-publish-release-assets/linux-x64.sha256
+          (cd target/post-publish-release-assets && sha256sum -c linux-x64.sha256)
+
+      - name: Fetch retrieval embedding model
+        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
+
+      - name: Prove published agent runtime
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
+        run: |
+          set -euo pipefail
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/post-publish-release-assets/codestory-cli-v${{ steps.release.outputs.version }}-linux-x64.tar.gz" \
+            --expected-version "${{ steps.release.outputs.version }}" \
+            --project "${{ github.workspace }}" \
+            --plugin-root plugins/codestory \
+            --out-dir target/post-publish-agent-proof
+
+      - name: Upload post-publish agent proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: post-publish-agent-proof-linux-x64-${{ steps.release.outputs.version }}
+          path: target/post-publish-agent-proof
+          if-no-files-found: warn
