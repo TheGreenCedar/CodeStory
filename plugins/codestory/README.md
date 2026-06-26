@@ -8,15 +8,10 @@ CodeStory gives a coding agent a local, read-only grounding surface before it
 plans, reviews, or edits a repository. Index once; answer from evidence with
 citations instead of re-exploring the tree on every prompt.
 
-The human job is simple: run agent preflight in the repo, install the plugin,
-and start a fresh thread there.
-
-```sh
-codestory-cli agent preflight --project <repo> --format json
-```
-
-Use `safe_surfaces`, `blocked_surfaces`, and `repair_command` as the handoff.
-Then let the plugin path take over.
+The human job is simple: install the plugin, open the repository, and start a
+fresh thread there. The plugin owns runtime bootstrap through MCP. If the user
+has to find or install `codestory-cli` before installing the plugin, the product
+flow is wrong.
 Hosts with lifecycle-hook adapters keep CodeStory ambient. On session start,
 resume, clear, and compact, the hook
 injects CodeStory-first grounding rules and attempts a strict `ground` snapshot
@@ -27,12 +22,12 @@ changes. The CLI is still there, but it is the escape hatch and repair surface,
 not the main user experience.
 
 This is strict startup grounding plus request-aware packets, not a random
-repository summary. Hooks fail open. Missing `node`, missing `codestory-cli`, missing MCP, degraded
+repository summary. Hooks fail open. Missing `node`, missing MCP, degraded
 sidecars, timeouts, non-repo folders, and empty output must not block the host
 session. If the hook cannot produce useful grounding, it leaves the agent with
-the next CodeStory check to run: usually `codestory://status`, an allowed
-`packet`/`search`/`context` call, or incremental
-`ready --goal local --repair`. Agents still skip no-op ground output in huge
+the next CodeStory check to run through MCP: usually `codestory://status`,
+`codestory://agent-guide`, or an allowed `packet`/`search`/`context` call.
+Agents still skip no-op ground output in huge
 or non-code folders.
 
 ## What The Agent Gets
@@ -41,6 +36,7 @@ or non-code folders.
 | --- | --- | --- |
 | Is this repo indexed and safe to use? | `codestory://status` | Read first; status is the runtime truth. |
 | What should I do next? | `codestory://agent-guide` | Let the skill route normal setup and repair. |
+| Enable or repair packet/search sidecars. | `sidecar_setup` tool | Use MCP, not a shell command. |
 | Give me a compact repo map. | `codestory://grounding` | Start from current local files. |
 | Inspect indexed file inventory and coverage. | `files` tool | Use for scope, language mix, and missing coverage. |
 | Map changed files to likely impact. | `affected` tool | Use for review planning and focused test choice. |
@@ -89,18 +85,8 @@ CLI/MCP runtime.
 
 ## Install For Agent Use
 
-For normal Codex use, first preflight the repo:
-
-```bash
-codestory-cli agent preflight --project <repo> --format json
-```
-
-If local graph surfaces are blocked, run the emitted `repair_command` before
-source work. If only `packet`, `search`, or `context` is blocked, local
-navigation can continue while sidecars are repaired later.
-
-Then install the plugin through the Codex plugin flow for your workspace. Open
-Codex in the repo you want to ground, then use:
+For normal Codex use, install the plugin through the Codex plugin flow for your
+workspace. Open Codex in the repo you want to ground, then use:
 
 ```text
 /plugins
@@ -128,8 +114,8 @@ rather than the terminal. Use the UI path when the CLI marketplace command is
 unavailable.
 
 Start a new Codex thread after installation or refresh. The installed package
-launches the managed MCP adapter, which then starts
-`codestory-cli serve --stdio --refresh none`.
+launches the managed MCP adapter, which provisions and starts the runtime behind
+MCP.
 
 ### After install
 
@@ -157,6 +143,10 @@ Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
 missing, status reports a suspect runtime, or you are debugging/repairing the
 installed CLI. If PATH changed during repair, start a fresh Codex host/app
 session before treating a new MCP runtime as live.
+
+When `codestory://status` reports sidecar setup is needed, the agent should call
+`sidecar_setup` with `{"action":"enable"}` or `{"action":"repair"}`. Do not ask
+the user to install or run `codestory-cli`; the plugin owns that path.
 
 ### Optional dirty-marker Git hooks
 

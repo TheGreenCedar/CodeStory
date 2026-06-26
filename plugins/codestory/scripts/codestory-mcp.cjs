@@ -548,6 +548,26 @@ function localWaitFreshCommand(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
+function mcpNextCallForCommand(command) {
+  if (command.startsWith('Restart/reload') || command.startsWith('Refresh or reinstall')) {
+    return { method: 'host/restart', instruction: command };
+  }
+  if (command.includes('ready --goal agent --repair')) {
+    return {
+      method: 'tools/call',
+      tool: 'sidecar_setup',
+      arguments: { action: 'repair' },
+      debug_command: command,
+    };
+  }
+  return {
+    method: 'resources/read',
+    uri: 'codestory://status',
+    instruction: 'Use MCP status and agent-guide first; debug_command is for maintainer transcripts only.',
+    debug_command: command,
+  };
+}
+
 function localWaitFreshTimeoutMs() {
   const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
@@ -755,8 +775,6 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   ];
   const minimumNext = options.minimumNext || (managedProvisionFailed && pathCandidates.length === 0 ? managedProvisionNext : [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
-    process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
-    'codestory-cli --version',
   ]);
   const fullRepair = options.fullRepair || minimumNext;
   const recommendedNext = options.recommendedNext || fullRepair;
@@ -839,9 +857,8 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     allowed_surfaces: allowedSurfaces,
     recommended_next_calls: [
       { method: 'resources/read', uri: 'codestory://status' },
-      ...recommendedNext.map((command) => command.startsWith('Refresh or reinstall') || command.startsWith('Restart/reload')
-        ? { method: 'host/restart', instruction: command }
-        : { method: 'cli', command }),
+      { method: 'resources/read', uri: 'codestory://agent-guide' },
+      ...recommendedNext.map((command) => mcpNextCallForCommand(command)),
     ],
   };
 }
@@ -996,6 +1013,7 @@ function cargoPackageVersion(manifest) {
 
 function diagnosticText(status) {
   const setup = status.readiness[0].setup;
+  const next = status.recommended_next_calls?.[0] || status.readiness[0].minimum_next?.[0] || null;
   return [
     'CodeStory MCP runtime is not ready.',
     `reason: ${status.degraded_reason}`,
@@ -1006,7 +1024,7 @@ function diagnosticText(status) {
     `cli_version: ${setup.active_version || '<unknown>'}`,
     `source_checkout_version: ${status.source_checkout_version || '<none>'}`,
     `path_candidates: ${(status.path_candidates || []).map((candidate) => `${candidate.path}@${candidate.version || '<unknown>'}`).join(', ') || '<none>'}`,
-    `next: ${status.readiness[0].minimum_next[0]}`,
+    `next: ${next ? JSON.stringify(next) : 'read codestory://status'}`,
   ].join('\n');
 }
 
@@ -1047,6 +1065,30 @@ function failOpenToolResult(status) {
   };
 }
 
+function failOpenSidecarSetupResult(request) {
+  const action = request.params?.arguments?.action || 'status';
+  if (!['status', 'enable', 'disable', 'ask'].includes(action)) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, or ask while the runtime is in diagnostic mode.' }],
+      structuredContent: { code: 'invalid_sidecar_setup_action', action },
+    };
+  }
+  if (action !== 'status') {
+    writeSidecarPolicy(action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'ask');
+  }
+  const policy = readSidecarPolicy();
+  return {
+    content: [{ type: 'text', text: JSON.stringify(policy) }],
+    structuredContent: {
+      state: policy.state,
+      path: policy.path,
+      updated_at: policy.updatedAt,
+      last_repair: policy.lastRepair,
+    },
+  };
+}
+
 function runFailOpenMcp(status) {
   const tools = ['ground', 'files', 'packet', 'search', 'context'].map((name) => ({
     name,
@@ -1054,6 +1096,31 @@ function runFailOpenMcp(status) {
     inputSchema: { type: 'object', additionalProperties: true },
     outputSchema: { type: 'object', additionalProperties: true },
   }));
+  tools.unshift({
+    name: 'sidecar_setup',
+    description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask'], default: 'status' },
+      },
+      additionalProperties: false,
+    },
+    outputSchema: { type: 'object', additionalProperties: true },
+    safety: {
+      readOnly: false,
+      sideEffects: true,
+      localOnly: true,
+      openWorld: false,
+      mutation: 'local_plugin_configuration',
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  });
   const resources = [
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
@@ -1100,7 +1167,12 @@ function runFailOpenMcp(status) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        response = jsonrpcResult(request.id, failOpenToolResult(status));
+        response = jsonrpcResult(
+          request.id,
+          request.params?.name === 'sidecar_setup'
+            ? failOpenSidecarSetupResult(request)
+            : failOpenToolResult(status),
+        );
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }

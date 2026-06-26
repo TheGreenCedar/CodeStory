@@ -24,7 +24,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use crate::args;
 use crate::http_transport::{
@@ -416,11 +416,31 @@ fn stdio_tool_blocked_error(
         "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
-        "minimum_next": surface.get("minimum_next").cloned().unwrap_or_else(|| serde_json::json!([])),
-        "full_repair": surface.get("full_repair").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next")),
+        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair")),
         "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
         "sidecar": verdict.and_then(|verdict| verdict.get("sidecar")).cloned().unwrap_or(serde_json::Value::Null),
     })))
+}
+
+fn stdio_repair_calls_from_value(value: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(commands) = value.and_then(serde_json::Value::as_array) else {
+        return serde_json::json!([]);
+    };
+    serde_json::Value::Array(
+        commands
+            .iter()
+            .filter_map(|command| {
+                if let Some(command) = command.as_str() {
+                    Some(stdio_recommended_next_call(command))
+                } else if command.is_object() {
+                    Some(command.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
 }
 
 fn stdio_jsonrpc_tool_call_from_legacy(
@@ -823,6 +843,7 @@ fn handle_stdio_tool_call(
         "symbols" => handle_stdio_symbols(runtime, request),
         "snippet" => handle_stdio_snippet(runtime, request),
         "context" => handle_stdio_context(runtime, request),
+        "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
 }
@@ -3069,12 +3090,16 @@ fn stdio_status_recommended_next_calls(
                             "instruction": sidecar_setup["prompt"]
                         },
                         {
-                            "method": "cli",
-                            "command": sidecar_setup["enable_command"]
+                            "method": "tools/call",
+                            "tool": "sidecar_setup",
+                            "arguments": {"action": "enable"},
+                            "debug_command": sidecar_setup["enable_command"]
                         },
                         {
-                            "method": "cli",
-                            "command": sidecar_setup["disable_command"]
+                            "method": "tools/call",
+                            "tool": "sidecar_setup",
+                            "arguments": {"action": "disable"},
+                            "debug_command": sidecar_setup["disable_command"]
                         },
                         {
                             "method": "resources/read",
@@ -3093,8 +3118,10 @@ fn stdio_status_recommended_next_calls(
                             "instruction": "Automatic sidecar setup is disabled for this plugin install."
                         },
                         {
-                            "method": "cli",
-                            "command": sidecar_setup["enable_command"]
+                            "method": "tools/call",
+                            "tool": "sidecar_setup",
+                            "arguments": {"action": "enable"},
+                            "debug_command": sidecar_setup["enable_command"]
                         },
                         {
                             "method": "resources/read",
@@ -3190,9 +3217,26 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
             "instruction": command
         });
     }
+    if command.contains("ready --goal agent --repair") {
+        return serde_json::json!({
+            "method": "tools/call",
+            "tool": "sidecar_setup",
+            "arguments": {"action": "repair"},
+            "debug_command": command
+        });
+    }
+    if command.contains("ready --goal local") || command.contains("codestory-cli doctor") {
+        return serde_json::json!({
+            "method": "resources/read",
+            "uri": "codestory://status",
+            "instruction": "Read status again after the MCP-managed local freshness check. Use the debug_command only for maintainer transcripts.",
+            "debug_command": command
+        });
+    }
     serde_json::json!({
-        "method": "cli",
-        "command": command
+        "method": "host/instruction",
+        "instruction": "Follow MCP status and agent-guide before falling back to CLI diagnostics.",
+        "debug_command": command
     })
 }
 
@@ -3252,7 +3296,14 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
 }
 
 pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Value {
-    let state = match env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE").as_deref() {
+    let policy = stdio_sidecar_policy_file();
+    let env_state = env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE");
+    let state = match policy
+        .as_ref()
+        .and_then(|policy| policy.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .or(env_state.as_deref())
+    {
         Some("enabled") => "enabled",
         Some("disabled") => "disabled",
         Some(_) => "ask",
@@ -3272,11 +3323,23 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         "auto_repair": auto_repair,
         "prompt_required": prompt_required,
         "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. Enable automatic sidecar setup for this plugin install?") } else { None },
+        "mcp_control": {
+            "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
+            "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
+            "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "disable"}},
+            "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "ask"}},
+            "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}
+        },
         "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
         "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
         "next_repair_command": next_repair_command,
         "policy_path": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH"),
-        "policy_updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT"),
+        "policy_updated_at": policy
+            .as_ref()
+            .and_then(|policy| policy.get("updated_at"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT")),
         "last_repair": {
             "state": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE"),
             "updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT"),
@@ -3284,6 +3347,115 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND")
         }
     })
+}
+
+fn stdio_sidecar_policy_file() -> Option<serde_json::Value> {
+    let policy_path =
+        std::env::var_os("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH").map(PathBuf::from)?;
+    fs::read_to_string(policy_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn handle_stdio_sidecar_setup(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let action = request
+        .pointer("/params/arguments/action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("status");
+    match action {
+        "status" => {
+            serde_json::json!({"result": stdio_sidecar_setup_status(&runtime.project_root)})
+        }
+        "enable" | "disable" | "ask" => match stdio_write_sidecar_policy(action) {
+            Ok(()) => {
+                state.status_cache = None;
+                serde_json::json!({"result": stdio_sidecar_setup_status(&runtime.project_root)})
+            }
+            Err(error) => serde_json::json!({"error": error.to_string()}),
+        },
+        "repair" => {
+            state.status_cache = None;
+            handle_stdio_sidecar_repair(runtime)
+        }
+        _ => {
+            serde_json::json!({"error": "sidecar_setup.action must be status, enable, disable, ask, or repair"})
+        }
+    }
+}
+
+fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
+    let state = match action {
+        "enable" => "enabled",
+        "disable" => "disabled",
+        "ask" => "ask",
+        _ => bail!("unsupported sidecar setup action: {action}"),
+    };
+    let policy_path = std::env::var_os("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH")
+        .map(PathBuf::from)
+        .context("CodeStory plugin data is unavailable; restart from an installed plugin before changing sidecar setup policy")?;
+    if let Some(parent) = policy_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("create sidecar setup policy directory {}", parent.display())
+        })?;
+    }
+    let current = fs::read_to_string(&policy_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut next = current.as_object().cloned().unwrap_or_default();
+    next.insert("state".to_string(), serde_json::json!(state));
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| format!("unix:{}", duration.as_secs()))
+        .unwrap_or_else(|_| "unix:0".to_string());
+    next.insert("updated_at".to_string(), serde_json::json!(updated_at));
+    fs::write(
+        &policy_path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(next))?,
+    )
+    .with_context(|| format!("write sidecar setup policy {}", policy_path.display()))?;
+    Ok(())
+}
+
+fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let output = Command::new(exe)
+        .arg("ready")
+        .arg("--goal")
+        .arg("agent")
+        .arg("--repair")
+        .arg("--project")
+        .arg(&runtime.project_root)
+        .arg("--format")
+        .arg("json")
+        .arg("--run-id")
+        .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+        .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
+        .output();
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let parsed = serde_json::from_str::<serde_json::Value>(&stdout).ok();
+            serde_json::json!({
+                "result": {
+                    "status": if output.status.success() { "completed" } else { "failed" },
+                    "exit_code": output.status.code(),
+                    "stdout": stdout,
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                    "parsed": parsed,
+                    "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+                }
+            })
+        }
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    }
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -3515,7 +3687,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             }
         ],
         "safety_notes": [
-            "All stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world.",
+            "Browser stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world; sidecar_setup is the local plugin-configuration exception.",
             "Read codestory://status first and branch on allowed_surfaces before choosing tools.",
             "Use ground for compact repository orientation after status when local_navigation is ready.",
             "Use packet for broad task questions only when packet/search status is allowed; use context only when allowed_surfaces.context.allowed is true.",

@@ -11,10 +11,10 @@ use serde_json::{Map, Value, json};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Side-effect class advertised for a stdio tool.
 ///
-/// The current stdio surface is read-only and local-only; adding a new effect
-/// requires updating both safety metadata and tool annotations.
+/// Adding a new effect requires updating both safety metadata and tool annotations.
 pub(crate) enum ToolEffect {
     Read,
+    LocalConfigWrite,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +30,12 @@ impl SafetyMetadata {
         }
     }
 
+    pub(crate) const fn local_config_write() -> Self {
+        Self {
+            effect: ToolEffect::LocalConfigWrite,
+        }
+    }
+
     fn to_json(self) -> Value {
         match self.effect {
             ToolEffect::Read => json!({
@@ -38,6 +44,13 @@ impl SafetyMetadata {
                 "localOnly": true,
                 "openWorld": false
             }),
+            ToolEffect::LocalConfigWrite => json!({
+                "readOnly": false,
+                "sideEffects": true,
+                "localOnly": true,
+                "openWorld": false,
+                "mutation": "local_plugin_configuration"
+            }),
         }
     }
 
@@ -45,6 +58,12 @@ impl SafetyMetadata {
         match self.effect {
             ToolEffect::Read => json!({
                 "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }),
+            ToolEffect::LocalConfigWrite => json!({
+                "readOnlyHint": false,
                 "destructiveHint": false,
                 "idempotentHint": true,
                 "openWorldHint": false
@@ -1266,7 +1285,22 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &["question"],
 );
 
+static SIDECAR_SETUP_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Configure the plugin-local sidecar setup policy.",
+    &[SchemaProperty::string("action", "Policy action.")
+        .with_enum(&["status", "enable", "disable", "ask", "repair"])
+        .with_default(ValueLiteral::String("status"))],
+    &[],
+);
+
 static TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "sidecar_setup",
+        description: "Read or change the plugin-local sidecar setup policy through MCP; use this instead of asking the user to run shell commands.",
+        input_schema: SIDECAR_SETUP_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
+        safety: SafetyMetadata::local_config_write(),
+    },
     ToolSpec {
         name: "packet",
         description: "Answer broad structural questions with graph/sidecar evidence, sufficiency, truncation, and follow-up commands before source snippets.",
@@ -1478,7 +1512,6 @@ pub(crate) fn is_tool_name(name: &str) -> bool {
 
 /// Build the `tools/list` response.
 pub(crate) fn tools_list_json() -> Value {
-    debug_assert_read_only_catalog();
     json!({
         "result": {
             "tools": TOOLS.iter().map(|tool| tool.to_json()).collect::<Vec<_>>()
@@ -1523,13 +1556,4 @@ pub(crate) fn prompt_get_json(name: &str) -> Result<Value> {
         .find(|prompt| prompt.name == name)
         .map(|prompt| prompt.get_json())
         .ok_or_else(|| anyhow::anyhow!("Unknown prompt: {name}"))
-}
-
-fn debug_assert_read_only_catalog() {
-    debug_assert!(
-        TOOLS
-            .iter()
-            .all(|tool| matches!(tool.safety.effect, ToolEffect::Read)),
-        "stdio catalog may only expose read-only tools"
-    );
 }

@@ -2096,8 +2096,8 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
   ];
   const cliRepairRequired = ["where.exe codestory-cli", "codestory-cli --version"];
   const stdioLaunchRequired = [
-    "codestory-cli serve --stdio --refresh none",
     "scripts/codestory-mcp.cjs",
+    "sidecar_setup",
     "github_release",
     "path_fallback",
     "closing transport",
@@ -2185,8 +2185,8 @@ test("plugin docs are agent-first, status-first, and marketplace-aware", async (
   const rootReadmeRequired = [
     "Install details, binary bootstrap",
     "[plugin README](plugins/codestory/README.md)",
-    "`codestory-cli serve --stdio --refresh none`",
     "managed MCP adapter",
+    "normal users should\nnot run `codestory-cli` directly",
     "Codex uses the plugin's MCP server plus the\n`@CodeStory` skill",
   ];
   for (const text of [readme, skill]) {
