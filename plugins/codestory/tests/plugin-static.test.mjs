@@ -485,7 +485,7 @@ test("mcp launcher waits for fresh local navigation without agent repair", async
         ...process.env,
         CODESTORY_CLI: cliPath,
         PLUGIN_DATA: dataDir,
-        CODESTORY_PLUGIN_SIDECAR_POLICY: "enabled",
+        CODESTORY_PLUGIN_SIDECAR_POLICY: "ask",
         TEST_CODESTORY_VERSION: version,
         TEST_LOG: logFile,
         TEST_OUT: marker,
@@ -809,7 +809,7 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
   }
 });
 
-test("enabled sidecar policy does not schedule agent repair at MCP startup", async () => {
+test("enabled sidecar policy runs one agent repair at MCP startup", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
@@ -851,12 +851,29 @@ test("enabled sidecar policy does not schedule agent repair at MCP startup", asy
 
     const text = await readFile(logFile, "utf8");
     const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    const repairCalls = calls.filter((call) => call.repair);
+    assert.equal(repairCalls.length, 1, text);
+    assert.equal(repairCalls[0].policy, "enabled");
+    assert.deepEqual(repairCalls[0].args, [
+      "ready",
+      "--goal",
+      "agent",
+      "--repair",
+      "--project",
+      repoRoot,
+      "--format",
+      "json",
+      "--run-id",
+      "shared-agent",
+    ]);
     assert.ok(calls.some((call) => {
       return JSON.stringify(call.args) === JSON.stringify(["serve", "--stdio", "--refresh", "none"]);
     }), text);
-    assert.equal(calls.some((call) => call.repair), false);
-    assert.equal(calls.some((call) => call.args.includes("agent")), false);
-    assert.equal(calls.some((call) => call.args.includes("--repair")), false);
+    const policy = JSON.parse(await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"));
+    assert.equal(policy.last_repair.state, "completed");
+    assert.equal(policy.last_repair.project_root, repoRoot);
+    assert.match(policy.last_repair.command, /ready --goal agent --repair/u);
+    assert.match(policy.last_repair.command, /--run-id shared-agent/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

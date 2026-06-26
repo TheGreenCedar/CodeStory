@@ -128,6 +128,10 @@ function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
 
+function resolvedRepairCommandForProject(resolved, projectRoot = process.cwd()) {
+  return `${JSON.stringify(resolved.path)} ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
+}
+
 function optionValue(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : null;
@@ -519,6 +523,11 @@ function localWaitFreshTimeoutMs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
 }
 
+function sidecarRepairTimeoutMs() {
+  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR_TIMEOUT_MS || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
+}
+
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
   const args = ['ready', '--goal', 'local', '--wait-fresh'];
   args.push('--project', projectRoot, '--format', 'json');
@@ -529,6 +538,38 @@ function runLocalNavigationWaitFresh(resolved, projectRoot) {
     windowsHide: true,
   });
   return { args, result };
+}
+
+function runSidecarStartupRepair(resolved, sidecarStatus, projectRoot = process.cwd()) {
+  if (sidecarStatus.state !== 'enabled') return sidecarStatus;
+  if (resolved.source !== 'managed' && resolved.source !== 'local_dev_override') return sidecarStatus;
+  const args = ['ready', '--goal', 'agent', '--repair'];
+  args.push('--project', projectRoot, '--format', 'json', '--run-id', sharedAgentRunId);
+  const result = spawnSync(resolved.path, args, {
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+    timeout: sidecarRepairTimeoutMs(),
+    windowsHide: true,
+    env: {
+      ...process.env,
+      CODESTORY_PLUGIN_SIDECAR_REPAIR: '1',
+      CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
+    },
+  });
+  const lastRepair = {
+    state: result.error?.code === 'ETIMEDOUT' ? 'timeout' : result.status === 0 ? 'completed' : 'failed',
+    updated_at: new Date().toISOString(),
+    project_root: projectRoot,
+    command: resolvedRepairCommandForProject(resolved, projectRoot),
+  };
+  if (sidecarStatus.path) {
+    writeSidecarPolicy(sidecarStatus.state, { last_repair: lastRepair }, sidecarStatus.path);
+    return readSidecarPolicy(sidecarStatus.path);
+  }
+  return {
+    ...sidecarStatus,
+    lastRepair,
+  };
 }
 
 function localReadySetup(prefix, args, result) {
@@ -1094,7 +1135,7 @@ async function main() {
     }));
     return;
   }
-  const sidecarStatus = readSidecarPolicy();
+  const sidecarStatus = runSidecarStartupRepair(resolved, readSidecarPolicy(), process.cwd());
   const dirtyMarker = dirtyMarkerEnv(process.cwd());
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
