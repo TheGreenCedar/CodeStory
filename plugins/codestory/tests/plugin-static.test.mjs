@@ -1136,6 +1136,60 @@ test("session-start hooks are thin and host manifests point at them", async () =
   assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
 });
 
+test("hook manifest timeouts cover managed bootstrap budget", async () => {
+  const hookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "claude-codex-hooks.json"), "utf8"),
+  );
+  const copilotHookConfig = JSON.parse(
+    await readFile(join(pluginRoot, "hooks", "copilot-hooks.json"), "utf8"),
+  );
+  const runtimeSource = await readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8");
+  const mcpSource = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
+  const numberFrom = (text, pattern, label) => {
+    const match = text.match(pattern);
+    assert.ok(match, `missing ${label}`);
+    return Number.parseInt(match[1], 10);
+  };
+
+  const bootstrapTimeoutMs = numberFrom(
+    runtimeSource,
+    /function bootstrapTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
+    "bootstrap timeout default",
+  );
+  const releaseDownloadTimeoutMs = numberFrom(
+    mcpSource,
+    /const releaseDownloadTimeoutMs = (\d+);/u,
+    "release download timeout",
+  );
+  const releaseDownloadAttempts = numberFrom(
+    mcpSource,
+    /const releaseDownloadAttempts = (\d+);/u,
+    "release download attempts",
+  );
+  const localWaitFreshTimeoutMs = numberFrom(
+    mcpSource,
+    /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
+    "local wait-fresh timeout default",
+  );
+  const requiredTimeoutSec = Math.max(
+    Math.ceil((bootstrapTimeoutMs + 30000) / 1000),
+    Math.ceil((releaseDownloadTimeoutMs * releaseDownloadAttempts + localWaitFreshTimeoutMs) / 1000),
+  );
+  const claudeTimeouts = Object.values(hookConfig.hooks)
+    .flat()
+    .flatMap((entry) => entry.hooks)
+    .map((hook) => hook.timeout);
+  const copilotTimeouts = copilotHookConfig.hooks.sessionStart.map((hook) => hook.timeoutSec);
+
+  for (const timeoutSec of [...claudeTimeouts, ...copilotTimeouts]) {
+    assert.equal(typeof timeoutSec, "number");
+    assert.ok(
+      timeoutSec >= requiredTimeoutSec,
+      `hook timeout ${timeoutSec}s must cover managed bootstrap budget ${requiredTimeoutSec}s`,
+    );
+  }
+});
+
 async function withFakeCodeStoryCli(callback) {
   const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-test-"));
   const shPath = join(binDir, "codestory-cli");
