@@ -1163,7 +1163,7 @@ async function main() {
       CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
       CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
       CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: repairCommandForProject(process.cwd()),
+      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, process.cwd()),
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',

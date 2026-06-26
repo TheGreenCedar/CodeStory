@@ -335,6 +335,10 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.sidecarPolicy, "ask");
     assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
     assert.match(observed.sidecarEnable, /--policy-file/u);
+    assert.equal(
+      observed.sidecarRepair.startsWith(`${JSON.stringify(cliPath)} ready --goal agent --repair`),
+      true,
+    );
     assert.match(observed.sidecarRepair, /ready --goal agent --repair/u);
     assert.match(observed.sidecarRepair, /--run-id shared-agent/u);
     assert.equal(observed.dirtyMarkerRoot, await realpath(repoRoot));
