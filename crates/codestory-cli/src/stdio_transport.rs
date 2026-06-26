@@ -2210,6 +2210,12 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
             stdio_path_fingerprint(&layout.state_file)
         ),
         format!(
+            "repair_state:{}",
+            crate::ready_repair_status::ready_repair_status_cache_fingerprint(
+                &runtime.project_root
+            )
+        ),
+        format!(
             "source_state:{}",
             stdio_source_fingerprint(&runtime.project_root)
         ),
@@ -2704,6 +2710,14 @@ fn stdio_runtime_truth_status(
                 .get("degraded_reason")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
+            "namespace": readiness_lanes
+                .pointer("/agent_packet_search/namespace")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "phase": readiness_lanes
+                .pointer("/agent_packet_search/phase")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         },
         "readiness_lanes": {
             "local_graph": {
@@ -2740,6 +2754,16 @@ fn stdio_runtime_truth_sidecar_lane(lane: &serde_json::Value) -> serde_json::Val
             .cloned()
             .unwrap_or_else(|| serde_json::json!("unavailable")),
         "run_id": lane.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "namespace": lane.get("namespace").cloned().unwrap_or(serde_json::Value::Null),
+        "compose_project": lane
+            .get("compose_project")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "phase": lane.get("phase").cloned().unwrap_or(serde_json::Value::Null),
+        "repair_updated_at_epoch_ms": lane
+            .get("repair_updated_at_epoch_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "sidecar_mode": lane
             .get("sidecar_mode")
             .cloned()

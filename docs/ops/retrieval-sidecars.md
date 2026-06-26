@@ -54,6 +54,7 @@ from the source checkout, marketplace cache, or PATH when status is available.
 | State | Meaning | Operator action |
 |-------|---------|-----------------|
 | `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
+| `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
 | `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; run the repair command from preflight/status before packet/search claims |
 | `local_navigation=repair_local` | Core index or cache is missing or stale | Run `codestory-cli ready --goal local --repair --project <repo> --format json`, then rerun `doctor` |
 | `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Repair the failing sidecar layer, rerun `retrieval index --refresh full`, then rerun `retrieval status` |

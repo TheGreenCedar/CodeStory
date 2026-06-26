@@ -311,6 +311,7 @@ pub enum ReadinessGoalDto {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessStatusDto {
     Ready,
+    Repairing,
     RepairSetup,
     RepairIndex,
     CheckIndex,

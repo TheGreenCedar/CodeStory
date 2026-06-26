@@ -137,6 +137,7 @@ pub(crate) fn primary_non_ready(verdicts: &[ReadinessVerdictDto]) -> Option<&Rea
 pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
     match status {
         ReadinessStatusDto::Ready => "ready",
+        ReadinessStatusDto::Repairing => "repairing",
         ReadinessStatusDto::RepairSetup => "repair_setup",
         ReadinessStatusDto::RepairIndex => "repair_index",
         ReadinessStatusDto::CheckIndex => "check_index",
@@ -147,6 +148,7 @@ pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
 pub(crate) fn failed_layer(verdict: &ReadinessVerdictDto) -> Option<&'static str> {
     match verdict.status {
         ReadinessStatusDto::Ready => None,
+        ReadinessStatusDto::Repairing => Some("retrieval_sidecar"),
         ReadinessStatusDto::RepairSetup => Some("runtime_setup"),
         ReadinessStatusDto::RepairIndex => Some("local_index"),
         ReadinessStatusDto::CheckIndex => Some("index_freshness"),
@@ -174,7 +176,9 @@ pub(crate) fn local_refresh_state_label(state: LocalRefreshState) -> &'static st
 pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefreshOutput {
     let index = verdict.index.as_ref();
     let state = match verdict.status {
-        ReadinessStatusDto::Ready | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Fresh,
+        ReadinessStatusDto::Ready
+        | ReadinessStatusDto::Repairing
+        | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Fresh,
         ReadinessStatusDto::CheckIndex => LocalRefreshState::NotChecked,
         ReadinessStatusDto::RepairSetup => LocalRefreshState::Failed,
         ReadinessStatusDto::RepairIndex => {

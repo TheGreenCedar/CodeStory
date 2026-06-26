@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 struct StdioFixture {
@@ -23,6 +23,14 @@ struct StdioServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Drop for StdioServer {
@@ -682,6 +690,58 @@ fn json_resource_content(result: &Value, uri: &str) -> Value {
         .unwrap_or_else(|| panic!("resource {uri} content should include JSON text: {content}"));
     serde_json::from_str(text)
         .unwrap_or_else(|error| panic!("resource {uri} should be parseable JSON: {error}\n{text}"))
+}
+
+fn write_active_repair_status_fixture(
+    fixture: &StdioFixture,
+    run_id: &str,
+    phase: &str,
+) -> (PathBuf, RemoveDirOnDrop) {
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &canonical_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(run_id),
+    );
+    let status_path = sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-status.json");
+    let status_dir = status_path
+        .parent()
+        .expect("repair status parent")
+        .to_path_buf();
+    fs::create_dir_all(&status_dir).expect("create repair status dir");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64;
+    let project_root = canonical_root
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    fs::write(
+        &status_path,
+        json!({
+            "schema_version": 1,
+            "status": "repairing",
+            "project_root": project_root,
+            "profile": "agent",
+            "run_id": run_id,
+            "namespace": sidecar.namespace,
+            "compose_project": sidecar.compose_project,
+            "phase": phase,
+            "pid": 4242,
+            "started_at_epoch_ms": now,
+            "updated_at_epoch_ms": now
+        })
+        .to_string(),
+    )
+    .expect("write repair status fixture");
+    (status_path, RemoveDirOnDrop(status_dir))
 }
 
 fn continuation_uris_for(node_id: &str) -> Vec<String> {
@@ -2282,6 +2342,63 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             .and_then(Value::as_array)
             .is_some_and(|calls| !calls.is_empty()),
         "status should include recommended next calls: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_reports_active_agent_repair_phase() {
+    let fixture = indexed_fixture();
+    let (status_path, _cleanup) =
+        write_active_repair_status_fixture(&fixture, "issue-661-proof", "Qdrant finalize");
+    assert!(status_path.exists(), "repair status fixture should exist");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-repairing",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+
+    let result = assert_success_envelope(&response, json!("status-repairing"));
+    let status = json_resource_content(result, "codestory://status");
+    let agent_lane = &status["readiness_lanes"]["agent_packet_search"];
+    assert_eq!(agent_lane["status"], json!("repairing"), "{status}");
+    assert_eq!(agent_lane["profile"], json!("agent"), "{status}");
+    assert_eq!(agent_lane["run_id"], json!("issue-661-proof"), "{status}");
+    assert_eq!(agent_lane["phase"], json!("Qdrant finalize"), "{status}");
+    assert!(
+        agent_lane["namespace"]
+            .as_str()
+            .is_some_and(|namespace| namespace.contains("issue-661-proof")),
+        "repairing status should include the active namespace: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
+        json!("repairing"),
+        "{status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["phase"],
+        json!("Qdrant finalize"),
+        "{status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_status"]["phase"],
+        json!("Qdrant finalize"),
+        "{status}"
+    );
+    assert!(
+        agent_lane["next_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--profile agent")
+                && command.contains("--run-id")
+                && command.contains("issue-661-proof")),
+        "repairing lane should point at status proof, not a second repair: {status}"
     );
 }
 
