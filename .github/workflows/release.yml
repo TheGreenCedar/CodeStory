@@ -178,6 +178,8 @@ jobs:
 
       - name: Packaged full-sidecar agent proof
         if: matrix.asset_target == 'linux-x64'
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
         run: |
           python .github/scripts/check-packaged-agent-proof.py \
             --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
@@ -327,6 +329,8 @@ jobs:
           (cd target/post-publish-release-assets && sha256sum -c linux-x64.sha256)
 
       - name: Prove published agent runtime
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
         run: |
           set -euo pipefail
           python .github/scripts/check-packaged-agent-proof.py \
