@@ -10,15 +10,30 @@ use std::time::{Duration, SystemTime};
 pub const ZOEKT_REAL_VERSION_PIN: &str = "zoekt-20250506123554";
 
 /// Zoekt webserver image for `COMPOSE_PROFILES=real`.
-pub const ZOEKT_WEBSERVER_IMAGE_PIN: &str =
-    "sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4";
+pub const ZOEKT_WEBSERVER_IMAGE_PIN: &str = "sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff";
 
 /// Qdrant container image pin for local dev and CI smoke.
-pub const QDRANT_IMAGE_PIN: &str = "qdrant/qdrant:v1.12.5";
+pub const QDRANT_IMAGE_PIN: &str =
+    "qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae";
 
 /// llama.cpp server image for `COMPOSE_PROFILES=real` embed service (see `docker/retrieval-compose.yml`).
 #[allow(dead_code)]
-pub const LLAMACPP_SERVER_IMAGE_PIN: &str = "ghcr.io/ggml-org/llama.cpp:server";
+pub const LLAMACPP_SERVER_IMAGE_PIN: &str = "ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarImagePins {
+    pub qdrant: String,
+    pub zoekt: String,
+    pub embed: String,
+}
+
+pub fn default_sidecar_image_pins() -> SidecarImagePins {
+    SidecarImagePins {
+        qdrant: QDRANT_IMAGE_PIN.into(),
+        zoekt: ZOEKT_WEBSERVER_IMAGE_PIN.into(),
+        embed: LLAMACPP_SERVER_IMAGE_PIN.into(),
+    }
+}
 
 pub const DEFAULT_ZOEKT_HTTP_PORT: u16 = 6070;
 pub const DEFAULT_QDRANT_HTTP_PORT: u16 = 6333;

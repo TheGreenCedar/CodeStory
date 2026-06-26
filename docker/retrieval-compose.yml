@@ -10,7 +10,7 @@ name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}
 
 services:
   qdrant:
-    image: qdrant/qdrant:v1.12.5
+    image: qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae
     container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-qdrant
     restart: unless-stopped
     labels:
@@ -27,7 +27,7 @@ services:
 
   # Zoekt webserver (mount index dir populated by `retrieval index`).
   zoekt:
-    image: sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4
+    image: sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff
     container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-zoekt
     restart: unless-stopped
     labels:
@@ -44,7 +44,7 @@ services:
   # BAAI/bge-base-en-v1.5 embeddings via llama.cpp OpenAI-compatible API (768-dim).
   # Model GGUF must exist under CODESTORY_EMBED_MODEL_DIR (see setup-retrieval-env.mjs).
   embed:
-    image: ghcr.io/ggml-org/llama.cpp:server
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c
     container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-embed
     restart: unless-stopped
     labels:

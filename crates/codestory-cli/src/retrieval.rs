@@ -478,6 +478,12 @@ fn emit_retrieval_bootstrap(
             )
         })
         .unwrap_or_default();
+    let sidecar_images_note = format!(
+        "\n- sidecar_images: qdrant=`{}` zoekt=`{}` embed=`{}`",
+        payload.sidecar_state.sidecar_images.qdrant,
+        payload.sidecar_state.sidecar_images.zoekt,
+        payload.sidecar_state.sidecar_images.embed
+    );
     let markdown = format!(
         "# Retrieval bootstrap\n\n- compose_started: {}\n- zoekt_reachable: {} ({})\n- qdrant_reachable: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
         payload.compose_started,
@@ -513,7 +519,7 @@ fn emit_retrieval_bootstrap(
     emit(
         format,
         &payload,
-        format!("{markdown}{project_repair_note}"),
+        format!("{markdown}{sidecar_images_note}{project_repair_note}"),
         output_file,
     )
 }
@@ -574,8 +580,12 @@ fn emit_retrieval_status(
             )
         })
         .unwrap_or_default();
+    let sidecar_images_note = format!(
+        "- sidecar_images: qdrant=`{}` zoekt=`{}` embed=`{}`\n",
+        report.sidecar_images.qdrant, report.sidecar_images.zoekt, report.sidecar_images.embed
+    );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -596,6 +606,7 @@ fn emit_retrieval_status(
         manifest_contract_note,
         repair_note,
         ownership_note,
+        sidecar_images_note,
         report.zoekt.status,
         report.zoekt.detail,
         report.zoekt.capabilities.lexical,

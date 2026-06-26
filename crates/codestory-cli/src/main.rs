@@ -12590,6 +12590,7 @@ mod tests {
         codestory_retrieval::RetrievalStatusReport {
             retrieval_mode: mode.into(),
             ownership: None,
+            sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
             degraded_reason: reason.map(str::to_string),
             repair: None,
             query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),

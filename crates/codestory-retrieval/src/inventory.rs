@@ -870,6 +870,7 @@ mod tests {
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             embedding_launch: None,
+            sidecar_images: crate::config::default_sidecar_image_pins(),
             zoekt_data_dir: root.join("zoekt").display().to_string(),
             qdrant_data_dir: root.join("qdrant").display().to_string(),
             scip_artifacts_root: root.join("scip").display().to_string(),
