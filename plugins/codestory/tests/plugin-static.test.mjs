@@ -609,6 +609,7 @@ test("mcp launcher fails open when wait-fresh skips local refresh", async () => 
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "repair" } } }),
   ].join("\n") + "\n";
 
   try {
@@ -654,7 +655,7 @@ test("mcp launcher fails open when wait-fresh skips local refresh", async () => 
     assert.equal(result.status, 0, result.stderr);
     await assert.rejects(access(marker));
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 3, result.stdout);
+    assert.equal(responses.length, 4, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
     assert.equal(status.runtime_truth.runtime_source, "local_dev_override");
@@ -680,6 +681,9 @@ test("mcp launcher fails open when wait-fresh skips local refresh", async () => 
     assert.equal(responses[2].result.structuredContent.local_refresh.reason, "index_locked");
     assert.equal(responses[2].result.structuredContent.local_refresh.changed_file_count, 1);
     assert.equal(responses[2].result.structuredContent.local_refresh.fatal_error_count, 0);
+    assert.equal(responses[3].result.structuredContent.state, "enabled");
+    const policy = JSON.parse(await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"));
+    assert.equal(policy.state, "enabled");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -882,10 +886,17 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
     assert.equal(disable.status, 0, disable.stderr);
     assert.equal(JSON.parse(disable.stdout).state, "disabled");
 
+    const repair = spawnSync(process.execPath, [launcher, "sidecar-policy", "repair"], {
+      env: { PLUGIN_DATA: dataDir },
+      encoding: "utf8",
+    });
+    assert.equal(repair.status, 0, repair.stderr);
+    assert.equal(JSON.parse(repair.stdout).state, "enabled");
+
     const policy = JSON.parse(
       await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
     );
-    assert.equal(policy.state, "disabled");
+    assert.equal(policy.state, "enabled");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

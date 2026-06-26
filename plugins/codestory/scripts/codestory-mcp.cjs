@@ -105,6 +105,12 @@ function normalizeSidecarPolicyState(value) {
   return 'ask';
 }
 
+function sidecarPolicyStateForAction(action) {
+  if (action === 'enable' || action === 'repair') return 'enabled';
+  if (action === 'disable') return 'disabled';
+  return 'ask';
+}
+
 function readSidecarPolicy(file = sidecarPolicyPath()) {
   const policy = file ? readJson(file) : null;
   const state = normalizeSidecarPolicyState(process.env.CODESTORY_PLUGIN_SIDECAR_POLICY || policy?.state);
@@ -135,8 +141,8 @@ function handleSidecarPolicyCommand(argv) {
   const action = argv[3] || 'status';
   const policyFileFlag = argv.indexOf('--policy-file');
   const policyFile = policyFileFlag >= 0 ? argv[policyFileFlag + 1] : sidecarPolicyPath();
-  if (!['enable', 'disable', 'ask', 'status'].includes(action)) {
-    process.stderr.write('usage: codestory-mcp.cjs sidecar-policy [enable|disable|ask|status] [--policy-file PATH]\n');
+  if (!['enable', 'disable', 'ask', 'repair', 'status'].includes(action)) {
+    process.stderr.write('usage: codestory-mcp.cjs sidecar-policy [enable|disable|ask|repair|status] [--policy-file PATH]\n');
     process.exit(2);
   }
   if (policyFileFlag >= 0 && !policyFile) {
@@ -148,7 +154,7 @@ function handleSidecarPolicyCommand(argv) {
       process.stderr.write('sidecar-policy needs PLUGIN_DATA or --policy-file to remember the setting\n');
       process.exit(2);
     }
-    writeSidecarPolicy(action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'ask', {}, policyFile);
+    writeSidecarPolicy(sidecarPolicyStateForAction(action), {}, policyFile);
   }
   process.stdout.write(`${JSON.stringify(readSidecarPolicy(policyFile), null, 2)}\n`);
   process.exit(0);
@@ -1067,15 +1073,15 @@ function failOpenToolResult(status) {
 
 function failOpenSidecarSetupResult(request) {
   const action = request.params?.arguments?.action || 'status';
-  if (!['status', 'enable', 'disable', 'ask'].includes(action)) {
+  if (!['status', 'enable', 'disable', 'ask', 'repair'].includes(action)) {
     return {
       isError: true,
-      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, or ask while the runtime is in diagnostic mode.' }],
+      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, ask, or repair while the runtime is in diagnostic mode.' }],
       structuredContent: { code: 'invalid_sidecar_setup_action', action },
     };
   }
   if (action !== 'status') {
-    writeSidecarPolicy(action === 'enable' ? 'enabled' : action === 'disable' ? 'disabled' : 'ask');
+    writeSidecarPolicy(sidecarPolicyStateForAction(action));
   }
   const policy = readSidecarPolicy();
   return {
@@ -1102,7 +1108,7 @@ function runFailOpenMcp(status) {
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask'], default: 'status' },
+        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask', 'repair'], default: 'status' },
       },
       additionalProperties: false,
     },
