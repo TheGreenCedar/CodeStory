@@ -1121,14 +1121,19 @@ impl WorkspaceIndexer {
         }
 
         // 3.5 Resolve call/import edges post-pass
-        if had_edges {
+        let (resolution_scope_file_ids, expanded_resolution_scope_files) =
+            if plan.mode == codestory_workspace::BuildMode::Incremental {
+                let mut file_ids = Self::collect_touched_file_ids(&root, &plan.files_to_index);
+                let expanded = Self::extend_resolution_scope_for_matching_unresolved_targets(
+                    storage,
+                    &mut file_ids,
+                )?;
+                (file_ids, expanded)
+            } else {
+                (HashSet::new(), 0)
+            };
+        if had_edges || expanded_resolution_scope_files > 0 {
             let resolver = resolution::ResolutionPass::new();
-            let resolution_scope_file_ids =
-                if plan.mode == codestory_workspace::BuildMode::Incremental {
-                    Self::collect_touched_file_ids(&root, &plan.files_to_index)
-                } else {
-                    Default::default()
-                };
             let resolution_scope = if plan.mode == codestory_workspace::BuildMode::Incremental {
                 (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids)
             } else {
@@ -1322,6 +1327,109 @@ impl WorkspaceIndexer {
             }
         }
         file_ids
+    }
+
+    fn extend_resolution_scope_for_matching_unresolved_targets(
+        storage: &Storage,
+        scope_file_ids: &mut HashSet<i64>,
+    ) -> Result<usize> {
+        // New definitions can unblock old unresolved callers; keep the scope bounded
+        // to callers whose placeholder target names match names in touched files.
+        if scope_file_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = storage.get_connection();
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS incremental_resolution_touched_file_ids (
+                file_id INTEGER PRIMARY KEY
+             );
+             DELETE FROM incremental_resolution_touched_file_ids;
+             CREATE TEMP TABLE IF NOT EXISTS incremental_resolution_target_names (
+                name TEXT PRIMARY KEY
+             );
+             DELETE FROM incremental_resolution_target_names;",
+        )?;
+
+        {
+            let mut insert_touched = conn.prepare(
+                "INSERT OR IGNORE INTO incremental_resolution_touched_file_ids (file_id)
+                 VALUES (?1)",
+            )?;
+            for file_id in scope_file_ids.iter().copied() {
+                insert_touched.execute(rusqlite::params![file_id])?;
+            }
+        }
+
+        let definition_kind_values = incremental_resolution_target_node_kinds()
+            .iter()
+            .map(|kind| (*kind as i32).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let definition_name_query = format!(
+            "INSERT OR IGNORE INTO incremental_resolution_target_names (name)
+             SELECT DISTINCT name FROM (
+                 SELECT serialized_name AS name
+                 FROM node
+                 WHERE file_node_id IN (
+                     SELECT file_id FROM incremental_resolution_touched_file_ids
+                 )
+                   AND kind IN ({definition_kind_values})
+                 UNION
+                 SELECT qualified_name AS name
+                 FROM node
+                 WHERE file_node_id IN (
+                     SELECT file_id FROM incremental_resolution_touched_file_ids
+                 )
+                   AND kind IN ({definition_kind_values})
+             )
+             WHERE name IS NOT NULL AND name <> ''"
+        );
+        conn.execute(&definition_name_query, [])?;
+        let target_name_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM incremental_resolution_target_names",
+            [],
+            |row| row.get(0),
+        )?;
+        if target_name_count == 0 {
+            return Ok(0);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT COALESCE(caller.file_node_id, e.file_node_id) AS file_id
+             FROM edge e
+             JOIN node caller ON caller.id = e.source_node_id
+             JOIN node target ON target.id = e.target_node_id
+             JOIN incremental_resolution_target_names target_name
+               ON target_name.name = target.serialized_name
+               OR target_name.name = target.qualified_name
+             WHERE e.resolved_target_node_id IS NULL
+               AND e.kind IN (?1, ?2, ?3)
+               AND (e.kind != ?1 OR (e.confidence IS NULL AND e.certainty IS NULL))
+               AND COALESCE(caller.file_node_id, e.file_node_id) IS NOT NULL
+               AND (target.canonical_id IS NULL OR (
+                 target.canonical_id NOT LIKE 'tauri:command:%'
+                 AND target.canonical_id NOT LIKE 'openapi:endpoint:%'
+                 AND target.canonical_id NOT LIKE 'route_endpoint:%'
+                 AND target.canonical_id NOT LIKE 'payload:collection:%'
+               ))",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                EdgeKind::CALL as i32,
+                EdgeKind::IMPORT as i32,
+                EdgeKind::OVERRIDE as i32
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        let mut added = 0;
+        for row in rows {
+            if scope_file_ids.insert(row?) {
+                added += 1;
+            }
+        }
+        Ok(added)
     }
 
     fn normalize_index_path(root: &Path, path: &Path) -> PathBuf {
@@ -1762,6 +1870,28 @@ impl WorkspaceIndexer {
             symbol_table.insert(node.id.0, node.kind);
         }
     }
+}
+
+fn incremental_resolution_target_node_kinds() -> &'static [NodeKind] {
+    &[
+        NodeKind::MODULE,
+        NodeKind::NAMESPACE,
+        NodeKind::PACKAGE,
+        NodeKind::STRUCT,
+        NodeKind::CLASS,
+        NodeKind::INTERFACE,
+        NodeKind::ANNOTATION,
+        NodeKind::UNION,
+        NodeKind::ENUM,
+        NodeKind::TYPEDEF,
+        NodeKind::FUNCTION,
+        NodeKind::METHOD,
+        NodeKind::MACRO,
+        NodeKind::GLOBAL_VARIABLE,
+        NodeKind::FIELD,
+        NodeKind::CONSTANT,
+        NodeKind::ENUM_CONSTANT,
+    ]
 }
 
 fn file_modification_time(path: &Path) -> i64 {
