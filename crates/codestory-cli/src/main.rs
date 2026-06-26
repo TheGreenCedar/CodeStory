@@ -118,6 +118,7 @@ const CONTEXT_BUNDLE_OUTPUT_BYTE_CAP: usize = 5 * 1024 * 1024;
 const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
+const READY_REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
@@ -627,6 +628,102 @@ fn format_progress_bar(current: u32, total: u32) -> String {
         "[{}{}]",
         "#".repeat(filled as usize),
         "-".repeat(WIDTH.saturating_sub(filled) as usize)
+    )
+}
+
+struct ReadyRepairProgress {
+    profile: &'static str,
+    run_id: String,
+    namespace: String,
+    phase: Arc<Mutex<&'static str>>,
+    done: Arc<AtomicBool>,
+    start: Instant,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ReadyRepairProgress {
+    fn start(sidecar: &codestory_retrieval::SidecarRuntimeConfig) -> Self {
+        let phase = Arc::new(Mutex::new("starting"));
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let profile = sidecar.profile.as_str();
+        let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
+        let namespace = sidecar.namespace.clone();
+        let worker_phase = Arc::clone(&phase);
+        let worker_done = Arc::clone(&done);
+        let worker_run_id = run_id.clone();
+        let worker_namespace = namespace.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_done.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+                if start.elapsed() < READY_REPAIR_PROGRESS_INTERVAL {
+                    continue;
+                }
+                let elapsed = start.elapsed().as_secs();
+                if elapsed % READY_REPAIR_PROGRESS_INTERVAL.as_secs() != 0 {
+                    continue;
+                }
+                let phase = *worker_phase.lock().expect("ready repair phase lock");
+                eprintln!(
+                    "{}",
+                    ready_repair_progress_line(
+                        phase,
+                        profile,
+                        &worker_run_id,
+                        &worker_namespace,
+                        elapsed,
+                        "active"
+                    )
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+        Self {
+            profile,
+            run_id,
+            namespace,
+            phase,
+            done,
+            start,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_phase(&self, phase: &'static str) {
+        *self.phase.lock().expect("ready repair phase lock") = phase;
+        eprintln!(
+            "{}",
+            ready_repair_progress_line(
+                phase,
+                self.profile,
+                &self.run_id,
+                &self.namespace,
+                self.start.elapsed().as_secs(),
+                "started"
+            )
+        );
+    }
+}
+
+impl Drop for ReadyRepairProgress {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn ready_repair_progress_line(
+    phase: &str,
+    profile: &str,
+    run_id: &str,
+    namespace: &str,
+    elapsed_s: u64,
+    status: &str,
+) -> String {
+    format!(
+        "[ready-repair] phase=\"{phase}\" profile={profile} run_id={run_id} namespace={namespace} elapsed_s={elapsed_s} status={status}"
     )
 }
 
@@ -2195,13 +2292,15 @@ fn repair_ready_state(
         sidecar.namespace,
         sidecar.compose_project
     );
-    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime(
+    let progress = ReadyRepairProgress::start(&sidecar);
+    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
         &sidecar,
         Some(runtime.project_root.as_path()),
         &storage_scope,
         None,
         false,
         Duration::from_secs(90),
+        |phase| progress.set_phase(phase),
     )
     .context("ready repair retrieval bootstrap")?;
     let infrastructure = ready_repair_infrastructure_with_runtime_observation(
@@ -2211,24 +2310,31 @@ fn repair_ready_state(
         &sidecar,
     );
     ensure_ready_repair_embed_liveness(&infrastructure)?;
+    progress.set_phase("Qdrant finalize");
     codestory_retrieval::repair_project_qdrant_collection(
         &runtime.project_root,
         &runtime.storage_path,
     )
     .context("ready repair project qdrant repair")?;
+    progress.set_phase("graph artifact");
     runtime
         .index
         .run_indexing_blocking(IndexMode::Full)
         .map_err(map_api_error)
         .context("ready repair retrieval index refresh")?;
-    retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar).with_context(
-        || {
-            format!(
-                "ready repair retrieval index finalize using {}",
-                retrieval::format_sidecar_runtime(&sidecar)
-            )
-        },
-    )?;
+    codestory_retrieval::finalize_index_for_runtime_with_progress(
+        &runtime.project_root,
+        &runtime.storage_path,
+        &sidecar,
+        |phase| progress.set_phase(phase),
+    )
+    .with_context(|| {
+        format!(
+            "ready repair retrieval index finalize using {}",
+            retrieval::format_sidecar_runtime(&sidecar)
+        )
+    })?;
+    progress.set_phase("readiness check");
     let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -12369,6 +12475,26 @@ mod tests {
         let mut unknown_full = ready_repair_test_report("full", None);
         unknown_full.embedding_device_state = "unknown".into();
         assert!(!ready_repair_existing_sidecar_is_reusable(&unknown_full));
+    }
+
+    #[test]
+    fn ready_repair_progress_line_names_phase_identity_and_status() {
+        let line = ready_repair_progress_line(
+            "Qdrant finalize",
+            "agent",
+            "shared-agent",
+            "codestory-agent",
+            10,
+            "active",
+        );
+
+        assert!(line.starts_with("[ready-repair] "));
+        assert!(line.contains("phase=\"Qdrant finalize\""));
+        assert!(line.contains("profile=agent"));
+        assert!(line.contains("run_id=shared-agent"));
+        assert!(line.contains("namespace=codestory-agent"));
+        assert!(line.contains("elapsed_s=10"));
+        assert!(line.contains("status=active"));
     }
 
     #[test]

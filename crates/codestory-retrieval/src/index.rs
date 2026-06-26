@@ -191,6 +191,15 @@ pub fn finalize_index_for_runtime(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<FinalizeIndexOutcome> {
+    finalize_index_for_runtime_with_progress(project_root, storage_path, runtime, |_| {})
+}
+
+pub fn finalize_index_for_runtime_with_progress(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    mut progress: impl FnMut(&'static str),
+) -> Result<FinalizeIndexOutcome> {
     runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
@@ -371,15 +380,17 @@ pub fn finalize_index_for_runtime(
         }
     }
 
-    let zoekt_version = ensure_zoekt_generation(
-        project_root,
-        storage_path,
-        &layout,
-        &project_id,
-        &generation,
-        zoekt_probe.reachable,
-        zoekt_ready,
-    )?;
+    let zoekt_version = with_finalize_progress(&mut progress, "lexical sidecar", || {
+        ensure_zoekt_generation(
+            project_root,
+            storage_path,
+            &layout,
+            &project_id,
+            &generation,
+            zoekt_probe.reachable,
+            zoekt_ready,
+        )
+    })?;
 
     let _qdrant_point_count = ensure_qdrant_collection(
         storage_path,
@@ -389,38 +400,52 @@ pub fn finalize_index_for_runtime(
         &collection,
         sidecar_input.projection_count,
         qdrant_ready_points,
+        &mut progress,
     )?;
 
-    ensure_scip_artifacts(
-        storage_path,
-        &scip_dir,
-        &project_id,
-        &generation,
-        scip_ready,
-        &mut manifest,
-    )?;
+    with_finalize_progress(&mut progress, "graph artifact", || {
+        ensure_scip_artifacts(
+            storage_path,
+            &scip_dir,
+            &project_id,
+            &generation,
+            scip_ready,
+            &mut manifest,
+        )
+    })?;
     update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
 
     manifest.zoekt_version = zoekt_version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &scip_dir);
 
-    finalize_manifest_after_health_check(
-        storage_path,
-        &layout,
-        &qdrant_client,
-        project_id,
-        &collection,
-        &sidecar_input,
-        manifest,
-        degraded_modes,
-        SidecarStubFlags {
-            zoekt_stubbed,
-            qdrant_stubbed,
-            scip_stubbed,
-        },
-        &embedding_device,
-    )
+    with_finalize_progress(&mut progress, "manifest write", || {
+        finalize_manifest_after_health_check(
+            storage_path,
+            &layout,
+            &qdrant_client,
+            project_id,
+            &collection,
+            &sidecar_input,
+            manifest,
+            degraded_modes,
+            SidecarStubFlags {
+                zoekt_stubbed,
+                qdrant_stubbed,
+                scip_stubbed,
+            },
+            &embedding_device,
+        )
+    })
+}
+
+fn with_finalize_progress<T>(
+    progress: &mut impl FnMut(&'static str),
+    phase: &'static str,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    progress(phase);
+    action()
 }
 
 fn ensure_zoekt_generation(
@@ -467,6 +492,7 @@ fn ensure_qdrant_collection(
     collection: &str,
     projection_count: i64,
     mut qdrant_ready_points: Option<u64>,
+    progress: &mut impl FnMut(&'static str),
 ) -> Result<u64> {
     if projection_count == 0 {
         info!(
@@ -491,8 +517,9 @@ fn ensure_qdrant_collection(
             "Qdrant generated collection reused"
         );
     } else {
-        let count =
-            upsert_qdrant_points_from_store(storage_path, project_root, qdrant_client, collection)?;
+        let count = with_finalize_progress(progress, "embeddings", || {
+            upsert_qdrant_points_from_store(storage_path, project_root, qdrant_client, collection)
+        })?;
         if count == 0 {
             bail!(
                 "mandatory Qdrant semantic collection has no indexed symbol points for {project_id}"
@@ -517,7 +544,9 @@ fn ensure_qdrant_collection(
             "Qdrant collection ensured and populated"
         );
     }
-    ensure_qdrant_semantic_smoke(project_id, collection, qdrant_client)?;
+    with_finalize_progress(progress, "Qdrant finalize", || {
+        ensure_qdrant_semantic_smoke(project_id, collection, qdrant_client)
+    })?;
     Ok(qdrant_ready_points.unwrap_or_default())
 }
 
@@ -1181,6 +1210,25 @@ mod tests {
             error.to_string().contains("mandatory"),
             "expected mandatory-sidecar error, got {error:#}"
         );
+    }
+
+    #[test]
+    fn finalize_progress_is_emitted_before_blocking_work() {
+        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let progress_phases = std::rc::Rc::clone(&phases);
+        let action_phases = std::rc::Rc::clone(&phases);
+
+        with_finalize_progress(
+            &mut |phase| progress_phases.borrow_mut().push(phase),
+            "lexical sidecar",
+            || {
+                assert_eq!(&*action_phases.borrow(), &["lexical sidecar"]);
+                Ok(())
+            },
+        )
+        .expect("progress wrapper should return action result");
+
+        assert_eq!(&*phases.borrow(), &["lexical sidecar"]);
     }
 
     #[test]
