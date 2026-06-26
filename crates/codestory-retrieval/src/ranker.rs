@@ -62,7 +62,7 @@ pub fn rank_candidates(
         if prefer_primary_code && symbol_name_looks_test_like(candidate.symbol_name.as_deref()) {
             candidate.score *= 0.55;
         }
-        candidate.rank_features = Some(rank_features);
+        candidate.rank_features = Some(export_rank_features(candidate, rank_features));
     }
 
     apply_exact_code_evidence_anchor(features, &query_tokens, &mut candidates);
@@ -151,19 +151,28 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let lexical = match candidate.source {
-        CandidateSource::Zoekt => candidate.score.max(0.35),
-        CandidateSource::Legacy => candidate.score * 0.5,
-        _ => candidate.score * 0.6,
+    let has_lexical = matches!(candidate.source, CandidateSource::Zoekt)
+        || candidate_has_provenance(candidate, "lexical_source");
+    let has_semantic = matches!(candidate.source, CandidateSource::Qdrant)
+        || candidate_has_provenance(candidate, "dense_anchor")
+        || candidate_has_provenance(candidate, "component_report");
+    let has_graph = candidate_has_graph_provenance(candidate);
+
+    let lexical = if matches!(candidate.source, CandidateSource::Legacy) {
+        candidate.score * 0.5
+    } else if has_lexical {
+        candidate.score.max(0.35)
+    } else {
+        candidate.score * 0.6
     };
 
-    let semantic = if candidate.source == CandidateSource::Qdrant {
+    let semantic = if has_semantic {
         candidate.score.max(0.4)
     } else {
         candidate.score * 0.25
     };
 
-    let scip_distance = if candidate.source == CandidateSource::Scip {
+    let scip_distance = if has_graph {
         1.0 / (1.0 + candidate.scip_hop_distance.unwrap_or(0) as f32)
     } else {
         0.2
@@ -187,6 +196,13 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
     }
 }
 
+fn export_rank_features(candidate: &CandidateHit, mut features: RankFeatures) -> RankFeatures {
+    if !candidate_has_graph_provenance(candidate) {
+        features.scip_distance = 0.0;
+    }
+    features
+}
+
 fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
     weights.lexical * features.lexical
         + weights.semantic * features.semantic
@@ -194,6 +210,19 @@ fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
         + weights.file_role_prior * features.file_role_prior
         + weights.definition_quality * features.definition_quality
         + weights.token_overlap * features.token_overlap
+}
+
+fn candidate_has_graph_provenance(candidate: &CandidateHit) -> bool {
+    matches!(candidate.source, CandidateSource::Scip)
+        || candidate_has_provenance(candidate, "graph_neighbor")
+        || candidate_has_provenance(candidate, "exact")
+}
+
+fn candidate_has_provenance(candidate: &CandidateHit, label: &str) -> bool {
+    candidate
+        .provenance
+        .iter()
+        .any(|candidate_label| candidate_label == label)
 }
 
 fn file_role_prior(file_role: FileRole) -> f32 {
@@ -575,6 +604,33 @@ mod tests {
     }
 
     #[test]
+    fn ranker_exports_zero_graph_feature_without_graph_provenance() {
+        let features = classify_query("explain service startup");
+        let lexical = CandidateHit::lexical_stub("src/service.rs", 0.8);
+        let dense = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.9,
+            CandidateSource::Qdrant,
+        );
+
+        let ranked = rank_candidates(&features, vec![lexical, dense]);
+
+        for candidate in ranked {
+            assert_eq!(
+                candidate
+                    .rank_features
+                    .as_ref()
+                    .expect("rank features")
+                    .scip_distance,
+                0.0,
+                "{} should not export graph evidence",
+                candidate.file_path
+            );
+        }
+    }
+
+    #[test]
     fn ranker_prefers_entrypoint_role_over_test_role() {
         let features = classify_query("main startup entrypoint");
         let mut test_hit = CandidateHit::lexical_stub("src/main_test.rs", 0.94);
@@ -825,5 +881,29 @@ mod tests {
             }),
             "direct lexical source evidence should stay inside the resolved top-5 window: {ranked:#?}"
         );
+    }
+
+    #[test]
+    fn ranker_fuses_duplicate_lane_provenance_into_rank_features() {
+        let features = classify_query("how does service startup flow");
+        let mut fused = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.85,
+            CandidateSource::Zoekt,
+        );
+        fused.provenance = vec![
+            "lexical_source".into(),
+            "dense_anchor".into(),
+            "graph_neighbor".into(),
+        ];
+        fused.scip_hop_distance = Some(1);
+
+        let ranked = rank_candidates(&features, vec![fused]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
+        assert_eq!(rank_features.lexical, 0.85);
+        assert_eq!(rank_features.semantic, 0.85);
+        assert_eq!(rank_features.scip_distance, 0.5);
     }
 }

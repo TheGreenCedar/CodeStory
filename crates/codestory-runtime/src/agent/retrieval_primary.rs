@@ -1431,12 +1431,16 @@ fn resolve_sidecar_candidates_with_stats(
 
 fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
     let provenance = candidate_provenance_labels(candidate);
-    let (lexical, semantic, graph) = match candidate.source {
-        CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
-        CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
-        CandidateSource::Scip => (0.0, 0.0, candidate.score),
-        CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
-    };
+    let (lexical, semantic, graph) = candidate
+        .rank_features
+        .as_ref()
+        .map(|features| (features.lexical, features.semantic, features.scip_distance))
+        .unwrap_or_else(|| match candidate.source {
+            CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+            CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
+            CandidateSource::Scip => (0.0, 0.0, candidate.score),
+            CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
+        });
     RetrievalScoreBreakdownDto {
         lexical,
         semantic,
@@ -1466,13 +1470,39 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::packet_evidence::PacketEvidenceTier;
+    use codestory_contracts::api::{NodeId, NodeKind as ApiNodeKind, SearchHitOrigin};
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
-        project_id_for_root, test_support::retrieval_manifest_fixture,
+        project_id_for_root, rank_candidates, test_support::retrieval_manifest_fixture,
     };
 
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::process_env_test_lock()
+    }
+
+    fn search_hit_for_candidate(candidate: &CandidateHit) -> SearchHit {
+        SearchHit {
+            node_id: NodeId("candidate".to_string()),
+            display_name: candidate
+                .symbol_name
+                .clone()
+                .unwrap_or_else(|| candidate.file_path.clone()),
+            kind: ApiNodeKind::FUNCTION,
+            file_path: Some(candidate.file_path.clone()),
+            line: candidate.start_line,
+            score: candidate.score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            score_breakdown: Some(score_breakdown_for_candidate(candidate)),
+        }
     }
 
     #[test]
@@ -1723,6 +1753,83 @@ mod tests {
         assert_eq!(shadow.stage_timings[0].stage, "stage1_zoekt_lexical");
         assert_eq!(shadow.candidates.len(), 2);
         assert_eq!(shadow.would_rank, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn score_breakdown_reports_fused_rank_features_and_provenance() {
+        let mut candidate = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.91,
+            CandidateSource::Zoekt,
+        );
+        candidate.provenance = vec![
+            "lexical_source".into(),
+            "dense_anchor".into(),
+            "graph_neighbor".into(),
+        ];
+        candidate.rank_features = Some(codestory_retrieval::RankFeatures {
+            lexical: 0.91,
+            semantic: 0.82,
+            scip_distance: 0.5,
+            file_role_prior: 0.72,
+            definition_quality: 0.85,
+            token_overlap: 0.25,
+        });
+
+        let breakdown = score_breakdown_for_candidate(&candidate);
+
+        assert_eq!(breakdown.lexical, 0.91);
+        assert_eq!(breakdown.semantic, 0.82);
+        assert_eq!(breakdown.graph, 0.5);
+        assert_eq!(
+            breakdown.provenance,
+            vec![
+                "lexical_source".to_string(),
+                "dense_anchor".to_string(),
+                "graph_neighbor".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn score_breakdown_does_not_export_graph_for_pure_lexical_candidate() {
+        let mut candidate = CandidateHit::with_source(
+            "src/service.rs",
+            Some("Service".into()),
+            0.78,
+            CandidateSource::Zoekt,
+        );
+        candidate.provenance = vec!["lexical_source".into()];
+        let ranked = rank_candidates(&classify_query("explain service startup"), vec![candidate]);
+        let candidate = ranked.first().expect("ranked candidate");
+
+        let breakdown = score_breakdown_for_candidate(candidate);
+        let mut hit = search_hit_for_candidate(candidate);
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(breakdown.graph, 0.0);
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::LexicalSource));
+    }
+
+    #[test]
+    fn score_breakdown_does_not_export_graph_for_pure_dense_candidate() {
+        let mut candidate = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.86,
+            CandidateSource::Qdrant,
+        );
+        candidate.provenance = vec!["dense_anchor".into()];
+        let ranked = rank_candidates(&classify_query("explain search service"), vec![candidate]);
+        let candidate = ranked.first().expect("ranked candidate");
+
+        let breakdown = score_breakdown_for_candidate(candidate);
+        let mut hit = search_hit_for_candidate(candidate);
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(breakdown.graph, 0.0);
+        assert_ne!(hit.evidence_tier, Some(PacketEvidenceTier::ResolvedGraph));
     }
 
     #[test]
