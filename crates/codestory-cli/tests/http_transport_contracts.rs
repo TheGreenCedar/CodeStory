@@ -173,6 +173,38 @@ fn free_local_addr() -> String {
     addr.to_string()
 }
 
+#[test]
+fn http_serve_rejects_non_loopback_addr_before_opening_runtime_state() {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_deep_rust_workspace(workspace.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .arg("serve")
+        .arg("--refresh")
+        .arg("none")
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path())
+        .arg("--addr")
+        .arg("0.0.0.0:0")
+        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .output()
+        .expect("run serve");
+    assert!(
+        !output.status.success(),
+        "non-loopback serve should be rejected without an acknowledgement flag"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--allow-non-loopback")
+            && stderr.contains("without request authentication")
+            && !stderr.contains("index not ready"),
+        "serve should fail at the bind guard before opening cache/index state:\n{stderr}"
+    );
+}
+
 fn spawn_http_server(fixture: &HttpFixture) -> (HttpServer, String) {
     let addr = free_local_addr();
     let child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
@@ -218,11 +250,20 @@ struct HttpResponse {
 }
 
 fn http_get(addr: &str, target: &str) -> std::io::Result<HttpResponse> {
+    http_get_with_headers(addr, target, &[("Host", addr)])
+}
+
+fn http_get_with_headers(
+    addr: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> std::io::Result<HttpResponse> {
     let mut stream = TcpStream::connect(addr)?;
-    write!(
-        stream,
-        "GET {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )?;
+    write!(stream, "GET {target} HTTP/1.1\r\n")?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")?;
     stream.flush()?;
     stream.shutdown(Shutdown::Write)?;
 
@@ -255,6 +296,82 @@ fn http_get(addr: &str, target: &str) -> std::io::Result<HttpResponse> {
     let body = serde_json::from_str(body.trim())
         .unwrap_or_else(|error| panic!("HTTP body should be JSON: {error}\n{body}"));
     Ok(HttpResponse { status, body })
+}
+
+#[test]
+fn http_serve_rejects_non_loopback_host_and_origin_headers() {
+    let fixture = indexed_fixture();
+    let (_server, addr) = spawn_http_server(&fixture);
+
+    let bad_host = http_get_with_headers(&addr, "/health", &[("Host", "evil.test:3917")])
+        .expect("bad host response");
+    assert_eq!(bad_host.status, 403);
+    assert_eq!(
+        bad_host.body.pointer("/error/code").and_then(Value::as_str),
+        Some("forbidden_http_boundary"),
+        "non-loopback Host should fail closed: {}",
+        bad_host.body
+    );
+
+    let bad_origin = http_get_with_headers(
+        &addr,
+        "/health",
+        &[("Host", &addr), ("Origin", "http://evil.test:3917")],
+    )
+    .expect("bad origin response");
+    assert_eq!(bad_origin.status, 403);
+    assert_eq!(
+        bad_origin
+            .body
+            .pointer("/error/code")
+            .and_then(Value::as_str),
+        Some("forbidden_http_boundary"),
+        "non-loopback Origin should fail closed: {}",
+        bad_origin.body
+    );
+
+    let malformed_ipv6_host =
+        http_get_with_headers(&addr, "/health", &[("Host", "[::1]evil.test:3917")])
+            .expect("malformed ipv6 host response");
+    assert_eq!(
+        malformed_ipv6_host.status, 403,
+        "malformed bracketed Host should fail closed: {}",
+        malformed_ipv6_host.body
+    );
+
+    let malformed_ipv6_origin = http_get_with_headers(
+        &addr,
+        "/health",
+        &[("Host", &addr), ("Origin", "http://[::1]evil.test:3917")],
+    )
+    .expect("malformed ipv6 origin response");
+    assert_eq!(
+        malformed_ipv6_origin.status, 403,
+        "malformed bracketed Origin should fail closed: {}",
+        malformed_ipv6_origin.body
+    );
+
+    for host in ["localhost:3917", "[::1]:3917"] {
+        let response = http_get_with_headers(&addr, "/health", &[("Host", host)])
+            .unwrap_or_else(|error| panic!("loopback Host {host}: {error}"));
+        assert_eq!(
+            response.status, 200,
+            "loopback Host {host} should stay allowed: {}",
+            response.body
+        );
+    }
+
+    let loopback_origin = http_get_with_headers(
+        &addr,
+        "/health",
+        &[("Host", &addr), ("Origin", "http://localhost:3917")],
+    )
+    .expect("loopback origin response");
+    assert_eq!(
+        loopback_origin.status, 200,
+        "loopback Origin should stay allowed: {}",
+        loopback_origin.body
+    );
 }
 
 fn get_json(addr: &str, target: &str) -> Value {

@@ -1526,6 +1526,11 @@ pub(crate) struct ServeCommand {
     pub(crate) addr: String,
     #[arg(
         long,
+        help = "Allow HTTP serve to bind and answer non-loopback addresses. Use only behind an intentional network boundary."
+    )]
+    pub(crate) allow_non_loopback: bool,
+    #[arg(
+        long,
         help = "Serve a small MCP-style JSON-lines protocol over stdio instead of HTTP."
     )]
     pub(crate) stdio: bool,
