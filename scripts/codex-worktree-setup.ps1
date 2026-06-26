@@ -154,6 +154,9 @@ function Get-RemoteHeadRefName {
     if ($Ref -match "^refs/heads/(.+)$") {
         return $Ref
     }
+    if ($Ref -notmatch "^refs/" -and $Ref -notmatch "^[0-9a-fA-F]{40}$") {
+        return "refs/heads/$Ref"
+    }
 
     return $null
 }
@@ -523,6 +526,7 @@ function Invoke-SelfTest {
         $resolvedCli = Find-CodeStoryCli $projectRoot
         Assert-SelfTest (Same-Path $resolvedCli $currentCli) "stale default install should be rejected and versioned current install should be used"
         Assert-SelfTest ((Get-RemoteHeadRefName "origin/dev/codestory-next") -eq "refs/heads/dev/codestory-next") "origin branch refs should map to ls-remote heads"
+        Assert-SelfTest ((Get-RemoteHeadRefName "codex/issue-670-handoff-proof-target") -eq "refs/heads/codex/issue-670-handoff-proof-target") "plain branch refs should map to ls-remote heads"
         Assert-SelfTest ((Get-ProofTarget "origin/dev/codestory-next" "origin/pr-branch" $false) -eq "base:origin/dev/codestory-next + pr-head:origin/pr-branch") "PR proof target should default to base plus PR head"
         Assert-SelfTest ((Get-ProofTarget "origin/dev/codestory-next" "origin/pr-branch" $true) -eq "branch-head:origin/pr-branch") "branch-head proof should be explicit"
     } finally {
