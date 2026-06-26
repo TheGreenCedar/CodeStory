@@ -34,7 +34,7 @@ use std::{
     fs,
     io::{IsTerminal, Read},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -52,6 +52,7 @@ mod managed_embeddings;
 mod output;
 mod query_resolution;
 mod readiness;
+mod ready_repair_status;
 mod report;
 mod retrieval;
 mod runtime;
@@ -635,24 +636,40 @@ struct ReadyRepairProgress {
     profile: &'static str,
     run_id: String,
     namespace: String,
+    project_root: PathBuf,
     phase: Arc<Mutex<&'static str>>,
     done: Arc<AtomicBool>,
     start: Instant,
+    started_at_epoch_ms: i64,
+    pid: u32,
+    sidecar: codestory_retrieval::SidecarRuntimeConfig,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ReadyRepairProgress {
-    fn start(sidecar: &codestory_retrieval::SidecarRuntimeConfig) -> Self {
+    fn start(sidecar: &codestory_retrieval::SidecarRuntimeConfig, project_root: &Path) -> Self {
         let phase = Arc::new(Mutex::new("starting"));
         let done = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
+        let started_at_epoch_ms = ready_repair_status::now_epoch_ms();
+        let pid = std::process::id();
         let profile = sidecar.profile.as_str();
         let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
         let namespace = sidecar.namespace.clone();
+        let project_root = project_root.to_path_buf();
+        let sidecar_for_worker = sidecar.clone();
         let worker_phase = Arc::clone(&phase);
         let worker_done = Arc::clone(&done);
         let worker_run_id = run_id.clone();
         let worker_namespace = namespace.clone();
+        let worker_project_root = project_root.clone();
+        let _ = ready_repair_status::write_ready_repair_status(
+            sidecar,
+            &project_root,
+            "starting",
+            started_at_epoch_ms,
+            pid,
+        );
         let handle = std::thread::spawn(move || {
             while !worker_done.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(100));
@@ -675,6 +692,13 @@ impl ReadyRepairProgress {
                         "active"
                     )
                 );
+                let _ = ready_repair_status::write_ready_repair_status(
+                    &sidecar_for_worker,
+                    &worker_project_root,
+                    phase,
+                    started_at_epoch_ms,
+                    pid,
+                );
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
@@ -682,9 +706,13 @@ impl ReadyRepairProgress {
             profile,
             run_id,
             namespace,
+            project_root,
             phase,
             done,
             start,
+            started_at_epoch_ms,
+            pid,
+            sidecar: sidecar.clone(),
             handle: Some(handle),
         }
     }
@@ -702,6 +730,13 @@ impl ReadyRepairProgress {
                 "started"
             )
         );
+        let _ = ready_repair_status::write_ready_repair_status(
+            &self.sidecar,
+            &self.project_root,
+            phase,
+            self.started_at_epoch_ms,
+            self.pid,
+        );
     }
 }
 
@@ -711,6 +746,11 @@ impl Drop for ReadyRepairProgress {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        ready_repair_status::clear_ready_repair_status(
+            &self.sidecar,
+            self.started_at_epoch_ms,
+            self.pid,
+        );
     }
 }
 
@@ -2292,7 +2332,7 @@ fn repair_ready_state(
         sidecar.namespace,
         sidecar.compose_project
     );
-    let progress = ReadyRepairProgress::start(&sidecar);
+    let progress = ReadyRepairProgress::start(&sidecar, &runtime.project_root);
     let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
         &sidecar,
         Some(runtime.project_root.as_path()),
@@ -10722,6 +10762,12 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
+    apply_ready_repair_status_overlay(
+        &mut lanes,
+        &runtime.project_root,
+        agent_run_id,
+        &project_arg,
+    );
     lanes
 }
 
@@ -10750,10 +10796,40 @@ fn readiness_lane_output(
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
         run_id: sidecar.run_id.clone(),
+        namespace: None,
+        compose_project: None,
+        phase: None,
+        repair_updated_at_epoch_ms: None,
         sidecar_mode: sidecar.retrieval_mode.clone(),
         degraded_reason: sidecar.degraded_reason.clone(),
         next_command: lane_next_command(lane, sidecar, status, verdict, project_arg),
     }
+}
+
+fn apply_ready_repair_status_overlay(
+    lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
+    project_root: &Path,
+    agent_run_id: Option<&str>,
+    project_arg: &str,
+) {
+    let Some(status) = ready_repair_status::active_ready_repair_status(project_root, agent_run_id)
+    else {
+        return;
+    };
+    let Some(lane) = lanes.get_mut("agent_packet_search") else {
+        return;
+    };
+    lane.status = ReadinessStatusDto::Repairing;
+    lane.profile = status.profile;
+    lane.run_id = status.run_id.clone();
+    lane.namespace = Some(status.namespace);
+    lane.compose_project = Some(status.compose_project);
+    lane.phase = Some(status.phase);
+    lane.repair_updated_at_epoch_ms = Some(status.updated_at_epoch_ms);
+    lane.next_command = Some(retrieval_status_command_for_agent(
+        project_arg,
+        status.run_id.as_deref(),
+    ));
 }
 
 fn readiness_lane_status(
@@ -10807,6 +10883,17 @@ fn agent_ready_repair_command(project_arg: &str, run_id: Option<&str>) -> String
         command.push_str(" --run-id ");
         command.push_str(&display::quote_command_argument_value(run_id));
     }
+    command
+}
+
+fn retrieval_status_command_for_agent(project_arg: &str, run_id: Option<&str>) -> String {
+    let mut command =
+        format!("codestory-cli retrieval status --project {project_arg} --profile agent");
+    if let Some(run_id) = run_id {
+        command.push_str(" --run-id ");
+        command.push_str(&display::quote_command_argument_value(run_id));
+    }
+    command.push_str(" --format json");
     command
 }
 

@@ -1603,6 +1603,14 @@ pub(crate) struct ReadinessLaneOutput {
     pub(crate) profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repair_updated_at_epoch_ms: Option<i64>,
     pub(crate) sidecar_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
