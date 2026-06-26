@@ -937,6 +937,104 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   }
 });
 
+test("release asset downloader retries a transient failure", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { PassThrough } = await import("node:stream");
+  const launcher = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"));
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-retry-"));
+  const destination = join(dataDir, "SHA256SUMS.txt");
+  let calls = 0;
+
+  const fakeGet = (_url, onResponse) => {
+    calls += 1;
+    const request = new EventEmitter();
+    request.setTimeout = () => request;
+    request.destroy = (error) => {
+      process.nextTick(() => request.emit("error", error));
+      return request;
+    };
+    process.nextTick(() => {
+      if (calls === 1) {
+        request.emit("error", new Error("synthetic network reset"));
+        return;
+      }
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = {};
+      onResponse(response);
+      response.end("checksum fixture\n");
+    });
+    return request;
+  };
+
+  try {
+    await launcher._test.downloadFile("https://example.invalid/SHA256SUMS.txt", destination, {
+      attempts: 2,
+      get: fakeGet,
+      retryDelayMs: () => 1,
+      timeoutMs: 100,
+    });
+
+    assert.equal(calls, 2);
+    assert.equal(await readFile(destination, "utf8"), "checksum fixture\n");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher keeps managed provision failures primary without PATH", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-fail-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-empty-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  }) + "\n";
+
+  try {
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        PLUGIN_DATA: dataDir,
+        PATH: "",
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    const status = JSON.parse(response.result.contents[0].text);
+    assert.match(
+      status.degraded_reason,
+      /^managed_cli_provision_failed:managed_cli_asset_fetch_failed:SHA256SUMS\.txt:elapsed_ms=\d+:attempts=1:retry=restart_reload_status:/u,
+    );
+    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
+    assert.deepEqual(status.path_candidates, []);
+    assert.equal(
+      status.plugin_runtime.warnings.includes("managed_cli_unavailable_no_path_fallback"),
+      true,
+    );
+    assert.match(status.readiness[0].minimum_next[0], /^Restart\/reload/u);
+    assert.equal(
+      status.readiness[0].minimum_next.some((step) => {
+        return /where\.exe codestory-cli|command -v codestory-cli|codestory-cli --version/u.test(step);
+      }),
+      false,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
 test("session-start hooks are thin and host manifests point at them", async () => {
   const hookConfig = JSON.parse(
     await readFile(join(pluginRoot, "hooks", "claude-codex-hooks.json"), "utf8"),

@@ -15,6 +15,9 @@ const fallbackBinaryNames = process.platform === 'win32'
   ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
   : ['codestory-cli'];
 const sharedAgentRunId = 'shared-agent';
+const releaseDownloadTimeoutMs = 60000;
+const releaseDownloadAttempts = 3;
+const releaseDownloadRetryDelaysMs = [1000, 3000];
 
 function readJson(file) {
   try {
@@ -230,12 +233,25 @@ function copyLocalReleaseFile(releaseDir, name, destination) {
   fs.copyFileSync(path.join(releaseDir, name), destination);
 }
 
-function downloadFile(url, destination) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function downloadFileOnce(url, destination, options = {}) {
+  const timeoutMs = options.timeoutMs || releaseDownloadTimeoutMs;
+  const redirectsRemaining = options.redirectsRemaining ?? 5;
+  const get = options.get || https.get;
   return new Promise((resolve, reject) => {
-    const request = https.get(url, (response) => {
+    const request = get(url, (response) => {
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         response.resume();
-        downloadFile(response.headers.location, destination).then(resolve, reject);
+        if (!response.headers.location || redirectsRemaining <= 0) {
+          reject(new Error(`download redirect failed: ${url}`));
+          return;
+        }
+        const nextUrl = new URL(response.headers.location, url).toString();
+        downloadFileOnce(nextUrl, destination, { ...options, redirectsRemaining: redirectsRemaining - 1 })
+          .then(resolve, reject);
         return;
       }
       if (response.statusCode !== 200) {
@@ -248,20 +264,58 @@ function downloadFile(url, destination) {
       output.on('finish', () => output.close(resolve));
       output.on('error', reject);
     });
-    request.setTimeout(15000, () => request.destroy(new Error(`download timed out: ${url}`)));
+    request.setTimeout(timeoutMs, () => request.destroy(new Error(`download timed out after ${timeoutMs}ms: ${url}`)));
     request.on('error', reject);
   });
 }
 
+async function downloadFile(url, destination, options = {}) {
+  const attempts = options.attempts || releaseDownloadAttempts;
+  const startedAt = Date.now();
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      await downloadFileOnce(url, destination, options);
+      return;
+    } catch (error) {
+      lastError = error;
+      fs.rmSync(destination, { force: true });
+      if (attempt < attempts) {
+        const delayMs = options.retryDelayMs
+          ? options.retryDelayMs(attempt)
+          : releaseDownloadRetryDelaysMs[attempt - 1] ||
+            releaseDownloadRetryDelaysMs[releaseDownloadRetryDelaysMs.length - 1];
+        if (delayMs > 0) await sleep(delayMs);
+      }
+    }
+  }
+  const elapsedMs = Date.now() - startedAt;
+  throw new Error(`download failed after ${attempts} attempts over ${elapsedMs}ms: ${lastError?.message || 'unknown error'}`);
+}
+
+function releaseAssetFetchFailure(name, startedAt, attempts, error) {
+  const elapsedMs = Date.now() - startedAt;
+  return `managed_cli_asset_fetch_failed:${name}:elapsed_ms=${elapsedMs}:attempts=${attempts}:retry=restart_reload_status:last_error=${error.message}`;
+}
+
 async function fetchReleaseFile(version, name, destination) {
+  const startedAt = Date.now();
   if (process.env.CODESTORY_PLUGIN_RELEASE_DIR) {
-    copyLocalReleaseFile(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name, destination);
+    try {
+      copyLocalReleaseFile(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name, destination);
+    } catch (error) {
+      throw new Error(releaseAssetFetchFailure(name, startedAt, 1, error));
+    }
     return `file://${path.join(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name)}`;
   }
   const baseUrl = process.env.CODESTORY_PLUGIN_RELEASE_BASE_URL ||
     `https://github.com/TheGreenCedar/CodeStory/releases/download/v${version}`;
   const url = `${baseUrl.replace(/\/$/u, '')}/${name}`;
-  await downloadFile(url, destination);
+  try {
+    await downloadFile(url, destination);
+  } catch (error) {
+    throw new Error(releaseAssetFetchFailure(name, startedAt, releaseDownloadAttempts, error));
+  }
   return url;
 }
 
@@ -375,8 +429,12 @@ async function resolveCli() {
     return { source: 'managed', version, warnings, ...managed };
   }
 
-  warnings.push('managed_cli_unavailable_using_path_fallback');
-  const pathFallback = pathCliCandidates()[0] || 'codestory-cli';
+  const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
+  const pathCandidates = pathCliCandidates();
+  warnings.push(pathCandidates.length > 0
+    ? 'managed_cli_unavailable_using_path_fallback'
+    : 'managed_cli_unavailable_no_path_fallback');
+  const pathFallback = pathCandidates[0] || 'codestory-cli';
   return {
     source: 'path_fallback',
     path: pathFallback,
@@ -388,6 +446,7 @@ async function resolveCli() {
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
+    managedProvisionFailure,
     warnings,
   };
 }
@@ -433,6 +492,9 @@ function probeResolvedCli(resolved) {
 }
 
 function failOpenReasonForProbe(resolved, probe) {
+  if (resolved.managedProvisionFailure && resolved.source === 'path_fallback' && pathCliCandidates().length === 0) {
+    return resolved.managedProvisionFailure;
+  }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
   }
@@ -585,11 +647,16 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     version: cliVersion(candidate),
     active: samePathText(candidate, resolved.path),
   }));
-  const minimumNext = options.minimumNext || [
+  const managedProvisionFailed = String(reason || '').startsWith('managed_cli_provision_failed:');
+  const managedProvisionNext = [
+    'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
+    'Refresh or reinstall the CodeStory plugin after GitHub release assets are reachable, then restart/reload the Codex host/app and read codestory://status.',
+  ];
+  const minimumNext = options.minimumNext || (managedProvisionFailed && pathCandidates.length === 0 ? managedProvisionNext : [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
     process.platform === 'win32' ? 'where.exe codestory-cli' : 'command -v codestory-cli',
     'codestory-cli --version',
-  ];
+  ]);
   const fullRepair = options.fullRepair || minimumNext;
   const recommendedNext = options.recommendedNext || fullRepair;
   const sidecarPolicy = readSidecarPolicy();
@@ -987,7 +1054,7 @@ async function main() {
   });
 }
 
-main().catch((error) => {
+function runLauncherError(error) {
   const resolved = {
     source: 'launcher',
     path: 'codestory-cli',
@@ -1008,4 +1075,14 @@ main().catch((error) => {
     stdout: '',
     stderr: '',
   }, 'launcher_error'));
-});
+}
+
+if (require.main === module) {
+  main().catch(runLauncherError);
+} else {
+  module.exports = {
+    _test: {
+      downloadFile,
+    },
+  };
+}
