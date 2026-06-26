@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.11.21
+
+CodeStory 0.11.21 is a patch hotfix for the main-served plugin package. It
+ships the MCP adapter startup wait cap from #675 through a synchronized release
+version bump so an official plugin refresh installs new package metadata instead
+of relying on same-version cache replacement.
+
+The adapter now waits up to five seconds for local freshness repair during MCP
+startup before failing open to diagnostic status. Operators can still override
+the cap with `CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS`. This release does not
+claim fresh installed-plugin or model-visible MCP resource proof; those remain
+runtime checks after publication and host/plugin refresh.
+
+Supporting PRs: #675.
+
 ## 0.11.20
 
 CodeStory 0.11.20 is the agent-readiness stabilization release. It makes
