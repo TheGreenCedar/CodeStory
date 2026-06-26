@@ -54,8 +54,38 @@ function pluginCacheVersion() {
   return parent === 'codestory' ? path.basename(pluginRoot) : null;
 }
 
+function inferredCodexPluginDataDir(root = pluginRoot) {
+  const parts = path.resolve(root).split(/[\\/]+/u);
+  for (let index = 0; index <= parts.length - 6; index += 1) {
+    if (
+      parts[index].toLowerCase() !== '.codex' ||
+      parts[index + 1] !== 'plugins' ||
+      parts[index + 2] !== 'cache' ||
+      parts[index + 4] !== 'codestory'
+    ) {
+      continue;
+    }
+    const codexRoot = parts.slice(0, index + 1).join(path.sep);
+    const dataDir = path.join(codexRoot, 'plugins', 'data', `codestory-${parts[index + 3]}`);
+    if (usablePluginDataDir(dataDir)) return dataDir;
+  }
+  return null;
+}
+
+function usablePluginDataDir(dataDir) {
+  try {
+    if (fs.existsSync(dataDir)) return fs.statSync(dataDir).isDirectory();
+    const dataRoot = path.dirname(dataDir);
+    if (fs.existsSync(dataRoot)) return fs.statSync(dataRoot).isDirectory();
+    fs.accessSync(path.dirname(dataRoot), fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function pluginDataDir() {
-  return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || null;
+  return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || inferredCodexPluginDataDir();
 }
 
 function sidecarPolicyPath(dataDir = pluginDataDir()) {
