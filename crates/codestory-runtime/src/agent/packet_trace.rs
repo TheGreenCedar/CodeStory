@@ -31,6 +31,7 @@ fn sanitize_section_id(value: &str) -> String {
     }
     id.trim_matches('-').chars().take(48).collect()
 }
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_packet_lexical_subquery_batch(
     answer: &mut AgentAnswerDto,
     pending: &[(usize, &PacketPlanQueryDto)],

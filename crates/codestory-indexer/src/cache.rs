@@ -198,7 +198,7 @@ fn has_unportable_embedded_absolute_path(flag: &str) -> bool {
         .iter()
         .any(|prefix| {
             flag.strip_prefix(prefix)
-                .is_some_and(|value| starts_with_absolute_path_like(value))
+                .is_some_and(starts_with_absolute_path_like)
         })
 }
 

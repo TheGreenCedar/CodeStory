@@ -533,23 +533,21 @@ fn buffered_io_buffer_storage_claim(ctx: &SourceClaimContext<'_>) -> Option<Stri
     let normalized_symbol = normalize_identifier(ctx.symbol);
     let normalized_source = normalize_identifier(ctx.source);
     let lower = ctx.source.to_ascii_lowercase();
-    if normalized_symbol == "buffer"
+    if (normalized_symbol == "buffer"
         || normalized_symbol.ends_with("buffer")
-        || normalized_symbol.contains("bytebuffer")
-    {
-        if (lower.contains("class buffer")
+        || normalized_symbol.contains("bytebuffer"))
+        && (lower.contains("class buffer")
             || lower.contains("struct buffer")
             || lower.contains("interface buffer")
             || lower.contains("expect class buffer")
             || lower.contains("actual class buffer")
             || lower.contains("typealias buffer"))
-            && (normalized_source.contains("read") || normalized_source.contains("write"))
-            && (normalized_source.contains("byte") || normalized_source.contains("segment"))
-        {
-            return Some(
-                "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
-            );
-        }
+        && (normalized_source.contains("read") || normalized_source.contains("write"))
+        && (normalized_source.contains("byte") || normalized_source.contains("segment"))
+    {
+        return Some(
+            "Buffer is the in-memory byte store used by buffered reads and writes.".to_string(),
+        );
     }
     None
 }
@@ -1364,15 +1362,14 @@ pub(crate) fn packet_generic_html_css_template_structure_claims(
     let lower = source.to_ascii_lowercase();
     let mut claims = Vec::new();
 
-    if file_name.ends_with(".html") || (lower.contains("<html") && lower.contains("<body")) {
-        if lower.contains("id=\"app\"")
-            && lower.contains("type=\"module\"")
-            && lower.contains("viewport")
-        {
-            claims.push(format!(
-                "{file_name} provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry."
-            ));
-        }
+    if (file_name.ends_with(".html") || (lower.contains("<html") && lower.contains("<body")))
+        && lower.contains("id=\"app\"")
+        && lower.contains("type=\"module\"")
+        && lower.contains("viewport")
+    {
+        claims.push(format!(
+            "{file_name} provides the app shell with viewport metadata, div#app, and a script[type=\"module\"] module script entry."
+        ));
     }
 
     if file_name.ends_with(".css") {

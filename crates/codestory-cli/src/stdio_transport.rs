@@ -83,7 +83,7 @@ pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
             continue;
         }
         let line = match std::str::from_utf8(&line) {
-            Ok(line) => line.trim_end_matches(&['\r', '\n']),
+            Ok(line) => line.trim_end_matches(['\r', '\n']),
             Err(error) => {
                 let response = stdio_jsonrpc_error(
                     serde_json::Value::Null,

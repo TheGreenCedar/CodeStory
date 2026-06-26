@@ -638,7 +638,7 @@ pub fn probe_sidecar_health_with_embedding_device(
         .or(manifest.projection_count)
         .unwrap_or(0);
     let qdrant = if dense_anchor_count == 0 {
-        zero_dense_qdrant_health(&embedding_device)
+        zero_dense_qdrant_health(embedding_device)
     } else {
         let collection = manifest.qdrant_collection.clone();
         let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);

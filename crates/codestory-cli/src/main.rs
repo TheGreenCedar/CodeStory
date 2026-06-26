@@ -678,7 +678,7 @@ impl ReadyRepairProgress {
                     continue;
                 }
                 let elapsed = start.elapsed().as_secs();
-                if elapsed % READY_REPAIR_PROGRESS_INTERVAL.as_secs() != 0 {
+                if !elapsed.is_multiple_of(READY_REPAIR_PROGRESS_INTERVAL.as_secs()) {
                     continue;
                 }
                 let phase = *worker_phase.lock().expect("ready repair phase lock");
@@ -2294,25 +2294,24 @@ fn repair_ready_state(
             run_id,
         )
     });
-    if let Some(sidecar) = sidecar.as_ref() {
-        if let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
+    if let Some(sidecar) = sidecar.as_ref()
+        && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
             sidecar.clone(),
-        ) {
-            if ready_repair_existing_sidecar_is_reusable(&existing_status) {
-                eprintln!(
-                    "ready repair agent sidecar already full: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
-                    sidecar.run_id.as_deref().unwrap_or("none"),
-                    sidecar.namespace,
-                    sidecar.compose_project,
-                    existing_status.embedding_device_state,
-                    existing_status.embedding_device_observation_source,
-                    existing_status.embedding_cpu_allowed
-                );
-                return Ok(Some(sidecar.clone()));
-            }
-        }
+        )
+        && ready_repair_existing_sidecar_is_reusable(&existing_status)
+    {
+        eprintln!(
+            "ready repair agent sidecar already full: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
+            sidecar.run_id.as_deref().unwrap_or("none"),
+            sidecar.namespace,
+            sidecar.compose_project,
+            existing_status.embedding_device_state,
+            existing_status.embedding_device_observation_source,
+            existing_status.embedding_cpu_allowed
+        );
+        return Ok(Some(sidecar.clone()));
     }
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;

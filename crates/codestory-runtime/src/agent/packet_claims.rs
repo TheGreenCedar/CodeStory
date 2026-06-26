@@ -796,7 +796,7 @@ fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Op
             .as_deref()
             .map(packet_display_path)
             .unwrap_or_default();
-        return eval_citation_shaped_claim(citation, prompt, &path);
+        eval_citation_shaped_claim(citation, prompt, &path)
     }
     #[cfg(not(test))]
     {

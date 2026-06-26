@@ -896,9 +896,11 @@ fn packet_coverage_report(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let budget_omitted = has_sufficiency_blocking_budget_omission
-        .then(|| budget.omitted_sections.clone())
-        .unwrap_or_default();
+    let budget_omitted = if has_sufficiency_blocking_budget_omission {
+        budget.omitted_sections.clone()
+    } else {
+        Vec::new()
+    };
     let provenance_counts = packet_provenance_counts(supported_claims);
     let provenance_labels = provenance_counts.keys().cloned().collect::<Vec<_>>();
     PacketCoverageReportDto {
@@ -1047,8 +1049,7 @@ fn packet_escape_coverage_report_value(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
 }
 
 struct PacketFlowContext {
@@ -1495,7 +1496,7 @@ fn packet_missing_required_flow_requirements(
         .requirements
         .iter()
         .copied()
-        .filter(|requirement| flow_requirement_blocks_sufficiency(requirement))
+        .filter(flow_requirement_blocks_sufficiency)
         .filter(|requirement| {
             !supported_claims
                 .iter()
@@ -1638,6 +1639,7 @@ fn packet_blocking_follow_up_probe_queries(
     queries
 }
 
+#[allow(clippy::too_many_arguments)]
 fn packet_flow_roles_for_claim(
     claim: &PacketClaimDto,
     site_build_flow: bool,
@@ -2162,6 +2164,7 @@ fn insert_generic_boundary_roles(roles: &mut HashSet<FlowRole>) {
     roles.insert(FlowRole::TerminalBoundary);
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4374,13 +4377,12 @@ fn packet_has_sufficiency_blocking_budget_omission(
         return false;
     }
 
-    budget
-        .omitted_sections
-        .iter()
-        .any(|section| match section.as_str() {
-            "citations" | "markdown_blocks" | "trail_edges" | "output_bytes" => true,
-            _ => false,
-        })
+    budget.omitted_sections.iter().any(|section| {
+        matches!(
+            section.as_str(),
+            "citations" | "markdown_blocks" | "trail_edges" | "output_bytes"
+        )
+    })
 }
 
 fn packet_missing_probe_requires_compact_proof(query: &str) -> bool {
@@ -4459,7 +4461,7 @@ fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
         .retrieval_trace
         .retrieval_shadow
         .as_ref()
-        .map_or(true, |shadow| shadow.retrieval_mode == "full")
+        .is_none_or(|shadow| shadow.retrieval_mode == "full")
 }
 
 fn packet_agent_repair_command(quoted_project: &str) -> String {
