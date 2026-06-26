@@ -692,6 +692,85 @@ func (r *Router) Handle(path string) {}
 }
 
 #[test]
+fn test_incremental_added_definition_resolves_existing_unresolved_caller() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let caller = root.join("main.rs");
+    let callee = root.join("helper.rs");
+
+    fs::write(
+        &caller,
+        "mod helper;\nuse crate::helper::late_helper;\n\nfn run() {\n    late_helper();\n}\n",
+    )?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(root.to_path_buf());
+    let event_bus = EventBus::new();
+    let initial = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![caller.clone()],
+        files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
+    };
+    indexer.run_incremental(&mut storage, &initial, &event_bus, None)?;
+
+    let run_id = storage
+        .get_nodes()?
+        .into_iter()
+        .find(|node| node.serialized_name == "run" && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing run() node after initial index"))?;
+    let initial_call_edges = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .collect::<Vec<_>>();
+    assert!(
+        !initial_call_edges.is_empty(),
+        "expected initial run() call edge to exist"
+    );
+    assert!(
+        initial_call_edges
+            .iter()
+            .all(|edge| edge.resolved_target.is_none()),
+        "late_helper() should be unresolved before helper.rs exists: {initial_call_edges:?}"
+    );
+
+    fs::write(&callee, "pub fn late_helper() {}\n")?;
+    let refresh = codestory_workspace::RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![callee.clone()],
+        files_to_remove: vec![],
+        existing_file_ids: std::collections::HashMap::new(),
+    };
+    let stats = indexer.run_incremental(&mut storage, &refresh, &event_bus, None)?;
+
+    let helper_id = storage
+        .get_nodes()?
+        .into_iter()
+        .find(|node| node.serialized_name == "late_helper" && node.kind == NodeKind::FUNCTION)
+        .map(|node| node.id)
+        .ok_or_else(|| anyhow::anyhow!("missing late_helper() node after incremental index"))?;
+    let refreshed_call_edges = storage
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.source == run_id)
+        .collect::<Vec<_>>();
+    assert!(
+        refreshed_call_edges
+            .iter()
+            .any(|edge| edge.resolved_target == Some(helper_id)),
+        "unchanged run() caller should resolve to newly added helper: {refreshed_call_edges:?}"
+    );
+    assert!(
+        stats.resolved_calls > 0,
+        "incremental resolution should count the unchanged caller resolution"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_incremental_indexing_deletes_removed_files_before_resolution() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let root = dir.path();
