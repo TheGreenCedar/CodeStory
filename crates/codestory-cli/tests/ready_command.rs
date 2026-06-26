@@ -177,6 +177,20 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
             ),
         "explicit run id should stay in agent repair guidance: {explicit_agent_json_text}"
     );
+    assert!(
+        explicit_agent_json["verdicts"][0]["full_repair"]
+            .as_array()
+            .is_some_and(
+                |commands| commands
+                    .iter()
+                    .any(|command| command.as_str().is_some_and(|text| text
+                        .contains("retrieval status")
+                        && text.contains("--profile agent")
+                        && text.contains("--run-id")
+                        && text.contains("isolated-proof")))
+            ),
+        "explicit run id should stay in agent status proof guidance: {explicit_agent_json_text}"
+    );
 }
 
 #[test]

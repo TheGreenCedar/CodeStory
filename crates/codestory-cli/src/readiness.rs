@@ -408,8 +408,15 @@ fn agent_packet_search_repair_commands(project_arg: &str, run_id: Option<&str>) 
         project_arg,
         run_id,
     ));
+    let mut status_command = format!(
+        "codestory-cli retrieval status --project {project_arg} --profile agent --format json"
+    );
+    if let Some(run_id) = run_id {
+        status_command.push_str(" --run-id ");
+        status_command.push_str(&quote_command_argument_value(run_id));
+    }
     commands.extend([
-        format!("codestory-cli retrieval status --project {project_arg} --format json"),
+        status_command,
         format!("codestory-cli doctor --project {project_arg} --format markdown"),
     ]);
     commands
