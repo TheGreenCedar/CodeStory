@@ -128,6 +128,11 @@ function repairCommandForProject(projectRoot = process.cwd()) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
 
+function optionValue(argv, name) {
+  const index = argv.indexOf(name);
+  return index >= 0 ? argv[index + 1] : null;
+}
+
 function dirtyMarkerEnv(projectRoot = process.cwd()) {
   const markerPath = dirtyMarkerPathForProject(projectRoot, pluginDataDir());
   const normalizedRoot = (() => {
@@ -624,7 +629,12 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
     );
   }
   if (parsedProbe.ok) {
-    return { ready: true };
+    return {
+      ready: true,
+      setup,
+      verdict: parsedProbe.verdict || null,
+      localRefresh: parsedProbe.localRefresh || null,
+    };
   }
   const verdict = parsedProbe.verdict || null;
   const status = typeof verdict?.status === 'string' ? verdict.status : 'repair_setup';
@@ -640,8 +650,28 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
   );
 }
 
+function pluginRuntimeForResolved(resolved) {
+  return {
+    plugin_version: resolved.version,
+    plugin_root: pluginRoot,
+    plugin_cache_version: pluginCacheVersion(),
+    plugin_data: pluginDataDir(),
+    cli_source: resolved.source,
+    cli_path: resolved.path,
+    cli_sha256: resolved.sha256,
+    build_source: resolved.buildSource,
+    repo_ref: resolved.repoRef,
+    local_dev_override: resolved.source === 'local_dev_override',
+    path_fallback: resolved.source === 'path_fallback',
+    managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
+    managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
+    managed_manifest_path: resolved.manifestPath || null,
+    warnings: resolved.warnings.filter(Boolean),
+  };
+}
+
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
-  const projectRoot = process.cwd();
+  const projectRoot = options.projectRoot || process.cwd();
   const pathCandidates = pathCliCandidates().map((candidate) => ({
     path: candidate,
     version: cliVersion(candidate),
@@ -660,23 +690,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   const fullRepair = options.fullRepair || minimumNext;
   const recommendedNext = options.recommendedNext || fullRepair;
   const sidecarPolicy = readSidecarPolicy();
-  const plugin = {
-    plugin_version: resolved.version,
-    plugin_root: pluginRoot,
-    plugin_cache_version: pluginCacheVersion(),
-    plugin_data: pluginDataDir(),
-    cli_source: resolved.source,
-    cli_path: resolved.path,
-    cli_sha256: resolved.sha256,
-    build_source: resolved.buildSource,
-    repo_ref: resolved.repoRef,
-    local_dev_override: resolved.source === 'local_dev_override',
-    path_fallback: resolved.source === 'path_fallback',
-    managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
-    managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
-    managed_manifest_path: resolved.manifestPath || null,
-    warnings: [...resolved.warnings, reason].filter(Boolean),
-  };
+  const plugin = pluginRuntimeForResolved({ ...resolved, warnings: [...resolved.warnings, reason] });
   const repair = {
     goal: options.goal || 'local_navigation',
     status: options.status || 'repair_setup',
@@ -759,6 +773,85 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
         : { method: 'cli', command }),
     ],
   };
+}
+
+async function bootstrapStatus(projectRoot = process.cwd()) {
+  const resolved = await resolveCli();
+  rememberLaunch(resolved);
+  const probe = probeResolvedCli(resolved);
+  const failOpenReason = failOpenReasonForProbe(resolved, probe);
+  if (failOpenReason) {
+    return {
+      ready: false,
+      ...fallbackDiagnostic(resolved, probe, failOpenReason, { projectRoot }),
+    };
+  }
+
+  const localReadiness = probeLocalNavigation(resolved, projectRoot);
+  if (!localReadiness.ready) {
+    return {
+      ready: false,
+      ...fallbackDiagnostic(resolved, probe, localReadiness.reason, {
+        projectRoot,
+        status: localReadiness.status,
+        summary: localReadiness.summary,
+        minimumNext: localReadiness.minimumNext,
+        fullRepair: localReadiness.fullRepair,
+        localRefresh: localReadiness.localRefresh,
+        setup: localReadiness.setup,
+      }),
+    };
+  }
+
+  const sidecarPolicy = readSidecarPolicy();
+  const plugin = pluginRuntimeForResolved(resolved);
+  const localRefresh = localReadiness.localRefresh || {
+    state: 'fresh',
+    blocks_local_surfaces: false,
+    readiness_status: 'ready',
+  };
+  const repair = {
+    goal: 'local_navigation',
+    status: 'ready',
+    summary: localReadiness.verdict?.summary || 'CodeStory local navigation is ready.',
+    repair_reason: null,
+    local_refresh: localRefresh,
+    minimum_next: [{ method: 'resources/read', uri: 'codestory://status' }],
+    full_repair: [],
+    setup: {
+      ...localReadiness.setup,
+      readiness_verdict: localReadiness.verdict,
+    },
+  };
+  return {
+    ready: true,
+    project_root: projectRoot,
+    server_version: resolved.version,
+    cli_version: probe.version,
+    plugin_runtime: plugin,
+    runtime_truth: runtimeTruthStatus(plugin, repair, {
+      sidecarPolicy: sidecarPolicy.state || 'unavailable',
+      localRefresh,
+    }),
+    local_refresh: localRefresh,
+    readiness: [repair],
+    recommended_next_calls: [{ method: 'resources/read', uri: 'codestory://status' }],
+  };
+}
+
+async function handleBootstrapStatusCommand(argv) {
+  if (argv[2] !== 'bootstrap-status') return false;
+  const projectRoot = optionValue(argv, '--project') || process.cwd();
+  try {
+    process.stdout.write(`${JSON.stringify(await bootstrapStatus(projectRoot))}\n`);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({
+      ready: false,
+      degraded_reason: `launcher_error:${error.message}`,
+      project_root: projectRoot,
+    })}\n`);
+  }
+  process.exit(0);
 }
 
 function pathCliCandidates() {
@@ -976,6 +1069,7 @@ function rememberLaunch(resolved) {
 }
 
 async function main() {
+  if (await handleBootstrapStatusCommand(process.argv)) return;
   handleSidecarPolicyCommand(process.argv);
   const resolved = await resolveCli();
   rememberLaunch(resolved);

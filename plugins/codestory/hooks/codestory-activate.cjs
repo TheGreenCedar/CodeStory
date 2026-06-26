@@ -4,6 +4,7 @@ const { spawnSync } = require('child_process');
 const { createHash } = require('crypto');
 const { eventHeader, getCodeStoryInstructions } = require('./codestory-instructions.cjs');
 const {
+  bootstrapManagedRuntime,
   classifyMcpRuntime,
   dirtyMarkerPathForProject,
   mcpDetectionText,
@@ -29,6 +30,7 @@ const EVENT_CAPS = {
 };
 const RUNTIME_TIMEOUT_MS = 3500;
 const SOURCE_FALLBACK = 'CodeStory is unavailable for this session. Use bounded source reads in the target repo; inspect only task-named files and nearby tests.';
+const BOOTSTRAP_TAXONOMIES = new Set(['startup', 'clear', 'child_worktree_start', 'session']);
 
 function readHookInput() {
   return new Promise((resolve) => {
@@ -172,6 +174,27 @@ function runtimeStatusBlock(policy, mcp) {
       ? 'Next: read codestory://status before source reads; use packet/search/context only when status allows them with retrieval_mode=full.'
       : 'Next: no sidecar-backed packet/search surface is proven available; use bounded source reads instead of repeated repair attempts.',
   ].join('\n');
+}
+
+function shouldBootstrapManagedRuntime(policy, mcp) {
+  if (process.env.CODESTORY_CLI) return false;
+  if (!BOOTSTRAP_TAXONOMIES.has(policy.taxonomy)) return false;
+  return Boolean(policy.project && mcp.mcp_process_launchable && !mcp.mcp_resources_exposed);
+}
+
+function bootstrapText(bootstrap) {
+  if (!bootstrap || !bootstrap.attempted) return null;
+  const status = bootstrap.parsed || {};
+  const plugin = status.plugin_runtime || {};
+  const localRefresh = status.local_refresh || status.readiness?.[0]?.local_refresh || {};
+  const reason = status.degraded_reason || status.readiness?.[0]?.repair_reason || bootstrap.error || bootstrap.stderr;
+  return [
+    `managed_bootstrap: ${bootstrap.ready ? 'ready' : 'blocked'}`,
+    `managed_bootstrap_cli_source: ${plugin.cli_source || '<unknown>'}`,
+    plugin.managed_binary_path ? `managed_bootstrap_cli_path: ${plugin.managed_binary_path}` : null,
+    `managed_bootstrap_local_refresh: ${localRefresh.state || status.readiness?.[0]?.status || '<unknown>'}`,
+    reason ? `managed_bootstrap_reason: ${truncate(reason, 500)}` : null,
+  ].filter(Boolean).join('\n');
 }
 
 function firstFreshness(value) {
@@ -348,7 +371,14 @@ function runCodeStory(input, event, policy, state = {}) {
     };
   }
 
-  const mcp = classifyMcpRuntime();
+  let mcp = classifyMcpRuntime();
+  const bootstrap = shouldBootstrapManagedRuntime(policy, mcp)
+    ? bootstrapManagedRuntime({ projectRoot: policy.project })
+    : null;
+  if (bootstrap?.attempted) {
+    mcp = classifyMcpRuntime();
+  }
+  const bootstrapBlock = bootstrapText(bootstrap);
   if (policy.runtimeOnly) {
     const heartbeatProbe = policy.heartbeat
       ? heartbeatReadinessProbe(mcp, policy.project, input.cwd || process.cwd())
@@ -377,12 +407,13 @@ function runCodeStory(input, event, policy, state = {}) {
         `event_taxonomy: ${policy.taxonomy}`,
         `output_cap_chars: ${policy.cap}`,
         `dedupe_key: ${policy.dedupeKey}`,
+        bootstrapBlock,
         mcpDetectionText(mcp),
         mcp.mcp_resources_exposed
           ? 'Use codestory://status as the active runtime truth. Run packet/search/context only when status allows that surface with retrieval_mode=full.'
           : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Reload the host/plugin and read codestory://status; do not add CodeStory to PATH.',
       ].join('\n'), policy.cap),
-      fingerprint: runtimeFingerprint(mcp),
+      fingerprint: `${runtimeFingerprint(mcp)}|${bootstrapBlock || 'no-bootstrap'}`,
     };
   }
 

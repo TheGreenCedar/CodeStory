@@ -937,6 +937,74 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   }
 });
 
+test("startup hook bootstraps managed cli before reporting MCP visibility", async (t) => {
+  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  if (tarProbe.status !== 0) {
+    t.skip("tar unavailable for archive fixture");
+    return;
+  }
+
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-bootstrap-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-hook-release-"));
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
+  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const stageDir = join(releaseDir, archiveBase);
+  const cliPath = join(stageDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const archivePath = join(releaseDir, archiveName);
+
+  try {
+    await mkdir(stageDir, { recursive: true });
+    await writeFakeCli(cliPath);
+    const packArgs = archiveName.endsWith(".zip")
+      ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
+      : ["-czf", archivePath, "-C", releaseDir, archiveBase];
+    const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
+    assert.equal(pack.status, 0, pack.stderr);
+    const archiveSha256 = createHash("sha256")
+      .update(await readFile(archivePath))
+      .digest("hex");
+    await writeFile(join(releaseDir, "SHA256SUMS.txt"), `${archiveSha256}  ${archiveName}\n`, "utf8");
+
+    const result = spawnSync(process.execPath, [hookPath], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        CODESTORY_MCP_RESOURCES_EXPOSED: "",
+        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        COPILOT_PLUGIN_DATA: "",
+        PLUGIN_DATA: dataDir,
+      },
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        source: "startup",
+        cwd: repoRoot,
+      }),
+      encoding: "utf8",
+      timeout: 30000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, /managed_bootstrap: ready/u);
+    assert.match(context, /managed_bootstrap_cli_source: managed/u);
+    assert.match(context, /managed_bootstrap_local_refresh: fresh/u);
+    assert.match(context, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
+    assert.match(context, /managed_cli_present: yes/u);
+    assert.doesNotMatch(context, /where\.exe codestory-cli|command -v codestory-cli|adding CodeStory to PATH/u);
+
+    const manifest = JSON.parse(
+      await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
+    );
+    assert.equal(manifest.version, version);
+    assert.equal(manifest.build_source, "github_release");
+    assert.equal(manifest.archive_sha256, archiveSha256);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
 test("release asset downloader retries a transient failure", async () => {
   const { EventEmitter } = await import("node:events");
   const { PassThrough } = await import("node:stream");
