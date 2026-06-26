@@ -364,6 +364,84 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
   }
 });
 
+test("mcp launcher infers Codex managed data from installed cache without env", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const codexHome = await mkdtemp(join(tmpdir(), "codestory-installed-cache-"));
+  const codexRoot = join(codexHome, ".codex");
+  const installRoot = join(codexRoot, "plugins", "cache", "TheGreenCedar", "codestory", version);
+  const dataDir = join(codexRoot, "plugins", "data", "codestory-TheGreenCedar");
+  const outFile = join(dataDir, "env.json");
+  const cliDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const pathDir = await mkdtemp(join(tmpdir(), "codestory-stale-path-"));
+  const staleCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const launcher = join(installRoot, "scripts", "codestory-mcp.cjs");
+
+  try {
+    await mkdir(join(installRoot, "scripts"), { recursive: true });
+    await mkdir(join(installRoot, "hooks"), { recursive: true });
+    await mkdir(join(installRoot, ".codex-plugin"), { recursive: true });
+    await mkdir(cliDir, { recursive: true });
+    await writeFile(
+      launcher,
+      await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8"),
+      "utf8",
+    );
+    await writeFile(
+      join(installRoot, "hooks", "codestory-runtime.cjs"),
+      await readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8"),
+      "utf8",
+    );
+    await writeFile(
+      join(installRoot, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ version }),
+      "utf8",
+    );
+    await writeFakeCli(cliPath);
+    const sha256 = createHash("sha256")
+      .update(await readFile(cliPath))
+      .digest("hex");
+    await writeFile(
+      join(cliDir, "manifest.json"),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      "utf8",
+    );
+    await writeFile(
+      staleCli,
+      process.platform === "win32"
+        ? "@echo off\r\necho codestory-cli 0.0.1\r\n"
+        : "#!/bin/sh\necho codestory-cli 0.0.1\n",
+      "utf8",
+    );
+    await chmod(staleCli, 0o755);
+
+    const result = spawnSync(process.execPath, [launcher], {
+      env: {
+        PLUGIN_DATA: "",
+        COPILOT_PLUGIN_DATA: "",
+        TEST_OUT: outFile,
+        PATH: pathDir,
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
+      },
+      cwd: repoRoot,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const observed = JSON.parse(await readFile(outFile, "utf8"));
+    assert.equal(observed.source, "managed");
+    assert.equal(observed.path, cliPath);
+    assert.equal(observed.pluginRoot, installRoot);
+    assert.equal(observed.pluginCacheVersion, version);
+    assert.equal(observed.dirtyMarkerPath, dirtyMarkerPathForProject(repoRoot, dataDir));
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+    await rm(pathDir, { recursive: true, force: true });
+  }
+});
+
 test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
