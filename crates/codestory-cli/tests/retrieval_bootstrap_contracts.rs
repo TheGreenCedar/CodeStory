@@ -46,6 +46,18 @@ fn run_down(project: &std::path::Path, extra_args: &[&str]) {
     );
 }
 
+fn assert_digest_image_pins(json: &Value) {
+    for field in ["qdrant", "zoekt", "embed"] {
+        let image = json[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("sidecar_images.{field} should be a string: {json}"));
+        assert!(
+            image.contains("@sha256:"),
+            "sidecar_images.{field} must include a digest pin: {image}"
+        );
+    }
+}
+
 fn create_valid_cache_with_cli(project: &std::path::Path, cache: &std::path::Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
         .args(["index", "--project"])
@@ -113,6 +125,7 @@ fn bootstrap_json_includes_storage_repair_fields() {
         json.get("embed_detail").is_some(),
         "bootstrap output missing embed_detail: {json}"
     );
+    assert_digest_image_pins(&json["sidecar_state"]["sidecar_images"]);
     assert!(repair["scan_errors"].is_array());
     assert!(
         repair["prune_suppressed_reason"].is_null()
@@ -146,11 +159,13 @@ fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
         bootstrap["storage_repair"].is_object(),
         "bootstrap output missing storage repair: {bootstrap}"
     );
+    assert_digest_image_pins(&bootstrap["sidecar_state"]["sidecar_images"]);
 
     let status = run_status(
         project.path(),
         &["--cache-dir", cache_arg, "--format", "json"],
     );
+    assert_digest_image_pins(&status["sidecar_images"]);
     assert_eq!(
         status["degraded_reason"].as_str(),
         Some("retrieval_manifest_missing"),
