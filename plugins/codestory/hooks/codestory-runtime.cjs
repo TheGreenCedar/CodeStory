@@ -107,8 +107,7 @@ function classifyMcpRuntime(options = {}) {
   const runtime = runtimePath ? readJson(runtimePath) : null;
   const managed = managedCliInfo(dataDir, pluginVersion(root));
   const launchable = mcp.installed && mcp.command === 'node' && mcpScriptExists(root, mcp.args);
-  const resourcesExposed = process.env.CODESTORY_MCP_RESOURCES_EXPOSED === '1' ||
-    Boolean(runtime?.source && runtime?.path && fs.existsSync(runtime.path));
+  const resourcesExposed = process.env.CODESTORY_MCP_RESOURCES_EXPOSED === '1';
   const resourceStatus = resourcesExposed
     ? 'mcp_resources_exposed'
     : launchable
