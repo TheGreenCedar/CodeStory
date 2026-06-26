@@ -2,14 +2,63 @@
 
 ## 0.11.20
 
-CodeStory 0.11.20 promotes the current `dev/codestory-next` release slice:
-the query-shape fusion work has landed, packet/search ranking keeps graph,
-lexical, and dense evidence distinct, and the release lane is ready for the
-final branch-vs-main review gate before promotion.
+CodeStory 0.11.20 is the agent-readiness stabilization release. It makes
+packet/search status harder to misread: local graph freshness, local/default
+retrieval, and agent packet/search readiness are reported as separate lanes,
+and repair only succeeds when the selected sidecar lane is actually full.
 
-This release is a metadata sync for the completed v0.11.20 readiness evidence.
-It does not start v0.12 work, merge development history into `main` locally, or
-claim readiness beyond the packaged sidecar proof and recorded release gates.
+The release also tightens retrieval quality and runtime truth. Query-shape
+fusion and broader lexical windows keep exact symbols, graph structure,
+lexical matches, and dense retrieval evidence visible without flattening them
+into one score. Agent sidecars now reuse stable run IDs, report observed
+embedding-device state, distinguish requested AMD/Vulkan acceleration from
+proof that acceleration was observed, and fail closed when stored sidecar
+content no longer matches the active embedding backend.
+
+Operationally, 0.11.20 adds sidecar inventory and garbage-collection surfaces,
+dirty-hook freshness handling, bounded sidecar stage overruns, MCP visibility
+reporting, safer GitHub status comment posting, and post-publish release smoke
+coverage for packaged runtime assets. Release assets remain packaging evidence;
+packet/search readiness still depends on the sidecar evidence tiers in
+`docs/contributors/testing-matrix.md`.
+
+Supporting PRs: #544, #593, #650, #653, #655, #656.
+
+## 0.11.19
+
+CodeStory 0.11.19 is the release-proof repair slice after the agent-readiness
+work in 0.11.18. It keeps packaged agent proof tied to the active runtime and
+records repo-scale full-sidecar packet/search evidence in the stats log instead
+of relying on stale local assumptions.
+
+The release also fixes the packaged proof setup path: release automation now
+fetches and verifies the pinned embedding model before running packaged-agent
+proof, so CI failure points at runtime readiness instead of a missing model
+artifact.
+
+Supporting PRs: #542, #546.
+
+## 0.11.18
+
+CodeStory 0.11.18 turns agent sidecar readiness into an explicit product
+contract. Agent packet/search uses isolated sidecar runs, infers the agent
+profile from the sidecar run ID, and exposes packet proof metadata so a caller
+can see whether an answer came from full retrieval evidence or from a blocked
+fallback path.
+
+The release makes failure modes more useful for operators. The plugin MCP
+launcher and local-index paths fail open with bounded guidance instead of
+crashing the session, while readiness checks detect dead embedding runtimes,
+zero-dense sidecar state, profile handoff mistakes, and blocked repair guidance
+before packet/search is trusted.
+
+0.11.18 also expands setup and packaging coverage with CI agent-smoke profiles,
+Windows ARM64 installer asset resolution, managed embedding cache overrides,
+task-brief packet support, stdio frame-size limits, and updated sidecar
+readiness docs. It does not claim packet/search quality without full sidecar
+readiness.
+
+Supporting PRs: #467.
 
 ## 0.11.17
 
