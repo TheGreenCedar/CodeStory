@@ -576,6 +576,7 @@ fn drill_repo_cases_from_manifest(manifest_path: &Path) -> Vec<DrillRepoCase> {
 fn codestory_repo_release_e2e_emits_stats() {
     let project_root = repo_root();
     let binary = release_cli_binary();
+    let sidecar_run_id = "release-e2e-stats";
     assert!(
         binary.is_file(),
         "missing release binary at {}. Run `cargo build --release -p codestory-cli` first.",
@@ -613,6 +614,22 @@ fn codestory_repo_release_e2e_emits_stats() {
         ],
     );
 
+    let (_retrieval_bootstrap_seconds, _retrieval_bootstrap_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "retrieval".to_string(),
+            "bootstrap".to_string(),
+            "--profile".to_string(),
+            "agent".to_string(),
+            "--run-id".to_string(),
+            sidecar_run_id.to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
+
     let (retrieval_index_seconds, _retrieval_index_json) = run_cli_json(
         &binary,
         project_root.as_path(),
@@ -620,6 +637,10 @@ fn codestory_repo_release_e2e_emits_stats() {
         &[
             "retrieval".to_string(),
             "index".to_string(),
+            "--profile".to_string(),
+            "agent".to_string(),
+            "--run-id".to_string(),
+            sidecar_run_id.to_string(),
             "--refresh".to_string(),
             "none".to_string(),
             "--format".to_string(),
@@ -634,6 +655,10 @@ fn codestory_repo_release_e2e_emits_stats() {
         &[
             "retrieval".to_string(),
             "status".to_string(),
+            "--profile".to_string(),
+            "agent".to_string(),
+            "--run-id".to_string(),
+            sidecar_run_id.to_string(),
             "--format".to_string(),
             "json".to_string(),
         ],
@@ -691,6 +716,10 @@ fn codestory_repo_release_e2e_emits_stats() {
             "10".to_string(),
             "--refresh".to_string(),
             "none".to_string(),
+            "--profile".to_string(),
+            "agent".to_string(),
+            "--run-id".to_string(),
+            sidecar_run_id.to_string(),
             "--format".to_string(),
             "json".to_string(),
         ],

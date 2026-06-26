@@ -771,9 +771,6 @@ mod tests {
     use super::*;
     use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn hash_projection_dim_matches_retrieval_embedding_dim() {
@@ -785,7 +782,7 @@ mod tests {
 
     #[test]
     fn embed_documents_preserves_count_for_hash_projection() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "hash");
         let docs = vec!["alpha".to_string(), "beta".to_string()];
 
@@ -806,7 +803,7 @@ mod tests {
 
     #[test]
     fn default_qdrant_semantic_vectors_are_768() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::remove("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS");
         let _guard2 = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
         assert_eq!(embedding_runtime_id(), PRODUCT_EMBEDDING_RUNTIME_ID);
@@ -815,7 +812,7 @@ mod tests {
 
     #[test]
     fn embedding_runtime_id_llamacpp_when_backend_set() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _guard2 = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
         assert_eq!(embedding_runtime_id(), "llamacpp:bge-base-en-v1.5");
@@ -823,7 +820,7 @@ mod tests {
 
     #[test]
     fn explicit_onnx_backend_is_not_product_sidecar_runtime() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
         let _guard2 = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
 
@@ -843,7 +840,7 @@ mod tests {
 
     #[test]
     fn default_embedding_device_policy_blocks_unknown_device() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
@@ -869,7 +866,7 @@ mod tests {
 
     #[test]
     fn explicit_cpu_opt_in_allows_cpu_backed_retrieval() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::set(DEVICE_STATE_ENV, "cpu");
@@ -921,7 +918,7 @@ mod tests {
 
     #[test]
     fn amd_provider_env_detects_and_requests_vulkan_without_observing_acceleration() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
@@ -969,7 +966,7 @@ mod tests {
 
     #[test]
     fn sidecar_log_observed_acceleration_allows_amd_vulkan_request() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
@@ -1010,7 +1007,7 @@ mod tests {
 
     #[test]
     fn inconclusive_sidecar_log_keeps_amd_vulkan_request_unknown() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
@@ -1035,7 +1032,7 @@ mod tests {
 
     #[test]
     fn native_log_observed_acceleration_uses_native_source() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
@@ -1074,7 +1071,7 @@ mod tests {
 
     #[test]
     fn explicit_unknown_device_still_fails_closed_on_amd_host() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::set(DEVICE_STATE_ENV, "unknown");
@@ -1092,7 +1089,7 @@ mod tests {
 
     #[test]
     fn explicit_accelerated_device_allows_retrieval_with_manual_observation_source() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::set(DEVICE_STATE_ENV, "vulkan");
@@ -1109,7 +1106,7 @@ mod tests {
 
     #[test]
     fn cpu_policy_without_device_state_reports_cpu_policy_source() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
@@ -1126,7 +1123,7 @@ mod tests {
 
     #[test]
     fn product_embedding_backend_requires_device_policy() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
@@ -1144,7 +1141,7 @@ mod tests {
 
     #[test]
     fn product_embedding_backend_uses_runtime_native_log_observation() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
         let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
@@ -1193,7 +1190,7 @@ mod tests {
 
     #[test]
     fn product_embedding_backend_for_runtime_waits_for_native_log_observation() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
         let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
@@ -1239,7 +1236,7 @@ mod tests {
 
     #[test]
     fn product_embedding_backend_allows_explicit_cpu_policy() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
@@ -1275,7 +1272,7 @@ mod tests {
 
     #[test]
     fn remote_embedding_url_requires_explicit_opt_in() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::remove(ALLOW_REMOTE_EMBEDDINGS_ENV);
         let error = ensure_llamacpp_url_allowed("http://192.168.1.10:8080/v1/embeddings")
             .expect_err("remote URL should be rejected by default");
@@ -1303,7 +1300,7 @@ mod tests {
 
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
-            // SAFETY: test-only env mutation guarded by ENV_LOCK.
+            // SAFETY: test-only env mutation guarded by crate::test_support::env_lock().
             unsafe {
                 std::env::remove_var(key);
             }

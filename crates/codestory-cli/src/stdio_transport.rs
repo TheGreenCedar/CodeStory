@@ -2197,7 +2197,12 @@ fn read_stdio_status_resource_cached(
 
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
-    let (summary, local_refresh) = crate::wait_for_local_freshness(&project, &inspect_runtime)?;
+    let summary = inspect_runtime.open_project_summary()?;
+    let (summary, local_refresh) = if crate::local_freshness_needs_refresh(&summary) {
+        crate::wait_for_local_freshness(&project, &inspect_runtime)?
+    } else {
+        (summary, None)
+    };
     let key = stdio_status_cache_key(runtime);
     let value = read_stdio_status_resource(runtime, summary, local_refresh)?;
     // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
