@@ -191,6 +191,15 @@ pub fn finalize_index_for_runtime(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<FinalizeIndexOutcome> {
+    finalize_index_for_runtime_with_progress(project_root, storage_path, runtime, |_| {})
+}
+
+pub fn finalize_index_for_runtime_with_progress(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    mut progress: impl FnMut(&'static str),
+) -> Result<FinalizeIndexOutcome> {
     runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
@@ -371,6 +380,7 @@ pub fn finalize_index_for_runtime(
         }
     }
 
+    progress("lexical sidecar");
     let zoekt_version = ensure_zoekt_generation(
         project_root,
         storage_path,
@@ -389,8 +399,10 @@ pub fn finalize_index_for_runtime(
         &collection,
         sidecar_input.projection_count,
         qdrant_ready_points,
+        &mut progress,
     )?;
 
+    progress("graph artifact");
     ensure_scip_artifacts(
         storage_path,
         &scip_dir,
@@ -405,6 +417,7 @@ pub fn finalize_index_for_runtime(
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &scip_dir);
 
+    progress("manifest write");
     finalize_manifest_after_health_check(
         storage_path,
         &layout,
@@ -467,6 +480,7 @@ fn ensure_qdrant_collection(
     collection: &str,
     projection_count: i64,
     mut qdrant_ready_points: Option<u64>,
+    progress: &mut impl FnMut(&'static str),
 ) -> Result<u64> {
     if projection_count == 0 {
         info!(
@@ -491,6 +505,7 @@ fn ensure_qdrant_collection(
             "Qdrant generated collection reused"
         );
     } else {
+        progress("embeddings");
         let count =
             upsert_qdrant_points_from_store(storage_path, project_root, qdrant_client, collection)?;
         if count == 0 {
@@ -517,6 +532,7 @@ fn ensure_qdrant_collection(
             "Qdrant collection ensured and populated"
         );
     }
+    progress("Qdrant finalize");
     ensure_qdrant_semantic_smoke(project_id, collection, qdrant_client)?;
     Ok(qdrant_ready_points.unwrap_or_default())
 }

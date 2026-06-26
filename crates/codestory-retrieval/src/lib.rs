@@ -71,7 +71,8 @@ pub use health::{
 };
 pub use index::{
     FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, finalize_index_for_runtime,
-    project_id_for_root, repair_project_qdrant_collection, sidecar_project_id_for_root,
+    finalize_index_for_runtime_with_progress, project_id_for_root,
+    repair_project_qdrant_collection, sidecar_project_id_for_root,
 };
 pub use inventory::{
     SidecarDockerResource, SidecarDockerResourceKind, SidecarGcNamespaceResult, SidecarGcReport,
