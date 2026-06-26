@@ -124,7 +124,7 @@ cargo build --release -p codestory-cli
 
 On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
 
-This loop proves the local CLI and managed ONNX diagnostic path are wired, but
+This loop proves the local CLI and diagnostic ONNX asset path are wired, but
 it is not product packet/search sidecar setup. Treat `setup embeddings
 --dry-run` as an asset-plan check only. It should not start an embedding server,
 write a product retrieval manifest, or make agent-facing retrieval evidence

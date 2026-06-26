@@ -5734,7 +5734,7 @@ fn sync_llm_symbol_projection(
         })?),
         Err(error) => {
             tracing::warn!(
-                "embedding runtime unavailable ({error}); graph-native symbol docs will still be refreshed, but dense anchor retrieval will be unavailable until managed ONNX assets are installed with `codestory-cli setup embeddings` or embedding env points at a reachable runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
+                "embedding runtime unavailable ({error}); graph-native symbol docs will still be refreshed, but dense anchor retrieval will be unavailable until the llama.cpp embedding sidecar is reachable or embedding env points at an explicit diagnostic runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
             );
             None
         }

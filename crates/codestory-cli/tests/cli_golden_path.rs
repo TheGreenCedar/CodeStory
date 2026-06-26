@@ -1098,7 +1098,13 @@ fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
     );
     assert_eq!(
         setup["backend"], "onnx",
-        "setup should select ONNX: {setup:#}"
+        "setup should report the diagnostic ONNX backend: {setup:#}"
+    );
+    assert!(
+        setup["status"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Diagnostic ONNX assets are not installed")),
+        "setup should label ONNX as diagnostic: {setup:#}"
     );
     assert!(
         setup["model"]["url"]
@@ -1143,7 +1149,12 @@ fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
                 clean_test_path(cache_dir.path())
             ),
             format!(
-                "codestory-cli index --project \"{}\" --cache-dir \"{}\" --refresh full",
+                "codestory-cli retrieval bootstrap --project \"{}\" --cache-dir \"{}\"",
+                clean_test_path(workspace.path()),
+                clean_test_path(cache_dir.path())
+            ),
+            format!(
+                "codestory-cli retrieval index --project \"{}\" --cache-dir \"{}\" --refresh full",
                 clean_test_path(workspace.path()),
                 clean_test_path(cache_dir.path())
             ),
@@ -1170,14 +1181,20 @@ fn doctor_reports_managed_embedding_setup_state() {
     let message = managed["message"].as_str().expect("managed message");
     match status {
         "info" => assert!(
-            message.contains("setup embeddings"),
-            "doctor should name the setup command when managed assets are missing: {doctor:#}"
+            message.contains("Diagnostic ONNX") && message.contains("retrieval bootstrap"),
+            "doctor should label missing ONNX assets as diagnostic and name product sidecar repair: {doctor:#}"
         ),
         "ok" => assert!(
-            message.contains("Managed ONNX embeddings are installed"),
-            "doctor should report globally available managed assets for isolated cache dirs: {doctor:#}"
+            message.contains("Diagnostic ONNX embeddings are installed"),
+            "doctor should label globally available ONNX assets as diagnostic: {doctor:#}"
         ),
-        _ => panic!("managed setup state should be informational or installed: {doctor:#}"),
+        "warn" => assert!(
+            message.contains("External llama.cpp endpoint"),
+            "doctor should report product llama.cpp endpoint warnings separately from ONNX setup: {doctor:#}"
+        ),
+        _ => panic!(
+            "managed setup state should be informational, installed, or endpoint warning: {doctor:#}"
+        ),
     }
 }
 
@@ -1198,14 +1215,30 @@ fn doctor_does_not_autostart_installed_managed_embeddings() {
     let managed = check_with_name(&doctor, "managed_embeddings");
     assert_eq!(
         managed["status"], "warn",
-        "installed but invalid managed assets should fail runtime verification: {doctor:#}"
+        "unreachable product llama.cpp endpoint should warn without promoting ONNX assets: {doctor:#}"
     );
     assert!(
         managed["message"]
             .as_str()
-            .is_some_and(|message| message.contains("failed runtime verification")),
-        "managed status should explain that installed assets did not pass runtime verification: {doctor:#}"
+            .is_some_and(|message| message.contains("External llama.cpp endpoint")),
+        "managed status should report the product endpoint warning: {doctor:#}"
     );
+    for name in [
+        "CODESTORY_EMBED_ONNX_MODEL",
+        "CODESTORY_EMBED_ONNX_TOKENIZER",
+        "CODESTORY_EMBED_ONNX_PROVIDER",
+    ] {
+        let env_row = doctor["environment"]
+            .as_array()
+            .expect("doctor environment")
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap_or_else(|| panic!("missing env row {name}: {doctor:#}"));
+        assert_eq!(
+            env_row["message"], "not set; using runtime defaults",
+            "doctor must not set {name} from installed diagnostic assets: {env_row:#}"
+        );
+    }
     assert!(
         !cache_dir
             .path()
