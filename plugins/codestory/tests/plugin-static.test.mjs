@@ -970,6 +970,16 @@ test("session-start hooks are thin and host manifests point at them", async () =
   assert.equal(manifest.hooks, "./hooks/claude-codex-hooks.json");
 });
 
+test("mcp launcher local wait-fresh default stays startup-safe", async () => {
+  const mcpSource = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
+  const match = mcpSource.match(
+    /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
+  );
+  assert.ok(match, "missing local wait-fresh timeout default");
+  const localWaitFreshTimeoutMs = Number.parseInt(match[1], 10);
+  assert.equal(localWaitFreshTimeoutMs, 5000, "local wait-fresh default must stay MCP startup-safe");
+});
+
 async function withFakeCodeStoryCli(callback) {
   const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-test-"));
   const shPath = join(binDir, "codestory-cli");
