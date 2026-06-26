@@ -449,7 +449,7 @@ function localWaitFreshCommand(projectRoot = process.cwd()) {
 
 function localWaitFreshTimeoutMs() {
   const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
 }
 
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
