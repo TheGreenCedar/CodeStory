@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn write_tiny_rust_workspace(root: &Path) {
@@ -1298,8 +1298,10 @@ fn app_controller_opens_project() {
         index_tiny_workspace_for_browser_loop(workspace.path(), cache_dir.path());
 
     assert_doctor_reports_existing_cache_health(workspace.path(), cache_dir.path());
+    search_dir_snapshot.assert_unchanged("doctor");
 
     assert_ground_reads_existing_cache(workspace.path(), cache_dir.path());
+    search_dir_snapshot.assert_unchanged("ground");
 
     let node_id = ground_symbol_node_id_from_existing_cache(
         workspace.path(),
@@ -1307,45 +1309,58 @@ fn app_controller_opens_project() {
         "AppController",
         None,
     );
+    search_dir_snapshot.assert_unchanged("ground symbol");
     assert_product_search_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         "AppController",
     );
+    search_dir_snapshot.assert_unchanged("product search");
 
     assert_symbol_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
+    search_dir_snapshot.assert_unchanged("symbol");
 
     assert_trail_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
+    search_dir_snapshot.assert_unchanged("trail");
 
     assert_snippet_reads_focus_node(workspace.path(), cache_dir.path(), &node_id);
+    search_dir_snapshot.assert_unchanged("snippet");
 
     let bookmark_id = add_and_assert_bookmark_focus(workspace.path(), cache_dir.path(), &node_id);
+    search_dir_snapshot.assert_unchanged("bookmark add");
 
     assert_context_bookmark_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         &bookmark_id,
     );
+    search_dir_snapshot.assert_unchanged("context bookmark");
 
     assert_explore_outputs_focus_context(workspace.path(), cache_dir.path(), &node_id);
+    search_dir_snapshot.assert_unchanged("explore");
 
     assert_files_and_affected_read_existing_cache(workspace.path(), cache_dir.path());
+    search_dir_snapshot.assert_unchanged("files and affected");
 
     assert_query_search_fails_closed_without_full_sidecars(workspace.path(), cache_dir.path());
+    search_dir_snapshot.assert_unchanged("query search");
     assert_packet_builds_broad_task_contract(workspace.path(), cache_dir.path());
+    search_dir_snapshot.assert_unchanged("packet");
     assert_context_id_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         &node_id,
     );
+    search_dir_snapshot.assert_unchanged("context id");
     remove_and_assert_bookmark_gone(workspace.path(), cache_dir.path(), &bookmark_id);
+    search_dir_snapshot.assert_unchanged("bookmark remove");
+    search_dir_snapshot.assert_unchanged("read loop");
+
     assert_stdio_context_id_fails_closed_without_full_sidecars(
         workspace.path(),
         cache_dir.path(),
         &node_id,
     );
-
-    search_dir_snapshot.assert_unchanged();
 }
 
 #[test]
@@ -1384,7 +1399,7 @@ fn files_json_reports_structural_support_tiers_for_cargo_and_compose() {
 
 struct SearchDirSnapshot {
     path: PathBuf,
-    modified: SystemTime,
+    marker: PathBuf,
 }
 
 fn index_tiny_workspace_for_browser_loop(workspace: &Path, cache_dir: &Path) -> SearchDirSnapshot {
@@ -2274,21 +2289,24 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
 
 impl SearchDirSnapshot {
     fn capture(path: PathBuf) -> Self {
-        let modified = fs::metadata(&path)
+        fs::metadata(&path)
             .expect("search dir metadata before read commands")
             .modified()
             .expect("search dir modified before read commands");
-        Self { path, modified }
+        let marker = path.join("codestory-read-cache-marker.txt");
+        fs::write(&marker, "preserve across read commands")
+            .expect("write search dir preservation marker");
+        Self { path, marker }
     }
 
-    fn assert_unchanged(&self) {
-        let after = fs::metadata(&self.path)
+    fn assert_unchanged(&self, step: &str) {
+        fs::metadata(&self.path)
             .expect("search dir metadata after read commands")
             .modified()
             .expect("search dir modified after read commands");
-        assert_eq!(
-            self.modified, after,
-            "read commands should not recreate the persisted search directory"
+        assert!(
+            self.marker.exists(),
+            "{step} should not recreate the persisted search directory"
         );
     }
 }

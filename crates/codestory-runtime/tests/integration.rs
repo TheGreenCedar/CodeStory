@@ -45,7 +45,9 @@ fn test_cli_app_indexer_smoke() -> anyhow::Result<()> {
     assert_eq!(summary.stats.node_count, 0, "Should start empty");
 
     // 2. Index project
-    let timings = controller.run_indexing_blocking(IndexMode::Full).unwrap();
+    let timings = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .unwrap();
     assert!(timings.parse_index_ms > 0);
 
     // Re-open to get refresh stats

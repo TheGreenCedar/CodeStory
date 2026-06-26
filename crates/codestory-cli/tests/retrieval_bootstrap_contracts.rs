@@ -62,10 +62,21 @@ fn create_valid_cache_with_cli(project: &std::path::Path, cache: &std::path::Pat
     );
 }
 
+fn write_embed_model_fixture(project: &std::path::Path) {
+    let model_dir = project.join("models").join("gguf").join("bge-base-en-v1.5");
+    fs::create_dir_all(&model_dir).expect("model dir");
+    fs::write(
+        model_dir.join("bge-base-en-v1.5.Q8_0.gguf"),
+        b"model placeholder",
+    )
+    .expect("model file");
+}
+
 #[test]
 fn bootstrap_json_includes_storage_repair_fields() {
     let project = tempdir().expect("project");
     fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    write_embed_model_fixture(project.path());
 
     let json = run_bootstrap(
         project.path(),
@@ -115,6 +126,7 @@ fn bootstrap_json_includes_storage_repair_fields() {
 fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
     let project = tempdir().expect("project");
     fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    write_embed_model_fixture(project.path());
     let cache = tempdir().expect("cache");
     let cache_arg = cache.path().to_str().expect("utf8 cache");
 
@@ -183,6 +195,7 @@ fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
 fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
     let project = tempdir().expect("project");
     fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    write_embed_model_fixture(project.path());
     let cache = tempdir().expect("cache");
     let cache_arg = cache.path().to_str().expect("utf8 cache");
 
@@ -370,6 +383,7 @@ fn run_id_status_implies_agent_profile() {
 fn bootstrap_json_surfaces_prune_suppressed_reason_on_scan_errors() {
     let project = tempdir().expect("project");
     fs::write(project.path().join("lib.rs"), "pub fn main() {}\n").expect("source");
+    write_embed_model_fixture(project.path());
     let cache = tempdir().expect("cache");
     create_valid_cache_with_cli(project.path(), cache.path());
     let corrupt_subdir = cache.path().join("deadbeefdeadbeef");

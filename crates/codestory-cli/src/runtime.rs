@@ -900,10 +900,19 @@ mod tests {
             runtime.managed_embeddings_root,
             cache.join("managed-embeddings")
         );
-        assert_eq!(
-            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
-            Some("onnx")
-        );
+        for name in [
+            "CODESTORY_EMBED_BACKEND",
+            "CODESTORY_EMBED_ONNX_MODEL",
+            "CODESTORY_EMBED_ONNX_TOKENIZER",
+            "CODESTORY_EMBED_ONNX_PROVIDER",
+            "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
+        ] {
+            assert_eq!(
+                env::var(name).ok(),
+                None,
+                "runtime context must not promote managed ONNX assets via {name}"
+            );
+        }
     }
 
     #[test]

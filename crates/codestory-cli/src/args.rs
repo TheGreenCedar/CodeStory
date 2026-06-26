@@ -57,7 +57,10 @@ pub(crate) enum Command {
     Index(IndexCommand),
     #[command(about = "Summarize indexed repository context.")]
     Ground(GroundCommand),
-    #[command(about = "Generate a repo report or machine graph export from the current store.")]
+    #[command(
+        about = "Generate a repo report or machine graph export from the current store.",
+        long_about = "Generate a repo report or machine graph export from the current store."
+    )]
     Report(ReportCommand),
     #[command(about = "Gather evidence for one concrete target.")]
     Context(ContextCommand),

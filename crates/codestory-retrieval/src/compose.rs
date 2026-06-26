@@ -771,10 +771,7 @@ fn wait_for_infrastructure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn embed_model_dir_discovers_repo_models_layout() {
@@ -958,7 +955,7 @@ mod tests {
 
     #[test]
     fn native_launch_args_use_model_port_and_amd_vulkan_device() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _provider = EnvGuard::set("CODESTORY_EMBED_DEVICE_PROVIDER", "amd");
         let _name = EnvGuard::set("CODESTORY_EMBED_DEVICE_NAME", "AMD Radeon RX 7900 XT");
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");

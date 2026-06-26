@@ -531,10 +531,7 @@ mod tests {
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
@@ -643,7 +640,7 @@ mod tests {
 
     #[test]
     fn strict_readiness_rejects_stored_doc_backend_mismatch() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
@@ -690,6 +687,8 @@ mod tests {
 
     #[test]
     fn status_rejects_manifest_when_live_indexed_file_changes_or_is_removed() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -751,6 +750,8 @@ mod tests {
 
     #[test]
     fn lightweight_status_does_not_scan_live_indexable_inventory() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -813,6 +814,8 @@ mod tests {
 
     #[test]
     fn strict_status_rejects_manifest_when_new_indexable_file_is_added() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -866,6 +869,8 @@ mod tests {
 
     #[test]
     fn strict_status_rejects_manifest_when_new_parser_backed_language_file_is_added() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -919,6 +924,8 @@ mod tests {
 
     #[test]
     fn strict_readiness_accepts_markdown_covered_by_sidecar_fingerprint() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -1011,7 +1018,7 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
-            // SAFETY: tests that mutate process environment hold ENV_LOCK.
+            // SAFETY: tests that mutate process environment hold crate::test_support::env_lock().
             unsafe {
                 std::env::set_var(key, value);
             }
@@ -1021,7 +1028,7 @@ mod tests {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: tests that mutate process environment hold ENV_LOCK.
+            // SAFETY: tests that mutate process environment hold crate::test_support::env_lock().
             unsafe {
                 if let Some(previous) = self.previous.take() {
                     std::env::set_var(self.key, previous);

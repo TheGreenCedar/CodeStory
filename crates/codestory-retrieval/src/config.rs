@@ -644,10 +644,7 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn agent_profile_default_runtime_reuses_project_shared_run() {
@@ -726,7 +723,7 @@ mod tests {
 
     #[test]
     fn explicit_embedding_launch_modes_parse() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
 
         assert_eq!(
@@ -737,7 +734,7 @@ mod tests {
 
     #[test]
     fn invalid_embedding_launch_mode_fails_closed() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "llama-server.exe");
 
         let error = embedding_server_launch_mode().expect_err("invalid mode");
