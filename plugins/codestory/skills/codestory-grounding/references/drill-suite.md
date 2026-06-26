@@ -1,6 +1,6 @@
 # `drill-suite` - Run A Manifest-Defined Real-Repo Agent Drill Matrix
 
-Runs a repeatable agent-grounding drill suite from the CodeStory owner checkout. Use it when evaluating whether CodeStory helps an agent answer realistic architecture questions across one or more real repositories, not just whether indexing succeeds.
+Runs a repeatable agent-grounding drill suite from a manifest file. Use it to evaluate whether CodeStory helps an agent answer realistic architecture questions across real repositories.
 
 ## Usage
 

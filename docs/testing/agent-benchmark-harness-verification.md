@@ -1,5 +1,7 @@
 # Agent Benchmark Harness Verification
 
+**Audience:** Evidence record — not an install guide.
+
 Scope: transcript analysis and manifest-backed quality scoring for
 `scripts/codestory-agent-ab-benchmark.mjs`.
 
@@ -229,7 +231,7 @@ thresholds.
 
 ## README with/without row
 
-The [README with/without section](../../README.md#with-vs-without-codestory) keeps
+The [README evaluation section](../../README.md#evaluation) keeps
 two recorded tiers: the focused `readme-with-without` task and a suite-total row
 for the 18-task `language-expansion-holdout` manifest
 [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json).

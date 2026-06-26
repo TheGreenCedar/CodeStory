@@ -27,9 +27,9 @@
 This page documents CLI ownership and subsystem boundaries, not detailed option
 semantics. The canonical option contract is the generated CLI help from
 `crates/codestory-cli/src/args.rs`; the agent-facing operational reference is
-`plugins/codestory/skills/codestory-grounding/references/*.md`. README and usage docs
-should stay workflow-oriented and link to those sources instead of copying
-complete option matrices.
+`plugins/codestory/skills/codestory-grounding/references/*.md`. User guides in
+`docs/users/` should stay workflow-oriented and link to those sources instead of
+copying complete option matrices.
 
 Refresh behavior belongs to runtime, not the CLI adapter. The CLI parses the
 requested refresh mode, resolves project/cache paths, delegates to runtime, and
@@ -62,9 +62,9 @@ Index output should expose:
 
 ## Read And Query Output
 
-Generated help and [../../usage.md](../../usage.md) own command syntax,
-workflow examples, and option semantics. This subsystem page owns the adapter
-boundary:
+Generated help and [../../users/cli-reference.md](../../users/cli-reference.md)
+own command syntax, workflow examples, and option semantics. This subsystem
+page owns the adapter boundary:
 
 - parse CLI arguments without embedding runtime policy;
 - keep rendering in `output.rs`;

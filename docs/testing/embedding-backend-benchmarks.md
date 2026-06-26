@@ -1,5 +1,7 @@
 # Embedding Pipeline Decision Matrix
 
+**Audience:** Evidence record — not an install guide.
+
 This is the curated decision record for CodeStory embedding, indexing, and
 retrieval performance work. It keeps the evidence needed to understand what was
 tried, what was rejected, and what still needs proof.

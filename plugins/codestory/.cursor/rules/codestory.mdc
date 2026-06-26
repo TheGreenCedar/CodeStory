@@ -15,3 +15,7 @@ Before making source claims, planning edits, choosing tests, or reviewing change
 3. Use local graph surfaces only when their own `allowed_surfaces` entry allows them.
 4. Use `packet`, `search`, or `context` only when that surface is allowed and `retrieval_mode=full`.
 5. If MCP is missing, use `codestory-cli ready` or `doctor` as a repair/debug fallback.
+
+Cursor setup, MCP wiring, and host-specific notes: [docs/users/cursor.md](../../../../docs/users/cursor.md).
+
+Skill details and the status field glossary live in `plugins/codestory/skills/codestory-grounding/` and `references/status-contract.md`.

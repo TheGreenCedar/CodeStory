@@ -1,5 +1,7 @@
 # Search Quality Eval Harness
 
+**Audience:** Evidence record — not an install guide.
+
 The lightweight search-quality harness checks whether expected symbols and
 framework routes are discoverable after ranking or indexing changes.
 

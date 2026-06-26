@@ -1,5 +1,7 @@
 # CodeStory Stdio Warm Loop Stats
 
+**Audience:** Evidence record — not an install guide.
+
 This log tracks the persistent `serve --stdio` path that agents should prefer once an index already exists. It complements `codestory-e2e-stats-log.md`, which tracks cold one-shot CLI timings.
 
 Run after building the release CLI:

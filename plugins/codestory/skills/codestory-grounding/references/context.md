@@ -1,6 +1,6 @@
 # `context` - Target Context For One Concrete Target
 
-Builds target context around one concrete retrieval target. Target selection is DB/index-first: `--query` must name a concrete symbol, file, literal, API path, module, or behavior term. The context packet itself runs through the Investigate agent path with the selected focus node and can fail closed unless sidecar-primary retrieval is full. This is not a question-answering or chat command: it does not interpret natural-language questions. Use `packet` for broad task questions, `search` for candidate discovery, and `drill` for repeatable investigation reports.
+Builds target context around one concrete retrieval target (`--query` must name a symbol, file, literal, API path, module, or behavior term — not a broad question). Runs through the Investigate agent path and fails closed unless sidecar-primary retrieval is full. For broad questions use `packet`; for discovery use `search`; for repeatable reports use `drill`.
 
 ## Usage
 

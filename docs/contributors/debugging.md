@@ -1,5 +1,7 @@
 # Debugging Guide
 
+**Audience:** Contributors
+
 ```mermaid
 flowchart TD
     start["Unexpected behavior"] --> symptom{"What is wrong?"}
@@ -214,3 +216,25 @@ Keep the work serialized. Running multiple cargo or CLI indexing commands at onc
 If the repo-scale runtime integration gate hits memory pressure, do not keep retrying it in a loop. Capture the failing command, confirm the default runtime and retrieval lanes still pass, and treat the repo-scale run as a heavy manual follow-up on a roomier machine or after further containment work.
 
 If retrieval behavior changes at the same time, walk the recovery order above before assuming the memory event and the ranking regression share the same cause.
+
+## Optional Dirty-Marker Git Hooks
+
+Optional dirty-marker Git hooks mark local graph freshness dirty after Git
+checkout, merge, or rewrite operations. Install them only when you want that
+repo-level signal:
+
+```sh
+node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <target-workspace> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <target-workspace> --plugin-data <plugin-data-dir>
+```
+
+Uninstall is safe and removes only CodeStory-managed hook blocks:
+
+```sh
+node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <target-workspace> --plugin-data <plugin-data-dir>
+```
+
+`foreign_hook_present` means existing hook content was preserved.
+`uninstall_required` means an older CodeStory-managed block should be removed
+before reinstalling. Dirty markers affect local graph freshness only; packet,
+search, and context remain gated on full sidecar readiness.

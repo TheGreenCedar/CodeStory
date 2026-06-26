@@ -33,13 +33,6 @@ surprise-download. Agent-facing packet/search evidence still requires
 
 ## Notes
 
-- Normal commands may use already installed assets, but they do not download
-  missing assets.
-- Plain `index` builds the core SQLite code index only. Run `retrieval index`
-  after sidecars are configured, then require `retrieval status --format json`
-  to report `retrieval_mode=full` before relying on packet/search evidence.
-- Product sidecar evidence requires the llama.cpp/GGUF contract documented in
-  `docs/ops/retrieval-sidecars.md`; keep model pins, checksums, compose
-  lifecycle, and repair steps in that runbook.
-- Hash embeddings, ONNX-only flows, and non-sidecar embedding paths are
-  diagnostic or historical comparison modes only.
+- Normal commands may use already installed assets, but they do not download missing assets.
+- Plain `index` builds the core SQLite code index only; run `retrieval index` after sidecars are configured. Packet/search readiness: [status-contract.md](status-contract.md) and `docs/ops/retrieval-sidecars.md`.
+- Hash embeddings, ONNX-only flows, and non-sidecar embedding paths are diagnostic or historical comparison modes only.

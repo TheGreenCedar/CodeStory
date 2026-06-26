@@ -1,7 +1,6 @@
 # Repository Guidelines
 
-CodeStory indexes a repository once so coding agents can answer from local graph
-evidence instead of rediscovering the checkout on every question.
+**Audience:** Contributors — workspace layout, verification lanes, and merge bar.
 
 ## Project Structure & Module Organization
 - Rust workspace is defined in `Cargo.toml`; crates live under `crates/`.
@@ -44,6 +43,7 @@ evidence instead of rediscovering the checkout on every question.
   - Note: Using `cargo test -p codestory-index fidelity_regression` will just filter tests instead of running the targeted suites.
 - Cargo verifications (build, check, test) should be serialized when working in this repo because parallel `cargo` commands will contend on the shared package and build locks.
 - For graph perf and fidelity checks, use Criterion benches in `crates/codestory-bench`.
+- Operator documentation lives in `docs/users/`. Docs-only proof: `git diff --check` and `node .github/scripts/check-doc-links.mjs`. Do not add unit tests that assert documentation copy or required phrases.
 
 ## Commit & Pull Request Guidelines
 - Commit messages are short, lowercase, imperative (e.g., `fix minimap`, `refactor graph style`).

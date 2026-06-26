@@ -209,29 +209,6 @@ fn cli_stays_thin() {
 }
 
 #[test]
-fn cli_subsystem_doc_does_not_own_command_option_matrices() {
-    let cli_doc = read("docs/architecture/subsystems/cli.md");
-    assert!(
-        cli_doc.contains("## Command Reference Ownership")
-            && cli_doc.contains("crates/codestory-cli/src/args.rs")
-            && cli_doc.contains("plugins/codestory/skills/codestory-grounding/references/*.md"),
-        "CLI subsystem doc should route option semantics to CLI help and skill refs"
-    );
-    for forbidden in [
-        "## `index` Command Options",
-        "| Option | Default | Runtime effect |",
-        "`--project <PROJECT>`",
-        "## `search` And `context` Research Options",
-        "`--hybrid-lexical <WEIGHT>`",
-    ] {
-        assert!(
-            !cli_doc.contains(forbidden),
-            "CLI subsystem doc should not own detailed command option matrix text `{forbidden}`"
-        );
-    }
-}
-
-#[test]
 fn runtime_exposes_read_only_browser_service_boundary() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     let browser = read("crates/codestory-runtime/src/browser.rs");
@@ -383,9 +360,6 @@ fn stdio_tool_catalog_stays_aligned_with_read_only_browser_service_operations() 
 
 #[test]
 fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
-    let gate = read("docs/architecture/overview.md");
-    let warm_stats = read("docs/testing/codestory-stdio-warm-loop-stats.md");
-    let runtime_path = read("docs/architecture/runtime-execution-path.md");
     let cli_args = read("crates/codestory-cli/src/args.rs");
     let http_transport = read("crates/codestory-cli/src/http_transport.rs");
     let command_enum = source_between(
@@ -397,46 +371,6 @@ fn web_cockpit_stays_deferred_until_browser_surface_gate_opens() {
         &http_transport,
         "match path {",
         "fn browser_references_config",
-    );
-
-    for required in [
-        "Status: deferred.",
-        "Do not add a new `browse` command, web UI route, or browser-specific UI",
-        "Tool, resource, and prompt manifests",
-        "Warm stdio/browser-loop p50, p95, and p99",
-        "Current Promotion Budget",
-        "docs/testing/codestory-stdio-warm-loop-stats.md",
-        "Browser stress lanes",
-        "`explore` must demonstrate the browser workflow",
-        "Screenshot-visible review",
-    ] {
-        assert!(
-            gate.contains(required),
-            "browser surface gate should document required gate evidence: missing {required}"
-        );
-    }
-
-    assert!(
-        runtime_path.contains("browser surface gate")
-            && runtime_path.contains("Do not add a")
-            && runtime_path
-                .contains("separate `browse` command, web UI route, or browser-specific UI"),
-        "runtime execution path should point future UI work at the browser surface gate"
-    );
-    assert!(
-        warm_stats.contains("## Current Promotion Budget")
-            && warm_stats.contains("### Smoke Budget")
-            && warm_stats.contains("| search | 75 ms |")
-            && warm_stats.contains("| symbol | 50 ms |")
-            && warm_stats.contains("| trail | 75 ms |")
-            && warm_stats.contains("| snippet | 50 ms |")
-            && warm_stats.contains("| resources/read:status | 50 ms |")
-            && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 250 ms |")
-            && warm_stats.contains("### Web UI Promotion Budget")
-            && warm_stats.contains("| each default read operation | 500 ms |")
-            && warm_stats.contains("| full `search -> symbol -> trail -> snippet` loop | 1.5 s |")
-            && warm_stats.contains("browser surface gate stays closed"),
-        "warm-loop stats doc should own the active p95 budget state"
     );
 
     assert!(

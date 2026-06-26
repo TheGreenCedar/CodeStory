@@ -1,5 +1,7 @@
 # CodeStory Browser Stress Lanes
 
+**Audience:** Evidence record — not an install guide.
+
 These lanes exercise large synthetic browser workloads after the warm stdio loop
 metrics exist. They are promotion scouts, not product proof by themselves.
 

@@ -1,5 +1,7 @@
 # Codestory E2E Stats Log
 
+**Audience:** Evidence record — not an install guide.
+
 Append one entry before each commit after running:
 
 ```sh

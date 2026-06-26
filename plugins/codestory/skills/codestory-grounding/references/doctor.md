@@ -1,11 +1,6 @@
 # `doctor` - Project And Retrieval Health
 
-Reads project/cache/index/retrieval health without mutating the index. Use it at the start of an LLM browser loop and when a read command fails unexpectedly.
-
-When plugin MCP is live, read `codestory://status` first and treat its
-`server_version`, `server_executable`, and `allowed_surfaces` as active runtime
-truth. Use `doctor` when MCP is missing, a repair transcript is needed, or a
-status field points to stale runtime or readiness evidence.
+Reads project/cache/index/retrieval health without mutating the index. Use it at the start of an LLM browser loop and when a read command fails unexpectedly. For MCP runtime truth and surface gating, see [status-contract.md](status-contract.md). Use `doctor` when MCP is missing, a repair transcript is needed, or status points to stale evidence.
 
 ## Usage
 
@@ -31,7 +26,7 @@ status field points to stale runtime or readiness evidence.
 | Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
 
 For MCP/runtime drift, collect binary evidence only after status is missing or
-suspect:
+suspect (see [status-contract.md](status-contract.md#runtime-repair)):
 
 ```powershell
 where.exe codestory-cli

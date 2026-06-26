@@ -1,5 +1,7 @@
 # Testing Matrix
 
+**Audience:** Contributors
+
 Choose the verification lane before running broad checks. Run Cargo
 verifications serially in this repo when the lane needs them; the workspace
 shares build locks. Examples use POSIX shell syntax. On Windows PowerShell, use
@@ -15,7 +17,7 @@ flowchart TD
     change --> cli["CLI args or output boundary work"]
     change --> bench["Bench or perf-surface work"]
     change --> e2e["Repo-scale semantic or cold-start behavior"]
-    docs --> docs_checks["readback + git diff --check"]
+    docs --> docs_checks["readback + git diff --check + check-doc-links.mjs"]
     always --> workspace["fmt, check, targeted tests, clippy"]
     indexer --> fidelity["fidelity_regression, tictactoe_language_coverage, integration"]
     store --> store_tests["cargo test -p codestory-store"]
@@ -24,6 +26,22 @@ flowchart TD
     bench --> bench_checks["cargo check -p codestory-bench --benches"]
     e2e --> e2e_stats["release build + codestory_repo_e2e_stats"]
 ```
+
+## Verification Lane Summary
+
+Run Cargo commands serially in this repo.
+
+| Lane | Commands |
+| --- | --- |
+| Docs only | `git diff --check`, `node .github/scripts/check-doc-links.mjs` |
+| Routine code | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings` |
+| Release-blocking fidelity | `cargo test -p codestory-indexer --test fidelity_regression`, `cargo test -p codestory-indexer --test tictactoe_language_coverage`, `cargo test -p codestory-runtime --test retrieval_eval` |
+| Heavy repo-scale timing | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` |
+
+Append fresh headline rows to
+[`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md) when
+default indexing, semantic persistence, embedding reuse, or cold-start behavior
+changes.
 
 ## Whole Workspace
 
@@ -61,14 +79,31 @@ agent-facing packet/search readiness.
 
 ## Docs-Only Fast Path
 
-If you only changed `README.md` or `docs/**`, use the smallest credible lane:
+If you only changed documentation or plugin doc surfaces, use the smallest credible
+lane. Scope matches the markdown link checker:
+
+- `README.md`
+- `docs/**` (including templates)
+- `plugins/codestory/README.md`
+- `plugins/codestory/docs/**`
+- `plugins/codestory/skills/**`
 
 ```sh
 git diff --check
+node .github/scripts/check-doc-links.mjs
+```
+
+When plugin adapter files change, also run:
+
+```sh
+node --test plugins/codestory/tests/plugin-static.test.mjs
 ```
 
 Read the changed pages back before finishing. Only escalate to broader Cargo
 checks if the doc change depends on new code behavior or command output.
+
+Do not add unit tests that assert documentation prose or required phrases.
+Structure gates only: links, whitespace, plugin/runtime shape.
 
 ## Indexer And Graph Fidelity
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- Restructured operator docs under `docs/users/` (host guides, CLI reference, troubleshooting, trust and readiness).
+- Added CI markdown link checker: `node .github/scripts/check-doc-links.mjs` (`.github/workflows/docs-link-check.yml`).
+
 ## 0.12.0
 
 CodeStory 0.12.0 promotes the managed plugin runtime path for Codex. The

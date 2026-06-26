@@ -1,4 +1,4 @@
-# Documentation Search Index
+﻿# Documentation Search Index
 
 Keyword index for CodeStory documentation. For routing by job, start at
 [docs/README.md](README.md). Canonical owners are listed there.
@@ -22,17 +22,17 @@ Keyword index for CodeStory documentation. For routing by job, start at
 - **Canonical owners**: Which doc owns operator flow, terms, verification
 - **Documentation maintenance**: Search index, checklist, templates
 
-#### docs/usage.md
-- **Operator Journey**: Step-by-step user journey
-- **Example prompts**: Portable templates and CodeStory-repo examples
-- **Readiness Lanes**: Local navigation vs agent packet/search
-- **Local Navigation**: Commands for cache-local exact-target source inspection
-- **Broad Packet/Search**: Commands for sidecar-backed discovery
-- **Stale Local Cache**: Refresh procedures
-- **Sidecar Repair**: Sidecar setup and repair procedures
-- **Output And Configuration**: Command output and configuration options
-- **Command Cheat Sheet**: Quick reference for all commands
-- **Verification**: Documentation verification procedures
+#### docs/users/
+- **README.md**: Host selection, capability matrix, portable prompt shapes, day-1 checklist
+- **trust-and-readiness.md**: Repo map vs broad search lanes
+- **what-to-expect.md**, **prompt-patterns.md**: Coverage limits and prompt shapes
+- **cli-reference.md**: CLI commands, readiness, repair, configuration
+- **cursor.md**, **codex.md**, **claude-code.md**, **copilot.md**: Host-specific setup
+- **troubleshooting.md**: Blocked sessions and recovery
+
+#### plugins/codestory/skills/
+- **codestory-grounding/SKILL.md**: Canonical grounding skill
+- **references/status-contract.md**: Runtime status field glossary for agents
 
 #### docs/architecture/
 - **overview.md**: Architecture overview and system layers
@@ -106,14 +106,14 @@ Portable shapes (any repository):
 @CodeStory I am editing [PATH_TO_FILE]. What symbols are affected and what tests should I run first?
 ```
 
-CodeStory-repo dogfood examples: [usage.md - Example prompts](usage.md#example-prompts).
+CodeStory-repo dogfood examples: [users/README.md - Portable prompt shapes](users/README.md#portable-prompt-shapes).
 
 ## Navigation Paths
 
 ### For First-Time Users
-1. Start with [README.md - Quick start](../README.md#quick-start)
-2. Read [Usage - Operator Journey](usage.md#operator-journey)
-3. Use example prompts to understand the workflow
+1. Start with [User guides - Pick your host](users/README.md#pick-your-host)
+2. Open your host guide from the table on that page
+3. Use [portable prompt shapes](users/README.md#portable-prompt-shapes) to understand the workflow
 
 ### For Contributors
 1. Start with [Contributor setup](contributors/getting-started.md)
@@ -133,5 +133,7 @@ CodeStory-repo dogfood examples: [usage.md - Example prompts](usage.md#example-p
 ## Maintenance
 
 Update this index when adding major doc pages. Canonical command and verification
-details live in [usage.md](usage.md) and
+details live in [users/cli-reference.md](users/cli-reference.md) and
 [contributors/testing-matrix.md](contributors/testing-matrix.md).
+
+Link-check scope: `README.md`, `docs/**` (including templates), `plugins/codestory/README.md`, `plugins/codestory/docs/**`, and `plugins/codestory/skills/**`. Run `node .github/scripts/check-doc-links.mjs` before merge.

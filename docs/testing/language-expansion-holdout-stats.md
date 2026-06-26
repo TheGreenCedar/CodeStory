@@ -1,6 +1,8 @@
 # Language expansion holdout stats
 
-Scoped with/without evidence for the [README with/without section](../../README.md#with-vs-without-codestory).
+**Audience:** Evidence record — not an install guide.
+
+Scoped with/without evidence for the [README evaluation section](../../README.md#evaluation).
 
 Task manifest:
 [`language-support-ab.task.json`](../../benchmarks/tasks/language-expansion-holdout/language-support-ab.task.json)

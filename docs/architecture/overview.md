@@ -1,7 +1,6 @@
 # Architecture Overview
 
-Agents usually rediscover a repository on every question. CodeStory turns a
-repository into local evidence a coding agent can query once and reuse: files
+Seven workspace crates plus `codestory-bench` form a local evidence stack: files
 and symbols in SQLite, optional sidecar indexes for packet/search, thin CLI on
 top of `codestory-runtime`.
 
@@ -111,7 +110,7 @@ before promotion.
 
 ## Where To Start
 
-- Product workflow: [../usage.md](../usage.md)
+- Operator workflow: [../users/README.md](../users/README.md)
 - System behavior: [runtime-execution-path.md](runtime-execution-path.md)
 - Indexing lifecycle: [indexing-pipeline.md](indexing-pipeline.md)
 - Language support claims: [language-support.md](language-support.md)

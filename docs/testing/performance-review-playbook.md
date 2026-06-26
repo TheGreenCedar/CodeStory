@@ -1,5 +1,7 @@
 # Performance Review Playbook
 
+**Audience:** Evidence record — not an install guide.
+
 This playbook covers CLI-first performance review, targeted parallelization, and
 search-quality promotion for the navigation workflow. It is not a server, MCP,
 watch, or transport playbook.

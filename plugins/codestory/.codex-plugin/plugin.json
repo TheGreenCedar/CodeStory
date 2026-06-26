@@ -24,9 +24,9 @@
     "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
     "termsOfServiceURL": "https://github.com/TheGreenCedar/CodeStory",
     "defaultPrompt": [
-      "@CodeStory Check local and agent readiness for this checkout before packet/search.",
-      "@CodeStory Find RefreshMode and the index path into codestory-store.",
-      "@CodeStory I am editing a file in this repo. What symbols are affected and what tests should I run first?"
+      "@CodeStory Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]?",
+      "@CodeStory I am editing a file in this repo. What symbols are affected and what tests should I run first?",
+      "@CodeStory Read codestory://status, ground this checkout if allowed, and report which surfaces are ready."
     ],
     "brandColor": "#2563EB",
     "screenshots": []

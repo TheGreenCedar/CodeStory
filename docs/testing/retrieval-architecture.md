@@ -1,5 +1,7 @@
 # Sidecar retrieval — architecture and promotion guide
 
+**Audience:** Evidence record — not an install guide.
+
 Sidecar-primary packet retrieval (Zoekt lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
 `codestory-retrieval` and integrated in `codestory-runtime`. Production packet paths use
 generic symbol/path roles; benchmark-only probe catalogs remain behind test-only eval harness hooks.
@@ -260,7 +262,8 @@ node --test scripts/tests/codestory-agent-ab-analyzer.test.mjs
 ## Promotion Gates
 
 This page defines the gates; dated pass/fail rows live in
-[`benchmark-ledger.md`](benchmark-ledger.md) and contributor verification lanes
+[language-expansion holdout stats](language-expansion-holdout-stats.md) and
+contributor verification lanes
 live in [`testing-matrix.md`](../contributors/testing-matrix.md).
 
 Support claims must be backed by committed benchmark manifests, generated

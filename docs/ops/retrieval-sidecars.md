@@ -9,11 +9,13 @@ A healthy SQLite cache alone is not enough. Full sidecars also do not prove
 answer quality by themselves; answer quality still needs the matching
 packet-runtime, drill, or benchmark evidence tier.
 
-| Runtime truth | Allows | Blocks |
-| --- | --- | --- |
-| `codestory://status` | Current MCP `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `runtime_truth`, `sidecar_setup`, `build_source`, `repo_ref`, and `allowed_surfaces`; `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Use this first when plugin MCP is live. | Guessing the active runtime from source checkout, marketplace cache, or PATH alone. |
-| `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
-| `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
+**Runtime truth and surface gating:** When plugin MCP is live, read
+`codestory://status` first and obey `allowed_surfaces` plus `retrieval_mode`.
+Field semantics and operator repair prompts live in
+[users/troubleshooting.md](../users/troubleshooting.md) and
+[glossary.md](../glossary.md#retrieval-mode). This runbook owns bootstrap,
+index, inventory, maintainer internals, and promotion-adjacent ops — not a
+duplicate status-field matrix.
 
 For local-only audits, do not run sidecar repair just because `packet`, `search`,
 or `context` is blocked. Use this runbook when the task needs one of those
@@ -48,8 +50,11 @@ codestory-cli retrieval status --project <repo> --format json
 ```
 
 When plugin MCP is live, read `codestory://status` first and use its
-`allowed_surfaces` values as the tool boundary. Do not infer the active runtime
-from the source checkout, marketplace cache, or PATH when status is available.
+`allowed_surfaces` values as the tool boundary. For field semantics and
+first-response repair prompts, use
+[users/troubleshooting.md](../users/troubleshooting.md). Do not infer the active
+runtime from the source checkout, marketplace cache, or PATH when status is
+available.
 
 | State | Meaning | Operator action |
 |-------|---------|-----------------|
@@ -276,6 +281,10 @@ are not promoted into product runtime defaults, and do not substitute for
 llama.cpp sidecar retrieval.
 
 ## Operator troubleshooting
+
+For session-level repair prompts and status-field interpretation, start with
+[users/troubleshooting.md](../users/troubleshooting.md). Use this table for
+sidecar-layer symptoms during ops work:
 
 | Symptom | Likely cause | Action |
 |---------|--------------|--------|
