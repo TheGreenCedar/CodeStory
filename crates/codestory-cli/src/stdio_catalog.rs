@@ -1290,14 +1290,14 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "files",
-        description: "List indexed files and coverage from the existing local index; never refreshes, indexes, or bootstraps sidecars.",
+        description: "List indexed files and coverage from a locally fresh index; refreshes local graph before dispatch and never bootstraps sidecars.",
         input_schema: FILES_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(INDEXED_FILES_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
     },
     ToolSpec {
         name: "affected",
-        description: "Analyze explicit changed paths against the existing local index; never discovers git changes, refreshes, indexes, or bootstraps sidecars.",
+        description: "Analyze explicit changed paths against a locally fresh index; uses provided paths only, refreshes local graph before dispatch, never discovers git changes, and never bootstraps sidecars.",
         input_schema: AFFECTED_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AFFECTED_ANALYSIS_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::read_only(),

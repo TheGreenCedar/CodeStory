@@ -9,7 +9,6 @@ use tempfile::tempdir;
 
 // Repo-scale smoke guard. Phase-specific assertions below carry the product
 // repeat-refresh contract; wall-clock process timing remains telemetry.
-const REPEAT_FULL_REFRESH_SMOKE_SECONDS_BUDGET: f64 = 45.0;
 const REPEAT_GRAPH_PHASE_SECONDS_BUDGET: f64 = 20.0;
 const REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET: f64 = 3.0;
 
@@ -21,6 +20,7 @@ struct RepoE2eStats {
     search_dir: String,
     proof_tier: String,
     warnings: Vec<String>,
+    stats_baseline: StatsLogBaseline,
     embed_batch_size: u32,
     search_dir_unchanged: bool,
     index_seconds: f64,
@@ -82,6 +82,18 @@ struct SidecarManifestStats {
     graph_artifact_hash_present: bool,
     dense_reason_counts_json: String,
     dense_reason_count_total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct StatsLogBaseline {
+    source_path: String,
+    date: String,
+    commit: String,
+    scenario: String,
+    index_seconds: f64,
+    graph_phase_seconds: f64,
+    semantic_phase_seconds: f64,
+    repeat_full_refresh_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,8 +161,7 @@ struct ReportStats {
 
 const PROOF_TIER_STATS_ONLY: &str = "stats_only";
 const PROOF_TIER_FULL_SIDECAR: &str = "full_sidecar";
-const INDEX_SECONDS_WARNING_THRESHOLD: f64 = 600.0;
-const SEMANTIC_PHASE_SECONDS_WARNING_THRESHOLD: f64 = 500.0;
+const RELEASE_WARNING_REGRESSION_FACTOR: f64 = 1.25;
 
 fn release_readiness_proof_tier(
     sidecar_status_after_retrieval_index: &str,
@@ -163,19 +174,94 @@ fn release_readiness_proof_tier(
     }
 }
 
-fn release_readiness_warnings(index_seconds: f64, semantic_phase_seconds: f64) -> Vec<String> {
+fn release_readiness_warnings(
+    index_seconds: f64,
+    semantic_phase_seconds: f64,
+    baseline: &StatsLogBaseline,
+) -> Vec<String> {
     let mut warnings = Vec::new();
-    if index_seconds > INDEX_SECONDS_WARNING_THRESHOLD {
+    let index_threshold = baseline.index_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
+    if index_seconds > index_threshold {
         warnings.push(format!(
-            "index_seconds exceeded {INDEX_SECONDS_WARNING_THRESHOLD:.0}s release-readiness warning threshold: {index_seconds:.2}s"
+            "index_seconds exceeded latest stats-log baseline by >25%: current {index_seconds:.2}s > threshold {index_threshold:.2}s from {} {} ({:.2}s)",
+            baseline.date, baseline.commit, baseline.index_seconds
         ));
     }
-    if semantic_phase_seconds > SEMANTIC_PHASE_SECONDS_WARNING_THRESHOLD {
+    let semantic_threshold = baseline.semantic_phase_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
+    if semantic_phase_seconds > semantic_threshold {
         warnings.push(format!(
-            "semantic_phase_seconds exceeded {SEMANTIC_PHASE_SECONDS_WARNING_THRESHOLD:.0}s release-readiness warning threshold: {semantic_phase_seconds:.2}s"
+            "semantic_phase_seconds exceeded latest stats-log baseline by >25%: current {semantic_phase_seconds:.2}s > threshold {semantic_threshold:.2}s from {} {} ({:.2}s)",
+            baseline.date, baseline.commit, baseline.semantic_phase_seconds
         ));
     }
     warnings
+}
+
+fn latest_phase_stats_baseline(repo_root: &Path) -> StatsLogBaseline {
+    let source_path = repo_root.join("docs/testing/codestory-e2e-stats-log.md");
+    let log = fs::read_to_string(&source_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read release stats baseline {}: {error}",
+            source_path.display()
+        )
+    });
+    let mut baseline = latest_phase_stats_baseline_from_str(&log)
+        .expect("docs/testing/codestory-e2e-stats-log.md must contain a Phase Metrics row");
+    baseline.source_path = source_path.display().to_string();
+    baseline
+}
+
+fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
+    let mut in_phase_table = false;
+    let mut latest = None;
+    for line in log.lines() {
+        if line.trim() == "## Phase Metrics" {
+            in_phase_table = true;
+            continue;
+        }
+        if !in_phase_table || !line.starts_with('|') {
+            continue;
+        }
+        let fields = line.split('|').skip(1).map(str::trim).collect::<Vec<_>>();
+        if fields.len() < 9 || fields[0] == "Date" || fields[0].starts_with("---") {
+            continue;
+        }
+        let Some(index_seconds) = parse_stats_seconds(fields[3]) else {
+            continue;
+        };
+        let Some(graph_phase_seconds) = parse_stats_seconds(fields[4]) else {
+            continue;
+        };
+        let Some(semantic_phase_seconds) = parse_stats_seconds(fields[5]) else {
+            continue;
+        };
+        let Some(repeat_full_refresh_seconds) = parse_repeat_full_refresh_seconds(fields[2]) else {
+            continue;
+        };
+        latest = Some(StatsLogBaseline {
+            source_path: String::new(),
+            date: fields[0].to_string(),
+            commit: fields[1].to_string(),
+            scenario: fields[2].to_string(),
+            index_seconds,
+            graph_phase_seconds,
+            semantic_phase_seconds,
+            repeat_full_refresh_seconds,
+        });
+    }
+    latest
+}
+
+fn parse_repeat_full_refresh_seconds(value: &str) -> Option<f64> {
+    let marker = "repeat full refresh ";
+    let start = value.find(marker)? + marker.len();
+    let seconds = value[start..].split_once('s')?.0.trim();
+    parse_stats_seconds(seconds)
+}
+
+fn parse_stats_seconds(value: &str) -> Option<f64> {
+    let value = value.replace(',', "");
+    value.parse::<f64>().ok().filter(|value| value.is_finite())
 }
 
 #[derive(Debug)]
@@ -226,16 +312,52 @@ fn release_readiness_proof_tier_does_not_claim_drill_or_promotion() {
 
 #[test]
 fn release_readiness_warnings_only_emit_above_thresholds() {
-    assert!(release_readiness_warnings(600.0, 500.0).is_empty());
+    let baseline = StatsLogBaseline {
+        source_path: "docs/testing/codestory-e2e-stats-log.md".to_string(),
+        date: "2026-06-24".to_string(),
+        commit: "f8ffbd15+wt".to_string(),
+        scenario: "release evidence".to_string(),
+        index_seconds: 80.0,
+        graph_phase_seconds: 16.0,
+        semantic_phase_seconds: 50.0,
+        repeat_full_refresh_seconds: 30.0,
+    };
+
+    assert!(release_readiness_warnings(100.0, 62.5, &baseline).is_empty());
 
     assert_eq!(
-        release_readiness_warnings(600.01, 500.01),
+        release_readiness_warnings(100.01, 62.51, &baseline),
         vec![
-            "index_seconds exceeded 600s release-readiness warning threshold: 600.01s".to_string(),
-            "semantic_phase_seconds exceeded 500s release-readiness warning threshold: 500.01s"
-                .to_string(),
+            "index_seconds exceeded latest stats-log baseline by >25%: current 100.01s > threshold 100.00s from 2026-06-24 f8ffbd15+wt (80.00s)".to_string(),
+            "semantic_phase_seconds exceeded latest stats-log baseline by >25%: current 62.51s > threshold 62.50s from 2026-06-24 f8ffbd15+wt (50.00s)".to_string(),
         ]
     );
+}
+
+#[test]
+fn latest_phase_stats_baseline_parses_last_valid_phase_row() {
+    let baseline = latest_phase_stats_baseline_from_str(
+        r#"
+## Phase Metrics
+
+| Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-06-23 | old+wt | old stats; repeat full refresh 30.00s with 0 embedded | 90.00 | 15.00 | 60.00 | 0 | 1 | 0 |
+| 2026-06-24 | new+wt | latest stats; repeat full refresh 32.57s with 907 reused and 0 embedded | 85.15 | 17.79 | 55.34 | 0 | 907 | 0 |
+"#,
+    )
+    .expect("phase baseline");
+
+    assert_eq!(baseline.date, "2026-06-24");
+    assert_eq!(baseline.commit, "new+wt");
+    assert_eq!(
+        baseline.scenario,
+        "latest stats; repeat full refresh 32.57s with 907 reused and 0 embedded"
+    );
+    assert_eq!(baseline.index_seconds, 85.15);
+    assert_eq!(baseline.graph_phase_seconds, 17.79);
+    assert_eq!(baseline.semantic_phase_seconds, 55.34);
+    assert_eq!(baseline.repeat_full_refresh_seconds, 32.57);
 }
 
 fn repo_root() -> PathBuf {
@@ -726,7 +848,9 @@ fn codestory_repo_release_e2e_emits_stats() {
         search_sidecar_shadow_retrieval_mode.as_str(),
     )
     .to_string();
-    let warnings = release_readiness_warnings(index_seconds, semantic_phase_seconds);
+    let stats_baseline = latest_phase_stats_baseline(project_root.as_path());
+    let warnings =
+        release_readiness_warnings(index_seconds, semantic_phase_seconds, &stats_baseline);
 
     let stats = RepoE2eStats {
         project_root: project_root.display().to_string(),
@@ -735,6 +859,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         search_dir: search_dir.display().to_string(),
         proof_tier,
         warnings,
+        stats_baseline,
         embed_batch_size: 128,
         search_dir_unchanged,
         index_seconds,
@@ -973,10 +1098,14 @@ fn codestory_repo_release_e2e_emits_stats() {
         REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
         stats.repeat_semantic_phase_seconds
     );
+    let repeat_full_refresh_seconds_budget =
+        stats.stats_baseline.repeat_full_refresh_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
     assert!(
-        stats.repeat_full_refresh_seconds < REPEAT_FULL_REFRESH_SMOKE_SECONDS_BUDGET,
-        "repeat full refresh process smoke cap should stay under {:.0} seconds, got {:.2}s",
-        REPEAT_FULL_REFRESH_SMOKE_SECONDS_BUDGET,
+        stats.repeat_full_refresh_seconds < repeat_full_refresh_seconds_budget,
+        "repeat full refresh process smoke cap should stay within 25% of latest stats-log baseline {} {}: threshold {:.2}s, got {:.2}s",
+        stats.stats_baseline.date,
+        stats.stats_baseline.commit,
+        repeat_full_refresh_seconds_budget,
         stats.repeat_full_refresh_seconds
     );
     assert!(

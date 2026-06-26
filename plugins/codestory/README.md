@@ -50,8 +50,8 @@ or non-code folders.
 
 The status resource is the contract. When MCP is live, read
 `codestory://status` first and obey `allowed_surfaces`. Treat
-`server_version`, `server_executable`, `server_executable_sha256`, and
-`plugin_runtime` from status as the active runtime evidence; source docs,
+`server_version`, `server_executable`, `server_executable_sha256`,
+`plugin_runtime`, and `runtime_truth` from status as the active runtime evidence; source docs,
 marketplace cache contents, and local build outputs can all differ from the
 running server.
 
@@ -59,7 +59,7 @@ running server.
 | --- | --- | --- |
 | `allowed_surfaces.<surface>.allowed` for local graph surfaces | The named local surface only: `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, or `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, or `context` for broad candidate discovery and evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
-| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, and `allowed_surfaces`. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when the plugin launcher is active. | Guessing active runtime from source checkout or PATH alone. |
+| `codestory://status` fields | Current `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `runtime_truth`, `sidecar_setup`, `dirty_marker`, and `allowed_surfaces`. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when the plugin launcher is active. | Guessing active runtime from source checkout or PATH alone. |
 
 ## How It Runs
 
@@ -77,6 +77,9 @@ This package stays thin:
 - `hooks/` keeps CodeStory ambient for host adapters that support lifecycle
   hooks: `SessionStart` attempts strict startup grounding and
   `UserPromptSubmit` attempts request-aware packet grounding.
+- `hooks/codestory-dirty-hook.cjs` is the explicit opt-in Git hook manager for
+  local graph freshness. It installs CodeStory-managed blocks only, preserves
+  existing hook content, and uninstalls only those managed blocks.
 - `skills/codestory-grounding` is the single canonical CodeStory grounding
   skill shipped by this repository.
 
@@ -147,13 +150,35 @@ The first run should be agent-owned. The skill checks whether `codestory-cli` is
 live through MCP by reading `codestory://status`. If MCP is live, the agent uses
 `server_version`, `cli_version`, `server_executable`,
 `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`,
-`sidecar_setup`, and `allowed_surfaces` from status instead of rechecking PATH
+`runtime_truth`, `sidecar_setup`, `dirty_marker`, and `allowed_surfaces` from status instead of rechecking PATH
 or release metadata.
 
 Use `where.exe codestory-cli` and `codestory-cli --version` only when MCP is
 missing, status reports a suspect runtime, or you are debugging/repairing the
 installed CLI. If PATH changed during repair, start a fresh Codex host/app
 session before treating a new MCP runtime as live.
+
+### Optional dirty-marker Git hooks
+
+The plugin status path can consume dirty markers written under plugin data. To
+mark a repo dirty after Git checkout/merge/rewrite operations, install the
+optional hook blocks explicitly:
+
+```bash
+node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> --plugin-data <plugin-data-dir>
+node plugins/codestory/hooks/codestory-dirty-hook.cjs status --project <repo> --plugin-data <plugin-data-dir>
+```
+
+Uninstall removes only the CodeStory-managed blocks:
+
+```bash
+node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <repo> --plugin-data <plugin-data-dir>
+```
+
+If status reports `foreign_hook_present`, existing hook content was preserved.
+If it reports `uninstall_required`, uninstall the old managed block before
+installing again. Dirty markers affect local graph freshness only; packet,
+search, and context remain gated on full sidecar readiness.
 
 ## What To Ask
 

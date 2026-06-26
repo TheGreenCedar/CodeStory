@@ -11,7 +11,7 @@ packet-runtime, drill, or benchmark evidence tier.
 
 | Runtime truth | Allows | Blocks |
 | --- | --- | --- |
-| `codestory://status` | Current MCP `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `sidecar_setup`, `build_source`, `repo_ref`, and `allowed_surfaces`; `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Use this first when plugin MCP is live. | Guessing the active runtime from source checkout, marketplace cache, or PATH alone. |
+| `codestory://status` | Current MCP `server_version`, `cli_version`, `server_executable`, `server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, `runtime_truth`, `sidecar_setup`, `build_source`, `repo_ref`, and `allowed_surfaces`; `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Use this first when plugin MCP is live. | Guessing the active runtime from source checkout, marketplace cache, or PATH alone. |
 | `allowed_surfaces.<surface>.allowed` for `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` | The named MCP local graph surface only; check each surface's own `.allowed` bit before calling it. | Other local surfaces, `packet`, `search`, or `context`. |
 | `allowed_surfaces.packet.allowed`, `allowed_surfaces.search.allowed`, and `allowed_surfaces.context.allowed` with `retrieval_mode=full` | `packet`, `search`, and `context` for broad candidate discovery and bounded evidence packets. | Answer-quality claims without packet-runtime, drill, benchmark, or source evidence. |
 
@@ -118,9 +118,17 @@ defaults do not match your machine:
 | `CODESTORY_EMBED_MODEL_DIR` | Host path containing `bge-base-en-v1.5.Q8_0.gguf` for the compose embed service |
 | `CODESTORY_EMBED_BACKEND` | `llamacpp`; unset also means product llama.cpp mode for retrieval commands |
 | `CODESTORY_EMBED_LLAMACPP_URL` | Local embedding endpoint, default `http://127.0.0.1:8080/v1/embeddings` |
+| `CODESTORY_EMBED_DEVICE_STATE` | Optional operator assertion for observed device state: `accelerated`, `cpu`, or unset/unknown |
+| `CODESTORY_EMBED_ALLOW_CPU` | Set to `1` only when intentional CPU-backed retrieval is acceptable on this machine |
+| `CODESTORY_EMBED_DEVICE_POLICY` | Optional policy alias; set `allow_cpu` instead of `CODESTORY_EMBED_ALLOW_CPU=1` when CPU mode is intentional |
 | `CODESTORY_ZOEKT_PORT` | Override Zoekt HTTP port when `6070` is unavailable |
 | `CODESTORY_QDRANT_HTTP_PORT` | Override Qdrant HTTP port when `6333` is unavailable |
 | `CODESTORY_QDRANT_GRPC_PORT` | Override Qdrant gRPC port when `6334` is unavailable |
+
+If device state is unknown, full packet/search readiness fails closed by
+default. Use the CPU opt-in only as an explicit operator decision; otherwise
+configure/verify accelerated llama.cpp execution and set
+`CODESTORY_EMBED_DEVICE_STATE=accelerated`.
 
 Keep endpoint and cache-root settings out of project `.codestory.toml` files.
 Use trusted user config, explicit CLI flags, or environment variables for those
@@ -206,12 +214,45 @@ not an answer-quality claim and not a product packet/search success.
 Generated sidecar artifacts are disposable local cache state. To recover from a
 bad setup:
 
-1. Stop the relevant Docker/sidecar services.
-2. Move the affected CodeStory-owned Qdrant, Zoekt, or SCIP cache directory
-   aside under the cache root.
-3. Rerun `retrieval bootstrap`.
-4. Rerun `retrieval index --project <repo> --refresh full`.
-5. Delete the backup only after status reports the expected mode.
+Start with the read-only inventory dry-run:
+
+```powershell
+codestory-cli retrieval inventory --project <repo> --format markdown
+codestory-cli retrieval inventory --project <repo> --format json
+```
+
+The inventory lists CodeStory-owned sidecar namespaces, state paths, cleanup
+commands, Compose projects, matching containers/networks, visible ports, and
+the required `bge-base-en-v1.5.Q8_0.gguf` model check. It classifies namespaces
+as `live`, `stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate
+and blocking reasons. It is a dry-run status surface only: it does not run
+Docker prune, remove containers, delete networks, or clear state files, and it
+works even when packet/search readiness is unavailable.
+
+To let the CLI remove only CodeStory-owned inventory safe candidates, review the
+dry-run output first and then pass the explicit apply flag:
+
+```powershell
+codestory-cli retrieval inventory --project <repo> --format markdown
+codestory-cli retrieval inventory --project <repo> --format json
+codestory-cli retrieval inventory --project <repo> --apply --format markdown
+codestory-cli retrieval inventory --project <repo> --apply --format json
+```
+
+`--apply` removes only namespaces classified as inventory safe candidates. Live
+namespaces, incomplete state, and unknown ownership stay blocked with
+per-namespace reasons. The apply path removes exact CodeStory-owned state/data
+paths and explicitly matched sidecar resources only; it does not run Docker
+prune, broad Docker cleanup, host/global network deletion, readiness-triggered
+cleanup, or packet/search-triggered cleanup.
+
+1. Run the dry-run inventory in Markdown and JSON.
+2. Confirm the safe candidates and blocked reasons.
+3. Run `retrieval inventory --apply` only for operator-approved cleanup.
+4. Rerun `retrieval bootstrap`.
+5. Rerun `retrieval index --project <repo> --refresh full`.
+6. Confirm `retrieval status --project <repo> --format json` reports the
+   expected mode.
 
 `retrieval down` clears the sidecar state file only. Stop Docker/Compose
 separately if containers must be removed.

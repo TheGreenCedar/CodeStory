@@ -9,8 +9,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// bge-base-en-v1.5 vector width (must match Qdrant collection and llama.cpp model).
 pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
@@ -30,6 +32,17 @@ const DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX";
 const LLAMACPP_BATCH_SIZE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_BATCH_SIZE";
 const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 const ALLOW_REMOTE_EMBEDDINGS_ENV: &str = "CODESTORY_ALLOW_REMOTE_EMBEDDINGS";
+const DEVICE_POLICY_ENV: &str = "CODESTORY_EMBED_DEVICE_POLICY";
+const DEVICE_STATE_ENV: &str = "CODESTORY_EMBED_DEVICE_STATE";
+const DEVICE_PROVIDER_ENV: &str = "CODESTORY_EMBED_DEVICE_PROVIDER";
+const DEVICE_NAME_ENV: &str = "CODESTORY_EMBED_DEVICE_NAME";
+const DISABLE_HOST_GPU_DETECT_ENV: &str = "CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT";
+const LLAMACPP_DEVICE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_DEVICE";
+const LLAMACPP_N_GPU_LAYERS_ENV: &str = "CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS";
+const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
+const NATIVE_LLAMA_LOG_START_MARKER: &str = "starting native llama.cpp embedding server:";
+const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_EMBED_DEVICE_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +53,27 @@ const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 6;
 pub struct EmbeddingRuntimeProbe {
     pub reachable: bool,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingDeviceReadiness {
+    pub requested_policy: &'static str,
+    pub observed_state: &'static str,
+    pub observation_source: &'static str,
+    pub detected_provider: Option<String>,
+    pub detected_gpu: Option<String>,
+    pub accelerator_requested: bool,
+    pub accelerator_request_provider: Option<String>,
+    pub accelerator_request_device: Option<String>,
+    pub cpu_allowed: bool,
+    pub full_retrieval_allowed: bool,
+    pub degraded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingAcceleratorRequest {
+    pub device: String,
+    pub n_gpu_layers: String,
 }
 
 /// Stable id stored on retrieval manifest rows (backend + model family).
@@ -58,6 +92,37 @@ pub fn manifest_embedding_backend_is_product(backend: Option<&str>) -> bool {
 }
 
 pub fn ensure_product_embedding_backend() -> Result<()> {
+    ensure_product_embedding_backend_with_device(embedding_device_readiness())
+}
+
+pub fn ensure_product_embedding_backend_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<()> {
+    ensure_product_embedding_backend_static()?;
+    let deadline = Instant::now() + RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT;
+    let mut device = embedding_device_readiness_for_runtime(runtime);
+    loop {
+        if device.full_retrieval_allowed {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("{}", device.degraded_reason.expect("device policy reason"));
+        }
+        thread::sleep((deadline - now).min(RUNTIME_EMBED_DEVICE_OBSERVATION_POLL));
+        device = embedding_device_readiness_for_runtime(runtime);
+    }
+}
+
+fn ensure_product_embedding_backend_with_device(device: EmbeddingDeviceReadiness) -> Result<()> {
+    ensure_product_embedding_backend_static()?;
+    if !device.full_retrieval_allowed {
+        bail!("{}", device.degraded_reason.expect("device policy reason"));
+    }
+    Ok(())
+}
+
+fn ensure_product_embedding_backend_static() -> Result<()> {
     if !super::config::qdrant_semantic_vectors_enabled() {
         bail!("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS=0 is unsupported for product sidecar indexing");
     }
@@ -67,6 +132,324 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
+    embedding_device_readiness_with_observed_state(None)
+}
+
+pub fn embedding_device_readiness_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> EmbeddingDeviceReadiness {
+    embedding_device_readiness_with_observed_state(observe_sidecar_embedding_device_state(runtime))
+}
+
+fn embedding_device_readiness_with_observed_state(
+    sidecar_observed_state: Option<EmbeddingDeviceObservation>,
+) -> EmbeddingDeviceReadiness {
+    let cpu_allowed = explicit_cpu_allowed();
+    let detection = host_embedding_device_detection();
+    let accelerator_request = if cpu_allowed {
+        None
+    } else {
+        embedding_accelerator_request_for_detection(detection.as_ref())
+    };
+    let accelerator_requested = accelerator_request.is_some();
+    let observation = sidecar_observed_state
+        .unwrap_or_else(|| observed_embedding_device_state(cpu_allowed, accelerator_requested));
+    let observed_state = observation.state;
+    let accelerated = observed_state == "accelerated";
+    let full_retrieval_allowed = accelerated || cpu_allowed;
+    let requested_policy = if cpu_allowed {
+        "cpu_allowed"
+    } else {
+        "accelerator_required"
+    };
+    let degraded_reason = (!full_retrieval_allowed).then(|| {
+        let request_note = if accelerator_requested {
+            " host accelerator was detected/requested, but the embedding sidecar did not prove accelerator execution;"
+        } else {
+            ""
+        };
+        format!("embedding_device_unverified: requested_policy={requested_policy} observed_device={observed_state} observation_source={};{request_note} set {ALLOW_CPU_ENV}=1 or {DEVICE_POLICY_ENV}=allow_cpu for intentional CPU-backed retrieval", observation.source)
+    });
+
+    EmbeddingDeviceReadiness {
+        requested_policy,
+        observed_state,
+        observation_source: observation.source,
+        detected_provider: detection.as_ref().map(|gpu| gpu.provider.clone()),
+        detected_gpu: detection.map(|gpu| gpu.name),
+        accelerator_requested,
+        accelerator_request_provider: accelerator_request.as_ref().map(|_| "vulkan".to_string()),
+        accelerator_request_device: accelerator_request
+            .as_ref()
+            .map(|request| request.device.clone()),
+        cpu_allowed,
+        full_retrieval_allowed,
+        degraded_reason,
+    }
+}
+
+fn observe_sidecar_embedding_device_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<EmbeddingDeviceObservation> {
+    if crate::config::embedding_server_launch_mode()
+        .ok()
+        .is_some_and(|mode| mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned)
+    {
+        return observe_native_embedding_device_state(runtime);
+    }
+    let output = Command::new("docker")
+        .args([
+            "logs",
+            "--tail",
+            "200",
+            &format!("{}-embed", runtime.compose_project),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    match observed_embedding_device_state_from_text(&text) {
+        "unknown" => None,
+        state => Some(EmbeddingDeviceObservation {
+            state,
+            source: "sidecar_log",
+        }),
+    }
+}
+
+fn observe_native_embedding_device_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<EmbeddingDeviceObservation> {
+    let text = std::fs::read_to_string(native_embedding_log_path(runtime)).ok()?;
+    match observed_embedding_device_state_from_text(native_embedding_log_current_launch(&text)) {
+        "unknown" => None,
+        state => Some(EmbeddingDeviceObservation {
+            state,
+            source: "native_log",
+        }),
+    }
+}
+
+pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeConfig) -> PathBuf {
+    runtime
+        .layout
+        .state_file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("llama-server-native.log")
+}
+
+fn native_embedding_log_current_launch(text: &str) -> &str {
+    text.rfind(NATIVE_LLAMA_LOG_START_MARKER)
+        .map(|offset| &text[offset..])
+        .unwrap_or(text)
+}
+
+pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
+    if explicit_cpu_allowed() {
+        return None;
+    }
+    let detection = host_embedding_device_detection();
+    embedding_accelerator_request_for_detection(detection.as_ref())
+}
+
+fn embedding_accelerator_request_for_detection(
+    detection: Option<&HostGpuDetection>,
+) -> Option<EmbeddingAcceleratorRequest> {
+    let detection = detection?;
+    (detection.provider == "amd").then(|| EmbeddingAcceleratorRequest {
+        device: env_trimmed(LLAMACPP_DEVICE_ENV).unwrap_or_else(|| "Vulkan0".to_string()),
+        n_gpu_layers: env_trimmed(LLAMACPP_N_GPU_LAYERS_ENV).unwrap_or_else(|| "99".to_string()),
+    })
+}
+
+fn explicit_cpu_allowed() -> bool {
+    env_truthy(ALLOW_CPU_ENV)
+        || std::env::var(DEVICE_POLICY_ENV)
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "allow_cpu" | "cpu_allowed" | "cpu"
+                )
+            })
+            .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmbeddingDeviceObservation {
+    state: &'static str,
+    source: &'static str,
+}
+
+fn observed_embedding_device_state(
+    cpu_allowed: bool,
+    accelerator_requested: bool,
+) -> EmbeddingDeviceObservation {
+    if let Some(state) = std::env::var(DEVICE_STATE_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .and_then(|value| match value.as_str() {
+            "accelerated" | "gpu" | "vulkan" | "cuda" | "metal" => Some("accelerated"),
+            "cpu" => Some("cpu"),
+            "unknown" => Some("unknown"),
+            _ => None,
+        })
+    {
+        return EmbeddingDeviceObservation {
+            state,
+            source: "manual_env",
+        };
+    }
+    if cpu_allowed {
+        return EmbeddingDeviceObservation {
+            state: "cpu",
+            source: "cpu_policy",
+        };
+    }
+    if accelerator_requested {
+        return EmbeddingDeviceObservation {
+            state: "unknown",
+            source: "accelerator_request_unobserved",
+        };
+    }
+    EmbeddingDeviceObservation {
+        state: "unknown",
+        source: "sidecar_unobserved",
+    }
+}
+
+fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
+    let mut saw_cpu = false;
+    for line in text.lines().map(|line| line.to_ascii_lowercase()) {
+        if line_reports_gpu_offload(&line) == Some(true)
+            || (line.contains("using device")
+                && ["vulkan", "cuda", "metal"]
+                    .iter()
+                    .any(|needle| line.contains(needle)))
+        {
+            return "accelerated";
+        }
+        saw_cpu |= line_reports_gpu_offload(&line) == Some(false)
+            || line.contains("n_gpu_layers = 0")
+            || line.contains("using cpu")
+            || line.contains("no gpu")
+            || line.contains("no vulkan device");
+    }
+    if saw_cpu { "cpu" } else { "unknown" }
+}
+
+fn line_reports_gpu_offload(line: &str) -> Option<bool> {
+    let keyword = if let Some(offset) = line.find("offloaded ") {
+        offset + "offloaded ".len()
+    } else if let Some(offset) = line.find("offloading ") {
+        offset + "offloading ".len()
+    } else {
+        return None;
+    };
+    let digits = line[keyword..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<u32>().ok().map(|count| count > 0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostGpuDetection {
+    provider: String,
+    name: String,
+}
+
+fn host_embedding_device_detection() -> Option<HostGpuDetection> {
+    if env_truthy(DISABLE_HOST_GPU_DETECT_ENV) {
+        return None;
+    }
+    let env_provider = env_trimmed(DEVICE_PROVIDER_ENV).map(|value| normalize_gpu_provider(&value));
+    let env_name = env_trimmed(DEVICE_NAME_ENV);
+    if let Some(provider) = env_provider.filter(|provider| provider == "amd") {
+        return Some(HostGpuDetection {
+            provider,
+            name: env_name.unwrap_or_else(|| "AMD GPU".to_string()),
+        });
+    }
+    detect_windows_amd_gpu()
+}
+
+fn detect_windows_amd_gpu() -> Option<HostGpuDetection> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            windows_video_controller_probe_script(),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    detect_amd_gpu_from_windows_video_controller(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn windows_video_controller_probe_script() -> &'static str {
+    r#"$job = Start-Job -ScriptBlock { Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) $($_.AdapterCompatibility)" } }; if (Wait-Job $job -Timeout 10) { Receive-Job $job; Remove-Job $job -Force } else { Stop-Job $job; Remove-Job $job -Force; exit 124 }"#
+}
+
+fn detect_amd_gpu_from_windows_video_controller(output: &str) -> Option<HostGpuDetection> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| {
+            let normalized = line.to_ascii_lowercase();
+            normalized.contains("amd")
+                || normalized.contains("radeon")
+                || normalized.contains("advanced micro devices")
+        })
+        .map(|name| HostGpuDetection {
+            provider: "amd".to_string(),
+            name: name.to_string(),
+        })
+}
+
+fn normalize_gpu_provider(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.contains("amd")
+        || normalized.contains("radeon")
+        || normalized.contains("advanced micro devices")
+    {
+        "amd".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 pub fn embed_query(text: &str) -> Result<Vec<f32>> {
@@ -386,6 +769,8 @@ pub fn qdrant_vector_dim() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -454,6 +839,414 @@ mod tests {
                 .contains("llama.cpp embedding sidecar is mandatory"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn default_embedding_device_policy_blocks_unknown_device() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.observation_source, "sidecar_unobserved");
+        assert_eq!(readiness.detected_provider, None);
+        assert_eq!(readiness.detected_gpu, None);
+        assert!(!readiness.accelerator_requested);
+        assert!(!readiness.full_retrieval_allowed);
+        assert!(
+            readiness
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("embedding_device_unverified")
+        );
+    }
+
+    #[test]
+    fn explicit_cpu_opt_in_allows_cpu_backed_retrieval() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "cpu");
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "cpu_allowed");
+        assert_eq!(readiness.observed_state, "cpu");
+        assert_eq!(readiness.observation_source, "manual_env");
+        assert!(readiness.cpu_allowed);
+        assert!(!readiness.accelerator_requested);
+        assert!(embedding_accelerator_request().is_none());
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn windows_video_controller_parser_detects_amd_gpu() {
+        let detection = detect_amd_gpu_from_windows_video_controller(
+            "Intel(R) UHD Graphics\r\nAMD Radeon RX 7800 XT\r\n",
+        )
+        .expect("amd gpu");
+
+        assert_eq!(detection.provider, "amd");
+        assert_eq!(detection.name, "AMD Radeon RX 7800 XT");
+    }
+
+    #[test]
+    fn windows_video_controller_parser_skips_virtual_monitor_before_amd() {
+        let detection = detect_amd_gpu_from_windows_video_controller(
+            "Meta Virtual Monitor Meta Platforms\r\nAMD Radeon RX 7900 XT Advanced Micro Devices, Inc.\r\n",
+        )
+        .expect("amd gpu");
+
+        assert_eq!(detection.provider, "amd");
+        assert!(detection.name.contains("AMD Radeon RX 7900 XT"));
+    }
+
+    #[test]
+    fn windows_video_controller_probe_script_has_timeout() {
+        let script = windows_video_controller_probe_script();
+
+        assert!(script.contains("Wait-Job $job -Timeout 10"));
+        assert!(script.contains("AdapterCompatibility"));
+        assert!(script.contains("Stop-Job $job"));
+        assert!(script.contains("exit 124"));
+    }
+
+    #[test]
+    fn amd_provider_env_detects_and_requests_vulkan_without_observing_acceleration() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7800 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _ngl = EnvGuard::remove(LLAMACPP_N_GPU_LAYERS_ENV);
+
+        let readiness = embedding_device_readiness();
+        let request = embedding_accelerator_request().expect("accelerator request");
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(
+            readiness.observation_source,
+            "accelerator_request_unobserved"
+        );
+        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
+        assert_eq!(
+            readiness.detected_gpu.as_deref(),
+            Some("AMD Radeon RX 7800 XT")
+        );
+        assert!(readiness.accelerator_requested);
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("vulkan")
+        );
+        assert_eq!(
+            readiness.accelerator_request_device.as_deref(),
+            Some("Vulkan0")
+        );
+        assert!(!readiness.cpu_allowed);
+        assert!(!readiness.full_retrieval_allowed);
+        assert!(
+            readiness
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sidecar did not prove accelerator execution")
+        );
+        assert_eq!(request.device, "Vulkan0");
+        assert_eq!(request.n_gpu_layers, "99");
+    }
+
+    #[test]
+    fn sidecar_log_observed_acceleration_allows_amd_vulkan_request() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let observed = observed_embedding_device_state_from_text(
+            "llama_model_load: offloaded 33/33 layers to GPU\n",
+        );
+        let readiness =
+            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+                state: observed,
+                source: "sidecar_log",
+            }));
+
+        assert_eq!(observed, "accelerated");
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.observation_source, "sidecar_log");
+        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
+        assert_eq!(
+            readiness.detected_gpu.as_deref(),
+            Some("AMD Radeon RX 7900 XT")
+        );
+        assert!(readiness.accelerator_requested);
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("vulkan")
+        );
+        assert_eq!(
+            readiness.accelerator_request_device.as_deref(),
+            Some("Vulkan0")
+        );
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn inconclusive_sidecar_log_keeps_amd_vulkan_request_unknown() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let observed = observed_embedding_device_state_from_text("server listening on 0.0.0.0");
+        let readiness = embedding_device_readiness_with_observed_state(None);
+
+        assert_eq!(observed, "unknown");
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(
+            readiness.observation_source,
+            "accelerator_request_unobserved"
+        );
+        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
+        assert!(readiness.accelerator_requested);
+        assert!(!readiness.full_retrieval_allowed);
+    }
+
+    #[test]
+    fn native_log_observed_acceleration_uses_native_source() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let readiness =
+            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+                state: "accelerated",
+                source: "native_log",
+            }));
+
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.observation_source, "native_log");
+        assert!(readiness.full_retrieval_allowed);
+    }
+
+    #[test]
+    fn native_log_current_launch_ignores_stale_acceleration() {
+        let text = concat!(
+            "starting native llama.cpp embedding server: old --device Vulkan0\n",
+            "using device Vulkan0\n",
+            "offloaded 33/33 layers to GPU\n",
+            "starting native llama.cpp embedding server: current --device Vulkan0\n",
+            "server listening on 0.0.0.0\n",
+            "n_gpu_layers = 0\n",
+        );
+
+        let current = native_embedding_log_current_launch(text);
+
+        assert!(current.contains("current --device Vulkan0"));
+        assert!(!current.contains("old --device Vulkan0"));
+        assert_eq!(observed_embedding_device_state_from_text(current), "cpu");
+    }
+
+    #[test]
+    fn explicit_unknown_device_still_fails_closed_on_amd_host() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "unknown");
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7800 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "unknown");
+        assert_eq!(readiness.observation_source, "manual_env");
+        assert!(!readiness.full_retrieval_allowed);
+    }
+
+    #[test]
+    fn explicit_accelerated_device_allows_retrieval_with_manual_observation_source() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "vulkan");
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "accelerator_required");
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.observation_source, "manual_env");
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn cpu_policy_without_device_state_reports_cpu_policy_source() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _allow_cpu = EnvGuard::set(ALLOW_CPU_ENV, "1");
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+
+        assert_eq!(readiness.requested_policy, "cpu_allowed");
+        assert_eq!(readiness.observed_state, "cpu");
+        assert_eq!(readiness.observation_source, "cpu_policy");
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn product_embedding_backend_requires_device_policy() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+
+        let error = ensure_product_embedding_backend()
+            .expect_err("unknown device should not satisfy product readiness");
+
+        assert!(
+            error.to_string().contains("embedding_device_unverified"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn product_embedding_backend_uses_runtime_native_log_observation() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let runtime = SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.path().join("zoekt"),
+                qdrant_data_dir: root.path().join("qdrant"),
+                scip_artifacts_root: root.path().join("scip"),
+                state_file: root.path().join("state").join("retrieval-sidecars.json"),
+            },
+            profile: SidecarProfile::Agent,
+            run_id: Some("shared-agent".into()),
+            namespace: "agent-shared-agent".into(),
+            compose_project: "codestory-agent-shared-agent".into(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".into(),
+            labels: BTreeMap::new(),
+        };
+        std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
+            .expect("create state dir");
+        std::fs::write(
+            native_embedding_log_path(&runtime),
+            "llama_model_load: offloaded 33/33 layers to GPU\n",
+        )
+        .expect("write native log");
+
+        let generic_error = ensure_product_embedding_backend()
+            .expect_err("generic check should not see the runtime native log");
+        assert!(
+            generic_error
+                .to_string()
+                .contains("embedding_device_unverified")
+        );
+
+        ensure_product_embedding_backend_for_runtime(&runtime)
+            .expect("runtime native log should satisfy accelerator policy");
+    }
+
+    #[test]
+    fn product_embedding_backend_for_runtime_waits_for_native_log_observation() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let runtime = SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.path().join("zoekt"),
+                qdrant_data_dir: root.path().join("qdrant"),
+                scip_artifacts_root: root.path().join("scip"),
+                state_file: root.path().join("state").join("retrieval-sidecars.json"),
+            },
+            profile: SidecarProfile::Agent,
+            run_id: Some("shared-agent".into()),
+            namespace: "agent-shared-agent".into(),
+            compose_project: "codestory-agent-shared-agent".into(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".into(),
+            labels: BTreeMap::new(),
+        };
+        std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
+            .expect("create state dir");
+        let log_path = native_embedding_log_path(&runtime);
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            std::fs::write(
+                log_path,
+                "starting native llama.cpp embedding server: test --device Vulkan0\nload_tensors: offloaded 13/13 layers to GPU\n",
+            )
+            .expect("write native log");
+        });
+
+        ensure_product_embedding_backend_for_runtime(&runtime)
+            .expect("runtime helper should wait for native log acceleration");
+        writer.join().expect("native log writer");
+    }
+
+    #[test]
+    fn product_embedding_backend_allows_explicit_cpu_policy() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::set(DEVICE_POLICY_ENV, "allow_cpu");
+        let _device = EnvGuard::set(DEVICE_STATE_ENV, "cpu");
+
+        ensure_product_embedding_backend().expect("explicit CPU policy should be accepted");
     }
 
     #[test]

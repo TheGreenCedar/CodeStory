@@ -7,7 +7,8 @@ use crate::generation::{
     manifest_staleness_reason, manifest_unavailable_reason,
 };
 use crate::health::{
-    RetrievalStatusReport, attach_manifest_contract, attach_repair_hint, probe_sidecar_health,
+    EmbeddingLaunchMetadata, RetrievalStatusReport, attach_manifest_contract, attach_repair_hint,
+    probe_sidecar_health_with_embedding_device, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_root};
 use anyhow::{Context, Result};
@@ -42,6 +43,26 @@ pub struct SidecarStateFile {
     pub embed_http_port: u16,
     #[serde(default = "default_embed_url")]
     pub embed_url: String,
+    #[serde(default = "default_embedding_device_policy")]
+    pub embedding_device_policy: String,
+    #[serde(default = "default_embedding_device_state")]
+    pub embedding_device_state: String,
+    #[serde(default = "default_embedding_device_observation_source")]
+    pub embedding_device_observation_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_gpu: Option<String>,
+    #[serde(default)]
+    pub embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_device: Option<String>,
+    #[serde(default)]
+    pub embedding_cpu_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     pub zoekt_data_dir: String,
     pub qdrant_data_dir: String,
     pub scip_artifacts_root: String,
@@ -60,8 +81,17 @@ pub fn sidecar_up_with_runtime(
     runtime: &SidecarRuntimeConfig,
     compose_file: Option<&Path>,
 ) -> Result<SidecarStateFile> {
+    sidecar_up_with_runtime_and_launch_metadata(runtime, compose_file, None)
+}
+
+pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
+    runtime: &SidecarRuntimeConfig,
+    compose_file: Option<&Path>,
+    embedding_launch: Option<EmbeddingLaunchMetadata>,
+) -> Result<SidecarStateFile> {
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     let state = SidecarStateFile {
         owner: "codestory".into(),
         profile: runtime.profile.as_str().into(),
@@ -73,6 +103,16 @@ pub fn sidecar_up_with_runtime(
         qdrant_grpc_port: layout.qdrant_grpc_port,
         embed_http_port: runtime.embed_http_port,
         embed_url: SidecarLayout::embed_base_url(runtime.embed_http_port),
+        embedding_device_policy: embedding_device.requested_policy.into(),
+        embedding_device_state: embedding_device.observed_state.into(),
+        embedding_device_observation_source: embedding_device.observation_source.into(),
+        embedding_detected_provider: embedding_device.detected_provider,
+        embedding_detected_gpu: embedding_device.detected_gpu,
+        embedding_accelerator_requested: embedding_device.accelerator_requested,
+        embedding_accelerator_request_provider: embedding_device.accelerator_request_provider,
+        embedding_accelerator_request_device: embedding_device.accelerator_request_device,
+        embedding_cpu_allowed: embedding_device.cpu_allowed,
+        embedding_launch,
         zoekt_data_dir: layout.zoekt_data_dir.display().to_string(),
         qdrant_data_dir: layout.qdrant_data_dir.display().to_string(),
         scip_artifacts_root: layout.scip_artifacts_root.display().to_string(),
@@ -168,6 +208,7 @@ fn sidecar_status_inner_with_runtime(
 ) -> Result<RetrievalStatusReport> {
     runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
     let project_id = sidecar_project_id_for_root(project_root);
     let manifest = if let Some(path) = storage_path.filter(|path| path.exists()) {
         let storage = Store::open(path).context("open storage for manifest")?;
@@ -189,9 +230,10 @@ fn sidecar_status_inner_with_runtime(
                 enrich_status_with_semantic_doc_stats(
                     attach_repair_hint(
                         attach_manifest_contract(
-                            crate::health::unavailable_status_report(
+                            unavailable_status_report_with_embedding_device(
                                 format!("sidecar_manifest_stale: {reason}"),
                                 Some(manifest.clone()),
+                                &embedding_device,
                             ),
                             project_root,
                         ),
@@ -210,9 +252,10 @@ fn sidecar_status_inner_with_runtime(
                 enrich_status_with_semantic_doc_stats(
                     attach_repair_hint(
                         attach_manifest_contract(
-                            crate::health::unavailable_status_report(
+                            unavailable_status_report_with_embedding_device(
                                 reason,
                                 Some(manifest.clone()),
+                                &embedding_device,
                             ),
                             project_root,
                         ),
@@ -224,7 +267,12 @@ fn sidecar_status_inner_with_runtime(
                 &runtime,
             ));
         }
-        let report = probe_sidecar_health(&layout, &project_id, manifest);
+        let report = probe_sidecar_health_with_embedding_device(
+            &layout,
+            &project_id,
+            manifest,
+            &embedding_device,
+        );
         return Ok(attach_status_ownership(
             enrich_status_with_semantic_doc_stats(
                 attach_repair_hint(
@@ -242,7 +290,12 @@ fn sidecar_status_inner_with_runtime(
     Ok(attach_status_ownership(
         attach_repair_hint(
             attach_manifest_contract(
-                probe_sidecar_health(&layout, &project_id, manifest),
+                probe_sidecar_health_with_embedding_device(
+                    &layout,
+                    &project_id,
+                    manifest,
+                    &embedding_device,
+                ),
                 project_root,
             ),
             project_root,
@@ -257,7 +310,16 @@ fn attach_status_ownership(
     runtime: &SidecarRuntimeConfig,
 ) -> RetrievalStatusReport {
     report.ownership = Some(runtime.ownership());
+    report.embedding_launch = read_sidecar_state(&runtime.layout.state_file)
+        .and_then(|state| state.embedding_launch)
+        .or(report.embedding_launch);
     report
+}
+
+fn read_sidecar_state(path: &Path) -> Option<SidecarStateFile> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
 }
 
 fn enrich_status_with_semantic_doc_stats(
@@ -313,6 +375,23 @@ fn strict_readiness_unavailable_reason(
     }
 
     let embedding_backend = crate::embeddings::embedding_runtime_id();
+    let expected_doc_backend = crate::embeddings::embedding_backend_label();
+    if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
+        if stats.mixed_embedding_backends {
+            return Ok(Some("sidecar_symbol_docs_mixed_embedding_backends".into()));
+        }
+        if stats
+            .embedding_backend
+            .as_deref()
+            .is_some_and(|backend| backend != expected_doc_backend)
+        {
+            return Ok(Some(format!(
+                "sidecar_symbol_doc_embedding_backend_changed: stored={} current={}",
+                stats.embedding_backend.as_deref().unwrap_or("<missing>"),
+                expected_doc_backend
+            )));
+        }
+    }
     let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     let current_input = compute_sidecar_input_fingerprint(
@@ -428,6 +507,18 @@ fn default_embed_url() -> String {
     SidecarLayout::embed_base_url(crate::config::DEFAULT_EMBED_HTTP_PORT)
 }
 
+fn default_embedding_device_policy() -> String {
+    "accelerator_required".into()
+}
+
+fn default_embedding_device_state() -> String {
+    "unknown".into()
+}
+
+fn default_embedding_device_observation_source() -> String {
+    "sidecar_unobserved".into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,8 +527,87 @@ mod tests {
     };
     use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
     use crate::test_support::retrieval_manifest_fixture;
-    use codestory_store::{FileInfo, FileRole};
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
+        SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.path().join("zoekt"),
+                qdrant_data_dir: root.path().join("qdrant"),
+                scip_artifacts_root: root.path().join("scip"),
+                state_file: root.path().join("retrieval-sidecars.json"),
+            },
+            profile: SidecarProfile::Local,
+            run_id: None,
+            namespace: "test".to_string(),
+            compose_project: "test".to_string(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".to_string(),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn semantic_doc_with_backend(backend: &str) -> LlmSymbolDoc {
+        LlmSymbolDoc {
+            node_id: NodeId(1),
+            file_node_id: None,
+            kind: NodeKind::FUNCTION,
+            display_name: "do_work".into(),
+            qualified_name: Some("pkg::do_work".into()),
+            file_path: Some("src/lib.rs".into()),
+            start_line: Some(1),
+            doc_text: "semantic doc".into(),
+            doc_version: 5,
+            doc_hash: "doc-hash".into(),
+            embedding_profile: Some("bge-base-en-v1.5".into()),
+            embedding_model: format!("BAAI/bge-base-en-v1.5-local|backend={backend}"),
+            embedding_backend: Some(backend.into()),
+            embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            doc_shape: Some("semantic_doc_version=5;scope=durable_symbols".into()),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            dense_reason: Some("public_api".into()),
+            embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
+            updated_at_epoch_ms: 123,
+        }
+    }
+
+    #[test]
+    fn status_attaches_embedding_launch_metadata_from_state_file() {
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        let launch = EmbeddingLaunchMetadata {
+            provider: "llamacpp".to_string(),
+            launch_mode: "native_spawned".to_string(),
+            endpoint: "http://127.0.0.1:18080/v1/embeddings".to_string(),
+            executable_source: Some("managed_cache".to_string()),
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+            requested_device: Some("Vulkan0".to_string()),
+        };
+        let state =
+            sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch.clone()))
+                .expect("write state");
+        assert_eq!(state.embedding_launch, Some(launch.clone()));
+
+        let report = unavailable_status_report_with_embedding_device(
+            "missing",
+            None,
+            &crate::embeddings::embedding_device_readiness(),
+        );
+        let report = attach_status_ownership(report, &runtime);
+
+        assert_eq!(report.embedding_launch, Some(launch));
+    }
 
     #[test]
     fn status_rejects_stale_manifest_before_component_probes() {
@@ -468,6 +638,53 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("sidecar_manifest_stale")
+        );
+    }
+
+    #[test]
+    fn strict_readiness_rejects_stored_doc_backend_mismatch() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let project_id = project_id_for_root(project.path());
+        let hash = "badc0ffee0ddf00d";
+        let mut manifest = retrieval_manifest_fixture(&project_id, hash);
+        manifest.projection_count = Some(1);
+        manifest.dense_projection_count = Some(1);
+        manifest.dense_reason_counts_json = Some("{\"public_api\":1}".into());
+
+        let mut storage = Store::open(&storage_path).expect("open db");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "do_work".into(),
+                ..Default::default()
+            }])
+            .expect("node");
+        storage
+            .upsert_llm_symbol_docs_batch(&[semantic_doc_with_backend("onnx")])
+            .expect("semantic doc");
+
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("backend mismatch should degrade");
+
+        assert!(
+            reason.contains("sidecar_symbol_doc_embedding_backend_changed"),
+            "unexpected reason: {reason}"
+        );
+        assert!(
+            reason.contains("stored=onnx current=llamacpp"),
+            "unexpected reason: {reason}"
         );
     }
 
@@ -784,5 +1001,34 @@ mod tests {
             .expect("mtime since epoch")
             .as_millis()
             .min(i64::MAX as u128) as i64
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate process environment hold ENV_LOCK.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests that mutate process environment hold ENV_LOCK.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }

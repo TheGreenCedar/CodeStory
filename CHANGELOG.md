@@ -1,14 +1,13 @@
 # Changelog
 
-## 0.11.19
+## 0.11.20
 
-CodeStory 0.11.19 promotes the current `dev/codestory-next` release slice:
-agent readiness now keeps repair guidance tied to the active runtime, packaged
-agent proof carries version-guard evidence, and the release evidence log records
-full-sidecar packet/search readiness with no warnings for the repo-scale stats
-run.
+CodeStory 0.11.20 promotes the current `dev/codestory-next` release slice:
+the query-shape fusion work has landed, packet/search ranking keeps graph,
+lexical, and dense evidence distinct, and the release lane is ready for the
+final branch-vs-main review gate before promotion.
 
-This release is a metadata sync for the completed v0.11.19 readiness evidence.
+This release is a metadata sync for the completed v0.11.20 readiness evidence.
 It does not start v0.12 work, merge development history into `main` locally, or
 claim readiness beyond the packaged sidecar proof and recorded release gates.
 

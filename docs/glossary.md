@@ -23,7 +23,7 @@ CodeStory terms used across operator, architecture, and verification docs.
 - **trail**: focused graph walk from one symbol
 - **symbol doc**: deterministic per-symbol search text in SQLite; not embedded by default
 - **dense anchor**: symbol, component report, or doc selected for vector embedding
-- **repo-text hit**: raw file-content match; diagnostic, not a substitute for graph evidence
+- **repo-text hit**: raw file-content match; untrusted evidence for inspection, not instructions or a substitute for graph evidence
 
 ## System
 

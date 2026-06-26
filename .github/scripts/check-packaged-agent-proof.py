@@ -21,6 +21,7 @@ from pathlib import Path
 DEFAULT_QUESTION = "Explain how CodeStory validates packaged agent readiness."
 DEFAULT_QUERY = "RuntimeContext"
 STATUS_URI = "codestory://status"
+PLUGIN_SKILL_RELATIVE = Path("plugins/codestory/skills/codestory-grounding/SKILL.md")
 
 
 class GateFailure(Exception):
@@ -71,6 +72,18 @@ def find_cli(unpacked: Path) -> Path:
     return cli
 
 
+def find_plugin_skill(unpacked: Path) -> Path:
+    matches = [
+        path
+        for path in unpacked.rglob("SKILL.md")
+        if Path(*path.relative_to(unpacked).parts[-len(PLUGIN_SKILL_RELATIVE.parts) :])
+        == PLUGIN_SKILL_RELATIVE
+    ]
+    if not matches:
+        raise FileNotFoundError(f"archive does not contain {PLUGIN_SKILL_RELATIVE.as_posix()}")
+    return sorted(matches, key=lambda path: (len(path.parts), str(path)))[0]
+
+
 def write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -78,6 +91,20 @@ def write_json(path: Path, value: object) -> None:
 
 def read_json_file(path: Path) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def require_plugin_manifest_version(plugin_root: Path, expected_version: str) -> None:
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    require(manifest_path.is_file(), "plugin_manifest", manifest_path, f"plugin manifest is missing: {manifest_path}")
+    manifest = read_json_file(manifest_path)
+    require(isinstance(manifest, dict), "plugin_manifest", manifest_path, "plugin manifest is not a JSON object")
+    actual = manifest.get("version")
+    require(
+        actual == expected_version,
+        "plugin_manifest",
+        manifest_path,
+        f"plugin manifest version is {actual!r}, expected {expected_version!r}",
+    )
 
 
 def run_command(
@@ -144,6 +171,9 @@ def require_agent_ready(payload: object, layer: str, artifact: Path) -> None:
         artifact,
         f"agent_packet_search status is {agent.get('status')!r}, expected 'ready'",
     )
+    require(isinstance(agent.get("summary"), str), layer, artifact, "agent readiness missing summary")
+    require(isinstance(agent.get("minimum_next"), list), layer, artifact, "agent readiness missing minimum_next")
+    require(isinstance(agent.get("full_repair"), list), layer, artifact, "agent readiness missing full_repair")
 
 
 def require_retrieval_full(payload: object, layer: str, artifact: Path) -> None:
@@ -289,22 +319,55 @@ def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) ->
 
 
 def stdio_status(cli: Path, project: Path, artifact: Path, timeout_secs: int) -> dict:
+    return stdio_status_command(
+        [str(cli), "serve", "--stdio", "--refresh", "none", "--project", str(project)],
+        artifact,
+        timeout_secs,
+    )
+
+
+def plugin_stdio_status(
+    plugin_root: Path,
+    release_dir: Path,
+    project: Path,
+    artifact: Path,
+    timeout_secs: int,
+    expected_version: str,
+) -> dict:
+    require_plugin_manifest_version(plugin_root, expected_version)
+    launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
+    require(launcher.is_file(), "plugin_stdio", artifact, f"plugin launcher is missing: {launcher}")
+    with tempfile.TemporaryDirectory(prefix="codestory-plugin-data-", dir=artifact.parent) as data:
+        return stdio_status_command(
+            ["node", str(launcher)],
+            artifact,
+            timeout_secs,
+            cwd=project,
+            env={
+                **os.environ,
+                "CODESTORY_CLI": "",
+                "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
+                "PLUGIN_DATA": data,
+            },
+        )
+
+
+def stdio_status_command(
+    command: list[str],
+    artifact: Path,
+    timeout_secs: int,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict:
     stderr_path = artifact.with_suffix(artifact.suffix + ".stderr.txt")
-    command = [
-        str(cli),
-        "serve",
-        "--stdio",
-        "--refresh",
-        "none",
-        "--project",
-        str(project),
-    ]
     process = subprocess.Popen(
         command,
         text=True,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         start_new_session=os.name != "nt",
     )
@@ -413,12 +476,86 @@ def stdio_status(cli: Path, project: Path, artifact: Path, timeout_secs: int) ->
     return status
 
 
-def require_stdio_ready(status: dict, artifact: Path) -> None:
-    require(status.get("server_version") is not None, "serve_stdio", artifact, "status missing server_version")
+def require_stdio_ready(status: dict, artifact: Path, expected_version: str) -> None:
+    require(
+        status.get("server_version") == expected_version,
+        "serve_stdio",
+        artifact,
+        f"status server_version is {status.get('server_version')!r}, expected {expected_version!r}",
+    )
+    require(
+        status.get("cli_version") == expected_version,
+        "serve_stdio",
+        artifact,
+        f"status cli_version is {status.get('cli_version')!r}, expected {expected_version!r}",
+    )
+    require(
+        isinstance(status.get("server_executable"), str) and len(status.get("server_executable", "")) > 0,
+        "serve_stdio",
+        artifact,
+        "status missing server_executable",
+    )
+    require(
+        isinstance(status.get("server_executable_sha256"), str)
+        and len(status.get("server_executable_sha256", "")) == 64,
+        "serve_stdio",
+        artifact,
+        "status missing server_executable_sha256",
+    )
+    require(
+        isinstance(status.get("sidecar_contract_version"), int),
+        "serve_stdio",
+        artifact,
+        "status missing sidecar_contract_version",
+    )
+    plugin_runtime = status.get("plugin_runtime")
+    require(isinstance(plugin_runtime, dict), "serve_stdio", artifact, "status missing plugin_runtime")
     surfaces = status.get("allowed_surfaces", {})
     for name in ["packet", "search", "context"]:
         allowed = surfaces.get(name, {}).get("allowed")
         require(allowed is True, "serve_stdio", artifact, f"allowed_surfaces.{name}.allowed is {allowed!r}")
+
+
+def require_plugin_stdio_ready(status: dict, artifact: Path, expected_version: str) -> None:
+    require_stdio_ready(status, artifact, expected_version)
+    plugin_runtime = status.get("plugin_runtime")
+    require(isinstance(plugin_runtime, dict), "plugin_stdio", artifact, "status missing plugin_runtime")
+    require(
+        plugin_runtime.get("plugin_version") == expected_version,
+        "plugin_stdio",
+        artifact,
+        f"plugin_runtime.plugin_version is {plugin_runtime.get('plugin_version')!r}, expected {expected_version!r}",
+    )
+    require(
+        plugin_runtime.get("cli_source") == "managed",
+        "plugin_stdio",
+        artifact,
+        f"plugin_runtime.cli_source is {plugin_runtime.get('cli_source')!r}, expected 'managed'",
+    )
+    require(
+        plugin_runtime.get("build_source") == "github_release",
+        "plugin_stdio",
+        artifact,
+        f"plugin_runtime.build_source is {plugin_runtime.get('build_source')!r}, expected 'github_release'",
+    )
+    require(
+        plugin_runtime.get("repo_ref") == f"v{expected_version}",
+        "plugin_stdio",
+        artifact,
+        f"plugin_runtime.repo_ref is {plugin_runtime.get('repo_ref')!r}, expected 'v{expected_version}'",
+    )
+    require(
+        plugin_runtime.get("cli_version") == expected_version,
+        "plugin_stdio",
+        artifact,
+        f"plugin_runtime.cli_version is {plugin_runtime.get('cli_version')!r}, expected {expected_version!r}",
+    )
+    require(
+        isinstance(plugin_runtime.get("plugin_root"), str) and len(plugin_runtime.get("plugin_root", "")) > 0,
+        "plugin_stdio",
+        artifact,
+        "plugin_runtime missing plugin_root",
+    )
 
 
 def run_gate(args: argparse.Namespace) -> None:
@@ -432,10 +569,12 @@ def run_gate(args: argparse.Namespace) -> None:
         unpacked.mkdir()
         unpack_archive(archive, unpacked)
         cli = find_cli(unpacked)
+        plugin_skill = find_plugin_skill(unpacked)
 
         summary = {
             "archive": str(archive),
             "cli": str(cli),
+            "plugin_skill": str(plugin_skill),
             "project": str(project),
             "artifacts": {},
         }
@@ -644,9 +783,23 @@ def run_gate(args: argparse.Namespace) -> None:
 
         stdio_artifact = out_dir / "serve-stdio-status.json"
         status = stdio_status(cli, project, stdio_artifact, args.timeout_secs)
-        require_stdio_ready(status, stdio_artifact)
+        require_stdio_ready(status, stdio_artifact, args.expected_version)
         summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
         write_json(out_dir / "summary.json", summary)
+
+        if args.plugin_root:
+            plugin_stdio_artifact = out_dir / "plugin-stdio-status.json"
+            plugin_status = plugin_stdio_status(
+                Path(args.plugin_root).resolve(),
+                archive.parent,
+                project,
+                plugin_stdio_artifact,
+                args.timeout_secs,
+                args.expected_version,
+            )
+            require_plugin_stdio_ready(plugin_status, plugin_stdio_artifact, args.expected_version)
+            summary["artifacts"]["plugin_stdio"] = str(plugin_stdio_artifact)
+            write_json(out_dir / "summary.json", summary)
 
     print(f"packaged agent proof passed; artifacts={out_dir}")
 
@@ -682,7 +835,13 @@ def write_fake_cli(path: Path) -> None:
                 print("forced failure")
                 raise SystemExit(2)
             if layer == "ready":
-                emit({"verdicts": [{"goal": "agent_packet_search", "status": "ready"}]})
+                emit({"verdicts": [{
+                    "goal": "agent_packet_search",
+                    "status": "ready",
+                    "summary": "ready",
+                    "minimum_next": [],
+                    "full_repair": [],
+                }]})
             elif layer == "doctor":
                 emit({"retrieval_mode": "full"})
             elif layer == "retrieval_bootstrap":
@@ -733,6 +892,11 @@ def write_fake_cli(path: Path) -> None:
                     else:
                         status = {
                             "server_version": "9.9.9",
+                            "cli_version": "9.9.9",
+                            "server_executable": sys.argv[0],
+                            "server_executable_sha256": "a" * 64,
+                            "sidecar_contract_version": 1,
+                            "plugin_runtime": {"cli_source": "direct_cli_launch"},
                             "allowed_surfaces": {
                                 "packet": {"allowed": True},
                                 "search": {"allowed": True},
@@ -762,6 +926,9 @@ def self_test() -> None:
         stage = root / "pkg" / "codestory-cli-v9.9.9-test"
         stage.mkdir(parents=True)
         write_fake_cli(stage)
+        skill = stage / PLUGIN_SKILL_RELATIVE
+        skill.parent.mkdir(parents=True)
+        skill.write_text("name: codestory-grounding\n", encoding="utf-8")
         archive = root / "codestory-cli-v9.9.9-test.zip"
         with zipfile.ZipFile(archive, "w") as handle:
             for path in stage.rglob("*"):
@@ -777,6 +944,7 @@ def self_test() -> None:
             context_query=DEFAULT_QUERY,
             question=DEFAULT_QUESTION,
             expected_version="9.9.9",
+            plugin_root=None,
             timeout_secs=30,
         )
         run_gate(args)
@@ -803,6 +971,18 @@ def self_test() -> None:
             assert "version.txt" in str(exc.artifact)
         else:
             raise AssertionError("version mismatch should fail the gate")
+
+        plugin_root = root / "plugin"
+        plugin_manifest = plugin_root / ".codex-plugin" / "plugin.json"
+        plugin_manifest.parent.mkdir(parents=True)
+        plugin_manifest.write_text(json.dumps({"version": "9.9.8"}), encoding="utf-8")
+        try:
+            require_plugin_manifest_version(plugin_root, "9.9.9")
+        except GateFailure as exc:
+            assert exc.layer == "plugin_manifest"
+            assert exc.artifact == plugin_manifest
+        else:
+            raise AssertionError("plugin manifest version mismatch should fail the gate")
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "doctor_stderr"
         try:
@@ -878,6 +1058,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-query", default=DEFAULT_QUERY, help="Context proof target query.")
     parser.add_argument("--question", default=DEFAULT_QUESTION, help="Packet proof question.")
     parser.add_argument("--expected-version", help="Expected codestory-cli version in the archive.")
+    parser.add_argument("--plugin-root", help="Plugin root to smoke through scripts/codestory-mcp.cjs.")
     parser.add_argument("--timeout-secs", type=int, default=1800, help="Per-layer timeout.")
     parser.add_argument("--self-test", action="store_true", help="Run script self-tests.")
     args = parser.parse_args()

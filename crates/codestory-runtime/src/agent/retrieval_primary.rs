@@ -12,9 +12,9 @@ use codestory_contracts::api::{
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 use codestory_retrieval::{
     CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
-    QueryTrace, execute_retrieval_query_with_cache,
+    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache,
     execute_strict_retrieval_query_batch_with_cache, is_phantom_sidecar_hit,
-    sidecar_project_id_for_root, strict_sidecar_status,
+    sidecar_project_id_for_root, sidecar_runtime_auto, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
 use std::collections::{BTreeMap, HashMap};
@@ -68,9 +68,9 @@ fn shadow_env_enabled() -> Option<bool> {
 
 /// Whether sidecar retrieval should serve packet/agent results.
 ///
-/// - `CODESTORY_RETRIEVAL=1` forces a sidecar-primary attempt when live mode is `full`.
+/// - `CODESTORY_RETRIEVAL=1` forces a sidecar-primary attempt when the agent sidecar is `full`.
 /// - `CODESTORY_RETRIEVAL=0` is unsupported; packet paths fail closed.
-/// - Unset: sidecar primary when the manifest exists and all sidecars are healthy.
+/// - Unset: sidecar primary when the manifest exists and the agent sidecar is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
     match retrieval_env_override() {
         Some(false) => {
@@ -81,11 +81,13 @@ pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> b
             sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
         }
         None => {
-            // Default product path: sidecar primary when live local state is strong enough to serve.
+            // Default product path: sidecar primary only from full agent-scoped retrieval.
             let auto_on =
                 sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller);
             if auto_on {
-                tracing::info!("retrieval primary auto-on (unset CODESTORY_RETRIEVAL; mode full)");
+                tracing::info!(
+                    "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; agent sidecar full)"
+                );
             }
             auto_on
         }
@@ -110,8 +112,9 @@ pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -
         .degraded_reason
         .map(|reason| format!("; reason={reason}"))
         .unwrap_or_default();
+    let profile = status.profile.as_deref().unwrap_or("unknown");
     Some(format!(
-        "sidecar retrieval primary is unavailable or degraded (mode={}); expected mode=full{reason}",
+        "sidecar retrieval primary is unavailable or degraded (profile={profile} mode={}); expected profile=agent mode=full{reason}",
         status.mode
     ))
 }
@@ -120,23 +123,44 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
     controller: &AppController,
     reason: impl Into<String>,
 ) -> ApiError {
-    let project = controller
-        .require_project_root()
-        .ok()
+    let project_root = controller.require_project_root().ok();
+    let project = project_root
+        .as_ref()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "<project>".to_string());
-    ApiError::retrieval_unavailable(
-        reason,
-        project.clone(),
-        sidecar_retrieval_recovery_commands(&project),
-    )
+    let recovery_commands = project_root
+        .as_deref()
+        .map(sidecar_retrieval_recovery_commands)
+        .unwrap_or_else(|| sidecar_retrieval_recovery_commands_for_project(&project, None));
+    ApiError::retrieval_unavailable(reason, project.clone(), recovery_commands)
 }
 
-fn sidecar_retrieval_recovery_commands(project: &str) -> Vec<String> {
+fn sidecar_retrieval_recovery_commands(project_root: &Path) -> Vec<String> {
+    let runtime = sidecar_runtime_auto(project_root);
+    let agent_run_id = (runtime.profile == SidecarProfile::Agent)
+        .then(|| runtime.run_id.as_deref())
+        .flatten();
+    sidecar_retrieval_recovery_commands_for_project(&project_root.to_string_lossy(), agent_run_id)
+}
+
+fn sidecar_retrieval_recovery_commands_for_project(
+    project: &str,
+    agent_run_id: Option<&str>,
+) -> Vec<String> {
     let project = quote_cli_arg(project);
+    let mut ready = format!("codestory-cli ready --goal agent --repair --project {project}");
+    let mut status = format!("codestory-cli retrieval status --project {project}");
+    if let Some(run_id) = agent_run_id {
+        ready.push_str(" --run-id ");
+        ready.push_str(run_id);
+        status.push_str(" --profile agent --run-id ");
+        status.push_str(run_id);
+    }
+    ready.push_str(" --format json");
+    status.push_str(" --format json");
     vec![
-        format!("codestory-cli ready --goal agent --repair --project {project} --format json"),
-        format!("codestory-cli retrieval status --project {project} --format json"),
+        ready,
+        status,
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
 }
@@ -219,28 +243,40 @@ fn sidecar_mode_is_required_full(controller: &AppController) -> bool {
     let Ok(storage_path) = controller.require_storage_path() else {
         return false;
     };
-    sidecar_mode_can_serve_primary(
-        &sidecar_mode_status_for_project(&project_root, &storage_path).mode,
-    )
+    sidecar_status_can_serve_primary(&sidecar_mode_status_for_project(
+        &project_root,
+        &storage_path,
+    ))
 }
 
 fn sidecar_mode_can_serve_primary(mode: &str) -> bool {
     mode == "full"
 }
 
+fn sidecar_status_can_serve_primary(status: &SidecarModeStatus) -> bool {
+    status.profile.as_deref() == Some("agent") && sidecar_mode_can_serve_primary(&status.mode)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidecarModeStatus {
+    profile: Option<String>,
     mode: String,
     degraded_reason: Option<String>,
 }
 
 fn sidecar_mode_status_for_project(project_root: &Path, storage_path: &Path) -> SidecarModeStatus {
-    match strict_sidecar_status(project_root, Some(storage_path)) {
+    let runtime = sidecar_runtime_auto(project_root);
+    match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime) {
         Ok(report) => SidecarModeStatus {
+            profile: report
+                .ownership
+                .as_ref()
+                .map(|ownership| ownership.profile.clone()),
             mode: report.retrieval_mode,
             degraded_reason: report.degraded_reason,
         },
         Err(error) => SidecarModeStatus {
+            profile: None,
             mode: "unavailable".into(),
             degraded_reason: Some(format!("sidecar_status_error: {error}")),
         },
@@ -1395,12 +1431,16 @@ fn resolve_sidecar_candidates_with_stats(
 
 fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
     let provenance = candidate_provenance_labels(candidate);
-    let (lexical, semantic, graph) = match candidate.source {
-        CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
-        CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
-        CandidateSource::Scip => (0.0, 0.0, candidate.score),
-        CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
-    };
+    let (lexical, semantic, graph) = candidate
+        .rank_features
+        .as_ref()
+        .map(|features| (features.lexical, features.semantic, features.scip_distance))
+        .unwrap_or_else(|| match candidate.source {
+            CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+            CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
+            CandidateSource::Scip => (0.0, 0.0, candidate.score),
+            CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
+        });
     RetrievalScoreBreakdownDto {
         lexical,
         semantic,
@@ -1430,13 +1470,39 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::packet_evidence::PacketEvidenceTier;
+    use codestory_contracts::api::{NodeId, NodeKind as ApiNodeKind, SearchHitOrigin};
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
-        project_id_for_root, test_support::retrieval_manifest_fixture,
+        project_id_for_root, rank_candidates, test_support::retrieval_manifest_fixture,
     };
 
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::process_env_test_lock()
+    }
+
+    fn search_hit_for_candidate(candidate: &CandidateHit) -> SearchHit {
+        SearchHit {
+            node_id: NodeId("candidate".to_string()),
+            display_name: candidate
+                .symbol_name
+                .clone()
+                .unwrap_or_else(|| candidate.file_path.clone()),
+            kind: ApiNodeKind::FUNCTION,
+            file_path: Some(candidate.file_path.clone()),
+            line: candidate.start_line,
+            score: candidate.score,
+            origin: SearchHitOrigin::IndexedSymbol,
+            match_quality: None,
+            resolvable: true,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: None,
+            score_breakdown: Some(score_breakdown_for_candidate(candidate)),
+        }
     }
 
     #[test]
@@ -1687,6 +1753,83 @@ mod tests {
         assert_eq!(shadow.stage_timings[0].stage, "stage1_zoekt_lexical");
         assert_eq!(shadow.candidates.len(), 2);
         assert_eq!(shadow.would_rank, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn score_breakdown_reports_fused_rank_features_and_provenance() {
+        let mut candidate = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.91,
+            CandidateSource::Zoekt,
+        );
+        candidate.provenance = vec![
+            "lexical_source".into(),
+            "dense_anchor".into(),
+            "graph_neighbor".into(),
+        ];
+        candidate.rank_features = Some(codestory_retrieval::RankFeatures {
+            lexical: 0.91,
+            semantic: 0.82,
+            scip_distance: 0.5,
+            file_role_prior: 0.72,
+            definition_quality: 0.85,
+            token_overlap: 0.25,
+        });
+
+        let breakdown = score_breakdown_for_candidate(&candidate);
+
+        assert_eq!(breakdown.lexical, 0.91);
+        assert_eq!(breakdown.semantic, 0.82);
+        assert_eq!(breakdown.graph, 0.5);
+        assert_eq!(
+            breakdown.provenance,
+            vec![
+                "lexical_source".to_string(),
+                "dense_anchor".to_string(),
+                "graph_neighbor".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn score_breakdown_does_not_export_graph_for_pure_lexical_candidate() {
+        let mut candidate = CandidateHit::with_source(
+            "src/service.rs",
+            Some("Service".into()),
+            0.78,
+            CandidateSource::Zoekt,
+        );
+        candidate.provenance = vec!["lexical_source".into()];
+        let ranked = rank_candidates(&classify_query("explain service startup"), vec![candidate]);
+        let candidate = ranked.first().expect("ranked candidate");
+
+        let breakdown = score_breakdown_for_candidate(candidate);
+        let mut hit = search_hit_for_candidate(candidate);
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(breakdown.graph, 0.0);
+        assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::LexicalSource));
+    }
+
+    #[test]
+    fn score_breakdown_does_not_export_graph_for_pure_dense_candidate() {
+        let mut candidate = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.86,
+            CandidateSource::Qdrant,
+        );
+        candidate.provenance = vec!["dense_anchor".into()];
+        let ranked = rank_candidates(&classify_query("explain search service"), vec![candidate]);
+        let candidate = ranked.first().expect("ranked candidate");
+
+        let breakdown = score_breakdown_for_candidate(candidate);
+        let mut hit = search_hit_for_candidate(candidate);
+        decorate_search_hit_evidence(&mut hit);
+
+        assert_eq!(breakdown.graph, 0.0);
+        assert_ne!(hit.evidence_tier, Some(PacketEvidenceTier::ResolvedGraph));
     }
 
     #[test]
@@ -1952,7 +2095,8 @@ mod tests {
 
     #[test]
     fn recovery_commands_quote_shell_sensitive_project_paths() {
-        let commands = sidecar_retrieval_recovery_commands(r"C:\tmp\cost$cache`tick's repo");
+        let commands =
+            sidecar_retrieval_recovery_commands_for_project(r"C:\tmp\cost$cache`tick's repo", None);
 
         #[cfg(windows)]
         let expected_project = r"'C:/tmp/cost$cache`tick''s repo'";
@@ -1974,12 +2118,66 @@ mod tests {
     }
 
     #[test]
+    fn recovery_commands_preserve_agent_run_id_for_readiness_and_status() {
+        let commands =
+            sidecar_retrieval_recovery_commands_for_project("C:/repo", Some("packet-search-eval"));
+
+        assert!(
+            commands
+                .first()
+                .is_some_and(|command| command.contains("ready --goal agent --repair")
+                    && command.contains("--run-id packet-search-eval")),
+            "ready repair should keep the selected agent run id: {commands:?}"
+        );
+        assert!(
+            commands
+                .get(1)
+                .is_some_and(|command| command.contains("retrieval status")
+                    && command.contains("--profile agent --run-id packet-search-eval")),
+            "retrieval status should keep the selected agent profile/run id: {commands:?}"
+        );
+        assert!(
+            commands
+                .get(2)
+                .is_some_and(|command| command
+                    == "codestory-cli doctor --project \"C:/repo\" --format markdown"),
+            "doctor does not accept profile/run-id flags, so the hint should remain parseable: {commands:?}"
+        );
+    }
+
+    #[test]
     fn sidecar_primary_modes_fail_closed_for_partial_sidecars() {
         assert!(sidecar_mode_can_serve_primary("full"));
         assert!(!sidecar_mode_can_serve_primary("no_scip"));
         assert!(!sidecar_mode_can_serve_primary("no_semantic"));
         assert!(!sidecar_mode_can_serve_primary("lexical_only"));
         assert!(!sidecar_mode_can_serve_primary("unavailable"));
+    }
+
+    #[test]
+    fn sidecar_primary_requires_agent_profile_even_when_local_mode_is_full() {
+        let local_full = SidecarModeStatus {
+            profile: Some("local".into()),
+            mode: "full".into(),
+            degraded_reason: None,
+        };
+        let agent_full = SidecarModeStatus {
+            profile: Some("agent".into()),
+            mode: "full".into(),
+            degraded_reason: None,
+        };
+        let missing_profile_full = SidecarModeStatus {
+            profile: None,
+            mode: "full".into(),
+            degraded_reason: None,
+        };
+
+        assert!(
+            !sidecar_status_can_serve_primary(&local_full),
+            "local/default full sidecar must not serve packet/search/context primary retrieval"
+        );
+        assert!(sidecar_status_can_serve_primary(&agent_full));
+        assert!(!sidecar_status_can_serve_primary(&missing_profile_full));
     }
 
     #[test]

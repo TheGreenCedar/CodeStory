@@ -27,6 +27,7 @@ evidence instead of rediscovering the checkout on every question.
 - Release version checks: `python .github/scripts/check-codestory-release.py --version <version>` and `node .github/scripts/check-workflow-policy.mjs`.
 - On Windows, the Codex npm shim should be invoked as `codex.cmd` (typically under `%APPDATA%\\npm`); using the extensionless `codex` shim can fail with `os error 193`.
 - In this PowerShell environment, large parallel file reads can truncate output; when investigating a single large file, prefer one direct read command (for example `Get-Content` or `cmd /c type`) before parallelizing.
+- Public GitHub status comments should go through `node scripts/github-status-comment.mjs --issue <n> --body-file <file>` or stdin; the helper rejects literal `\\n` text before posting.
 
 ## Coding Style & Naming Conventions
 - Rust edition is `2024` across workspace crates.

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "fixture_file": "production_packet_search_fixtures.json",
+  "k": 5,
+  "packet_anchor_budget": 6000,
+  "required_full_modes": {
+    "readiness_mode": "ready",
+    "retrieval_mode": "full"
+  },
+  "tolerances": {
+    "recall_at_k": 0.0,
+    "anchor_in_packet": 0.0,
+    "anchor_before_budget": 0.0
+  },
+  "overall": {
+    "fixture_count": 2,
+    "full_mode_fixture_count": 2,
+    "recall_at_k": 1.0,
+    "anchor_in_packet": 1.0,
+    "anchor_before_budget": 1.0
+  },
+  "categories": {
+    "anchor_placement": {
+      "fixture_count": 1,
+      "full_mode_fixture_count": 1,
+      "recall_at_k": 1.0,
+      "anchor_in_packet": 1.0,
+      "anchor_before_budget": 1.0
+    },
+    "readiness_boundary": {
+      "fixture_count": 1,
+      "full_mode_fixture_count": 1,
+      "recall_at_k": 1.0,
+      "anchor_in_packet": 1.0,
+      "anchor_before_budget": 1.0
+    }
+  }
+}

@@ -100,6 +100,15 @@ fn render_report_markdown(output: &RepoReport, profile: ReportProfile) -> String
 struct ReportSidecarStatus {
     retrieval_mode: String,
     degraded_reason: Option<String>,
+    embedding_device_policy: String,
+    embedding_device_state: String,
+    embedding_device_observation_source: String,
+    embedding_detected_provider: Option<String>,
+    embedding_detected_gpu: Option<String>,
+    embedding_accelerator_requested: bool,
+    embedding_accelerator_request_provider: Option<String>,
+    embedding_accelerator_request_device: Option<String>,
+    embedding_cpu_allowed: bool,
     manifest_generation: Option<String>,
     manifest_input_hash: Option<String>,
 }
@@ -121,6 +130,16 @@ fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
             ReportSidecarStatus {
                 retrieval_mode: report.retrieval_mode,
                 degraded_reason: report.degraded_reason,
+                embedding_device_policy: report.embedding_device_policy,
+                embedding_device_state: report.embedding_device_state,
+                embedding_device_observation_source: report.embedding_device_observation_source,
+                embedding_detected_provider: report.embedding_detected_provider,
+                embedding_detected_gpu: report.embedding_detected_gpu,
+                embedding_accelerator_requested: report.embedding_accelerator_requested,
+                embedding_accelerator_request_provider: report
+                    .embedding_accelerator_request_provider,
+                embedding_accelerator_request_device: report.embedding_accelerator_request_device,
+                embedding_cpu_allowed: report.embedding_cpu_allowed,
                 manifest_generation,
                 manifest_input_hash,
             }
@@ -128,6 +147,15 @@ fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
         Err(error) => ReportSidecarStatus {
             retrieval_mode: "unavailable".to_string(),
             degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "unknown".to_string(),
+            embedding_device_observation_source: "sidecar_unobserved".to_string(),
+            embedding_detected_provider: None,
+            embedding_detected_gpu: None,
+            embedding_accelerator_requested: false,
+            embedding_accelerator_request_provider: None,
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: false,
             manifest_generation: None,
             manifest_input_hash: None,
         },
@@ -145,8 +173,23 @@ fn attach_report_handoff(
         freshness: summary.freshness.as_ref(),
         setup: None,
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
+            profile: Some("local"),
+            run_id: None,
             retrieval_mode: &sidecar.retrieval_mode,
             degraded_reason: sidecar.degraded_reason.as_deref(),
+            embedding_device_policy: Some(&sidecar.embedding_device_policy),
+            embedding_device_state: Some(&sidecar.embedding_device_state),
+            embedding_device_observation_source: Some(&sidecar.embedding_device_observation_source),
+            embedding_detected_provider: sidecar.embedding_detected_provider.as_deref(),
+            embedding_detected_gpu: sidecar.embedding_detected_gpu.as_deref(),
+            embedding_accelerator_requested: sidecar.embedding_accelerator_requested,
+            embedding_accelerator_request_provider: sidecar
+                .embedding_accelerator_request_provider
+                .as_deref(),
+            embedding_accelerator_request_device: sidecar
+                .embedding_accelerator_request_device
+                .as_deref(),
+            embedding_cpu_allowed: sidecar.embedding_cpu_allowed,
             manifest_generation: sidecar.manifest_generation.as_deref(),
             manifest_input_hash: sidecar.manifest_input_hash.as_deref(),
         }),

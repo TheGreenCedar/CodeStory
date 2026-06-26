@@ -11,6 +11,7 @@ use codestory_contracts::api::{
 };
 
 use crate::AppController;
+use codestory_indexer::CancellationToken;
 
 #[derive(Clone)]
 pub struct ProjectService {
@@ -87,12 +88,30 @@ impl IndexService {
         self.controller.run_indexing_blocking(mode)
     }
 
+    pub fn run_indexing_blocking_with_cancel(
+        &self,
+        mode: IndexMode,
+        cancel_token: &CancellationToken,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.controller
+            .run_indexing_blocking_with_cancel(mode, cancel_token)
+    }
+
     pub fn run_indexing_blocking_without_runtime_refresh(
         &self,
         mode: IndexMode,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.controller
             .run_indexing_blocking_without_runtime_refresh(mode)
+    }
+
+    pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
+        &self,
+        mode: IndexMode,
+        cancel_token: &CancellationToken,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.controller
+            .run_indexing_blocking_without_runtime_refresh_with_cancel(mode, cancel_token)
     }
 
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {

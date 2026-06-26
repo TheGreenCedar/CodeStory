@@ -1,13 +1,17 @@
 use crate::config::{
-    SidecarLayout, SidecarProfile, SidecarRuntimeConfig, retrieval_compose_profile, user_cache_root,
+    EmbeddingServerLaunchMode, NATIVE_LLAMA_MANAGED_CACHE_REL_PATH,
+    NATIVE_LLAMA_SOURCE_CACHE_REL_PATH, SidecarLayout, SidecarProfile, SidecarRuntimeConfig,
+    embedding_server_launch_mode, retrieval_compose_profile, user_cache_root,
 };
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
 use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
     repair_qdrant_storage,
 };
-use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime};
+use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime_and_launch_metadata};
 use anyhow::{Context, Result, bail};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -16,6 +20,17 @@ use std::time::{Duration, Instant};
 /// Relative path from repository root to the retrieval compose file.
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
 const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-compose.yml");
+const DOCKER_ADDRESS_POOL_EXHAUSTED_REASON: &str = "docker_address_pool_exhausted";
+const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
+    "all predefined address pools have been fully subnetted";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EmbedModelInventory {
+    pub model_dir: Option<String>,
+    pub required_gguf: String,
+    pub required_gguf_present: bool,
+    pub candidate_dirs: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapReport {
@@ -24,6 +39,14 @@ pub struct BootstrapReport {
     pub compose_started: bool,
     pub compose_file: Option<PathBuf>,
     pub storage_repair: QdrantStorageRepairReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeEmbeddingServerLaunch {
+    executable: PathBuf,
+    model_path: PathBuf,
+    args: Vec<String>,
+    log_path: PathBuf,
 }
 
 /// Prepare cache dirs, optionally start Docker Compose, write sidecar state, wait for probes.
@@ -76,6 +99,10 @@ pub fn bootstrap_sidecars_with_runtime(
     layout.ensure_data_dirs()?;
     let storage_repair =
         repair_qdrant_storage(&layout, storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
+    let launch_mode = embedding_server_launch_mode()?;
+    let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
+        .then(|| native_embedding_server_launch(repo_root, runtime))
+        .transpose()?;
 
     let resolved_compose = if skip_compose {
         None
@@ -84,18 +111,30 @@ pub fn bootstrap_sidecars_with_runtime(
     };
 
     let compose_started = if let Some(path) = resolved_compose.as_ref() {
-        docker_compose_up(path, repo_root, runtime)?;
+        docker_compose_up(path, repo_root, runtime, launch_mode)?;
         true
     } else {
         false
     };
+    if let Some(launch) = native_embedding.as_ref() {
+        spawn_native_embedding_server(launch)?;
+    }
 
-    let state = sidecar_up_with_runtime(runtime, resolved_compose.as_deref())?;
-    let infrastructure = if wait_timeout.is_zero() {
-        probe_infrastructure_health(&layout)
-    } else {
-        wait_for_infrastructure(&layout, wait_timeout)?
-    };
+    let state = sidecar_up_with_runtime_and_launch_metadata(
+        runtime,
+        resolved_compose.as_deref(),
+        native_embedding
+            .as_ref()
+            .map(|launch| embedding_launch_metadata(launch, runtime, repo_root)),
+    )?;
+    if !wait_timeout.is_zero() {
+        let _ = wait_for_infrastructure(&layout, wait_timeout)?;
+    }
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
+        &layout,
+        &embedding_device,
+    );
 
     Ok(BootstrapReport {
         state,
@@ -196,6 +235,7 @@ fn docker_compose_up(
     compose_file: &Path,
     repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
+    launch_mode: EmbeddingServerLaunchMode,
 ) -> Result<()> {
     let layout = &runtime.layout;
     if !docker_available() {
@@ -229,6 +269,7 @@ fn docker_compose_up(
         );
     }
     remove_container_if_present("codestory-zoekt-stub")?;
+    let embedding_device = crate::embeddings::embedding_device_readiness();
     command
         .arg("compose")
         .arg("-p")
@@ -264,21 +305,77 @@ fn docker_compose_up(
             "CODESTORY_EMBED_LLAMACPP_URL",
             SidecarLayout::embed_base_url(runtime.embed_http_port),
         )
+        .env(
+            "CODESTORY_EMBED_DEVICE_STATE",
+            embedding_device.observed_state,
+        )
         .env("CODESTORY_SIDECAR_NAMESPACE", &runtime.namespace)
         .env("CODESTORY_SIDECAR_PROFILE", runtime.profile.as_str())
         .env("CODESTORY_SIDECAR_OWNER", "codestory")
         .env("COMPOSE_PROFILES", compose_profile);
+    if let Some(provider) = embedding_device.detected_provider.as_deref() {
+        command.env("CODESTORY_EMBED_DEVICE_PROVIDER", provider);
+    }
+    if let Some(gpu) = embedding_device.detected_gpu.as_deref() {
+        command.env("CODESTORY_EMBED_DEVICE_NAME", gpu);
+    }
+    if let Some(request) = crate::embeddings::embedding_accelerator_request() {
+        let device = request.device;
+        let n_gpu_layers = request.n_gpu_layers;
+        command
+            .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
+            .env("CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS", &n_gpu_layers)
+            .env("LLAMA_ARG_DEVICE", device)
+            .env("LLAMA_ARG_N_GPU_LAYERS", n_gpu_layers);
+    } else {
+        command
+            .env_remove("LLAMA_ARG_DEVICE")
+            .env_remove("LLAMA_ARG_N_GPU_LAYERS");
+    }
+    command.args(docker_compose_services_for_launch_mode(launch_mode));
 
     let output = command.output().context("spawn docker compose")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "docker compose up failed (exit {:?}):\n{stdout}{stderr}",
-            output.status.code()
+            "{}",
+            docker_compose_up_failure_message(output.status.code(), &stdout, &stderr, repo_root)
         );
     }
     Ok(())
+}
+
+fn docker_compose_up_failure_message(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    repo_root: Option<&Path>,
+) -> String {
+    if docker_address_pool_exhausted(stdout) || docker_address_pool_exhausted(stderr) {
+        let project = repo_root
+            .map(|path| quoted_project_arg(&path.display().to_string()))
+            .unwrap_or_else(|| "<repo>".to_string());
+        return format!(
+            "docker compose up failed (exit {exit_code:?}): reason={DOCKER_ADDRESS_POOL_EXHAUSTED_REASON}\n\
+Docker's predefined address pools are exhausted. Run read-only inventory: \
+`codestory-cli sidecar inventory --project {project} --format markdown` \
+or `codestory-cli sidecar inventory --project {project} --format json`.\n\
+Raw docker compose output:\n{stdout}{stderr}"
+        );
+    }
+
+    format!("docker compose up failed (exit {exit_code:?}):\n{stdout}{stderr}")
+}
+
+fn quoted_project_arg(project: &str) -> String {
+    format!("\"{}\"", project.replace('"', "\\\""))
+}
+
+fn docker_address_pool_exhausted(details: &str) -> bool {
+    details
+        .to_ascii_lowercase()
+        .contains(DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE)
 }
 
 pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
@@ -315,6 +412,180 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
 
 fn docker_compose_command() -> Result<Command> {
     Ok(Command::new("docker"))
+}
+
+fn docker_compose_services_for_launch_mode(
+    mode: EmbeddingServerLaunchMode,
+) -> &'static [&'static str] {
+    match mode {
+        EmbeddingServerLaunchMode::DockerComposeEmbed => &[],
+        EmbeddingServerLaunchMode::NativeSpawned => &["qdrant", "zoekt"],
+    }
+}
+
+fn native_embedding_server_launch(
+    repo_root: Option<&Path>,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<NativeEmbeddingServerLaunch> {
+    let executable = native_llama_server_path(repo_root)?;
+    let model_path =
+        embed_model_dir(repo_root, &runtime.layout)?.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+    if !model_path.is_file() {
+        bail!(
+            "native llama.cpp embedding model not found: {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+            model_path.display()
+        );
+    }
+    Ok(native_embedding_server_launch_from_paths(
+        executable, model_path, runtime,
+    ))
+}
+
+fn native_embedding_server_launch_from_paths(
+    executable: PathBuf,
+    model_path: PathBuf,
+    runtime: &SidecarRuntimeConfig,
+) -> NativeEmbeddingServerLaunch {
+    let mut args = vec![
+        "--embedding".to_string(),
+        "--model".to_string(),
+        model_path.display().to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        runtime.embed_http_port.to_string(),
+    ];
+    if let Some(request) = crate::embeddings::embedding_accelerator_request() {
+        args.push("--device".to_string());
+        args.push(request.device);
+    }
+    NativeEmbeddingServerLaunch {
+        executable,
+        model_path,
+        args,
+        log_path: crate::embeddings::native_embedding_log_path(runtime),
+    }
+}
+
+fn embedding_launch_metadata(
+    native_launch: &NativeEmbeddingServerLaunch,
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+) -> crate::health::EmbeddingLaunchMetadata {
+    crate::health::EmbeddingLaunchMetadata {
+        provider: "llamacpp".to_string(),
+        launch_mode: EmbeddingServerLaunchMode::NativeSpawned
+            .as_str()
+            .to_string(),
+        endpoint: SidecarLayout::embed_base_url(runtime.embed_http_port),
+        executable_source: Some(native_llama_executable_source(
+            &native_launch.executable,
+            repo_root,
+        )),
+        executable_path: Some(native_launch.executable.display().to_string()),
+        model_path: Some(native_launch.model_path.display().to_string()),
+        requested_device: crate::embeddings::embedding_accelerator_request()
+            .map(|request| request.device),
+    }
+}
+
+fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> String {
+    if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
+        return "env:CODESTORY_EMBED_NATIVE_LLAMA_SERVER".to_string();
+    }
+    if path == user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
+        return "managed_cache".to_string();
+    }
+    if let Some(root) = repo_root {
+        if path == root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH) {
+            return "source_cache".to_string();
+        }
+        if path == root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
+            return "repo_managed_cache".to_string();
+        }
+    }
+    "resolved_path".to_string()
+}
+
+fn native_llama_server_path(repo_root: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER") {
+        return validate_explicit_native_llama_server(PathBuf::from(path));
+    }
+    native_llama_server_path_from_candidates(native_llama_server_candidates(repo_root))
+}
+
+fn validate_explicit_native_llama_server(path: PathBuf) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!(
+            "CODESTORY_EMBED_NATIVE_LLAMA_SERVER must be an absolute path to llama-server.exe; ambient PATH lookup is not allowed"
+        );
+    }
+    if !path.is_file() {
+        bail!(
+            "CODESTORY_EMBED_NATIVE_LLAMA_SERVER does not point to a file: {}; install managed llama.cpp assets or set the absolute executable path",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn native_llama_server_path_from_candidates(candidates: Vec<PathBuf>) -> Result<PathBuf> {
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "native llama-server.exe not found; set CODESTORY_EMBED_NATIVE_LLAMA_SERVER to an absolute path or install managed llama.cpp assets under {}; ambient PATH lookup is not allowed",
+                user_cache_root()
+                    .join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)
+                    .display()
+            )
+        })
+}
+
+fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = vec![user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)];
+    if let Some(root) = repo_root {
+        candidates.push(root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH));
+        candidates.push(root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH));
+    }
+    candidates
+}
+
+fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result<()> {
+    if let Some(parent) = launch.log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create native llama.cpp log dir {}", parent.display()))?;
+    }
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&launch.log_path)
+        .with_context(|| format!("open native llama.cpp log {}", launch.log_path.display()))?;
+    writeln!(
+        log,
+        "starting native llama.cpp embedding server: {} {}",
+        launch.executable.display(),
+        launch.args.join(" ")
+    )
+    .ok();
+    let stdout = log
+        .try_clone()
+        .context("clone native llama.cpp stdout log")?;
+    let _child = Command::new(&launch.executable)
+        .args(&launch.args)
+        .current_dir(launch.executable.parent().unwrap_or_else(|| Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .with_context(|| {
+            format!(
+                "spawn native llama.cpp server {}",
+                launch.executable.display()
+            )
+        })?;
+    Ok(())
 }
 
 fn remove_container_if_present(name: &str) -> Result<()> {
@@ -355,15 +626,53 @@ fn docker_bind_path(path: &Path) -> String {
 }
 
 fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
-        let path = PathBuf::from(path);
-        if embed_model_dir_ready(&path) {
-            return Ok(path);
-        }
-        bail!(
+    let inventory = embed_model_inventory(repo_root, layout);
+    if let Some(model_dir) = inventory
+        .required_gguf_present
+        .then(|| inventory.model_dir.as_ref())
+        .flatten()
+    {
+        return Ok(PathBuf::from(model_dir));
+    }
+    if std::env::var("CODESTORY_EMBED_MODEL_DIR").is_ok() {
+        anyhow::bail!(
             "CODESTORY_EMBED_MODEL_DIR does not contain {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
             crate::embeddings::BGE_BASE_EN_V1_5_GGUF
         );
+    }
+    anyhow::bail!(
+        "No llama.cpp embedding model directory contains {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+        crate::embeddings::BGE_BASE_EN_V1_5_GGUF
+    )
+}
+
+pub fn embed_model_inventory(
+    repo_root: Option<&Path>,
+    layout: &SidecarLayout,
+) -> EmbedModelInventory {
+    let candidates = embed_model_candidates(repo_root, layout);
+    let model_dir = candidates
+        .iter()
+        .find(|candidate| embed_model_dir_ready(candidate))
+        .or_else(|| candidates.first())
+        .map(|path| path.display().to_string());
+    let required_gguf_present = model_dir
+        .as_ref()
+        .is_some_and(|path| embed_model_dir_ready(Path::new(path)));
+    EmbedModelInventory {
+        model_dir,
+        required_gguf: crate::embeddings::BGE_BASE_EN_V1_5_GGUF.to_string(),
+        required_gguf_present,
+        candidate_dirs: candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    }
+}
+
+fn embed_model_candidates(repo_root: Option<&Path>, layout: &SidecarLayout) -> Vec<PathBuf> {
+    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
+        return vec![PathBuf::from(path)];
     }
     let workdir = repo_root
         .or_else(|| Some(Path::new(".")))
@@ -373,14 +682,21 @@ fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<P
         .parent()
         .map(|parent| parent.join("embed-models"))
         .unwrap_or_else(|| layout.qdrant_data_dir.join("embed-models"));
-    embed_model_dir_from_candidates([
+    let mut candidates = Vec::new();
+    for candidate in [
         workdir.join("target").join("retrieval-models"),
         workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
         user_cache_root().join("embed-models"),
         fallback,
-    ])
+    ] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
+#[cfg(test)]
 fn embed_model_dir_from_candidates(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> Result<PathBuf> {
@@ -420,7 +736,10 @@ fn wait_for_infrastructure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn embed_model_dir_discovers_repo_models_layout() {
@@ -486,6 +805,45 @@ mod tests {
     }
 
     #[test]
+    fn compose_failure_classifies_docker_address_pool_exhaustion() {
+        let project = Path::new("C:/repo/example project");
+        let stdout = "compose stdout\n";
+        let stderr =
+            "failed to create network: all predefined address pools have been fully subnetted";
+
+        let message = docker_compose_up_failure_message(Some(1), stdout, stderr, Some(project));
+
+        assert!(message.contains("reason=docker_address_pool_exhausted"));
+        assert!(message.contains(stdout));
+        assert!(message.contains(stderr));
+        assert!(message.contains(
+            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format markdown"
+        ));
+        assert!(message.contains(
+            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format json"
+        ));
+        for forbidden in [" prune", " remove", " down", " delete", " restart"] {
+            assert!(
+                !message.to_ascii_lowercase().contains(forbidden),
+                "guidance must stay non-destructive: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_failure_preserves_generic_stderr_without_reason() {
+        let stderr = "compose service failed for another reason";
+
+        let message = docker_compose_up_failure_message(Some(17), "stdout\n", stderr, None);
+
+        assert!(message.contains("docker compose up failed (exit Some(17))"));
+        assert!(message.contains("stdout\n"));
+        assert!(message.contains(stderr));
+        assert!(!message.contains("docker_address_pool_exhausted"));
+        assert!(!message.contains("sidecar inventory"));
+    }
+
+    #[test]
     fn bundled_compose_file_is_written_to_cache() {
         let cache = tempdir().expect("cache");
         let path = write_bundled_compose_file(cache.path()).expect("write bundled compose");
@@ -494,6 +852,122 @@ mod tests {
         let contents = std::fs::read_to_string(path).expect("read bundled compose");
         assert!(contents.contains("name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}"));
         assert!(contents.contains("qdrant/qdrant:v1.12.5"));
+    }
+
+    #[test]
+    fn bundled_compose_keeps_llamacpp_device_env_request_only() {
+        assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_DEVICE"));
+        assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_N_GPU_LAYERS"));
+        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("LLAMA_ARG_DEVICE:"));
+        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains(":-none"));
+    }
+
+    #[test]
+    fn native_launch_mode_limits_compose_to_qdrant_and_zoekt() {
+        assert_eq!(
+            docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::NativeSpawned),
+            &["qdrant", "zoekt"]
+        );
+        assert!(
+            docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::DockerComposeEmbed)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_explicit_executable_requires_absolute_file() {
+        let relative = validate_explicit_native_llama_server(PathBuf::from("llama-server.exe"))
+            .expect_err("relative executable must fail closed");
+        assert!(relative.to_string().contains("absolute path"));
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        assert_eq!(
+            validate_explicit_native_llama_server(exe.clone()).expect("absolute file"),
+            exe
+        );
+    }
+
+    #[test]
+    fn native_executable_candidates_do_not_fall_back_to_path() {
+        let error =
+            native_llama_server_path_from_candidates(vec![PathBuf::from("llama-server.exe")])
+                .expect_err("bare executable must not resolve through PATH");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ambient PATH lookup is not allowed")
+        );
+    }
+
+    #[test]
+    fn native_launch_args_use_model_port_and_amd_vulkan_device() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _provider = EnvGuard::set("CODESTORY_EMBED_DEVICE_PROVIDER", "amd");
+        let _name = EnvGuard::set("CODESTORY_EMBED_DEVICE_NAME", "AMD Radeon RX 7900 XT");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        std::fs::write(&model, b"fake model").expect("model");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+
+        let launch =
+            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
+        let model_arg = model.display().to_string();
+        let port_arg = runtime.embed_http_port.to_string();
+
+        assert_eq!(launch.executable, exe);
+        assert_eq!(launch.args[0], "--embedding");
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--model" && pair[1] == model_arg.as_str())
+        );
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--host" && pair[1] == "127.0.0.1")
+        );
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--port" && pair[1] == port_arg.as_str())
+        );
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
+        );
+        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
+        assert_eq!(metadata.provider, "llamacpp");
+        assert_eq!(metadata.launch_mode, "native_spawned");
+        assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
+        assert_eq!(metadata.model_path, Some(model.display().to_string()));
+        assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));
+    }
+
+    #[test]
+    fn native_launch_missing_model_fails_before_spawn() {
+        let temp = tempdir().expect("temp");
+        let error = embed_model_dir_from_candidates([temp.path().join("embed-models")])
+            .expect_err("missing model should fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
+        );
+        assert!(error.to_string().contains("fetch-embed-model"));
     }
 
     #[test]
@@ -507,5 +981,39 @@ mod tests {
         let resolved = resolve_compose_file(Some(project.path()), None).expect("resolve compose");
 
         assert_eq!(resolved, compose);
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 }

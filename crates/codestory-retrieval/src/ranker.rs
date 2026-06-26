@@ -46,21 +46,15 @@ pub fn rank_candidates(
         {
             candidate.score += 0.25;
         }
-        if matches!(features.shape, QueryShape::NaturalLanguage) {
-            let path_lower = candidate.file_path.to_ascii_lowercase();
-            let symbol_lower = candidate
-                .symbol_name
-                .as_deref()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let strong_token_hits = query_tokens
-                .iter()
-                .filter(|token| token.len() >= 4)
-                .filter(|token| {
-                    path_lower.contains(token.as_str()) || symbol_lower.contains(token.as_str())
-                })
-                .count();
+        if matches!(
+            features.shape,
+            QueryShape::NaturalLanguage | QueryShape::Mixed
+        ) {
+            let strong_token_hits = strong_query_token_hits(candidate, &query_tokens);
             candidate.score += (strong_token_hits as f32) * 0.06;
+            if candidate.source == CandidateSource::Zoekt && strong_token_hits >= 3 {
+                candidate.score += 0.08;
+            }
         }
         if prefer_primary_code && matches!(file_role, FileRole::Source | FileRole::Entrypoint) {
             candidate.score += primary_source_path_bonus(&candidate.file_path, &query_tokens);
@@ -68,7 +62,7 @@ pub fn rank_candidates(
         if prefer_primary_code && symbol_name_looks_test_like(candidate.symbol_name.as_deref()) {
             candidate.score *= 0.55;
         }
-        candidate.rank_features = Some(rank_features);
+        candidate.rank_features = Some(export_rank_features(candidate, rank_features));
     }
 
     apply_exact_code_evidence_anchor(features, &query_tokens, &mut candidates);
@@ -81,6 +75,7 @@ pub fn rank_candidates(
     }
     if prefer_primary_code {
         cap_non_primary_below_best_primary(&mut candidates);
+        cap_dense_below_strong_lexical_source(&mut candidates, &query_tokens);
     }
 
     candidates.sort_by(|left, right| {
@@ -156,19 +151,28 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let lexical = match candidate.source {
-        CandidateSource::Zoekt => candidate.score.max(0.35),
-        CandidateSource::Legacy => candidate.score * 0.5,
-        _ => candidate.score * 0.6,
+    let has_lexical = matches!(candidate.source, CandidateSource::Zoekt)
+        || candidate_has_provenance(candidate, "lexical_source");
+    let has_semantic = matches!(candidate.source, CandidateSource::Qdrant)
+        || candidate_has_provenance(candidate, "dense_anchor")
+        || candidate_has_provenance(candidate, "component_report");
+    let has_graph = candidate_has_graph_provenance(candidate);
+
+    let lexical = if matches!(candidate.source, CandidateSource::Legacy) {
+        candidate.score * 0.5
+    } else if has_lexical {
+        candidate.score.max(0.35)
+    } else {
+        candidate.score * 0.6
     };
 
-    let semantic = if candidate.source == CandidateSource::Qdrant {
+    let semantic = if has_semantic {
         candidate.score.max(0.4)
     } else {
         candidate.score * 0.25
     };
 
-    let scip_distance = if candidate.source == CandidateSource::Scip {
+    let scip_distance = if has_graph {
         1.0 / (1.0 + candidate.scip_hop_distance.unwrap_or(0) as f32)
     } else {
         0.2
@@ -192,6 +196,13 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
     }
 }
 
+fn export_rank_features(candidate: &CandidateHit, mut features: RankFeatures) -> RankFeatures {
+    if !candidate_has_graph_provenance(candidate) {
+        features.scip_distance = 0.0;
+    }
+    features
+}
+
 fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
     weights.lexical * features.lexical
         + weights.semantic * features.semantic
@@ -199,6 +210,19 @@ fn score_features(features: &RankFeatures, weights: RankWeights) -> f32 {
         + weights.file_role_prior * features.file_role_prior
         + weights.definition_quality * features.definition_quality
         + weights.token_overlap * features.token_overlap
+}
+
+fn candidate_has_graph_provenance(candidate: &CandidateHit) -> bool {
+    matches!(candidate.source, CandidateSource::Scip)
+        || candidate_has_provenance(candidate, "graph_neighbor")
+        || candidate_has_provenance(candidate, "exact")
+}
+
+fn candidate_has_provenance(candidate: &CandidateHit, label: &str) -> bool {
+    candidate
+        .provenance
+        .iter()
+        .any(|candidate_label| candidate_label == label)
 }
 
 fn file_role_prior(file_role: FileRole) -> f32 {
@@ -371,6 +395,55 @@ fn token_overlap_score(query_tokens: &[String], path_lower: &str, symbol_lower: 
     hits as f32 / query_tokens.len() as f32
 }
 
+fn strong_query_token_hits(candidate: &CandidateHit, query_tokens: &[String]) -> usize {
+    let path_lower = candidate.file_path.to_ascii_lowercase();
+    let symbol_lower = candidate
+        .symbol_name
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    query_tokens
+        .iter()
+        .filter(|token| token.len() >= 4)
+        .filter(|token| {
+            path_lower.contains(token.as_str()) || symbol_lower.contains(token.as_str())
+        })
+        .count()
+}
+
+fn cap_dense_below_strong_lexical_source(candidates: &mut [CandidateHit], query_tokens: &[String]) {
+    let Some((anchor_hits, anchor_score)) = candidates
+        .iter()
+        .filter(|candidate| candidate.source == CandidateSource::Zoekt)
+        .filter(|candidate| {
+            matches!(
+                effective_file_role(candidate),
+                FileRole::Source | FileRole::Entrypoint
+            )
+        })
+        .filter_map(|candidate| {
+            let hits = strong_query_token_hits(candidate, query_tokens);
+            (hits >= 3).then_some((hits, candidate.score))
+        })
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return;
+    };
+
+    for candidate in candidates {
+        if candidate.source == CandidateSource::Qdrant
+            && strong_query_token_hits(candidate, query_tokens) < anchor_hits
+            && candidate.score >= anchor_score
+        {
+            candidate.score = (anchor_score - 0.001).max(0.0);
+        }
+    }
+}
+
 fn apply_exact_code_evidence_anchor(
     features: &QueryFeatures,
     query_tokens: &[String],
@@ -528,6 +601,33 @@ mod tests {
         let ranked = rank_candidates(&features, vec![hit]);
         let rf = ranked[0].rank_features.as_ref().expect("features");
         assert!(rf.file_role_prior > 0.0);
+    }
+
+    #[test]
+    fn ranker_exports_zero_graph_feature_without_graph_provenance() {
+        let features = classify_query("explain service startup");
+        let lexical = CandidateHit::lexical_stub("src/service.rs", 0.8);
+        let dense = CandidateHit::with_source(
+            "src/search.rs",
+            Some("SearchService".into()),
+            0.9,
+            CandidateSource::Qdrant,
+        );
+
+        let ranked = rank_candidates(&features, vec![lexical, dense]);
+
+        for candidate in ranked {
+            assert_eq!(
+                candidate
+                    .rank_features
+                    .as_ref()
+                    .expect("rank features")
+                    .scip_distance,
+                0.0,
+                "{} should not export graph evidence",
+                candidate.file_path
+            );
+        }
     }
 
     #[test]
@@ -700,5 +800,110 @@ mod tests {
             Some("workspace/app/tests/event_processor_with_json_output.rs")
         );
         assert_eq!(ranked[0].file_role, Some(FileRole::Test));
+    }
+
+    #[test]
+    fn ranker_prefers_lexical_source_anchor_over_dense_dto_distractor() {
+        let features = classify_query(
+            "packet search output evidence packet indexed symbol hits retrieval shadow",
+        );
+        let mut source = CandidateHit::with_source(
+            "crates/codestory-cli/src/output.rs",
+            Some("append_search_evidence_packet".into()),
+            0.92,
+            CandidateSource::Zoekt,
+        );
+        source.file_role = Some(FileRole::Source);
+        let mut dense_dto = CandidateHit::with_source(
+            "crates/codestory-contracts/src/api/dto.rs",
+            Some("PacketRetrievalTraceSummaryDto".into()),
+            0.99,
+            CandidateSource::Qdrant,
+        );
+        dense_dto.file_role = Some(FileRole::Source);
+
+        let ranked = rank_candidates(&features, vec![dense_dto, source]);
+
+        assert_eq!(
+            ranked.first().map(|hit| hit.file_path.as_str()),
+            Some("crates/codestory-cli/src/output.rs")
+        );
+    }
+
+    #[test]
+    fn ranker_keeps_broad_lexical_source_anchor_inside_resolved_window() {
+        let features = classify_query(
+            "packet search output evidence packet indexed symbol hits retrieval shadow",
+        );
+        let mut source = CandidateHit::with_source(
+            "crates/codestory-runtime/src/agent/packet_evidence.rs",
+            Some("decorate_search_hit_evidence".into()),
+            0.82,
+            CandidateSource::Zoekt,
+        );
+        source.file_role = Some(FileRole::Source);
+        let dense_distractors = [
+            (
+                "PacketTraceDto",
+                "crates/codestory-contracts/src/api/dto.rs",
+            ),
+            (
+                "RetrievalTraceDto",
+                "crates/codestory-contracts/src/api/retrieval.rs",
+            ),
+            (
+                "SearchResultDto",
+                "crates/codestory-contracts/src/api/search.rs",
+            ),
+            (
+                "IndexedSymbolDto",
+                "crates/codestory-contracts/src/api/symbol.rs",
+            ),
+            (
+                "SearchShadowDto",
+                "crates/codestory-contracts/src/api/shadow.rs",
+            ),
+        ]
+        .into_iter()
+        .map(|(symbol, path)| {
+            let mut hit =
+                CandidateHit::with_source(path, Some(symbol.into()), 0.99, CandidateSource::Qdrant);
+            hit.file_role = Some(FileRole::Source);
+            hit
+        });
+
+        let ranked = rank_candidates(&features, dense_distractors.chain([source]).collect());
+
+        assert!(
+            ranked.iter().take(5).any(|hit| {
+                hit.file_path == "crates/codestory-runtime/src/agent/packet_evidence.rs"
+                    && hit.symbol_name.as_deref() == Some("decorate_search_hit_evidence")
+            }),
+            "direct lexical source evidence should stay inside the resolved top-5 window: {ranked:#?}"
+        );
+    }
+
+    #[test]
+    fn ranker_fuses_duplicate_lane_provenance_into_rank_features() {
+        let features = classify_query("how does service startup flow");
+        let mut fused = CandidateHit::with_source(
+            "src/service.rs",
+            Some("ExtensionService".into()),
+            0.85,
+            CandidateSource::Zoekt,
+        );
+        fused.provenance = vec![
+            "lexical_source".into(),
+            "dense_anchor".into(),
+            "graph_neighbor".into(),
+        ];
+        fused.scip_hop_distance = Some(1);
+
+        let ranked = rank_candidates(&features, vec![fused]);
+        let rank_features = ranked[0].rank_features.as_ref().expect("rank features");
+
+        assert_eq!(rank_features.lexical, 0.85);
+        assert_eq!(rank_features.semantic, 0.85);
+        assert_eq!(rank_features.scip_distance, 0.5);
     }
 }

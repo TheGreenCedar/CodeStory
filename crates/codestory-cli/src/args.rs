@@ -17,7 +17,7 @@ use codestory_contracts::api::{
     TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
 cache already has indexed files.";
@@ -85,6 +85,10 @@ pub(crate) enum Command {
     DrillSuite(DrillSuiteCommand),
     #[command(about = "Inspect a symbol by query or id.")]
     Symbol(SymbolCommand),
+    #[command(about = "Summarize symbol-centered impact, callers, surfaces, and tests.")]
+    Impact(SymbolWorkflowCommand),
+    #[command(about = "Map a symbol to focused test-like files and caller evidence.")]
+    TestMap(SymbolWorkflowCommand),
     #[command(about = "Trace calls, refs, and related symbols.")]
     Trail(TrailCommand),
     #[command(about = "Show incoming callers for a symbol.")]
@@ -111,6 +115,8 @@ pub(crate) enum Command {
     GenerateCompletions(GenerateCompletionsCommand),
     #[command(about = "Manage retrieval sidecar data.")]
     Retrieval(RetrievalCommand),
+    #[command(about = "Show retrieval sidecar status.")]
+    Sidecar(SidecarCommand),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -468,6 +474,14 @@ pub(crate) struct PacketCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for packet retrieval. Passing --run-id implies the agent profile."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -578,6 +592,17 @@ pub(crate) struct ReadyCommand {
         help = "Repair readiness before reporting it. Local repairs refresh the index; agent repairs also bootstrap and rebuild retrieval sidecars."
     )]
     pub(crate) repair: bool,
+    #[arg(
+        long,
+        help = "For local graph freshness, no-op when fresh and run at most one incremental refresh when stale or unchecked."
+    )]
+    pub(crate) wait_fresh: bool,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Use a specific agent sidecar run id when checking or repairing agent readiness."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -704,6 +729,8 @@ pub(crate) enum RetrievalAction {
     Down(RetrievalSidecarStateCommand),
     /// Probe Zoekt, Qdrant, and SCIP availability for the project.
     Status(RetrievalStatusCommand),
+    /// List owned sidecar namespaces and dry-run cleanup eligibility.
+    Inventory(RetrievalInventoryCommand),
     /// Run workspace index then persist retrieval_index_manifest sidecar metadata.
     Index(RetrievalIndexCommand),
     /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
@@ -812,6 +839,37 @@ pub(crate) struct RetrievalStatusCommand {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct RetrievalInventoryCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        help = "Apply cleanup for CodeStory-owned inventory safe candidates. Omit for dry-run inventory only."
+    )]
+    pub(crate) apply: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SidecarCommand {
+    #[command(subcommand)]
+    pub(crate) action: SidecarAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SidecarAction {
+    /// Alias for `retrieval status`.
+    Status(RetrievalStatusCommand),
+    /// Alias for `retrieval inventory`.
+    Inventory(RetrievalInventoryCommand),
+    #[command(external_subcommand)]
+    Unknown(Vec<String>),
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct RetrievalIndexCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -906,6 +964,14 @@ pub(crate) struct SearchCommand {
         long_help = READ_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for search retrieval. Passing --run-id implies the agent profile."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -1121,6 +1187,38 @@ pub(crate) struct TrailCommand {
     pub(crate) output_file: Option<PathBuf>,
     #[arg(long, help = "Render a Mermaid graph instead of Markdown/JSON output.")]
     pub(crate) mermaid: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SymbolWorkflowCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[command(flatten)]
+    pub(crate) target: TargetArgs,
+    #[arg(long, default_value_t = 3)]
+    pub(crate) depth: u32,
+    #[arg(long, default_value_t = 120)]
+    pub(crate) max_nodes: u32,
+    #[arg(
+        long,
+        help = "Include test and benchmark callers in caller trail evidence."
+    )]
+    pub(crate) include_tests: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = RefreshMode::None,
+        long_help = READ_REFRESH_HELP
+    )]
+    pub(crate) refresh: RefreshMode,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1467,6 +1565,10 @@ pub(crate) struct IndexOutput<'a> {
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadyOutput {
     pub(crate) verdicts: Vec<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1475,6 +1577,37 @@ pub(crate) struct AgentPreflightLaneOutput {
     pub(crate) status: ReadinessStatusDto,
     pub(crate) failed_layer: Option<&'static str>,
     pub(crate) summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_device_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_device_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_device_observation_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_gpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_requested: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_cpu_allowed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ReadinessLaneOutput {
+    pub(crate) status: ReadinessStatusDto,
+    pub(crate) profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) sidecar_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_command: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1482,7 +1615,11 @@ pub(crate) struct AgentPreflightOutput {
     pub(crate) usable: bool,
     pub(crate) mode: String,
     pub(crate) local_graph: AgentPreflightLaneOutput,
+    pub(crate) local_refresh: crate::readiness::LocalRefreshOutput,
     pub(crate) full_retrieval: AgentPreflightLaneOutput,
+    pub(crate) local_default: ReadinessLaneOutput,
+    pub(crate) agent_packet_search: ReadinessLaneOutput,
+    pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     pub(crate) sidecar_setup: serde_json::Value,
     pub(crate) safe_surfaces: Vec<String>,
     pub(crate) blocked_surfaces: Vec<String>,
@@ -2269,9 +2406,26 @@ pub(crate) struct DoctorCheckOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DoctorSidecarStatusOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
     pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
+    pub(crate) embedding_device_policy: String,
+    pub(crate) embedding_device_state: String,
+    pub(crate) embedding_device_observation_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_detected_gpu: Option<String>,
+    pub(crate) embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_accelerator_request_device: Option<String>,
+    pub(crate) embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manifest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2306,6 +2460,8 @@ pub(crate) struct DoctorOutput {
     pub(crate) freshness: Option<IndexFreshnessDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) readiness: Vec<ReadinessVerdictDto>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,
@@ -2485,7 +2641,7 @@ mod tests {
     fn read_commands_explain_refresh_none_default() {
         for name in [
             "ground", "context", "search", "symbol", "trail", "callers", "callees", "trace",
-            "snippet", "query", "explore", "serve",
+            "impact", "test-map", "snippet", "query", "explore", "serve",
         ] {
             let help = render_subcommand_help(name);
             assert!(
@@ -2499,10 +2655,19 @@ mod tests {
     fn search_help_explains_repo_text_modes() {
         let help = render_subcommand_help("search");
         assert!(help.contains("--repo-text <REPO_TEXT>"));
+        assert!(help.contains("--profile <PROFILE>"));
+        assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("--why"));
         assert!(help.contains("auto"));
         assert!(help.contains("on"));
         assert!(help.contains("off"));
+    }
+
+    #[test]
+    fn packet_help_exposes_agent_runtime_selection() {
+        let help = render_subcommand_help("packet");
+        assert!(help.contains("--profile <PROFILE>"));
+        assert!(help.contains("--run-id <ID>"));
     }
 
     #[test]
@@ -2633,10 +2798,48 @@ mod tests {
     }
 
     #[test]
+    fn symbol_workflow_commands_parse_target_and_caps() {
+        let impact = Cli::try_parse_from([
+            "codestory-cli",
+            "impact",
+            "--query",
+            "AppController::affected_analysis",
+            "--depth",
+            "4",
+            "--max-nodes",
+            "80",
+        ])
+        .expect("impact command should parse");
+        match impact.command {
+            Command::Impact(cmd) => {
+                assert_eq!(
+                    cmd.target.query.as_deref(),
+                    Some("AppController::affected_analysis")
+                );
+                assert_eq!(cmd.depth, 4);
+                assert_eq!(cmd.max_nodes, 80);
+                assert!(!cmd.include_tests);
+            }
+            _ => panic!("expected impact command"),
+        }
+
+        let test_map = Cli::try_parse_from(["codestory-cli", "test-map", "--id", "node-1"])
+            .expect("test-map command should parse");
+        match test_map.command {
+            Command::TestMap(cmd) => {
+                assert_eq!(cmd.target.id.as_deref(), Some("node-1"));
+                assert_eq!(cmd.depth, 3);
+                assert_eq!(cmd.max_nodes, 120);
+            }
+            _ => panic!("expected test-map command"),
+        }
+    }
+
+    #[test]
     fn non_trail_help_does_not_advertise_dot_format() {
         for name in [
-            "index", "ground", "context", "doctor", "search", "symbol", "snippet", "query",
-            "explore",
+            "index", "ground", "context", "doctor", "search", "symbol", "impact", "test-map",
+            "snippet", "query", "explore",
         ] {
             let help = render_subcommand_help(name);
             assert!(
@@ -2691,6 +2894,27 @@ mod tests {
                 action: SetupAction::Embeddings(cmd),
             }) => assert_eq!(cmd.variant, CliLlamaVariant::Vulkan),
             _ => panic!("expected setup embeddings command"),
+        }
+    }
+
+    #[test]
+    fn retrieval_inventory_apply_is_explicit_opt_in() {
+        let dry_run = Cli::try_parse_from(["codestory-cli", "retrieval", "inventory"])
+            .expect("retrieval inventory should parse");
+        match dry_run.command {
+            Command::Retrieval(RetrievalCommand {
+                action: RetrievalAction::Inventory(cmd),
+            }) => assert!(!cmd.apply),
+            _ => panic!("expected retrieval inventory command"),
+        }
+
+        let apply = Cli::try_parse_from(["codestory-cli", "sidecar", "inventory", "--apply"])
+            .expect("sidecar inventory --apply should parse");
+        match apply.command {
+            Command::Sidecar(SidecarCommand {
+                action: SidecarAction::Inventory(cmd),
+            }) => assert!(cmd.apply),
+            _ => panic!("expected sidecar inventory command"),
         }
     }
 

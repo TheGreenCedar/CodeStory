@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 /// Phase 2 lexical shard pin (local index + optional Zoekt webserver).
 pub const ZOEKT_REAL_VERSION_PIN: &str = "zoekt-20250506123554";
@@ -25,10 +24,13 @@ pub const DEFAULT_ZOEKT_HTTP_PORT: u16 = 6070;
 pub const DEFAULT_QDRANT_HTTP_PORT: u16 = 6333;
 pub const DEFAULT_QDRANT_GRPC_PORT: u16 = 6334;
 pub const DEFAULT_EMBED_HTTP_PORT: u16 = 8080;
+pub const DEFAULT_AGENT_RUN_ID: &str = "shared-agent";
+pub const NATIVE_LLAMA_MANAGED_CACHE_REL_PATH: &str =
+    "managed-embeddings/llama/b9058/llama-b9058-bin-win-vulkan-x64/llama-server.exe";
+pub const NATIVE_LLAMA_SOURCE_CACHE_REL_PATH: &str = "target/llamacpp/b8840/llama-server.exe";
 
 pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
-static AGENT_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SidecarLayout {
@@ -53,6 +55,22 @@ impl SidecarProfile {
         match self {
             Self::Local => "local",
             Self::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingServerLaunchMode {
+    DockerComposeEmbed,
+    NativeSpawned,
+}
+
+impl EmbeddingServerLaunchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DockerComposeEmbed => "docker_compose_embed",
+            Self::NativeSpawned => "native_spawned",
         }
     }
 }
@@ -425,12 +443,7 @@ fn agent_run_id(explicit: Option<&str>) -> String {
 }
 
 fn default_agent_run_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let counter = AGENT_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{nanos:x}-{counter:x}", std::process::id())
+    DEFAULT_AGENT_RUN_ID.to_string()
 }
 
 fn normalized_label_component(value: &str) -> Option<String> {
@@ -566,6 +579,34 @@ pub fn retrieval_compose_profile() -> String {
         .unwrap_or_else(|| "real".to_string())
 }
 
+pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
+    if let Some(mode) = std::env::var("CODESTORY_EMBED_SERVER_LAUNCH")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .and_then(|value| match value.as_str() {
+            "native_spawned" | "native" | "windows_amd_native" => {
+                Some(EmbeddingServerLaunchMode::NativeSpawned)
+            }
+            "docker_compose_embed" | "docker" | "compose" => {
+                Some(EmbeddingServerLaunchMode::DockerComposeEmbed)
+            }
+            _ => None,
+        })
+    {
+        return Ok(mode);
+    }
+    if std::env::var("CODESTORY_EMBED_SERVER_LAUNCH").is_ok() {
+        anyhow::bail!(
+            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
+        );
+    }
+    if cfg!(target_os = "windows") && crate::embeddings::embedding_accelerator_request().is_some() {
+        Ok(EmbeddingServerLaunchMode::NativeSpawned)
+    } else {
+        Ok(EmbeddingServerLaunchMode::DockerComposeEmbed)
+    }
+}
+
 fn env_port(name: &str, default: u16) -> Option<u16> {
     std::env::var(name)
         .ok()
@@ -603,10 +644,13 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn agent_profile_default_runtime_isolates_same_project_runs() {
+    fn agent_profile_default_runtime_reuses_project_shared_run() {
         let project = tempdir().expect("project");
 
         let first =
@@ -614,19 +658,21 @@ mod tests {
         let second =
             SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
 
-        assert_ne!(first.run_id, second.run_id);
-        assert_ne!(first.namespace, second.namespace);
-        assert_ne!(first.layout.state_file, second.layout.state_file);
-        assert_ne!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
-        assert_ne!(
+        assert_eq!(first.run_id.as_deref(), Some(DEFAULT_AGENT_RUN_ID));
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(first.namespace, second.namespace);
+        assert_eq!(first.layout.state_file, second.layout.state_file);
+        assert_eq!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
+        assert_eq!(
             first.layout.qdrant_http_port,
             second.layout.qdrant_http_port
         );
-        assert_ne!(
+        assert_eq!(
             first.layout.qdrant_grpc_port,
             second.layout.qdrant_grpc_port
         );
-        assert_ne!(first.embed_http_port, second.embed_http_port);
+        assert_eq!(first.embed_http_port, second.embed_http_port);
+        assert!(first.cleanup_command.contains("--run-id shared-agent"));
     }
 
     #[test]
@@ -676,5 +722,54 @@ mod tests {
 
         assert_eq!(profile, SidecarProfile::Agent);
         assert_eq!(run_id.as_deref(), Some("latest-agent"));
+    }
+
+    #[test]
+    fn explicit_embedding_launch_modes_parse() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::NativeSpawned
+        );
+    }
+
+    #[test]
+    fn invalid_embedding_launch_mode_fails_closed() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "llama-server.exe");
+
+        let error = embedding_server_launch_mode().expect_err("invalid mode");
+
+        assert!(error.to_string().contains(
+            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
+        ));
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 }

@@ -16,9 +16,9 @@ is missing, unversioned, or older than the plugin package, the adapter returns
 `repair_setup` MCP diagnostics instead of closing transport. Once MCP is live,
 `codestory://status` is the runtime truth: use `server_version`, `cli_version`,
 `server_executable`,
-`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`, and
-`allowed_surfaces` from status before any local grounding, packet, or search
-call.
+`server_executable_sha256`, `sidecar_contract_version`, `plugin_runtime`,
+`runtime_truth`, `dirty_marker`, and `allowed_surfaces` from status before any
+local grounding, packet, or search call.
 
 ## Usage
 
@@ -65,7 +65,9 @@ call.
 | `server_executable` / `server_executable_sha256` | Active MCP server executable path and checksum. Use them to diagnose stale runtime or binary drift. |
 | `sidecar_contract_version` | Active sidecar schema contract version compiled into the CLI. |
 | `plugin_runtime` | Plugin launch source. `managed` is the installed plugin path, `local_dev_override` means `CODESTORY_CLI`, and `path_fallback` means no managed binary was available. `plugin_runtime.plugin_root` and `plugin_cache_version` identify the installed package cache when launched by the plugin adapter. Provisioned records include `build_source=github_release` and `repo_ref`. |
+| `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, sidecar policy/status, and local/agent readiness lanes. |
 | `sidecar_setup` | Plugin sidecar setup policy (`ask`, `enabled`, or `disabled`) plus last repair state and opt-in/disable commands. |
+| `dirty_marker` | Optional plugin hook freshness marker. `dirty_stale` means local graph surfaces report `repair_index` until the index is refreshed; packet/search/context readiness remains sidecar-gated. |
 | `runtime_boundary` | Restart/reload reminder for changes to the managed binary, override, or PATH. |
 | `allowed_surfaces.<surface>.allowed` | Allows that concrete MCP surface. Local graph surfaces include `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Allows `packet`, `search`, and `context` only when the surface bit is true and `retrieval_mode=full`. |

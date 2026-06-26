@@ -348,9 +348,31 @@ pub struct ReadinessIndexSnapshotDto {
 /// Sidecar state snapshot used inside readiness verdicts.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ReadinessSidecarSnapshotDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device_observation_source: Option<String>,
+    #[serde(default)]
+    pub embedding_cpu_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_detected_gpu: Option<String>,
+    #[serde(default)]
+    pub embedding_accelerator_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_request_device: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

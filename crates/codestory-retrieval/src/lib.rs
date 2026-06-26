@@ -19,6 +19,7 @@ mod executor;
 mod generation;
 mod health;
 mod index;
+mod inventory;
 mod mode;
 mod planner;
 mod qdrant_client;
@@ -43,31 +44,39 @@ pub use capabilities::SidecarCapabilities;
 #[allow(deprecated)]
 pub use compose::bootstrap_sidecars_without_storage_scope;
 pub use compose::{
-    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, bootstrap_sidecars, bootstrap_sidecars_with_profile,
-    bootstrap_sidecars_with_runtime, docker_available, resolve_compose_file,
+    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory, bootstrap_sidecars,
+    bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime, docker_available,
+    embed_model_inventory, resolve_compose_file,
 };
 pub use config::{
-    DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT, DEFAULT_QDRANT_HTTP_PORT,
-    DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN, SidecarLayout, SidecarOwnership, SidecarPorts,
-    SidecarProfile, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
-    sidecar_runtime_auto, sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
+    DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
+    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN, SidecarLayout,
+    SidecarOwnership, SidecarPorts, SidecarProfile, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN,
+    ZOEKT_WEBSERVER_IMAGE_PIN, sidecar_runtime_auto, sidecar_runtime_for_project,
+    sidecar_runtime_for_project_with_run_id,
 };
 pub use config::{qdrant_enabled, qdrant_semantic_vectors_enabled};
 pub use embeddings::qdrant_vector_dim;
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, RETRIEVAL_EMBEDDING_DIM,
-    embedding_backend_label, embedding_runtime_id,
+    embedding_backend_label, embedding_runtime_id, ensure_product_embedding_backend,
+    ensure_product_embedding_backend_for_runtime,
 };
 pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellation_flag};
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
 pub use health::{
-    ComponentHealth, ComponentStatus, InfrastructureHealth, RetrievalManifestContractReport,
-    RetrievalManifestLaneProvenance, RetrievalRepairHint, RetrievalStatusReport,
-    probe_infrastructure_health, probe_sidecar_health,
+    ComponentHealth, ComponentStatus, EmbeddingLaunchMetadata, InfrastructureHealth,
+    RetrievalManifestContractReport, RetrievalManifestLaneProvenance, RetrievalRepairHint,
+    RetrievalStatusReport, probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
     FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, finalize_index_for_runtime,
     project_id_for_root, repair_project_qdrant_collection, sidecar_project_id_for_root,
+};
+pub use inventory::{
+    SidecarDockerResource, SidecarDockerResourceKind, SidecarGcNamespaceResult, SidecarGcReport,
+    SidecarInventoryEntry, SidecarInventoryReport, SidecarInventoryState, sidecar_gc_apply,
+    sidecar_inventory,
 };
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;

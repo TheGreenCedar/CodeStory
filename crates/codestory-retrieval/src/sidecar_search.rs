@@ -1,5 +1,6 @@
 use crate::candidate::CandidateHit;
 use crate::config::SidecarLayout;
+use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::qdrant_client::QdrantClient;
 use crate::scip_client::ScipClient;
 use crate::zoekt_client::ZoektClient;
@@ -8,6 +9,10 @@ use codestory_store::RetrievalIndexManifest;
 /// Sidecar search surface used by the executor (mockable in unit tests).
 pub trait SidecarSearch: Send + Sync {
     fn layout(&self) -> Option<&SidecarLayout> {
+        None
+    }
+
+    fn embedding_device_readiness(&self) -> Option<&EmbeddingDeviceReadiness> {
         None
     }
 
@@ -23,6 +28,7 @@ pub struct LiveSidecarSearch {
     project_id: String,
     sidecar_generation: String,
     qdrant_collection: String,
+    embedding_device: Option<EmbeddingDeviceReadiness>,
     zoekt: ZoektClient,
     qdrant: QdrantClient,
 }
@@ -32,6 +38,15 @@ impl LiveSidecarSearch {
         layout: SidecarLayout,
         project_id: String,
         manifest: Option<&RetrievalIndexManifest>,
+    ) -> Self {
+        Self::new_with_embedding_device(layout, project_id, manifest, None)
+    }
+
+    pub fn new_with_embedding_device(
+        layout: SidecarLayout,
+        project_id: String,
+        manifest: Option<&RetrievalIndexManifest>,
+        embedding_device: Option<EmbeddingDeviceReadiness>,
     ) -> Self {
         let zoekt = ZoektClient::new(&layout);
         let qdrant = QdrantClient::new(&layout);
@@ -46,6 +61,7 @@ impl LiveSidecarSearch {
             project_id,
             sidecar_generation,
             qdrant_collection,
+            embedding_device,
             zoekt,
             qdrant,
         }
@@ -67,6 +83,10 @@ impl LiveSidecarSearch {
 impl SidecarSearch for LiveSidecarSearch {
     fn layout(&self) -> Option<&SidecarLayout> {
         Some(&self.layout)
+    }
+
+    fn embedding_device_readiness(&self) -> Option<&EmbeddingDeviceReadiness> {
+        self.embedding_device.as_ref()
     }
 
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
@@ -167,5 +187,55 @@ pub mod mock {
                 .take(limit)
                 .collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_layout() -> SidecarLayout {
+        let root = std::env::temp_dir().join("codestory-sidecar-search-test");
+        SidecarLayout {
+            zoekt_http_port: 32101,
+            qdrant_http_port: 32102,
+            qdrant_grpc_port: 32103,
+            zoekt_data_dir: root.join("zoekt"),
+            qdrant_data_dir: root.join("qdrant"),
+            scip_artifacts_root: root.join("scip"),
+            state_file: root.join("retrieval-sidecars.json"),
+        }
+    }
+
+    fn accelerated_device() -> EmbeddingDeviceReadiness {
+        EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "native_log",
+            detected_provider: Some("amd".into()),
+            detected_gpu: Some("AMD Radeon RX 7900 XT".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("vulkan".into()),
+            accelerator_request_device: Some("Vulkan0".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        }
+    }
+
+    #[test]
+    fn live_sidecar_search_carries_runtime_embedding_device_truth() {
+        let device = accelerated_device();
+        let live = LiveSidecarSearch::new_with_embedding_device(
+            test_layout(),
+            "project".into(),
+            None,
+            Some(device.clone()),
+        );
+
+        assert_eq!(live.embedding_device_readiness(), Some(&device));
+
+        let generic = LiveSidecarSearch::new(test_layout(), "project".into(), None);
+        assert!(generic.embedding_device_readiness().is_none());
     }
 }
