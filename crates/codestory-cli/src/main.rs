@@ -33,7 +33,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::{IsTerminal, Read},
-    net::TcpListener,
+    net::{TcpListener, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -10174,6 +10174,9 @@ fn render_affected_footer(
 }
 
 fn run_serve(cmd: ServeCommand) -> Result<()> {
+    if !cmd.stdio {
+        ensure_http_serve_bind_allowed(&cmd.addr, cmd.allow_non_loopback)?;
+    }
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
@@ -10183,10 +10186,11 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
     eprintln!("codestory serve listening on http://{}", cmd.addr);
+    let policy = http_transport::HttpServePolicy::new(cmd.allow_non_loopback);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = http_transport::handle_http_request(&runtime, stream) {
+                if let Err(error) = http_transport::handle_http_request(&runtime, stream, policy) {
                     eprintln!("serve request failed: {error:#}");
                 }
             }
@@ -10194,6 +10198,32 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_http_serve_bind_allowed(addr: &str, allow_non_loopback: bool) -> Result<()> {
+    if allow_non_loopback {
+        return Ok(());
+    }
+
+    let resolved = addr
+        .to_socket_addrs()
+        .with_context(|| format!("Failed to resolve serve address {addr}"))?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        bail!("Serve address {addr} did not resolve to a socket address");
+    }
+    if resolved
+        .iter()
+        .all(|socket_addr| socket_addr.ip().is_loopback())
+    {
+        return Ok(());
+    }
+
+    bail!(
+        "Refusing to bind HTTP serve to non-loopback address `{addr}` without --allow-non-loopback. \
+serve exposes local graph/search endpoints without request authentication; bind to 127.0.0.1/localhost \
+or rerun with --allow-non-loopback only behind an intentional network boundary."
+    )
 }
 
 fn run_generate_completions(cmd: GenerateCompletionsCommand) -> Result<()> {
@@ -12447,6 +12477,34 @@ mod tests {
             first_index < second_index,
             "expected `{first}` before `{second}` in:\n{markdown}"
         );
+    }
+
+    #[test]
+    fn http_serve_allows_loopback_bind_without_acknowledgement() {
+        ensure_http_serve_bind_allowed("127.0.0.1:3917", false)
+            .expect("ipv4 loopback should be allowed by default");
+        ensure_http_serve_bind_allowed("localhost:3917", false)
+            .expect("localhost should resolve to loopback and stay ergonomic");
+        ensure_http_serve_bind_allowed("[::1]:3917", false)
+            .expect("ipv6 loopback should be allowed by default");
+    }
+
+    #[test]
+    fn http_serve_rejects_non_loopback_bind_without_acknowledgement() {
+        let error = ensure_http_serve_bind_allowed("0.0.0.0:3917", false)
+            .expect_err("wildcard bind should require explicit acknowledgement");
+        let message = error.to_string();
+        assert!(
+            message.contains("--allow-non-loopback")
+                && message.contains("without request authentication"),
+            "unsafe bind error should name the guard and auth boundary: {message}"
+        );
+    }
+
+    #[test]
+    fn http_serve_allows_non_loopback_bind_with_acknowledgement() {
+        ensure_http_serve_bind_allowed("0.0.0.0:3917", true)
+            .expect("explicit acknowledgement should allow intentional remote binds");
     }
 
     #[test]

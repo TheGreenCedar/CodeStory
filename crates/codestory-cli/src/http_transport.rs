@@ -6,7 +6,7 @@ use codestory_contracts::api::{
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::TcpStream,
+    net::{IpAddr, TcpStream},
     time::Duration,
 };
 
@@ -24,7 +24,22 @@ const BROWSER_REFERENCES_MAX_NODES: u32 = 120;
 pub(crate) const BROWSER_SYMBOLS_DEFAULT_LIMIT: u32 = 300;
 pub(crate) const BROWSER_SYMBOLS_MAX_LIMIT: u32 = 2_000;
 
-pub(crate) fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStream) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HttpServePolicy {
+    allow_non_loopback: bool,
+}
+
+impl HttpServePolicy {
+    pub(crate) fn new(allow_non_loopback: bool) -> Self {
+        Self { allow_non_loopback }
+    }
+}
+
+pub(crate) fn handle_http_request(
+    runtime: &RuntimeContext,
+    mut stream: TcpStream,
+    policy: HttpServePolicy,
+) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut request_bytes = Vec::with_capacity(1024);
     let mut buffer = [0u8; 1024];
@@ -66,6 +81,10 @@ pub(crate) fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStrea
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or("/");
+    let headers = parse_http_headers(&request);
+    if let Some(message) = http_boundary_rejection(&headers, policy) {
+        return write_http_error_json(&mut stream, 403, "forbidden_http_boundary", message);
+    }
     if method != "GET" {
         return write_http_json(
             &mut stream,
@@ -199,6 +218,104 @@ pub(crate) fn handle_http_request(runtime: &RuntimeContext, mut stream: TcpStrea
         }
         _ => write_http_json(&mut stream, 404, &serde_json::json!({"error": "not found"})),
     }
+}
+
+fn parse_http_headers(request: &str) -> Vec<(&str, &str)> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim(), value.trim()))
+        })
+        .collect()
+}
+
+fn http_boundary_rejection(headers: &[(&str, &str)], policy: HttpServePolicy) -> Option<String> {
+    if policy.allow_non_loopback {
+        return None;
+    }
+
+    let host_values = http_header_values(headers, "host");
+    if host_values.len() != 1 {
+        return Some(
+            "HTTP serve requires exactly one loopback Host header unless --allow-non-loopback is set."
+                .to_string(),
+        );
+    }
+    let host = host_values[0];
+    if !http_authority_is_loopback(host) {
+        return Some(format!(
+            "Refusing HTTP serve request with non-loopback Host `{host}`. Use 127.0.0.1, localhost, or --allow-non-loopback behind an intentional network boundary."
+        ));
+    }
+
+    for origin in http_header_values(headers, "origin") {
+        if !http_origin_is_loopback(origin) {
+            return Some(format!(
+                "Refusing HTTP serve request with non-loopback Origin `{origin}`. Use a loopback origin or --allow-non-loopback behind an intentional network boundary."
+            ));
+        }
+    }
+
+    None
+}
+
+fn http_header_values<'a>(headers: &'a [(&str, &str)], name: &str) -> Vec<&'a str> {
+    headers
+        .iter()
+        .filter_map(|(header_name, value)| header_name.eq_ignore_ascii_case(name).then_some(*value))
+        .collect()
+}
+
+fn http_origin_is_loopback(origin: &str) -> bool {
+    let origin = origin.trim();
+    let Some(authority_and_path) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    http_authority_is_loopback(authority)
+}
+
+fn http_authority_is_loopback(authority: &str) -> bool {
+    let Some(host) = http_authority_host(authority.trim()) else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn http_authority_host(authority: &str) -> Option<&str> {
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        if suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return (!host.is_empty()).then_some(host);
+        }
+        return None;
+    }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.contains(':')
+        && !port.is_empty()
+        && port.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return (!host.is_empty()).then_some(host);
+    }
+    Some(authority)
 }
 
 fn resolve_http_target_from_params(
@@ -352,6 +469,7 @@ fn write_http_json<T: serde::Serialize>(
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "OK",
