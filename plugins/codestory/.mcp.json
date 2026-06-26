@@ -3,6 +3,7 @@
     "codestory": {
       "command": "node",
       "args": ["./scripts/codestory-mcp.cjs"],
+      "cwd": ".",
       "tool_timeout_sec": 300
     }
   }

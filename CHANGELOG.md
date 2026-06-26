@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.22
+
+CodeStory 0.11.22 fixes the plugin-bundled MCP launch directory. The plugin
+now sets the MCP server `cwd` to the installed plugin root so Codex resolves
+`./scripts/codestory-mcp.cjs` inside the plugin cache instead of the active
+repo/session directory.
+
+Supporting PRs: #677.
+
 ## 0.11.21
 
 CodeStory 0.11.21 is a patch hotfix for the main-served plugin package. It
