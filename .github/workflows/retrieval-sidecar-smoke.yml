@@ -15,6 +15,8 @@ on:
       - crates/codestory-cli/src/args.rs
       - crates/codestory-cli/src/runtime.rs
       - crates/codestory-cli/src/stdio_*.rs
+      - crates/codestory-cli/tests/fixtures/packet_search_eval/**
+      - crates/codestory-cli/tests/packet_search_eval.rs
       - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
       - crates/codestory-cli/tests/search_json_output.rs
       - crates/codestory-cli/tests/stdio_protocol_contracts.rs
@@ -43,6 +45,8 @@ on:
       - crates/codestory-cli/src/args.rs
       - crates/codestory-cli/src/runtime.rs
       - crates/codestory-cli/src/stdio_*.rs
+      - crates/codestory-cli/tests/fixtures/packet_search_eval/**
+      - crates/codestory-cli/tests/packet_search_eval.rs
       - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
       - crates/codestory-cli/tests/search_json_output.rs
       - crates/codestory-cli/tests/stdio_protocol_contracts.rs
@@ -116,6 +120,9 @@ jobs:
 
       - name: CLI search JSON fail-closed contract tests
         run: cargo test -p codestory-cli --test search_json_output
+
+      - name: Packet/search fixture and baseline contract tests
+        run: cargo test -p codestory-cli --test packet_search_eval
 
       - name: Retrieval crate unit tests
         run: cargo test -p codestory-retrieval

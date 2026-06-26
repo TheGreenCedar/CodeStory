@@ -183,8 +183,7 @@ fn retrieval_eval_search_fails_closed_without_full_retrieval_sidecars() {
     assert!(
         details
             .next_commands
-            .iter()
-            .next()
+            .first()
             .is_some_and(|command| command.contains("codestory-cli ready --goal agent --repair")),
         "retrieval error should start with the canonical agent repair command: {error:?}"
     );

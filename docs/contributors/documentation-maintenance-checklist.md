@@ -65,7 +65,7 @@ contract-complete.
 ### Verification process
 - [ ] Run `cargo fmt --check` on all documentation-related code
 - [ ] Run `cargo check` to ensure no documentation compilation errors
-- [ ] Run `cargo clippy --all-targets -- -D warnings` for linting
+- [ ] Run `cargo clippy --workspace --all-targets --all-features -- -D warnings` for strict linting
 - [ ] Run plugin static tests with `node --test plugins/codestory/tests/plugin-static.test.mjs` when plugin files change (structure and runtime shape only — not doc copy)
 - [ ] Check for broken links with `node .github/scripts/check-doc-links.mjs` (covers `README.md`, `docs/**` including templates, `plugins/codestory/README.md`, `plugins/codestory/docs/**`, and `plugins/codestory/skills/**`)
 

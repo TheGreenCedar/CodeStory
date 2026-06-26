@@ -664,7 +664,7 @@ fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<P
     let inventory = embed_model_inventory(repo_root, layout);
     if let Some(model_dir) = inventory
         .required_gguf_present
-        .then(|| inventory.model_dir.as_ref())
+        .then_some(inventory.model_dir.as_ref())
         .flatten()
     {
         return Ok(PathBuf::from(model_dir));

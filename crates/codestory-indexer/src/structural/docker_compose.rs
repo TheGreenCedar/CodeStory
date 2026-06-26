@@ -183,6 +183,7 @@ fn push_service(
     service_id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_anchor(
     storage: &mut IntermediateStorage,
     file_id: NodeId,

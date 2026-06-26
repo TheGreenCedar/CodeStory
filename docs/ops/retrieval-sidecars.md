@@ -386,7 +386,9 @@ expansion lanes are skipped for that query.
 
 `retrieval-sidecar-smoke` is a reduced CI contract lane, not the operator repair
 path and not a full sidecar proof. Linux carries generic
-lint/runtime/search/retrieval contract slices. Windows carries the
+lint/runtime/search/retrieval contract slices plus the non-live packet/search
+fixture and baseline gate (`cargo test -p codestory-cli --test packet_search_eval`).
+Windows carries the
 manifest-missing bootstrap/status shape only when manually dispatched or when a
 PR has the `ci:windows-smoke` label.
 

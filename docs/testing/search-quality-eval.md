@@ -43,6 +43,10 @@ schema, category, baseline, and non-full-mode gating checks with:
 cargo test -p codestory-cli --test packet_search_eval
 ```
 
+This non-ignored command is the CI-safe packet/search gate. It validates fixture
+schema, category coverage, baselines, and non-full-mode behavior without claiming
+live sidecar readiness.
+
 The live production-path check is ignored by default because it repairs and
 requires `retrieval_mode=full` agent sidecars for the checkout:
 

@@ -295,8 +295,7 @@ fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
     assert!(
         details
             .next_commands
-            .iter()
-            .next()
+            .first()
             .is_some_and(|command| command.contains("codestory-cli ready --goal agent --repair")),
         "retrieval error should start with the canonical agent repair command: {error:?}"
     );

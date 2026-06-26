@@ -1037,21 +1037,17 @@ pub(crate) fn packet_citation_probe_match_rank(
         } else {
             None
         }
-    } else if packet_citation_matches_route_registration_probe(query, citation) {
+    } else if packet_citation_matches_route_registration_probe(query, citation)
+        || packet_citation_matches_route_engine_constructor_probe(query, citation)
+        || packet_citation_matches_route_dispatch_probe(query, citation)
+        || packet_citation_matches_argument_planning_probe(query, citation)
+        || packet_citation_matches_buffered_wrapper_implementation(query, citation)
+        || packet_citation_matches_public_api_surface_probe(query, citation)
+    {
         Some(6)
-    } else if packet_citation_matches_route_engine_constructor_probe(query, citation) {
-        Some(6)
-    } else if packet_citation_matches_route_dispatch_probe(query, citation) {
-        Some(6)
-    } else if packet_citation_matches_argument_planning_probe(query, citation) {
-        Some(6)
-    } else if packet_citation_matches_buffered_wrapper_implementation(query, citation) {
-        Some(6)
-    } else if packet_citation_matches_public_api_surface_probe(query, citation) {
-        Some(6)
-    } else if packet_citation_matches_validation_bypass_probe(query, citation) {
-        Some(5)
-    } else if packet_citation_matches_sql_schema_scripts_probe(query, citation) {
+    } else if packet_citation_matches_validation_bypass_probe(query, citation)
+        || packet_citation_matches_sql_schema_scripts_probe(query, citation)
+    {
         Some(5)
     } else if packet_required_probe_needs_request_validation_anchor(query) {
         packet_citation_matches_request_validation_anchor(query, citation).then_some(5)

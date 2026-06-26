@@ -537,7 +537,7 @@ fn match_resource(
         return Some(resource);
     }
     if resource.kind == SidecarDockerResourceKind::Network
-        && resource.labels.get("dev.codestory.owner").is_none()
+        && !resource.labels.contains_key("dev.codestory.owner")
         && compose_project
             .as_ref()
             .is_some_and(|project| owned_compose_projects.contains(project))
@@ -620,6 +620,7 @@ fn inventory_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_entry(
     state: Option<&SidecarStateFile>,
     state_exists: bool,

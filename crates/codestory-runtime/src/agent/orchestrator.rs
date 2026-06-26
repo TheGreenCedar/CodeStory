@@ -1180,6 +1180,7 @@ fn maybe_append_generic_source_shape_citations(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_generic_source_shape_candidates(
     project_root: &Path,
     dir: &Path,

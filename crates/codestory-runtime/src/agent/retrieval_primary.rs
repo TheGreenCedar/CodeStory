@@ -138,7 +138,7 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
 fn sidecar_retrieval_recovery_commands(project_root: &Path) -> Vec<String> {
     let runtime = sidecar_runtime_auto(project_root);
     let agent_run_id = (runtime.profile == SidecarProfile::Agent)
-        .then(|| runtime.run_id.as_deref())
+        .then_some(runtime.run_id.as_deref())
         .flatten();
     sidecar_retrieval_recovery_commands_for_project(&project_root.to_string_lossy(), agent_run_id)
 }

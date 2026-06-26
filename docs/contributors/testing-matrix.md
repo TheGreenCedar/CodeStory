@@ -23,7 +23,7 @@ flowchart TD
     store --> store_tests["cargo test -p codestory-store"]
     runtime --> runtime_tests["cargo test -p codestory-runtime and retrieval_eval"]
     cli --> cli_tests["cargo test -p codestory-cli"]
-    bench --> bench_checks["cargo check -p codestory-bench --benches"]
+    bench --> bench_checks["cargo check -p codestory-bench --bench name"]
     e2e --> e2e_stats["release build + codestory_repo_e2e_stats"]
 ```
 
@@ -34,7 +34,7 @@ Run Cargo commands serially in this repo.
 | Lane | Commands |
 | --- | --- |
 | Docs only | `git diff --check`, `node .github/scripts/check-doc-links.mjs` |
-| Routine code | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy --all-targets -- -D warnings` |
+| Routine code | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Release-blocking fidelity | `cargo test -p codestory-indexer --test fidelity_regression`, `cargo test -p codestory-indexer --test tictactoe_language_coverage`, `cargo test -p codestory-runtime --test retrieval_eval` |
 | Heavy repo-scale timing | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` |
 
@@ -49,11 +49,15 @@ changes.
 cargo fmt --check
 cargo check
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 These are the default broad checks for code changes after the lane picker says
 workspace-wide proof is useful.
+
+Do not use `cargo test --workspace --all-targets` as the routine broad test
+gate. `--all-targets` expands into benchmark targets; Criterion benches are
+compiled or run through the bench lane below.
 
 ## Release And Version Bumps
 
@@ -300,8 +304,14 @@ present. A zero-evaluated run is not quality proof.
 
 ```sh
 node scripts/semantic-doc-leakage-check.mjs
-cargo check -p codestory-bench --benches
+cargo check -p codestory-bench --bench <name>
 ```
+
+Criterion benches opt out of broad workspace test selection. Run them
+explicitly with `cargo bench -p codestory-bench --bench <name>` when the lane
+needs performance numbers. Use the same explicit `--bench <name>` form for
+compile-only proof; aggregate `--benches` does not select benches that opt out
+of broad workspace test selection.
 
 When changing embedding backends, model profiles, pooling, prefixes, batching,
 hardware-provider settings, generated symbol-doc text, or dense-anchor text, run

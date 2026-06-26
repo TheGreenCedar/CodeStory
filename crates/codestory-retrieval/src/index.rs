@@ -484,6 +484,7 @@ fn ensure_zoekt_generation(
     Ok(ZOEKT_REAL_VERSION_PIN.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_qdrant_collection(
     storage_path: &Path,
     project_root: &Path,

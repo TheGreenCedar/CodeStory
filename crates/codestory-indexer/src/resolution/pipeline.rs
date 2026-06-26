@@ -276,6 +276,7 @@ pub(super) fn resolve_overrides_on_conn(
     Ok(resolved)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_edges_after_prepare<F>(
     pass: &ResolutionPass,
     conn: &rusqlite::Connection,
@@ -505,6 +506,62 @@ fn collect_override_candidates(
     candidates.into_vec()
 }
 
+fn collect_override_candidates_by_owner_name(
+    owner_name: &str,
+    method_name: &str,
+    inheritance_by_owner_name: &HashMap<String, Vec<String>>,
+    methods_by_owner_name_and_name: &HashMap<(String, String), Vec<i64>>,
+) -> Vec<i64> {
+    let mut pending = std::collections::VecDeque::from([owner_name.to_string()]);
+    let mut visited = HashSet::new();
+    let mut candidates = OrderedCandidateIds::default();
+    let method_name = method_name.to_string();
+
+    while let Some(current_owner) = pending.pop_front() {
+        if !visited.insert(current_owner.clone()) {
+            continue;
+        }
+        if current_owner != owner_name
+            && let Some(method_ids) =
+                methods_by_owner_name_and_name.get(&(current_owner.clone(), method_name.clone()))
+        {
+            candidates.extend_stage(method_ids, usize::MAX);
+        }
+        if let Some(parents) = inheritance_by_owner_name.get(&current_owner) {
+            for parent in parents {
+                pending.push_back(parent.clone());
+            }
+        }
+    }
+
+    candidates.into_vec()
+}
+
+fn owner_name_from_member_name(name: &str) -> Option<&str> {
+    let colon = name.rfind("::");
+    let dot = name.rfind('.');
+    match (colon, dot) {
+        (Some(colon_idx), Some(dot_idx)) => {
+            let split = if colon_idx + 1 > dot_idx {
+                colon_idx
+            } else {
+                dot_idx
+            };
+            Some(&name[..split])
+        }
+        (Some(colon_idx), None) => Some(&name[..colon_idx]),
+        (None, Some(dot_idx)) => Some(&name[..dot_idx]),
+        (None, None) => None,
+    }
+}
+
+fn short_member_name(name: &str) -> &str {
+    let colon = name.rfind("::").map(|idx| idx + 2).unwrap_or(0);
+    let dot = name.rfind('.').map(|idx| idx + 1).unwrap_or(0);
+    let split = colon.max(dot);
+    &name[split..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,60 +670,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-fn collect_override_candidates_by_owner_name(
-    owner_name: &str,
-    method_name: &str,
-    inheritance_by_owner_name: &HashMap<String, Vec<String>>,
-    methods_by_owner_name_and_name: &HashMap<(String, String), Vec<i64>>,
-) -> Vec<i64> {
-    let mut pending = std::collections::VecDeque::from([owner_name.to_string()]);
-    let mut visited = HashSet::new();
-    let mut candidates = OrderedCandidateIds::default();
-    let method_name = method_name.to_string();
-
-    while let Some(current_owner) = pending.pop_front() {
-        if !visited.insert(current_owner.clone()) {
-            continue;
-        }
-        if current_owner != owner_name
-            && let Some(method_ids) =
-                methods_by_owner_name_and_name.get(&(current_owner.clone(), method_name.clone()))
-        {
-            candidates.extend_stage(method_ids, usize::MAX);
-        }
-        if let Some(parents) = inheritance_by_owner_name.get(&current_owner) {
-            for parent in parents {
-                pending.push_back(parent.clone());
-            }
-        }
-    }
-
-    candidates.into_vec()
-}
-
-fn owner_name_from_member_name(name: &str) -> Option<&str> {
-    let colon = name.rfind("::");
-    let dot = name.rfind('.');
-    match (colon, dot) {
-        (Some(colon_idx), Some(dot_idx)) => {
-            let split = if colon_idx + 1 > dot_idx {
-                colon_idx
-            } else {
-                dot_idx
-            };
-            Some(&name[..split])
-        }
-        (Some(colon_idx), None) => Some(&name[..colon_idx]),
-        (None, Some(dot_idx)) => Some(&name[..dot_idx]),
-        (None, None) => None,
-    }
-}
-
-fn short_member_name(name: &str) -> &str {
-    let colon = name.rfind("::").map(|idx| idx + 2).unwrap_or(0);
-    let dot = name.rfind('.').map(|idx| idx + 1).unwrap_or(0);
-    let split = colon.max(dot);
-    &name[split..]
 }

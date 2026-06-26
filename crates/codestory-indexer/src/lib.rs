@@ -1356,7 +1356,7 @@ impl WorkspaceIndexer {
                 "INSERT OR IGNORE INTO incremental_resolution_touched_file_ids (file_id)
                  VALUES (?1)",
             )?;
-            for file_id in scope_file_ids.iter().copied() {
+            for file_id in scope_file_ids.iter() {
                 insert_touched.execute(rusqlite::params![file_id])?;
             }
         }
