@@ -437,12 +437,10 @@ test("mcp launcher uses active project state when host launches from plugin root
     assert.equal(result.status, 0, result.stderr);
     assert.equal(await readFile(marker, "utf8"), "serve-called");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    const ready = calls.find((call) => call.args[0] === "ready" && call.args.includes("--wait-fresh"));
+    const readyCalls = calls.filter((call) => call.args[0] === "ready");
     const serve = calls.find((call) => call.args[0] === "serve");
-    assert.ok(ready, "expected local wait-fresh call");
+    assert.deepEqual(readyCalls, []);
     assert.ok(serve, "expected serve call");
-    assert.equal(ready.args[ready.args.indexOf("--project") + 1], realRepoRoot);
-    assert.equal(ready.cwd, realRepoRoot);
     assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", realRepoRoot]);
     assert.equal(serve.cwd, realRepoRoot);
     assert.equal(serve.projectRoot, realRepoRoot);
@@ -746,7 +744,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
   }
 });
 
-test("mcp launcher waits for fresh local navigation without agent repair", async () => {
+test("mcp launcher starts stdio without local or agent repair", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-repair-index-"));
@@ -808,9 +806,7 @@ test("mcp launcher waits for fresh local navigation without agent repair", async
     assert.equal(await readFile(marker, "utf8"), "serve-called");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     const readyCalls = calls.filter((call) => call.args[0] === "ready");
-    assert.deepEqual(readyCalls.map((call) => call.args.slice(0, 5)), [
-      ["ready", "--goal", "local", "--wait-fresh", "--project"],
-    ]);
+    assert.deepEqual(readyCalls, []);
     assert.equal(calls.some((call) => call.args.includes("agent")), false);
     assert.equal(calls.some((call) => call.args.includes("--repair")), false);
     assert.equal(calls.some((call) => call.sidecarRepair), false);
@@ -826,180 +822,6 @@ test("mcp launcher waits for fresh local navigation without agent repair", async
       ]);
     }));
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("mcp launcher fails open when wait-fresh skips local refresh", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-index-"));
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-  const cliScript = join(dataDir, "fake-codestory-cli.cjs");
-  const cliPath = join(
-    dataDir,
-    process.platform === "win32" ? "fake-codestory-cli.cmd" : "fake-codestory-cli",
-  );
-  const marker = join(dataDir, "serve-called.txt");
-  const input = [
-    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "repair" } } }),
-  ].join("\n") + "\n";
-
-  try {
-    await writeFile(
-      cliScript,
-      [
-        "const fs = require('node:fs');",
-        "const version = process.env.TEST_CODESTORY_VERSION;",
-        "const marker = process.env.TEST_OUT;",
-        "const command = process.argv[2];",
-        "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
-        "if (command === 'ready') {",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'No indexed symbols are available yet.', minimum_next: ['codestory-cli ready --goal local --wait-fresh --project \"fixture\" --format json'], full_repair: ['codestory-cli doctor --project \"fixture\"'] }], local_refresh: { state: 'skipped_locked', reason: 'index_locked', blocks_local_surfaces: true, readiness_status: 'repair_index', changed_file_count: 1, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
-        "  process.exit(0);",
-        "}",
-        "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(1); }",
-        "process.exit(2);",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
-    } else {
-      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
-      await chmod(cliPath, 0o755);
-    }
-
-    const result = spawnSync(process.execPath, [launcher], {
-      cwd: dataDir,
-      env: {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
-        TEST_OUT: marker,
-      },
-      input,
-      encoding: "utf8",
-      timeout: 15000,
-    });
-
-    assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
-    const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 4, result.stdout);
-    const status = JSON.parse(responses[1].result.contents[0].text);
-    assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
-    assert.equal(status.runtime_truth.runtime_source, "local_dev_override");
-    assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
-    assert.equal(status.runtime_truth.readiness_lanes.local_graph.refresh_state, "skipped_locked");
-    assert.equal(status.readiness[0].status, "repair_index");
-    assert.equal(status.readiness[0].repair_reason, "local_navigation_wait_fresh_skipped_locked");
-    assert.equal(status.local_refresh.state, "skipped_locked");
-    assert.equal(status.readiness[0].local_refresh.reason, "index_locked");
-    assert.equal(status.allowed_surfaces.ground.allowed, false);
-    assert.equal(status.allowed_surfaces.ground.status, "repair_index");
-    assert.match(status.readiness[0].minimum_next[0], /ready --goal local --wait-fresh/u);
-    assert.deepEqual(status.readiness[0].setup.local_wait_fresh_args.slice(0, 5), [
-      "ready",
-      "--goal",
-      "local",
-      "--wait-fresh",
-      "--project",
-    ]);
-    assert.equal(responses[2].result.isError, true);
-    assert.equal(responses[2].result.structuredContent.status, "repair_index");
-    assert.equal(responses[2].result.structuredContent.local_refresh.state, "skipped_locked");
-    assert.equal(responses[2].result.structuredContent.local_refresh.reason, "index_locked");
-    assert.equal(responses[2].result.structuredContent.local_refresh.changed_file_count, 1);
-    assert.equal(responses[2].result.structuredContent.local_refresh.fatal_error_count, 0);
-    assert.equal(responses[3].result.structuredContent.state, "enabled");
-    const policy = JSON.parse(await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"));
-    assert.equal(policy.state, "enabled");
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("mcp launcher fails open when local navigation repair times out", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-repair-timeout-"));
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-  const cliScript = join(dataDir, "fake-codestory-cli.cjs");
-  const cliPath = join(
-    dataDir,
-    process.platform === "win32" ? "fake-codestory-cli.cmd" : "fake-codestory-cli",
-  );
-  const marker = join(dataDir, "serve-called.txt");
-  const input = JSON.stringify({
-    jsonrpc: "2.0",
-    id: "status",
-    method: "resources/read",
-    params: { uri: "codestory://status" },
-  }) + "\n";
-
-  try {
-    await writeFile(
-      cliScript,
-      [
-        "const fs = require('node:fs');",
-        "const version = process.env.TEST_CODESTORY_VERSION;",
-        "const marker = process.env.TEST_OUT;",
-        "const args = process.argv.slice(2);",
-        "const command = args[0];",
-        "if (command === '--version') { console.log('codestory-cli ' + version); process.exit(0); }",
-        "if (command === 'ready' && args.includes('--wait-fresh')) { const end = Date.now() + 200; while (Date.now() < end) {} process.exit(0); }",
-        "if (command === 'ready') { console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'repair_index', summary: 'stale local graph', minimum_next: [], full_repair: [] }] })); process.exit(0); }",
-        "if (command === 'serve') { fs.writeFileSync(marker, 'serve-called'); process.exit(1); }",
-        "process.exit(2);",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    if (process.platform === "win32") {
-      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
-    } else {
-      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
-      await chmod(cliPath, 0o755);
-    }
-
-    const result = spawnSync(process.execPath, [launcher], {
-      cwd: dataDir,
-      env: {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS: "50",
-        PLUGIN_DATA: dataDir,
-        TEST_CODESTORY_VERSION: version,
-        TEST_OUT: marker,
-      },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
-    });
-
-    assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.readiness[0].repair_reason, "local_navigation_wait_fresh_timeout");
-    assert.equal(status.local_refresh.state, "failed");
-    assert.equal(status.local_refresh.reason, "wait_fresh_timeout");
-    assert.deepEqual(status.readiness[0].setup.local_wait_fresh_args.slice(0, 5), [
-      "ready",
-      "--goal",
-      "local",
-      "--wait-fresh",
-      "--project",
-    ]);
-    assert.equal(status.allowed_surfaces.ground.allowed, false);
-  } finally {
-    await new Promise((resolve) => setTimeout(resolve, 300));
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -1138,7 +960,7 @@ test("mcp launcher persists sidecar setup policy in plugin data", async () => {
   }
 });
 
-test("enabled sidecar policy runs one agent repair at MCP startup", async () => {
+test("enabled sidecar policy defers repair until after MCP startup", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
@@ -1182,21 +1004,8 @@ test("enabled sidecar policy runs one agent repair at MCP startup", async () => 
     const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
     const repairCalls = calls.filter((call) => call.repair);
     const realRepoRoot = await realpath(repoRoot);
-    assert.equal(repairCalls.length, 1, text);
-    assert.equal(repairCalls[0].policy, "enabled");
-    assert.deepEqual(repairCalls[0].args, [
-      "ready",
-      "--goal",
-      "agent",
-      "--repair",
-      "--project",
-      realRepoRoot,
-      "--format",
-      "json",
-      "--run-id",
-      "shared-agent",
-    ]);
-    assert.ok(calls.some((call) => {
+    assert.equal(repairCalls.length, 0, text);
+    const serveCall = calls.find((call) => {
       return JSON.stringify(call.args) === JSON.stringify([
         "serve",
         "--stdio",
@@ -1205,12 +1014,12 @@ test("enabled sidecar policy runs one agent repair at MCP startup", async () => 
         "--project",
         realRepoRoot,
       ]);
-    }), text);
+    });
+    assert.ok(serveCall, text);
+    assert.equal(serveCall.policy, "enabled");
     const policy = JSON.parse(await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"));
-    assert.equal(policy.last_repair.state, "completed");
-    assert.equal(policy.last_repair.project_root, realRepoRoot);
-    assert.match(policy.last_repair.command, /ready --goal agent --repair/u);
-    assert.match(policy.last_repair.command, /--run-id shared-agent/u);
+    assert.equal(policy.state, "enabled");
+    assert.equal(policy.last_repair, undefined);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1526,7 +1335,7 @@ test("hook manifest timeouts cover managed bootstrap budget", async () => {
     /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
     "local wait-fresh timeout default",
   );
-  assert.equal(localWaitFreshTimeoutMs, 5000, "local wait-fresh default must stay MCP startup-safe");
+  assert.equal(localWaitFreshTimeoutMs, 5000, "local wait-fresh default must stay bounded for bootstrap diagnostics");
   const requiredTimeoutSec = Math.max(
     Math.ceil((bootstrapTimeoutMs + 30000) / 1000),
     Math.ceil((releaseDownloadTimeoutMs * releaseDownloadAttempts + localWaitFreshTimeoutMs) / 1000),
