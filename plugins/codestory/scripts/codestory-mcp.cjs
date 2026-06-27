@@ -657,11 +657,6 @@ function localWaitFreshTimeoutMs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
 }
 
-function sidecarRepairTimeoutMs() {
-  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR_TIMEOUT_MS || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120000;
-}
-
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
   const args = ['ready', '--goal', 'local', '--wait-fresh'];
   args.push('--project', projectRoot, '--format', 'json');
@@ -673,39 +668,6 @@ function runLocalNavigationWaitFresh(resolved, projectRoot) {
     windowsHide: true,
   });
   return { args, result };
-}
-
-function runSidecarStartupRepair(resolved, sidecarStatus, projectRoot = process.cwd()) {
-  if (sidecarStatus.state !== 'enabled') return sidecarStatus;
-  if (resolved.source !== 'managed' && resolved.source !== 'local_dev_override') return sidecarStatus;
-  const args = ['ready', '--goal', 'agent', '--repair'];
-  args.push('--project', projectRoot, '--format', 'json', '--run-id', sharedAgentRunId);
-  const result = spawnSync(resolved.path, args, {
-    cwd: projectRoot,
-    encoding: 'utf8',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
-    timeout: sidecarRepairTimeoutMs(),
-    windowsHide: true,
-    env: {
-      ...process.env,
-      CODESTORY_PLUGIN_SIDECAR_REPAIR: '1',
-      CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
-    },
-  });
-  const lastRepair = {
-    state: result.error?.code === 'ETIMEDOUT' ? 'timeout' : result.status === 0 ? 'completed' : 'failed',
-    updated_at: new Date().toISOString(),
-    project_root: projectRoot,
-    command: resolvedRepairCommandForProject(resolved, projectRoot),
-  };
-  if (sidecarStatus.path) {
-    writeSidecarPolicy(sidecarStatus.state, { last_repair: lastRepair }, sidecarStatus.path);
-    return readSidecarPolicy(sidecarStatus.path);
-  }
-  return {
-    ...sidecarStatus,
-    lastRepair,
-  };
 }
 
 function localReadySetup(prefix, args, result) {
@@ -1350,24 +1312,8 @@ async function main() {
     return;
   }
   const projectRoot = projectResolution.projectRoot;
-  const localReadiness = probeLocalNavigation(resolved, projectRoot);
-  if (!localReadiness.ready) {
-    runFailOpenMcp(fallbackDiagnostic(resolved, probe, localReadiness.reason, {
-      projectRoot,
-      projectRootSource: projectResolution.source,
-      status: localReadiness.status,
-      summary: localReadiness.summary,
-      minimumNext: localReadiness.minimumNext,
-      fullRepair: [
-        ...localReadiness.fullRepair,
-        'Restart/reload the Codex host/app after repairing the local CodeStory index, then read codestory://status in a fresh thread.',
-      ],
-      localRefresh: localReadiness.localRefresh,
-      setup: localReadiness.setup,
-    }));
-    return;
-  }
-  const sidecarStatus = runSidecarStartupRepair(resolved, readSidecarPolicy(), projectRoot);
+  // Keep the JSON-RPC server handshake first; codestory://status reports readiness after stdio is alive.
+  const sidecarStatus = readSidecarPolicy();
   const dirtyMarker = dirtyMarkerEnv(projectRoot);
 
   const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none', '--project', projectRoot], {
