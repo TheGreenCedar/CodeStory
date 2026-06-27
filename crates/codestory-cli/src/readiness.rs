@@ -333,20 +333,19 @@ fn verdict_state(
                             )
                         })
                         .unwrap_or_default();
-                    let request = sidecar
-                        .embedding_accelerator_requested
-                        .then(|| {
-                            format!(
-                                " accelerator_request=`{}:{}`",
-                                sidecar
-                                    .embedding_accelerator_request_provider
-                                    .unwrap_or("unknown"),
-                                sidecar
-                                    .embedding_accelerator_request_device
-                                    .unwrap_or("unknown")
-                            )
-                        })
-                        .unwrap_or_default();
+                    let request = if sidecar.embedding_accelerator_requested {
+                        format!(
+                            " accelerator_request=`{}:{}`",
+                            sidecar
+                                .embedding_accelerator_request_provider
+                                .unwrap_or("unknown"),
+                            sidecar
+                                .embedding_accelerator_request_device
+                                .unwrap_or("unknown")
+                        )
+                    } else {
+                        String::new()
+                    };
                     let source = sidecar
                         .embedding_device_observation_source
                         .map(|source| format!(" observation_source=`{source}`"))

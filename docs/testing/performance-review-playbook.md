@@ -61,11 +61,14 @@ cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
 cargo test -p codestory-runtime --test retrieval_eval
-cargo check -p codestory-bench --benches
+cargo check -p codestory-bench --bench <name>
 ```
 
 `retrieval_eval` needs `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` for full sidecar quality assertions;
 without it, the suite checks that non-full retrieval fails closed.
+
+Bench targets opt out of broad workspace test selection, so compile or run them
+with an explicit `--bench <name>` target.
 
 Use Criterion benches from `crates/codestory-bench` only when the measured hot
 path is narrower than the repo-scale e2e test can explain.

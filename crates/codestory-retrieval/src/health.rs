@@ -1,7 +1,8 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
-    QDRANT_HEALTH_BUDGET, SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig,
-    ZOEKT_HEALTH_BUDGET, qdrant_semantic_vectors_enabled, retrieval_command,
+    QDRANT_HEALTH_BUDGET, SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile,
+    SidecarRuntimeConfig, ZOEKT_HEALTH_BUDGET, default_sidecar_image_pins,
+    qdrant_semantic_vectors_enabled, retrieval_command,
 };
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
@@ -90,6 +91,8 @@ pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ownership: Option<SidecarOwnership>,
+    #[serde(default = "default_sidecar_image_pins")]
+    pub sidecar_images: SidecarImagePins,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,6 +381,7 @@ pub fn unavailable_status_report_with_embedding_device(
     RetrievalStatusReport {
         retrieval_mode: "unavailable".into(),
         ownership: None,
+        sidecar_images: default_sidecar_image_pins(),
         degraded_reason: Some(reason.clone()),
         repair: None,
         query_embedding_backend: crate::embeddings::embedding_runtime_id(),
@@ -638,7 +642,7 @@ pub fn probe_sidecar_health_with_embedding_device(
         .or(manifest.projection_count)
         .unwrap_or(0);
     let qdrant = if dense_anchor_count == 0 {
-        zero_dense_qdrant_health(&embedding_device)
+        zero_dense_qdrant_health(embedding_device)
     } else {
         let collection = manifest.qdrant_collection.clone();
         let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);
@@ -734,6 +738,7 @@ pub fn probe_sidecar_health_with_embedding_device(
     RetrievalStatusReport {
         retrieval_mode: mode.as_str().into(),
         ownership: None,
+        sidecar_images: default_sidecar_image_pins(),
         degraded_reason,
         repair: None,
         query_embedding_backend: current_embedding_backend,
@@ -1063,6 +1068,7 @@ mod tests {
         let report = RetrievalStatusReport {
             retrieval_mode: "full".into(),
             ownership: None,
+            sidecar_images: default_sidecar_image_pins(),
             degraded_reason: None,
             query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
             manifest_vector_embedding_backend: manifest.embedding_backend.clone(),

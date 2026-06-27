@@ -860,15 +860,26 @@ impl WorkspaceIndexer {
         let processed_count = Arc::new(AtomicUsize::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let root = self.root.clone();
-        let existing_projection_ids = plan.existing_file_ids.clone();
         let existing_projection_setup_started = Instant::now();
+        let existing_projection_ids = plan.existing_file_ids.clone();
+        let existing_projection_file_ids = Self::existing_projection_file_ids(
+            storage,
+            &root,
+            &plan.files_to_index,
+            &existing_projection_ids,
+        )?;
         stats.setup_existing_projection_ids_ms =
             duration_ms_u64(existing_projection_setup_started.elapsed());
 
         let mut replaced_projection_ids = HashSet::new();
         let symbol_seed_started = Instant::now();
         let symbol_table = Arc::new(SymbolTable::new());
-        Self::seed_symbol_table(storage, &symbol_table, plan.mode, &existing_projection_ids)?;
+        Self::seed_symbol_table(
+            storage,
+            &symbol_table,
+            plan.mode,
+            &existing_projection_file_ids,
+        )?;
         stats.setup_seed_symbol_table_ms = duration_ms_u64(symbol_seed_started.elapsed());
 
         // Clone for parallel closure
@@ -923,10 +934,11 @@ impl WorkspaceIndexer {
                 }
 
                 let normalized_path = Self::normalize_index_path(&root, path);
+                let file_id = Self::canonical_file_node_id_for_path(&normalized_path);
                 let existing_projection_id = (plan.mode
                     == codestory_workspace::BuildMode::Incremental)
-                    .then(|| existing_projection_ids.get(&normalized_path).copied())
-                    .flatten();
+                    .then_some(file_id)
+                    .filter(|file_id| existing_projection_file_ids.contains(file_id));
                 match self.prepare_index_work(
                     storage,
                     path,
@@ -1008,7 +1020,7 @@ impl WorkspaceIndexer {
                 all_errors.append(&mut local_storage.errors);
                 if let Some(file_info) = local_storage.files.first()
                     && plan.mode == codestory_workspace::BuildMode::Incremental
-                    && existing_projection_ids.contains_key(&file_info.path)
+                    && existing_projection_file_ids.contains(&file_info.id)
                     && replaced_projection_ids.insert(file_info.id)
                 {
                     let existing_states = storage
@@ -1109,14 +1121,19 @@ impl WorkspaceIndexer {
         }
 
         // 3.5 Resolve call/import edges post-pass
-        if had_edges {
+        let (resolution_scope_file_ids, expanded_resolution_scope_files) =
+            if plan.mode == codestory_workspace::BuildMode::Incremental {
+                let mut file_ids = Self::collect_touched_file_ids(&root, &plan.files_to_index);
+                let expanded = Self::extend_resolution_scope_for_matching_unresolved_targets(
+                    storage,
+                    &mut file_ids,
+                )?;
+                (file_ids, expanded)
+            } else {
+                (HashSet::new(), 0)
+            };
+        if had_edges || expanded_resolution_scope_files > 0 {
             let resolver = resolution::ResolutionPass::new();
-            let resolution_scope_file_ids =
-                if plan.mode == codestory_workspace::BuildMode::Incremental {
-                    Self::collect_touched_file_ids(&root, &plan.files_to_index)
-                } else {
-                    Default::default()
-                };
             let resolution_scope = if plan.mode == codestory_workspace::BuildMode::Incremental {
                 (!resolution_scope_file_ids.is_empty()).then_some(&resolution_scope_file_ids)
             } else {
@@ -1249,13 +1266,13 @@ impl WorkspaceIndexer {
         storage: &Storage,
         symbol_table: &SymbolTable,
         mode: codestory_workspace::BuildMode,
-        existing_projection_ids: &HashMap<PathBuf, i64>,
+        existing_projection_file_ids: &HashSet<i64>,
     ) -> Result<()> {
         if mode == codestory_workspace::BuildMode::FullRefresh {
             return Ok(());
         }
-        let file_ids = existing_projection_ids
-            .values()
+        let file_ids = existing_projection_file_ids
+            .iter()
             .copied()
             .collect::<Vec<_>>();
         let node_kinds = storage
@@ -1265,6 +1282,39 @@ impl WorkspaceIndexer {
             symbol_table.insert(node_id.0, kind);
         }
         Ok(())
+    }
+
+    fn existing_projection_file_ids(
+        storage: &Storage,
+        root: &Path,
+        files_to_index: &[PathBuf],
+        existing_projection_ids: &HashMap<PathBuf, i64>,
+    ) -> Result<HashSet<i64>> {
+        let mut candidates = existing_projection_ids
+            .values()
+            .copied()
+            .collect::<HashSet<_>>();
+        for path in files_to_index {
+            let full_path = Self::normalize_index_path(root, path);
+            candidates.insert(Self::canonical_file_node_id_for_path(&full_path));
+            if let Ok(canonical) = full_path.canonicalize() {
+                candidates.insert(Self::canonical_file_node_id_for_path(&canonical));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let candidate_ids = candidates.iter().copied().collect::<Vec<_>>();
+        let node_kinds = storage
+            .get_node_kinds_for_files(&candidate_ids)
+            .map_err(|e| anyhow!("Storage file identity lookup error: {:?}", e))?;
+        Ok(node_kinds
+            .into_iter()
+            .filter_map(|(node_id, kind)| {
+                (kind == NodeKind::FILE && candidates.contains(&node_id.0)).then_some(node_id.0)
+            })
+            .collect())
     }
 
     fn collect_touched_file_ids(root: &Path, files_to_index: &[PathBuf]) -> HashSet<i64> {
@@ -1277,6 +1327,109 @@ impl WorkspaceIndexer {
             }
         }
         file_ids
+    }
+
+    fn extend_resolution_scope_for_matching_unresolved_targets(
+        storage: &Storage,
+        scope_file_ids: &mut HashSet<i64>,
+    ) -> Result<usize> {
+        // New definitions can unblock old unresolved callers; keep the scope bounded
+        // to callers whose placeholder target names match names in touched files.
+        if scope_file_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = storage.get_connection();
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS incremental_resolution_touched_file_ids (
+                file_id INTEGER PRIMARY KEY
+             );
+             DELETE FROM incremental_resolution_touched_file_ids;
+             CREATE TEMP TABLE IF NOT EXISTS incremental_resolution_target_names (
+                name TEXT PRIMARY KEY
+             );
+             DELETE FROM incremental_resolution_target_names;",
+        )?;
+
+        {
+            let mut insert_touched = conn.prepare(
+                "INSERT OR IGNORE INTO incremental_resolution_touched_file_ids (file_id)
+                 VALUES (?1)",
+            )?;
+            for file_id in scope_file_ids.iter() {
+                insert_touched.execute(rusqlite::params![file_id])?;
+            }
+        }
+
+        let definition_kind_values = incremental_resolution_target_node_kinds()
+            .iter()
+            .map(|kind| (*kind as i32).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let definition_name_query = format!(
+            "INSERT OR IGNORE INTO incremental_resolution_target_names (name)
+             SELECT DISTINCT name FROM (
+                 SELECT serialized_name AS name
+                 FROM node
+                 WHERE file_node_id IN (
+                     SELECT file_id FROM incremental_resolution_touched_file_ids
+                 )
+                   AND kind IN ({definition_kind_values})
+                 UNION
+                 SELECT qualified_name AS name
+                 FROM node
+                 WHERE file_node_id IN (
+                     SELECT file_id FROM incremental_resolution_touched_file_ids
+                 )
+                   AND kind IN ({definition_kind_values})
+             )
+             WHERE name IS NOT NULL AND name <> ''"
+        );
+        conn.execute(&definition_name_query, [])?;
+        let target_name_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM incremental_resolution_target_names",
+            [],
+            |row| row.get(0),
+        )?;
+        if target_name_count == 0 {
+            return Ok(0);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT COALESCE(caller.file_node_id, e.file_node_id) AS file_id
+             FROM edge e
+             JOIN node caller ON caller.id = e.source_node_id
+             JOIN node target ON target.id = e.target_node_id
+             JOIN incremental_resolution_target_names target_name
+               ON target_name.name = target.serialized_name
+               OR target_name.name = target.qualified_name
+             WHERE e.resolved_target_node_id IS NULL
+               AND e.kind IN (?1, ?2, ?3)
+               AND (e.kind != ?1 OR (e.confidence IS NULL AND e.certainty IS NULL))
+               AND COALESCE(caller.file_node_id, e.file_node_id) IS NOT NULL
+               AND (target.canonical_id IS NULL OR (
+                 target.canonical_id NOT LIKE 'tauri:command:%'
+                 AND target.canonical_id NOT LIKE 'openapi:endpoint:%'
+                 AND target.canonical_id NOT LIKE 'route_endpoint:%'
+                 AND target.canonical_id NOT LIKE 'payload:collection:%'
+               ))",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                EdgeKind::CALL as i32,
+                EdgeKind::IMPORT as i32,
+                EdgeKind::OVERRIDE as i32
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+
+        let mut added = 0;
+        for row in rows {
+            if scope_file_ids.insert(row?) {
+                added += 1;
+            }
+        }
+        Ok(added)
     }
 
     fn normalize_index_path(root: &Path, path: &Path) -> PathBuf {
@@ -1306,9 +1459,21 @@ impl WorkspaceIndexer {
     }
 
     fn canonical_file_node_id_for_path(path: &Path) -> i64 {
-        let file_name = path.to_string_lossy();
+        let file_name = Self::file_identity_path(path);
         let canonical_id = format!("{file_name}:{file_name}:1");
         generate_id(&canonical_id)
+    }
+
+    fn file_identity_path(path: &Path) -> String {
+        #[cfg(windows)]
+        {
+            let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            path.to_string_lossy().replace('\\', "/").to_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            path.to_string_lossy().to_string()
+        }
     }
 
     fn flush_errors(
@@ -1707,6 +1872,28 @@ impl WorkspaceIndexer {
     }
 }
 
+fn incremental_resolution_target_node_kinds() -> &'static [NodeKind] {
+    &[
+        NodeKind::MODULE,
+        NodeKind::NAMESPACE,
+        NodeKind::PACKAGE,
+        NodeKind::STRUCT,
+        NodeKind::CLASS,
+        NodeKind::INTERFACE,
+        NodeKind::ANNOTATION,
+        NodeKind::UNION,
+        NodeKind::ENUM,
+        NodeKind::TYPEDEF,
+        NodeKind::FUNCTION,
+        NodeKind::METHOD,
+        NodeKind::MACRO,
+        NodeKind::GLOBAL_VARIABLE,
+        NodeKind::FIELD,
+        NodeKind::CONSTANT,
+        NodeKind::ENUM_CONSTANT,
+    ]
+}
+
 fn file_modification_time(path: &Path) -> i64 {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -1756,6 +1943,7 @@ fn accumulate_flush_breakdown(
 
 pub(crate) fn file_node_from_source(path: &Path, source: &str) -> (Node, String, NodeId) {
     let file_name = path.to_string_lossy().to_string();
+    let file_identity = WorkspaceIndexer::file_identity_path(path);
     let file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(path));
     let line_count = source.lines().count() as u32;
     let file_end_line = if line_count == 0 { 1 } else { line_count };
@@ -1770,7 +1958,7 @@ pub(crate) fn file_node_from_source(path: &Path, source: &str) -> (Node, String,
         ..Default::default()
     };
 
-    (file_node, file_name, file_id)
+    (file_node, file_identity, file_id)
 }
 
 fn rebase_cached_index_artifact(
@@ -1781,6 +1969,7 @@ fn rebase_cached_index_artifact(
     flags: IndexFeatureFlags,
 ) -> CachedIndexArtifact {
     let file_name = full_path.to_string_lossy().to_string();
+    let file_identity = WorkspaceIndexer::file_identity_path(full_path);
     for node in &mut artifact.nodes {
         if node.kind == NodeKind::FILE {
             node.serialized_name = file_name.clone();
@@ -1790,7 +1979,7 @@ fn rebase_cached_index_artifact(
     }
 
     let old_file_id = artifact.files.first().map(|file| NodeId(file.id));
-    let (nodes, id_remap) = canonicalize_nodes(&file_name, artifact.nodes, &HashMap::new());
+    let (nodes, id_remap) = canonicalize_nodes(&file_identity, artifact.nodes, &HashMap::new());
     let fallback_file_id = NodeId(WorkspaceIndexer::canonical_file_node_id_for_path(full_path));
     let new_file_id = old_file_id
         .and_then(|file_id| id_remap.get(&file_id).copied())
@@ -13492,6 +13681,15 @@ fn canonicalize_nodes(
     final_nodes: Vec<Node>,
     canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
+    canonicalize_nodes_with_file_identity(file_name, file_name, final_nodes, canonical_roles)
+}
+
+fn canonicalize_nodes_with_file_identity(
+    file_name: &str,
+    file_identity: &str,
+    final_nodes: Vec<Node>,
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
     let mut id_remap = HashMap::<NodeId, NodeId>::new();
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
 
@@ -13515,6 +13713,8 @@ fn canonicalize_nodes(
             .unwrap_or_else(|| {
                 if is_type_like_kind(node.kind) {
                     format!("{}:{}", file_name, qualified_name)
+                } else if node.kind == NodeKind::FILE {
+                    format!("{file_identity}:{file_identity}:1")
                 } else {
                     let start_line = node.start_line.unwrap_or(1);
                     format!("{}:{}:{}", file_name, qualified_name, start_line)
@@ -14423,9 +14623,14 @@ fn index_template_file(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("template");
+    let file_identity = WorkspaceIndexer::file_identity_path(path);
     let flags = index_feature_flags();
-    let (final_nodes, id_remap) =
-        canonicalize_nodes(file_name, local_storage.nodes, &HashMap::new());
+    let (final_nodes, id_remap) = canonicalize_nodes_with_file_identity(
+        file_name,
+        &file_identity,
+        local_storage.nodes,
+        &HashMap::new(),
+    );
     let new_file_id = id_remap.get(&file_id).copied().unwrap_or(file_id);
     local_storage.nodes = final_nodes;
     remap_file_affinity(&mut local_storage.nodes, new_file_id);
@@ -16495,6 +16700,7 @@ fn tauri_command_invoke_edge(
         kind: EdgeKind::CALL,
         file_node_id: Some(file_id),
         line: Some(invocation.line),
+        resolved_target: Some(command_node_id),
         certainty: Some(ResolutionCertainty::Uncertain),
         confidence: Some(0.45),
         ..Default::default()

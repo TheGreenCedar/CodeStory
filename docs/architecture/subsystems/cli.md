@@ -94,7 +94,7 @@ not expose ranking knobs for product search/context calls.
 
 ## Serving And Integration Surface
 
-HTTP serving keeps the current small GET/query-string shape. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
+HTTP serving keeps the current small GET/query-string shape. It is local-only by default: non-loopback binds and non-loopback `Host`/`Origin` headers are rejected unless the operator passes `--allow-non-loopback` behind an intentional network boundary. The stable routes are `/health`, `/search`, `/symbol`, `/definition`, `/references`, `/symbols`, and `/trail`. Definition and references accept either `q` or `id`, so agents can resolve from a query first and then reuse exact node ids.
 
 `serve --stdio` is MCP-style JSON lines. It exposes tools for ground, files, affected, packet, search, context, symbol, callers, callees, trace, trail, definition, references, symbols, snippet, and warm graph primitives (`get_node`, `neighbors`, `shortest_path`, and `query_subgraph`); resources for project, grounding, and root symbols; resource templates for node-specific symbol/reference/snippet/trail reads; and prompts for explain-symbol, callflow tracing, and impact analysis.
 

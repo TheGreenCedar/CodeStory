@@ -1,6 +1,6 @@
 [package]
 name = "codestory-bench"
-version = "0.12.2"
+version = "0.12.3"
 edition = "2024"
 publish = false
 
@@ -19,27 +19,34 @@ uuid = { workspace = true }
 [[bench]]
 name = "indexing"
 harness = false
+bench = false
 
 [[bench]]
 name = "graph_fidelity"
 harness = false
+bench = false
 
 [[bench]]
 name = "resolution_full_scope"
 harness = false
+bench = false
 
 [[bench]]
 name = "ask_latency"
 harness = false
+bench = false
 
 [[bench]]
 name = "grounding"
 harness = false
+bench = false
 
 [[bench]]
 name = "incremental_cleanup"
 harness = false
+bench = false
 
 [[bench]]
 name = "browser_stress"
 harness = false
+bench = false

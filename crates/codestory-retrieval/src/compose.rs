@@ -664,7 +664,7 @@ fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<P
     let inventory = embed_model_inventory(repo_root, layout);
     if let Some(model_dir) = inventory
         .required_gguf_present
-        .then(|| inventory.model_dir.as_ref())
+        .then_some(inventory.model_dir.as_ref())
         .flatten()
     {
         return Ok(PathBuf::from(model_dir));
@@ -883,7 +883,20 @@ mod tests {
         assert_eq!(path, cache.path().join("retrieval-compose.yml"));
         let contents = std::fs::read_to_string(path).expect("read bundled compose");
         assert!(contents.contains("name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}"));
-        assert!(contents.contains("qdrant/qdrant:v1.12.5"));
+        for image in [
+            crate::config::QDRANT_IMAGE_PIN,
+            crate::config::ZOEKT_WEBSERVER_IMAGE_PIN,
+            crate::config::LLAMACPP_SERVER_IMAGE_PIN,
+        ] {
+            assert!(
+                image.contains("@sha256:"),
+                "image pin must include digest: {image}"
+            );
+            assert!(
+                contents.contains(image),
+                "bundled compose should contain exact image pin {image}"
+            );
+        }
     }
 
     #[test]

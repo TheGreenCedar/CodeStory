@@ -609,9 +609,7 @@ pub(crate) fn packet_anchor_probe_limit_for_budget(
     let usage_pct = packet_latency.budget_usage_percent(consumed_trace_ms);
     if usage_pct >= 75 {
         (base / 4).max(1)
-    } else if usage_pct >= 50 {
-        (base / 2).max(1)
-    } else if budget == PacketBudgetModeDto::Compact && usage_pct >= 25 {
+    } else if usage_pct >= 50 || (budget == PacketBudgetModeDto::Compact && usage_pct >= 25) {
         (base / 2).max(1)
     } else {
         base

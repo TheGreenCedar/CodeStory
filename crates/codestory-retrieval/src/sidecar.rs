@@ -1,6 +1,6 @@
 use crate::config::{
-    SidecarLayout, SidecarProfile, SidecarRuntimeConfig, sidecar_runtime_auto,
-    sidecar_runtime_for_project,
+    SidecarImagePins, SidecarLayout, SidecarProfile, SidecarRuntimeConfig,
+    default_sidecar_image_pins, sidecar_runtime_auto, sidecar_runtime_for_project,
 };
 use crate::generation::{
     SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
@@ -63,6 +63,8 @@ pub struct SidecarStateFile {
     pub embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
+    #[serde(default = "default_sidecar_image_pins")]
+    pub sidecar_images: SidecarImagePins,
     pub zoekt_data_dir: String,
     pub qdrant_data_dir: String,
     pub scip_artifacts_root: String,
@@ -113,6 +115,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
         embedding_accelerator_request_device: embedding_device.accelerator_request_device,
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch,
+        sidecar_images: default_sidecar_image_pins(),
         zoekt_data_dir: layout.zoekt_data_dir.display().to_string(),
         qdrant_data_dir: layout.qdrant_data_dir.display().to_string(),
         scip_artifacts_root: layout.scip_artifacts_root.display().to_string(),
@@ -310,9 +313,10 @@ fn attach_status_ownership(
     runtime: &SidecarRuntimeConfig,
 ) -> RetrievalStatusReport {
     report.ownership = Some(runtime.ownership());
-    report.embedding_launch = read_sidecar_state(&runtime.layout.state_file)
-        .and_then(|state| state.embedding_launch)
-        .or(report.embedding_launch);
+    if let Some(state) = read_sidecar_state(&runtime.layout.state_file) {
+        report.embedding_launch = state.embedding_launch.or(report.embedding_launch);
+        report.sidecar_images = state.sidecar_images;
+    }
     report
 }
 

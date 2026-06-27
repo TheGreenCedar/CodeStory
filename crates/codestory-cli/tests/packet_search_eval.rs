@@ -449,11 +449,10 @@ fn packet_search_eval_baseline_scores_full_mode_category_breakdowns() {
                 "append_search_evidence_packet".to_string(),
                 "decorate_search_hit_evidence".to_string(),
             ],
-            packet_text: "decorate_search_hit_evidence uses evidence_candidate_from_hit"
-                .to_string(),
+            packet_text: "decorate_search_hit_evidence uses evidence_tier_for_hit".to_string(),
             anchor_offsets: BTreeMap::from([
-                ("decorate_search_hit_evidence".to_string(), 5),
-                ("evidence_candidate_from_hit".to_string(), 40),
+                ("decorate_search_hit_evidence".to_string(), 0),
+                ("evidence_tier_for_hit".to_string(), 34),
             ]),
         },
     ];

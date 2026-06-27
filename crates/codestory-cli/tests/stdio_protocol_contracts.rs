@@ -3821,13 +3821,13 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         .as_array()
         .unwrap_or_else(|| panic!("stdio search error should include full_repair: {response}"));
     assert!(
-        full_repair.iter().all(
-            |call| call.to_string().contains("\"method\":\"cli\"") == false
+        full_repair
+            .iter()
+            .all(|call| !call.to_string().contains("\"method\":\"cli\"")
                 && call
                     .get("debug_command")
                     .and_then(Value::as_str)
-                    .is_none_or(|text| !text.contains("codestory-cli index"))
-        ),
+                    .is_none_or(|text| !text.contains("codestory-cli index"))),
         "stdio search sidecar errors should not repeat core index repair commands: {response}"
     );
     assert!(

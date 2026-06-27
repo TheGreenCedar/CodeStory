@@ -23,6 +23,7 @@ The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap a
 | `--project <path>` | `.` | Repository root to serve. Always pass it explicitly. |
 | `--cache-dir <path>` | auto | Serve a specific cache directory. |
 | `--addr <host:port>` | `127.0.0.1:3917` | HTTP bind address. |
+| `--allow-non-loopback` | off | Required before HTTP serve can bind or answer wildcard/remote-facing addresses. Use only behind an intentional network boundary; HTTP routes do not require request authentication. |
 | `--stdio` | off | Use JSON-lines stdio instead of HTTP. |
 | `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
 
@@ -50,7 +51,7 @@ Stdio MCP status fields and allowed-surface rules: [status-contract.md](status-c
 
 ## Notes
 
-- `serve` is local by default on `127.0.0.1`; do not bind wider unless the user explicitly needs remote access.
+- `serve` is local by default on `127.0.0.1`; non-loopback HTTP binds and non-loopback `Host`/`Origin` headers fail unless `--allow-non-loopback` is set. Do not bind wider unless the user explicitly needs remote access and the network boundary is intentional.
 - HTTP only accepts GET requests for the documented routes.
 - Start it after a successful index or with an intentional refresh mode.
 - In one `serve --stdio` process, identical successful `packet` and search-fragment requests are cached with small LRUs keyed by request arguments, the current SQLite/WAL fingerprint, and a mandatory sidecar-readiness fingerprint. The sidecar fingerprint includes the active embedding backend, sidecar state-file metadata, strict retrieval mode, degraded reason, manifest generation/input hash/backend/dimension, and status errors. This is for repeated agent calls only; changed index files, sidecar state drift, and strict stale/unavailable readiness bypass the cache.

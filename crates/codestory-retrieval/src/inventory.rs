@@ -537,7 +537,7 @@ fn match_resource(
         return Some(resource);
     }
     if resource.kind == SidecarDockerResourceKind::Network
-        && resource.labels.get("dev.codestory.owner").is_none()
+        && !resource.labels.contains_key("dev.codestory.owner")
         && compose_project
             .as_ref()
             .is_some_and(|project| owned_compose_projects.contains(project))
@@ -620,6 +620,7 @@ fn inventory_entry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_entry(
     state: Option<&SidecarStateFile>,
     state_exists: bool,
@@ -869,6 +870,7 @@ mod tests {
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             embedding_launch: None,
+            sidecar_images: crate::config::default_sidecar_image_pins(),
             zoekt_data_dir: root.join("zoekt").display().to_string(),
             qdrant_data_dir: root.join("qdrant").display().to_string(),
             scip_artifacts_root: root.join("scip").display().to_string(),

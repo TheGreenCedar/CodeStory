@@ -302,13 +302,31 @@ sidecar implementation, CI policy, retention behavior, or promotion gates.
 
 ### Version pins
 
-| Dependency | Pin policy | Pinned version | Notes |
-|------------|------------|----------------|-------|
-| Zoekt real | `COMPOSE_PROFILES=real` | `zoekt-20250506123554` | `sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4` plus lexical shards |
-| Qdrant | Fixed container image tag | `qdrant/qdrant:v1.12.5` | HTTP `6333`, gRPC `6334` |
+| Dependency | Pin policy | Pinned identity | Notes |
+|------------|------------|-----------------|-------|
+| Zoekt real | `COMPOSE_PROFILES=real` plus digest-pinned image | `zoekt-20250506123554`; `sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff` | Lexical shards still live under the sidecar generation |
+| Qdrant | Digest-pinned container image | `qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae` | HTTP `6333`, gRPC `6334` |
+| llama.cpp embed | Digest-pinned container image | `ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c` | Used only when the embedding launch mode is Docker Compose |
 | SCIP | CodeStory graph artifact emitter | `graph-<hash>` | Generated local graph artifacts under the sidecar generation |
 
 CI `retrieval-sidecar-smoke` should use the same pins as local development.
+`retrieval bootstrap --format json`, `retrieval status --format json`, and the
+sidecar state file expose `sidecar_images` so smoke artifacts record the exact
+image identities used for packet/search readiness.
+
+To refresh an image pin safely:
+
+1. Inspect the candidate tag with Docker manifest tooling, for example
+   `docker buildx imagetools inspect qdrant/qdrant:v1.12.5`.
+2. Copy the top-level `Digest:` value for multi-arch images or the manifest
+   digest for single-manifest images.
+3. Update `docker/retrieval-compose.yml`,
+   `crates/codestory-retrieval/src/config.rs`, this table, and any manual
+   fallback command that names the image.
+4. Run `docker compose -f docker/retrieval-compose.yml config`,
+   `cargo test -p codestory-retrieval`, `cargo test -p codestory-cli --test
+   retrieval_bootstrap_contracts`, and the `retrieval-sidecar-smoke` workflow
+   before treating packet/search evidence as refreshed.
 
 ### Manifest and generation contract
 
@@ -386,7 +404,9 @@ expansion lanes are skipped for that query.
 
 `retrieval-sidecar-smoke` is a reduced CI contract lane, not the operator repair
 path and not a full sidecar proof. Linux carries generic
-lint/runtime/search/retrieval contract slices. Windows carries the
+lint/runtime/search/retrieval contract slices plus the non-live packet/search
+fixture and baseline gate (`cargo test -p codestory-cli --test packet_search_eval`).
+Windows carries the
 manifest-missing bootstrap/status shape only when manually dispatched or when a
 PR has the `ci:windows-smoke` label.
 

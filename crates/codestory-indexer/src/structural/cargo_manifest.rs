@@ -151,7 +151,7 @@ fn strip_toml_comment(line: &str) -> &str {
 }
 
 fn toml_key(trimmed: &str) -> Option<&str> {
-    trimmed.split_once('=')?.0.trim().split_whitespace().next()
+    trimmed.split_once('=')?.0.split_whitespace().next()
 }
 
 fn dependency_key(line: &str) -> Option<(String, u32)> {

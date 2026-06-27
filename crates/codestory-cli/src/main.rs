@@ -33,7 +33,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::{IsTerminal, Read},
-    net::TcpListener,
+    net::{TcpListener, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -678,7 +678,7 @@ impl ReadyRepairProgress {
                     continue;
                 }
                 let elapsed = start.elapsed().as_secs();
-                if elapsed % READY_REPAIR_PROGRESS_INTERVAL.as_secs() != 0 {
+                if !elapsed.is_multiple_of(READY_REPAIR_PROGRESS_INTERVAL.as_secs()) {
                     continue;
                 }
                 let phase = *worker_phase.lock().expect("ready repair phase lock");
@@ -2294,25 +2294,24 @@ fn repair_ready_state(
             run_id,
         )
     });
-    if let Some(sidecar) = sidecar.as_ref() {
-        if let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
+    if let Some(sidecar) = sidecar.as_ref()
+        && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
             sidecar.clone(),
-        ) {
-            if ready_repair_existing_sidecar_is_reusable(&existing_status) {
-                eprintln!(
-                    "ready repair agent sidecar already full: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
-                    sidecar.run_id.as_deref().unwrap_or("none"),
-                    sidecar.namespace,
-                    sidecar.compose_project,
-                    existing_status.embedding_device_state,
-                    existing_status.embedding_device_observation_source,
-                    existing_status.embedding_cpu_allowed
-                );
-                return Ok(Some(sidecar.clone()));
-            }
-        }
+        )
+        && ready_repair_existing_sidecar_is_reusable(&existing_status)
+    {
+        eprintln!(
+            "ready repair agent sidecar already full: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
+            sidecar.run_id.as_deref().unwrap_or("none"),
+            sidecar.namespace,
+            sidecar.compose_project,
+            existing_status.embedding_device_state,
+            existing_status.embedding_device_observation_source,
+            existing_status.embedding_cpu_allowed
+        );
+        return Ok(Some(sidecar.clone()));
     }
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
@@ -10175,6 +10174,9 @@ fn render_affected_footer(
 }
 
 fn run_serve(cmd: ServeCommand) -> Result<()> {
+    if !cmd.stdio {
+        ensure_http_serve_bind_allowed(&cmd.addr, cmd.allow_non_loopback)?;
+    }
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
@@ -10184,10 +10186,11 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
     eprintln!("codestory serve listening on http://{}", cmd.addr);
+    let policy = http_transport::HttpServePolicy::new(cmd.allow_non_loopback);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = http_transport::handle_http_request(&runtime, stream) {
+                if let Err(error) = http_transport::handle_http_request(&runtime, stream, policy) {
                     eprintln!("serve request failed: {error:#}");
                 }
             }
@@ -10195,6 +10198,32 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_http_serve_bind_allowed(addr: &str, allow_non_loopback: bool) -> Result<()> {
+    if allow_non_loopback {
+        return Ok(());
+    }
+
+    let resolved = addr
+        .to_socket_addrs()
+        .with_context(|| format!("Failed to resolve serve address {addr}"))?
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        bail!("Serve address {addr} did not resolve to a socket address");
+    }
+    if resolved
+        .iter()
+        .all(|socket_addr| socket_addr.ip().is_loopback())
+    {
+        return Ok(());
+    }
+
+    bail!(
+        "Refusing to bind HTTP serve to non-loopback address `{addr}` without --allow-non-loopback. \
+serve exposes local graph/search endpoints without request authentication; bind to 127.0.0.1/localhost \
+or rerun with --allow-non-loopback only behind an intentional network boundary."
+    )
 }
 
 fn run_generate_completions(cmd: GenerateCompletionsCommand) -> Result<()> {
@@ -12451,6 +12480,34 @@ mod tests {
     }
 
     #[test]
+    fn http_serve_allows_loopback_bind_without_acknowledgement() {
+        ensure_http_serve_bind_allowed("127.0.0.1:3917", false)
+            .expect("ipv4 loopback should be allowed by default");
+        ensure_http_serve_bind_allowed("localhost:3917", false)
+            .expect("localhost should resolve to loopback and stay ergonomic");
+        ensure_http_serve_bind_allowed("[::1]:3917", false)
+            .expect("ipv6 loopback should be allowed by default");
+    }
+
+    #[test]
+    fn http_serve_rejects_non_loopback_bind_without_acknowledgement() {
+        let error = ensure_http_serve_bind_allowed("0.0.0.0:3917", false)
+            .expect_err("wildcard bind should require explicit acknowledgement");
+        let message = error.to_string();
+        assert!(
+            message.contains("--allow-non-loopback")
+                && message.contains("without request authentication"),
+            "unsafe bind error should name the guard and auth boundary: {message}"
+        );
+    }
+
+    #[test]
+    fn http_serve_allows_non_loopback_bind_with_acknowledgement() {
+        ensure_http_serve_bind_allowed("0.0.0.0:3917", true)
+            .expect("explicit acknowledgement should allow intentional remote binds");
+    }
+
+    #[test]
     fn classify_local_refresh_failure_state_detects_lock_contention() {
         let locked = anyhow::anyhow!("cache_busy: database is locked");
         assert_eq!(
@@ -12533,6 +12590,7 @@ mod tests {
         codestory_retrieval::RetrievalStatusReport {
             retrieval_mode: mode.into(),
             ownership: None,
+            sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
             degraded_reason: reason.map(str::to_string),
             repair: None,
             query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),

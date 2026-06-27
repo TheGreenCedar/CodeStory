@@ -46,7 +46,7 @@
         ],
         "anchors": [
           "decorate_search_hit_evidence",
-          "evidence_candidate_from_hit"
+          "evidence_tier_for_hit"
         ]
       },
       "provenance": {

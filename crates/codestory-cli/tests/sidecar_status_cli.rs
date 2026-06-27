@@ -76,6 +76,10 @@ fn sidecar_status_uses_retrieval_status_human_output() {
         stdout.contains("# Retrieval status"),
         "sidecar status should reuse retrieval status output:\n{stdout}"
     );
+    assert!(
+        stdout.contains("sidecar_images:") && stdout.contains("@sha256:"),
+        "sidecar status should expose digest-pinned images:\n{stdout}"
+    );
 }
 
 #[test]

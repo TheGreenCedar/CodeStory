@@ -241,10 +241,7 @@ fn strict_batch_worker_limit(query_count: usize) -> usize {
         .map(usize::from)
         .unwrap_or(1);
     // Cap sidecar fan-out; make this configurable only if telemetry needs it.
-    query_count
-        .min(available)
-        .min(STRICT_BATCH_WORKER_CAP)
-        .max(1)
+    query_count.min(available).clamp(1, STRICT_BATCH_WORKER_CAP)
 }
 
 struct QueryContext {
