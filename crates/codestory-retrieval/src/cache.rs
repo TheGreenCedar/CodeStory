@@ -45,7 +45,7 @@ const DEFAULT_RETRIEVAL_CACHE_CAPACITY: usize = 128;
 /// Entries are safe only for the manifest identity captured by [`RetrievalCacheKey`]. Cache
 /// rehydration across worktrees must invalidate copied retrieval manifests before this cache is
 /// trusted again.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RetrievalCache {
     entries: HashMap<RetrievalCacheKey, Vec<super::CandidateHit>>,
     order: VecDeque<RetrievalCacheKey>,
@@ -86,6 +86,19 @@ impl RetrievalCache {
                 break;
             };
             self.entries.remove(&evicted);
+        }
+    }
+
+    pub fn merge_delta_from(&mut self, baseline: &RetrievalCache, other: RetrievalCache) {
+        let RetrievalCache { entries, order, .. } = other;
+        for key in order {
+            let Some(hits) = entries.get(&key) else {
+                continue;
+            };
+            if baseline.entries.get(&key) == Some(hits) {
+                continue;
+            }
+            self.insert(key, hits.clone());
         }
     }
 
@@ -164,6 +177,57 @@ mod tests {
         assert!(cache.get(&first).is_none());
         assert_eq!(
             cache.get(&second).expect("second entry should remain")[0].file_path,
+            "src/second.rs"
+        );
+    }
+
+    #[test]
+    fn merge_delta_from_does_not_replay_snapshot_entries() {
+        let first = RetrievalCacheKey {
+            project_id: "abc".into(),
+            zoekt_version: "v1".into(),
+            qdrant_collection: "codestory_abc".into(),
+            scip_revision: None,
+            sidecar_generation: Some("abc-hash".into()),
+            sidecar_input_hash: Some("hash".into()),
+            sidecar_schema_version: Some(1),
+            projection_count: Some(1),
+            query_fingerprint: "first".into(),
+        };
+        let second = RetrievalCacheKey {
+            query_fingerprint: "second".into(),
+            ..first.clone()
+        };
+
+        let mut target = RetrievalCache::with_capacity(1);
+        target.insert(
+            first.clone(),
+            vec![super::super::CandidateHit::lexical_stub(
+                "src/first.rs",
+                1.0,
+            )],
+        );
+        let baseline = target.clone();
+
+        let mut newer_worker = baseline.clone();
+        newer_worker.insert(
+            second.clone(),
+            vec![super::super::CandidateHit::lexical_stub(
+                "src/second.rs",
+                1.0,
+            )],
+        );
+        target.merge_delta_from(&baseline, newer_worker);
+        assert_eq!(
+            target.get(&second).expect("newer entry should remain")[0].file_path,
+            "src/second.rs"
+        );
+
+        target.merge_delta_from(&baseline, baseline.clone());
+
+        assert!(target.get(&first).is_none());
+        assert_eq!(
+            target.get(&second).expect("stale snapshot must not replay")[0].file_path,
             "src/second.rs"
         );
     }

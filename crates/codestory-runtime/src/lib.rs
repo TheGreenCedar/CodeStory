@@ -7151,10 +7151,64 @@ fn clear_search_engine(state: &mut AppState) {
 #[derive(Clone)]
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
-    sidecar_query_cache: Arc<Mutex<codestory_retrieval::RetrievalCache>>,
+    sidecar_query_cache: Arc<Mutex<SidecarQueryCacheState>>,
     grounding_detail_refresh: Arc<Mutex<()>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SidecarQueryCacheState {
+    generation: u64,
+    cache: codestory_retrieval::RetrievalCache,
+}
+
+impl SidecarQueryCacheState {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            cache: codestory_retrieval::RetrievalCache::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.cache.clear();
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, codestory_retrieval::RetrievalCache) {
+        (self.generation, self.cache.clone())
+    }
+
+    pub(crate) fn merge_if_current(
+        &mut self,
+        generation: u64,
+        baseline: &codestory_retrieval::RetrievalCache,
+        cache: codestory_retrieval::RetrievalCache,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.cache.merge_delta_from(baseline, cache);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(
+        &mut self,
+        key: codestory_retrieval::RetrievalCacheKey,
+        hits: Vec<codestory_retrieval::CandidateHit>,
+    ) {
+        self.cache.insert(key, hits);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(
+        &self,
+        key: &codestory_retrieval::RetrievalCacheKey,
+    ) -> Option<&[codestory_retrieval::CandidateHit]> {
+        self.cache.get(key)
+    }
 }
 
 impl Default for AppController {
@@ -7177,7 +7231,7 @@ impl AppController {
                 #[cfg(test)]
                 last_hybrid_instrumentation: None,
             })),
-            sidecar_query_cache: Arc::new(Mutex::new(codestory_retrieval::RetrievalCache::new())),
+            sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
             grounding_detail_refresh: Arc::new(Mutex::new(())),
             events_tx,
             events_rx,
