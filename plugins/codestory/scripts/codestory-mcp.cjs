@@ -14,6 +14,7 @@ const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codesto
 const fallbackBinaryNames = process.platform === 'win32'
   ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
   : ['codestory-cli'];
+const activeStateFile = '.codestory-active';
 const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
@@ -90,6 +91,83 @@ function pluginDataDir() {
 
 function sidecarPolicyPath(dataDir = pluginDataDir()) {
   return dataDir ? path.join(dataDir, 'sidecar-setup-policy.json') : null;
+}
+
+function activeStatePath(dataDir = pluginDataDir()) {
+  return dataDir ? path.join(dataDir, activeStateFile) : null;
+}
+
+function normalizeProjectRoot(projectRoot) {
+  const resolved = path.resolve(projectRoot);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function existingProjectRoot(projectRoot) {
+  if (!projectRoot || typeof projectRoot !== 'string' || !projectRoot.trim()) return null;
+  const normalized = normalizeProjectRoot(projectRoot);
+  try {
+    return fs.statSync(normalized).isDirectory() ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+function activeProjectStateMaxAgeMs() {
+  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_ACTIVE_PROJECT_TTL_MS || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60 * 60 * 1000;
+}
+
+function activeProjectStateTimestamp(active, statePath) {
+  const parsed = Date.parse(active?.updatedAt || active?.updated_at || '');
+  if (Number.isFinite(parsed)) return parsed;
+  try {
+    return fs.statSync(statePath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+function activeProjectStateFresh(active, statePath, nowMs = Date.now()) {
+  const timestamp = activeProjectStateTimestamp(active, statePath);
+  return timestamp !== null && nowMs - timestamp <= activeProjectStateMaxAgeMs();
+}
+
+function resolveProjectRoot(options = {}) {
+  const explicit = existingProjectRoot(options.projectRoot || process.env.CODESTORY_PROJECT_ROOT);
+  if (explicit) {
+    return { projectRoot: explicit, source: options.projectRoot ? 'argument' : 'env' };
+  }
+
+  const cwd = existingProjectRoot(process.cwd());
+  if (cwd && !samePathText(cwd, pluginRoot)) {
+    return { projectRoot: cwd, source: 'process_cwd' };
+  }
+
+  const statePath = activeStatePath();
+  const active = statePath ? readJson(statePath) : null;
+  if (active && !activeProjectStateFresh(active, statePath)) {
+    return {
+      projectRoot: null,
+      source: 'plugin_active_state_stale',
+      statePath,
+      reason: 'project_root_unavailable',
+    };
+  }
+  const activeRoot = existingProjectRoot(active?.cwd);
+  if (activeRoot && !samePathText(activeRoot, pluginRoot)) {
+    return { projectRoot: activeRoot, source: 'plugin_active_state', statePath };
+  }
+
+  return {
+    projectRoot: null,
+    source: statePath ? 'plugin_active_state_missing' : 'plugin_data_missing',
+    statePath,
+    reason: 'project_root_unavailable',
+  };
 }
 
 function sidecarPolicyCommand(action, policyFile = sidecarPolicyPath()) {
@@ -588,6 +666,7 @@ function runLocalNavigationWaitFresh(resolved, projectRoot) {
   const args = ['ready', '--goal', 'local', '--wait-fresh'];
   args.push('--project', projectRoot, '--format', 'json');
   const result = spawnSync(resolved.path, args, {
+    cwd: projectRoot,
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: localWaitFreshTimeoutMs(),
@@ -602,6 +681,7 @@ function runSidecarStartupRepair(resolved, sidecarStatus, projectRoot = process.
   const args = ['ready', '--goal', 'agent', '--repair'];
   args.push('--project', projectRoot, '--format', 'json', '--run-id', sharedAgentRunId);
   const result = spawnSync(resolved.path, args, {
+    cwd: projectRoot,
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: sidecarRepairTimeoutMs(),
@@ -768,7 +848,7 @@ function pluginRuntimeForResolved(resolved) {
 }
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
-  const projectRoot = options.projectRoot || process.cwd();
+  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : process.cwd();
   const pathCandidates = pathCliCandidates().map((candidate) => ({
     path: candidate,
     version: cliVersion(candidate),
@@ -856,6 +936,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     },
     warnings: plugin.warnings,
     project_root: projectRoot,
+    project_root_source: options.projectRootSource || null,
     retrieval_mode: 'unavailable',
     degraded_reason: reason,
     local_refresh: options.localRefresh || null,
@@ -869,7 +950,25 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   };
 }
 
+function projectRootUnavailableDiagnostic(resolved, probe, projectResolution) {
+  return fallbackDiagnostic(resolved, probe, projectResolution.reason, {
+    projectRoot: null,
+    projectRootSource: projectResolution.source,
+    goal: 'project_root',
+    status: 'repair_setup',
+    summary: 'CodeStory plugin MCP could not determine the target project root before starting stdio.',
+    minimumNext: [
+      'Restart/reload the Codex host from the target repo after a lifecycle hook records the active project, then read codestory://status.',
+    ],
+    fullRepair: [
+      'Start or resume the Codex session in the target repo so CodeStory lifecycle hooks can write active project state.',
+      'Restart/reload the Codex host from the target repo, then read codestory://status.',
+    ],
+  });
+}
+
 async function bootstrapStatus(projectRoot = process.cwd()) {
+  projectRoot = normalizeProjectRoot(projectRoot);
   const resolved = await resolveCli();
   rememberLaunch(resolved);
   const probe = probeResolvedCli(resolved);
@@ -923,6 +1022,7 @@ async function bootstrapStatus(projectRoot = process.cwd()) {
     server_version: resolved.version,
     cli_version: probe.version,
     plugin_runtime: plugin,
+    project_root_source: 'argument',
     runtime_truth: runtimeTruthStatus(plugin, repair, {
       sidecarPolicy: sidecarPolicy.state || 'unavailable',
       localRefresh,
@@ -935,14 +1035,26 @@ async function bootstrapStatus(projectRoot = process.cwd()) {
 
 async function handleBootstrapStatusCommand(argv) {
   if (argv[2] !== 'bootstrap-status') return false;
-  const projectRoot = optionValue(argv, '--project') || process.cwd();
+  const resolution = resolveProjectRoot({ projectRoot: optionValue(argv, '--project') });
   try {
+    if (!resolution.projectRoot) {
+      const resolved = await resolveCli();
+      rememberLaunch(resolved);
+      const probe = probeResolvedCli(resolved);
+      process.stdout.write(`${JSON.stringify({
+        ready: false,
+        ...projectRootUnavailableDiagnostic(resolved, probe, resolution),
+      })}\n`);
+      process.exit(0);
+    }
+    const projectRoot = resolution.projectRoot;
     process.stdout.write(`${JSON.stringify(await bootstrapStatus(projectRoot))}\n`);
   } catch (error) {
     process.stdout.write(`${JSON.stringify({
       ready: false,
       degraded_reason: `launcher_error:${error.message}`,
-      project_root: projectRoot,
+      project_root: resolution.projectRoot,
+      project_root_source: resolution.source,
     })}\n`);
   }
   process.exit(0);
@@ -995,6 +1107,7 @@ function dedupePaths(paths) {
 }
 
 function sourceCheckoutVersion(projectRoot) {
+  if (!projectRoot) return null;
   try {
     return cargoPackageVersion(fs.readFileSync(path.join(projectRoot, 'crates', 'codestory-cli', 'Cargo.toml'), 'utf8'));
   } catch {
@@ -1223,14 +1336,25 @@ async function main() {
   const resolved = await resolveCli();
   rememberLaunch(resolved);
   const probe = probeResolvedCli(resolved);
+  const projectResolution = resolveProjectRoot();
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
   if (failOpenReason) {
-    runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason));
+    runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason, {
+      projectRoot: projectResolution.projectRoot,
+      projectRootSource: projectResolution.source,
+    }));
     return;
   }
-  const localReadiness = probeLocalNavigation(resolved);
+  if (!projectResolution.projectRoot) {
+    runFailOpenMcp(projectRootUnavailableDiagnostic(resolved, probe, projectResolution));
+    return;
+  }
+  const projectRoot = projectResolution.projectRoot;
+  const localReadiness = probeLocalNavigation(resolved, projectRoot);
   if (!localReadiness.ready) {
     runFailOpenMcp(fallbackDiagnostic(resolved, probe, localReadiness.reason, {
+      projectRoot,
+      projectRootSource: projectResolution.source,
       status: localReadiness.status,
       summary: localReadiness.summary,
       minimumNext: localReadiness.minimumNext,
@@ -1243,10 +1367,11 @@ async function main() {
     }));
     return;
   }
-  const sidecarStatus = runSidecarStartupRepair(resolved, readSidecarPolicy(), process.cwd());
-  const dirtyMarker = dirtyMarkerEnv(process.cwd());
+  const sidecarStatus = runSidecarStartupRepair(resolved, readSidecarPolicy(), projectRoot);
+  const dirtyMarker = dirtyMarkerEnv(projectRoot);
 
-  const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none'], {
+  const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none', '--project', projectRoot], {
+    cwd: projectRoot,
     stdio: 'inherit',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     windowsHide: true,
@@ -1266,12 +1391,14 @@ async function main() {
       CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
       CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
       CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
+      CODESTORY_PLUGIN_PROJECT_ROOT: projectRoot,
+      CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE: projectResolution.source,
       CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
       CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
       CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
       CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
       CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, process.cwd()),
+      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, projectRoot),
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
       CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
@@ -1293,7 +1420,10 @@ async function main() {
       version: null,
       stdout: '',
       stderr: '',
-    }, `${resolved.source}_cli_unspawnable`));
+    }, `${resolved.source}_cli_unspawnable`, {
+      projectRoot,
+      projectRootSource: projectResolution.source,
+    }));
   });
 }
 
