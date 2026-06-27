@@ -1,6 +1,6 @@
 [package]
 name = "codestory-indexer"
-version = "0.12.3"
+version = "0.12.4"
 edition = "2024"
 
 [dev-dependencies]
