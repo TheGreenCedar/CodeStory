@@ -2261,8 +2261,13 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["runtime_truth"]["sidecar_status"]["mode"],
-        status["sidecar_retrieval"]["retrieval_mode"],
-        "runtime truth should reuse sidecar retrieval mode: {status}"
+        status["readiness_lanes"]["agent_packet_search"]["sidecar_mode"],
+        "runtime truth should reuse the selected agent readiness lane mode: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_status"]["degraded_reason"],
+        status["readiness_lanes"]["agent_packet_search"]["degraded_reason"],
+        "runtime truth should reuse the selected agent readiness lane reason: {status}"
     );
     assert!(
         status
