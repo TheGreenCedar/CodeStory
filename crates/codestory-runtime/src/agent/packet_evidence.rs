@@ -13,45 +13,16 @@ const OPENAPI_ENDPOINT_SCHEMA_PRODUCER: &str = "openapi_endpoint_schema";
 pub(crate) type PacketEvidenceTier = PacketEvidenceTierDto;
 pub(crate) type PacketEvidenceResolution = PacketEvidenceResolutionDto;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct EvidenceCandidate {
-    pub display_name: String,
-    pub path: Option<String>,
-    pub node_id: Option<String>,
-    pub tier: PacketEvidenceTier,
-    pub resolution: PacketEvidenceResolution,
-    pub producer: String,
-    pub score: f32,
-    pub loss_reason: Option<String>,
-}
-
-pub(crate) fn evidence_candidate_from_hit(hit: &SearchHit) -> EvidenceCandidate {
-    EvidenceCandidate {
-        display_name: hit.display_name.clone(),
-        path: hit.file_path.clone(),
-        node_id: Some(hit.node_id.0.clone()),
-        tier: evidence_tier_for_hit(hit),
-        resolution: evidence_resolution_for_hit(hit),
-        producer: evidence_producer_for_hit(hit),
-        score: hit.score,
-        loss_reason: hit.loss_reason.clone(),
-    }
-}
-
 pub(crate) fn decorate_search_hit_evidence(hit: &mut SearchHit) {
-    let candidate = evidence_candidate_from_hit(hit);
     let diagnostic_source_proof = hit_is_diagnostic_source_proof(hit);
-    hit.evidence_tier = Some(candidate.tier);
-    hit.evidence_producer = Some(candidate.producer);
-    hit.resolution_status = Some(candidate.resolution);
-    if hit.loss_reason.is_none() {
-        hit.loss_reason = candidate.loss_reason;
-    }
-    hit.eligible_for_sufficiency = Some(
-        !diagnostic_source_proof
-            && evidence_is_sufficiency_eligible(candidate.tier, candidate.resolution),
-    );
+    let tier = evidence_tier_for_hit(hit);
+    let resolution = evidence_resolution_for_hit(hit);
+    let producer = evidence_producer_for_hit(hit);
+    hit.evidence_tier = Some(tier);
+    hit.evidence_producer = Some(producer);
+    hit.resolution_status = Some(resolution);
+    hit.eligible_for_sufficiency =
+        Some(!diagnostic_source_proof && evidence_is_sufficiency_eligible(tier, resolution));
 }
 
 pub(crate) fn decorate_citation_from_hit(citation: &mut AgentCitationDto, hit: &SearchHit) {
