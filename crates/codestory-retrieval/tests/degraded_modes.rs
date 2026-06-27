@@ -79,3 +79,21 @@ fn degraded_mode_planner_matrix() {
     assert_eq!(unavailable, RetrievalDegradedMode::Unavailable);
     assert!(plan_query(&features, unavailable).stages.is_empty());
 }
+
+#[test]
+fn degraded_mandatory_sidecars_are_not_full_even_with_capabilities() {
+    let production = codestory_retrieval::SidecarCapabilities::production_stack();
+    let zoekt_up = component("zoekt", ComponentStatus::Healthy, None, production);
+    let qdrant_up = component("qdrant", ComponentStatus::Healthy, None, production);
+    let scip_up = component("scip", ComponentStatus::Healthy, None, production);
+
+    let zoekt_slow = component("zoekt", ComponentStatus::Degraded, None, production);
+    let (zoekt_mode, zoekt_reason) = derive_degraded_mode(&zoekt_slow, &qdrant_up, &scip_up);
+    assert_eq!(zoekt_mode, RetrievalDegradedMode::Unavailable);
+    assert_eq!(zoekt_reason.as_deref(), Some("mandatory_zoekt_degraded"));
+
+    let qdrant_slow = component("qdrant", ComponentStatus::Degraded, None, production);
+    let (qdrant_mode, qdrant_reason) = derive_degraded_mode(&zoekt_up, &qdrant_slow, &scip_up);
+    assert_eq!(qdrant_mode, RetrievalDegradedMode::NoSemantic);
+    assert_eq!(qdrant_reason.as_deref(), Some("mandatory_qdrant_degraded"));
+}
