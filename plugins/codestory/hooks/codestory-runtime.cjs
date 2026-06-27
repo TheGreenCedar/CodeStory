@@ -7,6 +7,7 @@ const isCopilot = Boolean(process.env.COPILOT_PLUGIN_DATA);
 const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
 
 const STATE_FILE = '.codestory-active';
+const THREAD_STATE_PREFIX = '.codestory-active-thread-';
 const HOOK_STATE_FILE = '.codestory-hook-output-state.json';
 const MCP_RUNTIME_FILE = '.codestory-mcp-runtime.json';
 const DIRTY_MARKER_SCHEMA_VERSION = 1;
@@ -24,6 +25,14 @@ function pluginDataDir() {
 function stateFilePath() {
   const stateDir = pluginDataDir();
   return stateDir ? path.join(stateDir, STATE_FILE) : null;
+}
+
+function threadStateFilePath(threadId) {
+  const stateDir = pluginDataDir();
+  const normalized = String(threadId || '').trim();
+  if (!stateDir || !normalized) return null;
+  const key = createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+  return path.join(stateDir, `${THREAD_STATE_PREFIX}${key}.json`);
 }
 
 function readJson(file) {
@@ -203,7 +212,7 @@ function rememberActiveState(state) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const previous = readActiveState() || {};
-    fs.writeFileSync(file, JSON.stringify({
+    const nextState = {
       ...previous,
       ...state,
       hook: {
@@ -211,7 +220,12 @@ function rememberActiveState(state) {
         ...(state.hook || {}),
       },
       updatedAt: new Date().toISOString(),
-    }));
+    };
+    fs.writeFileSync(file, JSON.stringify(nextState));
+    const threadFile = threadStateFilePath(nextState.codexThreadId);
+    if (threadFile) {
+      fs.writeFileSync(threadFile, JSON.stringify(nextState));
+    }
   } catch (e) {
     // Best effort only. Hook state must not block the host session.
   }

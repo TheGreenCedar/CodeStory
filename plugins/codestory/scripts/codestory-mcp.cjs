@@ -15,6 +15,7 @@ const fallbackBinaryNames = process.platform === 'win32'
   ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
   : ['codestory-cli'];
 const activeStateFile = '.codestory-active';
+const activeThreadStatePrefix = '.codestory-active-thread-';
 const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
@@ -98,6 +99,13 @@ function activeStatePath(dataDir = pluginDataDir()) {
   return dataDir ? path.join(dataDir, activeStateFile) : null;
 }
 
+function activeThreadStatePath(threadId, dataDir = pluginDataDir()) {
+  const normalized = String(threadId || '').trim();
+  if (!dataDir || !normalized) return null;
+  const key = createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+  return path.join(dataDir, `${activeThreadStatePrefix}${key}.json`);
+}
+
 function normalizeProjectRoot(projectRoot) {
   const resolved = path.resolve(projectRoot);
   try {
@@ -139,7 +147,7 @@ function activeProjectStateTimestamp(active, statePath) {
 
 function activeProjectStateMatchesHost(active) {
   const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  if (!currentThread) return true;
+  if (!currentThread) return !String(active?.codexThreadId || '').trim();
   return String(active?.codexThreadId || '').trim() === currentThread;
 }
 
@@ -160,6 +168,22 @@ function resolveProjectRoot(options = {}) {
   const cwd = existingProjectRoot(process.cwd());
   if (cwd && !samePathText(cwd, pluginRoot)) {
     return { projectRoot: cwd, source: 'process_cwd' };
+  }
+
+  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
+  const threadStatePath = activeThreadStatePath(currentThread);
+  const threadActive = threadStatePath ? readJson(threadStatePath) : null;
+  if (threadActive && !activeProjectStateFresh(threadActive, threadStatePath)) {
+    return {
+      projectRoot: null,
+      source: 'plugin_active_thread_state_stale',
+      statePath: threadStatePath,
+      reason: 'project_root_unavailable',
+    };
+  }
+  const threadRoot = existingProjectRoot(threadActive?.cwd);
+  if (threadRoot && !samePathText(threadRoot, pluginRoot)) {
+    return { projectRoot: threadRoot, source: 'plugin_active_thread_state', statePath: threadStatePath };
   }
 
   const statePath = activeStatePath();
