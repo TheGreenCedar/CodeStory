@@ -313,6 +313,23 @@ fn sidecar_packet_batch_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
         .clamp(100, MAX_PACKET_BATCH_BUDGET_MS)
 }
 
+fn with_detached_sidecar_query_cache<T>(
+    controller: &AppController,
+    work: impl FnOnce(&mut codestory_retrieval::RetrievalCache) -> T,
+) -> T {
+    let (generation, mut cache) = {
+        let shared = controller.sidecar_query_cache.lock();
+        shared.snapshot()
+    };
+    let baseline = cache.clone();
+    let result = work(&mut cache);
+    controller
+        .sidecar_query_cache
+        .lock()
+        .merge_if_current(generation, &baseline, cache);
+    result
+}
+
 pub(crate) fn run_sidecar_query(
     controller: &AppController,
     query: &str,
@@ -324,17 +341,18 @@ pub(crate) fn run_sidecar_query(
     let storage_path = controller
         .require_storage_path()
         .map_err(|error| anyhow::anyhow!("storage path required: {}", error.message))?;
-    let mut cache = controller.sidecar_query_cache.lock();
-    execute_retrieval_query_with_cache(
-        QueryRequest {
-            project_root: &project_root,
-            storage_path: &storage_path,
-            query,
-            budget_ms: Some(sidecar_budget_ms(latency_budget_ms)),
-            cancelled: None,
-        },
-        &mut cache,
-    )
+    with_detached_sidecar_query_cache(controller, |cache| {
+        execute_retrieval_query_with_cache(
+            QueryRequest {
+                project_root: &project_root,
+                storage_path: &storage_path,
+                query,
+                budget_ms: Some(sidecar_budget_ms(latency_budget_ms)),
+                cancelled: None,
+            },
+            cache,
+        )
+    })
 }
 
 pub(crate) fn run_sidecar_query_batch(
@@ -354,16 +372,17 @@ pub(crate) fn run_sidecar_query_batch(
             budget_ms: Some(*budget_ms),
         })
         .collect::<Vec<_>>();
-    let mut cache = controller.sidecar_query_cache.lock();
-    execute_strict_retrieval_query_batch_with_cache(
-        QueryBatchRequest {
-            project_root: &project_root,
-            storage_path: &storage_path,
-            queries: &batch_items,
-            cancelled: None,
-        },
-        &mut cache,
-    )
+    with_detached_sidecar_query_cache(controller, |cache| {
+        execute_strict_retrieval_query_batch_with_cache(
+            QueryBatchRequest {
+                project_root: &project_root,
+                storage_path: &storage_path,
+                queries: &batch_items,
+                cancelled: None,
+            },
+            cache,
+        )
+    })
 }
 
 pub(crate) fn maybe_run_retrieval_shadow(
@@ -1473,8 +1492,9 @@ mod tests {
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use codestory_contracts::api::{NodeId, NodeKind as ApiNodeKind, SearchHitOrigin};
     use codestory_retrieval::{
-        CandidateHit, QueryTrace, RetrievalStageKind, StageTrace, classify_query,
-        project_id_for_root, rank_candidates, test_support::retrieval_manifest_fixture,
+        CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
+        classify_query, project_id_for_root, rank_candidates,
+        test_support::retrieval_manifest_fixture,
     };
 
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1505,6 +1525,20 @@ mod tests {
         }
     }
 
+    fn retrieval_cache_key_for_test(query_fingerprint: &str) -> RetrievalCacheKey {
+        RetrievalCacheKey {
+            project_id: "abc".into(),
+            zoekt_version: "v1".into(),
+            qdrant_collection: "codestory_abc".into(),
+            scip_revision: None,
+            sidecar_generation: Some("abc-hash".into()),
+            sidecar_input_hash: Some("hash".into()),
+            sidecar_schema_version: Some(1),
+            projection_count: Some(1),
+            query_fingerprint: query_fingerprint.into(),
+        }
+    }
+
     #[test]
     fn env_flag_parsing_for_retrieval_rollout() {
         assert!(env_flag_enabled("1"));
@@ -1512,6 +1546,77 @@ mod tests {
         assert!(!env_flag_enabled("0"));
         assert!(env_flag_disabled("off"));
         assert!(!env_flag_disabled("yes"));
+    }
+
+    #[test]
+    fn detached_sidecar_query_cache_does_not_hold_mutex_during_work() {
+        let controller = AppController::new();
+        let first = retrieval_cache_key_for_test("first");
+        let second = retrieval_cache_key_for_test("second");
+        controller.sidecar_query_cache.lock().insert(
+            first.clone(),
+            vec![CandidateHit::lexical_stub("src/first.rs", 1.0)],
+        );
+
+        with_detached_sidecar_query_cache(&controller, |cache| {
+            assert!(
+                controller.sidecar_query_cache.try_lock().is_some(),
+                "sidecar query cache mutex should not be held during retrieval work"
+            );
+            assert_eq!(
+                cache.get(&first).expect("detached cache carries entries")[0].file_path,
+                "src/first.rs"
+            );
+            cache.insert(
+                second.clone(),
+                vec![CandidateHit::lexical_stub("src/second.rs", 1.0)],
+            );
+        });
+
+        let cache = controller.sidecar_query_cache.lock();
+        assert_eq!(
+            cache
+                .get(&first)
+                .expect("original cache entry should merge back")[0]
+                .file_path,
+            "src/first.rs"
+        );
+        assert_eq!(
+            cache
+                .get(&second)
+                .expect("new cache entry should merge back")[0]
+                .file_path,
+            "src/second.rs"
+        );
+    }
+
+    #[test]
+    fn detached_sidecar_query_cache_skips_merge_after_invalidation() {
+        let controller = AppController::new();
+        let first = retrieval_cache_key_for_test("first");
+        let second = retrieval_cache_key_for_test("second");
+        controller.sidecar_query_cache.lock().insert(
+            first.clone(),
+            vec![CandidateHit::lexical_stub("src/first.rs", 1.0)],
+        );
+
+        with_detached_sidecar_query_cache(&controller, |cache| {
+            controller.sidecar_query_cache.lock().clear();
+            cache.insert(
+                second.clone(),
+                vec![CandidateHit::lexical_stub("src/second.rs", 1.0)],
+            );
+        });
+
+        let cache = controller.sidecar_query_cache.lock();
+        assert!(
+            cache.get(&first).is_none(),
+            "clear during detached work should invalidate original entries"
+        );
+        assert!(
+            cache.get(&second).is_none(),
+            "detached entries must not merge after cache invalidation"
+        );
     }
 
     #[test]
