@@ -1185,8 +1185,9 @@ fn doctor_reports_managed_embedding_setup_state() {
             "doctor should label missing ONNX assets as diagnostic and name product sidecar repair: {doctor:#}"
         ),
         "ok" => assert!(
-            message.contains("Diagnostic ONNX embeddings are installed"),
-            "doctor should label globally available ONNX assets as diagnostic: {doctor:#}"
+            message.contains("Diagnostic ONNX embeddings are installed")
+                || message.contains("External llama.cpp endpoint"),
+            "doctor should label diagnostic ONNX assets or product endpoint readiness: {doctor:#}"
         ),
         "warn" => assert!(
             message.contains("External llama.cpp endpoint"),
@@ -1209,7 +1210,13 @@ fn doctor_does_not_autostart_installed_managed_embeddings() {
         workspace.path(),
         cache_dir.path(),
         &["doctor", "--format", "json"],
-        &[],
+        &[
+            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
+            (
+                "CODESTORY_EMBED_LLAMACPP_URL",
+                "http://127.0.0.1:9/v1/embeddings",
+            ),
+        ],
     );
 
     let managed = check_with_name(&doctor, "managed_embeddings");

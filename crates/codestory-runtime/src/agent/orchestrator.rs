@@ -102,7 +102,7 @@ use codestory_contracts::api::{
 use codestory_contracts::api::{
     AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetDto,
     PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto,
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, SearchMatchQualityDto,
+    PacketSufficiencyDto, PacketSufficiencyStatusDto, RetrievalShadowDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -5059,6 +5059,26 @@ mod tests {
         }
     }
 
+    fn mark_packet_fixture_full_retrieval_available(answer: &mut AgentAnswerDto) {
+        answer.retrieval_trace.retrieval_shadow = Some(RetrievalShadowDto {
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            retrieval_total_ms: 1,
+            total_budget_ms: Some(500),
+            cancel_reason: None,
+            cache_hit: false,
+            stage_timings: Vec::new(),
+            candidates: Vec::new(),
+            would_rank: Vec::new(),
+            error: None,
+            candidate_count: 0,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 0,
+            diagnostic_only: false,
+            candidate_resolution_counts: Vec::new(),
+        });
+    }
+
     fn packet_fixture_project_root() -> &'static std::path::Path {
         std::path::Path::new("C:/workspace/project root")
     }
@@ -9429,6 +9449,7 @@ mod tests {
                 0.8,
             )],
         );
+        mark_packet_fixture_full_retrieval_available(&mut partial_answer);
         let mut budget = apply_packet_budget(
             packet_fixture_project_root(),
             question,
@@ -9509,6 +9530,7 @@ mod tests {
         );
 
         let mut empty_answer = packet_answer_fixture(question, Vec::new());
+        mark_packet_fixture_full_retrieval_available(&mut empty_answer);
         let empty_budget = apply_packet_budget(
             packet_fixture_project_root(),
             question,
@@ -9882,6 +9904,7 @@ mod tests {
                 test_packet_citation("WorkspacePlan", "crates/core/src/workspace/plan.rs", 0.8),
             ],
         );
+        mark_packet_fixture_full_retrieval_available(&mut answer);
         let mut budget = apply_packet_budget(
             packet_fixture_project_root(),
             question,
