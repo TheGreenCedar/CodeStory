@@ -578,6 +578,7 @@ readHookInput().then((input) => {
       event,
       cwd: input.cwd || process.cwd(),
       source: input.source || input.trigger || null,
+      codexThreadId: process.env.CODEX_THREAD_ID || null,
       hook: {
         instructions_emitted: instructions,
         preflight_failed: state.hook && state.hook.preflight_failed,
