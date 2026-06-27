@@ -15,6 +15,12 @@ SEMVER_RE = re.compile(
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 
+PLUGIN_MANIFESTS = (
+    Path("plugins/codestory/.codex-plugin/plugin.json"),
+    Path("plugins/codestory/.claude-plugin/plugin.json"),
+    Path("plugins/codestory/.github/plugin/plugin.json"),
+)
+
 
 def read_toml(path: Path) -> dict:
     with path.open("rb") as handle:
@@ -50,16 +56,19 @@ def lock_packages(root: Path) -> dict[str, set[str]]:
     return packages
 
 
-def plugin_version(root: Path) -> str:
-    manifest_path = root / "plugins" / "codestory" / ".codex-plugin" / "plugin.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ValueError(f"{manifest_path} does not exist") from exc
-    version = manifest.get("version")
-    if not isinstance(version, str) or not version:
-        raise ValueError(f"{manifest_path} must declare a string version")
-    return version
+def plugin_versions(root: Path) -> dict[Path, str]:
+    versions: dict[Path, str] = {}
+    for relative_path in PLUGIN_MANIFESTS:
+        manifest_path = root / relative_path
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"{manifest_path} does not exist") from exc
+        version = manifest.get("version")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"{manifest_path} must declare a string version")
+        versions[relative_path] = version
+    return versions
 
 
 def fail(message: str) -> None:
@@ -91,12 +100,9 @@ def main() -> None:
     if cli_version != expected:
         fail(f"codestory-cli version is {cli_version}, expected {expected}")
 
-    current_plugin_version = plugin_version(root)
-    if current_plugin_version != expected:
-        fail(
-            "plugins/codestory/.codex-plugin/plugin.json version is "
-            f"{current_plugin_version}, expected {expected}"
-        )
+    for manifest_path, current_plugin_version in plugin_versions(root).items():
+        if current_plugin_version != expected:
+            fail(f"{manifest_path} version is {current_plugin_version}, expected {expected}")
 
     workspace_versions: dict[str, str] = {}
     for manifest_path in workspace_members(root):
@@ -131,7 +137,8 @@ def main() -> None:
 
     print(
         f"CodeStory release version {expected} is synchronized across "
-        f"{len(workspace_versions)} workspace crates, Cargo.lock, and the codestory plugin."
+        f"{len(workspace_versions)} workspace crates, Cargo.lock, and "
+        f"{len(PLUGIN_MANIFESTS)} codestory plugin manifests."
     )
 
 

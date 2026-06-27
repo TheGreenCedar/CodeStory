@@ -1,0 +1,46 @@
+name: plugin static
+
+on:
+  pull_request:
+    paths:
+      - plugins/codestory/**
+      - .github/scripts/check-codestory-release.py
+      - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/plugin-static.yml
+  push:
+    branches:
+      - main
+      - dev/codestory-next
+    paths:
+      - plugins/codestory/**
+      - .github/scripts/check-codestory-release.py
+      - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/plugin-static.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-static-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin-static:
+    name: plugin static tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check plugin static wiring
+        run: node --test plugins/codestory/tests/plugin-static.test.mjs
+
+      - name: Check workflow policy
+        run: node .github/scripts/check-workflow-policy.mjs
+
+      - name: Check release version surfaces
+        shell: bash
+        run: |
+          version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
+          python .github/scripts/check-codestory-release.py --version "$version"
