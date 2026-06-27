@@ -8,6 +8,7 @@ const shaPattern = /^[0-9a-f]{40}$/i;
 const violations = [];
 const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
+const rustCi = path.join(workflowRoot, "rust-ci.yml");
 
 for (const file of fs
   .readdirSync(workflowRoot)
@@ -81,6 +82,28 @@ if (!fs.existsSync(pluginStatic)) {
   for (const snippet of requiredSnippets) {
     if (!content.includes(snippet)) {
       violations.push(`plugin-static.yml must include ${snippet}`);
+    }
+  }
+}
+
+if (!fs.existsSync(rustCi)) {
+  violations.push("rust-ci.yml must run default Rust workspace checks for routine code changes");
+} else {
+  const content = fs.readFileSync(rustCi, "utf8");
+  const requiredSnippets = [
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/**",
+    "dev/codestory-next",
+    "cargo fmt --check",
+    "cargo check --workspace --locked",
+    "cargo test --locked",
+    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  ];
+
+  for (const snippet of requiredSnippets) {
+    if (!content.includes(snippet)) {
+      violations.push(`rust-ci.yml must include ${snippet}`);
     }
   }
 }
