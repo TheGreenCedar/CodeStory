@@ -2326,6 +2326,37 @@ fn repair_ready_state(
         Some(runtime.cache_root.as_path()),
     );
     let sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
+    let _repair_lock = match ready_repair_status::try_acquire_ready_repair_lock(
+        &sidecar,
+        &runtime.project_root,
+    )? {
+        ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
+        ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
+            if let Some(status) = busy.status {
+                bail!(
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    status.project_root,
+                    status.profile,
+                    status.run_id.as_deref().unwrap_or("none"),
+                    status.namespace,
+                    status.phase,
+                    status.pid,
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    sidecar
+                        .run_id
+                        .as_deref()
+                        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                );
+            }
+            bail!(
+                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or("none"),
+                sidecar.namespace,
+                busy.lock_path.display()
+            );
+        }
+    };
     eprintln!(
         "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
         sidecar.run_id.as_deref().unwrap_or("none"),
