@@ -10179,10 +10179,10 @@ fn run_serve(cmd: ServeCommand) -> Result<()> {
     }
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "serve")?;
     if cmd.stdio {
         return stdio_transport::run_stdio_server(runtime);
     }
+    ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
     eprintln!("codestory serve listening on http://{}", cmd.addr);

@@ -180,6 +180,23 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
     }
 }
 
+fn unindexed_fixture() -> StdioFixture {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    StdioFixture {
+        workspace,
+        cache_dir,
+        hash_embeddings: true,
+        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        disable_installed_cli_probe: false,
+        sidecar_policy_state: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
+    }
+}
+
 fn full_retrieval_fixture() -> Result<Option<StdioFixture>, String> {
     if !env_flag("CODESTORY_STDIO_FULL_RETRIEVAL_TESTS") {
         return Ok(None);
@@ -893,6 +910,49 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
     assert!(
         result.get("capabilities").is_some(),
         "initialize should report server capabilities: {response}"
+    );
+}
+
+#[test]
+fn stdio_starts_without_prebuilt_index_and_reports_status() {
+    let fixture = unindexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let init = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-unindexed",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "contract-test", "version": "0"}
+            }
+        }),
+    );
+    assert_success_envelope(&init, json!("init-unindexed"));
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-unindexed",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(&status_response, json!("status-unindexed"));
+    let status = json_resource_content(status_result, "codestory://status");
+
+    assert_eq!(status["readiness"][0]["status"], json!("ready"));
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(
+        &status,
+        "search",
+        false,
+        "agent_packet_search",
+        "repair_retrieval",
     );
 }
 
