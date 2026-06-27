@@ -2198,7 +2198,13 @@ fn read_stdio_status_resource_cached(
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
-    let (summary, local_refresh) = if crate::local_freshness_needs_refresh(&summary) {
+    let active_agent_repair = crate::ready_repair_status::active_ready_repair_status(
+        &runtime.project_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
+    let (summary, local_refresh) = if active_agent_repair.is_some() {
+        (summary, None)
+    } else if crate::local_freshness_needs_refresh(&summary) {
         crate::wait_for_local_freshness(&project, &inspect_runtime)?
     } else {
         (summary, None)
@@ -3323,6 +3329,10 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     );
     let next_repair_command =
         env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
+    let active_repair = crate::ready_repair_status::active_ready_repair_status(
+        project_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
     serde_json::json!({
         "state": state,
         "auto_repair": auto_repair,
@@ -3350,7 +3360,17 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT"),
             "project_root": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT"),
             "command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND")
-        }
+        },
+        "active_repair": active_repair.as_ref().map(|status| serde_json::json!({
+            "status": &status.status,
+            "project_root": &status.project_root,
+            "profile": &status.profile,
+            "run_id": &status.run_id,
+            "namespace": &status.namespace,
+            "phase": &status.phase,
+            "pid": status.pid,
+            "updated_at_epoch_ms": status.updated_at_epoch_ms
+        }))
     })
 }
 
@@ -3427,11 +3447,33 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
 }
 
 fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
+    if let Some(status) = crate::ready_repair_status::active_ready_repair_status(
+        &runtime.project_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    ) {
+        return serde_json::json!({
+            "result": {
+                "status": "already_running",
+                "project_root": status.project_root,
+                "profile": status.profile,
+                "run_id": status.run_id,
+                "namespace": status.namespace,
+                "phase": status.phase,
+                "pid": status.pid,
+                "next_status_command": format!(
+                    "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                ),
+                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+            }
+        });
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let output = Command::new(exe)
+    let child = Command::new(exe)
         .arg("ready")
         .arg("--goal")
         .arg("agent")
@@ -3443,18 +3485,21 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
         .arg("--run-id")
         .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
-        .output();
-    match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let parsed = serde_json::from_str::<serde_json::Value>(&stdout).ok();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(child) => {
             serde_json::json!({
                 "result": {
-                    "status": if output.status.success() { "completed" } else { "failed" },
-                    "exit_code": output.status.code(),
-                    "stdout": stdout,
-                    "stderr": String::from_utf8_lossy(&output.stderr),
-                    "parsed": parsed,
+                    "status": "started",
+                    "pid": child.id(),
+                    "next_status_command": format!(
+                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    ),
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
                 }
             })
