@@ -9,7 +9,7 @@
 //! same project root they are planning, and must treat unreadable files as
 //! needing reindexing rather than as clean.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 pub use codestory_contracts::workspace::{
     BuildMode, IndexedFileRecord, RefreshExecutionPlan, RefreshInfo, RefreshInputs, RefreshMode,
     RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
@@ -90,11 +90,12 @@ pub struct WorkspaceSettings {
 
 /// One discovered source group in a project manifest.
 ///
-/// `source_paths` may be files or directories, relative to the manifest root or
-/// absolute. `exclude_patterns` are applied against both workspace-relative and
-/// source-root-relative paths so repo-local build output can be pruned without
-/// excluding an explicitly selected workspace under a directory such as
-/// `target`.
+/// `source_paths` may be files or directories relative to the manifest root.
+/// Programmatic callers that construct a trusted manifest can also opt into
+/// absolute or outside-root paths. `exclude_patterns` are applied against both
+/// workspace-relative and source-root-relative paths so repo-local build output
+/// can be pruned without excluding an explicitly selected workspace under a
+/// directory such as `target`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceGroupSettings {
     pub id: Uuid,
@@ -142,6 +143,7 @@ pub struct WorkspaceManifest {
     settings: WorkspaceSettings,
     manifest_path: PathBuf,
     is_synthetic_default: Cell<bool>,
+    trusted_source_paths: Cell<bool>,
     members: Vec<PathBuf>,
 }
 
@@ -179,6 +181,7 @@ impl WorkspaceManifest {
             settings,
             manifest_path,
             is_synthetic_default: Cell::new(false),
+            trusted_source_paths: Cell::new(true),
             members: Vec::new(),
         }
     }
@@ -191,6 +194,7 @@ impl WorkspaceManifest {
             settings,
             manifest_path: path,
             is_synthetic_default: Cell::new(false),
+            trusted_source_paths: Cell::new(false),
             members: Vec::new(),
         })
     }
@@ -216,6 +220,7 @@ impl WorkspaceManifest {
             },
             manifest_path,
             is_synthetic_default: Cell::new(false),
+            trusted_source_paths: Cell::new(false),
             members: Vec::new(),
         }
     }
@@ -260,6 +265,7 @@ impl WorkspaceManifest {
                 language_specific: LanguageSpecificSettings::Other,
             });
             manifest.is_synthetic_default.set(true);
+            manifest.trusted_source_paths.set(true);
             Ok(manifest)
         }
     }
@@ -297,6 +303,7 @@ impl WorkspaceManifest {
                 language_specific: LanguageSpecificSettings::Other,
             })
             .collect();
+        manifest.trusted_source_paths.set(false);
         Ok(manifest)
     }
 
@@ -408,12 +415,7 @@ impl WorkspaceDiscovery {
             let exclude_patterns = compile_exclude_patterns(&group.exclude_patterns)?;
             let filter_by_language = manifest.should_filter_source_group_language();
             for source_path in &group.source_paths {
-                let full_path = if source_path.is_absolute() {
-                    source_path.clone()
-                } else {
-                    manifest.root_dir().join(source_path)
-                };
-                let full_path = normalize_lexical_path(&full_path);
+                let full_path = resolve_manifest_source_path(manifest, source_path)?;
                 let source_root = discovery_root(&full_path);
 
                 if full_path.is_file() {
@@ -596,6 +598,43 @@ fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
         .root_dir()
         .canonicalize()
         .unwrap_or_else(|_| normalize_lexical_path(&manifest.root_dir()))
+}
+
+fn resolve_manifest_source_path(
+    manifest: &WorkspaceManifest,
+    source_path: &Path,
+) -> Result<PathBuf> {
+    let root = manifest.root_dir();
+    if manifest.trusted_source_paths.get() {
+        return Ok(normalize_lexical_path(&if source_path.is_absolute() {
+            source_path.to_path_buf()
+        } else {
+            root.join(source_path)
+        }));
+    }
+
+    if source_path.is_absolute() {
+        bail!(
+            "repo-local manifest source path `{}` must be relative to `{}`",
+            source_path.display(),
+            root.display()
+        );
+    }
+
+    let full_path = normalize_lexical_path(&root.join(source_path));
+    let canonical_root = workspace_root(manifest);
+    let canonical_source = full_path
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_lexical_path(&full_path));
+    if !canonical_source.starts_with(&canonical_root) {
+        bail!(
+            "repo-local manifest source path `{}` resolves outside manifest root `{}`",
+            source_path.display(),
+            root.display()
+        );
+    }
+
+    Ok(full_path)
 }
 
 fn compile_exclude_patterns(patterns: &[String]) -> Result<Vec<CompiledExcludePattern>> {
@@ -846,6 +885,28 @@ mod tests {
     use std::io;
     use std::path::Path;
     use tempfile::tempdir;
+
+    fn write_repo_manifest(root: &Path, source_paths: Vec<PathBuf>) -> Result<()> {
+        let settings = WorkspaceSettings {
+            name: "repo".to_string(),
+            version: 1,
+            source_groups: vec![SourceGroupSettings {
+                id: Uuid::new_v4(),
+                language: Language::Rust,
+                standard: LanguageStandard::Default,
+                source_paths,
+                exclude_patterns: Vec::new(),
+                include_paths: Vec::new(),
+                defines: HashMap::new(),
+                language_specific: LanguageSpecificSettings::Other,
+            }],
+        };
+        fs::write(
+            root.join("codestory_project.json"),
+            serde_json::to_string_pretty(&settings)?,
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn builds_incremental_refresh_plan_without_storage_dependency() -> Result<()> {
@@ -1213,6 +1274,48 @@ mod tests {
         assert!(files.contains(&root.join("backend").join("src").join("lib.rs")));
         assert!(files.contains(&root.join("frontend").join("app.ts")));
         assert!(!files.contains(&root.join("backend").join("target").join("generated.rs")));
+        Ok(())
+    }
+
+    #[test]
+    fn repo_local_manifest_rejects_absolute_source_paths_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        fs::write(root.join("src").join("lib.rs"), "pub fn local() {}\n")?;
+        write_repo_manifest(&root, vec![root.join("src")])?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let error = WorkspaceDiscovery
+            .source_files(&manifest)
+            .expect_err("repo-local manifest should reject absolute source paths");
+
+        assert!(
+            error.to_string().contains("must be relative"),
+            "absolute source path rejection should explain the trusted boundary: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repo_local_manifest_rejects_paths_that_escape_manifest_root_by_default() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        let shared = temp.path().join("shared");
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&shared)?;
+        fs::write(shared.join("escape.rs"), "pub fn escape() {}\n")?;
+        write_repo_manifest(&root, vec![PathBuf::from("../shared")])?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let error = WorkspaceDiscovery
+            .source_files(&manifest)
+            .expect_err("repo-local manifest should reject source paths outside its root");
+
+        assert!(
+            error.to_string().contains("outside manifest root"),
+            "outside-root rejection should explain the trusted boundary: {error}"
+        );
         Ok(())
     }
 
