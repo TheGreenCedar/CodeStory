@@ -112,6 +112,9 @@ test("plugin metadata maps skill and direct stdio server", async () => {
     "./scripts/codestory-mcp.cjs",
   ]);
   assert.equal(mcp.mcpServers.codestory.cwd, ".");
+  assert.deepEqual(mcp.mcpServers.codestory.env, {
+    CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS: "15000",
+  });
 });
 
 test("plugin package version tracks the codestory-cli release version", async () => {

@@ -4,6 +4,9 @@
       "command": "node",
       "args": ["./scripts/codestory-mcp.cjs"],
       "cwd": ".",
+      "env": {
+        "CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS": "15000"
+      },
       "tool_timeout_sec": 300
     }
   }
