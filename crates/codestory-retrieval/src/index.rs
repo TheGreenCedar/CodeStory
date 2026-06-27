@@ -83,6 +83,15 @@ pub fn repair_project_qdrant_collection(
     project_root: &Path,
     storage_path: &Path,
 ) -> Result<Option<ProjectQdrantRepairOutcome>> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
+    repair_project_qdrant_collection_for_runtime(project_root, storage_path, &runtime)
+}
+
+pub fn repair_project_qdrant_collection_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Option<ProjectQdrantRepairOutcome>> {
     if !storage_path.is_file() {
         return Ok(None);
     }
@@ -118,9 +127,9 @@ pub fn repair_project_qdrant_collection(
         }));
     }
 
-    let layout = SidecarLayout::from_env_for_project(project_root);
+    let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
-    let qdrant_client = QdrantClient::new(&layout);
+    let qdrant_client = QdrantClient::new(layout);
     let probe = qdrant_client.health_probe(&manifest.qdrant_collection);
     if !probe.reachable {
         return Ok(Some(ProjectQdrantRepairOutcome {
@@ -1310,6 +1319,81 @@ mod tests {
         let repair =
             repair_project_qdrant_collection(project.path(), &storage_path).expect("repair");
         assert!(repair.is_none());
+    }
+
+    #[test]
+    fn project_qdrant_repair_uses_selected_runtime_layout() {
+        let project = TempDir::new().expect("project dir");
+        let storage_dir = TempDir::new().expect("storage dir");
+        let sidecar_dir = TempDir::new().expect("sidecar dir");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let project_id = sidecar_project_id_for_root(project.path());
+        let input = SidecarInputFingerprint {
+            hash: "0123456789abcdef0123456789abcdef".into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: "graph-hash".into(),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 1,
+            lexical_hash: "lexical".into(),
+        };
+        let collection = QdrantClient::collection_name_for_generation(&project_id, &input.hash);
+        let manifest = retrieval_manifest_for_sidecar(
+            &project_id,
+            &sidecar_generation_id(&project_id, &input.hash),
+            &collection,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            768,
+            &input,
+        );
+        {
+            let mut storage = Store::open(&storage_path).expect("open db");
+            storage
+                .upsert_retrieval_index_manifest(&manifest)
+                .expect("write manifest");
+            assert_eq!(
+                manifest_unavailable_reason(&project_id, &storage, &manifest),
+                None
+            );
+        }
+
+        let runtime = SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 9,
+                qdrant_http_port: 9,
+                qdrant_grpc_port: 10,
+                zoekt_data_dir: sidecar_dir.path().join("selected-zoekt"),
+                qdrant_data_dir: sidecar_dir.path().join("selected-qdrant"),
+                scip_artifacts_root: sidecar_dir.path().join("selected-scip"),
+                state_file: sidecar_dir.path().join("selected-state.json"),
+            },
+            profile: crate::config::SidecarProfile::Agent,
+            run_id: Some("selected-run".into()),
+            namespace: "selected-run".into(),
+            compose_project: "selected-run".into(),
+            embed_http_port: 11,
+            cleanup_command: "codestory-cli retrieval down".into(),
+            labels: BTreeMap::new(),
+        };
+
+        let repair =
+            repair_project_qdrant_collection_for_runtime(project.path(), &storage_path, &runtime)
+                .expect("repair")
+                .expect("manifest-backed repair");
+
+        assert!(runtime.layout.zoekt_data_dir.is_dir());
+        assert!(runtime.layout.qdrant_data_dir.is_dir());
+        assert!(runtime.layout.scip_artifacts_root.is_dir());
+        assert_eq!(repair.qdrant_collection, collection);
+        assert!(
+            repair
+                .skipped_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("qdrant_unreachable:")),
+            "{repair:?}"
+        );
     }
 
     #[test]

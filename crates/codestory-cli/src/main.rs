@@ -2385,9 +2385,10 @@ fn repair_ready_state(
     );
     ensure_ready_repair_embed_liveness(&infrastructure)?;
     progress.set_phase("Qdrant finalize");
-    codestory_retrieval::repair_project_qdrant_collection(
+    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
         &runtime.project_root,
         &runtime.storage_path,
+        &sidecar,
     )
     .context("ready repair project qdrant repair")?;
     progress.set_phase("graph artifact");
