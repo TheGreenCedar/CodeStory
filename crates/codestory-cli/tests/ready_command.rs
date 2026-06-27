@@ -162,8 +162,22 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     let explicit_agent_json: Value =
         serde_json::from_str(&explicit_agent_json_text).expect("explicit ready agent json");
     assert_eq!(
+        explicit_agent_json["verdicts"][0]["sidecar"]["run_id"],
+        "isolated-proof"
+    );
+    assert_eq!(
         explicit_agent_json["readiness_lanes"]["agent_packet_search"]["run_id"],
         "isolated-proof"
+    );
+    assert_eq!(
+        explicit_agent_json["verdicts"][0]["sidecar"]["run_id"],
+        explicit_agent_json["readiness_lanes"]["agent_packet_search"]["run_id"],
+        "explicit ready agent verdict and rendered lane should use one selected runtime status: {explicit_agent_json_text}"
+    );
+    assert_eq!(
+        explicit_agent_json["verdicts"][0]["sidecar"]["retrieval_mode"],
+        explicit_agent_json["readiness_lanes"]["agent_packet_search"]["sidecar_mode"],
+        "explicit ready agent verdict and rendered lane should agree on full-vs-degraded state: {explicit_agent_json_text}"
     );
     assert!(
         explicit_agent_json["verdicts"][0]["minimum_next"]

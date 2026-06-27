@@ -2599,33 +2599,71 @@ fn read_stdio_status_resource(
     let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
     let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
     let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
+    let raw_sidecar_status = crate::DoctorSidecarStatusOutput {
+        profile: Some(sidecar_runtime.profile.as_str().to_string()),
+        run_id: sidecar_runtime.run_id.clone(),
+        retrieval_mode: sidecar_mode.clone(),
+        degraded_reason: degraded_reason.clone(),
+        embedding_device_policy: embedding_device_policy.clone(),
+        embedding_device_state: embedding_device_state.clone(),
+        embedding_device_observation_source: embedding_device_observation_source.clone(),
+        embedding_detected_provider: embedding_detected_provider.clone(),
+        embedding_detected_gpu: embedding_detected_gpu.clone(),
+        embedding_accelerator_requested,
+        embedding_accelerator_request_provider: embedding_accelerator_request_provider.clone(),
+        embedding_accelerator_request_device: embedding_accelerator_request_device.clone(),
+        embedding_cpu_allowed,
+        manifest_generation: manifest_generation.clone(),
+        manifest_input_hash: manifest_input_hash.clone(),
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
+    };
+    let selected_agent_sidecar = crate::selected_agent_readiness_sidecar_status(
+        runtime,
+        sidecar_runtime.run_id.as_deref(),
+        &raw_sidecar_status,
+    );
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
         stats: &summary.stats,
         freshness: effective_freshness.as_ref(),
         setup: setup_repair.as_ref(),
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
-            profile: Some(sidecar_runtime.profile.as_str()),
-            run_id: sidecar_runtime.run_id.as_deref(),
-            retrieval_mode: &sidecar_mode,
-            degraded_reason: degraded_reason.as_deref(),
-            embedding_device_policy: Some(&embedding_device_policy),
-            embedding_device_state: Some(&embedding_device_state),
-            embedding_device_observation_source: Some(&embedding_device_observation_source),
-            embedding_detected_provider: embedding_detected_provider.as_deref(),
-            embedding_detected_gpu: embedding_detected_gpu.as_deref(),
-            embedding_accelerator_requested,
-            embedding_accelerator_request_provider: embedding_accelerator_request_provider
+            profile: selected_agent_sidecar.profile.as_deref(),
+            run_id: selected_agent_sidecar.run_id.as_deref(),
+            retrieval_mode: &selected_agent_sidecar.retrieval_mode,
+            degraded_reason: selected_agent_sidecar.degraded_reason.as_deref(),
+            embedding_device_policy: Some(&selected_agent_sidecar.embedding_device_policy),
+            embedding_device_state: Some(&selected_agent_sidecar.embedding_device_state),
+            embedding_device_observation_source: Some(
+                &selected_agent_sidecar.embedding_device_observation_source,
+            ),
+            embedding_detected_provider: selected_agent_sidecar
+                .embedding_detected_provider
                 .as_deref(),
-            embedding_accelerator_request_device: embedding_accelerator_request_device.as_deref(),
-            embedding_cpu_allowed,
-            manifest_generation: manifest_generation.as_deref(),
-            manifest_input_hash: manifest_input_hash.as_deref(),
+            embedding_detected_gpu: selected_agent_sidecar.embedding_detected_gpu.as_deref(),
+            embedding_accelerator_requested: selected_agent_sidecar.embedding_accelerator_requested,
+            embedding_accelerator_request_provider: selected_agent_sidecar
+                .embedding_accelerator_request_provider
+                .as_deref(),
+            embedding_accelerator_request_device: selected_agent_sidecar
+                .embedding_accelerator_request_device
+                .as_deref(),
+            embedding_cpu_allowed: selected_agent_sidecar.embedding_cpu_allowed,
+            manifest_generation: selected_agent_sidecar.manifest_generation.as_deref(),
+            manifest_input_hash: selected_agent_sidecar.manifest_input_hash.as_deref(),
         }),
     });
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
-    let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness, None);
+    let readiness_lanes = crate::build_readiness_lanes_for_runtime(
+        runtime,
+        &readiness,
+        None,
+        Some(&selected_agent_sidecar),
+    );
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
@@ -2644,7 +2682,6 @@ fn read_stdio_status_resource(
     let runtime_truth = stdio_runtime_truth_status(
         &plugin_runtime,
         &sidecar_setup,
-        &sidecar,
         &readiness_lanes_json,
         local,
         &local_refresh_json,
@@ -2702,7 +2739,6 @@ fn read_stdio_status_resource(
 fn stdio_runtime_truth_status(
     plugin_runtime: &serde_json::Value,
     sidecar_setup: &serde_json::Value,
-    sidecar: &serde_json::Value,
     readiness_lanes: &serde_json::Value,
     local: &ReadinessVerdictDto,
     local_refresh: &serde_json::Value,
@@ -2734,12 +2770,12 @@ fn stdio_runtime_truth_status(
                 .pointer("/agent_packet_search/run_id")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "mode": sidecar
-                .get("retrieval_mode")
+            "mode": readiness_lanes
+                .pointer("/agent_packet_search/sidecar_mode")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "degraded_reason": sidecar
-                .get("degraded_reason")
+            "degraded_reason": readiness_lanes
+                .pointer("/agent_packet_search/degraded_reason")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
             "namespace": readiness_lanes
