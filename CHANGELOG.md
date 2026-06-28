@@ -29,6 +29,8 @@
 - Surfaced non-default active agent repairs in stdio status and `sidecar_setup`
   so MCP repair does not spawn a duplicate shared-agent repair for the same
   project.
+- Moved Codex worktree setup from local/default retrieval bootstrap/index steps
+  to the shared agent readiness lane used by MCP packet/search.
 
 ### Documentation
 
