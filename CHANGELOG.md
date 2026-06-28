@@ -36,6 +36,8 @@
   state files exist.
 - Reported stale ready-repair status as abandoned sidecar work in MCP status
   with bounded inspect and cleanup commands instead of hiding aborted repairs.
+- Skipped oversized parser-backed source files before reading their full body
+  while persisting a nonfatal incomplete-file indexing error.
 
 ### Documentation
 
