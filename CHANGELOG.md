@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Kept retrieval bootstrap Qdrant repair on the selected sidecar runtime so
+  explicit agent profiles and run IDs do not fall back to ambient/default
+  runtime layout during collection repair.
+
 ### Documentation
 
 - Documented Codex plugin refresh recovery for Windows cache-backup

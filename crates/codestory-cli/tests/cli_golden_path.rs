@@ -2287,10 +2287,16 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
         stdio["result"]["isError"], true,
         "stdio context --id should return a tool error without full sidecars: {stdio:#}"
     );
-    let message = stdio["result"]["structuredContent"]["message"].as_str();
+    let structured = &stdio["result"]["structuredContent"];
+    assert_eq!(
+        structured["code"].as_str(),
+        Some("codestory_tool_blocked"),
+        "stdio context --id should fail closed with a typed tool block: {stdio:#}"
+    );
+    let status = structured["status"].as_str();
     assert!(
-        message.is_some_and(|message| message.contains("sidecar retrieval")),
-        "stdio context --id should fail closed without full sidecars: {stdio:#}"
+        status.is_some_and(|status| matches!(status, "repair_setup" | "repair_retrieval")),
+        "stdio context --id should fail closed before serving context: {stdio:#}"
     );
 }
 
