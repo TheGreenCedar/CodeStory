@@ -46,6 +46,8 @@
   repeated owner-qualified member calls avoid scanning every candidate node.
 - Extended release readiness warnings to compare retrieval index/status/search
   timings against the latest stats-log baselines.
+- Normalized release archive metadata and pinned the release Rust toolchain so
+  package-twice checksum proof can catch reproducibility drift.
 
 ### Documentation
 

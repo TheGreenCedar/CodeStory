@@ -9,6 +9,7 @@ const violations = [];
 const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
+const releaseWorkflow = path.join(workflowRoot, "release.yml");
 
 for (const file of fs
   .readdirSync(workflowRoot)
@@ -105,6 +106,18 @@ if (!fs.existsSync(rustCi)) {
     if (!content.includes(snippet)) {
       violations.push(`rust-ci.yml must include ${snippet}`);
     }
+  }
+}
+
+if (!fs.existsSync(releaseWorkflow)) {
+  violations.push("release.yml must exist for release automation");
+} else {
+  const content = fs.readFileSync(releaseWorkflow, "utf8");
+  if (!content.includes('RELEASE_RUST_TOOLCHAIN: "1.95.0"')) {
+    violations.push("release.yml must pin RELEASE_RUST_TOOLCHAIN to 1.95.0");
+  }
+  if (content.includes("rustup toolchain install stable")) {
+    violations.push("release.yml release builds must not install floating stable Rust");
   }
 }
 
