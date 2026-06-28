@@ -54,6 +54,9 @@
 - Removed deprecated benchmark, sidecar bootstrap, snapshot publish, and
   workspace alias compatibility surfaces after moving guards to maintained task
   manifests and concrete types.
+- Extracted CLI doctor readiness fallback status selection into the shared
+  readiness helper so rendering stays separate from local/default versus
+  agent packet/search readiness truth.
 
 ### Documentation
 
