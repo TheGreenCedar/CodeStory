@@ -7,6 +7,9 @@
 - Taught Auto Release to retry the current source version when a previous
   publish failed before creating a tag or release, while still refusing to
   overwrite existing release state.
+- Taught Auto Release to reject version downgrades and guarded `main`
+  promotions so release PRs must come from `dev/codestory-next`.
+- Ignored Python bytecode caches emitted by local release-script checks.
 - Removed shell execution from default file-open fallbacks so repo paths with
   shell metacharacters are passed as process arguments.
 - Shared retrieval file-role state across strict batch workers so cache-miss

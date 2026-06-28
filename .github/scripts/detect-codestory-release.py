@@ -16,6 +16,11 @@ SEMVER_RE = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+SEMVER_PARTS_RE = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,46 @@ def github_release_exists(tag: str, repo: str) -> bool:
     raise RuntimeError(f"failed to inspect GitHub release {tag}: {result.stderr.strip()}")
 
 
+def compare_identifiers(left: str, right: str) -> int:
+    left_numeric = left.isdigit()
+    right_numeric = right.isdigit()
+    if left_numeric and right_numeric:
+        return (int(left) > int(right)) - (int(left) < int(right))
+    if left_numeric != right_numeric:
+        return -1 if left_numeric else 1
+    return (left > right) - (left < right)
+
+
+def compare_prerelease(left: str | None, right: str | None) -> int:
+    if left == right:
+        return 0
+    if left is None:
+        return 1
+    if right is None:
+        return -1
+
+    left_parts = left.split(".")
+    right_parts = right.split(".")
+    for index in range(min(len(left_parts), len(right_parts))):
+        compared = compare_identifiers(left_parts[index], right_parts[index])
+        if compared:
+            return compared
+    return (len(left_parts) > len(right_parts)) - (len(left_parts) < len(right_parts))
+
+
+def compare_semver(left: str, right: str) -> int:
+    left_match = SEMVER_PARTS_RE.fullmatch(left)
+    right_match = SEMVER_PARTS_RE.fullmatch(right)
+    if left_match is None or right_match is None:
+        raise ValueError(f"cannot compare non-semver versions: {left!r}, {right!r}.")
+
+    left_core = tuple(int(part) for part in left_match.group(1, 2, 3))
+    right_core = tuple(int(part) for part in right_match.group(1, 2, 3))
+    if left_core != right_core:
+        return (left_core > right_core) - (left_core < right_core)
+    return compare_prerelease(left_match.group(4), right_match.group(4))
+
+
 def decide_release(
     *,
     old_version: str,
@@ -107,6 +152,12 @@ def decide_release(
         return ReleaseDecision(
             True,
             f"v{new_version} has no tag or release; retrying the current source version.",
+        )
+
+    if old_version and compare_semver(new_version, old_version) <= 0:
+        raise ValueError(
+            f"codestory-cli version moved from {old_version} to {new_version}; "
+            "auto-release requires a higher version."
         )
 
     return ReleaseDecision(True, f"codestory-cli version changed to {new_version}.")
