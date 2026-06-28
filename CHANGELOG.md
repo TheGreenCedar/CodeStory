@@ -48,6 +48,9 @@
   timings against the latest stats-log baselines.
 - Normalized release archive metadata and pinned the release Rust toolchain so
   package-twice checksum proof can catch reproducibility drift.
+- Collapsed stale sidecar disable/profile production branches so retrieval
+  follows the mandatory sidecar path while benchmark-contract setup keeps
+  stale-environment rejection guidance.
 
 ### Documentation
 

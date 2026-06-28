@@ -80,10 +80,8 @@ pub struct EmbeddingAcceleratorRequest {
 pub fn embedding_runtime_id() -> String {
     if llamacpp_backend_selected() {
         PRODUCT_EMBEDDING_RUNTIME_ID.into()
-    } else if super::config::qdrant_semantic_vectors_enabled() {
-        "hash-projection:768".into()
     } else {
-        "hash-label:8".into()
+        "hash-projection:768".into()
     }
 }
 
@@ -123,9 +121,6 @@ fn ensure_product_embedding_backend_with_device(device: EmbeddingDeviceReadiness
 }
 
 fn ensure_product_embedding_backend_static() -> Result<()> {
-    if !super::config::qdrant_semantic_vectors_enabled() {
-        bail!("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS=0 is unsupported for product sidecar indexing");
-    }
     if !llamacpp_backend_selected() {
         bail!(
             "llama.cpp embedding sidecar is mandatory; set CODESTORY_EMBED_BACKEND=llamacpp and CODESTORY_EMBED_LLAMACPP_URL"
@@ -519,10 +514,7 @@ fn llamacpp_backend_selected() -> bool {
             let normalized = value.trim().to_ascii_lowercase();
             normalized == "llamacpp" || normalized == "llama_cpp"
         }
-        Err(_) => {
-            super::config::qdrant_semantic_vectors_enabled()
-                || std::env::var(LLAMACPP_URL_ENV).is_ok()
-        }
+        Err(_) => true,
     }
 }
 
@@ -759,11 +751,7 @@ pub fn label_to_vector(label: &str) -> Vec<f32> {
 }
 
 pub fn qdrant_vector_dim() -> usize {
-    if super::config::qdrant_semantic_vectors_enabled() {
-        RETRIEVAL_EMBEDDING_DIM
-    } else {
-        8
-    }
+    RETRIEVAL_EMBEDDING_DIM
 }
 
 #[cfg(test)]

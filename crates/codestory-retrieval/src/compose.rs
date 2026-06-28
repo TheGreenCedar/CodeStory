@@ -298,11 +298,6 @@ fn docker_compose_up(
 
     let mut command = docker_compose_command()?;
     let compose_profile = retrieval_compose_profile();
-    if !compose_profile.trim().eq_ignore_ascii_case("real") {
-        bail!(
-            "CODESTORY_RETRIEVAL_COMPOSE_PROFILE={compose_profile} is unsupported; real sidecars are mandatory"
-        );
-    }
     remove_container_if_present("codestory-zoekt-stub")?;
     let embedding_device = crate::embeddings::embedding_device_readiness();
     command

@@ -194,7 +194,7 @@ fn prepare_retrieval_index_embedding_env(profile: CliSidecarProfile) {
 }
 
 fn prepare_retrieval_index_sidecar_env(sidecar: &SidecarRuntimeConfig) {
-    sidecar.activate_embed_url_default();
+    sidecar.activate_embed_url();
 }
 
 pub(crate) fn activate_retrieval_profile_env(
@@ -728,9 +728,6 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn auto_refresh_retries_full_for_semantic_doc_contract_drift() {
@@ -764,7 +761,7 @@ mod tests {
 
     #[test]
     fn retrieval_index_embedding_policy_blocks_unknown_device_before_refresh() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::config::config_env_test_lock();
         let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
@@ -788,7 +785,7 @@ mod tests {
 
     #[test]
     fn agent_retrieval_index_defaults_to_llamacpp_backend() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::config::config_env_test_lock();
         let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
         let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
 
@@ -802,7 +799,7 @@ mod tests {
 
     #[test]
     fn local_retrieval_index_does_not_force_llamacpp_backend() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::config::config_env_test_lock();
         let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
         let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
 
@@ -813,7 +810,7 @@ mod tests {
 
     #[test]
     fn retrieval_index_activates_selected_sidecar_embed_url_default() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::config::config_env_test_lock();
         let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let project = tempfile::TempDir::new().expect("project");
         let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
@@ -833,7 +830,7 @@ mod tests {
 
     #[test]
     fn run_id_without_profile_selects_agent_over_ambient_local_profile() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _lock = crate::config::config_env_test_lock();
         let _retrieval_profile = EnvGuard::set("CODESTORY_RETRIEVAL_PROFILE", "local");
         let _sidecar_profile = EnvGuard::set("CODESTORY_SIDECAR_PROFILE", "local");
         let _run_id = EnvGuard::remove("CODESTORY_SIDECAR_RUN_ID");
