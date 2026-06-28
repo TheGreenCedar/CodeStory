@@ -585,6 +585,8 @@ def run_gate(args: argparse.Namespace) -> None:
         require_version(version_artifact.read_text(encoding="utf-8"), args.expected_version, archive, version_artifact)
         summary["artifacts"]["version"] = str(version_artifact)
         write_json(out_dir / "summary.json", summary)
+        if args.version_only:
+            return
 
         local_bootstrap_artifact = out_dir / "local-retrieval-bootstrap.json"
         run_command(
@@ -946,9 +948,19 @@ def self_test() -> None:
             expected_version="9.9.9",
             plugin_root=None,
             timeout_secs=30,
+            version_only=False,
         )
         run_gate(args)
         assert (out_dir / "summary.json").is_file()
+
+        version_only_out = root / "version-only-out"
+        version_only_args = argparse.Namespace(**vars(args))
+        version_only_args.out_dir = str(version_only_out)
+        version_only_args.version_only = True
+        run_gate(version_only_args)
+        version_only_summary = read_json_file(version_only_out / "summary.json")
+        assert version_only_summary["artifacts"].keys() == {"version"}
+        assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "search"
         try:
@@ -1060,6 +1072,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-version", help="Expected codestory-cli version in the archive.")
     parser.add_argument("--plugin-root", help="Plugin root to smoke through scripts/codestory-mcp.cjs.")
     parser.add_argument("--timeout-secs", type=int, default=1800, help="Per-layer timeout.")
+    parser.add_argument(
+        "--version-only",
+        action="store_true",
+        help="Only unpack the archive and verify codestory-cli --version.",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run script self-tests.")
     args = parser.parse_args()
     if not args.self_test and not args.archive:
