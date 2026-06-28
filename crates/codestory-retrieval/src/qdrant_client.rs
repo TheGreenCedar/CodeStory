@@ -1,6 +1,4 @@
-use crate::config::{
-    QDRANT_HEALTH_BUDGET, SidecarLayout, qdrant_enabled, qdrant_semantic_vectors_enabled,
-};
+use crate::config::{QDRANT_HEALTH_BUDGET, SidecarLayout};
 use crate::embeddings::{self, qdrant_vector_dim as active_vector_dim};
 use anyhow::{Context, Result, bail};
 use codestory_store::FileRole;
@@ -60,11 +58,8 @@ impl QdrantClient {
         crate::generation::sidecar_qdrant_collection(project_id, sidecar_input_hash)
     }
 
-    /// List collection names from `GET /collections` (empty when unreachable or disabled).
+    /// List collection names from `GET /collections`.
     pub fn list_collection_names(&self) -> Result<Vec<String>> {
-        if !qdrant_enabled() {
-            return Ok(Vec::new());
-        }
         let url = format!("{}/collections", self.base_url);
         let response = ureq::get(&url)
             .timeout(self.timeout)
@@ -81,15 +76,6 @@ impl QdrantClient {
     /// Reachability probe that does not require a project collection.
     pub fn list_collections_probe(&self) -> QdrantHealthProbe {
         let started = Instant::now();
-        if !qdrant_enabled() {
-            return QdrantHealthProbe {
-                reachable: false,
-                latency_ms: 0,
-                collection_exists: false,
-                point_count: None,
-                detail: "disabled via CODESTORY_QDRANT_ENABLED=false".into(),
-            };
-        }
         let url = format!("{}/collections", self.base_url);
         match ureq::get(&url).timeout(self.timeout).call() {
             Ok(response) => {
@@ -114,15 +100,6 @@ impl QdrantClient {
 
     pub fn health_probe(&self, collection: &str) -> QdrantHealthProbe {
         let started = Instant::now();
-        if !qdrant_enabled() {
-            return QdrantHealthProbe {
-                reachable: false,
-                latency_ms: 0,
-                collection_exists: false,
-                point_count: None,
-                detail: "disabled via CODESTORY_QDRANT_ENABLED=false".into(),
-            };
-        }
         let url = format!("{}/collections/{collection}", self.base_url);
         let latency_ms = || started.elapsed().as_millis() as u64;
         match ureq::get(&url).timeout(self.timeout).call() {
@@ -163,9 +140,6 @@ impl QdrantClient {
 
     /// Exact count of indexed points in a generated collection.
     pub fn count_points_exact(&self, collection: &str) -> Result<u64> {
-        if !qdrant_enabled() {
-            bail!("qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
-        }
         let url = format!("{}/collections/{collection}/points/count", self.base_url);
         let body = serde_json::json!({ "exact": true });
         let payload = serde_json::to_string(&body).context("serialize qdrant count body")?;
@@ -216,9 +190,6 @@ impl QdrantClient {
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<super::CandidateHit>> {
-        if !qdrant_enabled() {
-            bail!("qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
-        }
         let expected_dim = active_vector_dim();
         if vector.len() != expected_dim {
             bail!(
@@ -252,9 +223,6 @@ impl QdrantClient {
 
     /// Drop collection when embedding backend/dim changes (idempotent).
     pub fn delete_collection(&self, collection: &str) -> Result<()> {
-        if !qdrant_enabled() {
-            return Ok(());
-        }
         let url = format!("{}/collections/{collection}", self.base_url);
         match ureq::delete(&url).timeout(QDRANT_MUTATION_BUDGET).call() {
             Ok(response) => {
@@ -277,9 +245,6 @@ impl QdrantClient {
 
     /// Create collection when missing (idempotent for 409 already exists).
     pub fn ensure_collection(&self, collection: &str) -> Result<()> {
-        if !qdrant_enabled() {
-            bail!("qdrant disabled");
-        }
         let probe = self.health_probe(collection);
         if !probe.reachable {
             bail!("qdrant unreachable: {}", probe.detail);
@@ -321,9 +286,6 @@ impl QdrantClient {
     /// Product indexing supplies stored local semantic-document vectors. If no vectors are supplied,
     /// this method still supports embedding labels for focused diagnostics; mixed batches fail.
     pub fn upsert_points(&self, collection: &str, points: &[QdrantUpsertPoint]) -> Result<usize> {
-        if !qdrant_enabled() {
-            bail!("qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
-        }
         if points.is_empty() {
             return Ok(0);
         }
@@ -399,9 +361,6 @@ impl QdrantClient {
 
     /// Smoke semantic search used by finalize paths when failure detail matters.
     pub fn semantic_search_smoke_result(&self, collection: &str) -> Result<()> {
-        if !qdrant_semantic_vectors_enabled() {
-            bail!("qdrant semantic vectors are disabled");
-        }
         match self.search(collection, "function", 3) {
             Ok(hits) => {
                 if hits.iter().any(hit_has_repo_relative_payload_path) {
@@ -631,11 +590,7 @@ pub fn label_to_vector(label: &str) -> Vec<f32> {
 }
 
 fn query_vector(query: &str) -> Result<Vec<f32>> {
-    if qdrant_semantic_vectors_enabled() {
-        embeddings::embed_query(query)
-    } else {
-        Ok(embeddings::label_to_vector(query))
-    }
+    embeddings::embed_query(query)
 }
 
 /// Diagnostic-only helper for offline vector-index parity checks.
@@ -647,14 +602,7 @@ pub fn diagnostic_query_vector(query: &str) -> Result<Vec<f32>> {
 }
 
 fn document_vectors(labels: &[String]) -> Result<Vec<Vec<f32>>> {
-    if qdrant_semantic_vectors_enabled() {
-        embeddings::embed_documents(labels)
-    } else {
-        Ok(labels
-            .iter()
-            .map(|label| embeddings::label_to_vector(label))
-            .collect())
-    }
+    embeddings::embed_documents(labels)
 }
 
 fn vectors_for_points(points: &[QdrantUpsertPoint]) -> Result<Vec<Vec<f32>>> {

@@ -1,8 +1,7 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
     QDRANT_HEALTH_BUDGET, SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile,
-    SidecarRuntimeConfig, ZOEKT_HEALTH_BUDGET, default_sidecar_image_pins,
-    qdrant_semantic_vectors_enabled, retrieval_command,
+    SidecarRuntimeConfig, ZOEKT_HEALTH_BUDGET, default_sidecar_image_pins, retrieval_command,
 };
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
@@ -483,9 +482,6 @@ fn qdrant_capabilities(
         return qdrant_capability_failure("qdrant_point_count_incomplete");
     }
     if QdrantClient::is_collection_stubbed(&layout.qdrant_data_dir, collection) {
-        return qdrant_capability_failure("qdrant_hash_vectors_only");
-    }
-    if !qdrant_semantic_vectors_enabled() {
         return qdrant_capability_failure("qdrant_hash_vectors_only");
     }
     if !product_embedding_backend {

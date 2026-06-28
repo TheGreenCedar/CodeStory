@@ -3,7 +3,7 @@
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_retrieval::{
     QdrantClient, QueryRequest, SidecarLayout, execute_retrieval_query, finalize_index,
-    probe_sidecar_health, project_id_for_root, qdrant_enabled,
+    probe_sidecar_health, project_id_for_root,
 };
 use codestory_store::{FileInfo, FileRole, SearchSymbolProjection, Store};
 use std::path::Path;
@@ -91,27 +91,25 @@ fn full_mode_fixture_produces_resolvable_hits() {
 
     let layout = SidecarLayout::from_env();
     let project_id = project_id_for_root(project.path());
-    if qdrant_enabled() {
-        let qdrant = QdrantClient::new(&layout);
-        if qdrant.list_collections_probe().reachable {
-            let collection = QdrantClient::collection_name(&project_id);
-            let _ = qdrant.ensure_collection(&collection);
-            let storage = Store::open(&storage_path).expect("reopen for qdrant");
-            if storage.get_search_symbol_projection_count().unwrap_or(0) > 0 {
-                let points = vec![codestory_retrieval::QdrantUpsertPoint {
-                    id: 2_001,
-                    display_name: "extension_service".to_string(),
-                    node_id: "2001".to_string(),
-                    file_path: Some("lib.rs".to_string()),
-                    file_role: Some(FileRole::Entrypoint),
-                    dense_reason: Some("entrypoint".to_string()),
-                    vector: None,
-                }];
-                if qdrant.upsert_points(&collection, &points).is_ok() {
-                    let stub = QdrantClient::stub_marker_path(&layout.qdrant_data_dir, &collection);
-                    if stub.is_file() {
-                        let _ = std::fs::remove_file(stub);
-                    }
+    let qdrant = QdrantClient::new(&layout);
+    if qdrant.list_collections_probe().reachable {
+        let collection = QdrantClient::collection_name(&project_id);
+        let _ = qdrant.ensure_collection(&collection);
+        let storage = Store::open(&storage_path).expect("reopen for qdrant");
+        if storage.get_search_symbol_projection_count().unwrap_or(0) > 0 {
+            let points = vec![codestory_retrieval::QdrantUpsertPoint {
+                id: 2_001,
+                display_name: "extension_service".to_string(),
+                node_id: "2001".to_string(),
+                file_path: Some("lib.rs".to_string()),
+                file_role: Some(FileRole::Entrypoint),
+                dense_reason: Some("entrypoint".to_string()),
+                vector: None,
+            }];
+            if qdrant.upsert_points(&collection, &points).is_ok() {
+                let stub = QdrantClient::stub_marker_path(&layout.qdrant_data_dir, &collection);
+                if stub.is_file() {
+                    let _ = std::fs::remove_file(stub);
                 }
             }
         }

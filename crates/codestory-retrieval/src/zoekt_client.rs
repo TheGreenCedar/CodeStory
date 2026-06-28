@@ -1,4 +1,4 @@
-use crate::config::{SidecarLayout, ZOEKT_HEALTH_BUDGET, zoekt_enabled};
+use crate::config::{SidecarLayout, ZOEKT_HEALTH_BUDGET};
 use crate::zoekt_index::{search_lexical_index, shard_dir_for, shard_has_lexical_index};
 use anyhow::Result;
 use std::time::{Duration, Instant};
@@ -27,14 +27,6 @@ impl ZoektClient {
 
     pub fn health_probe(&self) -> ZoektHealthProbe {
         let started = Instant::now();
-        if !zoekt_enabled() {
-            return ZoektHealthProbe {
-                reachable: false,
-                latency_ms: 0,
-                shard_count: 0,
-                detail: "disabled via CODESTORY_ZOEKT_ENABLED=false".into(),
-            };
-        }
         let url = format!("{}/", self.base_url);
         match ureq::get(&url).timeout(self.timeout).call() {
             Ok(response) => {

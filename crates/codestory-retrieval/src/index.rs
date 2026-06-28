@@ -1,7 +1,4 @@
-use crate::config::{
-    SidecarLayout, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, dir_size_bytes, qdrant_enabled,
-    qdrant_semantic_vectors_enabled, zoekt_enabled,
-};
+use crate::config::{SidecarLayout, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, dir_size_bytes};
 use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract, manifest_unavailable_reason,
     sidecar_generation_id,
@@ -116,17 +113,6 @@ pub fn repair_project_qdrant_collection_for_runtime(
     }
     drop(storage);
 
-    if !qdrant_enabled() {
-        return Ok(Some(ProjectQdrantRepairOutcome {
-            project_id,
-            qdrant_collection: manifest.qdrant_collection,
-            collection_existed: false,
-            repaired: false,
-            points_upserted: 0,
-            skipped_reason: Some("qdrant_disabled".into()),
-        }));
-    }
-
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
     let qdrant_client = QdrantClient::new(layout);
@@ -221,9 +207,6 @@ pub fn finalize_index_for_runtime_with_progress(
 
     let zoekt_client = ZoektClient::new(&layout);
     let zoekt_probe = zoekt_client.health_probe();
-    if !zoekt_enabled() {
-        bail!("Zoekt sidecar is mandatory; CODESTORY_ZOEKT_ENABLED=false is unsupported");
-    }
     if !zoekt_probe.reachable {
         bail!(
             "Zoekt sidecar is mandatory and must be reachable at {} before indexing {project_id}: {}",
@@ -236,9 +219,6 @@ pub fn finalize_index_for_runtime_with_progress(
     let embedding_backend = crate::embeddings::embedding_runtime_id();
     let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    if !qdrant_enabled() {
-        bail!("Qdrant sidecar is mandatory; CODESTORY_QDRANT_ENABLED=false is unsupported");
-    }
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
 
@@ -550,7 +530,7 @@ fn ensure_qdrant_collection(
             collection = %collection,
             points = count,
             qdrant_point_count = qdrant_ready_points.unwrap_or_default(),
-            real_embeddings = qdrant_semantic_vectors_enabled(),
+            real_embeddings = true,
             "Qdrant collection ensured and populated"
         );
     }
@@ -894,14 +874,7 @@ pub(crate) fn compute_sidecar_input_fingerprint(
             .as_deref()
             .unwrap_or(""),
     );
-    hash_part(
-        &mut hasher,
-        if qdrant_semantic_vectors_enabled() {
-            "qdrant-semantic-vectors"
-        } else {
-            "qdrant-hash-vectors"
-        },
-    );
+    hash_part(&mut hasher, "qdrant-semantic-vectors");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
     let mut symbol_doc_count = 0_i64;

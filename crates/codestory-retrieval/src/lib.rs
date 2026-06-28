@@ -56,7 +56,6 @@ pub use config::{
     ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN, default_sidecar_image_pins,
     sidecar_runtime_auto, sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
 };
-pub use config::{qdrant_enabled, qdrant_semantic_vectors_enabled};
 pub use embeddings::qdrant_vector_dim;
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, RETRIEVAL_EMBEDDING_DIM,

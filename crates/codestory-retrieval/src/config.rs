@@ -303,6 +303,16 @@ impl SidecarRuntimeConfig {
             }
         }
     }
+
+    pub fn activate_embed_url(&self) {
+        // SAFETY: this is command-local setup before sidecar probes/query embedding calls.
+        unsafe {
+            std::env::set_var(
+                "CODESTORY_EMBED_LLAMACPP_URL",
+                SidecarLayout::embed_base_url(self.embed_http_port),
+            );
+        }
+    }
 }
 
 impl SidecarLayout {
@@ -696,26 +706,9 @@ pub fn user_cache_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"))
 }
 
-pub fn zoekt_enabled() -> bool {
-    env_flag("CODESTORY_ZOEKT_ENABLED", true)
-}
-
-pub fn qdrant_enabled() -> bool {
-    env_flag("CODESTORY_QDRANT_ENABLED", true)
-}
-
-/// Sidecar retrieval is mandatory; Qdrant uses 768-d semantic vectors by default.
-/// `CODESTORY_RETRIEVAL_REAL_EMBEDDINGS=0` is unsupported for product indexing.
-pub fn qdrant_semantic_vectors_enabled() -> bool {
-    env_flag("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", true)
-}
-
-/// Docker compose profile: `real` by default. Other profiles are rejected by product bootstrap.
+/// Docker compose profile for mandatory sidecars.
 pub fn retrieval_compose_profile() -> String {
-    std::env::var("CODESTORY_RETRIEVAL_COMPOSE_PROFILE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "real".to_string())
+    "real".to_string()
 }
 
 pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
