@@ -54,9 +54,10 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
     )
     .context("retrieval bootstrap")?;
     activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
-    let project_qdrant_repair = codestory_retrieval::repair_project_qdrant_collection(
+    let project_qdrant_repair = codestory_retrieval::repair_project_qdrant_collection_for_runtime(
         &runtime.project_root,
         &runtime.storage_path,
+        &sidecar,
     )
     .context("retrieval project qdrant repair")?;
     let status = strict_sidecar_status_for_runtime(
