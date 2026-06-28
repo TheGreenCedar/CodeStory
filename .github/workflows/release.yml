@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_RUST_TOOLCHAIN: "1.95.0"
+
 concurrency:
   group: release-${{ inputs.version }}
   cancel-in-progress: false
@@ -116,10 +119,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
+      - name: Install pinned Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
+          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
           rustup target add "${{ matrix.rust_target }}"
 
       - name: Capture Rust cache key
@@ -137,9 +140,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-stable-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-stable-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
+            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
 
       - name: Build codestory-cli
         run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
