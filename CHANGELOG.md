@@ -4,6 +4,9 @@
 
 ### Documentation
 
+- Documented Codex plugin refresh recovery for Windows cache-backup
+  `Access is denied` failures and clarified marketplace snapshot vs package
+  refresh vs runtime reload.
 - Added release guidance requiring changelog updates before version commits and
   marketplace repo pushes when Codex needs to detect plugin updates.
 - Restructured operator docs under `docs/users/` (host guides, CLI reference, troubleshooting, trust and readiness).

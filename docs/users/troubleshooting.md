@@ -49,7 +49,7 @@ flowchart TD
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
 | Stale index / wrong symbols | New thread; hooks refresh on session start | Reload MCP; run local repair | New session; run local repair | New session; run [local repair](cli-reference.md#readiness-and-repair) |
 | Packet/search blocked | Agent calls sidecar setup when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) |
-| Version drift after update | Restart host; fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
+| Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
 Host-specific steps: [Codex](codex.md#troubleshooting), [Cursor](cursor.md#troubleshooting), [Claude Code](claude-code.md#troubleshooting), [Copilot](copilot.md).
 
@@ -179,6 +179,26 @@ install. Confirm with a fresh `codestory://status` read.
 
 **Local dev:** Set `CODESTORY_CLI` to a built binary; status labels this
 `local_dev_override`.
+
+### Codex marketplace refresh vs runtime reload
+
+For Codex, marketplace refresh, package refresh, and runtime reload are separate:
+
+```sh
+codex plugin marketplace upgrade TheGreenCedar
+codex plugin add codestory@TheGreenCedar
+```
+
+The first command only updates Codex's marketplace snapshot. The second refreshes
+the installed plugin package when your Codex build supports terminal plugin
+management. A running Codex host can still keep the old MCP adapter and managed
+CLI alive until you start a fresh host session.
+
+On Windows, `codex plugin add codestory@TheGreenCedar` can fail with
+`Access is denied` while backing up the plugin cache if an old Codex/MCP process
+still has files open. Quit stale Codex windows, start a fresh host session, and
+retry the `/plugins` refresh or terminal install. After refresh, confirm the
+active runtime through `codestory://status`, not only `codex plugin list`.
 
 ## Still stuck?
 
