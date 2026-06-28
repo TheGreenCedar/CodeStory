@@ -40,13 +40,22 @@ class AutoReleaseDecisionTest(unittest.TestCase):
 
     def test_releases_changed_unpublished_version(self) -> None:
         decision = detector.decide_release(
-            old_version="0.12.4",
-            new_version="0.12.5",
+            old_version="0.12.5",
+            new_version="0.12.6",
             tag_exists=False,
             release_exists=False,
         )
 
         self.assertTrue(decision.should_release)
+
+    def test_refuses_downgrade(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a higher version"):
+            detector.decide_release(
+                old_version="0.12.5",
+                new_version="0.12.4",
+                tag_exists=False,
+                release_exists=False,
+            )
 
     def test_refuses_changed_version_that_already_exists(self) -> None:
         with self.assertRaisesRegex(ValueError, "refusing to overwrite"):

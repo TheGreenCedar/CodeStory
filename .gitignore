@@ -32,6 +32,10 @@ check_output*.txt
 check_tests_output*.txt
 .worktrees/
 
+# Python tooling
+__pycache__/
+*.py[cod]
+
 # Node tooling (if used locally)
 node_modules/
 pnpm-debug.log*

@@ -10,6 +10,7 @@ const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
+const mainBranchSourceGuard = path.join(workflowRoot, "main-branch-source-guard.yml");
 
 for (const file of fs
   .readdirSync(workflowRoot)
@@ -118,6 +119,25 @@ if (!fs.existsSync(releaseWorkflow)) {
   }
   if (content.includes("rustup toolchain install stable")) {
     violations.push("release.yml release builds must not install floating stable Rust");
+  }
+}
+
+if (!fs.existsSync(mainBranchSourceGuard)) {
+  violations.push("main-branch-source-guard.yml must guard PRs into main");
+} else {
+  const content = fs.readFileSync(mainBranchSourceGuard, "utf8");
+  const requiredSnippets = [
+    "pull_request:",
+    "- main",
+    "dev/codestory-next",
+    "HEAD_REPO",
+    "BASE_REPO",
+  ];
+
+  for (const snippet of requiredSnippets) {
+    if (!content.includes(snippet)) {
+      violations.push(`main-branch-source-guard.yml must include ${snippet}`);
+    }
   }
 }
 

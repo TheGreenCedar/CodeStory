@@ -1,0 +1,34 @@
+name: main branch source guard
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-branch-source-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  enforce-source-branch:
+    name: enforce source branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require dev/codestory-next source branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$HEAD_REF" != "dev/codestory-next" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "::error::Pull requests into main must use $BASE_REPO:dev/codestory-next as the source branch."
+            echo "Current source: $HEAD_REPO:$HEAD_REF"
+            exit 1
+          fi
+          echo "Pull requests into main are allowed from $BASE_REPO:dev/codestory-next."
