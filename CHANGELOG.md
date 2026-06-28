@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.12.6
+
+CodeStory 0.12.6 promotes the current `dev/codestory-next` release automation,
+local-refresh coordination, retrieval hardening, packaging proof, and operator
+guidance work onto `main` as the next synchronized patch release.
+
 ### Fixed
 
 - Taught Auto Release to retry the current source version when a previous

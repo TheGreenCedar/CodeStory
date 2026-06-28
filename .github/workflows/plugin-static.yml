@@ -9,6 +9,8 @@ on:
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/workflows/auto-release.yml
+      - .github/workflows/main-branch-source-guard.yml
+      - .github/workflows/rust-ci.yml
       - .github/workflows/plugin-static.yml
   push:
     branches:
@@ -21,6 +23,8 @@ on:
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/workflows/auto-release.yml
+      - .github/workflows/main-branch-source-guard.yml
+      - .github/workflows/rust-ci.yml
       - .github/workflows/plugin-static.yml
   workflow_dispatch:
 

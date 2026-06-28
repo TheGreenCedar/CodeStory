@@ -22,7 +22,8 @@ use crate::agent::packet_terms::{
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, PacketBudgetDto,
     PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
-    PacketEvidenceTierDto, PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -393,14 +394,23 @@ fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
         .retrieval_trace
         .packet_sidecar_diagnostics
         .iter()
-        .filter(|diagnostic| {
-            diagnostic.candidate_count > 0
-                && diagnostic.resolved_hit_count == 0
-                && diagnostic.unresolved_candidate_count > 0
-        })
+        .filter(|diagnostic| sidecar_diagnostic_blocks_sufficiency(diagnostic))
         .filter(|diagnostic| seen.insert(diagnostic.query.clone()))
         .map(|diagnostic| diagnostic.query.clone())
         .collect()
+}
+
+fn sidecar_diagnostic_blocks_sufficiency(diagnostic: &PacketSidecarQueryDiagnosticDto) -> bool {
+    if diagnostic.candidate_count > 0
+        && diagnostic.resolved_hit_count == 0
+        && diagnostic.unresolved_candidate_count > 0
+    {
+        return true;
+    }
+    diagnostic
+        .diagnostic
+        .as_deref()
+        .is_some_and(|message| message.starts_with("sidecar query has blocking cancel reason "))
 }
 
 fn packet_sufficiency_min_citations(task_class: PacketTaskClassDto) -> usize {
@@ -2339,6 +2349,25 @@ mod tests {
         }
     }
 
+    fn cancelled_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
+        PacketSidecarQueryDiagnosticDto {
+            query: query.to_string(),
+            retrieval_mode: "full".to_string(),
+            sidecar_query_ms: None,
+            candidate_resolution_ms: None,
+            total_elapsed_ms: None,
+            sidecar_stage_count: 0,
+            sidecar_stage_total_ms: None,
+            batch_query_wall_ms: None,
+            candidate_count: 0,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 0,
+            diagnostic: Some(
+                "sidecar query has blocking cancel reason `stage_deadline`".to_string(),
+            ),
+        }
+    }
+
     fn budget_fixture() -> PacketBudgetDto {
         PacketBudgetDto {
             requested: PacketBudgetModeDto::Standard,
@@ -3988,6 +4017,51 @@ mod tests {
         let mut answer = answer_fixture(question);
         answer.retrieval_trace.packet_sidecar_diagnostics =
             vec![unresolved_sidecar_diagnostic("response finalization")];
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Public request entrypoint registers route wrappers before dispatching handler calls.",
+            ),
+            claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "request_terminal"));
+        assert_eq!(report.unresolved, vec!["response finalization".to_string()]);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("response finalization"))
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'response finalization'"))
+        );
+    }
+
+    #[test]
+    fn cancelled_sidecar_diagnostics_block_when_required_coverage_is_missing() {
+        let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
+        let mut answer = answer_fixture(question);
+        answer.retrieval_trace.packet_sidecar_diagnostics =
+            vec![cancelled_sidecar_diagnostic("response finalization")];
         let budget = budget_fixture();
         let claims = vec![
             claim(
