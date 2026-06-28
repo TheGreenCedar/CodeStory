@@ -93,11 +93,6 @@ impl<'a> SnapshotStore<'a> {
         })
     }
 
-    /// Back-compatible wrapper for `finalize_staged`.
-    pub fn prepare_staged_publish(&self) -> Result<(), StorageError> {
-        self.finalize_staged().map(|_| ())
-    }
-
     /// Return whether the summary snapshot is ready for reads.
     pub fn has_ready_summary(&self) -> Result<bool, StorageError> {
         self.storage.has_ready_grounding_summary_snapshots()

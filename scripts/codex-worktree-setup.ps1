@@ -102,6 +102,23 @@ function Invoke-DoctorJson {
     return ($json | ConvertFrom-Json)
 }
 
+function Get-AgentReadyRepairArguments {
+    param([string]$ProjectPath)
+
+    return @(
+        "ready",
+        "--goal",
+        "agent",
+        "--repair",
+        "--project",
+        $ProjectPath,
+        "--format",
+        "json",
+        "--run-id",
+        "shared-agent"
+    )
+}
+
 function Invoke-GitText {
     param([string[]]$Arguments)
 
@@ -529,6 +546,9 @@ function Invoke-SelfTest {
         Assert-SelfTest ((Get-RemoteHeadRefName "codex/issue-670-handoff-proof-target") -eq "refs/heads/codex/issue-670-handoff-proof-target") "plain branch refs should map to ls-remote heads"
         Assert-SelfTest ((Get-ProofTarget "origin/dev/codestory-next" "origin/pr-branch" $false) -eq "base:origin/dev/codestory-next + pr-head:origin/pr-branch") "PR proof target should default to base plus PR head"
         Assert-SelfTest ((Get-ProofTarget "origin/dev/codestory-next" "origin/pr-branch" $true) -eq "branch-head:origin/pr-branch") "branch-head proof should be explicit"
+        $agentRepairArgs = Get-AgentReadyRepairArguments $projectRoot
+        Assert-SelfTest (($agentRepairArgs -join " ") -match "ready --goal agent --repair") "setup should repair the agent readiness lane"
+        Assert-SelfTest (($agentRepairArgs -join " ") -match "--run-id shared-agent") "setup should target the shared agent run id"
     } finally {
         $env:CODESTORY_HOME = $oldCodeStoryHome
         $env:CODESTORY_CLI = $oldCodeStoryCli
@@ -635,12 +655,8 @@ try {
         Invoke-Checked $cli @("index", "--project", $projectPath, "--refresh", "auto")
     }
 
-    Invoke-SetupStep "Bootstrap retrieval sidecars" {
-        Invoke-Checked $cli @("retrieval", "bootstrap", "--project", $projectPath, "--wait-secs", "90")
-    } -Optional
-
-    Invoke-SetupStep "Refresh retrieval sidecar index" {
-        Invoke-Checked $cli @("retrieval", "index", "--project", $projectPath, "--refresh", "auto")
+    Invoke-SetupStep "Repair agent sidecar readiness" {
+        Invoke-Checked $cli (Get-AgentReadyRepairArguments $projectPath)
     } -Optional
 
     Invoke-SetupStep "Doctor readiness handoff" {

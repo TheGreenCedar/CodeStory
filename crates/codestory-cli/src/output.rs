@@ -6,16 +6,18 @@
 //! already-computed response.
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use codestory_contracts::api::IndexFreshnessStatusDto;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentResponseBlockDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ClaimReadinessDto, EvidenceTypeDto, GraphArtifactDto,
-    GroundingSnapshotDto, IndexFreshnessStatusDto, IndexingPhaseTimings, NodeDetailsDto,
-    PacketEvidenceResolutionDto, PacketEvidenceTierDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, SearchHit, SearchHitOrigin,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto,
-    SnippetContextDto, SymbolContextDto, TrailContextDto, TrailStoryDto,
+    GroundingSnapshotDto, IndexingPhaseTimings, NodeDetailsDto, PacketEvidenceResolutionDto,
+    PacketEvidenceTierDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto, RetrievalModeDto,
+    RetrievalStateDto, SearchHit, SearchHitOrigin, SearchPlanBridgeConfidenceDto,
+    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
+    SearchPlanChannelDto, SearchPlanDto, SearchPlanPromotionStatusDto, SnippetContextDto,
+    SymbolContextDto, TrailContextDto, TrailStoryDto,
 };
 use codestory_contracts::language_support::language_name_for_path;
 use serde::Serialize;
@@ -2343,44 +2345,23 @@ fn doctor_operator_next_action(output: &DoctorOutput) -> &str {
 }
 
 fn doctor_local_navigation_readiness(output: &DoctorOutput) -> &'static str {
-    if let Some(verdict) = output
-        .readiness
-        .iter()
-        .find(|verdict| crate::readiness::goal_label(verdict.goal) == "local_navigation")
-    {
-        return crate::readiness::status_label(verdict.status);
-    }
-    if !output.indexed
-        || output
-            .freshness
-            .as_ref()
-            .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale)
-    {
-        return "repair_index";
-    }
-    "ready"
+    crate::readiness::status_label_for_goal(
+        codestory_contracts::api::ReadinessGoalDto::LocalNavigation,
+        &output.readiness,
+        output.indexed,
+        output.freshness.as_ref().map(|freshness| freshness.status),
+        &output.retrieval_mode,
+    )
 }
 
 fn doctor_agent_packet_search_readiness(output: &DoctorOutput) -> &'static str {
-    if let Some(verdict) = output
-        .readiness
-        .iter()
-        .find(|verdict| crate::readiness::goal_label(verdict.goal) == "agent_packet_search")
-    {
-        return crate::readiness::status_label(verdict.status);
-    }
-    if !output.indexed {
-        return "repair_index";
-    }
-    match output.freshness.as_ref().map(|freshness| freshness.status) {
-        Some(IndexFreshnessStatusDto::Stale) => return "repair_index",
-        Some(IndexFreshnessStatusDto::NotChecked) => return "check_index",
-        Some(IndexFreshnessStatusDto::Fresh) | None => {}
-    }
-    if output.retrieval_mode != "full" {
-        return "repair_retrieval";
-    }
-    "ready"
+    crate::readiness::status_label_for_goal(
+        codestory_contracts::api::ReadinessGoalDto::AgentPacketSearch,
+        &output.readiness,
+        output.indexed,
+        output.freshness.as_ref().map(|freshness| freshness.status),
+        &output.retrieval_mode,
+    )
 }
 
 pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {

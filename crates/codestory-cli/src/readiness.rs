@@ -47,10 +47,9 @@ pub(crate) struct ReadinessSidecarInput<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalRefreshState {
-    Fresh,
-    Stale,
-    NotChecked,
-    SkippedLocked,
+    Refreshing,
+    Refreshed,
+    Skipped,
     Failed,
 }
 
@@ -61,6 +60,18 @@ pub(crate) struct LocalRefreshOutput {
     pub(crate) readiness_status: ReadinessStatusDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lock_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) changed_file_count: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -134,6 +145,38 @@ pub(crate) fn primary_non_ready(verdicts: &[ReadinessVerdictDto]) -> Option<&Rea
         .find(|verdict| verdict.status != ReadinessStatusDto::Ready)
 }
 
+pub(crate) fn status_label_for_goal(
+    goal: ReadinessGoalDto,
+    verdicts: &[ReadinessVerdictDto],
+    indexed: bool,
+    freshness_status: Option<IndexFreshnessStatusDto>,
+    retrieval_mode: &str,
+) -> &'static str {
+    if let Some(verdict) = verdicts.iter().find(|verdict| verdict.goal == goal) {
+        return status_label(verdict.status);
+    }
+
+    if !indexed {
+        return "repair_index";
+    }
+
+    match freshness_status {
+        Some(IndexFreshnessStatusDto::Stale) => return "repair_index",
+        Some(IndexFreshnessStatusDto::NotChecked)
+            if goal == ReadinessGoalDto::AgentPacketSearch =>
+        {
+            return "check_index";
+        }
+        Some(IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::NotChecked) | None => {}
+    }
+
+    if goal == ReadinessGoalDto::AgentPacketSearch && retrieval_mode != "full" {
+        return "repair_retrieval";
+    }
+
+    "ready"
+}
+
 pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
     match status {
         ReadinessStatusDto::Ready => "ready",
@@ -165,10 +208,9 @@ pub(crate) fn goal_label(goal: ReadinessGoalDto) -> &'static str {
 
 pub(crate) fn local_refresh_state_label(state: LocalRefreshState) -> &'static str {
     match state {
-        LocalRefreshState::Fresh => "fresh",
-        LocalRefreshState::Stale => "stale",
-        LocalRefreshState::NotChecked => "not_checked",
-        LocalRefreshState::SkippedLocked => "skipped_locked",
+        LocalRefreshState::Refreshing => "refreshing",
+        LocalRefreshState::Refreshed => "refreshed",
+        LocalRefreshState::Skipped => "skipped",
         LocalRefreshState::Failed => "failed",
     }
 }
@@ -178,22 +220,27 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
     let state = match verdict.status {
         ReadinessStatusDto::Ready
         | ReadinessStatusDto::Repairing
-        | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Fresh,
-        ReadinessStatusDto::CheckIndex => LocalRefreshState::NotChecked,
+        | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Refreshed,
+        ReadinessStatusDto::CheckIndex => LocalRefreshState::Skipped,
         ReadinessStatusDto::RepairSetup => LocalRefreshState::Failed,
         ReadinessStatusDto::RepairIndex => {
             if index.and_then(|index| index.status) == Some(IndexFreshnessStatusDto::Stale) {
-                LocalRefreshState::Stale
+                LocalRefreshState::Skipped
             } else {
                 LocalRefreshState::Failed
             }
         }
     };
     let reason = match state {
-        LocalRefreshState::Fresh => None,
-        LocalRefreshState::Stale => Some("index_changed".to_string()),
-        LocalRefreshState::NotChecked => Some("freshness_not_checked".to_string()),
-        LocalRefreshState::SkippedLocked => Some("index_locked".to_string()),
+        LocalRefreshState::Refreshing => Some("refresh_active".to_string()),
+        LocalRefreshState::Refreshed => None,
+        LocalRefreshState::Skipped => {
+            if index.and_then(|index| index.status) == Some(IndexFreshnessStatusDto::Stale) {
+                Some("index_changed".to_string())
+            } else {
+                Some("freshness_not_checked".to_string())
+            }
+        }
         LocalRefreshState::Failed => Some(verdict.summary.clone()),
     };
 
@@ -202,6 +249,12 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
         blocks_local_surfaces: verdict.status != ReadinessStatusDto::Ready,
         readiness_status: verdict.status,
         reason,
+        phase: None,
+        pid: None,
+        started_at_epoch_ms: None,
+        updated_at_epoch_ms: None,
+        lock_path: None,
+        last_failure_reason: None,
         changed_file_count: index
             .map(|index| index.changed_file_count)
             .unwrap_or_default(),
@@ -586,6 +639,63 @@ mod tests {
     }
 
     #[test]
+    fn status_label_for_goal_preserves_doctor_fallback_readiness_lanes() {
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::LocalNavigation,
+                &[],
+                true,
+                Some(IndexFreshnessStatusDto::NotChecked),
+                "unavailable",
+            ),
+            "ready",
+            "legacy doctor fallback kept local/default freshness separate from agent proof"
+        );
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[],
+                true,
+                Some(IndexFreshnessStatusDto::NotChecked),
+                "full",
+            ),
+            "check_index"
+        );
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[],
+                true,
+                Some(IndexFreshnessStatusDto::Fresh),
+                "unavailable",
+            ),
+            "repair_retrieval"
+        );
+
+        let verdict = ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::Ready,
+            summary: "ready".to_string(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            setup: None,
+            index: None,
+            sidecar: None,
+        };
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[verdict],
+                false,
+                Some(IndexFreshnessStatusDto::Stale),
+                "unavailable",
+            ),
+            "ready",
+            "rendering must trust the selected readiness verdict when present"
+        );
+    }
+
+    #[test]
     fn missing_index_blocks_local_graph_only() {
         let stats = stats(0);
         let verdicts = build_readiness_verdicts(inputs(&stats, None, None));
@@ -780,7 +890,7 @@ mod tests {
         assert_eq!(verdict.status, ReadinessStatusDto::Ready);
         assert_eq!(
             local_refresh_output(&verdict).state,
-            LocalRefreshState::Fresh
+            LocalRefreshState::Refreshed
         );
         assert!(
             verdict.summary.contains("2 nonfatal indexing errors"),
@@ -807,7 +917,7 @@ mod tests {
 
         assert_eq!(verdict.status, ReadinessStatusDto::CheckIndex);
         let refresh = local_refresh_output(&verdict);
-        assert_eq!(refresh.state, LocalRefreshState::NotChecked);
+        assert_eq!(refresh.state, LocalRefreshState::Skipped);
         assert!(refresh.blocks_local_surfaces);
         assert_eq!(
             verdict.index.as_ref().and_then(|index| index.status),
@@ -827,7 +937,7 @@ mod tests {
 
         assert_eq!(verdict.status, ReadinessStatusDto::RepairIndex);
         let refresh = local_refresh_output(&verdict);
-        assert_eq!(refresh.state, LocalRefreshState::Stale);
+        assert_eq!(refresh.state, LocalRefreshState::Skipped);
         assert!(refresh.blocks_local_surfaces);
         assert_eq!(refresh.changed_file_count, 1);
         assert!(
@@ -889,7 +999,7 @@ mod tests {
             inputs(&stats, Some(&freshness), None),
         );
         let refresh = local_refresh_output(&local);
-        assert_eq!(refresh.state, LocalRefreshState::Fresh);
+        assert_eq!(refresh.state, LocalRefreshState::Refreshed);
         assert!(!refresh.blocks_local_surfaces);
 
         let local_full = build_readiness_verdict(

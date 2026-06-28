@@ -47,6 +47,11 @@
 
 ## Commit & Pull Request Guidelines
 - Commit messages are short, lowercase, imperative (e.g., `fix minimap`, `refactor graph style`).
+- Before staging or committing, update `CHANGELOG.md` whenever the diff changes
+  shipped behavior, operator guidance, release automation, packaging, or version
+  metadata. If the work modifies the current latest unreleased version or
+  creates the next latest version heading, keep the entry under `Unreleased` or
+  that new release heading in the same commit.
 - PRs should include a summary, tests run, linked issues, and relevant artifacts for behavior changes.
 - Routine implementation PRs branch from and target `dev/codestory-next`. Do not target `main` directly unless the lane is an explicit release, hotfix, final comparison/review artifact, or promotion.
 - Agent branches should use the `codex/` prefix by default. Saga comparison/review branches may use `review/codestory-saga-*` when the branch exists only to support a reviewer comparison.
@@ -57,7 +62,15 @@
 ## Release Guidelines
 - `crates/codestory-cli/Cargo.toml` is the release version source.
 - Update every `codestory-*` workspace crate version and `Cargo.lock` together.
+- Before committing a change that modifies the current unreleased version or
+  creates the next latest version, update `CHANGELOG.md` under `Unreleased` or
+  the new release heading so release contents are tracked while the work is
+  still reviewable.
 - Do not create or push `v*` release tags manually. A synchronized version bump on `main` triggers GitHub Actions to create the tag, GitHub release, cross-platform `codestory-cli` binary assets, and `SHA256SUMS.txt`.
+- After a plugin release or plugin-source update that Codex must detect through
+  the marketplace, push a corresponding change to
+  `TheGreenCedar/AgentPluginMarketplace`; Codex observes the marketplace repo
+  state, not only the CodeStory repo release.
 - CI binary assets prove build/package smoke only. Packet/search readiness still requires the sidecar evidence tiers in `docs/contributors/testing-matrix.md`.
 
 ## Retrieval documentation

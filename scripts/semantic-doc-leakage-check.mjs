@@ -12,9 +12,7 @@ const SEMANTIC_DOC_SOURCE = path.join(
   "src",
   "semantic_doc_text.rs",
 );
-const BENCHMARK_SOURCES = [
-  path.join(ROOT, "scripts", "cross-repo-promotion-benchmark.mjs"),
-];
+const BENCHMARK_TASK_ROOT = path.join(ROOT, "benchmarks", "tasks");
 const OVERLAP_THRESHOLD = Number(
   process.env.CODESTORY_SEMANTIC_DOC_LEAKAGE_JACCARD ?? "0.82",
 );
@@ -81,21 +79,53 @@ function extractRuntimeConceptPhrases() {
   return phrases;
 }
 
+function collectTaskFiles(root) {
+  const files = [];
+  if (!fs.existsSync(root)) {
+    return files;
+  }
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectTaskFiles(fullPath));
+    } else if (entry.isFile() && entry.name.endsWith(".task.json")) {
+      files.push(fullPath);
+    }
+  }
+  return files.sort();
+}
+
+function collectPromptFields(value, prompts) {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectPromptFields(item, prompts);
+    }
+    return;
+  }
+  if (value == null || typeof value !== "object") {
+    return;
+  }
+  if (typeof value.prompt === "string" && value.prompt.trim()) {
+    prompts.push(value.prompt);
+  }
+  for (const child of Object.values(value)) {
+    collectPromptFields(child, prompts);
+  }
+}
+
 function extractBenchmarkQueries() {
   const queries = [];
-  for (const file of BENCHMARK_SOURCES) {
-    if (!fs.existsSync(file)) {
-      continue;
-    }
-
+  for (const file of collectTaskFiles(BENCHMARK_TASK_ROOT)) {
     const text = readText(file);
-    const queryLiteral = /query:\s*"([^"]+)"/g;
-    let match;
-    while ((match = queryLiteral.exec(text)) !== null) {
+    const parsed = JSON.parse(text);
+    const prompts = [];
+    collectPromptFields(parsed, prompts);
+    for (const prompt of prompts) {
+      const promptOffset = text.indexOf(prompt);
       queries.push({
         file: path.relative(ROOT, file),
-        line: lineOf(text, match.index),
-        text: match[1],
+        line: promptOffset === -1 ? 1 : lineOf(text, promptOffset),
+        text: prompt,
       });
     }
   }
@@ -105,6 +135,9 @@ function extractBenchmarkQueries() {
 function main() {
   const phrases = extractRuntimeConceptPhrases();
   const queries = extractBenchmarkQueries();
+  if (queries.length === 0) {
+    throw new Error("No benchmark task prompts found for semantic-doc leakage check");
+  }
   const exact = [];
   const highOverlap = [];
 

@@ -68,6 +68,9 @@ struct IndexFeatureFlags {
     lazy_graph_execution: bool,
 }
 
+const DEFAULT_SOURCE_FILE_BYTE_CAP: u64 = 1_000_000;
+const SOURCE_FILE_BYTE_CAP_ENV: &str = "CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP";
+
 struct PostProcessedIndexResults {
     nodes: Vec<Node>,
     id_remap: HashMap<NodeId, NodeId>,
@@ -769,6 +772,7 @@ pub struct WorkspaceIndexer {
     compilation_db: Option<compilation_database::CompilationDatabase>,
     compilation_db_warning: Option<String>,
     batch_config: IncrementalIndexingConfig,
+    source_file_byte_cap: u64,
 }
 
 impl WorkspaceIndexer {
@@ -800,12 +804,19 @@ impl WorkspaceIndexer {
             compilation_db,
             compilation_db_warning,
             batch_config: IncrementalIndexingConfig::default(),
+            source_file_byte_cap: configured_source_file_byte_cap(),
         }
     }
 
     /// Override incremental flush batch sizes.
     pub fn with_batch_config(mut self, batch_config: IncrementalIndexingConfig) -> Self {
         self.batch_config = batch_config;
+        self
+    }
+
+    /// Override the parser-backed source file byte cap.
+    pub fn with_source_file_byte_cap(mut self, source_file_byte_cap: u64) -> Self {
+        self.source_file_byte_cap = source_file_byte_cap.max(1);
         self
     }
 
@@ -1618,6 +1629,45 @@ impl WorkspaceIndexer {
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
 
+        let file_size = match std::fs::metadata(&full_path) {
+            Ok(metadata) => metadata.len(),
+            Err(e) => {
+                let local_storage = incomplete_file_storage(
+                    &full_path,
+                    None,
+                    language_config.language_name,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!("Failed to inspect {:?}: {}", path, e),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: true,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                    },
+                );
+                return Err(local_storage);
+            }
+        };
+        if file_size > self.source_file_byte_cap {
+            let local_storage = incomplete_file_storage(
+                &full_path,
+                None,
+                language_config.language_name,
+                codestory_contracts::graph::ErrorInfo {
+                    message: format!(
+                        "Skipped oversized source file {:?}: {} bytes exceeds {} byte cap",
+                        path, file_size, self.source_file_byte_cap
+                    ),
+                    file_id: None,
+                    line: None,
+                    column: None,
+                    is_fatal: false,
+                    index_step: codestory_contracts::graph::IndexStep::Indexing,
+                },
+            );
+            return Err(local_storage);
+        }
+
         let bytes = match std::fs::read(&full_path) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1908,6 +1958,14 @@ fn file_modification_time(path: &Path) -> i64 {
 
 fn duration_ms_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn configured_source_file_byte_cap() -> u64 {
+    std::env::var(SOURCE_FILE_BYTE_CAP_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(DEFAULT_SOURCE_FILE_BYTE_CAP)
 }
 
 fn accumulate_flush_breakdown(
@@ -19900,6 +19958,83 @@ public:
         // Each file should contribute at least one file node and one symbol node.
         let nodes = storage.get_nodes()?;
         assert!(nodes.len() >= 24);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_oversized_parser_file_is_skipped_before_indexing_read() -> Result<()> {
+        use codestory_store::Store as Storage;
+        use codestory_workspace::RefreshInfo;
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir()?;
+        let oversized = dir.path().join("oversized.rs");
+        let normal = dir.path().join("normal.rs");
+        fs::write(
+            &oversized,
+            format!("{}\nfn too_large() {{}}\n", "// padded".repeat(16)),
+        )?;
+        fs::write(&normal, "fn small() {}\n")?;
+
+        let mut storage = Storage::new_in_memory().unwrap();
+        let bus = EventBus::new();
+        let indexer = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(64)
+            .with_batch_config(IncrementalIndexingConfig {
+                file_batch_size: 2,
+                node_batch_size: 128,
+                edge_batch_size: 128,
+                occurrence_batch_size: 128,
+                error_batch_size: 128,
+            });
+        let refresh_info = RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![oversized.clone(), normal.clone()],
+            files_to_remove: vec![],
+            existing_file_ids: std::collections::HashMap::new(),
+        };
+
+        indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        let files = storage.get_files()?;
+        let oversized_file = files
+            .iter()
+            .find(|file| file.path == oversized)
+            .expect("oversized file row should be persisted");
+        assert!(
+            !oversized_file.complete,
+            "oversized file should be marked incomplete"
+        );
+        let normal_file = files
+            .iter()
+            .find(|file| file.path == normal)
+            .expect("normal file row should be persisted");
+        assert!(normal_file.complete, "normal file should remain complete");
+
+        let errors = storage.get_errors(None)?;
+        assert_eq!(errors.len(), 1);
+        let error = &errors[0];
+        assert_eq!(error.file_id, Some(NodeId(oversized_file.id)));
+        assert!(!error.is_fatal, "oversized skip should be nonfatal");
+        assert!(
+            error.message.contains("Skipped oversized source file"),
+            "unexpected oversized error: {}",
+            error.message
+        );
+
+        let nodes = storage.get_nodes()?;
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.serialized_name == "small" && node.kind == NodeKind::FUNCTION),
+            "normal files should still be indexed"
+        );
+        assert!(
+            !nodes.iter().any(|node| node.serialized_name == "too_large"),
+            "oversized parser-backed source should not be read and parsed"
+        );
 
         Ok(())
     }

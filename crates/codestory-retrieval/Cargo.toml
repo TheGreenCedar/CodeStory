@@ -1,6 +1,6 @@
 [package]
 name = "codestory-retrieval"
-version = "0.12.5"
+version = "0.12.6"
 edition = "2024"
 
 [features]
@@ -13,6 +13,7 @@ codestory-contracts = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 directories = { workspace = true }
+fs4 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

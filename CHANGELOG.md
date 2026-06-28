@@ -2,8 +2,80 @@
 
 ## Unreleased
 
+## 0.12.6
+
+CodeStory 0.12.6 promotes the current `dev/codestory-next` release automation,
+local-refresh coordination, retrieval hardening, packaging proof, and operator
+guidance work onto `main` as the next synchronized patch release.
+
+### Fixed
+
+- Taught Auto Release to retry the current source version when a previous
+  publish failed before creating a tag or release, while still refusing to
+  overwrite existing release state.
+- Taught Auto Release to reject version downgrades and guarded `main`
+  promotions so release PRs must come from `dev/codestory-next`.
+- Ignored Python bytecode caches emitted by local release-script checks.
+- Removed shell execution from default file-open fallbacks so repo paths with
+  shell metacharacters are passed as process arguments.
+- Shared retrieval file-role state across strict batch workers so cache-miss
+  fan-out does not clone the repo-wide role map per worker.
+- Kept retrieval bootstrap Qdrant repair on the selected sidecar runtime so
+  explicit agent profiles and run IDs do not fall back to ambient/default
+  runtime layout during collection repair.
+- Compacted local-refresh status across ready, agent preflight, and
+  `codestory://status` so agent-facing output uses refreshed/refreshing/skipped
+  states while maintainer JSON keeps stale freshness details.
+- Added a project-scoped single-flight lock/status for local refresh so
+  concurrent Codex/plugin processes report refreshing or skipped_locked instead
+  of launching duplicate incremental indexing.
+- Bounded stdio/MCP local-refresh waits so `ground` returns compact
+  `local_refresh` repair guidance instead of consuming the full tool timeout on
+  stale indexes.
+- Let `agent preflight` run one bounded quiet local refresh so repairable stale
+  local indexes report refreshed local graph readiness while packet/search stays
+  fail-closed.
+- Surfaced non-default active agent repairs in stdio status and `sidecar_setup`
+  so MCP repair does not spawn a duplicate shared-agent repair for the same
+  project.
+- Moved Codex worktree setup from local/default retrieval bootstrap/index steps
+  to the shared agent readiness lane used by MCP packet/search.
+- Serialized first-boot agent sidecar port allocation through a cache-backed
+  registry so concurrent namespaces do not choose duplicate dynamic ports before
+  state files exist.
+- Reported stale ready-repair status as abandoned sidecar work in MCP status
+  with bounded inspect and cleanup commands instead of hiding aborted repairs.
+- Skipped oversized parser-backed source files before reading their full body
+  while persisting a nonfatal incomplete-file indexing error.
+- Smoked every release matrix archive after packaging by unpacking it and
+  verifying packaged `codestory-cli --version` before upload.
+- Pinned the manual post-publish release smoke checkout to the requested release
+  tag so older release proofs do not drift with the current branch.
+- Narrowed owner-alias call resolution through exact/suffix candidate maps so
+  repeated owner-qualified member calls avoid scanning every candidate node.
+- Extended release readiness warnings to compare retrieval index/status/search
+  timings against the latest stats-log baselines.
+- Normalized release archive metadata and pinned the release Rust toolchain so
+  package-twice checksum proof can catch reproducibility drift.
+- Collapsed stale sidecar disable/profile production branches so retrieval
+  follows the mandatory sidecar path while benchmark-contract setup keeps
+  stale-environment rejection guidance.
+- Removed deprecated benchmark, sidecar bootstrap, snapshot publish, and
+  workspace alias compatibility surfaces after moving guards to maintained task
+  manifests and concrete types.
+- Extracted CLI doctor readiness fallback status selection into the shared
+  readiness helper so rendering stays separate from local/default versus
+  agent packet/search readiness truth.
+
 ### Documentation
 
+- Documented Codex plugin refresh recovery for Windows cache-backup
+  `Access is denied` failures and clarified marketplace snapshot vs package
+  refresh vs runtime reload.
+- Added contributor guidance requiring changelog updates before commits that
+  change shipped behavior, operator guidance, release automation, packaging, or
+  unreleased/latest version metadata, and requiring marketplace repo pushes when
+  Codex needs to detect plugin updates.
 - Restructured operator docs under `docs/users/` (host guides, CLI reference, troubleshooting, trust and readiness).
 - Added CI markdown link checker: `node .github/scripts/check-doc-links.mjs` (`.github/workflows/docs-link-check.yml`).
 

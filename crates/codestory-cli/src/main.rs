@@ -38,7 +38,9 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -48,6 +50,7 @@ mod display;
 mod drill_targeting;
 mod explore;
 mod http_transport;
+mod local_refresh_status;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
@@ -58,6 +61,8 @@ mod retrieval;
 mod runtime;
 mod stdio_catalog;
 mod stdio_transport;
+
+const AGENT_PREFLIGHT_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 
 use args::{
     AffectedChangeSource, AffectedCommand, AffectedStdinFormat, BookmarkAction, BookmarkAddCommand,
@@ -2191,17 +2196,78 @@ pub(crate) fn wait_for_local_freshness(
     let summary = inspect_runtime.open_project_summary()?;
     if !local_freshness_needs_refresh(&summary) {
         let mut output = local_refresh_output_from_summary(&summary);
-        if output.state == readiness::LocalRefreshState::Fresh {
+        if output.state == readiness::LocalRefreshState::Refreshed {
             output.reason = Some("already_fresh".to_string());
         }
         return Ok((summary, Some(output)));
     }
 
+    let lock = match local_refresh_status::try_acquire_local_refresh_lock(
+        &inspect_runtime.cache_root,
+        &inspect_runtime.project_root,
+    )? {
+        local_refresh_status::LocalRefreshLockAttempt::Acquired(lock) => lock,
+        local_refresh_status::LocalRefreshLockAttempt::Busy(busy) => {
+            let mut output = local_refresh_output_from_summary(&summary);
+            output.state = if busy.status.is_some() {
+                readiness::LocalRefreshState::Refreshing
+            } else {
+                readiness::LocalRefreshState::Skipped
+            };
+            output.blocks_local_surfaces = true;
+            output.readiness_status = ReadinessStatusDto::RepairIndex;
+            output.reason = Some(if busy.status.is_some() {
+                "refreshing".to_string()
+            } else {
+                "skipped_locked".to_string()
+            });
+            if let Some(status) = busy.status {
+                output.phase = Some(status.phase);
+                output.pid = Some(status.pid);
+                output.started_at_epoch_ms = Some(status.started_at_epoch_ms);
+                output.updated_at_epoch_ms = Some(status.updated_at_epoch_ms);
+                output.last_failure_reason = status.last_failure_reason;
+            } else {
+                output.pid = busy.pid;
+                output.started_at_epoch_ms = busy.started_at_epoch_ms;
+            }
+            output.lock_path = Some(display::clean_path_string(
+                &busy.lock_path.to_string_lossy(),
+            ));
+            return Ok((summary, Some(output)));
+        }
+    };
+    let refresh_started_at_epoch_ms = lock.started_at_epoch_ms();
+    let refresh_pid = lock.pid();
+    let refresh_phase = "incremental_index";
+    local_refresh_status::write_local_refresh_status(
+        &inspect_runtime.cache_root,
+        &inspect_runtime.project_root,
+        "refreshing",
+        refresh_phase,
+        refresh_started_at_epoch_ms,
+        refresh_pid,
+        None,
+    )?;
+
     let index_runtime = RuntimeContext::new(project)?;
     match index_runtime.ensure_open(args::RefreshMode::Incremental) {
         Ok(opened) => {
+            let _ = local_refresh_status::write_local_refresh_status(
+                &inspect_runtime.cache_root,
+                &inspect_runtime.project_root,
+                "refreshed",
+                refresh_phase,
+                refresh_started_at_epoch_ms,
+                refresh_pid,
+                None,
+            );
             let mut output = local_refresh_output_from_summary(&opened.summary);
-            if output.state == readiness::LocalRefreshState::Fresh {
+            output.phase = Some(refresh_phase.to_string());
+            output.pid = Some(refresh_pid);
+            output.started_at_epoch_ms = Some(refresh_started_at_epoch_ms);
+            output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
+            if output.state == readiness::LocalRefreshState::Refreshed {
                 output.reason = Some("refreshed".to_string());
             } else {
                 output.state = readiness::LocalRefreshState::Failed;
@@ -2211,11 +2277,26 @@ pub(crate) fn wait_for_local_freshness(
             Ok((opened.summary, Some(output)))
         }
         Err(error) => {
+            let error_text = error.to_string();
+            let _ = local_refresh_status::write_local_refresh_status(
+                &inspect_runtime.cache_root,
+                &inspect_runtime.project_root,
+                "failed",
+                refresh_phase,
+                refresh_started_at_epoch_ms,
+                refresh_pid,
+                Some(error_text.clone()),
+            );
             let mut output = local_refresh_output_from_summary(&summary);
             output.state = classify_local_refresh_failure_state(&error);
             output.blocks_local_surfaces = true;
             output.readiness_status = ReadinessStatusDto::RepairIndex;
-            output.reason = Some(error.to_string());
+            output.reason = Some(error_text.clone());
+            output.phase = Some(refresh_phase.to_string());
+            output.pid = Some(refresh_pid);
+            output.started_at_epoch_ms = Some(refresh_started_at_epoch_ms);
+            output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
+            output.last_failure_reason = Some(error_text);
             Ok((summary, Some(output)))
         }
     }
@@ -2230,7 +2311,9 @@ pub(crate) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
     })
 }
 
-fn local_refresh_output_from_summary(summary: &ProjectSummary) -> readiness::LocalRefreshOutput {
+pub(crate) fn local_refresh_output_from_summary(
+    summary: &ProjectSummary,
+) -> readiness::LocalRefreshOutput {
     let verdict = readiness::build_readiness_verdict(
         ReadinessGoalDto::LocalNavigation,
         readiness::ReadinessInputs {
@@ -2251,7 +2334,7 @@ fn classify_local_refresh_failure_state(error: &anyhow::Error) -> readiness::Loc
         || message.contains("database table is locked")
         || message.contains("cache is busy")
     {
-        readiness::LocalRefreshState::SkippedLocked
+        readiness::LocalRefreshState::Skipped
     } else {
         readiness::LocalRefreshState::Failed
     }
@@ -2268,6 +2351,11 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
+    let (summary, local_refresh) = if local_freshness_needs_refresh(&summary) {
+        wait_for_agent_preflight_local_freshness(&cmd.project, &summary)?
+    } else {
+        (summary, None)
+    };
     let sidecar = doctor_sidecar_status(&runtime);
     let readiness_sidecar = selected_agent_readiness_sidecar_status(&runtime, None, &sidecar);
     let readiness = build_summary_readiness(
@@ -2278,10 +2366,73 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     );
     let readiness_lanes =
         build_readiness_lanes_for_runtime(&runtime, &readiness, None, Some(&readiness_sidecar));
-    let output =
-        build_agent_preflight_output(&readiness, Path::new(&summary.root), readiness_lanes);
+    let output = build_agent_preflight_output(
+        &readiness,
+        Path::new(&summary.root),
+        readiness_lanes,
+        local_refresh,
+    );
     let markdown = render_agent_preflight_markdown(&output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn wait_for_agent_preflight_local_freshness(
+    project: &ProjectArgs,
+    summary: &ProjectSummary,
+) -> Result<(ProjectSummary, Option<readiness::LocalRefreshOutput>)> {
+    let (tx, rx) = mpsc::channel();
+    let project = project.clone();
+    thread::spawn(move || {
+        let result = RuntimeContext::new_inspect_only(&project)
+            .and_then(|runtime| wait_for_local_freshness(&project, &runtime));
+        let _ = tx.send(result);
+    });
+
+    let budget = agent_preflight_local_refresh_foreground_budget();
+    if budget.is_zero() {
+        return Ok((
+            summary.clone(),
+            Some(agent_preflight_local_refresh_timeout_output(summary)),
+        ));
+    }
+
+    match rx.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok((
+            summary.clone(),
+            Some(agent_preflight_local_refresh_timeout_output(summary)),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let mut output = local_refresh_output_from_summary(summary);
+            output.state = readiness::LocalRefreshState::Failed;
+            output.blocks_local_surfaces = true;
+            output.readiness_status = ReadinessStatusDto::RepairIndex;
+            output.reason = Some("refresh_worker_disconnected".to_string());
+            output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
+            Ok((summary.clone(), Some(output)))
+        }
+    }
+}
+
+fn agent_preflight_local_refresh_timeout_output(
+    summary: &ProjectSummary,
+) -> readiness::LocalRefreshOutput {
+    let mut output = local_refresh_output_from_summary(summary);
+    output.state = readiness::LocalRefreshState::Refreshing;
+    output.blocks_local_surfaces = true;
+    output.readiness_status = ReadinessStatusDto::RepairIndex;
+    output.reason = Some("refresh_timeout".to_string());
+    output.phase = Some("incremental_index".to_string());
+    output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
+    output
+}
+
+fn agent_preflight_local_refresh_foreground_budget() -> Duration {
+    std::env::var("CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(AGENT_PREFLIGHT_LOCAL_REFRESH_FOREGROUND_BUDGET)
 }
 
 fn repair_ready_state(
@@ -2586,6 +2737,7 @@ fn build_agent_preflight_output(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     project_root: &Path,
     readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
+    local_refresh: Option<readiness::LocalRefreshOutput>,
 ) -> args::AgentPreflightOutput {
     let local = readiness
         .iter()
@@ -2626,7 +2778,7 @@ fn build_agent_preflight_output(
         usable: local_ready || full_ready,
         mode: mode.to_string(),
         local_graph: agent_preflight_lane(local),
-        local_refresh: readiness::local_refresh_output(local),
+        local_refresh: local_refresh.unwrap_or_else(|| readiness::local_refresh_output(local)),
         full_retrieval: agent_preflight_lane(agent),
         local_default: readiness_lanes
             .get("local_default")
@@ -12584,7 +12736,7 @@ mod tests {
         let locked = anyhow::anyhow!("cache_busy: database is locked");
         assert_eq!(
             classify_local_refresh_failure_state(&locked),
-            readiness::LocalRefreshState::SkippedLocked
+            readiness::LocalRefreshState::Skipped
         );
 
         let failed = anyhow::anyhow!("index refresh failed");
@@ -13172,7 +13324,8 @@ mod tests {
             ),
         );
 
-        let output = build_agent_preflight_output(&verdicts, Path::new("C:/repo"), readiness_lanes);
+        let output =
+            build_agent_preflight_output(&verdicts, Path::new("C:/repo"), readiness_lanes, None);
 
         assert!(output.usable);
         assert_eq!(output.mode, "full_retrieval");

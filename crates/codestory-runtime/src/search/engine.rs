@@ -141,14 +141,9 @@ impl EmbeddingBackendSelection {
     fn from_env() -> Result<Self> {
         let runtime_mode_raw = std::env::var(EMBEDDING_RUNTIME_MODE_ENV).ok();
         let backend_raw = std::env::var(EMBEDDING_BACKEND_ENV).ok();
-        let default_backend = if codestory_retrieval::qdrant_semantic_vectors_enabled() {
-            "llamacpp"
-        } else {
-            "onnx"
-        };
         let runtime_mode = runtime_mode_raw
             .as_deref()
-            .unwrap_or(default_backend)
+            .unwrap_or("llamacpp")
             .trim()
             .to_ascii_lowercase();
         if runtime_mode == "hash" || runtime_mode == "hash_projection" {

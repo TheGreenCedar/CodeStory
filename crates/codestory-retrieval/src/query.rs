@@ -123,7 +123,7 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
 fn execute_strict_retrieval_query_batch_against_sidecars(
     sidecars: Arc<dyn SidecarSearch>,
     manifest: Option<RetrievalIndexManifest>,
-    file_roles: HashMap<String, FileRole>,
+    file_roles: Arc<HashMap<String, FileRole>>,
     cancelled: Arc<AtomicBool>,
     mode: RetrievalDegradedMode,
     queries: &[QueryBatchItem<'_>],
@@ -152,7 +152,7 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
             let mut handles = Vec::with_capacity(wave.len());
             for (index, query, budget_ms) in wave {
                 let manifest = manifest.clone();
-                let file_roles = file_roles.clone();
+                let file_roles = Arc::clone(&file_roles);
                 let cancelled = Arc::clone(&cancelled);
                 let sidecars = Arc::clone(&sidecars);
                 handles.push(scope.spawn(move || {
@@ -248,7 +248,7 @@ struct QueryContext {
     layout: SidecarLayout,
     project_id: String,
     manifest: Option<RetrievalIndexManifest>,
-    file_roles: HashMap<String, FileRole>,
+    file_roles: Arc<HashMap<String, FileRole>>,
     embedding_device: EmbeddingDeviceReadiness,
 }
 
@@ -299,7 +299,7 @@ fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryC
         layout,
         project_id,
         manifest,
-        file_roles,
+        file_roles: Arc::new(file_roles),
         embedding_device,
     })
 }
@@ -441,11 +441,21 @@ mod tests {
                 budget_ms: Some(500),
             },
         ];
+        let file_roles = Arc::new(
+            (0..10_000)
+                .map(|index| (format!("src/unrelated_{index}.rs"), FileRole::Source))
+                .chain([
+                    ("src/slow.rs".to_string(), FileRole::Source),
+                    ("src/fast.rs".to_string(), FileRole::Test),
+                    ("src/last.rs".to_string(), FileRole::Generated),
+                ])
+                .collect::<HashMap<_, _>>(),
+        );
 
         let results = execute_strict_retrieval_query_batch_against_sidecars(
             sidecars.clone(),
             Some(manifest),
-            HashMap::new(),
+            Arc::clone(&file_roles),
             cancellation_flag(),
             RetrievalDegradedMode::Full,
             &queries,
@@ -460,6 +470,19 @@ mod tests {
                 .map(|result| result.query.as_str())
                 .collect::<Vec<_>>(),
             ["slow", "fast", "last"]
+        );
+        assert_eq!(file_roles.len(), 10_003);
+        assert_eq!(
+            results
+                .iter()
+                .flat_map(|result| result.hits.iter())
+                .map(|hit| hit.file_role)
+                .collect::<Vec<_>>(),
+            [
+                Some(FileRole::Source),
+                Some(FileRole::Test),
+                Some(FileRole::Generated)
+            ]
         );
         assert_eq!(sidecars.max_active.load(Ordering::SeqCst), 2);
     }
@@ -481,7 +504,7 @@ mod tests {
         let error = execute_strict_retrieval_query_batch_against_sidecars(
             Arc::new(sidecars),
             Some(manifest),
-            HashMap::new(),
+            Arc::new(HashMap::new()),
             cancellation_flag(),
             RetrievalDegradedMode::NoSemantic,
             &queries,

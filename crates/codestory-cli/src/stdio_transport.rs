@@ -24,6 +24,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use crate::args;
@@ -48,6 +50,7 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -416,6 +419,7 @@ fn stdio_tool_blocked_error(
         "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
         "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next")),
         "full_repair": stdio_repair_calls_from_value(surface.get("full_repair")),
         "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
@@ -2198,14 +2202,20 @@ fn read_stdio_status_resource_cached(
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
-    let active_agent_repair = crate::ready_repair_status::active_ready_repair_status(
-        &runtime.project_root,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    );
-    let (summary, local_refresh) = if active_agent_repair.is_some() {
-        (summary, None)
+    let active_agent_repair =
+        crate::ready_repair_status::active_ready_repair_status(&runtime.project_root, None);
+    let (summary, local_refresh) = if let Some(active_repair) = active_agent_repair.as_ref() {
+        if crate::local_freshness_needs_refresh(&summary) {
+            let mut output = crate::local_refresh_output_from_summary(&summary);
+            output.state = crate::readiness::LocalRefreshState::Refreshing;
+            output.blocks_local_surfaces = true;
+            output.reason = Some(format!("active_ready_repair:{}", active_repair.phase));
+            (summary, Some(output))
+        } else {
+            (summary, None)
+        }
     } else if crate::local_freshness_needs_refresh(&summary) {
-        crate::wait_for_local_freshness(&project, &inspect_runtime)?
+        wait_for_stdio_local_freshness(&project, &summary)?
     } else {
         (summary, None)
     };
@@ -2218,6 +2228,66 @@ fn read_stdio_status_resource_cached(
         cached_at: Instant::now(),
     });
     Ok(value)
+}
+
+fn wait_for_stdio_local_freshness(
+    project: &args::ProjectArgs,
+    summary: &ProjectSummary,
+) -> Result<(ProjectSummary, Option<crate::readiness::LocalRefreshOutput>)> {
+    let (tx, rx) = mpsc::channel();
+    let project = project.clone();
+    thread::spawn(move || {
+        let result = RuntimeContext::new_inspect_only(&project).and_then(|inspect_runtime| {
+            crate::wait_for_local_freshness(&project, &inspect_runtime)
+        });
+        let _ = tx.send(result);
+    });
+
+    let budget = stdio_local_refresh_foreground_budget();
+    if budget.is_zero() {
+        return Ok((
+            summary.clone(),
+            Some(stdio_local_refresh_timeout_output(summary)),
+        ));
+    }
+
+    match rx.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok((
+            summary.clone(),
+            Some(stdio_local_refresh_timeout_output(summary)),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let mut output = crate::local_refresh_output_from_summary(summary);
+            output.state = crate::readiness::LocalRefreshState::Failed;
+            output.blocks_local_surfaces = true;
+            output.readiness_status = ReadinessStatusDto::RepairIndex;
+            output.reason = Some("refresh_worker_disconnected".to_string());
+            output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
+            Ok((summary.clone(), Some(output)))
+        }
+    }
+}
+
+fn stdio_local_refresh_timeout_output(
+    summary: &ProjectSummary,
+) -> crate::readiness::LocalRefreshOutput {
+    let mut output = crate::local_refresh_output_from_summary(summary);
+    output.state = crate::readiness::LocalRefreshState::Refreshing;
+    output.blocks_local_surfaces = true;
+    output.readiness_status = ReadinessStatusDto::RepairIndex;
+    output.reason = Some("refresh_timeout".to_string());
+    output.phase = Some("incremental_index".to_string());
+    output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
+    output
+}
+
+fn stdio_local_refresh_foreground_budget() -> Duration {
+    std::env::var("CODESTORY_STDIO_LOCAL_REFRESH_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET)
 }
 
 fn stdio_project_args(runtime: &RuntimeContext) -> args::ProjectArgs {
@@ -2245,6 +2315,12 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
             "repair_state:{}",
             crate::ready_repair_status::ready_repair_status_cache_fingerprint(
                 &runtime.project_root
+            )
+        ),
+        format!(
+            "local_refresh_state:{}",
+            crate::local_refresh_status::local_refresh_status_cache_fingerprint(
+                &runtime.cache_root
             )
         ),
         format!(
@@ -3365,10 +3441,12 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     );
     let next_repair_command =
         env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
-    let active_repair = crate::ready_repair_status::active_ready_repair_status(
-        project_root,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    );
+    let active_repair = crate::ready_repair_status::active_ready_repair_status(project_root, None);
+    let abandoned_repair = active_repair
+        .as_ref()
+        .is_none()
+        .then(|| crate::ready_repair_status::abandoned_ready_repair_status(project_root, None))
+        .flatten();
     serde_json::json!({
         "state": state,
         "auto_repair": auto_repair,
@@ -3406,8 +3484,54 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "phase": &status.phase,
             "pid": status.pid,
             "updated_at_epoch_ms": status.updated_at_epoch_ms
-        }))
+        })),
+        "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned"))
     })
+}
+
+fn stdio_ready_repair_status_json(
+    project_root: &Path,
+    status: &crate::ready_repair_status::ReadyRepairStatus,
+    state: &str,
+) -> serde_json::Value {
+    let run_id = status
+        .run_id
+        .as_deref()
+        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    serde_json::json!({
+        "status": state,
+        "recorded_status": &status.status,
+        "project_root": &status.project_root,
+        "profile": &status.profile,
+        "run_id": &status.run_id,
+        "namespace": &status.namespace,
+        "phase": &status.phase,
+        "pid": status.pid,
+        "updated_at_epoch_ms": status.updated_at_epoch_ms,
+        "age_ms": crate::ready_repair_status::now_epoch_ms().saturating_sub(status.updated_at_epoch_ms),
+        "inspect_command": stdio_agent_retrieval_status_command(project_root, run_id),
+        "cleanup_command": stdio_agent_retrieval_down_command(project_root, run_id)
+    })
+}
+
+fn stdio_agent_retrieval_status_command(project_root: &Path, run_id: &str) -> String {
+    format!(
+        "codestory-cli retrieval status --project {} --profile agent --run-id {} --format json",
+        crate::display::quote_command_argument_value(&crate::display::clean_path_string(
+            &project_root.to_string_lossy()
+        )),
+        crate::display::quote_command_argument_value(run_id)
+    )
+}
+
+fn stdio_agent_retrieval_down_command(project_root: &Path, run_id: &str) -> String {
+    format!(
+        "codestory-cli retrieval down --project {} --profile agent --run-id {}",
+        crate::display::quote_command_argument_value(&crate::display::clean_path_string(
+            &project_root.to_string_lossy()
+        )),
+        crate::display::quote_command_argument_value(run_id)
+    )
 }
 
 fn stdio_sidecar_policy_file() -> Option<serde_json::Value> {
@@ -3483,10 +3607,13 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
 }
 
 fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
-    if let Some(status) = crate::ready_repair_status::active_ready_repair_status(
-        &runtime.project_root,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    ) {
+    if let Some(status) =
+        crate::ready_repair_status::active_ready_repair_status(&runtime.project_root, None)
+    {
+        let run_id = status
+            .run_id
+            .as_deref()
+            .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID);
         return serde_json::json!({
             "result": {
                 "status": "already_running",
@@ -3499,8 +3626,19 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
                 "next_status_command": format!(
                     "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                    codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    run_id
                 ),
+                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+            }
+        });
+    }
+    if let Some(status) =
+        crate::ready_repair_status::abandoned_ready_repair_status(&runtime.project_root, None)
+    {
+        return serde_json::json!({
+            "result": {
+                "status": "abandoned_repair",
+                "abandoned_repair": stdio_ready_repair_status_json(&runtime.project_root, &status, "abandoned"),
                 "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }
         });

@@ -17,6 +17,7 @@ struct StdioFixture {
     sidecar_policy_state: Option<String>,
     dirty_marker_path: Option<PathBuf>,
     dirty_marker_project_root: Option<PathBuf>,
+    local_refresh_timeout_ms: Option<u64>,
 }
 
 struct StdioServer {
@@ -177,6 +178,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         sidecar_policy_state: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
     }
 }
 
@@ -194,6 +196,7 @@ fn unindexed_fixture() -> StdioFixture {
         sidecar_policy_state: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
     }
 }
 
@@ -307,6 +310,12 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
     }
     if let Some(root) = &fixture.dirty_marker_project_root {
         command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT", root);
+    }
+    if let Some(timeout_ms) = fixture.local_refresh_timeout_ms {
+        command.env(
+            "CODESTORY_STDIO_LOCAL_REFRESH_TIMEOUT_MS",
+            timeout_ms.to_string(),
+        );
     }
     let mut child = command.spawn().expect("spawn stdio server");
 
@@ -718,6 +727,32 @@ fn write_active_repair_status_fixture(
     run_id: &str,
     phase: &str,
 ) -> (PathBuf, RemoveDirOnDrop) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64;
+    write_repair_status_fixture(fixture, run_id, phase, now)
+}
+
+fn write_abandoned_repair_status_fixture(
+    fixture: &StdioFixture,
+    run_id: &str,
+    phase: &str,
+) -> (PathBuf, RemoveDirOnDrop) {
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64
+        - 60_000;
+    write_repair_status_fixture(fixture, run_id, phase, updated_at)
+}
+
+fn write_repair_status_fixture(
+    fixture: &StdioFixture,
+    run_id: &str,
+    phase: &str,
+    updated_at_epoch_ms: i64,
+) -> (PathBuf, RemoveDirOnDrop) {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
     let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
@@ -734,10 +769,6 @@ fn write_active_repair_status_fixture(
         .expect("repair status parent")
         .to_path_buf();
     fs::create_dir_all(&status_dir).expect("create repair status dir");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as i64;
     let project_root = canonical_root
         .to_string_lossy()
         .trim_start_matches(r"\\?\")
@@ -756,8 +787,8 @@ fn write_active_repair_status_fixture(
             "compose_project": sidecar.compose_project,
             "phase": phase,
             "pid": 4242,
-            "started_at_epoch_ms": now,
-            "updated_at_epoch_ms": now
+            "started_at_epoch_ms": updated_at_epoch_ms,
+            "updated_at_epoch_ms": updated_at_epoch_ms
         })
         .to_string(),
     )
@@ -2295,7 +2326,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["local_refresh"]["state"],
-        json!("fresh"),
+        json!("refreshed"),
         "fresh local graph state should be explicit even when sidecar retrieval is unavailable: {status}"
     );
     assert_eq!(
@@ -2384,7 +2415,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["runtime_truth"]["readiness_lanes"]["local_graph"]["refresh_state"],
-        json!("fresh"),
+        json!("refreshed"),
         "runtime truth should include local refresh state: {status}"
     );
     assert_eq!(
@@ -2526,6 +2557,74 @@ fn resources_read_status_reports_active_agent_repair_phase() {
                 && command.contains("--run-id")
                 && command.contains("issue-661-proof")),
         "repairing lane should point at status proof, not a second repair: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_reports_abandoned_agent_repair_actions() {
+    let fixture = indexed_fixture();
+    let (status_path, _cleanup) =
+        write_abandoned_repair_status_fixture(&fixture, "aborted-run", "Embedding documents");
+    assert!(status_path.exists(), "repair status fixture should exist");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-abandoned-repair",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-abandoned-repair"));
+    let status = json_resource_content(result, "codestory://status");
+    assert_eq!(status["sidecar_setup"]["active_repair"], Value::Null);
+    assert_eq!(
+        status["sidecar_setup"]["abandoned_repair"]["status"],
+        json!("abandoned"),
+        "{status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["abandoned_repair"]["run_id"],
+        json!("aborted-run"),
+        "{status}"
+    );
+    assert!(
+        status["sidecar_setup"]["abandoned_repair"]["inspect_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--run-id")
+                && command.contains("aborted-run")),
+        "abandoned repair should include a bounded inspect command: {status}"
+    );
+    assert!(
+        status["sidecar_setup"]["abandoned_repair"]["cleanup_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval down")
+                && command.contains("--run-id")
+                && command.contains("aborted-run")),
+        "abandoned repair should include an explicit cleanup command: {status}"
+    );
+
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair-abandoned",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair-abandoned"));
+    assert_eq!(repair["status"], json!("abandoned_repair"), "{repair}");
+    assert_eq!(
+        repair["abandoned_repair"]["cleanup_command"],
+        status["sidecar_setup"]["abandoned_repair"]["cleanup_command"],
+        "{repair}"
     );
 }
 
@@ -2733,6 +2832,15 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
         "Qdrant finalize",
     );
     assert!(status_path.exists(), "repair status fixture should exist");
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("active-repair:{project_name}")
+}
+"#,
+    )
+    .expect("make local graph stale while active repair is running");
     let mut server = spawn_stdio_server(&fixture);
 
     let status_response = send_json(
@@ -2757,6 +2865,35 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
         setup["active_repair"]["run_id"],
         json!(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
         "{setup}"
+    );
+    let status_resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-active-resource",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(
+        &status_resource,
+        json!("sidecar-setup-status-active-resource"),
+    );
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_eq!(
+        status["local_refresh"]["state"],
+        json!("refreshing"),
+        "active repair should compact stale local refresh chatter into a refreshing lane: {status}"
+    );
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("active_ready_repair:Qdrant finalize"),
+        "{status}"
+    );
+    assert_eq!(
+        status["effective_index_freshness"]["status"],
+        json!("stale"),
+        "maintainer JSON should still expose stale freshness detail while agent status stays compact: {status}"
     );
 
     let repair_response = send_json(
@@ -2789,6 +2926,113 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
                 && command.contains("--profile agent")
                 && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
         "already-running response should point to cheap status inspection: {repair}"
+    );
+}
+
+#[test]
+fn tools_call_sidecar_setup_reports_active_agent_repair_non_default_without_spawning_default() {
+    let fixture = indexed_fixture();
+    let run_id = "non-default-active";
+    let (status_path, _cleanup) =
+        write_active_repair_status_fixture(&fixture, run_id, "Embedding documents");
+    assert!(status_path.exists(), "repair status fixture should exist");
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("non-default-active-repair:{project_name}")
+}
+"#,
+    )
+    .expect("make local graph stale while non-default active repair is running");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-non-default-active",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "status"}
+            }
+        }),
+    );
+    let setup = assert_tool_success(
+        &status_response,
+        json!("sidecar-setup-status-non-default-active"),
+    );
+    assert_eq!(
+        setup["active_repair"]["run_id"],
+        json!(run_id),
+        "sidecar_setup status should surface non-default active repair lanes: {setup}"
+    );
+    assert!(
+        setup["next_repair_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("ready --goal agent --repair")
+                && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                && !command.contains(run_id)),
+        "normal repair command should remain shared-agent when no user action is taken: {setup}"
+    );
+
+    let status_resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-non-default-resource",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(
+        &status_resource,
+        json!("sidecar-setup-status-non-default-resource"),
+    );
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("active_ready_repair:Embedding documents"),
+        "status should not start local refresh while any project agent repair is active: {status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["active_repair"]["run_id"],
+        json!(run_id),
+        "runtime truth should expose the non-default active repair: {status}"
+    );
+
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair-non-default-active",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(
+        &repair_response,
+        json!("sidecar-setup-repair-non-default-active"),
+    );
+    assert_eq!(
+        repair["status"],
+        json!("already_running"),
+        "sidecar_setup repair should not spawn shared-agent while another run_id is active: {repair}"
+    );
+    assert_eq!(repair["run_id"], json!(run_id), "{repair}");
+    assert!(
+        repair["next_status_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--profile agent")
+                && command.contains("--run-id")
+                && command.contains(run_id)
+                && !command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
+        "already-running response should inspect the active non-default run: {repair}"
     );
 }
 
@@ -2838,7 +3082,7 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
         status["effective_index_freshness"]["status"],
         json!("stale")
     );
-    assert_eq!(status["local_refresh"]["state"], json!("stale"));
+    assert_eq!(status["local_refresh"]["state"], json!("skipped"));
     assert_eq!(
         status["local_refresh"]["blocks_local_surfaces"],
         json!(true)
@@ -3164,7 +3408,7 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
 }
 
 #[test]
-fn resources_read_status_refreshes_long_lived_stale_index_with_bounded_latency() {
+fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded_latency() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
     let warmup = send_json(
@@ -3313,6 +3557,98 @@ fn resources_read_status_refreshes_long_lived_stale_index_with_bounded_latency()
     let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
     let refreshed_status = json_resource_content(result, "codestory://status");
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after reindex");
+}
+
+#[test]
+fn ground_tool_returns_degraded_local_refresh_when_stale_refresh_budget_expires() {
+    let mut fixture = indexed_fixture();
+    fixture.local_refresh_timeout_ms = Some(0);
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("budget-expired:{project_name}")
+}
+"#,
+    )
+    .expect("modify indexed file after indexing");
+
+    let mut server = spawn_stdio_server(&fixture);
+    let started = Instant::now();
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-refresh-budget-expired",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "ground should return degraded local-refresh guidance before an MCP tool timeout, got {elapsed:?}: {response}"
+    );
+
+    let error = assert_tool_error(&response, json!("ground-refresh-budget-expired"));
+    assert_eq!(
+        error.pointer("/code").and_then(Value::as_str),
+        Some("codestory_tool_blocked")
+    );
+    assert_eq!(
+        error.pointer("/tool").and_then(Value::as_str),
+        Some("ground")
+    );
+    assert_eq!(
+        error.pointer("/readiness_goal").and_then(Value::as_str),
+        Some("local_navigation")
+    );
+    assert_eq!(
+        error.pointer("/status").and_then(Value::as_str),
+        Some("repair_index")
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/state")
+            .and_then(Value::as_str),
+        Some("refreshing")
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/readiness_status")
+            .and_then(Value::as_str),
+        Some("repair_index")
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/blocks_local_surfaces")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/reason")
+            .and_then(Value::as_str),
+        Some("refresh_timeout")
+    );
+    assert_ne!(
+        error
+            .pointer("/sidecar/retrieval_mode")
+            .and_then(Value::as_str),
+        Some("full"),
+        "local refresh degradation must not claim packet/search sidecar readiness: {error}"
+    );
+    assert!(
+        error
+            .pointer("/minimum_next")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| !commands.is_empty()),
+        "blocked ground should include compact next-step guidance: {error}"
+    );
 }
 
 #[test]
