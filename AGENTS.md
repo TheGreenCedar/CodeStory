@@ -57,7 +57,15 @@
 ## Release Guidelines
 - `crates/codestory-cli/Cargo.toml` is the release version source.
 - Update every `codestory-*` workspace crate version and `Cargo.lock` together.
+- Before committing a change that modifies the current unreleased version or
+  creates the next latest version, update `CHANGELOG.md` under `Unreleased` or
+  the new release heading so release contents are tracked while the work is
+  still reviewable.
 - Do not create or push `v*` release tags manually. A synchronized version bump on `main` triggers GitHub Actions to create the tag, GitHub release, cross-platform `codestory-cli` binary assets, and `SHA256SUMS.txt`.
+- After a plugin release or plugin-source update that Codex must detect through
+  the marketplace, push a corresponding change to
+  `TheGreenCedar/AgentPluginMarketplace`; Codex observes the marketplace repo
+  state, not only the CodeStory repo release.
 - CI binary assets prove build/package smoke only. Packet/search readiness still requires the sidecar evidence tiers in `docs/contributors/testing-matrix.md`.
 
 ## Retrieval documentation
