@@ -871,13 +871,6 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Back-compatible alias for the loaded workspace manifest.
-pub type Project = WorkspaceManifest;
-/// Back-compatible alias for serializable workspace settings.
-pub type ProjectSettings = WorkspaceSettings;
-/// Back-compatible alias for the loaded workspace manifest.
-pub type Workspace = WorkspaceManifest;
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -51,6 +51,9 @@
 - Collapsed stale sidecar disable/profile production branches so retrieval
   follows the mandatory sidecar path while benchmark-contract setup keeps
   stale-environment rejection guidance.
+- Removed deprecated benchmark, sidecar bootstrap, snapshot publish, and
+  workspace alias compatibility surfaces after moving guards to maintained task
+  manifests and concrete types.
 
 ### Documentation
 

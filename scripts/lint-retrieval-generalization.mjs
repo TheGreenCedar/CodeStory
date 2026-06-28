@@ -55,7 +55,6 @@ const evalOnlyProductionFiles = new Set([
 const benchmarkIdentityScriptFiles = [
   path.join(repoRoot, "scripts", "codestory-agent-ab-benchmark.mjs"),
   path.join(repoRoot, "scripts", "codestory-manual-friction-check.mjs"),
-  path.join(repoRoot, "scripts", "cross-repo-promotion-benchmark.mjs"),
   path.join(repoRoot, "scripts", "cross-repo-sourcetrail-queries.mjs"),
 ];
 const benchmarkTaskRoot = path.join(repoRoot, "benchmarks", "tasks");

@@ -48,7 +48,7 @@ use codestory_store::{
     SymbolSummaryRecord,
 };
 use codestory_workspace::{
-    IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, Workspace, WorkspaceInventory,
+    IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, WorkspaceInventory, WorkspaceManifest,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::Mutex;
@@ -3532,7 +3532,7 @@ fn looks_like_openapi_source_path(path: &Path) -> bool {
 
 fn index_freshness_from_storage(
     root: &Path,
-    workspace: &Workspace,
+    workspace: &WorkspaceManifest,
     storage: &Storage,
 ) -> IndexFreshnessDto {
     let started_at = Instant::now();
@@ -3654,7 +3654,7 @@ fn index_freshness_from_storage(
 
 fn workspace_member_index_summaries(
     root: &Path,
-    workspace: &Workspace,
+    workspace: &WorkspaceManifest,
     refresh_inputs: &RefreshInputs,
     execution_plan: &RefreshExecutionPlan,
 ) -> Vec<WorkspaceMemberIndexDto> {
@@ -3693,7 +3693,7 @@ fn workspace_member_index_summaries(
 
 fn workspace_member_storage_summaries(
     root: &Path,
-    workspace: &Workspace,
+    workspace: &WorkspaceManifest,
     storage: &Storage,
 ) -> Result<Vec<WorkspaceMemberIndexDto>, ApiError> {
     if workspace.members().is_empty() {
@@ -7891,7 +7891,7 @@ impl AppController {
             error_count: clamp_i64_to_u32(stats.error_count),
             fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
         };
-        let workspace = Workspace::open(root.to_path_buf())
+        let workspace = WorkspaceManifest::open(root.to_path_buf())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
         let freshness =
@@ -8215,7 +8215,7 @@ impl AppController {
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let workspace = Workspace::open(root.clone())
+        let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let refresh_inputs = if storage_path.exists() {
             let store = Store::open(&storage_path)
@@ -9578,7 +9578,7 @@ impl AppController {
         }
 
         let storage = self.open_storage()?;
-        let workspace = Workspace::open(root.clone())
+        let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let freshness =
             self.cached_index_freshness_from_storage(&root, &storage_path, &workspace, &storage);
@@ -9589,7 +9589,7 @@ impl AppController {
         &self,
         root: &Path,
         storage_path: &Path,
-        workspace: &Workspace,
+        workspace: &WorkspaceManifest,
         storage: &Storage,
     ) -> IndexFreshnessDto {
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
@@ -10501,7 +10501,7 @@ fn index_full(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<IndexingRunSummary, ApiError> {
-    let workspace = Workspace::open(root.to_path_buf())
+    let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let execution_plan = workspace
         .full_refresh_execution_plan()
@@ -10737,12 +10737,12 @@ fn run_incremental_indexing_common<F>(
     refresh_builder: F,
 ) -> Result<IndexingRunSummary, ApiError>
 where
-    F: FnOnce(&Workspace, &RefreshInputs) -> Result<RefreshExecutionPlan, ApiError>,
+    F: FnOnce(&WorkspaceManifest, &RefreshInputs) -> Result<RefreshExecutionPlan, ApiError>,
 {
     let mut store = Store::open(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
 
-    let workspace = Workspace::open(root.to_path_buf())
+    let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
 
     let refresh_inputs = workspace_refresh_inputs(&store)?;
