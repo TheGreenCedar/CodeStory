@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Taught Auto Release to retry the current source version when a previous
+  publish failed before creating a tag or release, while still refusing to
+  overwrite existing release state.
 - Kept retrieval bootstrap Qdrant repair on the selected sidecar runtime so
   explicit agent profiles and run IDs do not fall back to ambient/default
   runtime layout during collection repair.

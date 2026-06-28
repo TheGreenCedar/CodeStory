@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - crates/**/Cargo.toml
+      - crates/**
       - Cargo.lock
       - CHANGELOG.md
       - AGENTS.md
@@ -13,6 +13,7 @@ on:
       - .github/workflows/auto-release.yml
       - .github/workflows/release.yml
       - .github/scripts/**
+      - plugins/codestory/**
 
 permissions:
   contents: read
@@ -51,60 +52,13 @@ jobs:
         id: version
         env:
           BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
-          python - <<'PY'
-          import os
-          import re
-          import subprocess
-          import sys
-          import tomllib
-          from pathlib import Path
-
-          semver = re.compile(
-              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
-          )
-          package_path = "crates/codestory-cli/Cargo.toml"
-
-          def read_version_bytes(data: bytes) -> str:
-              package = tomllib.loads(data.decode("utf-8")).get("package", {})
-              return str(package.get("version", ""))
-
-          new_version = read_version_bytes(Path(package_path).read_bytes())
-          before = os.environ.get("BEFORE_SHA", "")
-          old_version = ""
-          if before and not re.fullmatch(r"0+", before):
-              result = subprocess.run(
-                  ["git", "show", f"{before}:{package_path}"],
-                  check=False,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.DEVNULL,
-              )
-              if result.returncode == 0:
-                  old_version = read_version_bytes(result.stdout)
-
-          print(f"Previous codestory-cli version: {old_version or '<missing>'}")
-          print(f"Current codestory-cli version: {new_version}")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"version={new_version}\n")
-              if old_version == new_version:
-                  print("codestory-cli version did not change; skipping release.")
-                  output.write("should_release=false\n")
-                  sys.exit(0)
-
-              if not semver.fullmatch(new_version):
-                  print(
-                      f"::error::codestory-cli version must be strict semver, got {new_version!r}.",
-                      file=sys.stderr,
-                  )
-                  sys.exit(1)
-
-              output.write("should_release=true\n")
-          PY
+          python .github/scripts/detect-codestory-release.py \
+            --before-sha "$BEFORE_SHA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --output "$GITHUB_OUTPUT"
 
       - name: Validate synchronized release version
         if: steps.version.outputs.should_release == 'true'

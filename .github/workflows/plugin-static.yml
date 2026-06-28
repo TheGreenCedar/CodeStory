@@ -4,8 +4,11 @@ on:
   pull_request:
     paths:
       - plugins/codestory/**
+      - .github/scripts/detect-codestory-release.py
+      - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/auto-release.yml
       - .github/workflows/plugin-static.yml
   push:
     branches:
@@ -13,8 +16,11 @@ on:
       - dev/codestory-next
     paths:
       - plugins/codestory/**
+      - .github/scripts/detect-codestory-release.py
+      - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/auto-release.yml
       - .github/workflows/plugin-static.yml
   workflow_dispatch:
 
@@ -38,6 +44,9 @@ jobs:
 
       - name: Check workflow policy
         run: node .github/scripts/check-workflow-policy.mjs
+
+      - name: Check auto-release detector
+        run: python .github/scripts/test-detect-codestory-release.py
 
       - name: Check release version surfaces
         shell: bash
