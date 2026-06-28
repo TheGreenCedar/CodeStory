@@ -803,7 +803,7 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
     assert_eq!(preflight["mode"], "local_graph", "{preflight:#}");
     assert_eq!(preflight["local_graph"]["ready"], true, "{preflight:#}");
     assert_eq!(
-        preflight["local_refresh"]["state"], "fresh",
+        preflight["local_refresh"]["state"], "refreshed",
         "{preflight:#}"
     );
     assert_eq!(

@@ -69,7 +69,7 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     );
     let wait_json: Value = serde_json::from_str(&wait_json_text).expect("ready wait json");
     assert_eq!(wait_json["verdicts"][0]["status"], "ready");
-    assert_eq!(wait_json["local_refresh"]["state"], "fresh");
+    assert_eq!(wait_json["local_refresh"]["state"], "refreshed");
     assert_eq!(wait_json["local_refresh"]["reason"], "already_fresh");
     assert_eq!(
         wait_json["verdicts"][0]["sidecar"]["degraded_reason"], "retrieval_manifest_missing",
@@ -286,7 +286,7 @@ fn helper(value: &str) -> String {
     let wait_json: Value = serde_json::from_str(&wait_json_text).expect("wait fresh json");
     assert_eq!(wait_json["verdicts"][0]["status"], "ready");
     assert_eq!(wait_json["verdicts"][0]["index"]["status"], "fresh");
-    assert_eq!(wait_json["local_refresh"]["state"], "fresh");
+    assert_eq!(wait_json["local_refresh"]["state"], "refreshed");
     assert_eq!(wait_json["local_refresh"]["reason"], "refreshed");
     assert_eq!(
         wait_json["verdicts"][0]["sidecar"]["retrieval_mode"],

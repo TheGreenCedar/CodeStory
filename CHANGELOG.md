@@ -14,6 +14,9 @@
 - Kept retrieval bootstrap Qdrant repair on the selected sidecar runtime so
   explicit agent profiles and run IDs do not fall back to ambient/default
   runtime layout during collection repair.
+- Compacted local-refresh status across ready, agent preflight, and
+  `codestory://status` so agent-facing output uses refreshed/refreshing/skipped
+  states while maintainer JSON keeps stale freshness details.
 
 ### Documentation
 

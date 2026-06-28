@@ -47,10 +47,9 @@ pub(crate) struct ReadinessSidecarInput<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalRefreshState {
-    Fresh,
-    Stale,
-    NotChecked,
-    SkippedLocked,
+    Refreshing,
+    Refreshed,
+    Skipped,
     Failed,
 }
 
@@ -165,10 +164,9 @@ pub(crate) fn goal_label(goal: ReadinessGoalDto) -> &'static str {
 
 pub(crate) fn local_refresh_state_label(state: LocalRefreshState) -> &'static str {
     match state {
-        LocalRefreshState::Fresh => "fresh",
-        LocalRefreshState::Stale => "stale",
-        LocalRefreshState::NotChecked => "not_checked",
-        LocalRefreshState::SkippedLocked => "skipped_locked",
+        LocalRefreshState::Refreshing => "refreshing",
+        LocalRefreshState::Refreshed => "refreshed",
+        LocalRefreshState::Skipped => "skipped",
         LocalRefreshState::Failed => "failed",
     }
 }
@@ -178,22 +176,27 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
     let state = match verdict.status {
         ReadinessStatusDto::Ready
         | ReadinessStatusDto::Repairing
-        | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Fresh,
-        ReadinessStatusDto::CheckIndex => LocalRefreshState::NotChecked,
+        | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Refreshed,
+        ReadinessStatusDto::CheckIndex => LocalRefreshState::Skipped,
         ReadinessStatusDto::RepairSetup => LocalRefreshState::Failed,
         ReadinessStatusDto::RepairIndex => {
             if index.and_then(|index| index.status) == Some(IndexFreshnessStatusDto::Stale) {
-                LocalRefreshState::Stale
+                LocalRefreshState::Skipped
             } else {
                 LocalRefreshState::Failed
             }
         }
     };
     let reason = match state {
-        LocalRefreshState::Fresh => None,
-        LocalRefreshState::Stale => Some("index_changed".to_string()),
-        LocalRefreshState::NotChecked => Some("freshness_not_checked".to_string()),
-        LocalRefreshState::SkippedLocked => Some("index_locked".to_string()),
+        LocalRefreshState::Refreshing => Some("refresh_active".to_string()),
+        LocalRefreshState::Refreshed => None,
+        LocalRefreshState::Skipped => {
+            if index.and_then(|index| index.status) == Some(IndexFreshnessStatusDto::Stale) {
+                Some("index_changed".to_string())
+            } else {
+                Some("freshness_not_checked".to_string())
+            }
+        }
         LocalRefreshState::Failed => Some(verdict.summary.clone()),
     };
 
@@ -780,7 +783,7 @@ mod tests {
         assert_eq!(verdict.status, ReadinessStatusDto::Ready);
         assert_eq!(
             local_refresh_output(&verdict).state,
-            LocalRefreshState::Fresh
+            LocalRefreshState::Refreshed
         );
         assert!(
             verdict.summary.contains("2 nonfatal indexing errors"),
@@ -807,7 +810,7 @@ mod tests {
 
         assert_eq!(verdict.status, ReadinessStatusDto::CheckIndex);
         let refresh = local_refresh_output(&verdict);
-        assert_eq!(refresh.state, LocalRefreshState::NotChecked);
+        assert_eq!(refresh.state, LocalRefreshState::Skipped);
         assert!(refresh.blocks_local_surfaces);
         assert_eq!(
             verdict.index.as_ref().and_then(|index| index.status),
@@ -827,7 +830,7 @@ mod tests {
 
         assert_eq!(verdict.status, ReadinessStatusDto::RepairIndex);
         let refresh = local_refresh_output(&verdict);
-        assert_eq!(refresh.state, LocalRefreshState::Stale);
+        assert_eq!(refresh.state, LocalRefreshState::Skipped);
         assert!(refresh.blocks_local_surfaces);
         assert_eq!(refresh.changed_file_count, 1);
         assert!(
@@ -889,7 +892,7 @@ mod tests {
             inputs(&stats, Some(&freshness), None),
         );
         let refresh = local_refresh_output(&local);
-        assert_eq!(refresh.state, LocalRefreshState::Fresh);
+        assert_eq!(refresh.state, LocalRefreshState::Refreshed);
         assert!(!refresh.blocks_local_surfaces);
 
         let local_full = build_readiness_verdict(

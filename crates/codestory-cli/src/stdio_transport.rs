@@ -2202,8 +2202,16 @@ fn read_stdio_status_resource_cached(
         &runtime.project_root,
         Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
     );
-    let (summary, local_refresh) = if active_agent_repair.is_some() {
-        (summary, None)
+    let (summary, local_refresh) = if let Some(active_repair) = active_agent_repair.as_ref() {
+        if crate::local_freshness_needs_refresh(&summary) {
+            let mut output = crate::local_refresh_output_from_summary(&summary);
+            output.state = crate::readiness::LocalRefreshState::Refreshing;
+            output.blocks_local_surfaces = true;
+            output.reason = Some(format!("active_ready_repair:{}", active_repair.phase));
+            (summary, Some(output))
+        } else {
+            (summary, None)
+        }
     } else if crate::local_freshness_needs_refresh(&summary) {
         crate::wait_for_local_freshness(&project, &inspect_runtime)?
     } else {
