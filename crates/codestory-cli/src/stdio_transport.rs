@@ -2202,10 +2202,8 @@ fn read_stdio_status_resource_cached(
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
-    let active_agent_repair = crate::ready_repair_status::active_ready_repair_status(
-        &runtime.project_root,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    );
+    let active_agent_repair =
+        crate::ready_repair_status::active_ready_repair_status(&runtime.project_root, None);
     let (summary, local_refresh) = if let Some(active_repair) = active_agent_repair.as_ref() {
         if crate::local_freshness_needs_refresh(&summary) {
             let mut output = crate::local_refresh_output_from_summary(&summary);
@@ -3443,10 +3441,7 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     );
     let next_repair_command =
         env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
-    let active_repair = crate::ready_repair_status::active_ready_repair_status(
-        project_root,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    );
+    let active_repair = crate::ready_repair_status::active_ready_repair_status(project_root, None);
     serde_json::json!({
         "state": state,
         "auto_repair": auto_repair,
@@ -3561,10 +3556,13 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
 }
 
 fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
-    if let Some(status) = crate::ready_repair_status::active_ready_repair_status(
-        &runtime.project_root,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    ) {
+    if let Some(status) =
+        crate::ready_repair_status::active_ready_repair_status(&runtime.project_root, None)
+    {
+        let run_id = status
+            .run_id
+            .as_deref()
+            .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID);
         return serde_json::json!({
             "result": {
                 "status": "already_running",
@@ -3577,7 +3575,7 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
                 "next_status_command": format!(
                     "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                    codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    run_id
                 ),
                 "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }

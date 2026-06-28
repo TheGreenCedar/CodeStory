@@ -2840,6 +2840,113 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
 }
 
 #[test]
+fn tools_call_sidecar_setup_reports_active_agent_repair_non_default_without_spawning_default() {
+    let fixture = indexed_fixture();
+    let run_id = "non-default-active";
+    let (status_path, _cleanup) =
+        write_active_repair_status_fixture(&fixture, run_id, "Embedding documents");
+    assert!(status_path.exists(), "repair status fixture should exist");
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("non-default-active-repair:{project_name}")
+}
+"#,
+    )
+    .expect("make local graph stale while non-default active repair is running");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-non-default-active",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "status"}
+            }
+        }),
+    );
+    let setup = assert_tool_success(
+        &status_response,
+        json!("sidecar-setup-status-non-default-active"),
+    );
+    assert_eq!(
+        setup["active_repair"]["run_id"],
+        json!(run_id),
+        "sidecar_setup status should surface non-default active repair lanes: {setup}"
+    );
+    assert!(
+        setup["next_repair_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("ready --goal agent --repair")
+                && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                && !command.contains(run_id)),
+        "normal repair command should remain shared-agent when no user action is taken: {setup}"
+    );
+
+    let status_resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-non-default-resource",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(
+        &status_resource,
+        json!("sidecar-setup-status-non-default-resource"),
+    );
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("active_ready_repair:Embedding documents"),
+        "status should not start local refresh while any project agent repair is active: {status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["active_repair"]["run_id"],
+        json!(run_id),
+        "runtime truth should expose the non-default active repair: {status}"
+    );
+
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair-non-default-active",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(
+        &repair_response,
+        json!("sidecar-setup-repair-non-default-active"),
+    );
+    assert_eq!(
+        repair["status"],
+        json!("already_running"),
+        "sidecar_setup repair should not spawn shared-agent while another run_id is active: {repair}"
+    );
+    assert_eq!(repair["run_id"], json!(run_id), "{repair}");
+    assert!(
+        repair["next_status_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--profile agent")
+                && command.contains("--run-id")
+                && command.contains(run_id)
+                && !command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
+        "already-running response should inspect the active non-default run: {repair}"
+    );
+}
+
+#[test]
 fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
     let mut fixture = indexed_fixture();
     let marker_path = write_dirty_marker_fixture(

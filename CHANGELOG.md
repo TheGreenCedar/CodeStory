@@ -26,6 +26,9 @@
 - Let `agent preflight` run one bounded quiet local refresh so repairable stale
   local indexes report refreshed local graph readiness while packet/search stays
   fail-closed.
+- Surfaced non-default active agent repairs in stdio status and `sidecar_setup`
+  so MCP repair does not spawn a duplicate shared-agent repair for the same
+  project.
 
 ### Documentation
 
