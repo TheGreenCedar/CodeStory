@@ -145,6 +145,38 @@ pub(crate) fn primary_non_ready(verdicts: &[ReadinessVerdictDto]) -> Option<&Rea
         .find(|verdict| verdict.status != ReadinessStatusDto::Ready)
 }
 
+pub(crate) fn status_label_for_goal(
+    goal: ReadinessGoalDto,
+    verdicts: &[ReadinessVerdictDto],
+    indexed: bool,
+    freshness_status: Option<IndexFreshnessStatusDto>,
+    retrieval_mode: &str,
+) -> &'static str {
+    if let Some(verdict) = verdicts.iter().find(|verdict| verdict.goal == goal) {
+        return status_label(verdict.status);
+    }
+
+    if !indexed {
+        return "repair_index";
+    }
+
+    match freshness_status {
+        Some(IndexFreshnessStatusDto::Stale) => return "repair_index",
+        Some(IndexFreshnessStatusDto::NotChecked)
+            if goal == ReadinessGoalDto::AgentPacketSearch =>
+        {
+            return "check_index";
+        }
+        Some(IndexFreshnessStatusDto::Fresh | IndexFreshnessStatusDto::NotChecked) | None => {}
+    }
+
+    if goal == ReadinessGoalDto::AgentPacketSearch && retrieval_mode != "full" {
+        return "repair_retrieval";
+    }
+
+    "ready"
+}
+
 pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
     match status {
         ReadinessStatusDto::Ready => "ready",
@@ -604,6 +636,63 @@ mod tests {
             setup: None,
             sidecar,
         }
+    }
+
+    #[test]
+    fn status_label_for_goal_preserves_doctor_fallback_readiness_lanes() {
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::LocalNavigation,
+                &[],
+                true,
+                Some(IndexFreshnessStatusDto::NotChecked),
+                "unavailable",
+            ),
+            "ready",
+            "legacy doctor fallback kept local/default freshness separate from agent proof"
+        );
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[],
+                true,
+                Some(IndexFreshnessStatusDto::NotChecked),
+                "full",
+            ),
+            "check_index"
+        );
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[],
+                true,
+                Some(IndexFreshnessStatusDto::Fresh),
+                "unavailable",
+            ),
+            "repair_retrieval"
+        );
+
+        let verdict = ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::Ready,
+            summary: "ready".to_string(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            setup: None,
+            index: None,
+            sidecar: None,
+        };
+        assert_eq!(
+            status_label_for_goal(
+                ReadinessGoalDto::AgentPacketSearch,
+                &[verdict],
+                false,
+                Some(IndexFreshnessStatusDto::Stale),
+                "unavailable",
+            ),
+            "ready",
+            "rendering must trust the selected readiness verdict when present"
+        );
     }
 
     #[test]
