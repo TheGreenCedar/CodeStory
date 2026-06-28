@@ -38,6 +38,8 @@
   with bounded inspect and cleanup commands instead of hiding aborted repairs.
 - Skipped oversized parser-backed source files before reading their full body
   while persisting a nonfatal incomplete-file indexing error.
+- Smoked every release matrix archive after packaging by unpacking it and
+  verifying packaged `codestory-cli --version` before upload.
 
 ### Documentation
 

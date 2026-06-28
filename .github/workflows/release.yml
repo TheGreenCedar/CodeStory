@@ -172,6 +172,15 @@ jobs:
             --binary "$bin" \
             --out-dir target/release-dist
 
+      - name: Smoke packaged release asset
+        if: runner.os != 'Windows'
+        run: |
+          python .github/scripts/check-packaged-agent-proof.py \
+            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
+            --expected-version "${{ needs.preflight.outputs.version }}" \
+            --version-only \
+            --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
+
       - name: Fetch retrieval embedding model
         if: matrix.asset_target == 'linux-x64'
         run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
@@ -206,6 +215,16 @@ jobs:
             --target "${{ matrix.asset_target }}" `
             --binary $bin `
             --out-dir target/release-dist
+
+      - name: Smoke packaged release asset on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python .github/scripts/check-packaged-agent-proof.py `
+            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.zip" `
+            --expected-version "${{ needs.preflight.outputs.version }}" `
+            --version-only `
+            --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
       - name: Upload release asset
         uses: actions/upload-artifact@v5
