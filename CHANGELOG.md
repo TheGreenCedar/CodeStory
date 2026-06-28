@@ -23,6 +23,9 @@
 - Bounded stdio/MCP local-refresh waits so `ground` returns compact
   `local_refresh` repair guidance instead of consuming the full tool timeout on
   stale indexes.
+- Let `agent preflight` run one bounded quiet local refresh so repairable stale
+  local indexes report refreshed local graph readiness while packet/search stays
+  fail-closed.
 
 ### Documentation
 
