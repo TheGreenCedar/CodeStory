@@ -48,6 +48,7 @@ mod display;
 mod drill_targeting;
 mod explore;
 mod http_transport;
+mod local_refresh_status;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
@@ -2197,10 +2198,71 @@ pub(crate) fn wait_for_local_freshness(
         return Ok((summary, Some(output)));
     }
 
+    let lock = match local_refresh_status::try_acquire_local_refresh_lock(
+        &inspect_runtime.cache_root,
+        &inspect_runtime.project_root,
+    )? {
+        local_refresh_status::LocalRefreshLockAttempt::Acquired(lock) => lock,
+        local_refresh_status::LocalRefreshLockAttempt::Busy(busy) => {
+            let mut output = local_refresh_output_from_summary(&summary);
+            output.state = if busy.status.is_some() {
+                readiness::LocalRefreshState::Refreshing
+            } else {
+                readiness::LocalRefreshState::Skipped
+            };
+            output.blocks_local_surfaces = true;
+            output.readiness_status = ReadinessStatusDto::RepairIndex;
+            output.reason = Some(if busy.status.is_some() {
+                "refreshing".to_string()
+            } else {
+                "skipped_locked".to_string()
+            });
+            if let Some(status) = busy.status {
+                output.phase = Some(status.phase);
+                output.pid = Some(status.pid);
+                output.started_at_epoch_ms = Some(status.started_at_epoch_ms);
+                output.updated_at_epoch_ms = Some(status.updated_at_epoch_ms);
+                output.last_failure_reason = status.last_failure_reason;
+            } else {
+                output.pid = busy.pid;
+                output.started_at_epoch_ms = busy.started_at_epoch_ms;
+            }
+            output.lock_path = Some(display::clean_path_string(
+                &busy.lock_path.to_string_lossy(),
+            ));
+            return Ok((summary, Some(output)));
+        }
+    };
+    let refresh_started_at_epoch_ms = lock.started_at_epoch_ms();
+    let refresh_pid = lock.pid();
+    let refresh_phase = "incremental_index";
+    local_refresh_status::write_local_refresh_status(
+        &inspect_runtime.cache_root,
+        &inspect_runtime.project_root,
+        "refreshing",
+        refresh_phase,
+        refresh_started_at_epoch_ms,
+        refresh_pid,
+        None,
+    )?;
+
     let index_runtime = RuntimeContext::new(project)?;
     match index_runtime.ensure_open(args::RefreshMode::Incremental) {
         Ok(opened) => {
+            let _ = local_refresh_status::write_local_refresh_status(
+                &inspect_runtime.cache_root,
+                &inspect_runtime.project_root,
+                "refreshed",
+                refresh_phase,
+                refresh_started_at_epoch_ms,
+                refresh_pid,
+                None,
+            );
             let mut output = local_refresh_output_from_summary(&opened.summary);
+            output.phase = Some(refresh_phase.to_string());
+            output.pid = Some(refresh_pid);
+            output.started_at_epoch_ms = Some(refresh_started_at_epoch_ms);
+            output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
             if output.state == readiness::LocalRefreshState::Refreshed {
                 output.reason = Some("refreshed".to_string());
             } else {
@@ -2211,11 +2273,26 @@ pub(crate) fn wait_for_local_freshness(
             Ok((opened.summary, Some(output)))
         }
         Err(error) => {
+            let error_text = error.to_string();
+            let _ = local_refresh_status::write_local_refresh_status(
+                &inspect_runtime.cache_root,
+                &inspect_runtime.project_root,
+                "failed",
+                refresh_phase,
+                refresh_started_at_epoch_ms,
+                refresh_pid,
+                Some(error_text.clone()),
+            );
             let mut output = local_refresh_output_from_summary(&summary);
             output.state = classify_local_refresh_failure_state(&error);
             output.blocks_local_surfaces = true;
             output.readiness_status = ReadinessStatusDto::RepairIndex;
-            output.reason = Some(error.to_string());
+            output.reason = Some(error_text.clone());
+            output.phase = Some(refresh_phase.to_string());
+            output.pid = Some(refresh_pid);
+            output.started_at_epoch_ms = Some(refresh_started_at_epoch_ms);
+            output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
+            output.last_failure_reason = Some(error_text);
             Ok((summary, Some(output)))
         }
     }
