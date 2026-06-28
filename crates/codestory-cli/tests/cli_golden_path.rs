@@ -880,6 +880,136 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
 }
 
 #[test]
+fn agent_preflight_refreshes_stale_local_graph_before_reporting() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("preflight-refreshed:{project_name}")
+}
+
+pub fn schedule_index(project_path: &str) -> usize {
+    super::open_project(project_path).len() + 1
+}
+"#,
+    )
+    .expect("modify indexed file after indexing");
+
+    let preflight = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["agent", "preflight", "--format", "json"],
+    );
+
+    assert_eq!(preflight["usable"], true, "{preflight:#}");
+    assert_eq!(preflight["mode"], "local_graph", "{preflight:#}");
+    assert_eq!(preflight["local_graph"]["ready"], true, "{preflight:#}");
+    assert_eq!(
+        preflight["local_refresh"]["state"], "refreshed",
+        "agent preflight should quietly refresh stale local freshness: {preflight:#}"
+    );
+    assert_eq!(
+        preflight["local_refresh"]["reason"], "refreshed",
+        "agent preflight should report the bounded refresh result: {preflight:#}"
+    );
+    assert_eq!(
+        preflight["local_refresh"]["blocks_local_surfaces"], false,
+        "{preflight:#}"
+    );
+    assert_eq!(
+        preflight["full_retrieval"]["status"], "repair_retrieval",
+        "local refresh must not claim full retrieval readiness: {preflight:#}"
+    );
+    assert_eq!(
+        preflight["agent_packet_search"]["status"], "repair_retrieval",
+        "agent packet/search should remain fail-closed without full sidecars: {preflight:#}"
+    );
+    assert!(
+        preflight["blocked_surfaces"]
+            .as_array()
+            .expect("blocked surfaces")
+            .iter()
+            .any(|surface| surface == "packet_full"),
+        "full retrieval surfaces should stay blocked after local refresh: {preflight:#}"
+    );
+}
+
+#[test]
+fn agent_preflight_reports_compact_reason_when_local_refresh_budget_expires() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("preflight-timeout:{project_name}")
+}
+
+pub fn schedule_index(project_path: &str) -> usize {
+    super::open_project(project_path).len() + 2
+}
+"#,
+    )
+    .expect("modify indexed file after indexing");
+
+    let preflight = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["agent", "preflight", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_RUNTIME_MODE", "hash"),
+            ("CODESTORY_AGENT_PREFLIGHT_LOCAL_REFRESH_TIMEOUT_MS", "0"),
+        ],
+    );
+
+    assert_eq!(preflight["usable"], false, "{preflight:#}");
+    assert_eq!(preflight["mode"], "blocked", "{preflight:#}");
+    assert_eq!(preflight["local_graph"]["ready"], false, "{preflight:#}");
+    assert_eq!(
+        preflight["local_refresh"]["state"], "refreshing",
+        "{preflight:#}"
+    );
+    assert_eq!(
+        preflight["local_refresh"]["reason"], "refresh_timeout",
+        "agent preflight should report one compact local refresh reason: {preflight:#}"
+    );
+    assert_eq!(
+        preflight["local_refresh"]["blocks_local_surfaces"], true,
+        "{preflight:#}"
+    );
+    assert!(
+        preflight["blocked_surfaces"]
+            .as_array()
+            .expect("blocked surfaces")
+            .iter()
+            .any(|surface| surface == "ground"),
+        "local graph surfaces should stay blocked when refresh does not finish: {preflight:#}"
+    );
+    assert_eq!(
+        preflight["agent_packet_search"]["status"], "repair_retrieval",
+        "timeout must not escalate into agent sidecar repair or readiness: {preflight:#}"
+    );
+}
+
+#[test]
 fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
