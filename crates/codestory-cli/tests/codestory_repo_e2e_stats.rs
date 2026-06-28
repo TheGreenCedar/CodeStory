@@ -94,6 +94,9 @@ struct StatsLogBaseline {
     graph_phase_seconds: f64,
     semantic_phase_seconds: f64,
     repeat_full_refresh_seconds: f64,
+    retrieval_index_seconds: f64,
+    retrieval_status_seconds: f64,
+    search_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,24 +180,64 @@ fn release_readiness_proof_tier(
 fn release_readiness_warnings(
     index_seconds: f64,
     semantic_phase_seconds: f64,
+    retrieval_index_seconds: f64,
+    retrieval_status_seconds: f64,
+    search_seconds: f64,
     baseline: &StatsLogBaseline,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let index_threshold = baseline.index_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
-    if index_seconds > index_threshold {
-        warnings.push(format!(
-            "index_seconds exceeded latest stats-log baseline by >25%: current {index_seconds:.2}s > threshold {index_threshold:.2}s from {} {} ({:.2}s)",
-            baseline.date, baseline.commit, baseline.index_seconds
-        ));
-    }
-    let semantic_threshold = baseline.semantic_phase_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
-    if semantic_phase_seconds > semantic_threshold {
-        warnings.push(format!(
-            "semantic_phase_seconds exceeded latest stats-log baseline by >25%: current {semantic_phase_seconds:.2}s > threshold {semantic_threshold:.2}s from {} {} ({:.2}s)",
-            baseline.date, baseline.commit, baseline.semantic_phase_seconds
-        ));
-    }
+    push_release_warning(
+        &mut warnings,
+        "index_seconds",
+        index_seconds,
+        baseline.index_seconds,
+        baseline,
+    );
+    push_release_warning(
+        &mut warnings,
+        "semantic_phase_seconds",
+        semantic_phase_seconds,
+        baseline.semantic_phase_seconds,
+        baseline,
+    );
+    push_release_warning(
+        &mut warnings,
+        "retrieval_index_seconds",
+        retrieval_index_seconds,
+        baseline.retrieval_index_seconds,
+        baseline,
+    );
+    push_release_warning(
+        &mut warnings,
+        "retrieval_status_seconds",
+        retrieval_status_seconds,
+        baseline.retrieval_status_seconds,
+        baseline,
+    );
+    push_release_warning(
+        &mut warnings,
+        "search_seconds",
+        search_seconds,
+        baseline.search_seconds,
+        baseline,
+    );
     warnings
+}
+
+fn push_release_warning(
+    warnings: &mut Vec<String>,
+    metric: &str,
+    current_seconds: f64,
+    baseline_seconds: f64,
+    baseline: &StatsLogBaseline,
+) {
+    let threshold = baseline_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
+    if current_seconds > threshold {
+        warnings.push(format!(
+            "{metric} exceeded latest stats-log baseline by >25%: current {current_seconds:.2}s > threshold {threshold:.2}s from {} {} ({baseline_seconds:.2}s)",
+            baseline.date, baseline.commit
+        ));
+    }
 }
 
 fn latest_phase_stats_baseline(repo_root: &Path) -> StatsLogBaseline {
@@ -214,15 +257,40 @@ fn latest_phase_stats_baseline(repo_root: &Path) -> StatsLogBaseline {
 fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
     let mut in_phase_table = false;
     let mut latest = None;
+    let mut latest_runtime = None;
     for line in log.lines() {
         if line.trim() == "## Phase Metrics" {
             in_phase_table = true;
             continue;
         }
-        if !in_phase_table || !line.starts_with('|') {
+        if !line.starts_with('|') {
             continue;
         }
         let fields = line.split('|').skip(1).map(str::trim).collect::<Vec<_>>();
+        if fields.len() >= 15 && fields[0] != "Date" && !fields[0].starts_with("---") {
+            let Some(search_seconds) = parse_stats_seconds(fields[5]) else {
+                continue;
+            };
+            let Some(retrieval_index_seconds) =
+                parse_named_result_seconds(fields[2], "retrieval_index_seconds")
+            else {
+                continue;
+            };
+            let Some(retrieval_status_seconds) =
+                parse_named_result_seconds(fields[2], "retrieval_status_seconds")
+            else {
+                continue;
+            };
+            latest_runtime = Some((
+                retrieval_index_seconds,
+                retrieval_status_seconds,
+                search_seconds,
+            ));
+            continue;
+        }
+        if !in_phase_table {
+            continue;
+        }
         if fields.len() < 9 || fields[0] == "Date" || fields[0].starts_with("---") {
             continue;
         }
@@ -238,6 +306,7 @@ fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
         let Some(repeat_full_refresh_seconds) = parse_repeat_full_refresh_seconds(fields[2]) else {
             continue;
         };
+        let (retrieval_index_seconds, retrieval_status_seconds, search_seconds) = latest_runtime?;
         latest = Some(StatsLogBaseline {
             source_path: String::new(),
             date: fields[0].to_string(),
@@ -247,9 +316,22 @@ fn latest_phase_stats_baseline_from_str(log: &str) -> Option<StatsLogBaseline> {
             graph_phase_seconds,
             semantic_phase_seconds,
             repeat_full_refresh_seconds,
+            retrieval_index_seconds,
+            retrieval_status_seconds,
+            search_seconds,
         });
     }
     latest
+}
+
+fn parse_named_result_seconds(value: &str, marker: &str) -> Option<f64> {
+    let start = value.find(marker)? + marker.len();
+    let seconds = value[start..]
+        .split(';')
+        .next()?
+        .trim()
+        .trim_end_matches('s');
+    parse_stats_seconds(seconds)
 }
 
 fn parse_repeat_full_refresh_seconds(value: &str) -> Option<f64> {
@@ -321,15 +403,21 @@ fn release_readiness_warnings_only_emit_above_thresholds() {
         graph_phase_seconds: 16.0,
         semantic_phase_seconds: 50.0,
         repeat_full_refresh_seconds: 30.0,
+        retrieval_index_seconds: 12.0,
+        retrieval_status_seconds: 0.8,
+        search_seconds: 4.0,
     };
 
-    assert!(release_readiness_warnings(100.0, 62.5, &baseline).is_empty());
+    assert!(release_readiness_warnings(100.0, 62.5, 15.0, 1.0, 5.0, &baseline).is_empty());
 
     assert_eq!(
-        release_readiness_warnings(100.01, 62.51, &baseline),
+        release_readiness_warnings(100.01, 62.51, 15.01, 1.01, 5.01, &baseline),
         vec![
             "index_seconds exceeded latest stats-log baseline by >25%: current 100.01s > threshold 100.00s from 2026-06-24 f8ffbd15+wt (80.00s)".to_string(),
             "semantic_phase_seconds exceeded latest stats-log baseline by >25%: current 62.51s > threshold 62.50s from 2026-06-24 f8ffbd15+wt (50.00s)".to_string(),
+            "retrieval_index_seconds exceeded latest stats-log baseline by >25%: current 15.01s > threshold 15.00s from 2026-06-24 f8ffbd15+wt (12.00s)".to_string(),
+            "retrieval_status_seconds exceeded latest stats-log baseline by >25%: current 1.01s > threshold 1.00s from 2026-06-24 f8ffbd15+wt (0.80s)".to_string(),
+            "search_seconds exceeded latest stats-log baseline by >25%: current 5.01s > threshold 5.00s from 2026-06-24 f8ffbd15+wt (4.00s)".to_string(),
         ]
     );
 }
@@ -338,6 +426,11 @@ fn release_readiness_warnings_only_emit_above_thresholds() {
 fn latest_phase_stats_baseline_parses_last_valid_phase_row() {
     let baseline = latest_phase_stats_baseline_from_str(
         r#"
+| Date | Commit | Result | Index seconds | Ground seconds | Search seconds | Symbol seconds | Trail seconds | Snippet seconds | Nodes | Edges | Files | Index errors | Semantic docs | Search dir unchanged |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-06-23 | old+wt | pass; retrieval_index_seconds 8.00; retrieval_status_seconds 0.40 | 90.00 | 0.20 | 2.00 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+| 2026-06-24 | new+wt | pass; retrieval_index_seconds 9.50; retrieval_status_seconds 0.70 | 85.00 | 0.20 | 3.40 | 0.50 | 0.20 | 0.20 | 1 | 1 | 1 | 0 | 1 | true |
+
 ## Phase Metrics
 
 | Date | Commit | Scenario | Index seconds | Graph phase seconds | Semantic phase seconds | Semantic docs reused | Semantic docs embedded | Semantic docs stale |
@@ -358,6 +451,9 @@ fn latest_phase_stats_baseline_parses_last_valid_phase_row() {
     assert_eq!(baseline.graph_phase_seconds, 17.79);
     assert_eq!(baseline.semantic_phase_seconds, 55.34);
     assert_eq!(baseline.repeat_full_refresh_seconds, 32.57);
+    assert_eq!(baseline.retrieval_index_seconds, 9.50);
+    assert_eq!(baseline.retrieval_status_seconds, 0.70);
+    assert_eq!(baseline.search_seconds, 3.40);
 }
 
 fn repo_root() -> PathBuf {
@@ -878,8 +974,14 @@ fn codestory_repo_release_e2e_emits_stats() {
     )
     .to_string();
     let stats_baseline = latest_phase_stats_baseline(project_root.as_path());
-    let warnings =
-        release_readiness_warnings(index_seconds, semantic_phase_seconds, &stats_baseline);
+    let warnings = release_readiness_warnings(
+        index_seconds,
+        semantic_phase_seconds,
+        retrieval_index_seconds,
+        retrieval_status_seconds,
+        search_seconds,
+        &stats_baseline,
+    );
 
     let stats = RepoE2eStats {
         project_root: project_root.display().to_string(),
