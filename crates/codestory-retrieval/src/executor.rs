@@ -80,7 +80,7 @@ pub struct QueryExecutor<'a> {
     pub sidecars: Arc<dyn SidecarSearch>,
     pub cache: &'a mut RetrievalCache,
     pub manifest: Option<RetrievalIndexManifest>,
-    pub file_roles: HashMap<String, codestory_store::FileRole>,
+    pub file_roles: Arc<HashMap<String, codestory_store::FileRole>>,
     pub cancelled: Arc<AtomicBool>,
     /// When set (tests), skips live health probing.
     pub mode_override: Option<RetrievalDegradedMode>,
@@ -664,7 +664,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -688,7 +688,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(manifest),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -718,7 +718,7 @@ mod tests {
                 sidecars: mock.clone(),
                 cache: &mut cache,
                 manifest: Some(manifest.clone()),
-                file_roles: HashMap::new(),
+                file_roles: Arc::new(HashMap::new()),
                 cancelled: cancellation_flag(),
                 mode_override: Some(RetrievalDegradedMode::Full),
             };
@@ -735,7 +735,7 @@ mod tests {
             sidecars: mock.clone(),
             cache: &mut cancelled_cache,
             manifest: Some(manifest.clone()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled,
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -778,7 +778,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -814,7 +814,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::NoSemantic),
         };
@@ -838,7 +838,7 @@ mod tests {
             sidecars: sidecars.clone(),
             cache: &mut cache,
             manifest: Some(manifest),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: None,
         };
@@ -862,7 +862,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(manifest),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::NoSemantic),
         };
@@ -891,7 +891,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -959,7 +959,7 @@ mod tests {
             sidecars: Arc::new(SlowZoektSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1061,7 +1061,7 @@ mod tests {
             sidecars: Arc::new(SlowScipExpandSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1157,7 +1157,7 @@ mod tests {
             sidecars: Arc::new(DenseAnchorExpandSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1243,7 +1243,7 @@ mod tests {
             sidecars: Arc::new(SlowLexicalUsefulSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: roles,
+            file_roles: Arc::new(roles),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1312,7 +1312,7 @@ mod tests {
             sidecars: Arc::new(SlowScipAnchorSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1400,7 +1400,7 @@ mod tests {
             sidecars: Arc::new(SlowDenseSymbolSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1464,7 +1464,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(manifest),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1525,7 +1525,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1558,7 +1558,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled,
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1597,7 +1597,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: roles,
+            file_roles: Arc::new(roles),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1636,7 +1636,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
@@ -1703,7 +1703,7 @@ mod tests {
             sidecars: Arc::new(mock),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
-            file_roles: HashMap::new(),
+            file_roles: Arc::new(HashMap::new()),
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
