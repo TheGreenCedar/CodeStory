@@ -42,6 +42,8 @@
   verifying packaged `codestory-cli --version` before upload.
 - Pinned the manual post-publish release smoke checkout to the requested release
   tag so older release proofs do not drift with the current branch.
+- Narrowed owner-alias call resolution through exact/suffix candidate maps so
+  repeated owner-qualified member calls avoid scanning every candidate node.
 
 ### Documentation
 
