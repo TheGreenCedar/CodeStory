@@ -20,6 +20,9 @@
 - Added a project-scoped single-flight lock/status for local refresh so
   concurrent Codex/plugin processes report refreshing or skipped_locked instead
   of launching duplicate incremental indexing.
+- Bounded stdio/MCP local-refresh waits so `ground` returns compact
+  `local_refresh` repair guidance instead of consuming the full tool timeout on
+  stale indexes.
 
 ### Documentation
 

@@ -17,6 +17,7 @@ struct StdioFixture {
     sidecar_policy_state: Option<String>,
     dirty_marker_path: Option<PathBuf>,
     dirty_marker_project_root: Option<PathBuf>,
+    local_refresh_timeout_ms: Option<u64>,
 }
 
 struct StdioServer {
@@ -177,6 +178,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         sidecar_policy_state: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
     }
 }
 
@@ -194,6 +196,7 @@ fn unindexed_fixture() -> StdioFixture {
         sidecar_policy_state: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
     }
 }
 
@@ -307,6 +310,12 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
     }
     if let Some(root) = &fixture.dirty_marker_project_root {
         command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT", root);
+    }
+    if let Some(timeout_ms) = fixture.local_refresh_timeout_ms {
+        command.env(
+            "CODESTORY_STDIO_LOCAL_REFRESH_TIMEOUT_MS",
+            timeout_ms.to_string(),
+        );
     }
     let mut child = command.spawn().expect("spawn stdio server");
 
@@ -3351,6 +3360,98 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     let result = assert_success_envelope(&refreshed, json!("status-freshness-after-reindex"));
     let refreshed_status = json_resource_content(result, "codestory://status");
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after reindex");
+}
+
+#[test]
+fn ground_tool_returns_degraded_local_refresh_when_stale_refresh_budget_expires() {
+    let mut fixture = indexed_fixture();
+    fixture.local_refresh_timeout_ms = Some(0);
+
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("budget-expired:{project_name}")
+}
+"#,
+    )
+    .expect("modify indexed file after indexing");
+
+    let mut server = spawn_stdio_server(&fixture);
+    let started = Instant::now();
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-refresh-budget-expired",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"budget": "strict"}
+            }
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "ground should return degraded local-refresh guidance before an MCP tool timeout, got {elapsed:?}: {response}"
+    );
+
+    let error = assert_tool_error(&response, json!("ground-refresh-budget-expired"));
+    assert_eq!(
+        error.pointer("/code").and_then(Value::as_str),
+        Some("codestory_tool_blocked")
+    );
+    assert_eq!(
+        error.pointer("/tool").and_then(Value::as_str),
+        Some("ground")
+    );
+    assert_eq!(
+        error.pointer("/readiness_goal").and_then(Value::as_str),
+        Some("local_navigation")
+    );
+    assert_eq!(
+        error.pointer("/status").and_then(Value::as_str),
+        Some("repair_index")
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/state")
+            .and_then(Value::as_str),
+        Some("refreshing")
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/readiness_status")
+            .and_then(Value::as_str),
+        Some("repair_index")
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/blocks_local_surfaces")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        error
+            .pointer("/local_refresh/reason")
+            .and_then(Value::as_str),
+        Some("refresh_timeout")
+    );
+    assert_ne!(
+        error
+            .pointer("/sidecar/retrieval_mode")
+            .and_then(Value::as_str),
+        Some("full"),
+        "local refresh degradation must not claim packet/search sidecar readiness: {error}"
+    );
+    assert!(
+        error
+            .pointer("/minimum_next")
+            .and_then(Value::as_array)
+            .is_some_and(|commands| !commands.is_empty()),
+        "blocked ground should include compact next-step guidance: {error}"
+    );
 }
 
 #[test]

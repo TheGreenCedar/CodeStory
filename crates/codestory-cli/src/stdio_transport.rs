@@ -24,6 +24,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use crate::args;
@@ -48,6 +50,7 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -416,6 +419,7 @@ fn stdio_tool_blocked_error(
         "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
         "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next")),
         "full_repair": stdio_repair_calls_from_value(surface.get("full_repair")),
         "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
@@ -2213,7 +2217,7 @@ fn read_stdio_status_resource_cached(
             (summary, None)
         }
     } else if crate::local_freshness_needs_refresh(&summary) {
-        crate::wait_for_local_freshness(&project, &inspect_runtime)?
+        wait_for_stdio_local_freshness(&project, &summary)?
     } else {
         (summary, None)
     };
@@ -2226,6 +2230,66 @@ fn read_stdio_status_resource_cached(
         cached_at: Instant::now(),
     });
     Ok(value)
+}
+
+fn wait_for_stdio_local_freshness(
+    project: &args::ProjectArgs,
+    summary: &ProjectSummary,
+) -> Result<(ProjectSummary, Option<crate::readiness::LocalRefreshOutput>)> {
+    let (tx, rx) = mpsc::channel();
+    let project = project.clone();
+    thread::spawn(move || {
+        let result = RuntimeContext::new_inspect_only(&project).and_then(|inspect_runtime| {
+            crate::wait_for_local_freshness(&project, &inspect_runtime)
+        });
+        let _ = tx.send(result);
+    });
+
+    let budget = stdio_local_refresh_foreground_budget();
+    if budget.is_zero() {
+        return Ok((
+            summary.clone(),
+            Some(stdio_local_refresh_timeout_output(summary)),
+        ));
+    }
+
+    match rx.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok((
+            summary.clone(),
+            Some(stdio_local_refresh_timeout_output(summary)),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let mut output = crate::local_refresh_output_from_summary(summary);
+            output.state = crate::readiness::LocalRefreshState::Failed;
+            output.blocks_local_surfaces = true;
+            output.readiness_status = ReadinessStatusDto::RepairIndex;
+            output.reason = Some("refresh_worker_disconnected".to_string());
+            output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
+            Ok((summary.clone(), Some(output)))
+        }
+    }
+}
+
+fn stdio_local_refresh_timeout_output(
+    summary: &ProjectSummary,
+) -> crate::readiness::LocalRefreshOutput {
+    let mut output = crate::local_refresh_output_from_summary(summary);
+    output.state = crate::readiness::LocalRefreshState::Refreshing;
+    output.blocks_local_surfaces = true;
+    output.readiness_status = ReadinessStatusDto::RepairIndex;
+    output.reason = Some("refresh_timeout".to_string());
+    output.phase = Some("incremental_index".to_string());
+    output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
+    output
+}
+
+fn stdio_local_refresh_foreground_budget() -> Duration {
+    std::env::var("CODESTORY_STDIO_LOCAL_REFRESH_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET)
 }
 
 fn stdio_project_args(runtime: &RuntimeContext) -> args::ProjectArgs {
