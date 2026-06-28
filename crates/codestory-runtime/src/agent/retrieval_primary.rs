@@ -293,10 +293,24 @@ pub(crate) fn sidecar_result_rejection_reason(
             query_result.trace.retrieval_mode
         ));
     }
+    if let Some(reason) = sidecar_blocking_cancel_reason(query_result) {
+        return Some(format!(
+            "sidecar retrieval trace `{reason}` is not eligible for primary results"
+        ));
+    }
     if !query_result.hits.is_empty() && resolved_hits.is_empty() {
         return Some("sidecar retrieval candidates did not resolve to indexed symbols".into());
     }
     None
+}
+
+fn sidecar_blocking_cancel_reason(query_result: &QueryResult) -> Option<&str> {
+    match query_result.trace.cancel_reason.as_deref() {
+        Some("deadline" | "stage_deadline" | "stage_worker_limit" | "cancelled") => {
+            query_result.trace.cancel_reason.as_deref()
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn sidecar_budget_ms(latency_budget_ms: Option<u32>) -> u64 {
@@ -580,8 +594,13 @@ fn packet_sidecar_query_diagnostic(
         resolved_hit_count: u32::try_from(resolution.resolved_hits.len()).unwrap_or(u32::MAX),
         unresolved_candidate_count: u32::try_from(resolution.unresolved_candidate_count)
             .unwrap_or(u32::MAX),
-        diagnostic: (resolution.unresolved_candidate_count > 0)
-            .then(|| "sidecar candidates did not all resolve to indexed symbols".to_string()),
+        diagnostic: sidecar_blocking_cancel_reason(query_result)
+            .map(|reason| format!("sidecar query has blocking cancel reason `{reason}`"))
+            .or_else(|| {
+                (resolution.unresolved_candidate_count > 0).then(|| {
+                    "sidecar candidates did not all resolve to indexed symbols".to_string()
+                })
+            }),
     }
 }
 
@@ -669,6 +688,10 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         ));
         let resolved_hits = resolution.resolved_hits;
         if let Some(reason) = sidecar_packet_batch_rejection_reason(&query_result, &resolved_hits) {
+            if sidecar_blocking_cancel_reason(&query_result).is_some() {
+                results.push((query.clone(), Vec::new()));
+                continue;
+            }
             let diagnostic =
                 sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
             return Err(sidecar_retrieval_unavailable_error(
@@ -698,6 +721,11 @@ fn sidecar_packet_batch_rejection_reason(
         return Some(format!(
             "sidecar retrieval mode `{}` is not eligible for packet batch results",
             query_result.trace.retrieval_mode
+        ));
+    }
+    if let Some(reason) = sidecar_blocking_cancel_reason(query_result) {
+        return Some(format!(
+            "sidecar retrieval trace `{reason}` is not eligible for packet batch results"
         ));
     }
     None
@@ -2475,6 +2503,47 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_result_rejects_blocking_cancel_reasons_even_with_resolved_hits() {
+        use codestory_retrieval::{CandidateSource, classify_query};
+
+        for reason in [
+            "deadline",
+            "stage_deadline",
+            "stage_worker_limit",
+            "cancelled",
+        ] {
+            let candidate = CandidateHit::with_source(
+                "src/handler.rs",
+                Some("handler".into()),
+                0.9,
+                CandidateSource::Zoekt,
+            );
+            let resolved_hit = search_hit_for_candidate(&candidate);
+            let result = QueryResult {
+                query: "handler".into(),
+                features: classify_query("handler"),
+                hits: vec![candidate],
+                trace: QueryTrace {
+                    retrieval_mode: "full".into(),
+                    degraded_reason: None,
+                    total_budget_ms: 500,
+                    elapsed_ms: 100,
+                    cancel_reason: Some(reason.into()),
+                    cache_hit: false,
+                    stages: Vec::new(),
+                },
+            };
+
+            let expected =
+                format!("sidecar retrieval trace `{reason}` is not eligible for primary results");
+            assert_eq!(
+                sidecar_result_rejection_reason(&result, &[resolved_hit]).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn sidecar_search_result_rejects_non_full_modes_even_without_candidates() {
         use codestory_retrieval::classify_query;
 
@@ -2567,6 +2636,38 @@ mod tests {
                 .diagnostic
                 .as_deref()
                 .is_some_and(|value| value.contains("did not all resolve"))
+        );
+
+        let cancelled = QueryResult {
+            query: "handler".into(),
+            features: classify_query("handler"),
+            hits: vec![CandidateHit::with_source(
+                "src/handler.rs",
+                Some("handler".into()),
+                0.9,
+                CandidateSource::Zoekt,
+            )],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 100,
+                cancel_reason: Some("stage_deadline".into()),
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+        let cancelled_resolution = SidecarCandidateResolutionOutcome {
+            resolved_hits: vec![search_hit_for_candidate(&cancelled.hits[0])],
+            attempted_candidate_count: 1,
+            unresolved_candidate_count: 0,
+        };
+        let cancelled_diagnostic =
+            packet_sidecar_query_diagnostic(&cancelled, &cancelled_resolution, 100, 1, 101);
+        assert_eq!(cancelled_diagnostic.resolved_hit_count, 1);
+        assert_eq!(
+            cancelled_diagnostic.diagnostic.as_deref(),
+            Some("sidecar query has blocking cancel reason `stage_deadline`")
         );
     }
 

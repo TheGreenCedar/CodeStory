@@ -5,13 +5,17 @@ use codestory_retrieval::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const READY_REPAIR_STATUS_FILE: &str = "ready-repair-status.json";
+const READY_REPAIR_LOCK_FILE: &str = "ready-repair.lock";
+const READY_REPAIR_PROJECT_LOCK_FILE: &str = "ready-repair-project.lock";
 const READY_REPAIR_STATUS_SCHEMA_VERSION: u32 = 1;
 const READY_REPAIR_STATUS_TTL: Duration = Duration::from_secs(30);
+const READY_REPAIR_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReadyRepairStatus {
@@ -28,11 +32,142 @@ pub(crate) struct ReadyRepairStatus {
     pub(crate) updated_at_epoch_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ReadyRepairLockFile {
+    schema_version: u32,
+    project_root: String,
+    profile: String,
+    run_id: Option<String>,
+    namespace: String,
+    pid: u32,
+    started_at_epoch_ms: i64,
+    token: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReadyRepairBusy {
+    pub(crate) status: Option<ReadyRepairStatus>,
+    pub(crate) lock_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReadyRepairLockAttempt {
+    Acquired(ReadyRepairLock),
+    Busy(ReadyRepairBusy),
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadyRepairLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for ReadyRepairLock {
+    fn drop(&mut self) {
+        let Some(lock) = read_ready_repair_lock_file(&self.path) else {
+            return;
+        };
+        if lock.token == self.token {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 pub(crate) fn now_epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or_default()
+}
+
+pub(crate) fn try_acquire_ready_repair_lock(
+    sidecar: &SidecarRuntimeConfig,
+    project_root: &Path,
+) -> Result<ReadyRepairLockAttempt> {
+    try_acquire_ready_repair_lock_at(
+        ready_repair_lock_path(sidecar),
+        sidecar,
+        project_root,
+        sidecar.run_id.as_deref(),
+    )
+}
+
+pub(crate) fn try_acquire_project_ready_repair_lock(
+    sidecar: &SidecarRuntimeConfig,
+    project_root: &Path,
+) -> Result<ReadyRepairLockAttempt> {
+    try_acquire_ready_repair_lock_at(
+        project_ready_repair_lock_path(sidecar),
+        sidecar,
+        project_root,
+        None,
+    )
+}
+
+fn try_acquire_ready_repair_lock_at(
+    path: PathBuf,
+    sidecar: &SidecarRuntimeConfig,
+    project_root: &Path,
+    active_run_id: Option<&str>,
+) -> Result<ReadyRepairLockAttempt> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let started_at_epoch_ms = now_epoch_ms();
+    let pid = std::process::id();
+    let token = format!("{pid}:{started_at_epoch_ms}");
+    let lock = ReadyRepairLockFile {
+        schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+        project_root: clean_path_text(project_root),
+        profile: sidecar.profile.as_str().to_string(),
+        run_id: sidecar.run_id.clone(),
+        namespace: sidecar.namespace.clone(),
+        pid,
+        started_at_epoch_ms,
+        token: token.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&lock)?;
+
+    match create_ready_repair_lock_file(&path, &content) {
+        Ok(()) => {
+            return Ok(ReadyRepairLockAttempt::Acquired(ReadyRepairLock {
+                path,
+                token,
+            }));
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    if let Some(status) = active_ready_repair_status(project_root, active_run_id) {
+        return Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
+            status: Some(status),
+            lock_path: path,
+        }));
+    }
+
+    if !ready_repair_lock_file_is_stale(&path) {
+        return Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
+            status: None,
+            lock_path: path,
+        }));
+    }
+
+    let _ = fs::remove_file(&path);
+    match create_ready_repair_lock_file(&path, &content) {
+        Ok(()) => Ok(ReadyRepairLockAttempt::Acquired(ReadyRepairLock {
+            path,
+            token,
+        })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
+                status: active_ready_repair_status(project_root, active_run_id),
+                lock_path: path,
+            }))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn write_ready_repair_status(
@@ -96,11 +231,60 @@ pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> Stri
         .join(";")
 }
 
+fn create_ready_repair_lock_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn ready_repair_lock_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
+    sidecar
+        .layout
+        .state_file
+        .with_file_name(READY_REPAIR_LOCK_FILE)
+}
+
+fn project_ready_repair_lock_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
+    let Some(run_id) = sidecar.run_id.as_deref() else {
+        return ready_repair_lock_path(sidecar).with_file_name(READY_REPAIR_PROJECT_LOCK_FILE);
+    };
+    let Some(namespace_prefix) = sidecar.namespace.strip_suffix(run_id) else {
+        return ready_repair_lock_path(sidecar).with_file_name(READY_REPAIR_PROJECT_LOCK_FILE);
+    };
+    let Some(namespace_dir) = sidecar.layout.state_file.parent() else {
+        return ready_repair_lock_path(sidecar).with_file_name(READY_REPAIR_PROJECT_LOCK_FILE);
+    };
+    let Some(sidecars_root) = namespace_dir.parent() else {
+        return ready_repair_lock_path(sidecar).with_file_name(READY_REPAIR_PROJECT_LOCK_FILE);
+    };
+    sidecars_root
+        .join(format!("{namespace_prefix}project"))
+        .join(READY_REPAIR_PROJECT_LOCK_FILE)
+}
+
 fn ready_repair_status_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
     sidecar
         .layout
         .state_file
         .with_file_name(READY_REPAIR_STATUS_FILE)
+}
+
+fn ready_repair_lock_file_is_stale(path: &Path) -> bool {
+    let now = now_epoch_ms();
+    if let Some(lock) = read_ready_repair_lock_file(path) {
+        return now.saturating_sub(lock.started_at_epoch_ms)
+            > READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64;
+    }
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|modified| {
+            let modified_ms = modified.as_millis().min(i64::MAX as u128) as i64;
+            now.saturating_sub(modified_ms) > READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64
+        })
+        .unwrap_or(true)
 }
 
 fn read_ready_repair_status(
@@ -121,6 +305,12 @@ fn read_ready_repair_status(
         return None;
     }
     Some(status)
+}
+
+fn read_ready_repair_lock_file(path: &Path) -> Option<ReadyRepairLockFile> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
 }
 
 fn read_ready_repair_status_file(path: &Path) -> Option<ReadyRepairStatus> {
@@ -210,7 +400,11 @@ mod tests {
     use codestory_retrieval::SidecarLayout;
 
     fn test_sidecar(root: &Path) -> SidecarRuntimeConfig {
-        let namespace = "codestory-agent-test-proof".to_string();
+        test_sidecar_with_run_id(root, "test-proof")
+    }
+
+    fn test_sidecar_with_run_id(root: &Path, run_id: &str) -> SidecarRuntimeConfig {
+        let namespace = format!("codestory-agent-{run_id}");
         SidecarRuntimeConfig {
             layout: SidecarLayout {
                 zoekt_http_port: 6070,
@@ -219,10 +413,10 @@ mod tests {
                 zoekt_data_dir: root.join("zoekt"),
                 qdrant_data_dir: root.join("qdrant"),
                 scip_artifacts_root: root.join("scip"),
-                state_file: root.join("retrieval-sidecars.json"),
+                state_file: root.join(&namespace).join("retrieval-sidecars.json"),
             },
             profile: SidecarProfile::Agent,
-            run_id: Some("test-proof".to_string()),
+            run_id: Some(run_id.to_string()),
             namespace: namespace.clone(),
             compose_project: namespace,
             embed_http_port: 8080,
@@ -255,6 +449,91 @@ mod tests {
             !path.exists(),
             "drop cleanup should remove the matching repair state file"
         );
+    }
+
+    #[test]
+    fn repair_lock_is_single_flight_and_clears_on_drop() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+
+        let lock = match try_acquire_ready_repair_lock(&sidecar, project.path())
+            .expect("first lock attempt")
+        {
+            ReadyRepairLockAttempt::Acquired(lock) => lock,
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!(
+                    "first lock should be acquired, got busy at {:?}",
+                    busy.lock_path
+                )
+            }
+        };
+
+        match try_acquire_ready_repair_lock(&sidecar, project.path()).expect("second lock attempt")
+        {
+            ReadyRepairLockAttempt::Busy(busy) => {
+                assert!(busy.status.is_none());
+                assert!(busy.lock_path.exists());
+            }
+            ReadyRepairLockAttempt::Acquired(_) => panic!("second lock must not be acquired"),
+        }
+
+        drop(lock);
+        match try_acquire_ready_repair_lock(&sidecar, project.path()).expect("third lock attempt") {
+            ReadyRepairLockAttempt::Acquired(_) => {}
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!(
+                    "lock should be reusable after drop, got busy at {:?}",
+                    busy.lock_path
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn project_repair_lock_serializes_different_run_ids() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let first = test_sidecar_with_run_id(state.path(), "first");
+        let second = test_sidecar_with_run_id(state.path(), "second");
+
+        let project_lock = match try_acquire_project_ready_repair_lock(&first, project.path())
+            .expect("first project lock")
+        {
+            ReadyRepairLockAttempt::Acquired(lock) => lock,
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!("first project lock should be acquired, got {busy:?}")
+            }
+        };
+
+        match try_acquire_project_ready_repair_lock(&second, project.path())
+            .expect("second project lock")
+        {
+            ReadyRepairLockAttempt::Busy(busy) => {
+                assert!(busy.status.is_none());
+                assert!(busy.lock_path.exists());
+            }
+            ReadyRepairLockAttempt::Acquired(_) => {
+                panic!("same project with different run id must be serialized")
+            }
+        }
+
+        match try_acquire_ready_repair_lock(&second, project.path()).expect("namespace lock") {
+            ReadyRepairLockAttempt::Acquired(namespace_lock) => drop(namespace_lock),
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!("namespace lock should remain separate, got {busy:?}")
+            }
+        }
+
+        drop(project_lock);
+        match try_acquire_project_ready_repair_lock(&second, project.path())
+            .expect("project lock after drop")
+        {
+            ReadyRepairLockAttempt::Acquired(_) => {}
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!("project lock should be reusable after drop, got {busy:?}")
+            }
+        }
     }
 
     #[test]

@@ -2153,14 +2153,11 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
     } else {
         (runtime.open_project_summary()?, None)
     };
-    let sidecar = ready_sidecar_status(&runtime, repaired_sidecar, cmd.goal, agent_run_id);
-    let readiness_sidecar = if !cmd.repair
-        && agent_run_id.is_none()
-        && matches!(cmd.goal, Some(args::ReadyGoal::Agent))
-    {
-        agent_goal_readiness_sidecar_status(&runtime, &sidecar)
+    let raw_sidecar = ready_sidecar_status(&runtime, repaired_sidecar, cmd.goal, agent_run_id);
+    let readiness_sidecar = if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
+        selected_agent_readiness_sidecar_status(&runtime, agent_run_id, &raw_sidecar)
     } else {
-        sidecar
+        raw_sidecar
     };
     let mut verdicts = build_summary_readiness(
         &summary.root,
@@ -2168,7 +2165,12 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &verdicts, agent_run_id);
+    let readiness_lanes = build_readiness_lanes_for_runtime(
+        &runtime,
+        &verdicts,
+        agent_run_id,
+        Some(&readiness_sidecar),
+    );
     if let Some(goal) = cmd.goal {
         let goal = goal.as_dto();
         verdicts.retain(|verdict| verdict.goal == goal);
@@ -2267,14 +2269,15 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     let summary = runtime.open_project_summary()?;
     let sidecar = doctor_sidecar_status(&runtime);
-    let readiness_sidecar = agent_goal_readiness_sidecar_status(&runtime, &sidecar);
+    let readiness_sidecar = selected_agent_readiness_sidecar_status(&runtime, None, &sidecar);
     let readiness = build_summary_readiness(
         &summary.root,
         &summary.stats,
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(&runtime, &readiness, None);
+    let readiness_lanes =
+        build_readiness_lanes_for_runtime(&runtime, &readiness, None, Some(&readiness_sidecar));
     let output =
         build_agent_preflight_output(&readiness, Path::new(&summary.root), readiness_lanes);
     let markdown = render_agent_preflight_markdown(&output);
@@ -2326,6 +2329,68 @@ fn repair_ready_state(
         Some(runtime.cache_root.as_path()),
     );
     let sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
+    let _project_repair_lock = match ready_repair_status::try_acquire_project_ready_repair_lock(
+        &sidecar,
+        &runtime.project_root,
+    )? {
+        ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
+        ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
+            if let Some(status) = busy.status {
+                bail!(
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    status.project_root,
+                    status.profile,
+                    status.run_id.as_deref().unwrap_or("none"),
+                    status.namespace,
+                    status.phase,
+                    status.pid,
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    sidecar
+                        .run_id
+                        .as_deref()
+                        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                );
+            }
+            bail!(
+                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or("none"),
+                sidecar.namespace,
+                busy.lock_path.display()
+            );
+        }
+    };
+    let _repair_lock = match ready_repair_status::try_acquire_ready_repair_lock(
+        &sidecar,
+        &runtime.project_root,
+    )? {
+        ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
+        ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
+            if let Some(status) = busy.status {
+                bail!(
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    status.project_root,
+                    status.profile,
+                    status.run_id.as_deref().unwrap_or("none"),
+                    status.namespace,
+                    status.phase,
+                    status.pid,
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    sidecar
+                        .run_id
+                        .as_deref()
+                        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                );
+            }
+            bail!(
+                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or("none"),
+                sidecar.namespace,
+                busy.lock_path.display()
+            );
+        }
+    };
     eprintln!(
         "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
         sidecar.run_id.as_deref().unwrap_or("none"),
@@ -2351,9 +2416,10 @@ fn repair_ready_state(
     );
     ensure_ready_repair_embed_liveness(&infrastructure)?;
     progress.set_phase("Qdrant finalize");
-    codestory_retrieval::repair_project_qdrant_collection(
+    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
         &runtime.project_root,
         &runtime.storage_path,
+        &sidecar,
     )
     .context("ready repair project qdrant repair")?;
     progress.set_phase("graph artifact");
@@ -10447,14 +10513,16 @@ fn build_doctor_output(
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
     let storage_exists = runtime.storage_path.exists();
     let sidecar_retrieval = doctor_sidecar_status(runtime);
-    let readiness_sidecar = agent_goal_readiness_sidecar_status(runtime, &sidecar_retrieval);
+    let readiness_sidecar =
+        selected_agent_readiness_sidecar_status(runtime, None, &sidecar_retrieval);
     let readiness = build_summary_readiness(
         &project,
         &summary.stats,
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(runtime, &readiness, None);
+    let readiness_lanes =
+        build_readiness_lanes_for_runtime(runtime, &readiness, None, Some(&readiness_sidecar));
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -10734,11 +10802,12 @@ fn doctor_sidecar_status_error(
     }
 }
 
-fn agent_goal_readiness_sidecar_status(
+pub(crate) fn selected_agent_readiness_sidecar_status(
     runtime: &RuntimeContext,
+    run_id: Option<&str>,
     fallback: &DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, None);
+    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, run_id);
     let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
     lane_scoped_agent_readiness_sidecar(fallback, agent_status)
 }
@@ -10765,6 +10834,7 @@ pub(crate) fn build_readiness_lanes_for_runtime(
     runtime: &RuntimeContext,
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     agent_run_id: Option<&str>,
+    selected_agent_status: Option<&DoctorSidecarStatusOutput>,
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
@@ -10774,7 +10844,9 @@ pub(crate) fn build_readiness_lanes_for_runtime(
     );
     let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, agent_run_id);
     let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
-    let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
+    let agent_status = selected_agent_status
+        .cloned()
+        .unwrap_or_else(|| doctor_sidecar_status_for_runtime(runtime, agent_runtime));
     let agent_verdict = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);

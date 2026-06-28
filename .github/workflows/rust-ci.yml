@@ -1,0 +1,55 @@
+name: rust ci
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - docs/contributors/testing-matrix.md
+      - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/rust-ci.yml
+  push:
+    branches:
+      - main
+      - dev/codestory-next
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/**
+      - docs/contributors/testing-matrix.md
+      - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/rust-ci.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: workspace cargo checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Test workspace
+        run: cargo test --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings

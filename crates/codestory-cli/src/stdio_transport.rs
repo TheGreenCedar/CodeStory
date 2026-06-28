@@ -2198,7 +2198,13 @@ fn read_stdio_status_resource_cached(
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
-    let (summary, local_refresh) = if crate::local_freshness_needs_refresh(&summary) {
+    let active_agent_repair = crate::ready_repair_status::active_ready_repair_status(
+        &runtime.project_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
+    let (summary, local_refresh) = if active_agent_repair.is_some() {
+        (summary, None)
+    } else if crate::local_freshness_needs_refresh(&summary) {
         crate::wait_for_local_freshness(&project, &inspect_runtime)?
     } else {
         (summary, None)
@@ -2593,33 +2599,71 @@ fn read_stdio_status_resource(
     let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
     let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
     let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
+    let raw_sidecar_status = crate::DoctorSidecarStatusOutput {
+        profile: Some(sidecar_runtime.profile.as_str().to_string()),
+        run_id: sidecar_runtime.run_id.clone(),
+        retrieval_mode: sidecar_mode.clone(),
+        degraded_reason: degraded_reason.clone(),
+        embedding_device_policy: embedding_device_policy.clone(),
+        embedding_device_state: embedding_device_state.clone(),
+        embedding_device_observation_source: embedding_device_observation_source.clone(),
+        embedding_detected_provider: embedding_detected_provider.clone(),
+        embedding_detected_gpu: embedding_detected_gpu.clone(),
+        embedding_accelerator_requested,
+        embedding_accelerator_request_provider: embedding_accelerator_request_provider.clone(),
+        embedding_accelerator_request_device: embedding_accelerator_request_device.clone(),
+        embedding_cpu_allowed,
+        manifest_generation: manifest_generation.clone(),
+        manifest_input_hash: manifest_input_hash.clone(),
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
+    };
+    let selected_agent_sidecar = crate::selected_agent_readiness_sidecar_status(
+        runtime,
+        sidecar_runtime.run_id.as_deref(),
+        &raw_sidecar_status,
+    );
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
         stats: &summary.stats,
         freshness: effective_freshness.as_ref(),
         setup: setup_repair.as_ref(),
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
-            profile: Some(sidecar_runtime.profile.as_str()),
-            run_id: sidecar_runtime.run_id.as_deref(),
-            retrieval_mode: &sidecar_mode,
-            degraded_reason: degraded_reason.as_deref(),
-            embedding_device_policy: Some(&embedding_device_policy),
-            embedding_device_state: Some(&embedding_device_state),
-            embedding_device_observation_source: Some(&embedding_device_observation_source),
-            embedding_detected_provider: embedding_detected_provider.as_deref(),
-            embedding_detected_gpu: embedding_detected_gpu.as_deref(),
-            embedding_accelerator_requested,
-            embedding_accelerator_request_provider: embedding_accelerator_request_provider
+            profile: selected_agent_sidecar.profile.as_deref(),
+            run_id: selected_agent_sidecar.run_id.as_deref(),
+            retrieval_mode: &selected_agent_sidecar.retrieval_mode,
+            degraded_reason: selected_agent_sidecar.degraded_reason.as_deref(),
+            embedding_device_policy: Some(&selected_agent_sidecar.embedding_device_policy),
+            embedding_device_state: Some(&selected_agent_sidecar.embedding_device_state),
+            embedding_device_observation_source: Some(
+                &selected_agent_sidecar.embedding_device_observation_source,
+            ),
+            embedding_detected_provider: selected_agent_sidecar
+                .embedding_detected_provider
                 .as_deref(),
-            embedding_accelerator_request_device: embedding_accelerator_request_device.as_deref(),
-            embedding_cpu_allowed,
-            manifest_generation: manifest_generation.as_deref(),
-            manifest_input_hash: manifest_input_hash.as_deref(),
+            embedding_detected_gpu: selected_agent_sidecar.embedding_detected_gpu.as_deref(),
+            embedding_accelerator_requested: selected_agent_sidecar.embedding_accelerator_requested,
+            embedding_accelerator_request_provider: selected_agent_sidecar
+                .embedding_accelerator_request_provider
+                .as_deref(),
+            embedding_accelerator_request_device: selected_agent_sidecar
+                .embedding_accelerator_request_device
+                .as_deref(),
+            embedding_cpu_allowed: selected_agent_sidecar.embedding_cpu_allowed,
+            manifest_generation: selected_agent_sidecar.manifest_generation.as_deref(),
+            manifest_input_hash: selected_agent_sidecar.manifest_input_hash.as_deref(),
         }),
     });
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
-    let readiness_lanes = crate::build_readiness_lanes_for_runtime(runtime, &readiness, None);
+    let readiness_lanes = crate::build_readiness_lanes_for_runtime(
+        runtime,
+        &readiness,
+        None,
+        Some(&selected_agent_sidecar),
+    );
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
     let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
@@ -2638,7 +2682,6 @@ fn read_stdio_status_resource(
     let runtime_truth = stdio_runtime_truth_status(
         &plugin_runtime,
         &sidecar_setup,
-        &sidecar,
         &readiness_lanes_json,
         local,
         &local_refresh_json,
@@ -2696,7 +2739,6 @@ fn read_stdio_status_resource(
 fn stdio_runtime_truth_status(
     plugin_runtime: &serde_json::Value,
     sidecar_setup: &serde_json::Value,
-    sidecar: &serde_json::Value,
     readiness_lanes: &serde_json::Value,
     local: &ReadinessVerdictDto,
     local_refresh: &serde_json::Value,
@@ -2728,12 +2770,12 @@ fn stdio_runtime_truth_status(
                 .pointer("/agent_packet_search/run_id")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "mode": sidecar
-                .get("retrieval_mode")
+            "mode": readiness_lanes
+                .pointer("/agent_packet_search/sidecar_mode")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "degraded_reason": sidecar
-                .get("degraded_reason")
+            "degraded_reason": readiness_lanes
+                .pointer("/agent_packet_search/degraded_reason")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
             "namespace": readiness_lanes
@@ -3323,6 +3365,10 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     );
     let next_repair_command =
         env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
+    let active_repair = crate::ready_repair_status::active_ready_repair_status(
+        project_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
     serde_json::json!({
         "state": state,
         "auto_repair": auto_repair,
@@ -3350,7 +3396,17 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT"),
             "project_root": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT"),
             "command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND")
-        }
+        },
+        "active_repair": active_repair.as_ref().map(|status| serde_json::json!({
+            "status": &status.status,
+            "project_root": &status.project_root,
+            "profile": &status.profile,
+            "run_id": &status.run_id,
+            "namespace": &status.namespace,
+            "phase": &status.phase,
+            "pid": status.pid,
+            "updated_at_epoch_ms": status.updated_at_epoch_ms
+        }))
     })
 }
 
@@ -3427,11 +3483,33 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
 }
 
 fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
+    if let Some(status) = crate::ready_repair_status::active_ready_repair_status(
+        &runtime.project_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    ) {
+        return serde_json::json!({
+            "result": {
+                "status": "already_running",
+                "project_root": status.project_root,
+                "profile": status.profile,
+                "run_id": status.run_id,
+                "namespace": status.namespace,
+                "phase": status.phase,
+                "pid": status.pid,
+                "next_status_command": format!(
+                    "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                ),
+                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+            }
+        });
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let output = Command::new(exe)
+    let child = Command::new(exe)
         .arg("ready")
         .arg("--goal")
         .arg("agent")
@@ -3443,18 +3521,21 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
         .arg("--run-id")
         .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
-        .output();
-    match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let parsed = serde_json::from_str::<serde_json::Value>(&stdout).ok();
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(child) => {
             serde_json::json!({
                 "result": {
-                    "status": if output.status.success() { "completed" } else { "failed" },
-                    "exit_code": output.status.code(),
-                    "stdout": stdout,
-                    "stderr": String::from_utf8_lossy(&output.stderr),
-                    "parsed": parsed,
+                    "status": "started",
+                    "pid": child.id(),
+                    "next_status_command": format!(
+                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    ),
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
                 }
             })

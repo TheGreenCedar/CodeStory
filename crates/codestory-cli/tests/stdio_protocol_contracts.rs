@@ -2261,8 +2261,13 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["runtime_truth"]["sidecar_status"]["mode"],
-        status["sidecar_retrieval"]["retrieval_mode"],
-        "runtime truth should reuse sidecar retrieval mode: {status}"
+        status["readiness_lanes"]["agent_packet_search"]["sidecar_mode"],
+        "runtime truth should reuse the selected agent readiness lane mode: {status}"
+    );
+    assert_eq!(
+        status["runtime_truth"]["sidecar_status"]["degraded_reason"],
+        status["readiness_lanes"]["agent_packet_search"]["degraded_reason"],
+        "runtime truth should reuse the selected agent readiness lane reason: {status}"
     );
     assert!(
         status
@@ -2716,6 +2721,74 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
             .to_string()
             .contains("\"tool\":\"sidecar_setup\""),
         "status should keep recovery on MCP tooling after sidecar_setup enable: {status}"
+    );
+}
+
+#[test]
+fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting() {
+    let fixture = indexed_fixture();
+    let (status_path, _cleanup) = write_active_repair_status_fixture(
+        &fixture,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        "Qdrant finalize",
+    );
+    assert!(status_path.exists(), "repair status fixture should exist");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let status_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-active",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "status"}
+            }
+        }),
+    );
+    let setup = assert_tool_success(&status_response, json!("sidecar-setup-status-active"));
+    assert_eq!(
+        setup["active_repair"]["status"],
+        json!("repairing"),
+        "sidecar_setup status should surface the active shared-agent repair: {setup}"
+    );
+    assert_eq!(
+        setup["active_repair"]["run_id"],
+        json!(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        "{setup}"
+    );
+
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair-active",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair-active"));
+    assert_eq!(
+        repair["status"],
+        json!("already_running"),
+        "sidecar_setup repair should not spawn or wait when shared-agent repair is active: {repair}"
+    );
+    assert_eq!(
+        repair["phase"],
+        json!("Qdrant finalize"),
+        "already-running response should preserve current repair phase: {repair}"
+    );
+    assert!(
+        repair["next_status_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--profile agent")
+                && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
+        "already-running response should point to cheap status inspection: {repair}"
     );
 }
 

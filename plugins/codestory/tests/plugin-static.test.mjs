@@ -20,6 +20,11 @@ const {
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
 
+function threadActiveStatePath(dataDir, threadId) {
+  const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
+  return join(dataDir, `.codestory-active-thread-${key}.json`);
+}
+
 function readCargoVersion(manifestText) {
   let inPackage = false;
   for (const line of manifestText.split(/\r?\n/u)) {
@@ -538,6 +543,183 @@ test("mcp launcher rejects active project state from another Codex thread", asyn
     assert.equal(status.project_root, null);
     assert.equal(status.project_root_source, "plugin_active_state_stale");
     assert.equal(status.readiness[0].goal, "project_root");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher prefers thread-scoped active project over another thread's global state", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-thread-active-project-"));
+  const currentRepo = join(dataDir, "current-repo");
+  const previousRepo = join(dataDir, "previous-repo");
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliScript = join(dataDir, "recording-codestory-cli.cjs");
+  const cliPath = join(
+    dataDir,
+    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+  );
+  const logFile = join(dataDir, "calls.jsonl");
+  const marker = join(dataDir, "serve-called.txt");
+  const currentThread = "current-thread";
+
+  try {
+    await mkdir(currentRepo);
+    await mkdir(previousRepo);
+    await writeFile(
+      join(dataDir, ".codestory-active"),
+      JSON.stringify({
+        event: "UserPromptSubmit",
+        cwd: previousRepo,
+        codexThreadId: "previous-thread",
+        updatedAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+    await writeFile(
+      threadActiveStatePath(dataDir, currentThread),
+      JSON.stringify({
+        event: "UserPromptSubmit",
+        cwd: currentRepo,
+        codexThreadId: currentThread,
+        updatedAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+    await writeFile(
+      cliScript,
+      [
+        "const fs = require('node:fs');",
+        "const args = process.argv.slice(2);",
+        "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify({",
+        "  args,",
+        "  cwd: process.cwd(),",
+        "  projectRoot: process.env.CODESTORY_PLUGIN_PROJECT_ROOT || '',",
+        "  projectRootSource: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE || ''",
+        "}) + '\\n');",
+        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+        "if (args[0] === 'serve') { fs.writeFileSync(process.env.TEST_OUT, 'serve-called'); process.exit(0); }",
+        "process.exit(2);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    if (process.platform === "win32") {
+      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+    } else {
+      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
+      await chmod(cliPath, 0o755);
+    }
+
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        CODESTORY_PLUGIN_ACTIVE_PROJECT_TTL_MS: "600000",
+        CODEX_THREAD_ID: currentThread,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+        TEST_OUT: marker,
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(await readFile(marker, "utf8"), "serve-called");
+    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.ok(serve, "expected serve call");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", currentRepo]);
+    assert.equal(serve.cwd, currentRepo);
+    assert.equal(serve.projectRoot, currentRepo);
+    assert.equal(serve.projectRootSource, "plugin_active_thread_state");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher rejects thread-owned global state when current thread is unavailable", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-missing-thread-active-project-"));
+  const previousRepo = join(dataDir, "previous-repo");
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliScript = join(dataDir, "recording-codestory-cli.cjs");
+  const cliPath = join(
+    dataDir,
+    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+  );
+  const logFile = join(dataDir, "calls.jsonl");
+  const marker = join(dataDir, "serve-called.txt");
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "status",
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  }) + "\n";
+
+  try {
+    await mkdir(previousRepo);
+    await writeFile(
+      join(dataDir, ".codestory-active"),
+      JSON.stringify({
+        event: "UserPromptSubmit",
+        cwd: previousRepo,
+        codexThreadId: "previous-thread",
+        updatedAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+    await writeFile(
+      cliScript,
+      [
+        "const fs = require('node:fs');",
+        "const args = process.argv.slice(2);",
+        "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify({ args, cwd: process.cwd(), projectRoot: process.env.CODESTORY_PLUGIN_PROJECT_ROOT || '' }) + '\\n');",
+        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+        "if (args[0] === 'ready' || args[0] === 'serve') { fs.writeFileSync(process.env.TEST_OUT, args[0]); process.exit(0); }",
+        "process.exit(2);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    if (process.platform === "win32") {
+      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+    } else {
+      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
+      await chmod(cliPath, 0o755);
+    }
+
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        CODESTORY_PLUGIN_ACTIVE_PROJECT_TTL_MS: "600000",
+        CODEX_THREAD_ID: "",
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+        TEST_OUT: marker,
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    await assert.rejects(access(marker));
+    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
+    const response = JSON.parse(result.stdout.trim());
+    const status = JSON.parse(response.result.contents[0].text);
+    assert.equal(status.degraded_reason, "project_root_unavailable");
+    assert.equal(status.project_root, null);
+    assert.equal(status.project_root_source, "plugin_active_state_stale");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1497,8 +1679,11 @@ test("hook records Codex thread id in active project state", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const state = JSON.parse(await readFile(join(dataDir, ".codestory-active"), "utf8"));
+    const threadState = JSON.parse(await readFile(threadActiveStatePath(dataDir, "hook-thread-id"), "utf8"));
     assert.equal(state.cwd, repoRoot);
     assert.equal(state.codexThreadId, "hook-thread-id");
+    assert.equal(threadState.cwd, repoRoot);
+    assert.equal(threadState.codexThreadId, "hook-thread-id");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

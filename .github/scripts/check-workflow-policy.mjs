@@ -7,6 +7,8 @@ const trustedOwners = new Set(["actions", "github"]);
 const shaPattern = /^[0-9a-f]{40}$/i;
 const violations = [];
 const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
+const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
+const rustCi = path.join(workflowRoot, "rust-ci.yml");
 
 for (const file of fs
   .readdirSync(workflowRoot)
@@ -62,6 +64,47 @@ if (fs.existsSync(sagaIssueLinkGuard)) {
     !closingRef.test("Closes https://github.com/TheGreenCedar/CodeStory/issues/123")
   ) {
     violations.push("saga-issue-link-guard.yml closing ref policy must reject bare numbers and accept # or full issue URLs");
+  }
+}
+
+if (!fs.existsSync(pluginStatic)) {
+  violations.push("plugin-static.yml must run plugin static tests for plugin changes");
+} else {
+  const content = fs.readFileSync(pluginStatic, "utf8");
+  const requiredSnippets = [
+    "plugins/codestory/**",
+    "dev/codestory-next",
+    "node --test plugins/codestory/tests/plugin-static.test.mjs",
+    "node .github/scripts/check-workflow-policy.mjs",
+    "python .github/scripts/check-codestory-release.py --version",
+  ];
+
+  for (const snippet of requiredSnippets) {
+    if (!content.includes(snippet)) {
+      violations.push(`plugin-static.yml must include ${snippet}`);
+    }
+  }
+}
+
+if (!fs.existsSync(rustCi)) {
+  violations.push("rust-ci.yml must run default Rust workspace checks for routine code changes");
+} else {
+  const content = fs.readFileSync(rustCi, "utf8");
+  const requiredSnippets = [
+    "Cargo.lock",
+    "Cargo.toml",
+    "crates/**",
+    "dev/codestory-next",
+    "cargo fmt --check",
+    "cargo check --workspace --locked",
+    "cargo test --locked",
+    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  ];
+
+  for (const snippet of requiredSnippets) {
+    if (!content.includes(snippet)) {
+      violations.push(`rust-ci.yml must include ${snippet}`);
+    }
   }
 }
 

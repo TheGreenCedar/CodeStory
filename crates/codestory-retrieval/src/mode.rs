@@ -48,33 +48,36 @@ pub fn derive_degraded_mode(
     qdrant: &ComponentHealth,
     scip: &ComponentHealth,
 ) -> (RetrievalDegradedMode, Option<String>) {
-    if zoekt.status == ComponentStatus::Unavailable || !zoekt.capabilities.lexical {
+    if zoekt.status != ComponentStatus::Healthy || !zoekt.capabilities.lexical {
         return (
             RetrievalDegradedMode::Unavailable,
-            zoekt
-                .degraded_reason
-                .clone()
-                .or_else(|| Some("mandatory_zoekt_unavailable".into())),
+            mandatory_failure_reason(zoekt, "zoekt"),
         );
     }
-    if qdrant.status == ComponentStatus::Unavailable || !qdrant.capabilities.semantic {
+    if qdrant.status != ComponentStatus::Healthy || !qdrant.capabilities.semantic {
         let mode = if scip.capabilities.graph {
             RetrievalDegradedMode::NoSemantic
         } else {
             RetrievalDegradedMode::LexicalOnly
         };
-        return (
-            mode,
-            qdrant
-                .degraded_reason
-                .clone()
-                .or_else(|| Some("mandatory_qdrant_unavailable".into())),
-        );
+        return (mode, mandatory_failure_reason(qdrant, "qdrant"));
     }
     if scip.status != ComponentStatus::Healthy || !scip.capabilities.graph {
         return (RetrievalDegradedMode::NoScip, scip.degraded_reason.clone());
     }
     (RetrievalDegradedMode::Full, None)
+}
+
+fn mandatory_failure_reason(component: &ComponentHealth, name: &str) -> Option<String> {
+    let state = if component.status == ComponentStatus::Unavailable {
+        "unavailable"
+    } else {
+        "degraded"
+    };
+    component
+        .degraded_reason
+        .clone()
+        .or_else(|| Some(format!("mandatory_{name}_{state}")))
 }
 
 #[cfg(test)]

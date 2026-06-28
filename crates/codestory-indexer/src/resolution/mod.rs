@@ -4189,6 +4189,7 @@ mod tests {
                 kind INTEGER NOT NULL,
                 serialized_name TEXT NOT NULL,
                 qualified_name TEXT,
+                canonical_id TEXT,
                 file_node_id INTEGER,
                 start_line INTEGER NOT NULL DEFAULT 0
             );

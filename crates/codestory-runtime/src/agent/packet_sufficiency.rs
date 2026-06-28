@@ -22,7 +22,8 @@ use crate::agent::packet_terms::{
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, AgentRetrievalStepStatusDto, PacketBudgetDto,
     PacketBudgetModeDto, PacketClaimDto, PacketCoverageReportDto, PacketEvidenceResolutionDto,
-    PacketEvidenceTierDto, PacketSufficiencyDto, PacketSufficiencyStatusDto, PacketTaskClassDto,
+    PacketEvidenceTierDto, PacketSidecarQueryDiagnosticDto, PacketSufficiencyDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -393,14 +394,23 @@ fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
         .retrieval_trace
         .packet_sidecar_diagnostics
         .iter()
-        .filter(|diagnostic| {
-            diagnostic.candidate_count > 0
-                && diagnostic.resolved_hit_count == 0
-                && diagnostic.unresolved_candidate_count > 0
-        })
+        .filter(|diagnostic| sidecar_diagnostic_blocks_sufficiency(diagnostic))
         .filter(|diagnostic| seen.insert(diagnostic.query.clone()))
         .map(|diagnostic| diagnostic.query.clone())
         .collect()
+}
+
+fn sidecar_diagnostic_blocks_sufficiency(diagnostic: &PacketSidecarQueryDiagnosticDto) -> bool {
+    if diagnostic.candidate_count > 0
+        && diagnostic.resolved_hit_count == 0
+        && diagnostic.unresolved_candidate_count > 0
+    {
+        return true;
+    }
+    diagnostic
+        .diagnostic
+        .as_deref()
+        .is_some_and(|message| message.starts_with("sidecar query has blocking cancel reason "))
 }
 
 fn packet_sufficiency_min_citations(task_class: PacketTaskClassDto) -> usize {
@@ -2302,6 +2312,26 @@ mod tests {
         });
     }
 
+    fn mark_full_retrieval_available(answer: &mut AgentAnswerDto) {
+        answer.retrieval_trace.retrieval_shadow = Some(RetrievalShadowDto {
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            retrieval_total_ms: 1,
+            total_budget_ms: Some(500),
+            cancel_reason: None,
+            cache_hit: false,
+            stage_timings: Vec::new(),
+            candidates: Vec::new(),
+            would_rank: Vec::new(),
+            error: None,
+            candidate_count: 0,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 0,
+            diagnostic_only: false,
+            candidate_resolution_counts: Vec::new(),
+        });
+    }
+
     fn unresolved_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
         PacketSidecarQueryDiagnosticDto {
             query: query.to_string(),
@@ -2316,6 +2346,25 @@ mod tests {
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,
             diagnostic: Some("unresolved test candidate".to_string()),
+        }
+    }
+
+    fn cancelled_sidecar_diagnostic(query: &str) -> PacketSidecarQueryDiagnosticDto {
+        PacketSidecarQueryDiagnosticDto {
+            query: query.to_string(),
+            retrieval_mode: "full".to_string(),
+            sidecar_query_ms: None,
+            candidate_resolution_ms: None,
+            total_elapsed_ms: None,
+            sidecar_stage_count: 0,
+            sidecar_stage_total_ms: None,
+            batch_query_wall_ms: None,
+            candidate_count: 0,
+            resolved_hit_count: 0,
+            unresolved_candidate_count: 0,
+            diagnostic: Some(
+                "sidecar query has blocking cancel reason `stage_deadline`".to_string(),
+            ),
         }
     }
 
@@ -3608,7 +3657,8 @@ mod tests {
     #[test]
     fn compact_proof_omission_reports_missing_role_and_standard_budget_follow_up() {
         let question = "Explain how formatting arguments become type-erased format args and reach vformat or format_to output paths.";
-        let answer = answer_fixture(question);
+        let mut answer = answer_fixture(question);
+        mark_full_retrieval_available(&mut answer);
         let budget = compact_truncated_budget(question, vec!["citations", "markdown_blocks"]);
         let claims = vec![
             claim(
@@ -3650,7 +3700,8 @@ mod tests {
     #[test]
     fn compact_budget_blocks_sufficiency_when_source_proof_probe_is_missing() {
         let question = "Explain how buffered Source and Sink wrappers use Buffer state during reads and writes.";
-        let answer = answer_fixture(question);
+        let mut answer = answer_fixture(question);
+        mark_full_retrieval_available(&mut answer);
         let budget = compact_truncated_budget(question, vec!["citations", "trail_edges"]);
         let claims = vec![
             claim("Buffer is the in-memory byte store used by buffered reads and writes."),
@@ -3841,6 +3892,7 @@ mod tests {
     fn unresolved_selected_probe_blocks_when_express_response_coverage_is_missing() {
         let question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
         let mut answer = answer_fixture(question);
+        mark_full_retrieval_available(&mut answer);
         answer.retrieval_trace.packet_sidecar_diagnostics =
             vec![unresolved_sidecar_diagnostic("response send")];
         let budget = budget_fixture();
@@ -3901,6 +3953,7 @@ mod tests {
     fn missing_flow_seed_follow_up_precedes_unresolved_selected_probe() {
         let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
         let mut answer = answer_fixture(question);
+        mark_full_retrieval_available(&mut answer);
         answer.retrieval_trace.packet_sidecar_diagnostics =
             vec![unresolved_sidecar_diagnostic("response send")];
         let budget = budget_fixture();
@@ -4004,6 +4057,51 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_sidecar_diagnostics_block_when_required_coverage_is_missing() {
+        let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
+        let mut answer = answer_fixture(question);
+        answer.retrieval_trace.packet_sidecar_diagnostics =
+            vec![cancelled_sidecar_diagnostic("response finalization")];
+        let budget = budget_fixture();
+        let claims = vec![
+            claim(
+                "Public request entrypoint registers route wrappers before dispatching handler calls.",
+            ),
+            claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            ),
+        ];
+
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: claims,
+            missing_required_probe_queries: Vec::new(),
+            targeted_follow_up_queries: Vec::new(),
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        let report = sufficiency.coverage_report.as_ref().unwrap();
+        assert!(report.missing.iter().any(|gap| gap == "request_terminal"));
+        assert_eq!(report.unresolved, vec!["response finalization".to_string()]);
+        assert!(
+            sufficiency
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("response finalization"))
+        );
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("--query 'response finalization'"))
+        );
+    }
+
+    #[test]
     fn partial_packets_with_blocked_full_retrieval_recommend_repair_and_local_graph() {
         let question = "Trace how route registration reaches response finalization.";
         let mut answer = answer_fixture(question);
@@ -4044,6 +4142,41 @@ mod tests {
                     && !command.contains("codestory-cli context")
             }),
             "blocked full retrieval must not recommend blocked search/context surfaces: {sufficiency:?}"
+        );
+    }
+
+    #[test]
+    fn partial_packets_with_missing_retrieval_shadow_recommend_repair() {
+        let question = "Trace how route registration reaches response finalization.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let sufficiency = assemble_packet_sufficiency(PacketSufficiencyInput {
+            project_root: Path::new("C:/workspace/service"),
+            question,
+            task_class: PacketTaskClassDto::RouteTracing,
+            answer: &answer,
+            budget: &budget,
+            supported_claims: vec![claim(
+                "Dispatch request invokes the selected view function or handler for the matched route.",
+            )],
+            missing_required_probe_queries: vec!["route registration".to_string()],
+            targeted_follow_up_queries: vec!["response finalization".to_string()],
+        });
+
+        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            sufficiency
+                .follow_up_commands
+                .first()
+                .is_some_and(|command| command.contains("ready --goal agent --repair")),
+            "missing retrieval shadow should lead with canonical sidecar repair: {sufficiency:?}"
+        );
+        assert!(
+            sufficiency.follow_up_commands.iter().all(|command| {
+                !command.contains("codestory-cli search")
+                    && !command.contains("codestory-cli context")
+            }),
+            "missing retrieval shadow must not recommend unproven search/context surfaces: {sufficiency:?}"
         );
     }
 
@@ -4461,7 +4594,7 @@ fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
         .retrieval_trace
         .retrieval_shadow
         .as_ref()
-        .is_none_or(|shadow| shadow.retrieval_mode == "full")
+        .is_some_and(|shadow| shadow.retrieval_mode == "full")
 }
 
 fn packet_agent_repair_command(quoted_project: &str) -> String {
