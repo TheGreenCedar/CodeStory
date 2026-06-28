@@ -40,6 +40,8 @@
   while persisting a nonfatal incomplete-file indexing error.
 - Smoked every release matrix archive after packaging by unpacking it and
   verifying packaged `codestory-cli --version` before upload.
+- Pinned the manual post-publish release smoke checkout to the requested release
+  tag so older release proofs do not drift with the current branch.
 
 ### Documentation
 

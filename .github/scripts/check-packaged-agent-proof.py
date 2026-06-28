@@ -996,6 +996,16 @@ def self_test() -> None:
         else:
             raise AssertionError("plugin manifest version mismatch should fail the gate")
 
+        plugin_drift_args = argparse.Namespace(**vars(args))
+        plugin_drift_args.plugin_root = str(plugin_root)
+        try:
+            run_gate(plugin_drift_args)
+        except GateFailure as exc:
+            assert exc.layer == "plugin_manifest"
+            assert exc.artifact == plugin_manifest
+        else:
+            raise AssertionError("plugin-root drift should fail the packaged proof gate")
+
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "doctor_stderr"
         try:
             try:
