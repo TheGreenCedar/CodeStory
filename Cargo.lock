@@ -556,6 +556,7 @@ dependencies = [
  "codestory-store",
  "codestory-workspace",
  "directories",
+ "fs4",
  "serde",
  "serde_json",
  "sha2",
