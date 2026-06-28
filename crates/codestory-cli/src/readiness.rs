@@ -60,6 +60,18 @@ pub(crate) struct LocalRefreshOutput {
     pub(crate) readiness_status: ReadinessStatusDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) updated_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lock_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) changed_file_count: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -205,6 +217,12 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
         blocks_local_surfaces: verdict.status != ReadinessStatusDto::Ready,
         readiness_status: verdict.status,
         reason,
+        phase: None,
+        pid: None,
+        started_at_epoch_ms: None,
+        updated_at_epoch_ms: None,
+        lock_path: None,
+        last_failure_reason: None,
         changed_file_count: index
             .map(|index| index.changed_file_count)
             .unwrap_or_default(),

@@ -2256,6 +2256,12 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
             )
         ),
         format!(
+            "local_refresh_state:{}",
+            crate::local_refresh_status::local_refresh_status_cache_fingerprint(
+                &runtime.cache_root
+            )
+        ),
+        format!(
             "source_state:{}",
             stdio_source_fingerprint(&runtime.project_root)
         ),

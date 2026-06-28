@@ -17,6 +17,9 @@
 - Compacted local-refresh status across ready, agent preflight, and
   `codestory://status` so agent-facing output uses refreshed/refreshing/skipped
   states while maintainer JSON keeps stale freshness details.
+- Added a project-scoped single-flight lock/status for local refresh so
+  concurrent Codex/plugin processes report refreshing or skipped_locked instead
+  of launching duplicate incremental indexing.
 
 ### Documentation
 
