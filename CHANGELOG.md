@@ -4,6 +4,8 @@
 
 ### Documentation
 
+- Added release guidance requiring changelog updates before version commits and
+  marketplace repo pushes when Codex needs to detect plugin updates.
 - Restructured operator docs under `docs/users/` (host guides, CLI reference, troubleshooting, trust and readiness).
 - Added CI markdown link checker: `node .github/scripts/check-doc-links.mjs` (`.github/workflows/docs-link-check.yml`).
 
