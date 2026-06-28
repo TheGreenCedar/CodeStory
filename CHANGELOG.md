@@ -44,6 +44,8 @@
   tag so older release proofs do not drift with the current branch.
 - Narrowed owner-alias call resolution through exact/suffix candidate maps so
   repeated owner-qualified member calls avoid scanning every candidate node.
+- Extended release readiness warnings to compare retrieval index/status/search
+  timings against the latest stats-log baselines.
 
 ### Documentation
 
