@@ -15,6 +15,7 @@ const READY_REPAIR_LOCK_FILE: &str = "ready-repair.lock";
 const READY_REPAIR_PROJECT_LOCK_FILE: &str = "ready-repair-project.lock";
 const READY_REPAIR_STATUS_SCHEMA_VERSION: u32 = 1;
 const READY_REPAIR_STATUS_TTL: Duration = Duration::from_secs(30);
+const READY_REPAIR_ABANDONED_STATUS_TTL: Duration = Duration::from_secs(15 * 60);
 const READY_REPAIR_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +224,17 @@ pub(crate) fn active_ready_repair_status(
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
+pub(crate) fn abandoned_ready_repair_status(
+    project_root: &Path,
+    run_id: Option<&str>,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths(project_root, run_id)
+        .into_iter()
+        .filter_map(|path| read_abandoned_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
 pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> String {
     ready_repair_status_paths(project_root, None)
         .into_iter()
@@ -302,6 +314,28 @@ fn read_ready_repair_status(
     }
     let age_ms = now_epoch_ms.saturating_sub(status.updated_at_epoch_ms);
     if age_ms > READY_REPAIR_STATUS_TTL.as_millis() as i64 {
+        return None;
+    }
+    Some(status)
+}
+
+fn read_abandoned_ready_repair_status(
+    path: &Path,
+    project_root: &Path,
+    now_epoch_ms: i64,
+) -> Option<ReadyRepairStatus> {
+    let status = read_ready_repair_status_file(path)?;
+    if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
+        || status.status != "repairing"
+        || status.profile != SidecarProfile::Agent.as_str()
+        || !same_path_text(Path::new(&status.project_root), project_root)
+    {
+        return None;
+    }
+    let age_ms = now_epoch_ms.saturating_sub(status.updated_at_epoch_ms);
+    if age_ms <= READY_REPAIR_STATUS_TTL.as_millis() as i64
+        || age_ms > READY_REPAIR_ABANDONED_STATUS_TTL.as_millis() as i64
+    {
         return None;
     }
     Some(status)

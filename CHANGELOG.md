@@ -34,6 +34,8 @@
 - Serialized first-boot agent sidecar port allocation through a cache-backed
   registry so concurrent namespaces do not choose duplicate dynamic ports before
   state files exist.
+- Reported stale ready-repair status as abandoned sidecar work in MCP status
+  with bounded inspect and cleanup commands instead of hiding aborted repairs.
 
 ### Documentation
 

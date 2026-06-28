@@ -3442,6 +3442,11 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     let next_repair_command =
         env_nonempty("CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND").unwrap_or(default_repair);
     let active_repair = crate::ready_repair_status::active_ready_repair_status(project_root, None);
+    let abandoned_repair = active_repair
+        .as_ref()
+        .is_none()
+        .then(|| crate::ready_repair_status::abandoned_ready_repair_status(project_root, None))
+        .flatten();
     serde_json::json!({
         "state": state,
         "auto_repair": auto_repair,
@@ -3479,8 +3484,54 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "phase": &status.phase,
             "pid": status.pid,
             "updated_at_epoch_ms": status.updated_at_epoch_ms
-        }))
+        })),
+        "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned"))
     })
+}
+
+fn stdio_ready_repair_status_json(
+    project_root: &Path,
+    status: &crate::ready_repair_status::ReadyRepairStatus,
+    state: &str,
+) -> serde_json::Value {
+    let run_id = status
+        .run_id
+        .as_deref()
+        .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    serde_json::json!({
+        "status": state,
+        "recorded_status": &status.status,
+        "project_root": &status.project_root,
+        "profile": &status.profile,
+        "run_id": &status.run_id,
+        "namespace": &status.namespace,
+        "phase": &status.phase,
+        "pid": status.pid,
+        "updated_at_epoch_ms": status.updated_at_epoch_ms,
+        "age_ms": crate::ready_repair_status::now_epoch_ms().saturating_sub(status.updated_at_epoch_ms),
+        "inspect_command": stdio_agent_retrieval_status_command(project_root, run_id),
+        "cleanup_command": stdio_agent_retrieval_down_command(project_root, run_id)
+    })
+}
+
+fn stdio_agent_retrieval_status_command(project_root: &Path, run_id: &str) -> String {
+    format!(
+        "codestory-cli retrieval status --project {} --profile agent --run-id {} --format json",
+        crate::display::quote_command_argument_value(&crate::display::clean_path_string(
+            &project_root.to_string_lossy()
+        )),
+        crate::display::quote_command_argument_value(run_id)
+    )
+}
+
+fn stdio_agent_retrieval_down_command(project_root: &Path, run_id: &str) -> String {
+    format!(
+        "codestory-cli retrieval down --project {} --profile agent --run-id {}",
+        crate::display::quote_command_argument_value(&crate::display::clean_path_string(
+            &project_root.to_string_lossy()
+        )),
+        crate::display::quote_command_argument_value(run_id)
+    )
 }
 
 fn stdio_sidecar_policy_file() -> Option<serde_json::Value> {
@@ -3577,6 +3628,17 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     run_id
                 ),
+                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+            }
+        });
+    }
+    if let Some(status) =
+        crate::ready_repair_status::abandoned_ready_repair_status(&runtime.project_root, None)
+    {
+        return serde_json::json!({
+            "result": {
+                "status": "abandoned_repair",
+                "abandoned_repair": stdio_ready_repair_status_json(&runtime.project_root, &status, "abandoned"),
                 "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }
         });
