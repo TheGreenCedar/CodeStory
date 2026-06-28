@@ -521,7 +521,7 @@ fn sidecar_primary_search_outcome_from_query_result(
         &resolved_hits,
     );
 
-    if let Some(reason) = sidecar_result_rejection_reason(&query_result, &resolved_hits) {
+    if let Some(reason) = packet_primary_result_rejection_reason(&query_result, &resolved_hits) {
         let diagnostic = sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
         let reason = format!("{reason}; {diagnostic}");
         return SidecarPrimarySearchOutcome::Rejected { shadow, reason };
@@ -545,6 +545,17 @@ fn sidecar_primary_search_outcome_from_query_result(
         scored_hits,
         shadow,
     }
+}
+
+fn packet_primary_result_rejection_reason(
+    query_result: &QueryResult,
+    resolved_hits: &[SearchHit],
+) -> Option<String> {
+    let reason = sidecar_result_rejection_reason(query_result, resolved_hits)?;
+    if sidecar_blocking_cancel_reason(query_result).is_some() && !resolved_hits.is_empty() {
+        return None;
+    }
+    Some(reason)
 }
 
 pub(crate) fn search_sidecar_packet_batch(
@@ -3036,6 +3047,100 @@ mod tests {
                 "reason should preserve candidate resolution failure: {reason}"
             ),
             _ => panic!("candidate resolution errors must make primary search unavailable"),
+        }
+    }
+
+    #[test]
+    fn sidecar_primary_search_serves_cancelled_full_trace_with_resolved_hits() {
+        use codestory_retrieval::CandidateSource;
+        use codestory_store::{FileInfo, FileRole, Store};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_path = temp.path().join("cache").join("codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let source_path = temp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "pub fn packaged_agent_proof() {}\n").expect("write source");
+
+        {
+            let mut storage = Store::open(&storage_path).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("insert file");
+            storage
+                .insert_nodes_batch(&[
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(1),
+                        kind: NodeKind::FILE,
+                        serialized_name: source_path.to_string_lossy().to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                    codestory_contracts::graph::Node {
+                        id: CoreNodeId(2),
+                        kind: NodeKind::FUNCTION,
+                        serialized_name: "packaged_agent_proof".to_string(),
+                        file_node_id: Some(CoreNodeId(1)),
+                        start_line: Some(1),
+                        ..Default::default()
+                    },
+                ])
+                .expect("insert nodes");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project_with_storage_path(temp.path().to_path_buf(), storage_path)
+            .expect("open project");
+        let mut candidate = CandidateHit::with_source(
+            source_path.to_string_lossy().to_string(),
+            Some("packaged_agent_proof".to_string()),
+            0.9,
+            CandidateSource::Scip,
+        );
+        candidate.node_id = Some("2".to_string());
+        let query_result = QueryResult {
+            query: "Explain how CodeStory validates packaged agent readiness.".into(),
+            features: classify_query("Explain how CodeStory validates packaged agent readiness."),
+            hits: vec![candidate],
+            trace: QueryTrace {
+                retrieval_mode: "full".into(),
+                degraded_reason: None,
+                total_budget_ms: 500,
+                elapsed_ms: 290,
+                cancel_reason: Some("stage_deadline".into()),
+                cache_hit: false,
+                stages: Vec::new(),
+            },
+        };
+
+        let outcome =
+            sidecar_primary_search_outcome_from_query_result(&controller, query_result, 5);
+
+        match outcome {
+            SidecarPrimarySearchOutcome::Served { hits, shadow, .. } => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(shadow.cancel_reason.as_deref(), Some("stage_deadline"));
+                assert_eq!(shadow.resolved_hit_count, 1);
+            }
+            SidecarPrimarySearchOutcome::Rejected { reason, .. } => {
+                panic!("resolved cancelled packet primary trace should serve: {reason}")
+            }
+            SidecarPrimarySearchOutcome::Unavailable { reason } => {
+                panic!("resolved cancelled packet primary trace should stay available: {reason}")
+            }
         }
     }
 
