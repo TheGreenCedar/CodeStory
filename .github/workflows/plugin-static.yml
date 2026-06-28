@@ -6,6 +6,7 @@ on:
       - plugins/codestory/**
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/rust-ci.yml
       - .github/workflows/plugin-static.yml
   push:
     branches:
@@ -15,6 +16,7 @@ on:
       - plugins/codestory/**
       - .github/scripts/check-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/workflows/rust-ci.yml
       - .github/workflows/plugin-static.yml
   workflow_dispatch:
 
