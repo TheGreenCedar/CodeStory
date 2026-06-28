@@ -37,6 +37,24 @@ Then install from `/plugins` as above. Marketplace catalog repo:
 `TheGreenCedar/AgentPluginMarketplace`; plugin source lives in this repository
 at `plugins/codestory`.
 
+## Refresh or update
+
+There are three separate steps:
+
+1. `codex plugin marketplace upgrade TheGreenCedar` refreshes the marketplace
+   snapshot only.
+2. `/plugins` refresh or `codex plugin add codestory@TheGreenCedar` updates
+   the installed plugin package.
+3. A fresh Codex host session starts the new MCP adapter and lets it provision
+   the matching managed CLI.
+
+If terminal refresh fails on Windows with `Access is denied` while backing up
+the plugin cache, quit stale Codex windows that may still be running the old
+CodeStory MCP process, then retry the `/plugins` refresh or terminal install.
+The marketplace may already show the new version before the running host has
+reloaded the package; prove the active runtime with a fresh
+`codestory://status` read.
+
 ## Install verification
 
 Run these three checks before your first real task:
@@ -117,6 +135,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | --- | --- |
 | `@CodeStory` loads but no MCP tools | Start a fresh Codex host session after install; confirm plugin shows in `/plugins` |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
+| Terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Agent can call `sidecar_setup`; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Hooks time out | Hooks fail open; ask the explicit status prompt above |
 
