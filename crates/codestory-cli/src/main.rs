@@ -2191,7 +2191,7 @@ pub(crate) fn wait_for_local_freshness(
     let summary = inspect_runtime.open_project_summary()?;
     if !local_freshness_needs_refresh(&summary) {
         let mut output = local_refresh_output_from_summary(&summary);
-        if output.state == readiness::LocalRefreshState::Fresh {
+        if output.state == readiness::LocalRefreshState::Refreshed {
             output.reason = Some("already_fresh".to_string());
         }
         return Ok((summary, Some(output)));
@@ -2201,7 +2201,7 @@ pub(crate) fn wait_for_local_freshness(
     match index_runtime.ensure_open(args::RefreshMode::Incremental) {
         Ok(opened) => {
             let mut output = local_refresh_output_from_summary(&opened.summary);
-            if output.state == readiness::LocalRefreshState::Fresh {
+            if output.state == readiness::LocalRefreshState::Refreshed {
                 output.reason = Some("refreshed".to_string());
             } else {
                 output.state = readiness::LocalRefreshState::Failed;
@@ -2230,7 +2230,9 @@ pub(crate) fn local_freshness_needs_refresh(summary: &ProjectSummary) -> bool {
     })
 }
 
-fn local_refresh_output_from_summary(summary: &ProjectSummary) -> readiness::LocalRefreshOutput {
+pub(crate) fn local_refresh_output_from_summary(
+    summary: &ProjectSummary,
+) -> readiness::LocalRefreshOutput {
     let verdict = readiness::build_readiness_verdict(
         ReadinessGoalDto::LocalNavigation,
         readiness::ReadinessInputs {
@@ -2251,7 +2253,7 @@ fn classify_local_refresh_failure_state(error: &anyhow::Error) -> readiness::Loc
         || message.contains("database table is locked")
         || message.contains("cache is busy")
     {
-        readiness::LocalRefreshState::SkippedLocked
+        readiness::LocalRefreshState::Skipped
     } else {
         readiness::LocalRefreshState::Failed
     }
@@ -12584,7 +12586,7 @@ mod tests {
         let locked = anyhow::anyhow!("cache_busy: database is locked");
         assert_eq!(
             classify_local_refresh_failure_state(&locked),
-            readiness::LocalRefreshState::SkippedLocked
+            readiness::LocalRefreshState::Skipped
         );
 
         let failed = anyhow::anyhow!("index refresh failed");

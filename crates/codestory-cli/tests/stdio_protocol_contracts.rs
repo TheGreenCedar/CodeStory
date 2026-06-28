@@ -2295,7 +2295,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["local_refresh"]["state"],
-        json!("fresh"),
+        json!("refreshed"),
         "fresh local graph state should be explicit even when sidecar retrieval is unavailable: {status}"
     );
     assert_eq!(
@@ -2384,7 +2384,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["runtime_truth"]["readiness_lanes"]["local_graph"]["refresh_state"],
-        json!("fresh"),
+        json!("refreshed"),
         "runtime truth should include local refresh state: {status}"
     );
     assert_eq!(
@@ -2733,6 +2733,15 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
         "Qdrant finalize",
     );
     assert!(status_path.exists(), "repair status fixture should exist");
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        r#"pub fn normalize_project(project_name: &str) -> String {
+    format!("active-repair:{project_name}")
+}
+"#,
+    )
+    .expect("make local graph stale while active repair is running");
     let mut server = spawn_stdio_server(&fixture);
 
     let status_response = send_json(
@@ -2757,6 +2766,35 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
         setup["active_repair"]["run_id"],
         json!(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
         "{setup}"
+    );
+    let status_resource = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-status-active-resource",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status_result = assert_success_envelope(
+        &status_resource,
+        json!("sidecar-setup-status-active-resource"),
+    );
+    let status = json_resource_content(status_result, "codestory://status");
+    assert_eq!(
+        status["local_refresh"]["state"],
+        json!("refreshing"),
+        "active repair should compact stale local refresh chatter into a refreshing lane: {status}"
+    );
+    assert_eq!(
+        status["local_refresh"]["reason"],
+        json!("active_ready_repair:Qdrant finalize"),
+        "{status}"
+    );
+    assert_eq!(
+        status["effective_index_freshness"]["status"],
+        json!("stale"),
+        "maintainer JSON should still expose stale freshness detail while agent status stays compact: {status}"
     );
 
     let repair_response = send_json(
@@ -2838,7 +2876,7 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
         status["effective_index_freshness"]["status"],
         json!("stale")
     );
-    assert_eq!(status["local_refresh"]["state"], json!("stale"));
+    assert_eq!(status["local_refresh"]["state"], json!("skipped"));
     assert_eq!(
         status["local_refresh"]["blocks_local_surfaces"],
         json!(true)
@@ -3164,7 +3202,7 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
 }
 
 #[test]
-fn resources_read_status_refreshes_long_lived_stale_index_with_bounded_latency() {
+fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded_latency() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
     let warmup = send_json(
