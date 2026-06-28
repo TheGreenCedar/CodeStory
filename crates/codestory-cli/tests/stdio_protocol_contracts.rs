@@ -727,6 +727,32 @@ fn write_active_repair_status_fixture(
     run_id: &str,
     phase: &str,
 ) -> (PathBuf, RemoveDirOnDrop) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64;
+    write_repair_status_fixture(fixture, run_id, phase, now)
+}
+
+fn write_abandoned_repair_status_fixture(
+    fixture: &StdioFixture,
+    run_id: &str,
+    phase: &str,
+) -> (PathBuf, RemoveDirOnDrop) {
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64
+        - 60_000;
+    write_repair_status_fixture(fixture, run_id, phase, updated_at)
+}
+
+fn write_repair_status_fixture(
+    fixture: &StdioFixture,
+    run_id: &str,
+    phase: &str,
+    updated_at_epoch_ms: i64,
+) -> (PathBuf, RemoveDirOnDrop) {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
     let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
@@ -743,10 +769,6 @@ fn write_active_repair_status_fixture(
         .expect("repair status parent")
         .to_path_buf();
     fs::create_dir_all(&status_dir).expect("create repair status dir");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as i64;
     let project_root = canonical_root
         .to_string_lossy()
         .trim_start_matches(r"\\?\")
@@ -765,8 +787,8 @@ fn write_active_repair_status_fixture(
             "compose_project": sidecar.compose_project,
             "phase": phase,
             "pid": 4242,
-            "started_at_epoch_ms": now,
-            "updated_at_epoch_ms": now
+            "started_at_epoch_ms": updated_at_epoch_ms,
+            "updated_at_epoch_ms": updated_at_epoch_ms
         })
         .to_string(),
     )
@@ -2535,6 +2557,74 @@ fn resources_read_status_reports_active_agent_repair_phase() {
                 && command.contains("--run-id")
                 && command.contains("issue-661-proof")),
         "repairing lane should point at status proof, not a second repair: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_reports_abandoned_agent_repair_actions() {
+    let fixture = indexed_fixture();
+    let (status_path, _cleanup) =
+        write_abandoned_repair_status_fixture(&fixture, "aborted-run", "Embedding documents");
+    assert!(status_path.exists(), "repair status fixture should exist");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-abandoned-repair",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-abandoned-repair"));
+    let status = json_resource_content(result, "codestory://status");
+    assert_eq!(status["sidecar_setup"]["active_repair"], Value::Null);
+    assert_eq!(
+        status["sidecar_setup"]["abandoned_repair"]["status"],
+        json!("abandoned"),
+        "{status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["abandoned_repair"]["run_id"],
+        json!("aborted-run"),
+        "{status}"
+    );
+    assert!(
+        status["sidecar_setup"]["abandoned_repair"]["inspect_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--run-id")
+                && command.contains("aborted-run")),
+        "abandoned repair should include a bounded inspect command: {status}"
+    );
+    assert!(
+        status["sidecar_setup"]["abandoned_repair"]["cleanup_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval down")
+                && command.contains("--run-id")
+                && command.contains("aborted-run")),
+        "abandoned repair should include an explicit cleanup command: {status}"
+    );
+
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair-abandoned",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair-abandoned"));
+    assert_eq!(repair["status"], json!("abandoned_repair"), "{repair}");
+    assert_eq!(
+        repair["abandoned_repair"]["cleanup_command"],
+        status["sidecar_setup"]["abandoned_repair"]["cleanup_command"],
+        "{repair}"
     );
 }
 
