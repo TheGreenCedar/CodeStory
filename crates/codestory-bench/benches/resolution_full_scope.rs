@@ -7,6 +7,8 @@ const FILE_COUNT: usize = 140;
 const CALLERS_PER_FILE: usize = 22;
 const CALL_EDGES_PER_CALLER: usize = 8;
 const IMPORT_EDGES_PER_FILE: usize = 12;
+const OWNER_ALIAS_CALL_COUNT: usize = 2_000;
+const OWNER_ALIAS_NOISE_NODE_COUNT: usize = 8_000;
 
 const CALL_TARGETS: &[&str] = &[
     "run", "save", "persist", "notify", "track", "compute", "helper", "build",
@@ -27,6 +29,17 @@ fn bench_resolution_full_scope(c: &mut Criterion) {
         b.iter(|| {
             reset_resolution_columns(&storage).expect("failed to reset resolution");
             resolver.run(&mut storage).expect("resolution pass failed");
+        })
+    });
+
+    let mut owner_alias_storage = build_owner_alias_benchmark_storage()
+        .expect("failed to seed owner-alias benchmark storage");
+    c.bench_function("resolution_owner_alias_member_calls", |b| {
+        b.iter(|| {
+            reset_resolution_columns(&owner_alias_storage).expect("failed to reset resolution");
+            resolver
+                .run(&mut owner_alias_storage)
+                .expect("resolution pass failed");
         })
     });
 }
@@ -204,6 +217,110 @@ fn build_benchmark_storage() -> anyhow::Result<Storage> {
             });
             edge_id += 1;
         }
+    }
+
+    storage.insert_nodes_batch(&nodes)?;
+    storage.insert_edges_batch(&edges)?;
+    Ok(storage)
+}
+
+fn build_owner_alias_benchmark_storage() -> anyhow::Result<Storage> {
+    let mut storage = Storage::new_in_memory()?;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut node_id = 1_i64;
+    let mut edge_id = 1_i64;
+
+    let file_id = node_id;
+    node_id += 1;
+    nodes.push(Node {
+        id: NodeId(file_id),
+        kind: NodeKind::FILE,
+        serialized_name: "/bench/owner_alias.rs".to_string(),
+        qualified_name: None,
+        canonical_id: None,
+        file_node_id: None,
+        start_line: Some(1),
+        start_col: Some(1),
+        end_line: Some(1),
+        end_col: Some(1),
+    });
+
+    nodes.push(Node {
+        id: NodeId(node_id),
+        kind: NodeKind::METHOD,
+        serialized_name: "Storage.open".to_string(),
+        qualified_name: Some("crate::Storage::open".to_string()),
+        canonical_id: None,
+        file_node_id: Some(NodeId(file_id)),
+        start_line: Some(2),
+        start_col: Some(1),
+        end_line: Some(2),
+        end_col: Some(20),
+    });
+    node_id += 1;
+
+    for idx in 0..OWNER_ALIAS_NOISE_NODE_COUNT {
+        nodes.push(Node {
+            id: NodeId(node_id),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("Noise{idx}.unrelated"),
+            qualified_name: Some(format!("crate::Noise{idx}::unrelated")),
+            canonical_id: None,
+            file_node_id: Some(NodeId(file_id)),
+            start_line: Some((10 + idx) as u32),
+            start_col: Some(1),
+            end_line: Some((10 + idx) as u32),
+            end_col: Some(20),
+        });
+        node_id += 1;
+    }
+
+    let caller_id = node_id;
+    node_id += 1;
+    nodes.push(Node {
+        id: NodeId(caller_id),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "caller".to_string(),
+        qualified_name: Some("crate::caller".to_string()),
+        canonical_id: None,
+        file_node_id: Some(NodeId(file_id)),
+        start_line: Some(20_000),
+        start_col: Some(1),
+        end_line: Some(20_000),
+        end_col: Some(20),
+    });
+
+    for idx in 0..OWNER_ALIAS_CALL_COUNT {
+        let target_id = node_id;
+        node_id += 1;
+        nodes.push(Node {
+            id: NodeId(target_id),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "open".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_node_id: Some(NodeId(file_id)),
+            start_line: Some((21_000 + idx) as u32),
+            start_col: Some(1),
+            end_line: Some((21_000 + idx) as u32),
+            end_col: Some(8),
+        });
+        edges.push(Edge {
+            id: EdgeId(edge_id),
+            source: NodeId(caller_id),
+            target: NodeId(target_id),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(file_id)),
+            line: Some((21_000 + idx) as u32),
+            resolved_source: None,
+            resolved_target: None,
+            confidence: None,
+            certainty: None,
+            callsite_identity: Some("receiver-owner:Store".to_string()),
+            candidate_targets: Vec::new(),
+        });
+        edge_id += 1;
     }
 
     storage.insert_nodes_batch(&nodes)?;

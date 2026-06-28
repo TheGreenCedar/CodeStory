@@ -2239,9 +2239,13 @@ impl CandidateIndex {
         let key = (name.to_string(), name_ascii_lower.to_string());
         self.cached_lookup(&self.global_owner_alias_cache, key, || {
             let (requested_owner, requested_member) = split_owner_member_name(name)?;
+            let offsets = self.owner_member_candidate_offsets(requested_owner, requested_member);
             let mut selected = None;
             let mut ambiguous = false;
-            for node in &self.nodes {
+            for offset in offsets {
+                let Some(node) = self.nodes.get(offset) else {
+                    continue;
+                };
                 let Some((candidate_owner, candidate_member)) =
                     split_owner_member_name(&node.serialized_name)
                 else {
@@ -2261,6 +2265,39 @@ impl CandidateIndex {
             }
             (!ambiguous).then_some(selected).flatten()
         })
+    }
+
+    fn owner_member_candidate_offsets(&self, owner_name: &str, method_name: &str) -> Vec<usize> {
+        let method_name_ascii_lower = method_name.to_ascii_lowercase();
+        let owner_dot_name = format!("{owner_name}.{method_name}");
+        let owner_colon_name = format!("{owner_name}::{method_name}");
+        let owner_dot_name_ascii_lower = owner_dot_name.to_ascii_lowercase();
+        let owner_colon_name_ascii_lower = owner_colon_name.to_ascii_lowercase();
+        let mut offsets = Vec::new();
+        if let Some(exact) = self.exact_map.get(method_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(exact) = self.exact_map.get(&owner_dot_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(exact) = self.exact_map.get(&owner_colon_name) {
+            offsets.extend(exact.iter().copied());
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&method_name_ascii_lower) {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self.suffix_map_ascii_lower.get(&owner_dot_name_ascii_lower) {
+            offsets.extend(suffix.iter().copied());
+        }
+        if let Some(suffix) = self
+            .suffix_map_ascii_lower
+            .get(&owner_colon_name_ascii_lower)
+        {
+            offsets.extend(suffix.iter().copied());
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
     }
 
     #[cfg(test)]
@@ -3338,6 +3375,42 @@ mod tests {
                 "Client",
                 "client",
             ),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_owner_alias_lookup_uses_member_candidate_offsets() {
+        let mut nodes = (0..250)
+            .map(|idx| CandidateNode {
+                id: 10_000 + idx,
+                file_node_id: Some(1),
+                file_path: None,
+                normalized_file_path: None,
+                serialized_name: format!("Noise{idx}.unrelated"),
+                serialized_name_ascii_lower: format!("noise{idx}.unrelated"),
+                qualified_name: None,
+            })
+            .collect::<Vec<_>>();
+        nodes.push(CandidateNode {
+            id: 42,
+            file_node_id: Some(1),
+            file_path: None,
+            normalized_file_path: None,
+            serialized_name: "Storage.open".to_string(),
+            serialized_name_ascii_lower: "storage.open".to_string(),
+            qualified_name: None,
+        });
+        let index = CandidateIndex::from_nodes(nodes);
+
+        let offsets = index.owner_member_candidate_offsets("Store", "open");
+        assert_eq!(
+            offsets.len(),
+            1,
+            "owner alias lookup should narrow to member candidates before alias filtering"
+        );
+        assert_eq!(
+            index.find_global_unique_owner_alias_readonly("Store.open", "store.open"),
             Some(42)
         );
     }
