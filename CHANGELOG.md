@@ -9,6 +9,8 @@
   overwrite existing release state.
 - Removed shell execution from default file-open fallbacks so repo paths with
   shell metacharacters are passed as process arguments.
+- Shared retrieval file-role state across strict batch workers so cache-miss
+  fan-out does not clone the repo-wide role map per worker.
 - Kept retrieval bootstrap Qdrant repair on the selected sidecar runtime so
   explicit agent profiles and run IDs do not fall back to ambient/default
   runtime layout during collection repair.
