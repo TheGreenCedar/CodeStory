@@ -131,6 +131,7 @@ Does not prove agent packet/search readiness.
 | Variable | Purpose |
 | --- | --- |
 | `CODESTORY_CLI` | Local-dev override for MCP adapter binary path |
+| `CODESTORY_IDE_COMMAND` | Optional shell command template for definition-open actions. Supports `{file}`, `{line}`, and `{col}`; set only trusted local templates because the template runs through your shell. |
 | `CODESTORY_NO_TUI` | Disable TUI for `explore` in CI or scripts |
 | `CODESTORY_SUMMARY_ENDPOINT` | Trusted summary endpoint |
 | `CODESTORY_EMBED_LLAMACPP_URL` | Trusted embedding endpoint |

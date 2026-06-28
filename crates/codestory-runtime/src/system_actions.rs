@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::OsString;
 use std::process::Command;
 
 pub(super) fn expand_ide_template(
@@ -25,19 +26,19 @@ pub(super) fn run_shell_command(command: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn open_with_os_default(path: &Path) -> io::Result<()> {
+fn os_default_open_invocation(path: &Path) -> (&'static str, Vec<OsString>) {
     if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(path)
-            .spawn()?;
-        return Ok(());
+        return ("explorer", vec![path.as_os_str().to_os_string()]);
     }
     if cfg!(target_os = "macos") {
-        Command::new("open").arg(path).spawn()?;
-        return Ok(());
+        return ("open", vec![path.as_os_str().to_os_string()]);
     }
-    Command::new("xdg-open").arg(path).spawn()?;
+    ("xdg-open", vec![path.as_os_str().to_os_string()])
+}
+
+pub(super) fn open_with_os_default(path: &Path) -> io::Result<()> {
+    let (program, args) = os_default_open_invocation(path);
+    Command::new(program).args(args).spawn()?;
     Ok(())
 }
 
@@ -71,6 +72,7 @@ pub(super) fn launch_definition_in_ide(
     if let Ok(template) = std::env::var("CODESTORY_IDE_COMMAND") {
         let trimmed = template.trim();
         if !trimmed.is_empty() {
+            // CODESTORY_IDE_COMMAND is an explicit user shell template.
             let expanded = expand_ide_template(trimmed, path, line, col);
             if run_shell_command(&expanded).is_ok() {
                 return Ok(status_response(format!(
@@ -108,4 +110,28 @@ pub(super) fn launch_definition_in_ide(
         "Opened definition with OS default handler: {}",
         path.display()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn os_default_open_passes_metacharacter_path_as_argument() {
+        let path = Path::new("repo & $(touch nope); file.rs");
+        let (program, args) = os_default_open_invocation(path);
+
+        assert_ne!(program, "cmd");
+        assert_ne!(program, "sh");
+        assert_eq!(args, vec![path.as_os_str().to_os_string()]);
+    }
+
+    #[test]
+    fn ide_template_substitution_is_for_explicit_shell_templates() {
+        let path = Path::new("repo & $(touch nope); file.rs");
+
+        let expanded = expand_ide_template("code --goto {file}:{line}:{col}", path, Some(7), None);
+
+        assert_eq!(expanded, "code --goto repo & $(touch nope); file.rs:7:1");
+    }
 }
