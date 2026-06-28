@@ -31,6 +31,9 @@
   project.
 - Moved Codex worktree setup from local/default retrieval bootstrap/index steps
   to the shared agent readiness lane used by MCP packet/search.
+- Serialized first-boot agent sidecar port allocation through a cache-backed
+  registry so concurrent namespaces do not choose duplicate dynamic ports before
+  state files exist.
 
 ### Documentation
 
