@@ -2026,7 +2026,7 @@ mod tests {
             "waitForHttpHealth",
             NodeKind::FUNCTION,
             0.95,
-            "scripts/cross-repo-promotion-benchmark.mjs",
+            "scripts/codestory-agent-ab-benchmark.mjs",
         );
         let application_script = hit_at_path(
             "script",

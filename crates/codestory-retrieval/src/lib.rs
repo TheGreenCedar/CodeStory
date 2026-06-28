@@ -41,8 +41,6 @@ pub use cache::{RetrievalCache, RetrievalCacheKey};
 pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
-#[allow(deprecated)]
-pub use compose::bootstrap_sidecars_without_storage_scope;
 pub use compose::{
     BootstrapReport, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory, bootstrap_sidecars,
     bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,

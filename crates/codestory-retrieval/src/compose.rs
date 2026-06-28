@@ -180,27 +180,6 @@ fn with_bootstrap_progress<T>(
     action()
 }
 
-/// Deprecated: pass [`BootstrapStorageScope::from_parts`] as the second argument to [`bootstrap_sidecars`].
-#[deprecated(
-    since = "0.4.0",
-    note = "use bootstrap_sidecars(repo_root, &BootstrapStorageScope::from_parts(repo_root, None, None), compose_file, skip_compose, wait_timeout)"
-)]
-pub fn bootstrap_sidecars_without_storage_scope(
-    repo_root: Option<&Path>,
-    compose_file: Option<&Path>,
-    skip_compose: bool,
-    wait_timeout: Duration,
-) -> Result<BootstrapReport> {
-    let storage_scope = BootstrapStorageScope::from_parts(repo_root, None, None);
-    bootstrap_sidecars(
-        repo_root,
-        &storage_scope,
-        compose_file,
-        skip_compose,
-        wait_timeout,
-    )
-}
-
 pub fn resolve_compose_file(
     repo_root: Option<&Path>,
     override_path: Option<&Path>,
