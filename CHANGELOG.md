@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Made packaged and post-publish agent proof fail when the installed plugin MCP
+  launcher omits server-advertised `codestory://status` or
+  `codestory://agent-guide` resources, while leaving true Codex host/model
+  visibility proof open.
+
 ## 0.12.6
 
 CodeStory 0.12.6 promotes the current `dev/codestory-next` release automation,

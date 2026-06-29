@@ -81,6 +81,14 @@ Binary release assets are packaging evidence only. They are not packet/search
 readiness proof; keep using the sidecar evidence tiers below before claiming
 agent-facing packet/search readiness.
 
+Release and post-publish agent proof must also exercise the installed plugin
+launcher with `--plugin-root plugins/codestory`. The packaged proof fails if
+the MCP `resources/list` response does not expose both `codestory://status` and
+`codestory://agent-guide`, and its `plugin-stdio-status.json` artifact records
+the active plugin runtime plus observed and missing server-advertised MCP
+resources. This proves the installed plugin launcher advertises the resources;
+it is not Codex host/model visibility proof.
+
 ## Docs-Only Fast Path
 
 If you only changed documentation or plugin doc surfaces, use the smallest credible
