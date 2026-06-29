@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Blocked CodeStory grounding when the plugin MCP is launchable but not
+  model-visible, even when a managed CLI exists; diagnostic fail-open mode now
+  exposes status/repair guidance instead of normal grounding tool names.
+
 ## 0.12.6
 
 CodeStory 0.12.6 promotes the current `dev/codestory-next` release automation,

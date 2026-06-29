@@ -1166,25 +1166,6 @@ function resourceContents(uri, value) {
   };
 }
 
-function failOpenToolResult(status) {
-  const readiness = status.readiness[0];
-  return {
-    isError: true,
-    content: [{ type: 'text', text: diagnosticText(status) }],
-    structuredContent: {
-      code: 'codestory_mcp_runtime_unavailable',
-      status: readiness.status,
-      repair_reason: status.degraded_reason,
-      local_refresh: status.local_refresh || null,
-      plugin_runtime: status.plugin_runtime,
-      setup: readiness.setup,
-      minimum_next: readiness.minimum_next,
-      full_repair: readiness.full_repair,
-      recommended_next_calls: status.recommended_next_calls,
-    },
-  };
-}
-
 function failOpenSidecarSetupResult(request) {
   const action = request.params?.arguments?.action || 'status';
   if (!['status', 'enable', 'disable', 'ask', 'repair'].includes(action)) {
@@ -1210,13 +1191,7 @@ function failOpenSidecarSetupResult(request) {
 }
 
 function runFailOpenMcp(status) {
-  const tools = ['ground', 'files', 'packet', 'search', 'context'].map((name) => ({
-    name,
-    description: 'CodeStory diagnostic fail-open surface; runtime repair is required before this tool can return repository grounding.',
-    inputSchema: { type: 'object', additionalProperties: true },
-    outputSchema: { type: 'object', additionalProperties: true },
-  }));
-  tools.unshift({
+  const tools = [{
     name: 'sidecar_setup',
     description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
     inputSchema: {
@@ -1240,7 +1215,7 @@ function runFailOpenMcp(status) {
       idempotentHint: true,
       openWorldHint: false,
     },
-  });
+  }];
   const resources = [
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
@@ -1287,12 +1262,9 @@ function runFailOpenMcp(status) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        response = jsonrpcResult(
-          request.id,
-          request.params?.name === 'sidecar_setup'
-            ? failOpenSidecarSetupResult(request)
-            : failOpenToolResult(status),
-        );
+        response = request.params?.name === 'sidecar_setup'
+          ? jsonrpcResult(request.id, failOpenSidecarSetupResult(request))
+          : jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status or call sidecar_setup.');
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }
