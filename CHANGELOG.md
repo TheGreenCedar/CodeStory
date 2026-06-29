@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Bounded required-probe citation promotion by deduplicating probe queries and
+  using set membership for promoted citation indexes, with a regression guard
+  for large synthetic packet capping.
+
 ## 0.12.6
 
 CodeStory 0.12.6 promotes the current `dev/codestory-next` release automation,
