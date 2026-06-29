@@ -103,7 +103,7 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     );
     let agent_json: Value = serde_json::from_str(&agent_json_text).expect("ready agent json");
     let agent = &agent_json["verdicts"][0];
-    assert_eq!(agent["status"], "repair_retrieval");
+    assert_eq!(agent["status"], "blocked");
     assert_eq!(
         agent["sidecar"]["degraded_reason"],
         "retrieval_manifest_missing"

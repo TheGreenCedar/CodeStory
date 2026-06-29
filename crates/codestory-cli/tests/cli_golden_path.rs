@@ -671,9 +671,7 @@ fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     );
     let markdown = String::from_utf8_lossy(&markdown.stdout);
     assert!(
-        markdown.contains(
-            "readiness: local_navigation=repair_index agent_packet_search=repair_retrieval"
-        ),
+        markdown.contains("readiness: local_navigation=repair_index agent_packet_search=blocked"),
         "doctor markdown should show local index repair without collapsing agent retrieval readiness:\n{markdown}"
     );
 }
@@ -729,7 +727,7 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
         "local/default lane should expose a local-scoped next command: {doctor:#}"
     );
     assert_eq!(
-        doctor["readiness_lanes"]["agent_packet_search"]["status"], "repair_retrieval",
+        doctor["readiness_lanes"]["agent_packet_search"]["status"], "blocked",
         "doctor should keep agent packet/search readiness separate: {doctor:#}"
     );
     assert_eq!(
@@ -776,8 +774,8 @@ fn doctor_next_commands_stop_at_retrieval_repair_when_sidecar_is_not_full() {
     );
     let markdown = String::from_utf8_lossy(&markdown.stdout);
     assert!(
-        markdown.contains("readiness: local_navigation=ready agent_packet_search=repair_retrieval"),
-        "doctor markdown should show split readiness with retrieval repair for agent use:\n{markdown}"
+        markdown.contains("readiness: local_navigation=ready agent_packet_search=blocked"),
+        "doctor markdown should show split readiness with blocked agent packet/search:\n{markdown}"
     );
 }
 
@@ -811,7 +809,7 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         "{preflight:#}"
     );
     assert_eq!(
-        preflight["full_retrieval"]["status"], "repair_retrieval",
+        preflight["full_retrieval"]["status"], "blocked",
         "{preflight:#}"
     );
     assert_eq!(
@@ -829,7 +827,7 @@ fn agent_preflight_reports_local_graph_when_retrieval_is_degraded() {
         "local/default lane should expose a local-scoped next command: {preflight:#}"
     );
     assert_eq!(
-        preflight["agent_packet_search"]["status"], "repair_retrieval",
+        preflight["agent_packet_search"]["status"], "blocked",
         "preflight should expose agent packet/search lane: {preflight:#}"
     );
     assert_eq!(
@@ -927,11 +925,11 @@ pub fn schedule_index(project_path: &str) -> usize {
         "{preflight:#}"
     );
     assert_eq!(
-        preflight["full_retrieval"]["status"], "repair_retrieval",
+        preflight["full_retrieval"]["status"], "blocked",
         "local refresh must not claim full retrieval readiness: {preflight:#}"
     );
     assert_eq!(
-        preflight["agent_packet_search"]["status"], "repair_retrieval",
+        preflight["agent_packet_search"]["status"], "blocked",
         "agent packet/search should remain fail-closed without full sidecars: {preflight:#}"
     );
     assert!(
@@ -1004,7 +1002,7 @@ pub fn schedule_index(project_path: &str) -> usize {
         "local graph surfaces should stay blocked when refresh does not finish: {preflight:#}"
     );
     assert_eq!(
-        preflight["agent_packet_search"]["status"], "repair_retrieval",
+        preflight["agent_packet_search"]["status"], "blocked",
         "timeout must not escalate into agent sidecar repair or readiness: {preflight:#}"
     );
 }
@@ -1067,8 +1065,8 @@ fn doctor_reports_current_and_stored_semantic_doc_embedding_contract() {
     );
     let sidecar_check = check_with_name(&doctor, "sidecar_retrieval");
     assert_eq!(
-        sidecar_check["status"], "warn",
-        "doctor should warn when mandatory sidecar retrieval is unavailable despite legacy semantic docs: {doctor:#}"
+        sidecar_check["status"], "error",
+        "doctor should block when mandatory sidecar retrieval is unavailable despite legacy semantic docs: {doctor:#}"
     );
     let next_commands = doctor["next_commands"]
         .as_array()
@@ -2425,7 +2423,7 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
     );
     let status = structured["status"].as_str();
     assert!(
-        status.is_some_and(|status| matches!(status, "repair_setup" | "repair_retrieval")),
+        status.is_some_and(|status| matches!(status, "repair_setup" | "blocked")),
         "stdio context --id should fail closed before serving context: {stdio:#}"
     );
 }
