@@ -594,17 +594,16 @@ async function resolveCli() {
   const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
   const pathCandidates = pathCliCandidates();
   warnings.push(pathCandidates.length > 0
-    ? 'managed_cli_unavailable_using_path_fallback'
+    ? 'managed_cli_unavailable_path_diagnostic_only'
     : 'managed_cli_unavailable_no_path_fallback');
-  const pathFallback = pathCandidates[0] || 'codestory-cli';
   return {
-    source: 'path_fallback',
-    path: pathFallback,
+    source: 'managed_unavailable',
+    path: null,
     sha256: null,
     version,
     cliVersion: null,
     repoRef: null,
-    buildSource: 'path_fallback',
+    buildSource: 'managed_unavailable',
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
@@ -637,6 +636,15 @@ function compareSemver(left, right) {
 }
 
 function probeResolvedCli(resolved) {
+  if (!resolved.path) {
+    return {
+      status: null,
+      error: `${resolved.source || 'unavailable'}_cli_unavailable`,
+      version: null,
+      stdout: '',
+      stderr: '',
+    };
+  }
   const result = spawnSync(resolved.path, ['--version'], {
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
@@ -654,8 +662,8 @@ function probeResolvedCli(resolved) {
 }
 
 function failOpenReasonForProbe(resolved, probe) {
-  if (resolved.managedProvisionFailure && resolved.source === 'path_fallback' && pathCliCandidates().length === 0) {
-    return resolved.managedProvisionFailure;
+  if (resolved.source === 'managed_unavailable') {
+    return resolved.managedProvisionFailure || 'managed_cli_unavailable';
   }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
@@ -860,7 +868,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
     'Refresh or reinstall the CodeStory plugin after GitHub release assets are reachable, then restart/reload the Codex host/app and read codestory://status.',
   ];
-  const minimumNext = options.minimumNext || (managedProvisionFailed && pathCandidates.length === 0 ? managedProvisionNext : [
+  const minimumNext = options.minimumNext || (managedProvisionFailed ? managedProvisionNext : [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
   ]);
   const fullRepair = options.fullRepair || minimumNext;

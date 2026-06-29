@@ -7,6 +7,9 @@
 - Blocked CodeStory grounding when the plugin MCP is launchable but not
   model-visible, even when a managed CLI exists; diagnostic fail-open mode now
   exposes status/repair guidance instead of normal grounding tool names.
+- Disabled ambient `PATH` CLI fallback for installed plugin runtime launches;
+  missing managed CLI setup now stays in `managed_unavailable` diagnostics while
+  preserving `CODESTORY_CLI` as an explicit local-dev override.
 
 ## 0.12.6
 
