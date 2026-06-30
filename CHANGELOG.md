@@ -7,6 +7,10 @@
 - Added `codestory-cli fix` and MCP `repair_all` as the single supported
   readiness repair entrypoint, with status recommendations collapsed to one
   repair action plus a `codestory://status` readback.
+- Made packaged and post-publish agent proof fail when the installed plugin MCP
+  launcher omits server-advertised `codestory://status` or
+  `codestory://agent-guide` resources, while leaving true Codex host/model
+  visibility proof open.
 - Blocked CodeStory grounding when the plugin MCP is launchable but not
   model-visible, even when a managed CLI exists; diagnostic fail-open mode now
   exposes status/repair guidance instead of normal grounding tool names.
