@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.13.0
+
+CodeStory 0.13.0 promotes the current `dev/codestory-next` MCP readiness and
+agent-repair hardening work onto `main` as the next synchronized release.
+
 ### Fixed
 
 - Rewrote agent-facing CodeStory guidance to make MCP status plus `repair_all`

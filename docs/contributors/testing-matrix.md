@@ -73,6 +73,17 @@ python .github/scripts/check-codestory-release.py --version <version>
 After a `main` release, run the release version check on `dev/codestory-next`
 with the released version before starting the next release lane.
 
+After merging a `dev/codestory-next` promotion PR into `main`, verify the dev
+branch survived the merge and still matches `main`:
+
+```sh
+git ls-remote --heads origin main dev/codestory-next
+git rev-list --left-right --count origin/main...origin/dev/codestory-next
+```
+
+If GitHub deletes `dev/codestory-next`, restore it from the promoted `main`
+commit before treating the release as complete.
+
 Do not create or push `v*` tags manually. A synchronized version bump merged to
 `main` runs the auto-release workflow, which creates the GitHub tag, release,
 cross-platform `codestory-cli` archives, and `SHA256SUMS.txt`.
