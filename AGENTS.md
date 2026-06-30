@@ -67,6 +67,12 @@
   the new release heading so release contents are tracked while the work is
   still reviewable.
 - Do not create or push `v*` release tags manually. A synchronized version bump on `main` triggers GitHub Actions to create the tag, GitHub release, cross-platform `codestory-cli` binary assets, and `SHA256SUMS.txt`.
+- After merging a `dev/codestory-next` promotion PR into `main`, verify
+  `dev/codestory-next` still exists and matches `main` with
+  `git ls-remote --heads origin main dev/codestory-next` and
+  `git rev-list --left-right --count origin/main...origin/dev/codestory-next`.
+  If GitHub deletes the head branch, restore it from the promoted `main` commit
+  before treating the release as complete.
 - After a plugin release or plugin-source update that Codex must detect through
   the marketplace, push a corresponding change to
   `TheGreenCedar/AgentPluginMarketplace`; Codex observes the marketplace repo
