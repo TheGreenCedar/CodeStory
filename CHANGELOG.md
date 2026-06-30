@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Blocked agent packet/search readiness when the selected sidecar retrieval is
+  not full, while keeping local/default graph readiness reported separately.
+
 ## 0.12.6
 
 CodeStory 0.12.6 promotes the current `dev/codestory-next` release automation,
