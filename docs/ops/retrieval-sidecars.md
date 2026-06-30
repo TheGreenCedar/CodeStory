@@ -41,7 +41,10 @@ navigation and agent retrieval separate: a ready SQLite graph can support
 `ground`, `files`, and symbol navigation while sidecar packet/search remains
 blocked.
 
-Start with the active runtime surface:
+Start with the active runtime surface. When plugin MCP is live, read
+`codestory://status`, follow `recommended_next_calls`, call MCP `repair_all`
+when recommended, and reread `codestory://status`. The CLI commands below are
+maintainer/debug transcripts, not the supported agent repair path:
 
 ```sh
 codestory-cli agent preflight --project <repo> --format json
@@ -60,9 +63,9 @@ available.
 |-------|---------|-----------------|
 | `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
 | `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
-| `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; run the repair command from preflight/status before packet/search claims |
-| `local_navigation=repair_local` | Core index or cache is missing or stale | Run `codestory-cli ready --goal local --repair --project <repo> --format json`, then rerun `doctor` |
-| `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Repair the failing sidecar layer, rerun `retrieval index --refresh full`, then rerun `retrieval status` |
+| `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; call MCP `repair_all` from status before packet/search claims |
+| `local_navigation=repair_local` | Core index or cache is missing or stale | Call MCP `repair_all`, then reread status; use CLI `fix` only for maintainer transcripts |
+| `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Call MCP `repair_all`, then reread status; maintainers can inspect `retrieval status` and rerun explicit sidecar commands if needed |
 | `doctor` ready but a packet/search command returns `retrieval_unavailable` | Runtime/status disagreement or sidecar process drift | Capture the failing command output, `doctor`, and `retrieval status`; repair the named layer before retrying |
 
 Layer repair should follow the first failing layer, not a broad rebuild:
@@ -70,7 +73,7 @@ Layer repair should follow the first failing layer, not a broad rebuild:
 | Failing layer | Evidence to capture | Small repair |
 |---------------|---------------------|--------------|
 | Active runtime or plugin adapter | `codestory://status` fields, `server_executable`, `cli_version`, `plugin_runtime`, `allowed_surfaces` | Reload or reinstall the active CLI/plugin runtime, then reread status |
-| Core SQLite graph | `doctor` cache/index checks and indexed file counts | `codestory-cli ready --goal local --repair --project <repo> --format json` |
+| Core SQLite graph | `doctor` cache/index checks and indexed file counts | MCP `repair_all`; CLI transcript: `codestory-cli fix --project <repo> --format json` |
 | Zoekt lexical sidecar | `retrieval status` mode/degraded reason and Zoekt health text | Free port `6070` or rerun bootstrap, then `retrieval index --refresh full` |
 | Qdrant dense sidecar | Qdrant health, collection name, point count, dense-anchor count, backend/dimension fields | Fix Qdrant/model/backend state; move the Qdrant cache aside only if repeated health checks fail |
 | SCIP graph artifacts | `scip_unavailable`, graph artifact hash/path, manifest contract | Rerun `retrieval index --refresh full`; inspect SCIP cache paths if it repeats |

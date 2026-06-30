@@ -6,16 +6,19 @@ work through the steps in order.
 Trust boundaries: [Trust and readiness](trust-and-readiness.md). Terms:
 [Glossary](../glossary.md).
 
-**Need JSON field names?** Common status keys: `allowed_surfaces`, `retrieval_mode`, `repair_command`. Full agent contract: [status-contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md). CLI repair commands: [CLI reference](cli-reference.md#readiness-and-repair).
+**Need JSON field names?** Common status keys: `allowed_surfaces`,
+`retrieval_mode`, and `recommended_next_calls`. Full agent contract:
+[status-contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md).
+CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#readiness-and-repair).
 
 ## Repair quick reference
 
-| Symptom | CLI command | Check in output |
+| Symptom | Supported action | Check in output |
 | --- | --- | --- |
-| Repo map stale or blocked | `codestory-cli ready --goal local --repair --project <repo> --format json` | `verdicts[].goal` is `local_navigation`; `status` is `ready` or follow `minimum_next` |
-| Broad search blocked | `codestory-cli ready --goal agent --repair --project <repo> --format json` | `verdicts[].goal` is `agent_packet_search`; `retrieval_mode` is `full` in retrieval status |
-| MCP down, need handoff | `codestory-cli agent preflight --project <repo> --format json` | `safe_surfaces`, `blocked_surfaces`, `repair_command` |
-| Sidecar health | `codestory-cli retrieval status --project <repo> --format json` | `retrieval_mode` is `full` before trusting packet/search |
+| Repo map stale or blocked | Agent reads `codestory://status`, calls MCP `repair_all` if recommended, then rereads status | Local graph surfaces are allowed after the reread |
+| Broad search blocked | Same MCP `repair_all` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
+| MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
+| Sidecar health | MCP status first; CLI `retrieval status` only for maintainer evidence | `retrieval_mode` is `full` before trusting packet/search |
 
 ## Decision tree
 
@@ -34,8 +37,9 @@ flowchart TD
   local --> fix_local[Refresh or repair local index]
   sidecar --> fix_sidecar[Sidecar setup or repair]
   fix_mcp --> host[Host guide]
-  fix_local --> cli_local["CLI: ready --goal local"]
-  fix_sidecar --> cli_agent["CLI: ready --goal agent"]
+  fix_local --> mcp_repair["MCP: repair_all"]
+  fix_sidecar --> mcp_repair
+  mcp_repair --> reread["Reread codestory://status"]
   host --> codex[Codex guide]
   host --> cursor[Cursor guide]
   host --> claude[Claude Code guide]
@@ -48,7 +52,7 @@ flowchart TD
 | --- | --- | --- | --- | --- |
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
 | Stale index / wrong symbols | New thread; hooks refresh on session start | Reload MCP; run local repair | New session; run local repair | New session; run [local repair](cli-reference.md#readiness-and-repair) |
-| Packet/search blocked | Agent calls sidecar setup when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) |
+| Packet/search blocked | Agent calls MCP `repair_all` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
 | Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
 Host-specific steps: [Codex](codex.md#troubleshooting), [Cursor](cursor.md#troubleshooting), [Claude Code](claude-code.md#troubleshooting), [Copilot](copilot.md).
@@ -90,8 +94,8 @@ Ask the agent:
 Read codestory://status, report allowed_surfaces, and tell me what is blocked and the next repair action.
 ```
 
-The agent uses MCP status, `codestory://agent-guide`, and `sidecar_setup` when
-packet/search needs repair. Re-read status after any repair.
+The agent uses MCP status, `codestory://agent-guide`, and `repair_all` when
+status recommends repair. Re-read status after any repair.
 
 </details>
 
@@ -107,8 +111,8 @@ codestory-cli agent preflight --project <repo> --format json
 codestory-cli doctor --project <repo>
 ```
 
-**Agent:** Can interpret `safe_surfaces`, `blocked_surfaces`, and
-`repair_command` from preflight when MCP is down.
+**Agent:** Treats CLI output as a debug transcript only. CLI output does not
+make CodeStory MCP live in the agent host.
 
 On Windows PowerShell, use `.\target\release\codestory-cli.exe` for a
 source-built binary.
@@ -120,10 +124,10 @@ Symptoms: missing symbols, old file list, `ground` or `files` not allowed.
 **Agent (MCP live):** Use allowed local graph tools only; request index refresh
 through status guidance.
 
-**You (CLI fallback):**
+**You (CLI debug transcript):**
 
 ```sh
-codestory-cli ready --goal local --repair --project <repo> --format json
+codestory-cli fix --project <repo> --format json
 codestory-cli doctor --project <repo>
 ```
 
@@ -141,8 +145,9 @@ node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> -
 Symptoms: `packet`, `search`, or `context` not allowed; retrieval mode not
 `full`.
 
-**Agent:** Call `sidecar_setup` with `enable` or `repair` when status says so.
-Do not treat degraded output as proof. See [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
+**Agent:** Call MCP `repair_all` when status says so, then reread
+`codestory://status`. Do not treat degraded output as proof. See
+[Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
 **You:** Sidecar model download and lifecycle:
 [Retrieval sidecars ops](../ops/retrieval-sidecars.md).
@@ -151,7 +156,7 @@ CLI check:
 
 ```sh
 codestory-cli retrieval status --project <repo> --format json
-codestory-cli ready --goal agent --repair --project <repo> --format json
+codestory-cli fix --project <repo> --format json
 ```
 
 Require `retrieval_mode: "full"` before trusting packet/search evidence.

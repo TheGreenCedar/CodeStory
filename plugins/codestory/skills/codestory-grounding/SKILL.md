@@ -1,6 +1,6 @@
 ---
 name: codestory-grounding
-description: Use when an agent should ground a local repository with CodeStory before making source claims, planning edits, choosing tests, reviewing changes, or using packet/search evidence through the CodeStory plugin or codestory-cli.
+description: Use when an agent should ground a local repository with CodeStory before making source claims, planning edits, choosing tests, reviewing changes, or using packet/search evidence through the CodeStory plugin MCP.
 ---
 
 # CodeStory Grounding
@@ -36,8 +36,9 @@ When the plugin MCP server is available:
 5. Read `codestory://agent-guide` when you need the runtime's recommended next calls.
 
 If the skill is visible but no `mcp__codestory` tools or `codestory://status`
-resource are exposed, call it a plugin MCP registration failure. Use CLI only as
-a degraded fallback and report that MCP was not live.
+resource are exposed, call it a plugin MCP registration failure. Do not use CLI
+as CodeStory grounding; use ordinary source inspection and report that MCP was
+not live.
 
 ## Task Router
 
@@ -48,7 +49,7 @@ a degraded fallback and report that MCP was not live.
 | Trace: "Who calls this?" | `callers`, `callees`, `trace`, or `trail --story --hide-speculative`. |
 | Impact: "What might this change touch?" | `affected` with changed files from git; planning hints only, not proof. |
 | Broad question | `packet`, `search`, or `context` only when allowed and `retrieval_mode=full`. |
-| Blocked surface | Follow `recommended_next_calls` from status; see [doctor](references/doctor.md) and [serve](references/serve.md). |
+| Blocked surface | Follow `recommended_next_calls` from status; normally call MCP `repair_all`, then reread `codestory://status`. |
 
 ## Evidence Rules
 
@@ -59,17 +60,21 @@ a degraded fallback and report that MCP was not live.
 - `retrieval_mode=full` is infrastructure eligibility, not answer-quality proof;
   anything weaker is navigation hints only.
 
-## CLI Fallback
+## Repair Loop
 
-Only when MCP is missing, repair is needed, or a transcript is requested:
+Supported agent repair is MCP-only:
 
-1. `ready --goal local --repair --project <target-workspace> --format json`
-2. `ready --goal agent --repair --project <target-workspace> --format json` before packet/search
-3. `doctor --project <target-workspace>` for a read-only health transcript
-4. Mirror allowed MCP surfaces: `ground`, `files`, `symbol`, `trail`, `snippet`, `search`, `packet`, `context`
+1. Read `codestory://status`.
+2. If `recommended_next_calls` says so, call MCP `repair_all` for
+   `<target-workspace>`.
+3. Reread `codestory://status`.
+4. Use only the surfaces allowed by the refreshed status.
 
-Always pass `--project <target-workspace>` explicitly. Repair details:
-[serve](references/serve.md), [doctor](references/doctor.md).
+CLI commands such as `fix`, `doctor`, `ready`, and `retrieval status` are
+maintainer/debug transcript tools. They do not prove plugin MCP is live in the
+agent host and are not the supported repair path for agent grounding.
+
+Repair details: [serve](references/serve.md), [doctor](references/doctor.md).
 
 `setup.ps1` and `setup.sh` under this skill are build-from-source paths for
 contributors only, not the normal user install path.

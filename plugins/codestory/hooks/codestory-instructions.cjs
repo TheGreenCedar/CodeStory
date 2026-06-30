@@ -13,7 +13,7 @@ Before reading source files, making source claims, planning edits, choosing test
 3. Use server_version, server_executable, allowed_surfaces, and retrieval_mode from status as runtime truth.
 4. Use local graph surfaces only when their own allowed_surfaces entry allows them.
 5. Use packet, search, or context confidently when that surface is allowed and retrieval_mode=full.
-6. If MCP is truly unavailable, use managed CLI or local-dev CODESTORY_CLI preflight as the setup/repair fallback. PATH checks are diagnostics only; reserve full rebuilds for explicit stale, corrupt, schema, or root-change cases.
+6. If MCP is unavailable, CodeStory grounding is unavailable in this host. Use ordinary source inspection, report the MCP blocker, and reserve CLI commands for maintainer/debug transcripts only.
 
 Do this without waiting for the user to mention CodeStory.`;
 
@@ -59,11 +59,11 @@ function getCodeStoryInstructions(event = 'SessionStart', input = {}) {
   return `${eventHeader(event, input)}CODESTORY BACKGROUND GROUNDING RULES
 
 Use CodeStory proactively for repository grounding. Do not wait for the user to call it by name.
-Before manually opening source files, first read codestory://status when MCP is live. When MCP is configured but resources are not model-visible, say that and reload the host/plugin instead of asking for PATH setup. When MCP is truly unavailable, use managed CLI or local-dev CODESTORY_CLI preflight and use the reported safe_surfaces.
+Before manually opening source files, first read codestory://status when MCP is live. When MCP is configured but resources are not model-visible, say that and reload the host/plugin instead of asking for PATH setup. When MCP is unavailable, CodeStory grounding is unavailable in this host; use ordinary source inspection and report the MCP blocker.
 For broad user requests, prefer a packet tied to the user's actual question. For concrete symbols, files, or routes, use search/context/trail/snippet. For no request context, use a compact ground snapshot only after confirming the target repo is indexable.
 Avoid no-op grounding context in huge or non-code folders.
 When retrieval sidecars are full and allowed, use packet, search, and context confidently.
-Use the managed/runtime preflight repair_command as the default setup path once a repository target is known; keep PATH checks diagnostic.
+Use status recommended_next_calls as the setup path once a repository target is known: call MCP repair_all when recommended, then reread codestory://status. Keep CLI and PATH checks diagnostic.
 
 ${body}`;
 }

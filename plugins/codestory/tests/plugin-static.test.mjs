@@ -122,6 +122,28 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   });
 });
 
+test("agent-facing guidance keeps MCP repair as the only supported repair path", async () => {
+  const guidanceFiles = [
+    join(pluginRoot, "hooks", "codestory-instructions.cjs"),
+    join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
+    join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
+    join(pluginRoot, "skills", "codestory-grounding", "references", "status-contract.md"),
+    join(pluginRoot, "skills", "codestory-grounding", "references", "doctor.md"),
+    join(pluginRoot, "skills", "codestory-grounding", "references", "serve.md"),
+    join(repoRoot, "docs", "users", "troubleshooting.md"),
+    join(repoRoot, "docs", "ops", "retrieval-sidecars.md"),
+  ];
+
+  for (const file of guidanceFiles) {
+    const text = await readFile(file, "utf8");
+    assert.doesNotMatch(text, /CLI Fallback/u, file);
+    assert.doesNotMatch(text, /CLI fallback/u, file);
+    assert.doesNotMatch(text, /managed CLI or local-dev CODESTORY_CLI preflight/u, file);
+    assert.doesNotMatch(text, /Call `sidecar_setup`/u, file);
+    assert.match(text, /repair_all/u, file);
+  }
+});
+
 test("plugin package version tracks the codestory-cli release version", async () => {
   const cliManifest = await readFile(
     join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),
@@ -1825,7 +1847,7 @@ function runCodexHook(input, env) {
   return JSON.parse(result.stdout);
 }
 
-test("hook output keeps CodeStory ambient and checks MCP before CLI fallback", async () => {
+test("hook output keeps CodeStory ambient and checks MCP before source fallback", async () => {
   const { spawnSync } = await import("node:child_process");
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-mcp-first-"));
@@ -1927,7 +1949,7 @@ test("hook degraded output is short when no MCP or managed runtime is usable", a
   }
 });
 
-test("hook failed preflight switches degraded guidance to bounded source fallback", async () => {
+test("hook failed preflight switches degraded guidance to bounded source reads", async () => {
   const { spawnSync } = await import("node:child_process");
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-preflight-"));
   const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-preflight-bin-"));

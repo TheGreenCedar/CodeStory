@@ -1,4 +1,4 @@
 interface:
   display_name: "CodeStory Grounding"
-  short_description: "Ground local repos through CodeStory's plugin MCP or CLI fallback before planning, editing, or reviewing."
-  default_prompt: "Use $codestory-grounding: Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]? Or: I am editing a file in this repo — what symbols are affected and what tests should I run first? For first session or after repair: read codestory://status, ground if allowed, and use packet/search only when sidecars report retrieval_mode=full."
+  short_description: "Ground local repos through CodeStory's plugin MCP before planning, editing, or reviewing."
+  default_prompt: "Use $codestory-grounding: Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]? Or: I am editing a file in this repo — what symbols are affected and what tests should I run first? For first session or after repair: read codestory://status, call repair_all if status recommends it, reread status, and use packet/search only when sidecars report retrieval_mode=full."
