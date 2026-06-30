@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Bounded required-probe citation promotion by deduplicating probe queries and
+  using set membership for promoted citation indexes, with a regression guard
+  for large synthetic packet capping.
 - Blocked agent packet/search readiness when the selected sidecar retrieval is
   not full, while keeping local/default graph readiness reported separately.
 
