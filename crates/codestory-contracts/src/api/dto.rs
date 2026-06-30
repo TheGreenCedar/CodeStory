@@ -315,6 +315,7 @@ pub enum ReadinessStatusDto {
     RepairSetup,
     RepairIndex,
     CheckIndex,
+    Blocked,
     RepairRetrieval,
 }
 

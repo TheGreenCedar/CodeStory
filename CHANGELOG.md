@@ -7,6 +7,11 @@
 - Blocked CodeStory grounding when the plugin MCP is launchable but not
   model-visible, even when a managed CLI exists; diagnostic fail-open mode now
   exposes status/repair guidance instead of normal grounding tool names.
+- Bounded required-probe citation promotion by deduplicating probe queries and
+  using set membership for promoted citation indexes, with a regression guard
+  for large synthetic packet capping.
+- Blocked agent packet/search readiness when the selected sidecar retrieval is
+  not full, while keeping local/default graph readiness reported separately.
 
 ## 0.12.6
 
