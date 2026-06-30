@@ -8,6 +8,18 @@
   launcher omits server-advertised `codestory://status` or
   `codestory://agent-guide` resources, while leaving true Codex host/model
   visibility proof open.
+- Blocked CodeStory grounding when the plugin MCP is launchable but not
+  model-visible, even when a managed CLI exists; diagnostic fail-open mode now
+  exposes status/repair guidance instead of normal grounding tool names.
+- Disabled ambient `PATH` CLI fallback for installed plugin runtime launches;
+  missing managed CLI setup now stays in `managed_unavailable` diagnostics while
+  preserving `CODESTORY_CLI` as an explicit local-dev override and keeping PATH
+  checks documented as CLI diagnostics only.
+- Bounded required-probe citation promotion by deduplicating probe queries and
+  using set membership for promoted citation indexes, with a regression guard
+  for large synthetic packet capping.
+- Blocked agent packet/search readiness when the selected sidecar retrieval is
+  not full, while keeping local/default graph readiness reported separately.
 
 ## 0.12.6
 

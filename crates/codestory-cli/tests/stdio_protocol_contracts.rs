@@ -978,13 +978,7 @@ fn stdio_starts_without_prebuilt_index_and_reports_status() {
 
     assert_eq!(status["readiness"][0]["status"], json!("ready"));
     assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-    assert_allowed_surface(
-        &status,
-        "search",
-        false,
-        "agent_packet_search",
-        "repair_retrieval",
-    );
+    assert_allowed_surface(&status, "search", false, "agent_packet_search", "blocked");
 }
 
 #[test]
@@ -2388,7 +2382,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         .unwrap_or_else(|| panic!("status should include agent_packet_search lane: {status}"));
     assert_eq!(
         agent_lane["status"],
-        json!("repair_retrieval"),
+        json!("blocked"),
         "agent lane should report blocked packet/search readiness: {status}"
     );
     assert_eq!(
@@ -2420,7 +2414,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_eq!(
         status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("repair_retrieval"),
+        json!("blocked"),
         "runtime truth should include the agent packet/search readiness lane: {status}"
     );
     for surface in [
@@ -2444,13 +2438,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         assert_allowed_surface(&status, surface, true, "local_navigation", "ready");
     }
     for surface in ["packet", "search", "context"] {
-        assert_allowed_surface(
-            &status,
-            surface,
-            false,
-            "agent_packet_search",
-            "repair_retrieval",
-        );
+        assert_allowed_surface(&status, surface, false, "agent_packet_search", "blocked");
         assert_eq!(
             status
                 .pointer(&format!("/allowed_surfaces/{surface}/repair_reason"))
@@ -3089,13 +3077,7 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
     );
     assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
     assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
-    assert_allowed_surface(
-        &status,
-        "packet",
-        false,
-        "agent_packet_search",
-        "repair_retrieval",
-    );
+    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
 }
 
 #[test]
@@ -3139,13 +3121,7 @@ fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
     );
     assert_fresh_freshness_counts(&status, "dirty marker older than full storage state");
     assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-    assert_allowed_surface(
-        &status,
-        "packet",
-        false,
-        "agent_packet_search",
-        "repair_retrieval",
-    );
+    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
 }
 
 #[test]
@@ -3182,13 +3158,7 @@ fn resources_read_status_reports_unknown_dirty_marker_without_blocking_local_ind
     );
     assert_fresh_freshness_counts(&status, "status with unknown dirty marker");
     assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-    assert_allowed_surface(
-        &status,
-        "packet",
-        false,
-        "agent_packet_search",
-        "repair_retrieval",
-    );
+    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
 }
 
 #[test]
@@ -3285,13 +3255,7 @@ fn resources_read_status_dirty_marker_fail_open_matrix() {
         }
         assert_fresh_freshness_counts(&status, name);
         assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-        assert_allowed_surface(
-            &status,
-            "packet",
-            false,
-            "agent_packet_search",
-            "repair_retrieval",
-        );
+        assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
     }
 }
 
@@ -3475,7 +3439,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     );
     assert_eq!(
         refreshed_status["allowed_surfaces"]["packet"]["status"],
-        json!("repair_retrieval"),
+        json!("blocked"),
         "packet/search should stay gated by the agent retrieval lane after local refresh: {refreshed_status}"
     );
     let status_next_call_text = refreshed_status["recommended_next_calls"].to_string();
@@ -3745,7 +3709,7 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     );
     assert_eq!(
         status["allowed_surfaces"]["search"]["status"],
-        json!("repair_retrieval"),
+        json!("blocked"),
         "local graph refresh must not make packet/search readiness claims: {status}"
     );
 
@@ -4250,7 +4214,7 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
     );
     assert_eq!(
         error.pointer("/status").and_then(Value::as_str),
-        Some("repair_retrieval")
+        Some("blocked")
     );
     assert_eq!(
         error.pointer("/failed_layer").and_then(Value::as_str),

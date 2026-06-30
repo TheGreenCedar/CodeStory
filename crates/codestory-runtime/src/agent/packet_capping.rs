@@ -520,15 +520,23 @@ pub(crate) fn promote_required_probe_citations(
         return HashSet::new();
     }
 
+    let mut seen_probe_queries = HashSet::new();
+    let required_probe_queries = required_probe_queries
+        .iter()
+        .filter(|query| seen_probe_queries.insert(query.as_str()))
+        .collect::<Vec<_>>();
     let focus_roots = packet_command_focus_roots(&answer.citations);
     let mut promoted_indices = Vec::new();
-    for query in required_probe_queries {
+    let mut promoted_index_set = HashSet::new();
+    for query in &required_probe_queries {
+        let query = query.as_str();
         if let Some(limit) = packet_required_probe_multi_match_limit(query) {
             promote_distinct_required_probe_matches(
                 answer,
                 query,
                 limit,
                 &mut promoted_indices,
+                &mut promoted_index_set,
                 &focus_roots,
             );
             continue;
@@ -541,7 +549,7 @@ pub(crate) fn promote_required_probe_citations(
         }
         let mut best_match = None;
         for (index, citation) in answer.citations.iter().enumerate() {
-            if promoted_indices.contains(&index) {
+            if promoted_index_set.contains(&index) {
                 continue;
             }
             let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
@@ -568,7 +576,9 @@ pub(crate) fn promote_required_probe_citations(
                 best_match = Some((index, match_rank));
             }
         }
-        if let Some((index, _)) = best_match {
+        if let Some((index, _)) = best_match
+            && promoted_index_set.insert(index)
+        {
             promoted_indices.push(index);
         }
     }
@@ -580,10 +590,9 @@ pub(crate) fn promote_required_probe_citations(
         .iter()
         .map(|index| packet_citation_key(&answer.citations[*index]))
         .collect::<HashSet<_>>();
-    let promoted_index_set = promoted_indices.iter().copied().collect::<HashSet<_>>();
     let mut reordered = Vec::with_capacity(answer.citations.len());
-    for index in promoted_indices {
-        reordered.push(answer.citations[index].clone());
+    for index in &promoted_indices {
+        reordered.push(answer.citations[*index].clone());
     }
     for (index, citation) in answer.citations.drain(..).enumerate() {
         if !promoted_index_set.contains(&index) {
@@ -594,7 +603,12 @@ pub(crate) fn promote_required_probe_citations(
     answer.retrieval_trace.annotations.push(format!(
         "packet_required_probe_citations promoted={} required={}",
         promoted_index_set.len(),
-        required_probe_queries.join("|").replace('`', "'")
+        required_probe_queries
+            .iter()
+            .map(|query| query.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+            .replace('`', "'")
     ));
     protected_citation_keys
 }
@@ -604,6 +618,7 @@ fn promote_distinct_required_probe_matches(
     query: &str,
     limit: usize,
     promoted_indices: &mut Vec<usize>,
+    promoted_index_set: &mut HashSet<usize>,
     focus_roots: &[PacketCommandFocusRoot],
 ) {
     let mut promoted_paths = promoted_indices
@@ -624,7 +639,7 @@ fn promote_distinct_required_probe_matches(
             .unwrap_or_default();
         let mut best_match = None;
         for (index, citation) in answer.citations.iter().enumerate() {
-            if promoted_indices.contains(&index) {
+            if promoted_index_set.contains(&index) {
                 continue;
             }
             let Some(path) = packet_citation_file_path_key(citation) else {
@@ -672,7 +687,9 @@ fn promote_distinct_required_probe_matches(
         if let Some(path) = packet_citation_file_path_key(&answer.citations[index]) {
             promoted_paths.insert(path);
         }
-        promoted_indices.push(index);
+        if promoted_index_set.insert(index) {
+            promoted_indices.push(index);
+        }
     }
 }
 
@@ -1210,6 +1227,7 @@ mod tests {
         AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId, PacketEvidenceResolutionDto,
         PacketEvidenceTierDto,
     };
+    use std::time::{Duration, Instant};
 
     fn citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
         AgentCitationDto {
@@ -1393,6 +1411,153 @@ mod tests {
                 .take(2)
                 .all(|path| path.contains("commonMain")),
             "generic source probes should protect shared source-set evidence before platform variants: {protected_paths:?}"
+        );
+    }
+
+    #[test]
+    fn packet_citation_capping_large_probe_set_stays_bounded() {
+        const CITATION_COUNT: usize = 1_024;
+        const MULTI_MATCH_CITATION_COUNT: usize = 256;
+        const UNIQUE_REQUIRED_PROBE_COUNT: usize = 16;
+        const REQUIRED_PROBE_COUNT: usize = 96;
+        const DUPLICATE_MULTI_MATCH_PROBE_COUNT: usize =
+            REQUIRED_PROBE_COUNT - UNIQUE_REQUIRED_PROBE_COUNT;
+        const MAX_ELAPSED: Duration = Duration::from_secs(2);
+
+        let mut citations = Vec::with_capacity(CITATION_COUNT);
+        for index in 0..CITATION_COUNT {
+            let display_name = if index < MULTI_MATCH_CITATION_COUNT {
+                format!("RealBufferedSource.read{index}")
+            } else if index < MULTI_MATCH_CITATION_COUNT + UNIQUE_REQUIRED_PROBE_COUNT {
+                format!("UniqueProbeKey{:03}", index - MULTI_MATCH_CITATION_COUNT)
+            } else {
+                match index % 8 {
+                    0 => format!("Client send implementation {index}"),
+                    1 => format!("Submit prevent default guard {index}"),
+                    2 => format!("Session request creation {index}"),
+                    3 => format!("Network command input {index}"),
+                    4 => format!("Input helper {index}"),
+                    5 => format!("DataRequest.validate {index}"),
+                    6 => format!("Route registration {index}"),
+                    _ => format!("Auxiliary evidence {index}"),
+                }
+            };
+            let file_path = if index < MULTI_MATCH_CITATION_COUNT {
+                format!("src/flow/source_buffer_{index}.rs")
+            } else if index < MULTI_MATCH_CITATION_COUNT + UNIQUE_REQUIRED_PROBE_COUNT {
+                format!(
+                    "src/flow/synthetic_probe_{}.rs",
+                    index - MULTI_MATCH_CITATION_COUNT
+                )
+            } else if index % 17 == 0 {
+                format!("docs/flow-guide-{index}.md")
+            } else if index % 13 == 0 {
+                format!("tests/flow_{index}_test.rs")
+            } else if index % 5 == 0 {
+                format!("src/commonMain/kotlin/io/common_{index}.kt")
+            } else {
+                format!("src/flow/module_{index}.rs")
+            };
+            citations.push(citation(&display_name, &file_path, index as f32));
+        }
+
+        let mut required_probe_queries = (0..UNIQUE_REQUIRED_PROBE_COUNT)
+            .map(|index| format!("UniqueProbeKey{index:03}"))
+            .collect::<Vec<_>>();
+        required_probe_queries.extend(
+            (0..DUPLICATE_MULTI_MATCH_PROBE_COUNT).map(|_| "source read buffer".to_string()),
+        );
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 18,
+            max_files: 18,
+            max_snippets: 80,
+            max_trail_edges: 240,
+            max_output_bytes: 512 * 1024,
+        };
+        let mut answer = answer_fixture(citations);
+
+        let started = Instant::now();
+        let truncated = cap_packet_citations(&mut answer, &limits, &required_probe_queries);
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "packet_citation_capping_large_probe_set elapsed_ms={} citations={} required_probes={} kept={} threshold_ms={}",
+            elapsed.as_millis(),
+            CITATION_COUNT,
+            REQUIRED_PROBE_COUNT,
+            answer.citations.len(),
+            MAX_ELAPSED.as_millis()
+        );
+
+        assert!(
+            truncated,
+            "large synthetic packet should hit the citation cap"
+        );
+        assert!(
+            answer.citations.len() <= limits.max_anchors as usize,
+            "citation cap should stay within max_anchors"
+        );
+        let leading_paths = answer
+            .citations
+            .iter()
+            .take(UNIQUE_REQUIRED_PROBE_COUNT)
+            .filter_map(|citation| citation.file_path.clone())
+            .collect::<Vec<_>>();
+        let expected_leading_paths = (0..UNIQUE_REQUIRED_PROBE_COUNT)
+            .map(|index| format!("src/flow/synthetic_probe_{index}.rs"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            leading_paths, expected_leading_paths,
+            "unique required probes should keep their protected citation order"
+        );
+        let multi_match_paths = answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref())
+            .filter(|path| path.contains("source_buffer_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            multi_match_paths.len(),
+            2,
+            "duplicated multi-match source probes should protect exactly two distinct source-buffer citations"
+        );
+        let kept_files = answer
+            .citations
+            .iter()
+            .filter_map(|citation| citation.file_path.as_deref().map(packet_display_path))
+            .collect::<HashSet<_>>();
+        assert!(
+            kept_files.len() <= limits.max_files as usize,
+            "citation cap should stay within max_files"
+        );
+        assert!(
+            answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .any(|annotation| annotation.starts_with("packet_required_probe_citations ")),
+            "required-probe promotion should still run on the large synthetic packet"
+        );
+        let required_probe_annotation = answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .find(|annotation| annotation.starts_with("packet_required_probe_citations "))
+            .expect("large guard should record required-probe promotion");
+        assert_eq!(
+            required_probe_annotation
+                .matches("source read buffer")
+                .count(),
+            1,
+            "duplicate required probes should be deduped before promotion"
+        );
+        assert!(
+            elapsed <= MAX_ELAPSED,
+            "packet citation capping regressed past the bounded guard: elapsed_ms={} threshold_ms={} citations={} required_probes={}",
+            elapsed.as_millis(),
+            MAX_ELAPSED.as_millis(),
+            CITATION_COUNT,
+            REQUIRED_PROBE_COUNT
         );
     }
 }

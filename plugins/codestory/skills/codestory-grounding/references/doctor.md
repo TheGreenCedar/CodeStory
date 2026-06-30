@@ -34,8 +34,9 @@ codestory-cli --version
 codestory-cli doctor --project <target-workspace> --format json
 ```
 
-If PATH repair changes which binary `codestory-cli` resolves to, start a fresh
-Codex host/app session before treating the plugin MCP runtime as updated.
+Treat PATH checks as CLI diagnostics only. Installed plugin MCP runtime changes
+require managed status/reinstall/reload, or an explicit `CODESTORY_CLI`
+override for local development, before starting a fresh Codex host/app session.
 
 ## Notes
 

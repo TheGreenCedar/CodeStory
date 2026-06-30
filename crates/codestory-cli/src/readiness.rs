@@ -171,7 +171,7 @@ pub(crate) fn status_label_for_goal(
     }
 
     if goal == ReadinessGoalDto::AgentPacketSearch && retrieval_mode != "full" {
-        return "repair_retrieval";
+        return "blocked";
     }
 
     "ready"
@@ -184,6 +184,7 @@ pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
         ReadinessStatusDto::RepairSetup => "repair_setup",
         ReadinessStatusDto::RepairIndex => "repair_index",
         ReadinessStatusDto::CheckIndex => "check_index",
+        ReadinessStatusDto::Blocked => "blocked",
         ReadinessStatusDto::RepairRetrieval => "repair_retrieval",
     }
 }
@@ -195,6 +196,7 @@ pub(crate) fn failed_layer(verdict: &ReadinessVerdictDto) -> Option<&'static str
         ReadinessStatusDto::RepairSetup => Some("runtime_setup"),
         ReadinessStatusDto::RepairIndex => Some("local_index"),
         ReadinessStatusDto::CheckIndex => Some("index_freshness"),
+        ReadinessStatusDto::Blocked => Some("retrieval_sidecar"),
         ReadinessStatusDto::RepairRetrieval => Some("retrieval_sidecar"),
     }
 }
@@ -222,7 +224,7 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
         | ReadinessStatusDto::Repairing
         | ReadinessStatusDto::RepairRetrieval => LocalRefreshState::Refreshed,
         ReadinessStatusDto::CheckIndex => LocalRefreshState::Skipped,
-        ReadinessStatusDto::RepairSetup => LocalRefreshState::Failed,
+        ReadinessStatusDto::RepairSetup | ReadinessStatusDto::Blocked => LocalRefreshState::Failed,
         ReadinessStatusDto::RepairIndex => {
             if index.and_then(|index| index.status) == Some(IndexFreshnessStatusDto::Stale) {
                 LocalRefreshState::Skipped
@@ -409,9 +411,9 @@ fn verdict_state(
             let full_repair = agent_packet_search_repair_commands(project_arg, sidecar_run_id);
             let minimum_next = full_repair.iter().take(1).cloned().collect();
             return (
-                ReadinessStatusDto::RepairRetrieval,
+                ReadinessStatusDto::Blocked,
                 format!(
-                    "Agent packet/search needs full agent sidecar retrieval; current profile is `{}` and mode is `{sidecar_mode}`.{device_note}",
+                    "Agent packet/search is blocked until full agent sidecar retrieval is proven; current profile is `{}` and mode is `{sidecar_mode}`.{device_note}",
                     sidecar_profile.unwrap_or("unknown")
                 ),
                 minimum_next,
@@ -669,7 +671,7 @@ mod tests {
                 Some(IndexFreshnessStatusDto::Fresh),
                 "unavailable",
             ),
-            "repair_retrieval"
+            "blocked"
         );
 
         let verdict = ReadinessVerdictDto {
@@ -704,7 +706,7 @@ mod tests {
         assert_eq!(verdicts[0].status, ReadinessStatusDto::RepairIndex);
         assert_eq!(
             verdicts[1].status,
-            ReadinessStatusDto::RepairRetrieval,
+            ReadinessStatusDto::Blocked,
             "missing local index should not collapse agent retrieval readiness: {verdicts:?}"
         );
         assert!(
@@ -986,11 +988,11 @@ mod tests {
             inputs(&stats, Some(&freshness), None),
         );
 
-        assert_eq!(unavailable.status, ReadinessStatusDto::RepairRetrieval);
+        assert_eq!(unavailable.status, ReadinessStatusDto::Blocked);
         assert!(
             unavailable
                 .summary
-                .contains("current profile is `unknown` and mode is `unavailable`")
+                .contains("blocked until full agent sidecar retrieval is proven")
         );
         assert!(unavailable.sidecar.is_none());
 
@@ -1027,7 +1029,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(local_full.status, ReadinessStatusDto::RepairRetrieval);
+        assert_eq!(local_full.status, ReadinessStatusDto::Blocked);
         assert!(
             local_full.summary.contains("current profile is `local`"),
             "local/default full retrieval must not unlock agent packet/search: {local_full:?}"
@@ -1058,7 +1060,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(degraded.status, ReadinessStatusDto::RepairRetrieval);
+        assert_eq!(degraded.status, ReadinessStatusDto::Blocked);
         assert_eq!(
             degraded
                 .sidecar
@@ -1139,7 +1141,7 @@ mod tests {
                 inputs(&stats, Some(&freshness), sidecar),
             );
 
-            assert_eq!(verdict.status, ReadinessStatusDto::RepairRetrieval);
+            assert_eq!(verdict.status, ReadinessStatusDto::Blocked);
             assert_eq!(failed_layer(&verdict), Some("retrieval_sidecar"));
             assert_eq!(verdict.minimum_next.len(), 1);
             assert!(
@@ -1177,7 +1179,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(verdict.status, ReadinessStatusDto::RepairRetrieval);
+        assert_eq!(verdict.status, ReadinessStatusDto::Blocked);
         assert!(
             verdict
                 .full_repair

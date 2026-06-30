@@ -133,6 +133,7 @@ function classifyMcpRuntime(options = {}) {
     : launchable
       ? 'mcp_resources_not_model_visible'
       : 'mcp_resources_unavailable';
+  const modelVisibleBlocked = launchable && !resourcesExposed;
 
   return {
     mcp_config_installed: mcp.installed,
@@ -142,12 +143,13 @@ function classifyMcpRuntime(options = {}) {
     mcp_process_launchable: launchable,
     mcp_resources_exposed: resourcesExposed,
     mcp_resource_status: resourceStatus,
+    mcp_model_visible_blocked: modelVisibleBlocked,
     mcp_runtime_state_path: runtimePath,
     mcp_runtime_state_present: Boolean(runtime),
     managed_cli_present: managed.present,
     managed_cli_path: managed.path,
     managed_cli_source: managed.source,
-    degraded_no_surface: !resourcesExposed && !managed.present,
+    degraded_no_surface: modelVisibleBlocked || (!resourcesExposed && !managed.present),
   };
 }
 
@@ -195,6 +197,7 @@ function mcpDetectionText(status) {
     `mcp_config_installed: ${status.mcp_config_installed ? 'yes' : 'no'}${status.mcp_config_installed ? ` (${status.mcp_config_path})` : ''}`,
     `mcp_process_launchable: ${status.mcp_process_launchable ? 'yes' : 'no'}`,
     `mcp_resources_exposed: ${status.mcp_resource_status}`,
+    `mcp_model_visible_blocked: ${status.mcp_model_visible_blocked ? 'yes' : 'no'}`,
     `managed_cli_present: ${status.managed_cli_present ? 'yes' : 'no'}${status.managed_cli_path ? ` (${status.managed_cli_path})` : ''}`,
     `degraded_no_surface: ${status.degraded_no_surface ? 'yes' : 'no'}`,
   ].join('\n');

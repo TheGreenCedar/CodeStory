@@ -1023,7 +1023,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
   }
 });
 
-test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
+test("mcp launcher blocks managed setup when only PATH cli is available", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const sourceVersion = readCargoVersion(await readFile(join(repoRoot, "crates", "codestory-cli", "Cargo.toml"), "utf8"));
@@ -1033,15 +1033,16 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
   await writeFile(
     fakeCli,
     process.platform === "win32"
-      ? "@echo off\r\necho codestory-cli 0.0.1\r\n"
-      : "#!/bin/sh\necho codestory-cli 0.0.1\n",
+      ? `@echo off\r\necho codestory-cli ${version}\r\n`
+      : `#!/bin/sh\necho codestory-cli ${version}\n`,
   );
   await chmod(fakeCli, 0o755);
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = [
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
   ].join("\n") + "\n";
 
   try {
@@ -1060,21 +1061,21 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 3, result.stdout);
+    assert.equal(responses.length, 4, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.source_checkout_version, sourceVersion);
     assert.deepEqual(status.path_candidates, [
       {
         path: fakeCli,
-        version: "0.0.1",
-        active: true,
+        version,
+        active: false,
       },
     ]);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
-    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
-    assert.equal(status.plugin_runtime.cli_path, fakeCli);
-    assert.equal(status.runtime_truth.runtime_source, "path_fallback");
+    assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
+    assert.equal(status.plugin_runtime.cli_path, null);
+    assert.equal(status.runtime_truth.runtime_source, "managed_unavailable");
     assert.equal(status.runtime_truth.plugin_root, pluginRoot);
     assert.equal(status.runtime_truth.sidecar_policy, "ask");
     assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
@@ -1082,17 +1083,12 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     assert.equal(status.runtime_truth.readiness_lanes.local_graph.status, "repair_setup");
     assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.profile, "agent");
     assert.equal(status.readiness[0].status, "repair_setup");
+    assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
-    assert.equal(responses[2].result.isError, true);
-    assert.equal(
-      responses[2].result.structuredContent.code,
-      "codestory_mcp_runtime_unavailable",
-    );
-    assert.equal(
-      responses[2].result.structuredContent.plugin_runtime.plugin_root,
-      pluginRoot,
-    );
+    assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
+    assert.equal(responses[3].error.code, -32602);
+    assert.match(responses[3].error.message, /grounding tools are unavailable/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(pathDir, { recursive: true, force: true });
@@ -1230,9 +1226,9 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = JSON.stringify({
     jsonrpc: "2.0",
-    id: "tool",
-    method: "tools/call",
-    params: { name: "ground", arguments: {} },
+    id: "status",
+    method: "resources/read",
+    params: { uri: "codestory://status" },
   }) + "\n";
 
   try {
@@ -1265,13 +1261,13 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const response = JSON.parse(result.stdout.trim());
-    assert.equal(response.result.isError, true);
+    const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
-      response.result.structuredContent.repair_reason,
+      status.readiness[0].repair_reason,
       "managed_cli_unspawnable",
     );
     assert.equal(
-      response.result.structuredContent.plugin_runtime.plugin_version,
+      status.plugin_runtime.plugin_version,
       version,
     );
   } finally {
@@ -1456,7 +1452,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   }
 });
 
-test("startup hook bootstraps managed cli before reporting MCP visibility", async (t) => {
+test("startup hook bootstraps managed cli when MCP resources are visible", async (t) => {
   const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
   if (tarProbe.status !== 0) {
     t.skip("tar unavailable for archive fixture");
@@ -1489,7 +1485,7 @@ test("startup hook bootstraps managed cli before reporting MCP visibility", asyn
       env: {
         ...process.env,
         CODESTORY_CLI: "",
-        CODESTORY_MCP_RESOURCES_EXPOSED: "",
+        CODESTORY_MCP_RESOURCES_EXPOSED: "1",
         CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
         COPILOT_PLUGIN_DATA: "",
         PLUGIN_DATA: dataDir,
@@ -1508,7 +1504,8 @@ test("startup hook bootstraps managed cli before reporting MCP visibility", asyn
     assert.match(context, /managed_bootstrap: ready/u);
     assert.match(context, /managed_bootstrap_cli_source: managed/u);
     assert.match(context, /managed_bootstrap_local_refresh: fresh/u);
-    assert.match(context, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
+    assert.match(context, /mcp_resources_exposed: mcp_resources_exposed/u);
+    assert.match(context, /mcp_model_visible_blocked: no/u);
     assert.match(context, /managed_cli_present: yes/u);
     assert.doesNotMatch(context, /where\.exe codestory-cli|command -v codestory-cli|adding CodeStory to PATH/u);
 
@@ -1569,10 +1566,20 @@ test("release asset downloader retries a transient failure", async () => {
   }
 });
 
-test("mcp launcher keeps managed provision failures primary without PATH", async () => {
+test("mcp launcher keeps managed provision failures primary with PATH diagnostic", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-fail-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-empty-release-"));
+  const pathDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-path-"));
+  const fakeCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  await writeFile(
+    fakeCli,
+    process.platform === "win32"
+      ? `@echo off\r\necho codestory-cli ${version}\r\n`
+      : `#!/bin/sh\necho codestory-cli ${version}\n`,
+  );
+  await chmod(fakeCli, 0o755);
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = JSON.stringify({
     jsonrpc: "2.0",
@@ -1588,7 +1595,7 @@ test("mcp launcher keeps managed provision failures primary without PATH", async
         CODESTORY_CLI: "",
         CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
         PLUGIN_DATA: dataDir,
-        PATH: "",
+        PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
       input,
@@ -1603,10 +1610,16 @@ test("mcp launcher keeps managed provision failures primary without PATH", async
       status.degraded_reason,
       /^managed_cli_provision_failed:managed_cli_asset_fetch_failed:SHA256SUMS\.txt:elapsed_ms=\d+:attempts=1:retry=restart_reload_status:/u,
     );
-    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
-    assert.deepEqual(status.path_candidates, []);
+    assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
+    assert.deepEqual(status.path_candidates, [
+      {
+        path: fakeCli,
+        version,
+        active: false,
+      },
+    ]);
     assert.equal(
-      status.plugin_runtime.warnings.includes("managed_cli_unavailable_no_path_fallback"),
+      status.plugin_runtime.warnings.includes("managed_cli_unavailable_path_diagnostic_only"),
       true,
     );
     assert.match(status.readiness[0].minimum_next[0], /^Restart\/reload/u);
@@ -1619,6 +1632,7 @@ test("mcp launcher keeps managed provision failures primary without PATH", async
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
+    await rm(pathDir, { recursive: true, force: true });
   }
 });
 
@@ -2231,6 +2245,7 @@ test("hook goal heartbeat is quiet until readiness or freshness evidence changes
   const env = {
     PLUGIN_DATA: dataDir,
     CODESTORY_CLI: cliPath,
+    CODESTORY_MCP_RESOURCES_EXPOSED: "1",
     TEST_AGENT_STATUS: "repair_retrieval",
     TEST_FRESHNESS_STATUS: "stale",
     TEST_CHANGED_FILES: "1",
@@ -2266,6 +2281,55 @@ test("hook goal heartbeat is quiet until readiness or freshness evidence changes
   }
 });
 
+test("hook goal heartbeat skips managed cli readiness when MCP is model-hidden", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-hidden-mcp-"));
+  const version = await readPluginVersion();
+  const cliDir = join(dataDir, "codestory-cli", version);
+  const marker = join(dataDir, "managed-cli-called.txt");
+  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+
+  try {
+    await mkdir(cliDir, { recursive: true });
+    await writeNodeCli(
+      cliDir,
+      [
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(' '));",
+        "if (process.argv[2] === 'ready') {",
+        "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready' }] }));",
+        "  process.exit(0);",
+        "}",
+        "process.exit(0);",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(cliDir, "manifest.json"),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
+      "utf8",
+    );
+    await writeFile(
+      join(dataDir, ".codestory-mcp-runtime.json"),
+      JSON.stringify({ source: "managed", path: cliPath }),
+      "utf8",
+    );
+
+    const output = runCodexHook({
+      hook_event_name: "GoalLoopHeartbeat",
+      cwd: repoRoot,
+    }, {
+      PLUGIN_DATA: dataDir,
+      CODESTORY_MCP_RESOURCES_EXPOSED: "",
+      PATH: "",
+      TEST_MARKER: marker,
+    });
+
+    assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
+    await assert.rejects(access(marker));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("hook MCP classifier distinguishes configured launchable and model-visible states", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-classify-"));
   const version = await readPluginVersion();
@@ -2278,6 +2342,7 @@ test("hook MCP classifier distinguishes configured launchable and model-visible 
     assert.equal(configured.mcp_process_launchable, true);
     assert.equal(configured.mcp_resources_exposed, false);
     assert.equal(configured.mcp_resource_status, "mcp_resources_not_model_visible");
+    assert.equal(configured.mcp_model_visible_blocked, true);
     assert.equal(configured.managed_cli_present, false);
 
     await mkdir(cliDir, { recursive: true });
@@ -2290,7 +2355,8 @@ test("hook MCP classifier distinguishes configured launchable and model-visible 
     const managed = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
     assert.equal(managed.managed_cli_present, true);
     assert.equal(managed.managed_cli_path, cliPath);
-    assert.equal(managed.degraded_no_surface, false);
+    assert.equal(managed.mcp_model_visible_blocked, true);
+    assert.equal(managed.degraded_no_surface, true);
 
     await writeFile(
       join(dataDir, ".codestory-mcp-runtime.json"),
@@ -2301,7 +2367,8 @@ test("hook MCP classifier distinguishes configured launchable and model-visible 
     assert.equal(runtimeStateOnly.mcp_runtime_state_present, true);
     assert.equal(runtimeStateOnly.mcp_resources_exposed, false);
     assert.equal(runtimeStateOnly.mcp_resource_status, "mcp_resources_not_model_visible");
-    assert.equal(runtimeStateOnly.degraded_no_surface, false);
+    assert.equal(runtimeStateOnly.mcp_model_visible_blocked, true);
+    assert.equal(runtimeStateOnly.degraded_no_surface, true);
 
     const previous = process.env.CODESTORY_MCP_RESOURCES_EXPOSED;
     try {
@@ -2309,6 +2376,7 @@ test("hook MCP classifier distinguishes configured launchable and model-visible 
       const exposed = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
       assert.equal(exposed.mcp_resources_exposed, true);
       assert.equal(exposed.mcp_resource_status, "mcp_resources_exposed");
+      assert.equal(exposed.mcp_model_visible_blocked, false);
       assert.equal(exposed.degraded_no_surface, false);
     } finally {
       if (previous === undefined) {
@@ -2448,10 +2516,14 @@ test("hook output reports model-invisible MCP instead of PATH setup guidance", a
   const context = output.hookSpecificOutput.additionalContext;
   assert.match(context, /mcp_config_installed: yes/u);
   assert.match(context, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
+  assert.match(context, /mcp_model_visible_blocked: yes/u);
   assert.match(context, /managed_cli_present: yes/u);
+  assert.match(context, /degraded_no_surface: yes/u);
   assert.match(context, /MCP resources are not visible/u);
+  assert.doesNotMatch(context, /managed_bootstrap: ready/u);
   assert.doesNotMatch(context, /codestory-cli ENOENT/u);
   assert.doesNotMatch(context, /attempted request packet/u);
+  assert.doesNotMatch(context, /bounded source reads/u);
   assert.doesNotMatch(context, /adding CodeStory to PATH/u);
   await rm(dataDir, { recursive: true, force: true });
 });

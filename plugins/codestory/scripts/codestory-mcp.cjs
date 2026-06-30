@@ -594,17 +594,16 @@ async function resolveCli() {
   const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
   const pathCandidates = pathCliCandidates();
   warnings.push(pathCandidates.length > 0
-    ? 'managed_cli_unavailable_using_path_fallback'
+    ? 'managed_cli_unavailable_path_diagnostic_only'
     : 'managed_cli_unavailable_no_path_fallback');
-  const pathFallback = pathCandidates[0] || 'codestory-cli';
   return {
-    source: 'path_fallback',
-    path: pathFallback,
+    source: 'managed_unavailable',
+    path: null,
     sha256: null,
     version,
     cliVersion: null,
     repoRef: null,
-    buildSource: 'path_fallback',
+    buildSource: 'managed_unavailable',
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
@@ -637,6 +636,15 @@ function compareSemver(left, right) {
 }
 
 function probeResolvedCli(resolved) {
+  if (!resolved.path) {
+    return {
+      status: null,
+      error: `${resolved.source || 'unavailable'}_cli_unavailable`,
+      version: null,
+      stdout: '',
+      stderr: '',
+    };
+  }
   const result = spawnSync(resolved.path, ['--version'], {
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
@@ -654,8 +662,8 @@ function probeResolvedCli(resolved) {
 }
 
 function failOpenReasonForProbe(resolved, probe) {
-  if (resolved.managedProvisionFailure && resolved.source === 'path_fallback' && pathCliCandidates().length === 0) {
-    return resolved.managedProvisionFailure;
+  if (resolved.source === 'managed_unavailable') {
+    return resolved.managedProvisionFailure || 'managed_cli_unavailable';
   }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
@@ -860,7 +868,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
     'Refresh or reinstall the CodeStory plugin after GitHub release assets are reachable, then restart/reload the Codex host/app and read codestory://status.',
   ];
-  const minimumNext = options.minimumNext || (managedProvisionFailed && pathCandidates.length === 0 ? managedProvisionNext : [
+  const minimumNext = options.minimumNext || (managedProvisionFailed ? managedProvisionNext : [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
   ]);
   const fullRepair = options.fullRepair || minimumNext;
@@ -1166,25 +1174,6 @@ function resourceContents(uri, value) {
   };
 }
 
-function failOpenToolResult(status) {
-  const readiness = status.readiness[0];
-  return {
-    isError: true,
-    content: [{ type: 'text', text: diagnosticText(status) }],
-    structuredContent: {
-      code: 'codestory_mcp_runtime_unavailable',
-      status: readiness.status,
-      repair_reason: status.degraded_reason,
-      local_refresh: status.local_refresh || null,
-      plugin_runtime: status.plugin_runtime,
-      setup: readiness.setup,
-      minimum_next: readiness.minimum_next,
-      full_repair: readiness.full_repair,
-      recommended_next_calls: status.recommended_next_calls,
-    },
-  };
-}
-
 function failOpenSidecarSetupResult(request) {
   const action = request.params?.arguments?.action || 'status';
   if (!['status', 'enable', 'disable', 'ask', 'repair'].includes(action)) {
@@ -1210,13 +1199,7 @@ function failOpenSidecarSetupResult(request) {
 }
 
 function runFailOpenMcp(status) {
-  const tools = ['ground', 'files', 'packet', 'search', 'context'].map((name) => ({
-    name,
-    description: 'CodeStory diagnostic fail-open surface; runtime repair is required before this tool can return repository grounding.',
-    inputSchema: { type: 'object', additionalProperties: true },
-    outputSchema: { type: 'object', additionalProperties: true },
-  }));
-  tools.unshift({
+  const tools = [{
     name: 'sidecar_setup',
     description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
     inputSchema: {
@@ -1240,7 +1223,7 @@ function runFailOpenMcp(status) {
       idempotentHint: true,
       openWorldHint: false,
     },
-  });
+  }];
   const resources = [
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
@@ -1287,12 +1270,9 @@ function runFailOpenMcp(status) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        response = jsonrpcResult(
-          request.id,
-          request.params?.name === 'sidecar_setup'
-            ? failOpenSidecarSetupResult(request)
-            : failOpenToolResult(status),
-        );
+        response = request.params?.name === 'sidecar_setup'
+          ? jsonrpcResult(request.id, failOpenSidecarSetupResult(request))
+          : jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status or call sidecar_setup.');
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }
