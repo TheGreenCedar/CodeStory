@@ -9,7 +9,8 @@
   exposes status/repair guidance instead of normal grounding tool names.
 - Disabled ambient `PATH` CLI fallback for installed plugin runtime launches;
   missing managed CLI setup now stays in `managed_unavailable` diagnostics while
-  preserving `CODESTORY_CLI` as an explicit local-dev override.
+  preserving `CODESTORY_CLI` as an explicit local-dev override and keeping PATH
+  checks documented as CLI diagnostics only.
 
 ## 0.12.6
 

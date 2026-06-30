@@ -294,12 +294,12 @@ function Ensure-InstallDirOnPath {
 function Assert-PathCliResolvesCurrent {
     $pathCli = Get-Command "codestory-cli" -ErrorAction SilentlyContinue
     if (-not $pathCli) {
-        throw "Installed MCP runtime cannot resolve codestory-cli from PATH. Add the current CodeStory install directory before stale entries, then restart the Codex host/app before opening a fresh agent thread."
+        throw "PATH diagnostic cannot resolve codestory-cli. Add the current CodeStory install directory before stale entries for shell CLI use; installed plugin runtime changes require managed status/reinstall/reload or explicit CODESTORY_CLI, then restart the Codex host/app before opening a fresh agent thread."
     }
 
     $version = Invoke-CliVersion $pathCli.Source
     if (-not (Test-RequiredVersion $version.Version)) {
-        throw "Installed MCP runtime still resolves stale codestory-cli from PATH: $($pathCli.Source) ($($version.Text)); expected $script:RequiredVersion. Stop or restart running 'codestory-cli serve --stdio --refresh none' processes that lock old binaries, move the current install directory before stale PATH entries, then restart the Codex host/app before opening a fresh agent thread."
+        throw "PATH diagnostic still resolves stale codestory-cli: $($pathCli.Source) ($($version.Text)); expected $script:RequiredVersion. Stop or restart running 'codestory-cli serve --stdio --refresh none' processes that lock old binaries, move the current install directory before stale PATH entries for shell CLI use, then update installed plugin runtime through managed status/reinstall/reload or explicit CODESTORY_CLI before opening a fresh agent thread."
     }
 }
 
