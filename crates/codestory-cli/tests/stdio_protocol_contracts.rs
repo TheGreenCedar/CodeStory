@@ -2688,10 +2688,10 @@ fn resources_read_status_recommends_sidecar_repair_when_policy_enabled() {
     );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
-        next_call_text.contains("\"tool\":\"sidecar_setup\"")
-            && next_call_text.contains("\"action\":\"repair\"")
-            && next_call_text.contains("\"debug_command\""),
-        "enabled policy should route agent repair through the MCP sidecar_setup tool: {status}"
+        next_call_text.contains("\"tool\":\"repair_all\"")
+            && next_call_text.contains("\"debug_commands\"")
+            && next_call_text.contains("\"uri\":\"codestory://status\""),
+        "enabled policy should route agent repair through one MCP repair tool plus status readback: {status}"
     );
     assert!(
         next_call_text.contains("--run-id") && next_call_text.contains("shared-agent"),

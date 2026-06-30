@@ -699,6 +699,25 @@ function mcpNextCallForCommand(command) {
   };
 }
 
+function singleRepairNextCalls(commands) {
+  const needsHost = commands.some((command) => command.startsWith('Restart/reload') || command.startsWith('Refresh or reinstall'));
+  if (needsHost) {
+    return [
+      { method: 'host/restart', instruction: commands[0] },
+      { method: 'resources/read', uri: 'codestory://status' },
+    ];
+  }
+  return [
+    {
+      method: 'tools/call',
+      tool: 'repair_all',
+      arguments: {},
+      debug_commands: commands,
+    },
+    { method: 'resources/read', uri: 'codestory://status' },
+  ];
+}
+
 function localWaitFreshTimeoutMs() {
   const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
@@ -951,11 +970,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     local_refresh: options.localRefresh || null,
     readiness: [repair],
     allowed_surfaces: allowedSurfaces,
-    recommended_next_calls: [
-      { method: 'resources/read', uri: 'codestory://status' },
-      { method: 'resources/read', uri: 'codestory://agent-guide' },
-      ...recommendedNext.map((command) => mcpNextCallForCommand(command)),
-    ],
+    recommended_next_calls: singleRepairNextCalls(recommendedNext),
   };
 }
 
@@ -1200,6 +1215,28 @@ function failOpenSidecarSetupResult(request) {
 
 function runFailOpenMcp(status) {
   const tools = [{
+    name: 'repair_all',
+    description: 'Run the single supported CodeStory readiness repair action, then read codestory://status again.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+    outputSchema: { type: 'object', additionalProperties: true },
+    safety: {
+      readOnly: false,
+      sideEffects: true,
+      localOnly: true,
+      openWorld: false,
+      mutation: 'local_plugin_configuration',
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  }, {
     name: 'sidecar_setup',
     description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
     inputSchema: {
@@ -1270,9 +1307,18 @@ function runFailOpenMcp(status) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        response = request.params?.name === 'sidecar_setup'
-          ? jsonrpcResult(request.id, failOpenSidecarSetupResult(request))
-          : jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status or call sidecar_setup.');
+        if (request.params?.name === 'repair_all') {
+          const repairRequest = {
+            params: {
+              arguments: { action: 'repair' },
+            },
+          };
+          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(repairRequest));
+        } else if (request.params?.name === 'sidecar_setup') {
+          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(request));
+        } else {
+          response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status or call repair_all.');
+        }
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }

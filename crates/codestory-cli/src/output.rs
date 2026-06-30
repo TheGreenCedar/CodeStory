@@ -29,9 +29,9 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::args::{
-    CliTrailMode, DoctorOutput, DrillOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
-    QueryItemOutput, QueryOutput, ReadyOutput, SearchHitOutput, SearchOutput, TrailCommand,
-    VerificationTargetOutput,
+    CliTrailMode, DoctorOutput, DrillOutput, FixOutput, IndexDryRunOutput, IndexOutput,
+    OutputFormat, QueryItemOutput, QueryOutput, ReadyOutput, SearchHitOutput, SearchOutput,
+    TrailCommand, VerificationTargetOutput,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -192,6 +192,20 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
             }
         }
     }
+    markdown
+}
+
+pub(crate) fn render_fix_markdown(output: &FixOutput) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Fix");
+    let _ = writeln!(markdown, "status: `{}`", output.status);
+    let _ = writeln!(markdown, "action: `{}`", output.action);
+    let _ = writeln!(
+        markdown,
+        "goal: `{}`",
+        crate::readiness::goal_label(output.goal)
+    );
+    markdown.push_str(&render_ready_markdown(&output.result));
     markdown
 }
 
