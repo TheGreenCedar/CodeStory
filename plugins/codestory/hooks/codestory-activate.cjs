@@ -132,6 +132,7 @@ function writeProjectDirtyMarker(policy) {
 function runtimeFingerprint(mcp) {
   return [
     mcp.mcp_resource_status,
+    mcp.mcp_model_visible_blocked ? 'model-hidden' : 'model-visible-or-unlaunchable',
     mcp.managed_cli_present ? 'managed' : 'no-managed',
     mcp.degraded_no_surface ? 'degraded' : 'surface',
   ].join('|');
@@ -154,6 +155,14 @@ function firstRuntimeFailure(mcp) {
 }
 
 function shortDegradedNotice(mcp, reason, state = {}) {
+  if (mcp.mcp_model_visible_blocked) {
+    return [
+      'CodeStory setup blocked: MCP is configured and launchable, but resources are not model-visible.',
+      `First failing layer: ${firstRuntimeFailure(mcp)}.`,
+      reason ? `Reason: ${truncate(reason, 600)}` : null,
+      'Reload the host/plugin and read codestory://status; do not use managed CLI or PATH fallback as CodeStory grounding.',
+    ].filter(Boolean).join('\n');
+  }
   const hook = state.hook || {};
   return [
     'CodeStory degraded mode: no MCP or managed runtime surface is usable.',
@@ -170,7 +179,9 @@ function runtimeStatusBlock(policy, mcp) {
     `output_cap_chars: ${policy.cap}`,
     `dedupe_key: ${policy.dedupeKey}`,
     mcpDetectionText(mcp),
-    mcp.mcp_resources_exposed
+    mcp.mcp_model_visible_blocked
+      ? 'Next: reload the host/plugin and read codestory://status; do not use managed CLI or PATH fallback as CodeStory grounding.'
+      : mcp.mcp_resources_exposed
       ? 'Next: read codestory://status before source reads; use packet/search/context only when status allows them with retrieval_mode=full.'
       : 'Next: no sidecar-backed packet/search surface is proven available; use bounded source reads instead of repeated repair attempts.',
   ].join('\n');
@@ -179,7 +190,7 @@ function runtimeStatusBlock(policy, mcp) {
 function shouldBootstrapManagedRuntime(policy, mcp) {
   if (process.env.CODESTORY_CLI) return false;
   if (!BOOTSTRAP_TAXONOMIES.has(policy.taxonomy)) return false;
-  return Boolean(policy.project && mcp.mcp_process_launchable && !mcp.mcp_resources_exposed);
+  return Boolean(policy.project && mcp.mcp_process_launchable && mcp.mcp_resources_exposed && !mcp.managed_cli_present);
 }
 
 function bootstrapText(bootstrap) {
@@ -380,7 +391,7 @@ function runCodeStory(input, event, policy, state = {}) {
   }
   const bootstrapBlock = bootstrapText(bootstrap);
   if (policy.runtimeOnly) {
-    const heartbeatProbe = policy.heartbeat
+    const heartbeatProbe = policy.heartbeat && !mcp.mcp_model_visible_blocked
       ? heartbeatReadinessProbe(mcp, policy.project, input.cwd || process.cwd())
       : null;
     const output = state.hook?.preflight_failed && mcp.degraded_no_surface
