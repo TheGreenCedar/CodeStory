@@ -2313,7 +2313,9 @@ fn compact_doctor_check_message(check: &crate::args::DoctorCheckOutput) -> Strin
 }
 
 fn doctor_operator_status(output: &DoctorOutput) -> &'static str {
-    if output.checks.iter().any(|check| check.status == "error") {
+    if doctor_agent_packet_search_readiness(output) == "blocked"
+        || output.checks.iter().any(|check| check.status == "error")
+    {
         "blocked"
     } else if doctor_agent_packet_search_readiness(output) != "ready"
         || output.checks.iter().any(|check| check.status == "warn")

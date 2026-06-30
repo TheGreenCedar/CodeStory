@@ -3765,7 +3765,10 @@ fn stdio_repair_reason(verdict: &ReadinessVerdictDto) -> Option<String> {
     if verdict.status == ReadinessStatusDto::RepairSetup {
         return Some("stale_active_cli".to_string());
     }
-    if verdict.status == ReadinessStatusDto::RepairRetrieval {
+    if matches!(
+        verdict.status,
+        ReadinessStatusDto::Blocked | ReadinessStatusDto::RepairRetrieval
+    ) {
         return verdict
             .sidecar
             .as_ref()
@@ -4167,9 +4170,9 @@ version = "0.11.20"
                 .to_string();
         let readiness = vec![ReadinessVerdictDto {
             goal: ReadinessGoalDto::AgentPacketSearch,
-            status: ReadinessStatusDto::RepairRetrieval,
+            status: ReadinessStatusDto::Blocked,
             summary:
-                "Agent packet/search needs full sidecar retrieval; current mode is `unavailable`."
+                "Agent packet/search is blocked until full sidecar retrieval is proven; current mode is `unavailable`."
                     .to_string(),
             minimum_next: vec![repair.clone()],
             full_repair: vec![
@@ -4327,7 +4330,7 @@ version = "0.11.20"
             );
             assert_eq!(
                 surfaces[surface]["status"],
-                json!("repair_retrieval"),
+                json!("blocked"),
                 "blocked agent surface should stay on the agent retrieval lane: {surfaces}"
             );
         }
