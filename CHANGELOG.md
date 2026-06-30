@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Added `codestory-cli fix` and MCP `repair_all` as the single supported
+  readiness repair entrypoint, with status recommendations collapsed to one
+  repair action plus a `codestory://status` readback.
 - Blocked CodeStory grounding when the plugin MCP is launchable but not
   model-visible, even when a managed CLI exists; diagnostic fail-open mode now
   exposes status/repair guidance instead of normal grounding tool names.

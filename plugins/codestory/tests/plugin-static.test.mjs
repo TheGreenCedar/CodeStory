@@ -1086,7 +1086,7 @@ test("mcp launcher blocks managed setup when only PATH cli is available", async 
     assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
-    assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
+    assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["repair_all", "sidecar_setup"]);
     assert.equal(responses[3].error.code, -32602);
     assert.match(responses[3].error.message, /grounding tools are unavailable/u);
   } finally {

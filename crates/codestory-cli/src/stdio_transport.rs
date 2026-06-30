@@ -847,6 +847,10 @@ fn handle_stdio_tool_call(
         "symbols" => handle_stdio_symbols(runtime, request),
         "snippet" => handle_stdio_snippet(runtime, request),
         "context" => handle_stdio_context(runtime, request),
+        "repair_all" => {
+            state.status_cache = None;
+            handle_stdio_sidecar_repair(runtime)
+        }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
@@ -3259,36 +3263,18 @@ fn stdio_status_recommended_next_calls(
                 _ => {}
             }
         }
-        let full_repair = if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
-            sidecar_setup
-                .get("next_repair_command")
-                .and_then(serde_json::Value::as_str)
-                .filter(|command| !command.trim().is_empty())
-                .map(|command| {
-                    std::iter::once(command.to_string())
-                        .chain(non_ready.full_repair.iter().skip(1).cloned())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| non_ready.full_repair.clone())
-        } else {
-            non_ready.full_repair.clone()
-        };
-        return serde_json::Value::Array(
-            full_repair
-                .iter()
-                .map(|command| stdio_recommended_next_call(command))
-                .chain([
-                    serde_json::json!({
-                        "method": "resources/read",
-                        "uri": "codestory://status"
-                    }),
-                    serde_json::json!({
-                        "method": "resources/read",
-                        "uri": "codestory://agent-guide"
-                    }),
-                ])
-                .collect(),
-        );
+        return serde_json::json!([
+            {
+                "method": "tools/call",
+                "tool": "repair_all",
+                "arguments": {},
+                "debug_commands": non_ready.full_repair
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }
+        ]);
     }
 
     serde_json::json!([
