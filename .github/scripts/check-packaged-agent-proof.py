@@ -21,6 +21,8 @@ from pathlib import Path
 DEFAULT_QUESTION = "Explain how CodeStory validates packaged agent readiness."
 DEFAULT_QUERY = "RuntimeContext"
 STATUS_URI = "codestory://status"
+AGENT_GUIDE_URI = "codestory://agent-guide"
+SERVER_RESOURCE_URIS = (STATUS_URI, AGENT_GUIDE_URI)
 PLUGIN_SKILL_RELATIVE = Path("plugins/codestory/skills/codestory-grounding/SKILL.md")
 
 
@@ -342,6 +344,7 @@ def plugin_stdio_status(
             ["node", str(launcher)],
             artifact,
             timeout_secs,
+            layer="plugin_stdio",
             cwd=project,
             env={
                 **os.environ,
@@ -356,6 +359,7 @@ def stdio_status_command(
     command: list[str],
     artifact: Path,
     timeout_secs: int,
+    layer: str = "serve_stdio",
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> dict:
@@ -373,6 +377,7 @@ def stdio_status_command(
     )
     requests = [
         {"jsonrpc": "2.0", "id": "tools", "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": "resources", "method": "resources/list"},
         {
             "jsonrpc": "2.0",
             "id": "status",
@@ -413,13 +418,13 @@ def stdio_status_command(
                     stderr_path,
                     {"timed_out": True, "timeout_secs": timeout_secs},
                 )
-                fail("serve_stdio", artifact, f"serve --stdio timed out after {timeout_secs}s")
+                fail(layer, artifact, f"stdio MCP request timed out after {timeout_secs}s")
             if line is None:
                 terminate_process_tree(process)
                 process_terminated = True
                 stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
                 write_stdio_artifact(artifact, transcript, "".join(stdout_lines), stderr_path)
-                fail("serve_stdio", artifact, "serve --stdio closed before responding")
+                fail(layer, artifact, "stdio MCP server closed before responding")
             try:
                 response = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -434,7 +439,7 @@ def stdio_status_command(
                     stderr_path,
                     {"invalid_line": line},
                 )
-                fail("serve_stdio", artifact, f"serve --stdio emitted invalid JSON: {exc}")
+                fail(layer, artifact, f"stdio MCP server emitted invalid JSON: {exc}")
             entry["response"] = response
             responses.append(response)
     finally:
@@ -457,22 +462,54 @@ def stdio_status_command(
     stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
     responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
     tools = responses_by_id.get("tools")
+    resources = responses_by_id.get("resources")
     status_response = responses_by_id.get("status")
-    payload = {"tools": tools, "status_response": status_response, "transcript": transcript, "stdout": "".join(stdout_lines)}
+    payload = {
+        "tools": tools,
+        "resources": resources,
+        "status_response": status_response,
+        "transcript": transcript,
+        "stdout": "".join(stdout_lines),
+    }
     write_json(artifact, payload)
-    require(isinstance(tools, dict), "serve_stdio", artifact, "serve --stdio did not return tools/list response")
-    require(isinstance(status_response, dict), "serve_stdio", artifact, "serve --stdio did not return status response")
+    require(isinstance(tools, dict), layer, artifact, "stdio MCP server did not return tools/list response")
+    require(isinstance(resources, dict), layer, artifact, "stdio MCP server did not return resources/list response")
+    require(isinstance(status_response, dict), layer, artifact, "stdio MCP server did not return status response")
     if "error" in tools:
-        fail("serve_stdio", artifact, f"tools/list failed: {tools['error']}")
+        fail(layer, artifact, f"tools/list failed: {tools['error']}")
+    if "error" in resources:
+        fail(layer, artifact, f"resources/list failed: {resources['error']}")
     if "error" in status_response:
-        fail("serve_stdio", artifact, f"status resource failed: {status_response['error']}")
+        fail(layer, artifact, f"status resource failed: {status_response['error']}")
+
+    listed_resources = resources.get("result", {}).get("resources", [])
+    observed_uris = sorted(
+        item.get("uri")
+        for item in listed_resources
+        if isinstance(item, dict) and isinstance(item.get("uri"), str)
+    )
+    missing_uris = [uri for uri in SERVER_RESOURCE_URIS if uri not in observed_uris]
+    visibility = {
+        "required": list(SERVER_RESOURCE_URIS),
+        "observed": observed_uris,
+        "missing": missing_uris,
+        "available": not missing_uris,
+    }
+    payload["server_advertised_mcp_resources"] = visibility
+    write_json(artifact, payload)
 
     contents = status_response.get("result", {}).get("contents", [])
     content = next((item for item in contents if item.get("uri") == STATUS_URI), None)
-    require(content is not None, "serve_stdio", artifact, "status response missing codestory://status")
+    require(content is not None, layer, artifact, "status response missing codestory://status")
     status = json.loads(content.get("text", "{}"))
     payload["status"] = status
     write_json(artifact, payload)
+    require(
+        not missing_uris,
+        layer,
+        artifact,
+        f"resources/list missing server-advertised CodeStory resources: {', '.join(missing_uris)}",
+    )
     return status
 
 
@@ -891,6 +928,11 @@ def write_fake_cli(path: Path) -> None:
                         continue
                     if request.get("method") == "tools/list":
                         result = {"tools": [{"name": "packet"}, {"name": "search"}, {"name": "context"}]}
+                    elif request.get("method") == "resources/list":
+                        resources = [{"uri": "codestory://status", "name": "CodeStory runtime status"}]
+                        if fail != "resources_hidden":
+                            resources.append({"uri": "codestory://agent-guide", "name": "CodeStory agent guide"})
+                        result = {"resources": resources}
                     else:
                         status = {
                             "server_version": "9.9.9",
@@ -920,6 +962,48 @@ def write_fake_cli(path: Path) -> None:
         wrapper = path / "codestory-cli"
         wrapper.write_text(f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(fake)!r}, run_name='__main__')\n", encoding="utf-8")
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+
+
+def write_fake_plugin_launcher(plugin_root: Path) -> None:
+    launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        textwrap.dedent(
+            r'''
+            const { spawn } = require('child_process');
+
+            const cli = process.env.CODESTORY_FAKE_PLUGIN_CLI;
+            if (!cli) {
+              process.stderr.write('CODESTORY_FAKE_PLUGIN_CLI is required\n');
+              process.exit(2);
+            }
+
+            const child = spawn(
+              cli,
+              ['serve', '--stdio', '--refresh', 'none', '--project', process.cwd()],
+              {
+                stdio: 'inherit',
+                shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli),
+                env: {
+                  ...process.env,
+                  CODESTORY_FAKE_FAIL_LAYER: process.env.CODESTORY_FAKE_PLUGIN_HIDE_RESOURCES === '1'
+                    ? 'resources_hidden'
+                    : process.env.CODESTORY_FAKE_FAIL_LAYER || '',
+                },
+              },
+            );
+            child.on('exit', (code, signal) => {
+              if (signal) process.kill(process.pid, signal);
+              process.exit(code || 0);
+            });
+            child.on('error', (error) => {
+              process.stderr.write(`${error.message}\n`);
+              process.exit(1);
+            });
+            '''
+        ).lstrip(),
+        encoding="utf-8",
+    )
 
 
 def self_test() -> None:
@@ -1006,6 +1090,28 @@ def self_test() -> None:
         else:
             raise AssertionError("plugin-root drift should fail the packaged proof gate")
 
+        plugin_manifest.write_text(json.dumps({"version": "9.9.9"}), encoding="utf-8")
+        write_fake_plugin_launcher(plugin_root)
+        plugin_hidden_args = argparse.Namespace(**vars(args))
+        plugin_hidden_args.plugin_root = str(plugin_root)
+        plugin_hidden_args.out_dir = str(root / "plugin-hidden-out")
+        os.environ["CODESTORY_FAKE_PLUGIN_HIDE_RESOURCES"] = "1"
+        os.environ["CODESTORY_FAKE_PLUGIN_CLI"] = str(stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli"))
+        try:
+            try:
+                run_gate(plugin_hidden_args)
+            except GateFailure as exc:
+                assert exc.layer == "plugin_stdio"
+                assert "plugin-stdio-status.json" in str(exc.artifact)
+                artifact = read_json_file(exc.artifact)
+                assert artifact["server_advertised_mcp_resources"]["missing"] == ["codestory://agent-guide"]
+                assert artifact["status"]["plugin_runtime"]["cli_source"] == "direct_cli_launch"
+            else:
+                raise AssertionError("hidden plugin MCP resources should fail the plugin stdio gate")
+        finally:
+            os.environ.pop("CODESTORY_FAKE_PLUGIN_HIDE_RESOURCES", None)
+            os.environ.pop("CODESTORY_FAKE_PLUGIN_CLI", None)
+
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "doctor_stderr"
         try:
             try:
@@ -1065,6 +1171,18 @@ def self_test() -> None:
                 assert "serve-stdio-status.json" in str(exc.artifact)
             else:
                 raise AssertionError("silent fake stdio server should fail the gate")
+        finally:
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "resources_hidden"
+        try:
+            try:
+                run_gate(args)
+            except GateFailure as exc:
+                assert exc.layer == "serve_stdio"
+                assert "serve-stdio-status.json" in str(exc.artifact)
+            else:
+                raise AssertionError("hidden MCP resources should fail the gate")
         finally:
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
 
