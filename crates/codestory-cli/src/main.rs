@@ -81,14 +81,14 @@ use args::{
     DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
     DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
-    DrillVerificationChecklistItemOutput, FilesCommand, GenerateCompletionsCommand, GroundCommand,
-    IndexCommand, IndexDryRunOutput, IndexOutput, PacketCommand, ProjectArgs, QueryCommand,
-    QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand,
-    ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand,
-    SetupAction, SetupCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile,
-    SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand,
-    TaskAction, TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput,
-    VerificationTargetOutput, build_trail_request,
+    DrillVerificationChecklistItemOutput, FilesCommand, FixCommand, FixOutput,
+    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
+    PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
+    QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand, ReadyOutput, RepoTextMode,
+    SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand,
+    SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput,
+    SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction, TaskBriefCommand,
+    TaskCommand, TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -96,9 +96,9 @@ use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
 use http_transport::search_repo_text_mode_param;
 use output::{
     REPO_CONTENT_BOUNDARY_LINE, context_packet_json, emit, emit_text, render_agent_citation,
-    render_context_markdown, render_doctor_markdown, render_drill_markdown, render_ground_markdown,
-    render_index_dry_run_markdown, render_index_markdown, render_query_markdown,
-    render_ready_markdown, render_search_hit_output, render_search_markdown,
+    render_context_markdown, render_doctor_markdown, render_drill_markdown, render_fix_markdown,
+    render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
+    render_query_markdown, render_ready_markdown, render_search_hit_output, render_search_markdown,
     render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
     render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
     validate_output_file_parent,
@@ -196,6 +196,7 @@ fn main() -> Result<()> {
         Command::Task(cmd) => run_task(cmd),
         Command::Doctor(cmd) => run_doctor(cmd),
         Command::Ready(cmd) => run_ready(cmd),
+        Command::Fix(cmd) => run_fix(cmd),
         Command::Smoke(cmd) => run_smoke(cmd),
         Command::Agent(cmd) => run_agent(cmd),
         Command::Setup(cmd) => run_setup(cmd),
@@ -2138,6 +2139,37 @@ fn run_doctor(cmd: DoctorCommand) -> Result<()> {
 fn run_ready(cmd: ReadyCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "ready")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    let output = build_ready_output(&cmd)?;
+    let markdown = render_ready_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn run_fix(cmd: FixCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "fix")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    let ready_cmd = ReadyCommand {
+        project: cmd.project,
+        goal: Some(args::ReadyGoal::Agent),
+        repair: true,
+        wait_fresh: false,
+        run_id: cmd.run_id,
+        format: cmd.format,
+        output_file: None,
+    };
+    let ready = build_ready_output(&ready_cmd)?;
+    let status = fix_status(&ready);
+    let output = FixOutput {
+        status,
+        ready: status == "ready",
+        goal: ReadinessGoalDto::AgentPacketSearch,
+        action: "ready_agent_repair",
+        result: ready,
+    };
+    let markdown = render_fix_markdown(&output);
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+}
+
+fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
     let runtime = if cmd.repair {
         if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
             new_agent_surface_runtime(&cmd.project)?
@@ -2185,8 +2217,23 @@ fn run_ready(cmd: ReadyCommand) -> Result<()> {
         local_refresh,
         readiness_lanes,
     };
-    let markdown = render_ready_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
+    Ok(output)
+}
+
+fn fix_status(output: &ReadyOutput) -> &'static str {
+    let Some(non_ready) = readiness::primary_non_ready(&output.verdicts) else {
+        return "ready";
+    };
+    if non_ready
+        .minimum_next
+        .iter()
+        .chain(non_ready.full_repair.iter())
+        .any(|command| command.starts_with("Restart/reload the Codex host/app"))
+    {
+        "blocked_requires_host_reload"
+    } else {
+        "blocked_with_error"
+    }
 }
 
 pub(crate) fn wait_for_local_freshness(
@@ -11096,6 +11143,7 @@ fn readiness_lane_status(
         ReadinessStatusDto::RepairRetrieval
     };
     match verdict.map(|verdict| verdict.status) {
+        Some(ReadinessStatusDto::Blocked) => ReadinessStatusDto::Blocked,
         Some(status @ (ReadinessStatusDto::RepairSetup | ReadinessStatusDto::RepairIndex)) => {
             status
         }
@@ -11500,9 +11548,9 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
         .unwrap_or("no degraded_reason reported");
     doctor_check(
         "sidecar_retrieval",
-        "warn",
+        "error",
         format!(
-            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); repair sidecars before trusting packet/search evidence.",
+            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); packet/search evidence is blocked until sidecars are full.",
             sidecar.retrieval_mode,
             sidecar.embedding_device_policy,
             sidecar.embedding_device_state,

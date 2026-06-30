@@ -25,7 +25,9 @@ comparison and portable prompts.
 
 The adapter prefers a checksummed plugin-managed CLI. It can provision from
 GitHub release `SHA256SUMS.txt`, honor `CODESTORY_CLI` as a local-dev override,
-and stay up with diagnostic `codestory://status` when spawn fails.
+and stay up with diagnostic `codestory://status` when managed setup fails.
+Ambient `PATH` binaries are reported as diagnostics only; installed plugin
+runtime does not launch them.
 
 ## Codex install (summary)
 

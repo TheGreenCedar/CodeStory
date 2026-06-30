@@ -1293,7 +1293,20 @@ static SIDECAR_SETUP_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 );
 
+static REPAIR_ALL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Run the single supported CodeStory readiness repair action.",
+    &[],
+    &[],
+);
+
 static TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "repair_all",
+        description: "Run the single supported readiness repair action, then read codestory://status again.",
+        input_schema: REPAIR_ALL_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
+        safety: SafetyMetadata::local_config_write(),
+    },
     ToolSpec {
         name: "sidecar_setup",
         description: "Read or change the plugin-local sidecar setup policy through MCP; use this instead of asking the user to run shell commands.",

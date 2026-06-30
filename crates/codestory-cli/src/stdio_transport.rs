@@ -847,6 +847,10 @@ fn handle_stdio_tool_call(
         "symbols" => handle_stdio_symbols(runtime, request),
         "snippet" => handle_stdio_snippet(runtime, request),
         "context" => handle_stdio_context(runtime, request),
+        "repair_all" => {
+            state.status_cache = None;
+            handle_stdio_sidecar_repair(runtime)
+        }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
@@ -3259,36 +3263,32 @@ fn stdio_status_recommended_next_calls(
                 _ => {}
             }
         }
-        let full_repair = if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
-            sidecar_setup
-                .get("next_repair_command")
-                .and_then(serde_json::Value::as_str)
-                .filter(|command| !command.trim().is_empty())
-                .map(|command| {
-                    std::iter::once(command.to_string())
-                        .chain(non_ready.full_repair.iter().skip(1).cloned())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| non_ready.full_repair.clone())
-        } else {
-            non_ready.full_repair.clone()
-        };
-        return serde_json::Value::Array(
-            full_repair
-                .iter()
-                .map(|command| stdio_recommended_next_call(command))
-                .chain([
-                    serde_json::json!({
-                        "method": "resources/read",
-                        "uri": "codestory://status"
-                    }),
-                    serde_json::json!({
-                        "method": "resources/read",
-                        "uri": "codestory://agent-guide"
-                    }),
-                ])
-                .collect(),
-        );
+        if let Some(host_action) = non_ready
+            .minimum_next
+            .iter()
+            .chain(non_ready.full_repair.iter())
+            .find(|command| command.starts_with("Restart/reload the Codex host/app"))
+        {
+            return serde_json::json!([
+                stdio_recommended_next_call(host_action),
+                {
+                    "method": "resources/read",
+                    "uri": "codestory://status"
+                }
+            ]);
+        }
+        return serde_json::json!([
+            {
+                "method": "tools/call",
+                "tool": "repair_all",
+                "arguments": {},
+                "debug_commands": non_ready.full_repair
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }
+        ]);
     }
 
     serde_json::json!([
@@ -3343,9 +3343,9 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     if command.contains("ready --goal agent --repair") {
         return serde_json::json!({
             "method": "tools/call",
-            "tool": "sidecar_setup",
-            "arguments": {"action": "repair"},
-            "debug_command": command
+            "tool": "repair_all",
+            "arguments": {},
+            "debug_commands": [command]
         });
     }
     if command.contains("ready --goal local") || command.contains("codestory-cli doctor") {
@@ -3765,7 +3765,10 @@ fn stdio_repair_reason(verdict: &ReadinessVerdictDto) -> Option<String> {
     if verdict.status == ReadinessStatusDto::RepairSetup {
         return Some("stale_active_cli".to_string());
     }
-    if verdict.status == ReadinessStatusDto::RepairRetrieval {
+    if matches!(
+        verdict.status,
+        ReadinessStatusDto::Blocked | ReadinessStatusDto::RepairRetrieval
+    ) {
         return verdict
             .sidecar
             .as_ref()
@@ -4167,9 +4170,9 @@ version = "0.11.20"
                 .to_string();
         let readiness = vec![ReadinessVerdictDto {
             goal: ReadinessGoalDto::AgentPacketSearch,
-            status: ReadinessStatusDto::RepairRetrieval,
+            status: ReadinessStatusDto::Blocked,
             summary:
-                "Agent packet/search needs full sidecar retrieval; current mode is `unavailable`."
+                "Agent packet/search is blocked until full sidecar retrieval is proven; current mode is `unavailable`."
                     .to_string(),
             minimum_next: vec![repair.clone()],
             full_repair: vec![
@@ -4327,7 +4330,7 @@ version = "0.11.20"
             );
             assert_eq!(
                 surfaces[surface]["status"],
-                json!("repair_retrieval"),
+                json!("blocked"),
                 "blocked agent surface should stay on the agent retrieval lane: {surfaces}"
             );
         }

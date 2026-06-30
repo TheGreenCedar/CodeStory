@@ -20,7 +20,6 @@ const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
-const processStartedAtMs = Date.now();
 
 function readJson(file) {
   try {
@@ -130,11 +129,6 @@ function activeProjectStateMaxAgeMs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 60 * 60 * 1000;
 }
 
-function activeProjectStateLaunchGraceMs() {
-  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_ACTIVE_PROJECT_LAUNCH_GRACE_MS || '', 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 1000;
-}
-
 function activeProjectStateTimestamp(active, statePath) {
   const parsed = Date.parse(active?.updatedAt || active?.updated_at || '');
   if (Number.isFinite(parsed)) return parsed;
@@ -147,15 +141,16 @@ function activeProjectStateTimestamp(active, statePath) {
 
 function activeProjectStateMatchesHost(active) {
   const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  if (!currentThread) return !String(active?.codexThreadId || '').trim();
-  return String(active?.codexThreadId || '').trim() === currentThread;
+  const activeThread = String(active?.codexThreadId || '').trim();
+  if (!activeThread) return true;
+  if (!currentThread) return false;
+  return activeThread === currentThread;
 }
 
 function activeProjectStateFresh(active, statePath, nowMs = Date.now()) {
   const timestamp = activeProjectStateTimestamp(active, statePath);
   return timestamp !== null
     && nowMs - timestamp <= activeProjectStateMaxAgeMs()
-    && timestamp >= processStartedAtMs - activeProjectStateLaunchGraceMs()
     && activeProjectStateMatchesHost(active);
 }
 
@@ -594,17 +589,16 @@ async function resolveCli() {
   const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
   const pathCandidates = pathCliCandidates();
   warnings.push(pathCandidates.length > 0
-    ? 'managed_cli_unavailable_using_path_fallback'
+    ? 'managed_cli_unavailable_path_diagnostic_only'
     : 'managed_cli_unavailable_no_path_fallback');
-  const pathFallback = pathCandidates[0] || 'codestory-cli';
   return {
-    source: 'path_fallback',
-    path: pathFallback,
+    source: 'managed_unavailable',
+    path: null,
     sha256: null,
     version,
     cliVersion: null,
     repoRef: null,
-    buildSource: 'path_fallback',
+    buildSource: 'managed_unavailable',
     archiveSha256: null,
     archiveUrl: null,
     provisionedAt: null,
@@ -637,6 +631,15 @@ function compareSemver(left, right) {
 }
 
 function probeResolvedCli(resolved) {
+  if (!resolved.path) {
+    return {
+      status: null,
+      error: `${resolved.source || 'unavailable'}_cli_unavailable`,
+      version: null,
+      stdout: '',
+      stderr: '',
+    };
+  }
   const result = spawnSync(resolved.path, ['--version'], {
     encoding: 'utf8',
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
@@ -654,8 +657,8 @@ function probeResolvedCli(resolved) {
 }
 
 function failOpenReasonForProbe(resolved, probe) {
-  if (resolved.managedProvisionFailure && resolved.source === 'path_fallback' && pathCliCandidates().length === 0) {
-    return resolved.managedProvisionFailure;
+  if (resolved.source === 'managed_unavailable') {
+    return resolved.managedProvisionFailure || 'managed_cli_unavailable';
   }
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
@@ -691,9 +694,28 @@ function mcpNextCallForCommand(command) {
   };
 }
 
+function singleRepairNextCalls(commands) {
+  const needsHost = commands.some((command) => command.startsWith('Restart/reload') || command.startsWith('Refresh or reinstall'));
+  if (needsHost) {
+    return [
+      { method: 'host/restart', instruction: commands[0] },
+      { method: 'resources/read', uri: 'codestory://status' },
+    ];
+  }
+  return [
+    {
+      method: 'tools/call',
+      tool: 'repair_all',
+      arguments: {},
+      debug_commands: commands,
+    },
+    { method: 'resources/read', uri: 'codestory://status' },
+  ];
+}
+
 function localWaitFreshTimeoutMs() {
   const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
 }
 
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
@@ -860,7 +882,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
     'Refresh or reinstall the CodeStory plugin after GitHub release assets are reachable, then restart/reload the Codex host/app and read codestory://status.',
   ];
-  const minimumNext = options.minimumNext || (managedProvisionFailed && pathCandidates.length === 0 ? managedProvisionNext : [
+  const minimumNext = options.minimumNext || (managedProvisionFailed ? managedProvisionNext : [
     'Refresh or reinstall the CodeStory plugin, then restart/reload the Codex host/app and read codestory://status in a fresh thread.',
   ]);
   const fullRepair = options.fullRepair || minimumNext;
@@ -943,11 +965,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     local_refresh: options.localRefresh || null,
     readiness: [repair],
     allowed_surfaces: allowedSurfaces,
-    recommended_next_calls: [
-      { method: 'resources/read', uri: 'codestory://status' },
-      { method: 'resources/read', uri: 'codestory://agent-guide' },
-      ...recommendedNext.map((command) => mcpNextCallForCommand(command)),
-    ],
+    recommended_next_calls: singleRepairNextCalls(recommendedNext),
   };
 }
 
@@ -1166,25 +1184,6 @@ function resourceContents(uri, value) {
   };
 }
 
-function failOpenToolResult(status) {
-  const readiness = status.readiness[0];
-  return {
-    isError: true,
-    content: [{ type: 'text', text: diagnosticText(status) }],
-    structuredContent: {
-      code: 'codestory_mcp_runtime_unavailable',
-      status: readiness.status,
-      repair_reason: status.degraded_reason,
-      local_refresh: status.local_refresh || null,
-      plugin_runtime: status.plugin_runtime,
-      setup: readiness.setup,
-      minimum_next: readiness.minimum_next,
-      full_repair: readiness.full_repair,
-      recommended_next_calls: status.recommended_next_calls,
-    },
-  };
-}
-
 function failOpenSidecarSetupResult(request) {
   const action = request.params?.arguments?.action || 'status';
   if (!['status', 'enable', 'disable', 'ask', 'repair'].includes(action)) {
@@ -1210,13 +1209,29 @@ function failOpenSidecarSetupResult(request) {
 }
 
 function runFailOpenMcp(status) {
-  const tools = ['ground', 'files', 'packet', 'search', 'context'].map((name) => ({
-    name,
-    description: 'CodeStory diagnostic fail-open surface; runtime repair is required before this tool can return repository grounding.',
-    inputSchema: { type: 'object', additionalProperties: true },
+  const tools = [{
+    name: 'repair_all',
+    description: 'Run the single supported CodeStory readiness repair action, then read codestory://status again.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
     outputSchema: { type: 'object', additionalProperties: true },
-  }));
-  tools.unshift({
+    safety: {
+      readOnly: false,
+      sideEffects: true,
+      localOnly: true,
+      openWorld: false,
+      mutation: 'local_plugin_configuration',
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  }, {
     name: 'sidecar_setup',
     description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
     inputSchema: {
@@ -1240,7 +1255,7 @@ function runFailOpenMcp(status) {
       idempotentHint: true,
       openWorldHint: false,
     },
-  });
+  }];
   const resources = [
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
@@ -1287,12 +1302,18 @@ function runFailOpenMcp(status) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        response = jsonrpcResult(
-          request.id,
-          request.params?.name === 'sidecar_setup'
-            ? failOpenSidecarSetupResult(request)
-            : failOpenToolResult(status),
-        );
+        if (request.params?.name === 'repair_all') {
+          const repairRequest = {
+            params: {
+              arguments: { action: 'repair' },
+            },
+          };
+          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(repairRequest));
+        } else if (request.params?.name === 'sidecar_setup') {
+          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(request));
+        } else {
+          response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status or call repair_all.');
+        }
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }

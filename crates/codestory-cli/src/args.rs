@@ -72,6 +72,8 @@ pub(crate) enum Command {
     Doctor(DoctorCommand),
     #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
     Ready(ReadyCommand),
+    #[command(about = "Run the single supported readiness repair entrypoint.")]
+    Fix(FixCommand),
     #[command(about = "Run a machine-readable smoke profile for CI and agent images.")]
     Smoke(SmokeCommand),
     #[command(about = "Agent-facing readiness and repair helpers.")]
@@ -607,6 +609,26 @@ pub(crate) struct ReadyCommand {
     )]
     pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct FixCommand {
+    #[command(flatten)]
+    pub(crate) project: ProjectArgs,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Use a specific agent sidecar run id when repairing agent readiness."
+    )]
+    pub(crate) run_id: Option<String>,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -1577,6 +1599,15 @@ pub(crate) struct ReadyOutput {
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FixOutput {
+    pub(crate) status: &'static str,
+    pub(crate) ready: bool,
+    pub(crate) goal: ReadinessGoalDto,
+    pub(crate) action: &'static str,
+    pub(crate) result: ReadyOutput,
 }
 
 #[derive(Debug, Serialize)]
@@ -2639,6 +2670,29 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
+    }
+
+    #[test]
+    fn fix_command_parses_as_single_repair_entrypoint() {
+        let cli = Cli::try_parse_from([
+            "codestory-cli",
+            "fix",
+            "--project",
+            "C:/repo",
+            "--format",
+            "json",
+            "--run-id",
+            "shared-agent",
+        ])
+        .expect("fix command should parse");
+        match cli.command {
+            Command::Fix(cmd) => {
+                assert_eq!(cmd.project.project, PathBuf::from("C:/repo"));
+                assert_eq!(cmd.run_id.as_deref(), Some("shared-agent"));
+                assert_eq!(cmd.format, OutputFormat::Json);
+            }
+            _ => panic!("expected fix command"),
+        }
     }
 
     #[test]
