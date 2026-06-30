@@ -416,7 +416,6 @@ test("mcp launcher uses active project state when host launches from plugin root
       JSON.stringify({
         event: "SessionStart",
         cwd: realRepoRoot,
-        codexThreadId: threadId,
         updatedAt: new Date().toISOString(),
       }),
       "utf8",
@@ -747,7 +746,7 @@ test("mcp launcher rejects thread-owned global state when current thread is unav
   }
 });
 
-test("mcp launcher rejects active project state from before launcher start", async () => {
+test("mcp launcher uses fresh active project state from before launcher start", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-prelaunch-active-project-"));
@@ -815,15 +814,9 @@ test("mcp launcher rejects active project state from before launcher start", asy
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_stale");
-    assert.equal(status.readiness[0].goal, "project_root");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1760,7 +1753,7 @@ test("hook manifest timeouts cover managed bootstrap budget", async () => {
     /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
     "local wait-fresh timeout default",
   );
-  assert.equal(localWaitFreshTimeoutMs, 5000, "local wait-fresh default must stay bounded for bootstrap diagnostics");
+  assert.equal(localWaitFreshTimeoutMs, 30000, "local wait-fresh default must stay bounded for bootstrap diagnostics");
   const requiredTimeoutSec = Math.max(
     Math.ceil((bootstrapTimeoutMs + 30000) / 1000),
     Math.ceil((releaseDownloadTimeoutMs * releaseDownloadAttempts + localWaitFreshTimeoutMs) / 1000),

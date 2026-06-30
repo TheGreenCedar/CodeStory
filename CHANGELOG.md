@@ -10,6 +10,10 @@
 - Added `codestory-cli fix` and MCP `repair_all` as the single supported
   readiness repair entrypoint, with status recommendations collapsed to one
   repair action plus a `codestory://status` readback.
+- Let the installed plugin MCP launcher use fresh active-project state even
+  when the host hook cannot attach a Codex thread id or the state predates the
+  MCP process start, while still rejecting state owned by another thread, and
+  give local wait-fresh enough bounded time to pass on the CodeStory repo.
 - Made packaged and post-publish agent proof fail when the installed plugin MCP
   launcher omits server-advertised `codestory://status` or
   `codestory://agent-guide` resources, while leaving true Codex host/model

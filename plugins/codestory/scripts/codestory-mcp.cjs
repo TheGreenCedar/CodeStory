@@ -20,7 +20,6 @@ const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
-const processStartedAtMs = Date.now();
 
 function readJson(file) {
   try {
@@ -130,11 +129,6 @@ function activeProjectStateMaxAgeMs() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 60 * 60 * 1000;
 }
 
-function activeProjectStateLaunchGraceMs() {
-  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_ACTIVE_PROJECT_LAUNCH_GRACE_MS || '', 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 5 * 1000;
-}
-
 function activeProjectStateTimestamp(active, statePath) {
   const parsed = Date.parse(active?.updatedAt || active?.updated_at || '');
   if (Number.isFinite(parsed)) return parsed;
@@ -147,15 +141,16 @@ function activeProjectStateTimestamp(active, statePath) {
 
 function activeProjectStateMatchesHost(active) {
   const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  if (!currentThread) return !String(active?.codexThreadId || '').trim();
-  return String(active?.codexThreadId || '').trim() === currentThread;
+  const activeThread = String(active?.codexThreadId || '').trim();
+  if (!activeThread) return true;
+  if (!currentThread) return false;
+  return activeThread === currentThread;
 }
 
 function activeProjectStateFresh(active, statePath, nowMs = Date.now()) {
   const timestamp = activeProjectStateTimestamp(active, statePath);
   return timestamp !== null
     && nowMs - timestamp <= activeProjectStateMaxAgeMs()
-    && timestamp >= processStartedAtMs - activeProjectStateLaunchGraceMs()
     && activeProjectStateMatchesHost(active);
 }
 
@@ -720,7 +715,7 @@ function singleRepairNextCalls(commands) {
 
 function localWaitFreshTimeoutMs() {
   const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_LOCAL_REPAIR_TIMEOUT_MS || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
 }
 
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
