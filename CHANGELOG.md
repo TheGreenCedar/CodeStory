@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Rewrote agent-facing CodeStory guidance to make MCP status plus `repair_all`
+  the single supported repair loop, with CLI commands labeled as
+  maintainer/debug transcripts.
 - Added `codestory-cli fix` and MCP `repair_all` as the single supported
   readiness repair entrypoint, with status recommendations collapsed to one
   repair action plus a `codestory://status` readback.
