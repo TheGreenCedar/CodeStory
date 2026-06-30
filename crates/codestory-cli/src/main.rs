@@ -11096,6 +11096,7 @@ fn readiness_lane_status(
         ReadinessStatusDto::RepairRetrieval
     };
     match verdict.map(|verdict| verdict.status) {
+        Some(ReadinessStatusDto::Blocked) => ReadinessStatusDto::Blocked,
         Some(status @ (ReadinessStatusDto::RepairSetup | ReadinessStatusDto::RepairIndex)) => {
             status
         }
@@ -11500,9 +11501,9 @@ fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutpu
         .unwrap_or("no degraded_reason reported");
     doctor_check(
         "sidecar_retrieval",
-        "warn",
+        "error",
         format!(
-            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); repair sidecars before trusting packet/search evidence.",
+            "mandatory sidecar retrieval is not full (mode={} reason={reason}; embedding_device_policy={} observed_device={} cpu_allowed={}); packet/search evidence is blocked until sidecars are full.",
             sidecar.retrieval_mode,
             sidecar.embedding_device_policy,
             sidecar.embedding_device_state,
