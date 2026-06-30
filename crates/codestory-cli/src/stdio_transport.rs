@@ -3263,6 +3263,20 @@ fn stdio_status_recommended_next_calls(
                 _ => {}
             }
         }
+        if let Some(host_action) = non_ready
+            .minimum_next
+            .iter()
+            .chain(non_ready.full_repair.iter())
+            .find(|command| command.starts_with("Restart/reload the Codex host/app"))
+        {
+            return serde_json::json!([
+                stdio_recommended_next_call(host_action),
+                {
+                    "method": "resources/read",
+                    "uri": "codestory://status"
+                }
+            ]);
+        }
         return serde_json::json!([
             {
                 "method": "tools/call",
@@ -3329,9 +3343,9 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     if command.contains("ready --goal agent --repair") {
         return serde_json::json!({
             "method": "tools/call",
-            "tool": "sidecar_setup",
-            "arguments": {"action": "repair"},
-            "debug_command": command
+            "tool": "repair_all",
+            "arguments": {},
+            "debug_commands": [command]
         });
     }
     if command.contains("ready --goal local") || command.contains("codestory-cli doctor") {

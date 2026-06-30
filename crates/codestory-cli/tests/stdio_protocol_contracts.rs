@@ -859,39 +859,40 @@ fn assert_read_only_tool_metadata(tool: &Value) {
     );
 }
 
-fn assert_sidecar_setup_tool_metadata(tool: &Value) {
+fn assert_local_plugin_mutation_tool_metadata(tool: &Value) {
+    let name = tool["name"].as_str().expect("tool name");
     let annotations = tool
         .get("annotations")
-        .unwrap_or_else(|| panic!("sidecar_setup should include MCP-style annotations: {tool}"));
+        .unwrap_or_else(|| panic!("{name} should include MCP-style annotations: {tool}"));
     let safety = tool
         .get("safety")
         .or_else(|| tool.get("metadata"))
-        .unwrap_or_else(|| panic!("sidecar_setup should include safety metadata: {tool}"));
+        .unwrap_or_else(|| panic!("{name} should include safety metadata: {tool}"));
 
     assert_eq!(
         annotations.get("readOnlyHint").and_then(Value::as_bool),
         Some(false),
-        "sidecar_setup should declare local config writes: {tool}"
+        "{name} should declare local config writes: {tool}"
     );
     assert_eq!(
         annotations.get("destructiveHint").and_then(Value::as_bool),
         Some(false),
-        "sidecar_setup should declare non-destructive behavior: {tool}"
+        "{name} should declare non-destructive behavior: {tool}"
     );
     assert_eq!(
         annotations.get("idempotentHint").and_then(Value::as_bool),
         Some(true),
-        "sidecar_setup should declare idempotent behavior: {tool}"
+        "{name} should declare idempotent behavior: {tool}"
     );
     assert!(
         contains_bool_recursive(safety, &["localOnly", "local_only"], true)
             && contains_bool_recursive(safety, &["openWorld", "open_world"], false),
-        "sidecar_setup should declare local-only closed-world behavior: {tool}"
+        "{name} should declare local-only closed-world behavior: {tool}"
     );
     assert_eq!(
         safety.get("mutation").and_then(Value::as_str),
         Some("local_plugin_configuration"),
-        "sidecar_setup should label the plugin-local mutation: {tool}"
+        "{name} should label the plugin-local mutation: {tool}"
     );
 }
 
@@ -1040,6 +1041,7 @@ fn tool_catalog_keeps_stable_browser_and_setup_tool_names() {
             "packet",
             "query_subgraph",
             "references",
+            "repair_all",
             "search",
             "shortest_path",
             "sidecar_setup",
@@ -1114,8 +1116,8 @@ fn tool_catalog_keeps_stable_browser_and_setup_tool_names() {
 
     for tool in tools["tools"].as_array().expect("tools array") {
         let name = tool["name"].as_str().expect("tool name");
-        if name == "sidecar_setup" {
-            assert_sidecar_setup_tool_metadata(tool);
+        if matches!(name, "repair_all" | "sidecar_setup") {
+            assert_local_plugin_mutation_tool_metadata(tool);
         } else {
             assert_read_only_tool_metadata(tool);
         }
@@ -2468,12 +2470,11 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         !next_call_text.contains("codestory-cli index --project")
             && !next_call_text.contains("retrieval bootstrap")
             && !next_call_text.contains("retrieval index")
-            && next_call_text.contains("\"tool\":\"sidecar_setup\"")
-            && next_call_text.contains("\"action\":\"repair\"")
-            && next_call_text.contains("\"debug_command\"")
+            && next_call_text.contains("\"tool\":\"repair_all\"")
+            && next_call_text.contains("\"debug_commands\"")
             && next_call_text.contains("retrieval status")
             && next_call_text.contains("codestory://status")
-            && next_call_text.contains("codestory://agent-guide"),
+            && !next_call_text.contains("codestory://agent-guide"),
         "status should recommend MCP-managed sidecar repair without repeating a fresh core index when mode is not full: {status}"
     );
     assert!(
@@ -2806,8 +2807,8 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     assert!(
         status["recommended_next_calls"]
             .to_string()
-            .contains("\"tool\":\"sidecar_setup\""),
-        "status should keep recovery on MCP tooling after sidecar_setup enable: {status}"
+            .contains("\"tool\":\"repair_all\""),
+        "status should keep recovery on the single MCP repair tool after sidecar_setup enable: {status}"
     );
 }
 
@@ -4242,12 +4243,11 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         minimum_next.iter().any(|call| call
             .get("tool")
             .and_then(Value::as_str)
-            .is_some_and(|tool| tool == "sidecar_setup")
+            .is_some_and(|tool| tool == "repair_all")
             && call
-                .pointer("/arguments/action")
-                .and_then(Value::as_str)
-                .is_some_and(|action| action == "repair")
-            && call.get("debug_command").and_then(Value::as_str).is_some()),
+                .get("debug_commands")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| !commands.is_empty())),
         "stdio search readiness error should point at MCP-managed agent repair: {response}"
     );
     let full_repair = error["full_repair"]
@@ -4264,11 +4264,10 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         "stdio search sidecar errors should not repeat core index repair commands: {response}"
     );
     assert!(
-        full_repair.iter().any(|call| call
-            .get("debug_command")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.contains("codestory-cli retrieval status")
-                && text.contains("--format json"))),
+        full_repair.iter().any(
+            |call| call.to_string().contains("codestory-cli retrieval status")
+                && call.to_string().contains("--format json")
+        ),
         "stdio search error should include sidecar status proof debug command: {response}"
     );
 }
