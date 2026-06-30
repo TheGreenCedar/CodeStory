@@ -1023,7 +1023,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
   }
 });
 
-test("mcp launcher fails open when only unusable PATH fallback is available", async () => {
+test("mcp launcher blocks managed setup when only PATH cli is available", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const sourceVersion = readCargoVersion(await readFile(join(repoRoot, "crates", "codestory-cli", "Cargo.toml"), "utf8"));
@@ -1033,8 +1033,8 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
   await writeFile(
     fakeCli,
     process.platform === "win32"
-      ? "@echo off\r\necho codestory-cli 0.0.1\r\n"
-      : "#!/bin/sh\necho codestory-cli 0.0.1\n",
+      ? `@echo off\r\necho codestory-cli ${version}\r\n`
+      : `#!/bin/sh\necho codestory-cli ${version}\n`,
   );
   await chmod(fakeCli, 0o755);
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
@@ -1068,14 +1068,14 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     assert.deepEqual(status.path_candidates, [
       {
         path: fakeCli,
-        version: "0.0.1",
-        active: true,
+        version,
+        active: false,
       },
     ]);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
-    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
-    assert.equal(status.plugin_runtime.cli_path, fakeCli);
-    assert.equal(status.runtime_truth.runtime_source, "path_fallback");
+    assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
+    assert.equal(status.plugin_runtime.cli_path, null);
+    assert.equal(status.runtime_truth.runtime_source, "managed_unavailable");
     assert.equal(status.runtime_truth.plugin_root, pluginRoot);
     assert.equal(status.runtime_truth.sidecar_policy, "ask");
     assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
@@ -1083,6 +1083,7 @@ test("mcp launcher fails open when only unusable PATH fallback is available", as
     assert.equal(status.runtime_truth.readiness_lanes.local_graph.status, "repair_setup");
     assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.profile, "agent");
     assert.equal(status.readiness[0].status, "repair_setup");
+    assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
     assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
@@ -1565,10 +1566,20 @@ test("release asset downloader retries a transient failure", async () => {
   }
 });
 
-test("mcp launcher keeps managed provision failures primary without PATH", async () => {
+test("mcp launcher keeps managed provision failures primary with PATH diagnostic", async () => {
   const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-fail-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-empty-release-"));
+  const pathDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-path-"));
+  const fakeCli = join(pathDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  await writeFile(
+    fakeCli,
+    process.platform === "win32"
+      ? `@echo off\r\necho codestory-cli ${version}\r\n`
+      : `#!/bin/sh\necho codestory-cli ${version}\n`,
+  );
+  await chmod(fakeCli, 0o755);
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = JSON.stringify({
     jsonrpc: "2.0",
@@ -1584,7 +1595,7 @@ test("mcp launcher keeps managed provision failures primary without PATH", async
         CODESTORY_CLI: "",
         CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
         PLUGIN_DATA: dataDir,
-        PATH: "",
+        PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
       input,
@@ -1599,10 +1610,16 @@ test("mcp launcher keeps managed provision failures primary without PATH", async
       status.degraded_reason,
       /^managed_cli_provision_failed:managed_cli_asset_fetch_failed:SHA256SUMS\.txt:elapsed_ms=\d+:attempts=1:retry=restart_reload_status:/u,
     );
-    assert.equal(status.plugin_runtime.cli_source, "path_fallback");
-    assert.deepEqual(status.path_candidates, []);
+    assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
+    assert.deepEqual(status.path_candidates, [
+      {
+        path: fakeCli,
+        version,
+        active: false,
+      },
+    ]);
     assert.equal(
-      status.plugin_runtime.warnings.includes("managed_cli_unavailable_no_path_fallback"),
+      status.plugin_runtime.warnings.includes("managed_cli_unavailable_path_diagnostic_only"),
       true,
     );
     assert.match(status.readiness[0].minimum_next[0], /^Restart\/reload/u);
@@ -1615,6 +1632,7 @@ test("mcp launcher keeps managed provision failures primary without PATH", async
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
+    await rm(pathDir, { recursive: true, force: true });
   }
 });
 
