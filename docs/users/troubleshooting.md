@@ -168,7 +168,7 @@ Symptoms: skill or rule loads but no `codestory://status` or `mcp__codestory` to
 
 | Host | Check |
 | --- | --- |
-| Codex | If hook status says `mcp_resources_not_model_visible`, request CodeStory MCP through host deferred discovery/tool_search when available. Reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
+| Codex | Read `codestory://status` through live MCP resources. If `status_resource_auto_repair` starts, reread status until the repair finishes. If resources are visible but `mcp__codestory` tools are hidden and status did not start repair, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
 | Cursor | MCP config path to `plugins/codestory/scripts/codestory-mcp.cjs`; reload server |
 | Claude Code | MCP configured separately; hooks alone do not expose tools |
 | Copilot | MCP not auto-started; configure manually or use CLI |
