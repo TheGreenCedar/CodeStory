@@ -160,7 +160,7 @@ function shortDegradedNotice(mcp, reason, state = {}) {
       'CodeStory setup blocked: MCP is configured and launchable, but resources are not model-visible.',
       `First failing layer: ${firstRuntimeFailure(mcp)}.`,
       reason ? `Reason: ${truncate(reason, 600)}` : null,
-      'Use the hook MCP bridge when present; reload the host/plugin only to expose live MCP tools. Do not use ambient CodeStory CLI discovery as grounding.',
+      'Request CodeStory MCP through host deferred discovery/tool_search when available; otherwise use the hook MCP bridge when present. Reload only after plugin install or config changes. Do not use ambient CodeStory CLI discovery as grounding.',
     ].filter(Boolean).join('\n');
   }
   const hook = state.hook || {};
@@ -180,7 +180,7 @@ function runtimeStatusBlock(policy, mcp) {
     `dedupe_key: ${policy.dedupeKey}`,
     mcpDetectionText(mcp),
     mcp.mcp_model_visible_blocked
-      ? 'Next: use the hook MCP bridge when present; reload the host/plugin only to expose live MCP tools. Do not use ambient CodeStory CLI discovery as grounding.'
+      ? 'Next: request CodeStory MCP through host deferred discovery/tool_search when available; otherwise use the hook MCP bridge when present. Reload only after plugin install or config changes. Do not use ambient CodeStory CLI discovery as grounding.'
       : mcp.mcp_resources_exposed
       ? 'Next: read codestory://status before source reads; use packet/search/context only when status allows them with retrieval_mode=full.'
       : 'Next: no sidecar-backed packet/search surface is proven available; use bounded source reads instead of repeated repair attempts.',
@@ -297,7 +297,7 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason) {
     reason ? `hook_bridge_reason: ${truncate(reason, 500)}` : null,
     'mcp_resources_exposed: mcp_resources_not_model_visible',
     'mcp_tools_visible: no',
-    'hook_bridge_next: use this bounded bridge status now; reload the host/plugin only to expose live MCP tools.',
+    'hook_bridge_next: request CodeStory MCP through host deferred discovery/tool_search when available; otherwise use this bounded bridge status and report that live MCP tools are hidden.',
   ].filter(Boolean).join('\n');
 }
 
@@ -557,7 +557,7 @@ function runCodeStory(input, event, policy, state = {}) {
         mcpDetectionText(mcp),
         mcp.mcp_resources_exposed
           ? 'Use codestory://status as the active runtime truth. Run packet/search/context only when status allows that surface with retrieval_mode=full.'
-          : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Use hook-bridged status when present; reload the host/plugin only to expose live MCP tools.',
+          : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Request CodeStory MCP through host deferred discovery/tool_search when available; otherwise use hook-bridged status and report that live MCP tools are hidden.',
       ].join('\n'), policy.cap),
       fingerprint: `${runtimeFingerprint(mcp)}|${bootstrapBlock || 'no-bootstrap'}`,
     };
