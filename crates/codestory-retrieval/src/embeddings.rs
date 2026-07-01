@@ -144,11 +144,7 @@ fn embedding_device_readiness_with_observed_state(
 ) -> EmbeddingDeviceReadiness {
     let cpu_allowed = explicit_cpu_allowed();
     let detection = host_embedding_device_detection();
-    let accelerator_request = if cpu_allowed {
-        None
-    } else {
-        embedding_accelerator_request_for_detection(detection.as_ref())
-    };
+    let accelerator_request = (!cpu_allowed).then(default_embedding_accelerator_request);
     let accelerator_requested = accelerator_request.is_some();
     let observation = sidecar_observed_state
         .unwrap_or_else(|| observed_embedding_device_state(cpu_allowed, accelerator_requested));
@@ -253,18 +249,14 @@ pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
     if explicit_cpu_allowed() {
         return None;
     }
-    let detection = host_embedding_device_detection();
-    embedding_accelerator_request_for_detection(detection.as_ref())
+    Some(default_embedding_accelerator_request())
 }
 
-fn embedding_accelerator_request_for_detection(
-    detection: Option<&HostGpuDetection>,
-) -> Option<EmbeddingAcceleratorRequest> {
-    let detection = detection?;
-    (detection.provider == "amd").then(|| EmbeddingAcceleratorRequest {
+fn default_embedding_accelerator_request() -> EmbeddingAcceleratorRequest {
+    EmbeddingAcceleratorRequest {
         device: env_trimmed(LLAMACPP_DEVICE_ENV).unwrap_or_else(|| "Vulkan0".to_string()),
         n_gpu_layers: env_trimmed(LLAMACPP_N_GPU_LAYERS_ENV).unwrap_or_else(|| "99".to_string()),
-    })
+    }
 }
 
 fn explicit_cpu_allowed() -> bool {
@@ -838,10 +830,21 @@ mod tests {
 
         assert_eq!(readiness.requested_policy, "accelerator_required");
         assert_eq!(readiness.observed_state, "unknown");
-        assert_eq!(readiness.observation_source, "sidecar_unobserved");
+        assert_eq!(
+            readiness.observation_source,
+            "accelerator_request_unobserved"
+        );
         assert_eq!(readiness.detected_provider, None);
         assert_eq!(readiness.detected_gpu, None);
-        assert!(!readiness.accelerator_requested);
+        assert!(readiness.accelerator_requested);
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("vulkan")
+        );
+        assert_eq!(
+            readiness.accelerator_request_device.as_deref(),
+            Some("Vulkan0")
+        );
         assert!(!readiness.full_retrieval_allowed);
         assert!(
             readiness
@@ -905,14 +908,14 @@ mod tests {
     }
 
     #[test]
-    fn amd_provider_env_detects_and_requests_vulkan_without_observing_acceleration() {
+    fn default_policy_requests_vulkan_without_observing_acceleration() {
         let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
-        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
-        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7800 XT");
-        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+        let _provider = EnvGuard::remove(DEVICE_PROVIDER_ENV);
+        let _name = EnvGuard::remove(DEVICE_NAME_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
         let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
         let _ngl = EnvGuard::remove(LLAMACPP_N_GPU_LAYERS_ENV);
 
@@ -925,11 +928,8 @@ mod tests {
             readiness.observation_source,
             "accelerator_request_unobserved"
         );
-        assert_eq!(readiness.detected_provider.as_deref(), Some("amd"));
-        assert_eq!(
-            readiness.detected_gpu.as_deref(),
-            Some("AMD Radeon RX 7800 XT")
-        );
+        assert_eq!(readiness.detected_provider, None);
+        assert_eq!(readiness.detected_gpu, None);
         assert!(readiness.accelerator_requested);
         assert_eq!(
             readiness.accelerator_request_provider.as_deref(),
@@ -953,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_log_observed_acceleration_allows_amd_vulkan_request() {
+    fn sidecar_log_observed_acceleration_allows_default_vulkan_request() {
         let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
@@ -994,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn inconclusive_sidecar_log_keeps_amd_vulkan_request_unknown() {
+    fn inconclusive_sidecar_log_keeps_default_vulkan_request_unknown() {
         let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);

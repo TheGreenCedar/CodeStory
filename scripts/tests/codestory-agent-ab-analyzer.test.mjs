@@ -254,12 +254,11 @@ async function withManifestFile(manifest, callback) {
 
 test("categorizes commands without treating source paths as cli invocations", () => {
   assert.equal(commandCategory("& $env:CODESTORY_CLI packet --project . --question flow"), "codestory_cli");
-  assert.equal(commandCategory('"${CODESTORY_CLI:-codestory-cli}" packet --project . --question flow'), "codestory_cli");
   assert.equal(commandCategory('"$CODESTORY_CLI" index --project . --refresh full'), "codestory_cli");
   assert.equal(commandCategory('& "C:\\tools\\codestory-cli.exe" packet --project . --question flow'), "codestory_cli");
   assert.equal(
     commandCategory(
-      String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $(if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { 'codestory-cli' }) packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`,
+      String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $env:CODESTORY_CLI packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`,
     ),
     "codestory_cli",
   );
@@ -401,7 +400,7 @@ test("packet-first command renders manifest text for host shells", () => {
     "linux",
   );
 
-  assert.ok(unixCommand.startsWith('"${CODESTORY_CLI:-codestory-cli}" packet '));
+  assert.ok(unixCommand.startsWith('"$CODESTORY_CLI" packet '));
   assert.ok(
     unixCommand.includes(
       "--question 'Inspect $env:SECRET and $(Get-ChildItem), then read John'\\''s file. Next line.'",
@@ -1000,7 +999,7 @@ test("requires packet as the CodeStory subcommand for packet-first telemetry", (
 
 test("recognizes quoted PowerShell variable CodeStory packet commands", () => {
   const command =
-    "\"C:\\\\Program Files\\\\PowerShell\\\\pwsh.exe\" -Command '$cli = if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { '\"'codestory-cli' }\n& \"'$cli packet --project . --question '\"'Explain flow' --task-class 'architecture-explanation' --budget compact --format json\"";
+    "\"C:\\\\Program Files\\\\PowerShell\\\\pwsh.exe\" -Command '$cli = $env:CODESTORY_CLI\n& \"'$cli packet --project . --question '\"'Explain flow' --task-class 'architecture-explanation' --budget compact --format json\"";
   const events = [
     commandEvent("cmd_1", "item.started", command),
     commandEvent("cmd_1", "item.completed", command, "{\"packet_id\":\"ask-1\"}", 0),
@@ -1012,8 +1011,8 @@ test("recognizes quoted PowerShell variable CodeStory packet commands", () => {
   assert.equal(analysis.packet_was_first_context_command, true);
 });
 
-test("recognizes inline PowerShell env fallback CodeStory packet commands", () => {
-  const command = String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $(if ($env:CODESTORY_CLI) { $env:CODESTORY_CLI } else { 'codestory-cli' }) packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`;
+test("recognizes inline PowerShell env CodeStory packet commands", () => {
+  const command = String.raw`"C:\Program Files\PowerShell\pwsh.exe" -Command '& $env:CODESTORY_CLI packet --project . --question 'Trace flow' --task-class 'route-tracing' --budget compact --format json"`;
   const events = [
     commandEvent("cmd_1", "item.started", command),
     commandEvent("cmd_1", "item.completed", command, "{\"packet_id\":\"ask-1\"}", 0),
@@ -1071,7 +1070,7 @@ test("harness packet prelude counts as the first context command", () => {
   assert.equal(analysis.packet_was_first_context_command, true);
 });
 
-test("codestory cli resolver prefers explicit path, release binary, then PATH fallback", () => {
+test("codestory cli resolver prefers explicit path, release binary, then fails closed", () => {
   const explicit = resolveCodeStoryCli({ codestoryCli: "C:/custom/codestory-cli.exe" }, () => {
     throw new Error("explicit path should not probe local candidates");
   });
@@ -1082,8 +1081,10 @@ test("codestory cli resolver prefers explicit path, release binary, then PATH fa
   );
   assert.match(release, /target[\\/]release[\\/]codestory-cli(?:\.exe)?$/);
 
-  const fallback = resolveCodeStoryCli({ codestoryCli: null }, () => false);
-  assert.equal(fallback, "codestory-cli");
+  assert.throws(
+    () => resolveCodeStoryCli({ codestoryCli: null }, () => false),
+    /Pass --codestory-cli, set CODESTORY_CLI, or build the release binary/,
+  );
 });
 
 test("scores expected claims without requiring exact wording", () => {

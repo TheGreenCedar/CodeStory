@@ -1,7 +1,7 @@
 {
   "name": "codestory",
   "description": "CodeStory grounding for coding agents over the local codestory-cli runtime.",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "author": {
     "name": "The Green Cedar",
     "url": "https://github.com/TheGreenCedar"

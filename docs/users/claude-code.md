@@ -59,6 +59,24 @@ Configure MCP separately if your Claude Code setup does not inherit the Codex
 `plugins/codestory/scripts/codestory-mcp.cjs` (same shape as
 [Cursor MCP config](cursor.md#2-mcp-server-copy-shipped-config)).
 
+Use `CODESTORY_PLUGIN_DATA` in the MCP server env block to give Claude Code a
+persistent managed-runtime data directory:
+
+```json
+{
+  "mcpServers": {
+    "codestory": {
+      "command": "node",
+      "args": ["/absolute/path/to/plugins/codestory/scripts/codestory-mcp.cjs"],
+      "env": {
+        "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
+      },
+      "tool_timeout_sec": 300
+    }
+  }
+}
+```
+
 Open the repository you want to ground. Managed CLI bootstrap depends on MCP:
 the adapter provisions the runtime when the MCP server starts successfully.
 
@@ -143,7 +161,7 @@ Shared repair: [Troubleshooting](troubleshooting.md).
 | MCP auto-start | Manual | Yes |
 | Hooks | Session + prompt | Session + prompt |
 | Skill | Partial (host-dependent) | Full `@CodeStory` skill |
-| Managed CLI | Depends on MCP setup | Yes via plugin |
+| Managed CLI | Yes when MCP sets `CODESTORY_PLUGIN_DATA` | Yes via plugin |
 
 Claude Code matches Codex on hooks when the plugin is installed, but MCP and
 managed bootstrap are not automatic unless you configure them.

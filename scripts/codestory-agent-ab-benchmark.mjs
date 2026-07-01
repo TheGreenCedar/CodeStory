@@ -122,7 +122,7 @@ const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use CodeStory grounding first. If CODESTORY_CLI is set, use that executable; otherwise use codestory-cli on PATH. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    "Use CodeStory grounding first. CODESTORY_CLI is set to the executable for this run. For broad repository questions, run packet first and read its sufficiency contract before ordinary source reads. Read follow-up commands from sufficiency.follow_up_commands, not a top-level field. If sufficiency.status is partial, run the listed follow_up_commands in order and prefer targeted CodeStory `search --why`, `context`, `trail`, or `snippet` commands for named gaps. If the packet and CodeStory follow-ups still do not support a correct answer, use ordinary local source reads only after those CodeStory attempts; those reads are valid but counted as post-packet overhead. If a later packet becomes sufficient, stop exploration and answer. If packet status is sufficient and sufficiency.follow_up_commands is empty, answer from the packet; do not verify citations with ordinary source reads, rg, grep, or git show. Budget truncation alone is not a gap. Preserve the packet's supported-claim wording in your final answer when it is correct, and correct it from local source when the packet is incomplete. Copy exact source identifiers, table names, declarations, and claim phrases from packet citations and sufficiency.covered_claims; do not compress exact anchors into comma shorthand that drops their repeated prefix, such as rewriting `CREATE TABLE A` and `CREATE TABLE B` as `CREATE TABLE A and B`. Include a compact 'Support files' list containing every relevant path from the packet's answer.citations, sufficiency.avoid_opening_paths, and any post-packet local source reads. The prepared full sidecar cache is mandatory; if CodeStory or its sidecars are unavailable, fail the run instead of continuing with ordinary exploration. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
 };
 
 function usage() {
@@ -151,7 +151,7 @@ Options:
                   Run direct packet runtime benchmark rows instead of agent A/B arms.
   --packet-runtime-mode
                   cold-cli, warm-stdio, or both. Default: both.
-  --codestory-cli Path to codestory-cli for packet runtime mode. Default: CODESTORY_CLI, release binary, then PATH.
+  --codestory-cli Path to codestory-cli for packet runtime mode. Default: CODESTORY_CLI, then release binary.
   --benchmark-run-id
                   Coherent benchmark run id to stamp packet-runtime artifacts.
   --include-local-repos
@@ -1168,7 +1168,7 @@ function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process
   if (platform === "win32") {
     return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
   }
-  return `"\${CODESTORY_CLI:-codestory-cli}" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
+  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget compact --format json`;
 }
 
 function packetPreludePromptBlock(prelude) {
@@ -1445,8 +1445,6 @@ function commandCategory(command) {
     "\\b(index|ground|doctor|search|symbol|trail|snippet|query|explore|bookmark|context|drill|files|affected|setup|serve|packet)\\b";
   const codestoryExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+${codestoryCommands}`;
-  const powershellEnvFallback =
-    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+${codestoryCommands}`;
   if (/^\s*(?:rg|grep|findstr|select-string)\b/i.test(text)) {
     return "shell_search";
   }
@@ -1458,13 +1456,8 @@ function commandCategory(command) {
     new RegExp(`^\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${codestoryExecutablePath}`, "i").test(shellText) ||
     /&\s*["']*\$env:CODESTORY_CLI\s+/i.test(shellText) ||
-    new RegExp(
-      `(?:^|[;&|]\\s*)["']?\\$\\{CODESTORY_CLI:-codestory-cli\\}["']?\\s+${codestoryCommands}`,
-      "i",
-    ).test(shellText) ||
     new RegExp(`(?:^|[;&|]\\s*)["']?\\$CODESTORY_CLI["']?\\s+${codestoryCommands}`, "i").test(shellText) ||
-    new RegExp(`&\\s*["']*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText) ||
-    new RegExp(powershellEnvFallback, "i").test(shellText)
+    new RegExp(`&\\s*["']*\\$[a-z_][a-z0-9_]*\\s+${codestoryCommands}`, "i").test(shellText)
   ) {
     return "codestory_cli";
   }
@@ -1487,8 +1480,6 @@ function isCodestoryPacketCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   const packetExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+packet\b`;
-  const powershellEnvFallbackPacket =
-    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+packet\b`;
   if (/(?:^|\s)(?:--help|-h)(?:\s|$)/i.test(shellText)) {
     return false;
   }
@@ -1500,10 +1491,8 @@ function isCodestoryPacketCommand(command) {
     new RegExp(`^\\s*${packetExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${packetExecutablePath}`, "i").test(shellText) ||
     /&\s*["']*\$env:CODESTORY_CLI\s+packet\b/i.test(shellText) ||
-    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+packet\b/i.test(shellText) ||
     /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+packet\b/i.test(shellText) ||
-    /&\s*["']*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText) ||
-    new RegExp(powershellEnvFallbackPacket, "i").test(shellText)
+    /&\s*["']*\$[a-z_][a-z0-9_]*\s+packet\b/i.test(shellText)
   );
 }
 
@@ -1511,17 +1500,13 @@ function isCodestoryIndexCommand(command) {
   const shellText = String(command ?? "").replace(/\\"/g, '"');
   const indexExecutablePath =
     String.raw`['"]?(?:[A-Z]:)?(?:[^;&|\r\n"']*[\\/])*codestory-cli(?:\.exe)?['"]?\s+index\b`;
-  const powershellEnvFallbackIndex =
-    String.raw`&\s*\$\(\s*if\s*\(\s*\$env:CODESTORY_CLI\s*\)\s*\{[^}]*\$env:CODESTORY_CLI[^}]*\}\s*else\s*\{[^}]*codestory-cli(?:\.exe)?[^}]*\}\s*\)\s+index\b`;
   return (
     /^\s*codestory-cli(?:\.exe)?\s+index\b/i.test(shellText) ||
     new RegExp(`^\\s*${indexExecutablePath}`, "i").test(shellText) ||
     new RegExp(`[;&|]\\s*${indexExecutablePath}`, "i").test(shellText) ||
     /&\s*["']*\$env:CODESTORY_CLI\s+index\b/i.test(shellText) ||
-    /(?:^|[;&|]\s*)["']?\$\{CODESTORY_CLI:-codestory-cli\}["']?\s+index\b/i.test(shellText) ||
     /(?:^|[;&|]\s*)["']?\$CODESTORY_CLI["']?\s+index\b/i.test(shellText) ||
-    /&\s*["']*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText) ||
-    new RegExp(powershellEnvFallbackIndex, "i").test(shellText)
+    /&\s*["']*\$[a-z_][a-z0-9_]*\s+index\b/i.test(shellText)
   );
 }
 
@@ -3573,7 +3558,10 @@ function resolveCodeStoryCli(opts, exists = existsSync) {
     "release",
     process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
   );
-  return exists(releaseCandidate) ? releaseCandidate : "codestory-cli";
+  if (exists(releaseCandidate)) {
+    return releaseCandidate;
+  }
+  throw new Error("No codestory-cli found. Pass --codestory-cli, set CODESTORY_CLI, or build the release binary.");
 }
 
 function packetPayloadText(packet) {
