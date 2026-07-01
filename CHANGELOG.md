@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.13.3
+
+CodeStory 0.13.3 fixes first-turn Codex plugin startup truth after the 0.13.2
+Windows dogfood run.
+
+### Fixed
+
+- Tightened Codex startup guidance so model-hidden CodeStory MCP sessions make
+  host deferred discovery/tool_search the first repository-work action before
+  manual source reads, keeping the hook bridge as a last-resort status label.
+- Made hook bootstrap status ask the managed Rust runtime for the shared-agent
+  readiness lane, so hook-bridged `runtime_truth` reports packet/search as
+  `full` when `ready --goal agent` proves the sidecar instead of fabricating an
+  unavailable agent lane from local/default status.
+- Made retrieval bootstrap force-recreate CodeStory-owned Docker sidecars once
+  when post-start health probes still fail, covering stale Windows Docker port
+  proxies where containers are up but Zoekt is unreachable from the host.
+
 ## 0.13.2
 
 CodeStory 0.13.2 fixes Codex plugin startup lifecycle failures found during
