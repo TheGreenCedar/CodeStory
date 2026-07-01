@@ -87,7 +87,10 @@ function usablePluginDataDir(dataDir) {
 }
 
 function pluginDataDir() {
-  return process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA || inferredCodexPluginDataDir();
+  return process.env.PLUGIN_DATA
+    || process.env.COPILOT_PLUGIN_DATA
+    || process.env.CODESTORY_PLUGIN_DATA
+    || inferredCodexPluginDataDir();
 }
 
 function sidecarPolicyPath(dataDir = pluginDataDir()) {
@@ -263,7 +266,7 @@ function handleSidecarPolicyCommand(argv) {
   }
   if (action !== 'status') {
     if (!policyFile) {
-      process.stderr.write('sidecar-policy needs PLUGIN_DATA or --policy-file to remember the setting\n');
+      process.stderr.write('sidecar-policy needs PLUGIN_DATA, COPILOT_PLUGIN_DATA, CODESTORY_PLUGIN_DATA, or --policy-file to remember the setting\n');
       process.exit(2);
     }
     writeSidecarPolicy(sidecarPolicyStateForAction(action), {}, policyFile);
@@ -587,10 +590,7 @@ async function resolveCli() {
   }
 
   const managedProvisionFailure = warnings.find((warning) => warning.startsWith('managed_cli_provision_failed:')) || null;
-  const pathCandidates = pathCliCandidates();
-  warnings.push(pathCandidates.length > 0
-    ? 'managed_cli_unavailable_path_diagnostic_only'
-    : 'managed_cli_unavailable_no_path_fallback');
+  warnings.push('managed_cli_unavailable');
   return {
     source: 'managed_unavailable',
     path: null,
@@ -610,24 +610,6 @@ async function resolveCli() {
 function normalizeVersion(value) {
   const match = String(value || '').match(/\b[vV]?(\d+\.\d+\.\d+)\b/u);
   return match ? match[1] : null;
-}
-
-function semverParts(version) {
-  const normalized = normalizeVersion(version);
-  if (!normalized) return null;
-  return normalized.split('.').map((part) => Number.parseInt(part, 10));
-}
-
-function compareSemver(left, right) {
-  const leftParts = semverParts(left);
-  const rightParts = semverParts(right);
-  if (!leftParts || !rightParts) return null;
-  for (let index = 0; index < 3; index += 1) {
-    if (leftParts[index] !== rightParts[index]) {
-      return leftParts[index] < rightParts[index] ? -1 : 1;
-    }
-  }
-  return 0;
 }
 
 function probeResolvedCli(resolved) {
@@ -663,15 +645,11 @@ function failOpenReasonForProbe(resolved, probe) {
   if (probe.error || probe.status !== 0) {
     return `${resolved.source}_cli_unspawnable`;
   }
-  if (resolved.source !== 'path_fallback') return null;
-  const comparison = compareSemver(probe.version, resolved.version);
-  if (!probe.version || comparison === null) return 'path_fallback_cli_unavailable';
-  if (comparison < 0) return 'path_fallback_cli_stale';
   return null;
 }
 
 function localWaitFreshCommand(projectRoot = process.cwd()) {
-  return `codestory-cli ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
+  return `<managed codestory-cli> ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
 }
 
 function mcpNextCallForCommand(command) {
@@ -862,7 +840,6 @@ function pluginRuntimeForResolved(resolved) {
     build_source: resolved.buildSource,
     repo_ref: resolved.repoRef,
     local_dev_override: resolved.source === 'local_dev_override',
-    path_fallback: resolved.source === 'path_fallback',
     managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
     managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
     managed_manifest_path: resolved.manifestPath || null,
@@ -872,11 +849,6 @@ function pluginRuntimeForResolved(resolved) {
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : process.cwd();
-  const pathCandidates = pathCliCandidates().map((candidate) => ({
-    path: candidate,
-    version: cliVersion(candidate),
-    active: samePathText(candidate, resolved.path),
-  }));
   const managedProvisionFailed = String(reason || '').startsWith('managed_cli_provision_failed:');
   const managedProvisionNext = [
     'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
@@ -945,7 +917,6 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     server_executable: null,
     server_executable_sha256: null,
     source_checkout_version: sourceCheckoutVersion(projectRoot),
-    path_candidates: pathCandidates,
     sidecar_contract_version: null,
     plugin_runtime: plugin,
     runtime_truth: runtimeTruthStatus(plugin, repair, {
@@ -955,7 +926,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     }),
     runtime_boundary: {
       restart_required_for_runtime_change: true,
-      message: 'A running MCP server keeps using the CLI process it was launched with; plugin refresh, managed runtime provisioning, CODESTORY_CLI, or PATH changes require a host reload/restart and fresh codestory://status readback.',
+      message: 'A running MCP server keeps using the CLI process it was launched with; plugin refresh, managed runtime provisioning, or CODESTORY_CLI changes require a host reload/restart and fresh codestory://status readback.',
     },
     warnings: plugin.warnings,
     project_root: projectRoot,
@@ -1079,50 +1050,9 @@ async function handleBootstrapStatusCommand(argv) {
   process.exit(0);
 }
 
-function pathCliCandidates() {
-  const pathValue = process.env.PATH || '';
-  const candidates = [];
-  for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
-    for (const name of cliBinaryNames()) {
-      const candidate = path.join(directory, name);
-      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-        candidates.push(candidate);
-      }
-    }
-  }
-  return dedupePaths(candidates);
-}
-
-function cliBinaryNames() {
-  return process.platform === 'win32'
-    ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli.bat', 'codestory-cli']
-    : ['codestory-cli'];
-}
-
-function cliVersion(candidate) {
-  const result = spawnSync(candidate, ['--version'], {
-    encoding: 'utf8',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(candidate),
-    timeout: 3000,
-    windowsHide: true,
-  });
-  if (result.status !== 0 || result.error) return null;
-  return normalizeVersion(`${result.stdout || ''}\n${result.stderr || ''}`);
-}
-
 function samePathText(left, right) {
   const normalize = (value) => String(value || '').replace(/[\\/]+$/u, '').toLowerCase();
   return normalize(left) === normalize(right);
-}
-
-function dedupePaths(paths) {
-  const deduped = [];
-  for (const candidate of paths) {
-    if (!deduped.some((seen) => samePathText(seen, candidate))) {
-      deduped.push(candidate);
-    }
-  }
-  return deduped;
 }
 
 function sourceCheckoutVersion(projectRoot) {
@@ -1161,7 +1091,6 @@ function diagnosticText(status) {
     `cli_path: ${setup.active_path}`,
     `cli_version: ${setup.active_version || '<unknown>'}`,
     `source_checkout_version: ${status.source_checkout_version || '<none>'}`,
-    `path_candidates: ${(status.path_candidates || []).map((candidate) => `${candidate.path}@${candidate.version || '<unknown>'}`).join(', ') || '<none>'}`,
     `next: ${next ? JSON.stringify(next) : 'read codestory://status'}`,
   ].join('\n');
 }

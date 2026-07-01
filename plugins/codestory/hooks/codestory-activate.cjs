@@ -160,7 +160,7 @@ function shortDegradedNotice(mcp, reason, state = {}) {
       'CodeStory setup blocked: MCP is configured and launchable, but resources are not model-visible.',
       `First failing layer: ${firstRuntimeFailure(mcp)}.`,
       reason ? `Reason: ${truncate(reason, 600)}` : null,
-      'Reload the host/plugin and read codestory://status; do not use managed CLI or PATH fallback as CodeStory grounding.',
+      'Use the hook MCP bridge when present; reload the host/plugin only to expose live MCP tools. Do not use ambient CodeStory CLI discovery as grounding.',
     ].filter(Boolean).join('\n');
   }
   const hook = state.hook || {};
@@ -180,7 +180,7 @@ function runtimeStatusBlock(policy, mcp) {
     `dedupe_key: ${policy.dedupeKey}`,
     mcpDetectionText(mcp),
     mcp.mcp_model_visible_blocked
-      ? 'Next: reload the host/plugin and read codestory://status; do not use managed CLI or PATH fallback as CodeStory grounding.'
+      ? 'Next: use the hook MCP bridge when present; reload the host/plugin only to expose live MCP tools. Do not use ambient CodeStory CLI discovery as grounding.'
       : mcp.mcp_resources_exposed
       ? 'Next: read codestory://status before source reads; use packet/search/context only when status allows them with retrieval_mode=full.'
       : 'Next: no sidecar-backed packet/search surface is proven available; use bounded source reads instead of repeated repair attempts.',
@@ -245,6 +245,135 @@ function readinessEvidence(parsed) {
       `freshness_evidence: ${evidence.freshness}`,
     ].join('\n'),
     fingerprint: hashText(JSON.stringify(evidence)),
+  };
+}
+
+function bridgeAllowedSurfaces(bootstrap, readiness) {
+  const surfaces = [];
+  if (bootstrap?.ready) surfaces.push('local_navigation');
+  if (readiness?.ready) surfaces.push('agent_packet_search');
+  return surfaces.length > 0 ? surfaces.join(',') : 'status_only';
+}
+
+function bridgeBootstrapForPolicy(policy, mcp, bootstrap) {
+  if (bootstrap?.attempted) return bootstrap;
+  if (!policy.project || !mcp.mcp_process_launchable) {
+    return { attempted: false, reason: 'mcp_launcher_unavailable' };
+  }
+  if (!mcp.managed_cli_present && !BOOTSTRAP_TAXONOMIES.has(policy.taxonomy)) {
+    return { attempted: false, reason: 'managed_runtime_not_present' };
+  }
+  return bootstrapManagedRuntime({ projectRoot: policy.project });
+}
+
+function managedHookCli(mcp) {
+  return process.env.CODESTORY_CLI || mcp.managed_cli_path || null;
+}
+
+function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason) {
+  const status = bootstrap?.parsed || {};
+  const plugin = status.plugin_runtime || {};
+  const localRefresh = status.local_refresh || status.readiness?.[0]?.local_refresh || {};
+  const reason = status.degraded_reason
+    || status.readiness?.[0]?.repair_reason
+    || bootstrap?.reason
+    || bootstrap?.error
+    || bootstrap?.stderr;
+  return [
+    'CODESTORY HOOK MCP BRIDGE',
+    'bridge_context_label: hook-bridged context, not live MCP tools',
+    'bridge_resource_uri: codestory://status',
+    `event_taxonomy: ${policy.taxonomy}`,
+    `output_cap_chars: ${policy.cap}`,
+    `dedupe_key: ${policy.dedupeKey}`,
+    mcpDetectionText(mcp),
+    `hook_bridge_status: ${bootstrap?.ready ? 'ready' : 'blocked'}`,
+    `hook_bridge_cli_source: ${plugin.cli_source || (process.env.CODESTORY_CLI ? 'local_dev_override' : mcp.managed_cli_source) || '<unknown>'}`,
+    plugin.managed_binary_path ? `hook_bridge_managed_cli_path: ${plugin.managed_binary_path}` : null,
+    `hook_bridge_local_refresh: ${localRefresh.state || status.readiness?.[0]?.status || '<unknown>'}`,
+    `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness)}`,
+    readiness ? readiness.evidence : null,
+    commandReason ? `hook_bridge_context: ${commandReason}` : null,
+    reason ? `hook_bridge_reason: ${truncate(reason, 500)}` : null,
+    'mcp_resources_exposed: mcp_resources_not_model_visible',
+    'mcp_tools_visible: no',
+    'hook_bridge_next: use this bounded bridge status now; reload the host/plugin only to expose live MCP tools.',
+  ].filter(Boolean).join('\n');
+}
+
+function runManagedHookCommand(cli, command, cwd) {
+  const result = spawnSync(cli, command.args, {
+    cwd,
+    encoding: 'utf8',
+    timeout: RUNTIME_TIMEOUT_MS,
+    maxBuffer: MAX_OUTPUT_CHARS * 4,
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli),
+    windowsHide: true,
+  });
+  if (result.status === 0 && result.stdout.trim()) {
+    return {
+      ok: true,
+      output: truncate(result.stdout),
+      fingerprint: `${command.kind}:${hashText(result.stdout)}`,
+    };
+  }
+  const reason = result.error
+    ? result.error.message
+    : truncate(result.stderr || `${command.kind} exited with status ${result.status} without usable output`);
+  return {
+    ok: false,
+    reason,
+    fingerprint: `${command.kind}:blocked:${hashText(reason)}`,
+  };
+}
+
+function hookMcpBridge(input, policy, mcp, command, bootstrap) {
+  const bridgeBootstrap = bridgeBootstrapForPolicy(policy, mcp, bootstrap);
+  const bridgedMcp = bridgeBootstrap.attempted ? classifyMcpRuntime() : mcp;
+  const cli = managedHookCli(bridgedMcp);
+  const cwd = input.cwd || process.cwd();
+  let readiness = null;
+  let commandResult = null;
+  let commandReason = command ? null : 'status_only';
+
+  if (command && !cli) {
+    commandReason = 'skipped_no_managed_cli';
+  } else if (command?.kind === 'request packet') {
+    readiness = runReadinessProbe(cli, policy.project, cwd);
+    if (readiness.ready) {
+      commandResult = runManagedHookCommand(cli, command, cwd);
+      commandReason = commandResult.ok ? null : `skipped_${commandResult.reason}`;
+    } else {
+      commandReason = `skipped_${readiness.reason}`;
+    }
+  } else if (command?.kind === 'session ground') {
+    if (bridgeBootstrap.ready) {
+      commandResult = runManagedHookCommand(cli, command, cwd);
+      commandReason = commandResult.ok ? null : `skipped_${commandResult.reason}`;
+    } else {
+      commandReason = 'skipped_local_navigation_not_ready';
+    }
+  }
+
+  const bridge = bridgeStatusText(policy, bridgedMcp, bridgeBootstrap, readiness, commandReason);
+  const commandBlock = commandResult?.ok
+    ? [
+      'CODESTORY HOOK MCP BRIDGE CONTEXT',
+      `hook_bridge_command: ${command.kind}`,
+      commandResult.output,
+    ].join('\n')
+    : null;
+  return {
+    kind: commandResult?.ok ? command.kind : 'mcp bridge',
+    output: truncate([bridge, commandBlock].filter(Boolean).join('\n'), policy.cap),
+    next: command?.next,
+    fingerprint: [
+      runtimeFingerprint(bridgedMcp),
+      bridgeBootstrap.ready ? 'bridge-ready' : `bridge-blocked:${bridgeBootstrap.reason || 'status'}`,
+      readiness?.fingerprint,
+      commandResult?.fingerprint,
+      commandReason,
+    ].filter(Boolean).join('|'),
   };
 }
 
@@ -391,6 +520,9 @@ function runCodeStory(input, event, policy, state = {}) {
   }
   const bootstrapBlock = bootstrapText(bootstrap);
   if (policy.runtimeOnly) {
+    if (mcp.mcp_config_installed && mcp.mcp_process_launchable && mcp.mcp_model_visible_blocked) {
+      return hookMcpBridge(input, policy, mcp, null, bootstrap);
+    }
     const heartbeatProbe = policy.heartbeat && !mcp.mcp_model_visible_blocked
       ? heartbeatReadinessProbe(mcp, policy.project, input.cwd || process.cwd())
       : null;
@@ -412,6 +544,9 @@ function runCodeStory(input, event, policy, state = {}) {
   const command = hookCommand(input, event, policy);
   if (!command) return null;
   if (mcp.mcp_config_installed && mcp.mcp_process_launchable) {
+    if (mcp.mcp_model_visible_blocked) {
+      return hookMcpBridge(input, policy, mcp, command, bootstrap);
+    }
     return {
       kind: 'mcp detection',
       output: truncate([
@@ -422,7 +557,7 @@ function runCodeStory(input, event, policy, state = {}) {
         mcpDetectionText(mcp),
         mcp.mcp_resources_exposed
           ? 'Use codestory://status as the active runtime truth. Run packet/search/context only when status allows that surface with retrieval_mode=full.'
-          : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Reload the host/plugin and read codestory://status; do not add CodeStory to PATH.',
+          : 'CodeStory MCP is configured and launchable, but MCP resources are not visible to this hook/model context. Use hook-bridged status when present; reload the host/plugin only to expose live MCP tools.',
       ].join('\n'), policy.cap),
       fingerprint: `${runtimeFingerprint(mcp)}|${bootstrapBlock || 'no-bootstrap'}`,
     };
@@ -539,7 +674,7 @@ function buildContext(input, event, state = {}) {
     return null;
   }
 
-  if (runtime && runtime.kind === 'mcp detection') {
+  if (runtime && runtimeBlock && (runtime.kind === 'mcp detection' || runtimeBlock.includes('CODESTORY HOOK MCP BRIDGE'))) {
     return truncate([eventHeader(event, input).trim(), runtimeBlock].filter(Boolean).join('\n\n'), policy.cap);
   }
 

@@ -26,17 +26,10 @@ Reads project/cache/index/retrieval health without mutating the index. Use it fo
 | Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
 
 For MCP/runtime drift, collect binary evidence only after status is missing or
-suspect (see [status-contract.md](status-contract.md#runtime-repair)):
-
-```powershell
-where.exe codestory-cli
-codestory-cli --version
-codestory-cli doctor --project <target-workspace> --format json
-```
-
-Treat PATH checks as CLI diagnostics only. Installed plugin MCP runtime changes
-require managed status/reinstall/reload, or an explicit `CODESTORY_CLI`
-override for local development, before starting a fresh Codex host/app session.
+suspect (see [status-contract.md](status-contract.md#runtime-repair)). Installed
+plugin MCP runtime changes require managed status/reinstall/reload, or an
+explicit `CODESTORY_CLI` override for local development, before starting a fresh
+Codex host/app session.
 
 ## Notes
 

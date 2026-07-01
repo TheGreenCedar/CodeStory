@@ -21,15 +21,13 @@ the agent-facing field glossary alongside runtime `codestory://agent-guide`.
 
 ## Runtime Repair
 
-Use `where.exe codestory-cli`, `codestory-cli --version`, release install, or
-source-build checks only for maintainer/debug transcripts when MCP is missing
-or suspect. They are not the supported agent repair path. `CODESTORY_CLI` is an explicit local-dev
-override; installed `.mcp.json` launches the managed adapter first, provisions
-from `github_release` when needed, and records the launch source in
+Use managed `codestory://status`, release install records, or source-build
+checks only for maintainer/debug transcripts when MCP is missing or suspect.
+They are not the supported agent repair path. `CODESTORY_CLI` is an explicit
+local-dev override; installed `.mcp.json` launches the managed adapter first,
+provisions from `github_release` when needed, and records the launch source in
 `plugin_runtime`. If the managed runtime cannot spawn or be provisioned, the
 adapter stays up with `repair_setup` diagnostics instead of closing transport.
-Any `PATH` candidates in status are diagnostic only and are not launched by the
-installed plugin runtime.
 
 If `codestory://status` reports a repairable state, run the MCP
 `recommended_next_calls` loop: call `repair_all` when recommended, then reread

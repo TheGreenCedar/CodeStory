@@ -297,11 +297,7 @@ fn verdict_state(
                     newer_path
                 ),
                 vec![restart.clone()],
-                vec![
-                    restart,
-                    "where.exe codestory-cli".to_string(),
-                    "codestory-cli --version".to_string(),
-                ],
+                vec![restart],
             );
         }
         let install = format!(
@@ -315,11 +311,7 @@ fn verdict_state(
                 setup.active_version, setup.active_path, setup.latest_version
             ),
             vec![install.clone()],
-            vec![
-                install,
-                "where.exe codestory-cli".to_string(),
-                "codestory-cli --version".to_string(),
-            ],
+            vec![install],
         );
     }
 

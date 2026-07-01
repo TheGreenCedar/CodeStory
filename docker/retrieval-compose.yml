@@ -58,6 +58,9 @@ services:
         source: ${CODESTORY_EMBED_MODEL_DIR:?set CODESTORY_EMBED_MODEL_DIR}
         target: /models
         read_only: true
+    # CodeStory requests Vulkan through these llama.cpp env vars when CPU mode
+    # is not explicitly allowed. Linux render-node access is added by a
+    # generated compose override only when /dev/dri exists.
     environment:
       - LLAMA_ARG_DEVICE
       - LLAMA_ARG_N_GPU_LAYERS

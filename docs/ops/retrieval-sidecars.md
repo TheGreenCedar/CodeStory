@@ -55,9 +55,8 @@ codestory-cli retrieval status --project <repo> --format json
 When plugin MCP is live, read `codestory://status` first and use its
 `allowed_surfaces` values as the tool boundary. For field semantics and
 first-response repair prompts, use
-[users/troubleshooting.md](../users/troubleshooting.md). Do not infer the active
-runtime from the source checkout, marketplace cache, or PATH when status is
-available.
+[users/troubleshooting.md](../users/troubleshooting.md). Treat status as the
+active runtime source when it is available.
 
 | State | Meaning | Operator action |
 |-------|---------|-----------------|
@@ -127,12 +126,23 @@ defaults do not match your machine:
 | `CODESTORY_EMBED_MODEL_DIR` | Host path containing `bge-base-en-v1.5.Q8_0.gguf` for the compose embed service |
 | `CODESTORY_EMBED_BACKEND` | `llamacpp`; unset also means product llama.cpp mode for retrieval commands |
 | `CODESTORY_EMBED_LLAMACPP_URL` | Local embedding endpoint, default `http://127.0.0.1:8080/v1/embeddings` |
+| `CODESTORY_EMBED_LLAMACPP_DEVICE` | Optional llama.cpp accelerator request, default `Vulkan0` when CPU is not explicitly allowed |
+| `CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS` | Optional llama.cpp GPU layer request, default `99` when CPU is not explicitly allowed |
 | `CODESTORY_EMBED_DEVICE_STATE` | Optional operator assertion for observed device state: `accelerated`, `cpu`, or unset/unknown |
 | `CODESTORY_EMBED_ALLOW_CPU` | Set to `1` only when intentional CPU-backed retrieval is acceptable on this machine |
 | `CODESTORY_EMBED_DEVICE_POLICY` | Optional policy alias; set `allow_cpu` instead of `CODESTORY_EMBED_ALLOW_CPU=1` when CPU mode is intentional |
 | `CODESTORY_ZOEKT_PORT` | Override Zoekt HTTP port when `6070` is unavailable |
 | `CODESTORY_QDRANT_HTTP_PORT` | Override Qdrant HTTP port when `6333` is unavailable |
 | `CODESTORY_QDRANT_GRPC_PORT` | Override Qdrant gRPC port when `6334` is unavailable |
+
+If CPU is not explicitly allowed, CodeStory requests llama.cpp Vulkan device
+`Vulkan0` and `99` GPU layers by default. Linux Docker Compose keeps the base
+file CPU-compatible and adds a generated `/dev/dri` override only when
+accelerator mode is requested and the host render node exists. On Windows and
+macOS GPU setups, run an already-working native or external llama.cpp embedding
+endpoint and point CodeStory at it with `CODESTORY_EMBED_LLAMACPP_URL`; set the
+device/layer variables only when the default request does not match that
+endpoint.
 
 If device state is unknown, full packet/search readiness fails closed by
 default. Use the CPU opt-in only as an explicit operator decision; otherwise

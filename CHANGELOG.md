@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.13.1
+
+CodeStory 0.13.1 hardens the portable plugin/runtime path across Codex,
+Cursor, Claude Code, and GPU hosts while keeping MCP visibility truth explicit.
+
+### Fixed
+
+- Added a hook MCP bridge for launchable-but-model-hidden Codex MCP sessions so
+  hooks inject bounded `codestory://status` truth and optional hook-bridged
+  context without claiming live MCP tools are model-visible.
+- Removed ambient CodeStory CLI discovery diagnostics and repair guidance from
+  the plugin adapter, stdio status, readiness output, installer, benchmark
+  harness, tests, and agent-facing docs while preserving `CODESTORY_CLI` as an
+  explicit local-development override.
+- Added `CODESTORY_PLUGIN_DATA` as the portable managed-runtime data directory
+  for non-Codex hosts, with Cursor and Claude Code examples that use managed
+  runtime state directly.
+- Made llama.cpp acceleration Vulkan-first by default with `Vulkan0` and GPU
+  layer requests when CPU mode is not explicitly allowed, plus Linux compose
+  `/dev/dri` access and operator docs for native/external endpoints on
+  Windows/macOS.
+- Expanded release and post-publish package proof to download every shipped
+  binary archive, verify checksums, run version/help smoke, and validate stdio
+  status shape while keeping full sidecar proof on runners that can support it.
+
 ## 0.13.0
 
 CodeStory 0.13.0 promotes the current `dev/codestory-next` MCP readiness and
