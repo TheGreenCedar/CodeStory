@@ -276,10 +276,17 @@ function readinessFromBootstrap(bootstrap) {
   };
 }
 
-function bridgeAllowedSurfaces(bootstrap, readiness, commandResult) {
+function statusResultAgentReady(statusResult) {
+  return statusResult?.parsed?.retrieval_mode === 'full';
+}
+
+function bridgeAllowedSurfaces(bootstrap, readiness, commandResult, statusResult) {
   const surfaces = [];
   if (bootstrap?.ready) surfaces.push('local_navigation');
-  if (readiness?.ready || bootstrapAgentReadinessReady(bootstrap) || commandResult?.kind === 'request packet') {
+  if (readiness?.ready
+    || bootstrapAgentReadinessReady(bootstrap)
+    || statusResultAgentReady(statusResult)
+    || commandResult?.kind === 'request packet') {
     surfaces.push('agent_packet_search');
   }
   return surfaces.length > 0 ? surfaces.join(',') : 'status_only';
@@ -329,11 +336,12 @@ function packetRetrievalMode(commandResult) {
     || null;
 }
 
-function bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult) {
+function bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult, statusResult) {
   const status = bootstrap?.parsed || {};
   return status.runtime_truth?.readiness_lanes?.agent_packet_search?.status
     || status.readiness_lanes?.agent_packet_search?.status
     || (readiness?.ready ? 'ready' : null)
+    || (statusResultAgentReady(statusResult) ? 'ready' : null)
     || (commandResult?.kind === 'request packet' && commandResult?.ok ? 'ready' : null)
     || 'not_ready';
 }
@@ -400,10 +408,10 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, comm
     `hook_bridge_cli_source: ${plugin.cli_source || (process.env.CODESTORY_CLI ? 'local_dev_override' : mcp.managed_cli_source) || '<unknown>'}`,
     plugin.managed_binary_path ? `hook_bridge_managed_cli_path: ${plugin.managed_binary_path}` : null,
     `hook_bridge_local_refresh: ${localRefresh.state || status.readiness?.[0]?.status || '<unknown>'}`,
-    `hook_bridge_agent_packet_search_status: ${bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult)}`,
+    `hook_bridge_agent_packet_search_status: ${bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult, statusResult)}`,
     `hook_bridge_sidecar_mode: ${bridgeSidecarMode(bootstrap, commandResult, statusResult)}`,
     `hook_bridge_embedding_request: ${bridgeEmbeddingRequest(bootstrap, statusResult)}`,
-    `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness, commandResult)}`,
+    `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness, commandResult, statusResult)}`,
     readiness ? readiness.evidence : null,
     commandReason ? `hook_bridge_context: ${commandReason}` : null,
     reason ? `hook_bridge_reason: ${truncate(reason, 500)}` : null,
@@ -508,6 +516,9 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
     } else {
       commandReason = 'skipped_local_navigation_not_ready';
     }
+  }
+  if (!statusResult && bridgedMcp.mcp_model_visible_blocked && cli && policy.project) {
+    statusResult = runManagedStatusCommand(cli, policy.project, cwd);
   }
 
   const bridge = bridgeStatusText(policy, bridgedMcp, bridgeBootstrap, readiness, commandReason, commandResult, statusResult);

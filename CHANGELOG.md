@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.13.6
+
+CodeStory 0.13.6 makes the startup hook bridge use the same Rust-owned
+sidecar-status truth as prompt hooks.
+
+### Fixed
+
+- Made hidden-MCP startup, heartbeat, and prompt bridges use the Rust
+  `retrieval status` surface for existing agent sidecar truth, so a fresh Codex
+  thread sees `agent_packet_search=ready`, `sidecar_mode=full`, and the Vulkan
+  accelerator request before it can mistake startup status for a blocked packet.
+
 ## 0.13.5
 
 CodeStory 0.13.5 makes first-turn Codex hook bridge proof explicit enough for

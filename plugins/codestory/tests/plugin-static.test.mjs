@@ -2379,7 +2379,8 @@ test("hook goal heartbeat bridges model-hidden MCP without live tools", async ()
 
     assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
     const markerText = await readFile(marker, "utf8");
-    assert.match(markerText, /ready --goal agent/u);
+    assert.match(markerText, /retrieval status/u);
+    assert.match(markerText, /--run-id shared-agent/u);
     assert.doesNotMatch(markerText, /--repair/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
@@ -2563,6 +2564,32 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
     JSON.stringify({ source: "managed", path: cliPath }),
     "utf8",
   );
+  const startup = spawnSync(process.execPath, [hookPath], {
+    env: {
+      ...process.env,
+      CODESTORY_MCP_RESOURCES_EXPOSED: "",
+      COPILOT_PLUGIN_DATA: "",
+      PLUGIN_DATA: dataDir,
+      PATH: "",
+      TEST_CODESTORY_VERSION: version,
+      TEST_LOG: logFile,
+    },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      source: "startup",
+      cwd: repoRoot,
+    }),
+    encoding: "utf8",
+  });
+
+  assert.equal(startup.status, 0, startup.stderr);
+  const startupContext = JSON.parse(startup.stdout).hookSpecificOutput.additionalContext;
+  assert.match(startupContext, /CODESTORY HOOK MCP BRIDGE/u);
+  assert.match(startupContext, /hook_bridge_agent_packet_search_status: ready/u);
+  assert.match(startupContext, /hook_bridge_sidecar_mode: full/u);
+  assert.match(startupContext, /hook_bridge_embedding_request: vulkan:Vulkan0 state=accelerated cpu_allowed=false/u);
+  assert.match(startupContext, /hook_bridge_allowed_surfaces: agent_packet_search/u);
+
   const result = spawnSync(process.execPath, [hookPath], {
     env: {
       ...process.env,
@@ -2607,9 +2634,11 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   assert.doesNotMatch(context, /retrieval: symbolic/u);
   assert.doesNotMatch(context, /ambient CodeStory CLI discovery/u);
   const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-  assert.deepEqual(calls.map((args) => args[0]), ["packet", "retrieval"]);
-  assert.deepEqual(calls[1].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
-  assert.match(calls[1].join(" "), /--run-id shared-agent/u);
+  assert.deepEqual(calls.map((args) => args[0]), ["retrieval", "packet", "retrieval"]);
+  assert.deepEqual(calls[0].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
+  assert.deepEqual(calls[2].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
+  assert.match(calls[0].join(" "), /--run-id shared-agent/u);
+  assert.match(calls[2].join(" "), /--run-id shared-agent/u);
   await rm(dataDir, { recursive: true, force: true });
 });
 
