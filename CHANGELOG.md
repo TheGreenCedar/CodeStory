@@ -26,6 +26,8 @@ Cursor, Claude Code, and GPU hosts while keeping MCP visibility truth explicit.
 - Expanded release and post-publish package proof to download every shipped
   binary archive, verify checksums, run version/help smoke, and validate stdio
   status shape while keeping full sidecar proof on runners that can support it.
+- Refreshed packaged proof stdio status after sidecar repair and cleared cached
+  proof output before each run so release artifacts reflect the current proof.
 
 ## 0.13.0
 
