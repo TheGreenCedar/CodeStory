@@ -3289,7 +3289,14 @@ fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
             .is_some_and(|path| path.contains("codestory-cli")),
         "setup snapshot should expose active executable path: {status}"
     );
-    for surface in ["ground", "files", "packet", "search", "context"] {
+    for surface in [
+        "ground",
+        "files",
+        "packet",
+        "search",
+        "context",
+        "repair_all",
+    ] {
         let surface_status = &status["allowed_surfaces"][surface];
         assert_eq!(surface_status["allowed"], json!(false));
         assert_eq!(surface_status["status"], json!("repair_setup"));
@@ -3312,6 +3319,7 @@ fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
     for (tool, arguments) in [
         ("ground", json!({})),
         ("search", json!({"query": "AppController"})),
+        ("repair_all", json!({})),
     ] {
         let response = send_json(
             &mut server,

@@ -3678,7 +3678,32 @@ fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Valu
     for surface in ["packet", "search", "context"] {
         surfaces.insert(surface.to_string(), stdio_allowed_surface(agent));
     }
+    surfaces.insert(
+        "repair_all".to_string(),
+        stdio_repair_all_surface(readiness),
+    );
     serde_json::Value::Object(surfaces)
+}
+
+fn stdio_repair_all_surface(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+    if let Some(setup) = readiness
+        .iter()
+        .find(|verdict| verdict.status == ReadinessStatusDto::RepairSetup)
+    {
+        return stdio_allowed_surface(Some(setup));
+    }
+
+    serde_json::json!({
+        "allowed": true,
+        "readiness_goal": "agent_packet_search",
+        "status": "ready",
+        "failed_layer": null,
+        "summary": "MCP repair_all may run bounded CodeStory agent repair for this runtime.",
+        "repair_reason": null,
+        "blocked_reason": null,
+        "minimum_next": [],
+        "full_repair": [],
+    })
 }
 
 fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::Value {
