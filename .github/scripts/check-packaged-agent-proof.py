@@ -202,6 +202,11 @@ def require_version(output: str, expected_version: str, archive: Path, artifact:
     )
 
 
+def require_help(output: str, artifact: Path) -> None:
+    require("Usage:" in output, "help", artifact, "codestory-cli --help output missing Usage")
+    require("codestory-cli" in output, "help", artifact, "codestory-cli --help output missing binary name")
+
+
 def require_retrieval_index_ready(payload: object, layer: str, artifact: Path) -> None:
     require(isinstance(payload, dict), layer, artifact, "retrieval index output is not a JSON object")
     for field in ["zoekt_stubbed", "qdrant_stubbed", "scip_stubbed"]:
@@ -513,40 +518,45 @@ def stdio_status_command(
     return status
 
 
-def require_stdio_ready(status: dict, artifact: Path, expected_version: str) -> None:
+def require_stdio_shape(status: dict, artifact: Path, expected_version: str, layer: str = "serve_stdio") -> None:
     require(
         status.get("server_version") == expected_version,
-        "serve_stdio",
+        layer,
         artifact,
         f"status server_version is {status.get('server_version')!r}, expected {expected_version!r}",
     )
     require(
         status.get("cli_version") == expected_version,
-        "serve_stdio",
+        layer,
         artifact,
         f"status cli_version is {status.get('cli_version')!r}, expected {expected_version!r}",
     )
     require(
         isinstance(status.get("server_executable"), str) and len(status.get("server_executable", "")) > 0,
-        "serve_stdio",
+        layer,
         artifact,
         "status missing server_executable",
     )
     require(
         isinstance(status.get("server_executable_sha256"), str)
         and len(status.get("server_executable_sha256", "")) == 64,
-        "serve_stdio",
+        layer,
         artifact,
         "status missing server_executable_sha256",
     )
     require(
         isinstance(status.get("sidecar_contract_version"), int),
-        "serve_stdio",
+        layer,
         artifact,
         "status missing sidecar_contract_version",
     )
     plugin_runtime = status.get("plugin_runtime")
-    require(isinstance(plugin_runtime, dict), "serve_stdio", artifact, "status missing plugin_runtime")
+    require(isinstance(plugin_runtime, dict), layer, artifact, "status missing plugin_runtime")
+    require(isinstance(status.get("allowed_surfaces"), dict), layer, artifact, "status missing allowed_surfaces")
+
+
+def require_stdio_ready(status: dict, artifact: Path, expected_version: str) -> None:
+    require_stdio_shape(status, artifact, expected_version)
     surfaces = status.get("allowed_surfaces", {})
     for name in ["packet", "search", "context"]:
         allowed = surfaces.get(name, {}).get("allowed")
@@ -622,6 +632,19 @@ def run_gate(args: argparse.Namespace) -> None:
         require_version(version_artifact.read_text(encoding="utf-8"), args.expected_version, archive, version_artifact)
         summary["artifacts"]["version"] = str(version_artifact)
         write_json(out_dir / "summary.json", summary)
+
+        help_artifact = out_dir / "help.txt"
+        run_command(cli, "help", ["--help"], help_artifact, args.timeout_secs, parse_json=False)
+        require_help(help_artifact.read_text(encoding="utf-8"), help_artifact)
+        summary["artifacts"]["help"] = str(help_artifact)
+        write_json(out_dir / "summary.json", summary)
+
+        stdio_artifact = out_dir / "serve-stdio-status.json"
+        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs)
+        require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
+        summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
+        write_json(out_dir / "summary.json", summary)
+
         if args.version_only:
             return
 
@@ -820,10 +843,7 @@ def run_gate(args: argparse.Namespace) -> None:
         summary["artifacts"]["packet"] = str(packet_artifact)
         write_json(out_dir / "summary.json", summary)
 
-        stdio_artifact = out_dir / "serve-stdio-status.json"
-        status = stdio_status(cli, project, stdio_artifact, args.timeout_secs)
-        require_stdio_ready(status, stdio_artifact, args.expected_version)
-        summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
+        require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
         write_json(out_dir / "summary.json", summary)
 
         if args.plugin_root:
@@ -863,6 +883,9 @@ def write_fake_cli(path: Path) -> None:
             fail = os.environ.get("CODESTORY_FAKE_FAIL_LAYER")
             if "--version" in sys.argv:
                 print("codestory-cli 9.9.9")
+                raise SystemExit(0)
+            if "--help" in sys.argv:
+                print("Usage: codestory-cli [OPTIONS] <COMMAND>")
                 raise SystemExit(0)
             layer = sys.argv[1]
             if layer == "retrieval" and len(sys.argv) > 2:
@@ -1043,7 +1066,7 @@ def self_test() -> None:
         version_only_args.version_only = True
         run_gate(version_only_args)
         version_only_summary = read_json_file(version_only_out / "summary.json")
-        assert version_only_summary["artifacts"].keys() == {"version"}
+        assert version_only_summary["artifacts"].keys() == {"version", "help", "serve_stdio"}
         assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "search"
@@ -1203,7 +1226,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--version-only",
         action="store_true",
-        help="Only unpack the archive and verify codestory-cli --version.",
+        help="Only run archive, version, help, and stdio status-shape smoke.",
     )
     parser.add_argument("--self-test", action="store_true", help="Run script self-tests.")
     args = parser.parse_args()

@@ -2673,7 +2673,6 @@ fn read_stdio_status_resource(
     });
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
-    let path_candidates = stdio_path_cli_candidate_statuses(server_executable.as_deref());
     let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
     let plugin_runtime = stdio_plugin_runtime_status();
     let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
@@ -2772,13 +2771,12 @@ fn read_stdio_status_resource(
         "server_executable": server_executable,
         "server_executable_sha256": server_executable_sha256,
         "source_checkout_version": source_checkout_version,
-        "path_candidates": path_candidates,
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "plugin_runtime": plugin_runtime,
         "runtime_truth": runtime_truth,
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
-            "message": "A running MCP server keeps using the CLI process it was launched with; install, override, or PATH changes require a host reload/restart and a fresh codestory://status readback."
+            "message": "A running MCP server keeps using the CLI process it was launched with; install or explicit override changes require a host reload/restart and a fresh codestory://status readback."
         },
         "warnings": server_warnings,
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
@@ -3051,53 +3049,6 @@ fn stdio_cli_version_with_timeout(candidate: &str, timeout: Duration) -> Option<
         }
         let remaining = timeout.saturating_sub(started_at.elapsed());
         std::thread::sleep(STDIO_CLI_VERSION_POLL_INTERVAL.min(remaining));
-    }
-}
-
-fn stdio_path_cli_candidate_statuses(active_path: Option<&str>) -> serde_json::Value {
-    serde_json::Value::Array(
-        stdio_path_cli_candidates()
-            .into_iter()
-            .map(|path| {
-                serde_json::json!({
-                    "path": crate::display::clean_path_string(&path),
-                    "version": stdio_cli_version(&path),
-                    "active": active_path.is_some_and(|active| same_path_text(&path, active)),
-                })
-            })
-            .collect(),
-    )
-}
-
-fn stdio_path_cli_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(paths) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&paths) {
-            push_existing_path_cli_candidates(&mut candidates, &directory);
-        }
-    }
-    dedupe_path_text(candidates)
-}
-
-fn push_existing_path_cli_candidates(candidates: &mut Vec<String>, directory: &Path) {
-    for binary in stdio_cli_binary_names() {
-        let candidate = directory.join(binary);
-        if candidate.is_file() {
-            candidates.push(candidate.to_string_lossy().to_string());
-        }
-    }
-}
-
-fn stdio_cli_binary_names() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &[
-            "codestory-cli.exe",
-            "codestory-cli.cmd",
-            "codestory-cli.bat",
-            "codestory-cli",
-        ]
-    } else {
-        &["codestory-cli"]
     }
 }
 
@@ -3410,7 +3361,6 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         "archive_url": env_nonempty("CODESTORY_PLUGIN_CLI_ARCHIVE_URL"),
         "provisioned_at": env_nonempty("CODESTORY_PLUGIN_CLI_PROVISIONED_AT"),
         "local_dev_override": cli_source == "local_dev_override",
-        "path_fallback": cli_source == "path_fallback",
         "managed_binary_path": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_PATH") } else { None },
         "managed_binary_sha256": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_SHA256") } else { None },
         "managed_manifest_path": env_nonempty("CODESTORY_PLUGIN_CLI_MANIFEST_PATH"),

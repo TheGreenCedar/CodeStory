@@ -18,6 +18,11 @@ const extraScanRoots = (
 )
   .split(path.delimiter)
   .filter(Boolean);
+const explicitScanRoots = (
+  process.env.CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS ?? ""
+)
+  .split(path.delimiter)
+  .filter(Boolean);
 
 const requiredScanDirs = [
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
@@ -31,8 +36,11 @@ const requiredProductionOnlyFiles = [
   path.join(repoRoot, "crates", "codestory-retrieval", "src", "ranker.rs"),
 ];
 
-const missingRequiredPaths = [...requiredScanDirs, ...requiredProductionOnlyFiles]
-  .filter((requiredPath) => !existsSync(requiredPath));
+const usesDefaultScanRoots = explicitScanRoots.length === 0;
+const missingRequiredPaths = usesDefaultScanRoots
+  ? [...requiredScanDirs, ...requiredProductionOnlyFiles]
+    .filter((requiredPath) => !existsSync(requiredPath))
+  : [];
 if (missingRequiredPaths.length > 0) {
   console.error("lint-retrieval-generalization: missing required production scan path(s)");
   for (const missingPath of missingRequiredPaths) {
@@ -42,11 +50,13 @@ if (missingRequiredPaths.length > 0) {
 }
 
 const scanDirs = [
-  ...requiredScanDirs,
+  ...(usesDefaultScanRoots
+    ? requiredScanDirs
+    : explicitScanRoots.filter((root) => root && existsSync(root))),
   ...extraScanRoots.filter((root) => root && existsSync(root)),
 ];
 
-const productionOnlyFiles = requiredProductionOnlyFiles;
+const productionOnlyFiles = usesDefaultScanRoots ? requiredProductionOnlyFiles : [];
 
 const evalOnlyProductionFiles = new Set([
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "eval_probes.rs"),
@@ -771,26 +781,42 @@ function rustBlockCommentEnd(text, start) {
   return text.length;
 }
 
-function scanProductionFile(filePath, pattern) {
-  const re = new RegExp(pattern, "i");
-  const lines = productionSource(filePath).split(/\r?\n/);
-  const hits = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    if (re.test(lines[index]) && !lineAllowedForPattern(pattern, lines[index])) {
-      hits.push(`${filePath}:${index + 1}:${lines[index]}`);
-    }
-  }
-  return hits;
+function prepareProductionFile(filePath) {
+  const production = productionSource(filePath);
+  return {
+    filePath,
+    production,
+    lines: production.split(/\r?\n/),
+    literals: null,
+  };
 }
 
-function scanProductionStringLiterals(filePath, pattern) {
-  const re = new RegExp(pattern, "i");
-  const lines = productionSource(filePath).split(/\r?\n/);
+function scanProductionFile(prepared, patterns, combinedRe) {
+  const lines = prepared.lines;
+  const hitsByPattern = new Map();
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!combinedRe.test(lines[index])) {
+      continue;
+    }
+    for (const { pattern, re } of patterns) {
+      if (re.test(lines[index]) && !lineAllowedForPattern(pattern, lines[index])) {
+        if (!hitsByPattern.has(pattern)) {
+          hitsByPattern.set(pattern, []);
+        }
+        hitsByPattern.get(pattern).push(`${prepared.filePath}:${index + 1}:${lines[index]}`);
+      }
+    }
+  }
+  return hitsByPattern;
+}
+
+function scanProductionStringLiterals(prepared, pattern, re) {
+  const lines = prepared.lines;
   const hits = [];
   for (let index = 0; index < lines.length; index += 1) {
     for (const literal of rustStringLiteralsOnLine(lines[index])) {
       if (re.test(literal) && !lineAllowedForPattern(pattern, lines[index])) {
-        hits.push(`${filePath}:${index + 1}:${lines[index]}`);
+        hits.push(`${prepared.filePath}:${index + 1}:${lines[index]}`);
         break;
       }
     }
@@ -816,11 +842,14 @@ function rustStringLiteralContent(literal) {
   return literal;
 }
 
-function scanProductionCompactPatterns(filePath, marker) {
-  const production = productionSource(filePath);
+function scanProductionCompactPatterns(prepared, marker) {
+  const production = prepared.production;
   const markerLower = marker.toLowerCase();
   const hits = [];
-  const literals = rustStringLiteralSpans(production);
+  if (prepared.literals == null) {
+    prepared.literals = rustStringLiteralSpans(production);
+  }
+  const literals = prepared.literals;
   for (let start = 0; start < literals.length; start += 1) {
     let compact = "";
     for (let end = start; end < literals.length; end += 1) {
@@ -835,7 +864,7 @@ function scanProductionCompactPatterns(filePath, marker) {
       compact += compactProductionSource(literals[end].literal);
       if (compact === markerLower) {
         hits.push(
-          compactPatternHit(filePath, literals[start].line, literals[end].line, marker),
+          compactPatternHit(prepared.filePath, literals[start].line, literals[end].line, marker),
         );
         break;
       }
@@ -915,12 +944,12 @@ function isEvalOnlyProductionFile(filePath) {
   return evalOnlyProductionFiles.has(path.resolve(filePath));
 }
 
-function scanRankerFilenameLiterals(filePath) {
-  const lines = productionSource(filePath).split(/\r?\n/);
+function scanRankerFilenameLiterals(prepared) {
+  const lines = prepared.lines;
   const hits = [];
   for (let index = 0; index < lines.length; index += 1) {
     if (rankerFilenameLiteralPattern.test(lines[index])) {
-      hits.push(`${filePath}:${index + 1}:${lines[index]}`);
+      hits.push(`${prepared.filePath}:${index + 1}:${lines[index]}`);
     }
   }
   return hits;
@@ -940,10 +969,29 @@ if (scanFiles.size === 0) {
   process.exit(2);
 }
 
+const bannedRegexPatterns = bannedPatterns.map((pattern) => ({
+  pattern,
+  re: new RegExp(pattern, "i"),
+}));
+const bannedCombinedRegex = new RegExp(
+  bannedPatterns.map((pattern) => `(?:${pattern})`).join("|"),
+  "i",
+);
+const bannedLiteralRegexPatterns = bannedLiteralPatterns.map((pattern) => ({
+  pattern,
+  re: new RegExp(pattern, "i"),
+}));
+
 for (const filePath of [...scanFiles].sort()) {
+  const prepared = prepareProductionFile(filePath);
   if (!isEvalOnlyProductionFile(filePath)) {
-    for (const pattern of bannedPatterns) {
-      const hits = scanProductionFile(filePath, pattern);
+    const productionHits = scanProductionFile(
+      prepared,
+      bannedRegexPatterns,
+      bannedCombinedRegex,
+    );
+    for (const { pattern } of bannedRegexPatterns) {
+      const hits = productionHits.get(pattern) ?? [];
       if (hits.length > 0) {
         console.error(
           `Banned pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
@@ -951,8 +999,8 @@ for (const filePath of [...scanFiles].sort()) {
         failed = true;
       }
     }
-    for (const pattern of bannedLiteralPatterns) {
-      const hits = scanProductionStringLiterals(filePath, pattern);
+    for (const { pattern, re } of bannedLiteralRegexPatterns) {
+      const hits = scanProductionStringLiterals(prepared, pattern, re);
       if (hits.length > 0) {
         console.error(
           `Banned literal pattern /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
@@ -961,7 +1009,7 @@ for (const filePath of [...scanFiles].sort()) {
       }
     }
     for (const pattern of bannedCompactPatterns) {
-      const hits = scanProductionCompactPatterns(filePath, pattern);
+      const hits = scanProductionCompactPatterns(prepared, pattern);
       if (hits.length > 0) {
         console.error(
           `Banned compact benchmark marker /${pattern}/ in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,
@@ -971,7 +1019,7 @@ for (const filePath of [...scanFiles].sort()) {
     }
   }
   if (filePath.endsWith(`${path.sep}ranker.rs`)) {
-    const hits = scanRankerFilenameLiterals(filePath);
+    const hits = scanRankerFilenameLiterals(prepared);
     if (hits.length > 0) {
       console.error(
         `Banned filename literals in ${path.relative(repoRoot, filePath)} (production slice):\n${hits.join("\n")}\n`,

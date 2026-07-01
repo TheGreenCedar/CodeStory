@@ -44,6 +44,9 @@ The shipped file looks like this:
     "codestory": {
       "command": "node",
       "args": ["./plugins/codestory/scripts/codestory-mcp.cjs"],
+      "env": {
+        "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
+      },
       "tool_timeout_sec": 300
     }
   }
@@ -52,11 +55,13 @@ The shipped file looks like this:
 
 **Path adjustment:** The `./plugins/codestory/...` path assumes the plugin
 checkout lives inside your workspace root. If the plugin is elsewhere, change
-`args` to an absolute path to `codestory-mcp.cjs`. On Windows, ensure `node` is
-on PATH.
+`args` to an absolute path to `codestory-mcp.cjs`. Replace
+`/absolute/path/to/codestory-plugin-data` with a real per-user data directory.
+On Windows, ensure `node` is on PATH.
 
-Set `CODESTORY_CLI` only for local development overrides. The adapter
-provisions a managed CLI when possible.
+Set `CODESTORY_PLUGIN_DATA` to a persistent per-user directory outside the
+repository; the adapter stores the managed CLI, runtime state, and sidecar
+policy there. Set `CODESTORY_CLI` only for local development overrides.
 
 Alternatively, add the same server block in Cursor user settings instead of a
 project `.cursor/mcp.json`.

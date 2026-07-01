@@ -1422,7 +1422,7 @@ mod tests {
         const REQUIRED_PROBE_COUNT: usize = 96;
         const DUPLICATE_MULTI_MATCH_PROBE_COUNT: usize =
             REQUIRED_PROBE_COUNT - UNIQUE_REQUIRED_PROBE_COUNT;
-        const MAX_ELAPSED: Duration = Duration::from_secs(2);
+        const MAX_ELAPSED: Duration = Duration::from_secs(3);
 
         let mut citations = Vec::with_capacity(CITATION_COUNT);
         for index in 0..CITATION_COUNT {

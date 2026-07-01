@@ -24,7 +24,10 @@ function main() {
   const args = process.argv.slice(2);
   const action = args[0];
   const project = argValue(args, '--project') || process.cwd();
-  const pluginDataDir = argValue(args, '--plugin-data') || process.env.PLUGIN_DATA || process.env.COPILOT_PLUGIN_DATA;
+  const pluginDataDir = argValue(args, '--plugin-data')
+    || process.env.PLUGIN_DATA
+    || process.env.COPILOT_PLUGIN_DATA
+    || process.env.CODESTORY_PLUGIN_DATA;
   const options = { pluginDataDir };
 
   if (!['install', 'uninstall', 'status', 'mark'].includes(action)) {

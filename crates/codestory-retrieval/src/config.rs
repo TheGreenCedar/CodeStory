@@ -716,9 +716,7 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .and_then(|value| match value.as_str() {
-            "native_spawned" | "native" | "windows_amd_native" => {
-                Some(EmbeddingServerLaunchMode::NativeSpawned)
-            }
+            "native_spawned" | "native" => Some(EmbeddingServerLaunchMode::NativeSpawned),
             "docker_compose_embed" | "docker" | "compose" => {
                 Some(EmbeddingServerLaunchMode::DockerComposeEmbed)
             }

@@ -3,6 +3,9 @@
     "codestory": {
       "command": "node",
       "args": ["./plugins/codestory/scripts/codestory-mcp.cjs"],
+      "env": {
+        "CODESTORY_PLUGIN_DATA": "/absolute/path/to/codestory-plugin-data"
+      },
       "tool_timeout_sec": 300
     }
   }

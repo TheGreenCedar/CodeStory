@@ -17,8 +17,9 @@ const DIRTY_HOOK_START = '# >>> codestory dirty marker >>>';
 const DIRTY_HOOK_END = '# <<< codestory dirty marker <<<';
 
 function pluginDataDir() {
-  if (isCodex) return process.env.PLUGIN_DATA;
-  if (isCopilot) return process.env.COPILOT_PLUGIN_DATA;
+  if (process.env.PLUGIN_DATA) return process.env.PLUGIN_DATA;
+  if (process.env.COPILOT_PLUGIN_DATA) return process.env.COPILOT_PLUGIN_DATA;
+  if (process.env.CODESTORY_PLUGIN_DATA) return process.env.CODESTORY_PLUGIN_DATA;
   return null;
 }
 

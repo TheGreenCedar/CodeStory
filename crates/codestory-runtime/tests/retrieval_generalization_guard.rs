@@ -69,7 +69,7 @@ fn lint_script(repo_root: &Path) -> PathBuf {
     script
 }
 
-fn run_lint_with_extra_root(repo_root: &Path, script: &Path, extra_root: &Path) -> Output {
+fn run_lint_with_scan_root(repo_root: &Path, script: &Path, scan_root: &Path) -> Output {
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -77,10 +77,7 @@ fn run_lint_with_extra_root(repo_root: &Path, script: &Path, extra_root: &Path) 
     Command::new("node")
         .arg(script)
         .current_dir(repo_root)
-        .env(
-            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS",
-            extra_root,
-        )
+        .env("CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS", scan_root)
         .output()
         .expect("run lint-retrieval-generalization.mjs against fixture")
 }
@@ -90,7 +87,7 @@ fn run_lint_with_fixture(contents: &str) -> Output {
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
     std::fs::write(fixture_root.path().join("fixture.rs"), contents).expect("write fixture");
-    run_lint_with_extra_root(&repo_root, &script, fixture_root.path())
+    run_lint_with_scan_root(&repo_root, &script, fixture_root.path())
 }
 
 fn run_lint_with_named_fixtures(fixtures: &[(&str, &str)]) -> Output {
@@ -100,26 +97,43 @@ fn run_lint_with_named_fixtures(fixtures: &[(&str, &str)]) -> Output {
     for (name, contents) in fixtures {
         std::fs::write(fixture_root.path().join(name), contents).expect("write fixture");
     }
-    run_lint_with_extra_root(&repo_root, &script, fixture_root.path())
+    run_lint_with_scan_root(&repo_root, &script, fixture_root.path())
 }
 
 #[test]
-fn retrieval_generalization_lint_script_exits_clean_when_dirs_absent() {
+fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let repo_root = workspace_root();
     let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
 
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .expect("lock lint script subprocess");
-    let status = Command::new("node")
+    let output = Command::new("node")
         .arg(&script)
         .current_dir(&repo_root)
-        .status()
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_EXTRA_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .output()
         .expect("run lint-retrieval-generalization.mjs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        status.success(),
-        "lint script should exit 0 when retrieval integration trees are clean"
+        output.status.success(),
+        "lint script should exit 0 when retrieval integration trees are clean; stderr={stderr}"
+    );
+    let production_file_count = stdout
+        .split(" production file(s)")
+        .next()
+        .and_then(|prefix| prefix.split_whitespace().last())
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("parse production file count from lint stdout");
+    assert!(
+        production_file_count > 0,
+        "extra fixture root should not replace the real production scan roots, stdout={stdout}"
     );
 }
 
@@ -367,30 +381,6 @@ mod tests {
     assert!(
         output.status.success(),
         "test-only cfg_attr and logically test-only cfg forms should be masked, stderr={stderr}"
-    );
-}
-
-#[test]
-fn linter_extra_fixture_roots_do_not_hide_real_scan_roots() {
-    let repo_root = workspace_root();
-    let script = lint_script(&repo_root);
-    let fixture_root = TempDir::new().expect("create fixture root");
-    let output = run_lint_with_extra_root(&repo_root, &script, fixture_root.path());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "empty extra fixture root should not replace or break the real scan roots, stderr={stderr}"
-    );
-    let production_file_count = stdout
-        .split(" production file(s)")
-        .next()
-        .and_then(|prefix| prefix.split_whitespace().last())
-        .and_then(|value| value.parse::<u32>().ok())
-        .expect("parse production file count from lint stdout");
-    assert!(
-        production_file_count > 0,
-        "lint should still report real production files, stdout={stdout}"
     );
 }
 

@@ -23,6 +23,9 @@ const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-
 const DOCKER_ADDRESS_POOL_EXHAUSTED_REASON: &str = "docker_address_pool_exhausted";
 const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
     "all predefined address pools have been fully subnetted";
+const LINUX_VULKAN_RENDER_NODE: &str = "/dev/dri";
+const VULKAN_COMPOSE_OVERRIDE: &str =
+    "services:\n  embed:\n    devices:\n      - /dev/dri:/dev/dri\n";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EmbedModelInventory {
@@ -279,12 +282,22 @@ fn docker_compose_up(
     let compose_profile = retrieval_compose_profile();
     remove_container_if_present("codestory-zoekt-stub")?;
     let embedding_device = crate::embeddings::embedding_device_readiness();
+    let accelerator_request = crate::embeddings::embedding_accelerator_request();
+    let vulkan_override = maybe_write_vulkan_compose_override(
+        &user_cache_root(),
+        Path::new(LINUX_VULKAN_RENDER_NODE),
+        accelerator_request.is_some(),
+    )?;
     command
         .arg("compose")
         .arg("-p")
         .arg(&runtime.compose_project)
         .arg("-f")
-        .arg(compose_file)
+        .arg(compose_file);
+    if let Some(override_file) = vulkan_override.as_ref() {
+        command.arg("-f").arg(override_file);
+    }
+    command
         .arg("up")
         .arg("-d")
         .current_dir(workdir)
@@ -328,7 +341,7 @@ fn docker_compose_up(
     if let Some(gpu) = embedding_device.detected_gpu.as_deref() {
         command.env("CODESTORY_EMBED_DEVICE_NAME", gpu);
     }
-    if let Some(request) = crate::embeddings::embedding_accelerator_request() {
+    if let Some(request) = accelerator_request {
         let device = request.device;
         let n_gpu_layers = request.n_gpu_layers;
         command
@@ -353,6 +366,33 @@ fn docker_compose_up(
         );
     }
     Ok(())
+}
+
+fn maybe_write_vulkan_compose_override(
+    cache_root: &Path,
+    host_render_node: &Path,
+    accelerator_requested: bool,
+) -> Result<Option<PathBuf>> {
+    if !accelerator_requested || !host_render_node.exists() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("create CodeStory cache dir {}", cache_root.display()))?;
+    let override_path = cache_root.join("retrieval-compose-vulkan.override.yml");
+    if override_path.is_file()
+        && std::fs::read_to_string(&override_path)
+            .map(|contents| contents == VULKAN_COMPOSE_OVERRIDE)
+            .unwrap_or(false)
+    {
+        return Ok(Some(override_path));
+    }
+    std::fs::write(&override_path, VULKAN_COMPOSE_OVERRIDE).with_context(|| {
+        format!(
+            "write Vulkan retrieval compose override {}",
+            override_path.display()
+        )
+    })?;
+    Ok(Some(override_path))
 }
 
 fn docker_compose_up_failure_message(
@@ -877,8 +917,31 @@ mod tests {
     fn bundled_compose_keeps_llamacpp_device_env_request_only() {
         assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_DEVICE"));
         assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_N_GPU_LAYERS"));
+        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("/dev/dri:/dev/dri"));
+        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("devices:"));
         assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("LLAMA_ARG_DEVICE:"));
         assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains(":-none"));
+    }
+
+    #[test]
+    fn vulkan_compose_override_is_only_written_when_host_render_node_exists() {
+        let cache = tempdir().expect("cache");
+        let missing = cache.path().join("missing-dri");
+        let skipped =
+            maybe_write_vulkan_compose_override(cache.path(), &missing, true).expect("skip");
+        assert_eq!(skipped, None);
+
+        let disabled =
+            maybe_write_vulkan_compose_override(cache.path(), &missing, false).expect("disabled");
+        assert_eq!(disabled, None);
+
+        let render_node = cache.path().join("dri");
+        std::fs::create_dir(&render_node).expect("render node dir");
+        let written =
+            maybe_write_vulkan_compose_override(cache.path(), &render_node, true).expect("write");
+        let written = written.expect("override path");
+        let contents = std::fs::read_to_string(written).expect("override contents");
+        assert!(contents.contains("/dev/dri:/dev/dri"));
     }
 
     #[test]
@@ -941,10 +1004,10 @@ mod tests {
     }
 
     #[test]
-    fn native_launch_args_use_model_port_and_amd_vulkan_device() {
+    fn native_launch_args_use_model_port_and_default_vulkan_device() {
         let _lock = crate::test_support::env_lock();
-        let _provider = EnvGuard::set("CODESTORY_EMBED_DEVICE_PROVIDER", "amd");
-        let _name = EnvGuard::set("CODESTORY_EMBED_DEVICE_NAME", "AMD Radeon RX 7900 XT");
+        let _provider = EnvGuard::remove("CODESTORY_EMBED_DEVICE_PROVIDER");
+        let _name = EnvGuard::remove("CODESTORY_EMBED_DEVICE_NAME");
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
 
@@ -1027,14 +1090,6 @@ mod tests {
     }
 
     impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             unsafe {
