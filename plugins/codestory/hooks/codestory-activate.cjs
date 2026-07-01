@@ -283,10 +283,11 @@ function statusResultAgentReady(statusResult) {
 function bridgeAllowedSurfaces(bootstrap, readiness, commandResult, statusResult) {
   const surfaces = [];
   if (bootstrap?.ready) surfaces.push('local_navigation');
-  if (readiness?.ready
-    || bootstrapAgentReadinessReady(bootstrap)
-    || statusResultAgentReady(statusResult)
-    || commandResult?.kind === 'request packet') {
+  const statusReady = statusResult ? statusResultAgentReady(statusResult) : null;
+  if (statusReady === true
+    || (statusReady === null && readiness?.ready)
+    || (statusReady === null && bootstrapAgentReadinessReady(bootstrap))
+    || (statusReady === null && commandResult?.kind === 'request packet')) {
     surfaces.push('agent_packet_search');
   }
   return surfaces.length > 0 ? surfaces.join(',') : 'status_only';
@@ -337,11 +338,13 @@ function packetRetrievalMode(commandResult) {
 }
 
 function bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult, statusResult) {
+  if (statusResult) {
+    return statusResultAgentReady(statusResult) ? 'ready' : 'not_ready';
+  }
   const status = bootstrap?.parsed || {};
   return status.runtime_truth?.readiness_lanes?.agent_packet_search?.status
     || status.readiness_lanes?.agent_packet_search?.status
     || (readiness?.ready ? 'ready' : null)
-    || (statusResultAgentReady(statusResult) ? 'ready' : null)
     || (commandResult?.kind === 'request packet' && commandResult?.ok ? 'ready' : null)
     || 'not_ready';
 }
@@ -395,7 +398,8 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, comm
     || status.readiness?.[0]?.repair_reason
     || bootstrapReason
     || bootstrap?.error
-    || bootstrap?.stderr;
+    || bootstrap?.stderr
+    || (statusResult?.ok === false ? statusResult.reason : null);
   return [
     'CODESTORY HOOK MCP BRIDGE',
     'bridge_context_label: hook-bridged context, not live MCP tools',
@@ -412,6 +416,7 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, comm
     `hook_bridge_sidecar_mode: ${bridgeSidecarMode(bootstrap, commandResult, statusResult)}`,
     `hook_bridge_embedding_request: ${bridgeEmbeddingRequest(bootstrap, statusResult)}`,
     `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness, commandResult, statusResult)}`,
+    statusResult?.ok === false ? `hook_bridge_status_reason: ${truncate(statusResult.reason, 500)}` : null,
     readiness ? readiness.evidence : null,
     commandReason ? `hook_bridge_context: ${commandReason}` : null,
     reason ? `hook_bridge_reason: ${truncate(reason, 500)}` : null,
@@ -582,6 +587,7 @@ function hookCommand(input, event, policy) {
         '--question', String(input.prompt),
         '--budget', 'tiny',
         '--refresh', 'none',
+        '--run-id', SHARED_AGENT_RUN_ID,
         '--latency-budget-ms', '1500',
       ],
       next: 'If CodeStory is unavailable, use bounded source reads in the target repo instead of repeated repair attempts.',

@@ -2638,8 +2638,76 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   assert.deepEqual(calls[0].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
   assert.deepEqual(calls[2].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
   assert.match(calls[0].join(" "), /--run-id shared-agent/u);
+  assert.match(calls[1].join(" "), /--run-id shared-agent/u);
   assert.match(calls[2].join(" "), /--run-id shared-agent/u);
   await rm(dataDir, { recursive: true, force: true });
+});
+
+test("hook bridge does not treat packet output as agent readiness without full status", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-status-not-full-"));
+  const version = await readPluginVersion();
+  const cliDir = join(dataDir, "codestory-cli", version);
+  const logFile = join(dataDir, "calls.jsonl");
+  await mkdir(cliDir, { recursive: true });
+  const cliPath = await writeNodeCli(
+    cliDir,
+    [
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
+      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'packet') { console.log('packet ok from managed runtime'); process.exit(0); }",
+      "if (args[0] === 'retrieval' && args[1] === 'status') { console.log(JSON.stringify({ retrieval_mode: 'symbolic', degraded_reason: 'qdrant_unavailable' })); process.exit(0); }",
+      "if (args[0] === 'ready') { process.exit(9); }",
+      "process.exit(2);",
+    ].join("\n"),
+  );
+  await writeFile(
+    join(cliDir, "manifest.json"),
+    JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
+    "utf8",
+  );
+  await writeFile(
+    join(dataDir, ".codestory-mcp-runtime.json"),
+    JSON.stringify({ source: "managed", path: cliPath }),
+    "utf8",
+  );
+
+  try {
+    const result = spawnSync(process.execPath, [hookPath], {
+      env: {
+        ...process.env,
+        CODESTORY_MCP_RESOURCES_EXPOSED: "",
+        COPILOT_PLUGIN_DATA: "",
+        PLUGIN_DATA: dataDir,
+        PATH: "",
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+      },
+      input: JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        prompt: "Explain indexing flow.",
+        cwd: repoRoot,
+      }),
+      encoding: "utf8",
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.match(context, /packet ok from managed runtime/u);
+    assert.match(context, /hook_bridge_agent_packet_search_status: not_ready/u);
+    assert.match(context, /hook_bridge_sidecar_mode: symbolic/u);
+    assert.match(context, /hook_bridge_allowed_surfaces: status_only/u);
+    assert.doesNotMatch(context, /hook_bridge_allowed_surfaces: agent_packet_search/u);
+    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.deepEqual(calls.map((args) => args[0]), ["packet", "retrieval"]);
+    assert.match(calls[0].join(" "), /--run-id shared-agent/u);
+    assert.match(calls[1].join(" "), /--run-id shared-agent/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test("portable agent adapters are present", async () => {
