@@ -6,7 +6,7 @@
     "name": "The Green Cedar",
     "url": "https://github.com/TheGreenCedar"
   },
-  "homepage": "https://github.com/TheGreenCedar/CodeStory/tree/dev/codestory-next/plugins/codestory",
+  "homepage": "https://github.com/TheGreenCedar/CodeStory/tree/main/plugins/codestory",
   "repository": "https://github.com/TheGreenCedar/CodeStory",
   "license": "Apache-2.0",
   "keywords": ["codestory", "codex", "grounding", "mcp", "local"],
@@ -24,9 +24,9 @@
     "privacyPolicyURL": "https://github.com/TheGreenCedar/CodeStory",
     "termsOfServiceURL": "https://github.com/TheGreenCedar/CodeStory",
     "defaultPrompt": [
-      "@CodeStory Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]?",
-      "@CodeStory I am editing a file in this repo. What symbols are affected and what tests should I run first?",
-      "@CodeStory Read codestory://status, ground this checkout if allowed, and report which surfaces are ready."
+      "Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]?",
+      "I am editing a file in this repo. What symbols are affected and what tests should I run first?",
+      "Read codestory://status, ground this checkout if allowed, and report which surfaces are ready."
     ],
     "brandColor": "#2563EB",
     "screenshots": []
