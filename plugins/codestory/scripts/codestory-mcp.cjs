@@ -304,7 +304,36 @@ function dirtyMarkerEnv(projectRoot = launchCwd) {
   };
 }
 
+function runtimeLaneFromReadiness(lanes, name, fallback) {
+  const lane = lanes && typeof lanes === 'object' ? lanes[name] : null;
+  if (!lane || typeof lane !== 'object') return fallback;
+  return {
+    ...fallback,
+    ...lane,
+    sidecar_mode: lane.sidecar_mode || lane.mode || fallback.sidecar_mode,
+    degraded_reason: Object.hasOwn(lane, 'degraded_reason')
+      ? lane.degraded_reason
+      : fallback.degraded_reason,
+  };
+}
+
 function runtimeTruthStatus(plugin, repair, options = {}) {
+  const fallbackAgentLane = {
+    status: 'unavailable',
+    profile: 'agent',
+    run_id: 'unavailable',
+    sidecar_mode: 'unavailable',
+    degraded_reason: options.degradedReason || repair.repair_reason || null,
+  };
+  const fallbackLocalLane = {
+    status: 'unavailable',
+    profile: 'local',
+    sidecar_mode: 'unavailable',
+    degraded_reason: 'unavailable',
+  };
+  const readinessLanes = options.readinessLanes || null;
+  const agentLane = runtimeLaneFromReadiness(readinessLanes, 'agent_packet_search', fallbackAgentLane);
+  const localLane = runtimeLaneFromReadiness(readinessLanes, 'local_default', fallbackLocalLane);
   return {
     runtime_source: plugin.cli_source || 'unavailable',
     plugin_root: plugin.plugin_root || null,
@@ -312,10 +341,12 @@ function runtimeTruthStatus(plugin, repair, options = {}) {
     launcher_source: plugin.cli_source || 'unavailable',
     sidecar_policy: options.sidecarPolicy || 'unavailable',
     sidecar_status: {
-      profile: 'agent',
-      run_id: 'unavailable',
-      mode: 'unavailable',
-      degraded_reason: options.degradedReason || repair.repair_reason || null,
+      profile: agentLane.profile || 'agent',
+      run_id: agentLane.run_id || 'unavailable',
+      mode: agentLane.sidecar_mode || 'unavailable',
+      degraded_reason: agentLane.degraded_reason || null,
+      namespace: agentLane.namespace || null,
+      phase: agentLane.phase || null,
     },
     readiness_lanes: {
       local_graph: {
@@ -323,19 +354,8 @@ function runtimeTruthStatus(plugin, repair, options = {}) {
         refresh_state: options.localRefresh?.state || 'unavailable',
         blocks_local_surfaces: options.localRefresh?.blocks_local_surfaces ?? null,
       },
-      local_default: {
-        status: 'unavailable',
-        profile: 'local',
-        sidecar_mode: 'unavailable',
-        degraded_reason: 'unavailable',
-      },
-      agent_packet_search: {
-        status: 'unavailable',
-        profile: 'agent',
-        run_id: 'unavailable',
-        sidecar_mode: 'unavailable',
-        degraded_reason: options.degradedReason || repair.repair_reason || null,
-      },
+      local_default: localLane,
+      agent_packet_search: agentLane,
     },
   };
 }
@@ -704,6 +724,19 @@ function runLocalNavigationWaitFresh(resolved, projectRoot) {
   return { args, result };
 }
 
+function runAgentReadiness(resolved, projectRoot) {
+  const args = ['ready', '--goal', 'agent'];
+  args.push('--project', projectRoot, '--format', 'json');
+  const result = spawnSync(resolved.path, args, {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+    timeout: localWaitFreshTimeoutMs(),
+    windowsHide: true,
+  });
+  return { args, result };
+}
+
 function localReadySetup(prefix, args, result) {
   return {
     [`${prefix}_args`]: args,
@@ -733,6 +766,30 @@ function parseLocalReadyResult(result) {
     invalidJson: null,
     verdict,
     localRefresh: parsed.local_refresh || null,
+  };
+}
+
+function parseAgentReadinessResult(result) {
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout || '{}');
+  } catch (error) {
+    return {
+      ok: false,
+      invalidJson: error.message,
+      parsed: null,
+      verdict: null,
+    };
+  }
+  const verdict = Array.isArray(parsed.verdicts)
+    ? parsed.verdicts.find((item) => item && item.goal === 'agent_packet_search') || null
+    : null;
+  const lane = parsed.readiness_lanes?.agent_packet_search || null;
+  return {
+    ok: Boolean((verdict && verdict.status === 'ready') || (lane && lane.status === 'ready')),
+    invalidJson: null,
+    parsed,
+    verdict,
   };
 }
 
@@ -821,6 +878,32 @@ function probeLocalNavigation(resolved, projectRoot = process.cwd()) {
     verdict,
     parsedProbe.localRefresh || null,
   );
+}
+
+function probeAgentReadiness(resolved, projectRoot = process.cwd()) {
+  const probe = runAgentReadiness(resolved, projectRoot);
+  const setup = {
+    ...localReadySetup('agent_readiness', probe.args, probe.result),
+  };
+  if (probe.result.error || probe.result.status !== 0) {
+    return {
+      ready: false,
+      setup,
+      parsed: null,
+      verdict: null,
+      reason: probe.result.error
+        ? probe.result.error.message
+        : `agent_readiness_failed:${probe.result.status}`,
+    };
+  }
+  const parsedProbe = parseAgentReadinessResult(probe.result);
+  return {
+    ready: parsedProbe.ok,
+    setup,
+    parsed: parsedProbe.parsed,
+    verdict: parsedProbe.verdict,
+    reason: parsedProbe.invalidJson ? `agent_readiness_invalid_json:${parsedProbe.invalidJson}` : null,
+  };
 }
 
 function pluginRuntimeForResolved(resolved) {
@@ -985,6 +1068,7 @@ async function bootstrapStatus(projectRoot = launchCwd) {
 
   const sidecarPolicy = readSidecarPolicy();
   const plugin = pluginRuntimeForResolved(resolved);
+  const agentReadiness = probeAgentReadiness(resolved, projectRoot);
   const localRefresh = localReadiness.localRefresh || {
     state: 'fresh',
     blocks_local_surfaces: false,
@@ -1001,8 +1085,13 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     setup: {
       ...localReadiness.setup,
       readiness_verdict: localReadiness.verdict,
+      ...agentReadiness.setup,
+      agent_readiness_verdict: agentReadiness.verdict,
+      agent_readiness_reason: agentReadiness.reason,
     },
   };
+  const readiness = [repair];
+  if (agentReadiness.verdict) readiness.push(agentReadiness.verdict);
   return {
     ready: true,
     project_root: projectRoot,
@@ -1013,9 +1102,11 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     runtime_truth: runtimeTruthStatus(plugin, repair, {
       sidecarPolicy: sidecarPolicy.state || 'unavailable',
       localRefresh,
+      readinessLanes: agentReadiness.parsed?.readiness_lanes || null,
     }),
     local_refresh: localRefresh,
-    readiness: [repair],
+    readiness,
+    readiness_lanes: agentReadiness.parsed?.readiness_lanes || null,
     recommended_next_calls: [{ method: 'resources/read', uri: 'codestory://status' }],
   };
 }
