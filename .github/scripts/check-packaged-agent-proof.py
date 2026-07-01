@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -609,6 +610,7 @@ def run_gate(args: argparse.Namespace) -> None:
     archive = Path(args.archive).resolve()
     project = Path(args.project).resolve()
     out_dir = Path(args.out_dir).resolve()
+    shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-agent-proof-", dir=out_dir) as temp:
@@ -843,6 +845,7 @@ def run_gate(args: argparse.Namespace) -> None:
         summary["artifacts"]["packet"] = str(packet_artifact)
         write_json(out_dir / "summary.json", summary)
 
+        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs)
         require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
         write_json(out_dir / "summary.json", summary)
 
@@ -944,6 +947,13 @@ def write_fake_cli(path: Path) -> None:
                 else:
                     emit({"sufficiency": {"status": "sufficient"}, "answer": {"retrieval_version": "sidecar"}, "retrieval_trace_summary": {}})
             elif layer == "serve":
+                marker = None
+                if fail == "serve_first_blocked":
+                    try:
+                        project = sys.argv[sys.argv.index("--project") + 1]
+                        marker = os.path.join(project, ".fake-serve-first-blocked-seen")
+                    except (ValueError, IndexError):
+                        marker = os.path.join(os.getcwd(), ".fake-serve-first-blocked-seen")
                 for line in sys.stdin:
                     request = json.loads(line)
                     if fail == "serve_timeout":
@@ -957,6 +967,10 @@ def write_fake_cli(path: Path) -> None:
                             resources.append({"uri": "codestory://agent-guide", "name": "CodeStory agent guide"})
                         result = {"resources": resources}
                     else:
+                        serve_allowed = True
+                        if marker is not None and not os.path.exists(marker):
+                            open(marker, "w", encoding="utf-8").write("seen")
+                            serve_allowed = False
                         status = {
                             "server_version": "9.9.9",
                             "cli_version": "9.9.9",
@@ -965,9 +979,9 @@ def write_fake_cli(path: Path) -> None:
                             "sidecar_contract_version": 1,
                             "plugin_runtime": {"cli_source": "direct_cli_launch"},
                             "allowed_surfaces": {
-                                "packet": {"allowed": True},
-                                "search": {"allowed": True},
-                                "context": {"allowed": True},
+                                "packet": {"allowed": serve_allowed},
+                                "search": {"allowed": serve_allowed},
+                                "context": {"allowed": serve_allowed},
                             },
                         }
                         result = {"contents": [{"uri": "codestory://status", "mimeType": "application/json", "text": json.dumps(status)}]}
@@ -1068,6 +1082,32 @@ def self_test() -> None:
         version_only_summary = read_json_file(version_only_out / "summary.json")
         assert version_only_summary["artifacts"].keys() == {"version", "help", "serve_stdio"}
         assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
+
+        stale_out = root / "stale-out"
+        stale_out.mkdir()
+        stale_file = stale_out / "stale-plugin-stdio-status.json"
+        stale_file.write_text("stale", encoding="utf-8")
+        stale_args = argparse.Namespace(**vars(version_only_args))
+        stale_args.out_dir = str(stale_out)
+        run_gate(stale_args)
+        assert not stale_file.exists()
+        assert (stale_out / "summary.json").is_file()
+
+        delayed_stdio_project = root / "repo-delayed-stdio"
+        delayed_stdio_project.mkdir()
+        delayed_stdio_out = root / "delayed-stdio-out"
+        delayed_stdio_args = argparse.Namespace(**vars(args))
+        delayed_stdio_args.project = str(delayed_stdio_project)
+        delayed_stdio_args.out_dir = str(delayed_stdio_out)
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_first_blocked"
+        try:
+            run_gate(delayed_stdio_args)
+            delayed_stdio_status = read_json_file(delayed_stdio_out / "serve-stdio-status.json")
+            delayed_status = delayed_stdio_status["status"]
+            assert delayed_status["allowed_surfaces"]["packet"]["allowed"] is True
+            assert (delayed_stdio_project / ".fake-serve-first-blocked-seen").is_file()
+        finally:
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "search"
         try:
