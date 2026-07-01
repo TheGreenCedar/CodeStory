@@ -849,7 +849,7 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         "repair_all" => {
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime)
+            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Foreground)
         }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
@@ -2868,7 +2868,10 @@ fn stdio_status_resource_auto_repair(
     {
         return None;
     }
-    Some(handle_stdio_sidecar_repair(runtime))
+    Some(handle_stdio_sidecar_repair(
+        runtime,
+        StdioSidecarRepairMode::Background,
+    ))
 }
 
 fn stdio_status_auto_repair_result_in_progress(value: Option<&serde_json::Value>) -> bool {
@@ -3618,7 +3621,7 @@ fn handle_stdio_sidecar_setup(
         },
         "repair" => {
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime)
+            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Foreground)
         }
         _ => {
             serde_json::json!({"error": "sidecar_setup.action must be status, enable, disable, ask, or repair"})
@@ -3660,7 +3663,16 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdioSidecarRepairMode {
+    Background,
+    Foreground,
+}
+
+fn handle_stdio_sidecar_repair(
+    runtime: &RuntimeContext,
+    mode: StdioSidecarRepairMode,
+) -> serde_json::Value {
     if let Some(status) =
         crate::ready_repair_status::active_ready_repair_status(&runtime.project_root, None)
     {
@@ -3671,6 +3683,10 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
         return serde_json::json!({
             "result": {
                 "status": "already_running",
+                "mode": match mode {
+                    StdioSidecarRepairMode::Background => "background",
+                    StdioSidecarRepairMode::Foreground => "foreground",
+                },
                 "project_root": status.project_root,
                 "profile": status.profile,
                 "run_id": status.run_id,
@@ -3686,22 +3702,17 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
             }
         });
     }
-    if let Some(status) =
-        crate::ready_repair_status::abandoned_ready_repair_status(&runtime.project_root, None)
-    {
-        return serde_json::json!({
-            "result": {
-                "status": "abandoned_repair",
-                "abandoned_repair": stdio_ready_repair_status_json(&runtime.project_root, &status, "abandoned"),
-                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
-            }
-        });
-    }
+    let previous_abandoned_repair =
+        crate::ready_repair_status::abandoned_ready_repair_status(&runtime.project_root, None).map(
+            |status| stdio_ready_repair_status_json(&runtime.project_root, &status, "abandoned"),
+        );
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let child = Command::new(exe)
+
+    let mut command = Command::new(&exe);
+    command
         .arg("ready")
         .arg("--goal")
         .arg("agent")
@@ -3713,27 +3724,119 @@ fn handle_stdio_sidecar_repair(runtime: &RuntimeContext) -> serde_json::Value {
         .arg("--run-id")
         .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match child {
-        Ok(child) => {
+        .stdin(Stdio::null());
+
+    match mode {
+        StdioSidecarRepairMode::Background => {
+            match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                Ok(child) => {
+                    serde_json::json!({
+                        "result": {
+                            "status": "started",
+                            "mode": "background",
+                            "pid": child.id(),
+                            "previous_abandoned_repair": previous_abandoned_repair,
+                            "next_status_command": format!(
+                                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                                codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                            ),
+                            "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+                        }
+                    })
+                }
+                Err(error) => serde_json::json!({"error": error.to_string()}),
+            }
+        }
+        StdioSidecarRepairMode::Foreground => {
+            let child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => return serde_json::json!({"error": error.to_string()}),
+            };
+            let pid = child.id();
+            let repair_status = match child.wait_with_output() {
+                Ok(output) => output.status,
+                Err(error) => return serde_json::json!({"error": error.to_string()}),
+            };
+            let ready_output = Command::new(&exe)
+                .arg("ready")
+                .arg("--goal")
+                .arg("agent")
+                .arg("--project")
+                .arg(&runtime.project_root)
+                .arg("--format")
+                .arg("json")
+                .arg("--run-id")
+                .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+                .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            let (ready_status_code, parsed_ready, ready_json_found, stdout_tail, stderr_tail) =
+                match ready_output {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        let parsed_ready = stdio_parse_trailing_json_object(&stdout);
+                        let ready_json_found = parsed_ready.is_some();
+                        (
+                            output.status.code(),
+                            parsed_ready,
+                            ready_json_found,
+                            stdio_tail_text(&stdout, 4000),
+                            stdio_tail_text(&stderr, 4000),
+                        )
+                    }
+                    Err(error) => (
+                        None,
+                        None,
+                        false,
+                        String::new(),
+                        format!("failed to run readiness probe after repair: {error}"),
+                    ),
+                };
             serde_json::json!({
                 "result": {
-                    "status": "started",
-                    "pid": child.id(),
-                    "next_status_command": format!(
-                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
-                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
-                    ),
+                    "status": if repair_status.success() { "completed" } else { "failed" },
+                    "mode": "foreground",
+                    "pid": pid,
+                    "exit_code": repair_status.code(),
+                    "repair_output_captured": false,
+                    "ready_probe_exit_code": ready_status_code,
+                    "ready": parsed_ready,
+                    "ready_json_found": ready_json_found,
+                    "previous_abandoned_repair": previous_abandoned_repair,
+                    "stdout_tail": stdout_tail,
+                    "stderr_tail": stderr_tail,
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
                 }
             })
         }
-        Err(error) => serde_json::json!({"error": error.to_string()}),
     }
+}
+
+fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Some(value);
+    }
+    for (index, _) in trimmed.match_indices('{').rev() {
+        if let Ok(value) = serde_json::from_str(&trimmed[index..]) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn stdio_tail_text(text: &str, max_chars: usize) -> String {
+    let mut chars: Vec<char> = text.chars().rev().take(max_chars).collect();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -4240,6 +4343,27 @@ version = "0.11.20"
             "version probe should return near the configured timeout"
         );
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn stdio_parse_trailing_json_object_skips_progress_logs() {
+        let output = r#"
+refreshing graph artifacts
+starting sidecar setup
+{
+  "status": "ready",
+  "summary": "resolved { enough context }",
+  "readiness": [
+    {"goal": "agent_packet_search", "status": "ready"}
+  ]
+}
+"#;
+
+        let parsed = stdio_parse_trailing_json_object(output)
+            .unwrap_or_else(|| panic!("expected trailing JSON object: {output}"));
+
+        assert_eq!(parsed["status"], json!("ready"));
+        assert_eq!(parsed["readiness"][0]["goal"], json!("agent_packet_search"));
     }
 
     #[test]

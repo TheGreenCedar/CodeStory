@@ -564,7 +564,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
   }
 });
 
-test("mcp launcher rejects active project state from another Codex thread", async () => {
+test("mcp launcher uses fresh global active project state despite stale thread env", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-wrong-thread-active-project-"));
@@ -634,15 +634,14 @@ test("mcp launcher rejects active project state from another Codex thread", asyn
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_stale");
-    assert.equal(status.readiness[0].goal, "project_root");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.ok(serve, "expected serve call");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", previousRepo]);
+    assert.equal(serve.cwd, previousRepo);
+    assert.equal(serve.projectRoot, previousRepo);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -742,7 +741,7 @@ test("mcp launcher prefers thread-scoped active project over another thread's gl
   }
 });
 
-test("mcp launcher rejects thread-owned global state when current thread is unavailable", async () => {
+test("mcp launcher uses fresh global active project state when current thread is unavailable", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-missing-thread-active-project-"));
@@ -812,14 +811,14 @@ test("mcp launcher rejects thread-owned global state when current thread is unav
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_stale");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.ok(serve, "expected serve call");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", previousRepo]);
+    assert.equal(serve.cwd, previousRepo);
+    assert.equal(serve.projectRoot, previousRepo);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

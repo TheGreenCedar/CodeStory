@@ -151,11 +151,11 @@ function activeProjectStateMatchesHost(active) {
   return activeThread === currentThread;
 }
 
-function activeProjectStateFresh(active, statePath, nowMs = Date.now()) {
+function activeProjectStateFresh(active, statePath, nowMs = Date.now(), options = {}) {
   const timestamp = activeProjectStateTimestamp(active, statePath);
   return timestamp !== null
     && nowMs - timestamp <= activeProjectStateMaxAgeMs()
-    && activeProjectStateMatchesHost(active);
+    && (!options.requireThreadMatch || activeProjectStateMatchesHost(active));
 }
 
 function resolveProjectRoot(options = {}) {
@@ -172,7 +172,7 @@ function resolveProjectRoot(options = {}) {
   const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
   const threadStatePath = activeThreadStatePath(currentThread);
   const threadActive = threadStatePath ? readJson(threadStatePath) : null;
-  if (threadActive && !activeProjectStateFresh(threadActive, threadStatePath)) {
+  if (threadActive && !activeProjectStateFresh(threadActive, threadStatePath, Date.now(), { requireThreadMatch: true })) {
     return {
       projectRoot: null,
       source: 'plugin_active_thread_state_stale',

@@ -521,7 +521,7 @@ fn sidecar_primary_search_outcome_from_query_result(
         &resolved_hits,
     );
 
-    if let Some(reason) = packet_primary_result_rejection_reason(&query_result, &resolved_hits) {
+    if let Some(reason) = sidecar_primary_result_rejection_reason(&query_result, &resolved_hits) {
         let diagnostic = sidecar_rejection_diagnostic(controller, &query_result, &resolved_hits, 5);
         let reason = format!("{reason}; {diagnostic}");
         return SidecarPrimarySearchOutcome::Rejected { shadow, reason };
@@ -547,7 +547,7 @@ fn sidecar_primary_search_outcome_from_query_result(
     }
 }
 
-fn packet_primary_result_rejection_reason(
+pub(crate) fn sidecar_primary_result_rejection_reason(
     query_result: &QueryResult,
     resolved_hits: &[SearchHit],
 ) -> Option<String> {
