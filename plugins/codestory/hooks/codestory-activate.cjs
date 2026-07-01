@@ -29,6 +29,7 @@ const EVENT_CAPS = {
   session: 3000,
 };
 const RUNTIME_TIMEOUT_MS = 3500;
+const PACKET_TIMEOUT_MS = 15000;
 const SOURCE_FALLBACK = 'CodeStory is unavailable for this session. Use bounded source reads in the target repo; inspect only task-named files and nearby tests.';
 const BOOTSTRAP_TAXONOMIES = new Set(['startup', 'clear', 'child_worktree_start', 'session']);
 const DEFERRED_DISCOVERY_NEXT = 'Next: if mcp__codestory is not already visible and tool_search is available, use host deferred discovery/tool_search first: make tool_search query "codestory mcp ground status packet search" the first repository-work tool action, then use the loaded CodeStory MCP tools before manual source reads. Use the hook bridge only if deferred discovery is unavailable or fails. Reload only after plugin install or config changes. Do not treat non-MCP runtime probes as grounding.';
@@ -257,17 +258,42 @@ function bootstrapAgentReadinessReady(bootstrap) {
       && status.readiness.some((verdict) => verdict?.goal === 'agent_packet_search' && verdict?.status === 'ready'));
 }
 
-function bridgeAllowedSurfaces(bootstrap, readiness) {
+function readinessFromBootstrap(bootstrap) {
+  if (!bootstrap?.parsed) return null;
+  const status = bootstrap.parsed;
+  const verdicts = Array.isArray(status.readiness) ? status.readiness : [];
+  const evidence = readinessEvidence({
+    ...status,
+    verdicts,
+  });
+  const ready = bootstrapAgentReadinessReady(bootstrap);
+  return {
+    ready,
+    reason: ready ? null : 'agent_packet_search readiness is not ready',
+    evidence: evidence.text,
+    fingerprint: `bootstrap-readiness:${evidence.fingerprint}`,
+  };
+}
+
+function bridgeAllowedSurfaces(bootstrap, readiness, commandResult) {
   const surfaces = [];
   if (bootstrap?.ready) surfaces.push('local_navigation');
-  if (readiness?.ready || bootstrapAgentReadinessReady(bootstrap)) surfaces.push('agent_packet_search');
+  if (readiness?.ready || bootstrapAgentReadinessReady(bootstrap) || commandResult?.kind === 'request packet') {
+    surfaces.push('agent_packet_search');
+  }
   return surfaces.length > 0 ? surfaces.join(',') : 'status_only';
 }
 
-function bridgeBootstrapForPolicy(policy, mcp, bootstrap) {
+function bridgeBootstrapForPolicy(policy, mcp, bootstrap, command) {
   if (bootstrap?.attempted) return bootstrap;
   if (!policy.project || !mcp.mcp_process_launchable) {
     return { attempted: false, reason: 'mcp_launcher_unavailable' };
+  }
+  if (command?.kind === 'session ground' && mcp.managed_cli_present) {
+    return { attempted: false, reason: 'hidden_mcp_session_ground_disabled' };
+  }
+  if (command?.kind === 'request packet' && mcp.managed_cli_present) {
+    return { attempted: false, reason: 'managed_runtime_available' };
   }
   if (!mcp.managed_cli_present && !BOOTSTRAP_TAXONOMIES.has(policy.taxonomy)) {
     return { attempted: false, reason: 'managed_runtime_not_present' };
@@ -279,13 +305,22 @@ function managedHookCli(mcp) {
   return process.env.CODESTORY_CLI || mcp.managed_cli_path || null;
 }
 
-function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason) {
+function bridgeRuntimeStatus(bootstrap, commandResult, mcp) {
+  if (bootstrap?.ready || commandResult?.ok) return 'ready';
+  if (mcp.managed_cli_present) return 'runtime_available';
+  return 'blocked';
+}
+
+function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, commandResult) {
   const status = bootstrap?.parsed || {};
   const plugin = status.plugin_runtime || {};
   const localRefresh = status.local_refresh || status.readiness?.[0]?.local_refresh || {};
+  const bootstrapReason = ['managed_runtime_available', 'hidden_mcp_session_ground_disabled'].includes(bootstrap?.reason)
+    ? null
+    : bootstrap?.reason;
   const reason = status.degraded_reason
     || status.readiness?.[0]?.repair_reason
-    || bootstrap?.reason
+    || bootstrapReason
     || bootstrap?.error
     || bootstrap?.stderr;
   return [
@@ -296,11 +331,11 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason) {
     `output_cap_chars: ${policy.cap}`,
     `dedupe_key: ${policy.dedupeKey}`,
     mcpDetectionText(mcp),
-    `hook_bridge_status: ${bootstrap?.ready ? 'ready' : 'blocked'}`,
+    `hook_bridge_status: ${bridgeRuntimeStatus(bootstrap, commandResult, mcp)}`,
     `hook_bridge_cli_source: ${plugin.cli_source || (process.env.CODESTORY_CLI ? 'local_dev_override' : mcp.managed_cli_source) || '<unknown>'}`,
     plugin.managed_binary_path ? `hook_bridge_managed_cli_path: ${plugin.managed_binary_path}` : null,
     `hook_bridge_local_refresh: ${localRefresh.state || status.readiness?.[0]?.status || '<unknown>'}`,
-    `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness)}`,
+    `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness, commandResult)}`,
     readiness ? readiness.evidence : null,
     commandReason ? `hook_bridge_context: ${commandReason}` : null,
     reason ? `hook_bridge_reason: ${truncate(reason, 500)}` : null,
@@ -310,11 +345,17 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason) {
   ].filter(Boolean).join('\n');
 }
 
+function managedHookCommandTimeoutMs(command) {
+  if (command?.kind !== 'request packet') return RUNTIME_TIMEOUT_MS;
+  const parsed = Number.parseInt(process.env.CODESTORY_HOOK_PACKET_TIMEOUT_MS || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : PACKET_TIMEOUT_MS;
+}
+
 function runManagedHookCommand(cli, command, cwd) {
   const result = spawnSync(cli, command.args, {
     cwd,
     encoding: 'utf8',
-    timeout: RUNTIME_TIMEOUT_MS,
+    timeout: managedHookCommandTimeoutMs(command),
     maxBuffer: MAX_OUTPUT_CHARS * 4,
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli),
     windowsHide: true,
@@ -322,6 +363,7 @@ function runManagedHookCommand(cli, command, cwd) {
   if (result.status === 0 && result.stdout.trim()) {
     return {
       ok: true,
+      kind: command.kind,
       output: truncate(result.stdout),
       fingerprint: `${command.kind}:${hashText(result.stdout)}`,
     };
@@ -337,7 +379,7 @@ function runManagedHookCommand(cli, command, cwd) {
 }
 
 function hookMcpBridge(input, policy, mcp, command, bootstrap) {
-  const bridgeBootstrap = bridgeBootstrapForPolicy(policy, mcp, bootstrap);
+  const bridgeBootstrap = bridgeBootstrapForPolicy(policy, mcp, bootstrap, command);
   const bridgedMcp = bridgeBootstrap.attempted ? classifyMcpRuntime() : mcp;
   const cli = managedHookCli(bridgedMcp);
   const cwd = input.cwd || process.cwd();
@@ -348,15 +390,13 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
   if (command && !cli) {
     commandReason = 'skipped_no_managed_cli';
   } else if (command?.kind === 'request packet') {
-    readiness = runReadinessProbe(cli, policy.project, cwd);
-    if (readiness.ready) {
-      commandResult = runManagedHookCommand(cli, command, cwd);
-      commandReason = commandResult.ok ? null : `skipped_${commandResult.reason}`;
-    } else {
-      commandReason = `skipped_${readiness.reason}`;
-    }
+    readiness = readinessFromBootstrap(bridgeBootstrap);
+    commandResult = runManagedHookCommand(cli, command, cwd);
+    commandReason = commandResult.ok ? null : `skipped_${commandResult.reason}`;
   } else if (command?.kind === 'session ground') {
-    if (bridgeBootstrap.ready) {
+    if (bridgedMcp.mcp_model_visible_blocked) {
+      commandReason = 'status_only_hidden_mcp_startup_ground_disabled';
+    } else if (bridgeBootstrap.ready) {
       commandResult = runManagedHookCommand(cli, command, cwd);
       commandReason = commandResult.ok ? null : `skipped_${commandResult.reason}`;
     } else {
@@ -364,7 +404,7 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
     }
   }
 
-  const bridge = bridgeStatusText(policy, bridgedMcp, bridgeBootstrap, readiness, commandReason);
+  const bridge = bridgeStatusText(policy, bridgedMcp, bridgeBootstrap, readiness, commandReason, commandResult);
   const commandBlock = commandResult?.ok
     ? [
       'CODESTORY HOOK MCP BRIDGE CONTEXT',

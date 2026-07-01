@@ -2538,9 +2538,20 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-resources-"));
   const version = await readPluginVersion();
   const cliDir = join(dataDir, "codestory-cli", version);
-  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const logFile = join(dataDir, "calls.jsonl");
   await mkdir(cliDir, { recursive: true });
-  await writeFakeCli(cliPath);
+  const cliPath = await writeNodeCli(
+    cliDir,
+    [
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
+      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'packet') { console.log('packet ok from managed runtime'); process.exit(0); }",
+      "if (args[0] === 'ready') { process.exit(9); }",
+      "process.exit(2);",
+    ].join("\n"),
+  );
   await writeFile(
     join(cliDir, "manifest.json"),
     JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
@@ -2558,6 +2569,8 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
       COPILOT_PLUGIN_DATA: "",
       PLUGIN_DATA: dataDir,
       PATH: "",
+      TEST_CODESTORY_VERSION: version,
+      TEST_LOG: logFile,
     },
     input: JSON.stringify({
       hook_event_name: "UserPromptSubmit",
@@ -2579,14 +2592,18 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   assert.match(context, /bridge_context_label: hook-bridged context, not live MCP tools/u);
   assert.match(context, /bridge_resource_uri: codestory:\/\/status/u);
   assert.match(context, /hook_bridge_status: ready/u);
-  assert.match(context, /hook_bridge_allowed_surfaces: local_navigation/u);
+  assert.match(context, /hook_bridge_allowed_surfaces: agent_packet_search/u);
+  assert.match(context, /packet ok from managed runtime/u);
   assert.match(context, /deferred discovery\/tool_search/u);
   assert.match(context, /first repository-work tool action/u);
   assert.match(context, /codestory mcp ground status packet search/u);
   assert.match(context, /mcp_tools_visible: no/u);
   assert.doesNotMatch(context, /codestory-cli ENOENT/u);
-  assert.doesNotMatch(context, /attempted request packet/u);
+  assert.doesNotMatch(context, /agent_readiness_evidence: unavailable/u);
+  assert.doesNotMatch(context, /retrieval: symbolic/u);
   assert.doesNotMatch(context, /ambient CodeStory CLI discovery/u);
+  const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+  assert.deepEqual(calls.map((args) => args[0]), ["packet"]);
   await rm(dataDir, { recursive: true, force: true });
 });
 
