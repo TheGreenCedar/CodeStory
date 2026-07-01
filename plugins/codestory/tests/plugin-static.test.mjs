@@ -2548,6 +2548,7 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
       "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
       "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
       "if (args[0] === 'packet') { console.log('packet ok from managed runtime'); process.exit(0); }",
+      "if (args[0] === 'retrieval' && args[1] === 'status') { console.log(JSON.stringify({ retrieval_mode: 'full', embedding_accelerator_request_provider: 'vulkan', embedding_accelerator_request_device: 'Vulkan0', embedding_device_state: 'accelerated', embedding_cpu_allowed: false })); process.exit(0); }",
       "if (args[0] === 'ready') { process.exit(9); }",
       "process.exit(2);",
     ].join("\n"),
@@ -2592,6 +2593,9 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   assert.match(context, /bridge_context_label: hook-bridged context, not live MCP tools/u);
   assert.match(context, /bridge_resource_uri: codestory:\/\/status/u);
   assert.match(context, /hook_bridge_status: ready/u);
+  assert.match(context, /hook_bridge_agent_packet_search_status: ready/u);
+  assert.match(context, /hook_bridge_sidecar_mode: full/u);
+  assert.match(context, /hook_bridge_embedding_request: vulkan:Vulkan0 state=accelerated cpu_allowed=false/u);
   assert.match(context, /hook_bridge_allowed_surfaces: agent_packet_search/u);
   assert.match(context, /packet ok from managed runtime/u);
   assert.match(context, /deferred discovery\/tool_search/u);
@@ -2603,7 +2607,9 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   assert.doesNotMatch(context, /retrieval: symbolic/u);
   assert.doesNotMatch(context, /ambient CodeStory CLI discovery/u);
   const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-  assert.deepEqual(calls.map((args) => args[0]), ["packet"]);
+  assert.deepEqual(calls.map((args) => args[0]), ["packet", "retrieval"]);
+  assert.deepEqual(calls[1].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
+  assert.match(calls[1].join(" "), /--run-id shared-agent/u);
   await rm(dataDir, { recursive: true, force: true });
 });
 

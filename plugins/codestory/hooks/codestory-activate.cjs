@@ -30,6 +30,7 @@ const EVENT_CAPS = {
 };
 const RUNTIME_TIMEOUT_MS = 3500;
 const PACKET_TIMEOUT_MS = 15000;
+const SHARED_AGENT_RUN_ID = 'shared-agent';
 const SOURCE_FALLBACK = 'CodeStory is unavailable for this session. Use bounded source reads in the target repo; inspect only task-named files and nearby tests.';
 const BOOTSTRAP_TAXONOMIES = new Set(['startup', 'clear', 'child_worktree_start', 'session']);
 const DEFERRED_DISCOVERY_NEXT = 'Next: if mcp__codestory is not already visible and tool_search is available, use host deferred discovery/tool_search first: make tool_search query "codestory mcp ground status packet search" the first repository-work tool action, then use the loaded CodeStory MCP tools before manual source reads. Use the hook bridge only if deferred discovery is unavailable or fails. Reload only after plugin install or config changes. Do not treat non-MCP runtime probes as grounding.';
@@ -311,7 +312,71 @@ function bridgeRuntimeStatus(bootstrap, commandResult, mcp) {
   return 'blocked';
 }
 
-function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, commandResult) {
+function parseHookJson(text) {
+  try {
+    return JSON.parse(String(text || ''));
+  } catch (_) {
+    return null;
+  }
+}
+
+function packetRetrievalMode(commandResult) {
+  if (commandResult?.kind !== 'request packet' || !commandResult?.output) return null;
+  const packet = parseHookJson(commandResult.output);
+  const trace = packet?.retrieval_trace_summary?.retrieval_trace;
+  return trace?.retrieval_shadow?.retrieval_mode
+    || trace?.packet_sidecar_diagnostics?.find((diagnostic) => diagnostic?.retrieval_mode)?.retrieval_mode
+    || null;
+}
+
+function bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult) {
+  const status = bootstrap?.parsed || {};
+  return status.runtime_truth?.readiness_lanes?.agent_packet_search?.status
+    || status.readiness_lanes?.agent_packet_search?.status
+    || (readiness?.ready ? 'ready' : null)
+    || (commandResult?.kind === 'request packet' && commandResult?.ok ? 'ready' : null)
+    || 'not_ready';
+}
+
+function sidecarFromBootstrap(bootstrap) {
+  const status = bootstrap?.parsed || {};
+  const verdictSidecar = Array.isArray(status.readiness)
+    ? status.readiness.find((verdict) => verdict?.goal === 'agent_packet_search')?.sidecar
+    : null;
+  return {
+    mode: status.runtime_truth?.sidecar_status?.mode
+      || status.runtime_truth?.readiness_lanes?.agent_packet_search?.sidecar_mode
+      || status.readiness_lanes?.agent_packet_search?.sidecar_mode
+      || verdictSidecar?.retrieval_mode
+      || null,
+    embedding: verdictSidecar || null,
+  };
+}
+
+function bridgeSidecarMode(bootstrap, commandResult, statusResult) {
+  return statusResult?.parsed?.retrieval_mode
+    || sidecarFromBootstrap(bootstrap).mode
+    || packetRetrievalMode(commandResult)
+    || 'not_reported';
+}
+
+function bridgeEmbeddingRequest(bootstrap, statusResult) {
+  const fromStatus = statusResult?.parsed || {};
+  const fromBootstrap = sidecarFromBootstrap(bootstrap).embedding || {};
+  const provider = fromStatus.embedding_accelerator_request_provider || fromBootstrap.embedding_accelerator_request_provider;
+  const device = fromStatus.embedding_accelerator_request_device || fromBootstrap.embedding_accelerator_request_device;
+  const state = fromStatus.embedding_device_state || fromBootstrap.embedding_device_state;
+  const cpuAllowed = fromStatus.embedding_cpu_allowed ?? fromBootstrap.embedding_cpu_allowed;
+  if (!provider && !device && !state) return 'not_reported';
+  return [
+    provider || 'unknown',
+    device ? `:${device}` : '',
+    state ? ` state=${state}` : '',
+    cpuAllowed !== undefined ? ` cpu_allowed=${cpuAllowed}` : '',
+  ].join('');
+}
+
+function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, commandResult, statusResult) {
   const status = bootstrap?.parsed || {};
   const plugin = status.plugin_runtime || {};
   const localRefresh = status.local_refresh || status.readiness?.[0]?.local_refresh || {};
@@ -335,6 +400,9 @@ function bridgeStatusText(policy, mcp, bootstrap, readiness, commandReason, comm
     `hook_bridge_cli_source: ${plugin.cli_source || (process.env.CODESTORY_CLI ? 'local_dev_override' : mcp.managed_cli_source) || '<unknown>'}`,
     plugin.managed_binary_path ? `hook_bridge_managed_cli_path: ${plugin.managed_binary_path}` : null,
     `hook_bridge_local_refresh: ${localRefresh.state || status.readiness?.[0]?.status || '<unknown>'}`,
+    `hook_bridge_agent_packet_search_status: ${bridgeAgentPacketSearchStatus(bootstrap, readiness, commandResult)}`,
+    `hook_bridge_sidecar_mode: ${bridgeSidecarMode(bootstrap, commandResult, statusResult)}`,
+    `hook_bridge_embedding_request: ${bridgeEmbeddingRequest(bootstrap, statusResult)}`,
     `hook_bridge_allowed_surfaces: ${bridgeAllowedSurfaces(bootstrap, readiness, commandResult)}`,
     readiness ? readiness.evidence : null,
     commandReason ? `hook_bridge_context: ${commandReason}` : null,
@@ -378,6 +446,40 @@ function runManagedHookCommand(cli, command, cwd) {
   };
 }
 
+function runManagedStatusCommand(cli, project, cwd) {
+  if (!cli || !project) return null;
+  const result = spawnSync(cli, [
+    'retrieval',
+    'status',
+    '--project', project,
+    '--profile', 'agent',
+    '--run-id', SHARED_AGENT_RUN_ID,
+    '--format', 'json',
+  ], {
+    cwd,
+    encoding: 'utf8',
+    timeout: RUNTIME_TIMEOUT_MS,
+    maxBuffer: MAX_OUTPUT_CHARS * 4,
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli),
+    windowsHide: true,
+  });
+  if (result.status === 0 && result.stdout.trim()) {
+    return {
+      ok: true,
+      parsed: parseHookJson(result.stdout),
+      fingerprint: `retrieval-status:${hashText(result.stdout)}`,
+    };
+  }
+  const reason = result.error
+    ? result.error.message
+    : truncate(result.stderr || `retrieval status exited with status ${result.status} without usable output`);
+  return {
+    ok: false,
+    reason,
+    fingerprint: `retrieval-status:blocked:${hashText(reason)}`,
+  };
+}
+
 function hookMcpBridge(input, policy, mcp, command, bootstrap) {
   const bridgeBootstrap = bridgeBootstrapForPolicy(policy, mcp, bootstrap, command);
   const bridgedMcp = bridgeBootstrap.attempted ? classifyMcpRuntime() : mcp;
@@ -385,6 +487,7 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
   const cwd = input.cwd || process.cwd();
   let readiness = null;
   let commandResult = null;
+  let statusResult = null;
   let commandReason = command ? null : 'status_only';
 
   if (command && !cli) {
@@ -392,6 +495,9 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
   } else if (command?.kind === 'request packet') {
     readiness = readinessFromBootstrap(bridgeBootstrap);
     commandResult = runManagedHookCommand(cli, command, cwd);
+    if (commandResult.ok) {
+      statusResult = runManagedStatusCommand(cli, policy.project, cwd);
+    }
     commandReason = commandResult.ok ? null : `skipped_${commandResult.reason}`;
   } else if (command?.kind === 'session ground') {
     if (bridgedMcp.mcp_model_visible_blocked) {
@@ -404,7 +510,7 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
     }
   }
 
-  const bridge = bridgeStatusText(policy, bridgedMcp, bridgeBootstrap, readiness, commandReason, commandResult);
+  const bridge = bridgeStatusText(policy, bridgedMcp, bridgeBootstrap, readiness, commandReason, commandResult, statusResult);
   const commandBlock = commandResult?.ok
     ? [
       'CODESTORY HOOK MCP BRIDGE CONTEXT',
@@ -421,6 +527,7 @@ function hookMcpBridge(input, policy, mcp, command, bootstrap) {
       bridgeBootstrap.ready ? 'bridge-ready' : `bridge-blocked:${bridgeBootstrap.reason || 'status'}`,
       readiness?.fingerprint,
       commandResult?.fingerprint,
+      statusResult?.fingerprint,
       commandReason,
     ].filter(Boolean).join('|'),
   };

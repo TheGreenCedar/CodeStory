@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.13.5
+
+CodeStory 0.13.5 makes first-turn Codex hook bridge proof explicit enough for
+fresh threads to distinguish runtime readiness from packet sufficiency.
+
+### Fixed
+
+- Added Rust-owned retrieval-status evidence to the hidden-MCP hook bridge after
+  a packet succeeds, so the visible bridge reports `agent_packet_search=ready`,
+  sidecar mode, and the Vulkan accelerator request without duplicating Rust
+  readiness logic in the hook.
+
 ## 0.13.4
 
 CodeStory 0.13.4 fixes the remaining first-turn Codex hook bridge failure found
