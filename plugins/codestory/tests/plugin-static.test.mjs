@@ -968,6 +968,67 @@ test("bootstrap-status fails open when plugin-root launch lacks project state", 
   }
 });
 
+test("bootstrap-status carries Rust agent readiness into runtime truth", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-agent-ready-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-agent-ready-bin-"));
+  const logFile = join(dataDir, "calls.jsonl");
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliPath = await writeNodeCli(
+    binDir,
+    [
+      "const fs = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
+      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'ready' && args.includes('--goal') && args.includes('local')) {",
+      "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'ready', summary: 'ready', minimum_next: [], full_repair: [] }], local_refresh: { state: 'fresh', reason: 'already_fresh', blocks_local_surfaces: false, readiness_status: 'ready', changed_file_count: 0, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
+      "  process.exit(0);",
+      "}",
+      "if (args[0] === 'ready' && args.includes('--goal') && args.includes('agent')) {",
+      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'zoekt_unreachable' } } }));",
+      "  process.exit(0);",
+      "}",
+      "process.exit(2);",
+    ].join("\n"),
+  );
+
+  try {
+    const result = spawnSync(process.execPath, [launcher, "bootstrap-status", "--project", dataDir], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const status = JSON.parse(result.stdout.trim());
+    assert.equal(status.ready, true);
+    assert.equal(status.runtime_truth.sidecar_status.mode, "full");
+    assert.equal(status.runtime_truth.sidecar_status.run_id, "shared-agent");
+    assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.status, "ready");
+    assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
+    assert.equal(status.readiness.some((verdict) => verdict.goal === "agent_packet_search" && verdict.status === "ready"), true);
+    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.deepEqual(calls.map((args) => args.slice(0, 3)), [
+      ["--version"],
+      ["ready", "--goal", "local"],
+      ["ready", "--goal", "agent"],
+    ]);
+    assert.equal(calls.some((args) => args.includes("--repair")), false);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
 test("mcp launcher infers Codex managed data from installed cache without env", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
@@ -2318,8 +2379,8 @@ test("hook goal heartbeat bridges model-hidden MCP without live tools", async ()
 
     assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
     const markerText = await readFile(marker, "utf8");
-    assert.match(markerText, /ready --goal local --wait-fresh/u);
-    assert.doesNotMatch(markerText, /--goal agent/u);
+    assert.match(markerText, /ready --goal agent/u);
+    assert.doesNotMatch(markerText, /--repair/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2520,6 +2581,8 @@ test("hook output bridges model-invisible MCP through managed runtime", async ()
   assert.match(context, /hook_bridge_status: ready/u);
   assert.match(context, /hook_bridge_allowed_surfaces: local_navigation/u);
   assert.match(context, /deferred discovery\/tool_search/u);
+  assert.match(context, /first repository-work tool action/u);
+  assert.match(context, /codestory mcp ground status packet search/u);
   assert.match(context, /mcp_tools_visible: no/u);
   assert.doesNotMatch(context, /codestory-cli ENOENT/u);
   assert.doesNotMatch(context, /attempted request packet/u);

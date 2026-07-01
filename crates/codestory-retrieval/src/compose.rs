@@ -135,7 +135,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
 
     let compose_started = if let Some(path) = resolved_compose.as_ref() {
         with_bootstrap_progress(&mut progress, "container startup", || {
-            docker_compose_up(path, repo_root, runtime, launch_mode)
+            docker_compose_up(path, repo_root, runtime, launch_mode, false)
         })?;
         true
     } else {
@@ -154,11 +154,29 @@ pub fn bootstrap_sidecars_with_runtime_progress(
             .as_ref()
             .map(|launch| embedding_launch_metadata(launch, runtime, repo_root)),
     )?;
-    if !wait_timeout.is_zero() {
-        let _ = with_bootstrap_progress(&mut progress, "model/bootstrap", || {
+
+    let infrastructure = if !wait_timeout.is_zero() {
+        with_bootstrap_progress(&mut progress, "model/bootstrap", || {
             wait_for_infrastructure(&layout, wait_timeout)
+        })?
+    } else {
+        probe_infrastructure_health(&layout)
+    };
+
+    if compose_started
+        && !infrastructure_ready(&infrastructure)
+        && let Some(path) = resolved_compose.as_ref()
+    {
+        with_bootstrap_progress(&mut progress, "container refresh", || {
+            docker_compose_up(path, repo_root, runtime, launch_mode, true)
         })?;
+        if !wait_timeout.is_zero() {
+            let _ = with_bootstrap_progress(&mut progress, "model/bootstrap", || {
+                wait_for_infrastructure(&layout, wait_timeout)
+            })?;
+        }
     }
+
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
         &layout,
@@ -172,6 +190,10 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         compose_file: resolved_compose,
         storage_repair,
     })
+}
+
+fn infrastructure_ready(health: &InfrastructureHealth) -> bool {
+    health.zoekt_reachable && health.qdrant_reachable && health.embed_reachable
 }
 
 fn with_bootstrap_progress<T>(
@@ -253,6 +275,7 @@ fn docker_compose_up(
     repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
     launch_mode: EmbeddingServerLaunchMode,
+    force_recreate: bool,
 ) -> Result<()> {
     let layout = &runtime.layout;
     if !docker_available() {
@@ -297,9 +320,11 @@ fn docker_compose_up(
     if let Some(override_file) = vulkan_override.as_ref() {
         command.arg("-f").arg(override_file);
     }
+    command.arg("up").arg("-d");
+    if force_recreate {
+        command.arg("--force-recreate");
+    }
     command
-        .arg("up")
-        .arg("-d")
         .current_dir(workdir)
         .env(
             "CODESTORY_QDRANT_DATA_DIR",
