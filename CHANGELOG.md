@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.13.2
+
+CodeStory 0.13.2 fixes Codex plugin startup lifecycle failures found during
+Windows dogfooding of the 0.13.1 release.
+
+### Fixed
+
+- Moved long-lived Codex plugin MCP wrapper processes out of the installed
+  plugin cache directory before serving so Windows plugin refreshes are not
+  blocked by the wrapper's current working directory.
+- Blocked MCP `repair_all` when `codestory://status` reports a stale active
+  CLI setup repair, preventing old runtimes from launching sidecar repair.
+- Updated Codex hook and user guidance for model-hidden plugin MCP sessions to
+  request host deferred discovery/tool_search when available instead of
+  treating reload as the first repair step.
+
 ## 0.13.1
 
 CodeStory 0.13.1 hardens the portable plugin/runtime path across Codex,

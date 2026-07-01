@@ -64,18 +64,19 @@ Run these three checks before your first real task:
 2. **MCP and hooks live** — Start a **new** Codex thread in the grounded repo.
    CodeStory MCP should start automatically and session hooks should run without
    blocking the host.
-3. **First status read succeeds** — Use the readiness prompt in [First
-   session](#first-session). The agent should answer in plain English whether
-   your repo map is ready and whether broad search is available.
+3. **First status read succeeds** — Use a normal repository question or the
+   readiness probe in [First session](#first-session). The agent should answer
+   in plain English whether your repo map is ready and whether broad search is
+   available.
 
 ## First session
 
 1. Start a **new** Codex thread in the grounded repository (not an old thread
    from before install).
-2. Ask:
+2. Ask a normal repository question. For an explicit readiness probe, ask:
 
 ```text
-@CodeStory read codestory://status, ground this checkout if allowed, and tell me which CodeStory surfaces are ready before I edit.
+Read codestory://status, ground this checkout if allowed, and tell me which CodeStory surfaces are ready before I edit.
 ```
 
 **Expected wait:** On a large repository, the first index build can take several
@@ -84,32 +85,32 @@ minutes. Let the agent finish grounding before you ask it to edit files.
 **Success looks like:** The agent confirms your repo map is ready, says whether
 broad search is available, and does not report a missing CLI or broken plugin.
 
-The agent reports `allowed_surfaces`, [local navigation](../glossary.md#local-navigation-readiness) vs [packet/search](../glossary.md#agent-packetsearch-readiness) readiness, and any repair steps. You do not install or run the CLI yourself for normal setup.
+The agent reports `allowed_surfaces`, [local navigation](../glossary.md#local-navigation-readiness) vs [packet/search](../glossary.md#agent-packetsearch-readiness) readiness, and any repair steps. You do not tag the plugin, install a CLI, or run the CLI yourself for normal setup.
 
 ## Example prompts
 
 **Readiness before editing**
 
 ```text
-@CodeStory read codestory://status and check allowed_surfaces before I change [path/to/file].
+Read codestory://status and check allowed_surfaces before I change [path/to/file].
 ```
 
 **Find ownership**
 
 ```text
-@CodeStory Where is [Feature] defined and who calls it?
+Where is [Feature] defined and who calls it?
 ```
 
 **Plan a change**
 
 ```text
-@CodeStory I am changing [path/to/file]. What symbols are affected and what tests should I run first?
+I am changing [path/to/file]. What symbols are affected and what tests should I run first?
 ```
 
 **Subsystem overview**
 
 ```text
-@CodeStory How does [subsystem] work? Cite concrete files and note any coverage gaps.
+How does [subsystem] work? Cite concrete files and note any coverage gaps.
 ```
 
 ## Prompt patterns
@@ -117,13 +118,13 @@ The agent reports `allowed_surfaces`, [local navigation](../glossary.md#local-na
 **Bad** — tree walk before grounding:
 
 ```text
-@CodeStory Grep the repo for [SYMBOL] and read every matching file.
+Grep the repo for [SYMBOL] and read every matching file.
 ```
 
 **Good** — repo question with concrete terms:
 
 ```text
-@CodeStory Where is [SYMBOL] defined, who calls it, and which tests cover that path?
+Where is [SYMBOL] defined, who calls it, and which tests cover that path?
 ```
 
 More pairs, anti-patterns, and language-flavored examples:
@@ -133,7 +134,7 @@ More pairs, anti-patterns, and language-flavored examples:
 
 | Symptom | What to try |
 | --- | --- |
-| `@CodeStory` loads but no MCP tools | Start a fresh Codex host session after install; confirm plugin shows in `/plugins` |
+| Hook says `mcp_resources_not_model_visible` | Let the agent request CodeStory MCP through host deferred discovery/tool_search when available; reload only after plugin install or config changes |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
 | Terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Agent can call `sidecar_setup`; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |

@@ -36,9 +36,10 @@ When the plugin MCP server is available:
 5. Read `codestory://agent-guide` when you need the runtime's recommended next calls.
 
 If the skill is visible but no `mcp__codestory` tools or `codestory://status`
-resource are exposed, call it a plugin MCP registration failure. Do not use CLI
-as CodeStory grounding; use ordinary source inspection and report that MCP was
-not live.
+resource are exposed, first request CodeStory MCP through host deferred
+discovery/tool_search when that host surface exists. If it remains hidden, call
+it a plugin MCP visibility failure. Do not use CLI as CodeStory grounding; use
+ordinary source inspection and report that live MCP tools were not visible.
 
 ## Task Router
 

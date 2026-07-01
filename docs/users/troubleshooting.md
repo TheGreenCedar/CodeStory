@@ -162,13 +162,13 @@ codestory-cli fix --project <repo> --format json
 Require `retrieval_mode: "full"` before trusting packet/search evidence.
 Command table: [CLI reference - readiness and repair](cli-reference.md#readiness-and-repair).
 
-## MCP registration failure
+## MCP visibility failure
 
 Symptoms: skill or rule loads but no `codestory://status` or `mcp__codestory` tools.
 
 | Host | Check |
 | --- | --- |
-| Codex | Fresh host session after `/plugins` install; see [Codex guide](codex.md#troubleshooting) |
+| Codex | If hook status says `mcp_resources_not_model_visible`, request CodeStory MCP through host deferred discovery/tool_search when available. Reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
 | Cursor | MCP config path to `plugins/codestory/scripts/codestory-mcp.cjs`; reload server |
 | Claude Code | MCP configured separately; hooks alone do not expose tools |
 | Copilot | MCP not auto-started; configure manually or use CLI |
@@ -199,11 +199,13 @@ the installed plugin package when your Codex build supports terminal plugin
 management. A running Codex host can still keep the old MCP adapter and managed
 CLI alive until you start a fresh host session.
 
-On Windows, `codex plugin add codestory@TheGreenCedar` can fail with
-`Access is denied` while backing up the plugin cache if an old Codex/MCP process
-still has files open. Quit stale Codex windows, start a fresh host session, and
-retry the `/plugins` refresh or terminal install. After refresh, confirm the
-active runtime through `codestory://status`, not only `codex plugin list`.
+On Windows, older running CodeStory MCP processes can make
+`codex plugin add codestory@TheGreenCedar` fail with `Access is denied` while
+backing up the plugin cache. Current MCP adapters move their long-lived working
+directory out of the plugin cache, but stale hosts from older packages can still
+hold files open. Quit stale Codex windows, start a fresh host session, and retry
+the `/plugins` refresh or terminal install. After refresh, confirm the active
+runtime through `codestory://status`, not only `codex plugin list`.
 
 ## Still stuck?
 

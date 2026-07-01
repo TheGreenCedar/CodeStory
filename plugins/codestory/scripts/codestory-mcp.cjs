@@ -10,6 +10,7 @@ const path = require('path');
 const { dirtyMarkerPathForProject } = require('../hooks/codestory-runtime.cjs');
 
 const pluginRoot = path.dirname(__dirname);
+const launchCwd = process.cwd();
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
 const fallbackBinaryNames = process.platform === 'win32'
   ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
@@ -163,7 +164,7 @@ function resolveProjectRoot(options = {}) {
     return { projectRoot: explicit, source: options.projectRoot ? 'argument' : 'env' };
   }
 
-  const cwd = existingProjectRoot(process.cwd());
+  const cwd = existingProjectRoot(options.cwd || launchCwd);
   if (cwd && !samePathText(cwd, pluginRoot)) {
     return { projectRoot: cwd, source: 'process_cwd' };
   }
@@ -275,11 +276,11 @@ function handleSidecarPolicyCommand(argv) {
   process.exit(0);
 }
 
-function repairCommandForProject(projectRoot = process.cwd()) {
+function repairCommandForProject(projectRoot = launchCwd) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
 
-function resolvedRepairCommandForProject(resolved, projectRoot = process.cwd()) {
+function resolvedRepairCommandForProject(resolved, projectRoot = launchCwd) {
   return `${JSON.stringify(resolved.path)} ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
 
@@ -288,7 +289,7 @@ function optionValue(argv, name) {
   return index >= 0 ? argv[index + 1] : null;
 }
 
-function dirtyMarkerEnv(projectRoot = process.cwd()) {
+function dirtyMarkerEnv(projectRoot = launchCwd) {
   const markerPath = dirtyMarkerPathForProject(projectRoot, pluginDataDir());
   const normalizedRoot = (() => {
     try {
@@ -568,10 +569,13 @@ async function resolveCli() {
   const version = pluginVersion();
   const warnings = [];
   if (process.env.CODESTORY_CLI) {
+    const cliPath = path.isAbsolute(process.env.CODESTORY_CLI)
+      ? process.env.CODESTORY_CLI
+      : path.resolve(launchCwd, process.env.CODESTORY_CLI);
     return {
       source: 'local_dev_override',
-      path: process.env.CODESTORY_CLI,
-      sha256: fs.existsSync(process.env.CODESTORY_CLI) ? fileSha256(process.env.CODESTORY_CLI) : null,
+      path: cliPath,
+      sha256: fs.existsSync(cliPath) ? fileSha256(cliPath) : null,
       version,
       cliVersion: null,
       repoRef: null,
@@ -648,28 +652,8 @@ function failOpenReasonForProbe(resolved, probe) {
   return null;
 }
 
-function localWaitFreshCommand(projectRoot = process.cwd()) {
+function localWaitFreshCommand(projectRoot = launchCwd) {
   return `<managed codestory-cli> ready --goal local --wait-fresh --project ${JSON.stringify(projectRoot)} --format json`;
-}
-
-function mcpNextCallForCommand(command) {
-  if (command.startsWith('Restart/reload') || command.startsWith('Refresh or reinstall')) {
-    return { method: 'host/restart', instruction: command };
-  }
-  if (command.includes('ready --goal agent --repair')) {
-    return {
-      method: 'tools/call',
-      tool: 'sidecar_setup',
-      arguments: { action: 'repair' },
-      debug_command: command,
-    };
-  }
-  return {
-    method: 'resources/read',
-    uri: 'codestory://status',
-    instruction: 'Use MCP status and agent-guide first; debug_command is for maintainer transcripts only.',
-    debug_command: command,
-  };
 }
 
 function singleRepairNextCalls(commands) {
@@ -680,14 +664,25 @@ function singleRepairNextCalls(commands) {
       { method: 'resources/read', uri: 'codestory://status' },
     ];
   }
+  const sidecarRepair = commands.find((command) => command.includes('ready --goal agent --repair'));
+  if (sidecarRepair) {
+    return [
+      {
+        method: 'tools/call',
+        tool: 'sidecar_setup',
+        arguments: { action: 'repair' },
+        debug_command: sidecarRepair,
+      },
+      { method: 'resources/read', uri: 'codestory://status' },
+    ];
+  }
   return [
     {
-      method: 'tools/call',
-      tool: 'repair_all',
-      arguments: {},
+      method: 'resources/read',
+      uri: 'codestory://status',
+      instruction: 'Diagnostic MCP cannot run full repair until a compatible stdio runtime starts; restore the runtime before retrying grounding.',
       debug_commands: commands,
     },
-    { method: 'resources/read', uri: 'codestory://status' },
   ];
 }
 
@@ -834,6 +829,8 @@ function pluginRuntimeForResolved(resolved) {
     plugin_root: pluginRoot,
     plugin_cache_version: pluginCacheVersion(),
     plugin_data: pluginDataDir(),
+    launch_cwd: launchCwd,
+    runtime_cwd: process.cwd(),
     cli_source: resolved.source,
     cli_path: resolved.path,
     cli_sha256: resolved.sha256,
@@ -848,7 +845,7 @@ function pluginRuntimeForResolved(resolved) {
 }
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
-  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : process.cwd();
+  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : launchCwd;
   const managedProvisionFailed = String(reason || '').startsWith('managed_cli_provision_failed:');
   const managedProvisionNext = [
     'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
@@ -957,7 +954,7 @@ function projectRootUnavailableDiagnostic(resolved, probe, projectResolution) {
   });
 }
 
-async function bootstrapStatus(projectRoot = process.cwd()) {
+async function bootstrapStatus(projectRoot = launchCwd) {
   projectRoot = normalizeProjectRoot(projectRoot);
   const resolved = await resolveCli();
   rememberLaunch(resolved);
@@ -1055,6 +1052,47 @@ function samePathText(left, right) {
   return normalize(left) === normalize(right);
 }
 
+function pathInside(child, parent) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === '' || (relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function ensureRuntimeDirectory(candidate) {
+  if (!candidate) return null;
+  try {
+    fs.mkdirSync(candidate, { recursive: true });
+    return fs.statSync(candidate).isDirectory() ? fs.realpathSync(candidate) : null;
+  } catch {
+    return null;
+  }
+}
+
+function launcherRuntimeCwd() {
+  const dataDir = pluginDataDir();
+  for (const candidate of [
+    dataDir ? path.join(dataDir, 'runtime-cwd') : null,
+    dataDir,
+    os.tmpdir(),
+  ]) {
+    const runtimeCwd = ensureRuntimeDirectory(candidate);
+    if (runtimeCwd && !pathInside(runtimeCwd, pluginRoot)) return runtimeCwd;
+  }
+  return launchCwd;
+}
+
+function releasePluginCacheCwd() {
+  const current = path.resolve(process.cwd());
+  if (!pathInside(current, pluginRoot)) return current;
+  const runtimeCwd = launcherRuntimeCwd();
+  if (!runtimeCwd || pathInside(runtimeCwd, pluginRoot)) return current;
+  try {
+    process.chdir(runtimeCwd);
+    return runtimeCwd;
+  } catch {
+    return current;
+  }
+}
+
 function sourceCheckoutVersion(projectRoot) {
   if (!projectRoot) return null;
   try {
@@ -1139,28 +1177,6 @@ function failOpenSidecarSetupResult(request) {
 
 function runFailOpenMcp(status) {
   const tools = [{
-    name: 'repair_all',
-    description: 'Run the single supported CodeStory readiness repair action, then read codestory://status again.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false,
-    },
-    outputSchema: { type: 'object', additionalProperties: true },
-    safety: {
-      readOnly: false,
-      sideEffects: true,
-      localOnly: true,
-      openWorld: false,
-      mutation: 'local_plugin_configuration',
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  }, {
     name: 'sidecar_setup',
     description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
     inputSchema: {
@@ -1191,7 +1207,7 @@ function runFailOpenMcp(status) {
   ];
   const guide = {
     status: 'repair_setup',
-    message: 'Read codestory://status, follow recommended_next_calls, restart/reload the host, then retry grounding.',
+    message: 'Read codestory://status, follow recommended_next_calls, restore a compatible stdio runtime, then retry grounding.',
     recommended_next_calls: status.recommended_next_calls,
   };
   let buffer = '';
@@ -1231,17 +1247,10 @@ function runFailOpenMcp(status) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        if (request.params?.name === 'repair_all') {
-          const repairRequest = {
-            params: {
-              arguments: { action: 'repair' },
-            },
-          };
-          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(repairRequest));
-        } else if (request.params?.name === 'sidecar_setup') {
+        if (request.params?.name === 'sidecar_setup') {
           response = jsonrpcResult(request.id, failOpenSidecarSetupResult(request));
         } else {
-          response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status or call repair_all.');
+          response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status and restore a compatible stdio runtime.');
         }
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
@@ -1255,7 +1264,7 @@ function resolvedVersionForStatus(status) {
   return status.plugin_runtime.plugin_version || 'unknown';
 }
 
-function rememberLaunch(resolved) {
+function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
   const dataDir = pluginDataDir();
   if (!dataDir) return;
   try {
@@ -1265,6 +1274,8 @@ function rememberLaunch(resolved) {
       path: resolved.path,
       sha256: resolved.sha256,
       pluginRoot,
+      launchCwd,
+      runtimeCwd,
       pluginCacheVersion: pluginCacheVersion(),
       pluginVersion: resolved.version,
       manifestPath: resolved.manifestPath || null,
@@ -1284,8 +1295,9 @@ function rememberLaunch(resolved) {
 async function main() {
   if (await handleBootstrapStatusCommand(process.argv)) return;
   handleSidecarPolicyCommand(process.argv);
+  const runtimeCwd = releasePluginCacheCwd();
   const resolved = await resolveCli();
-  rememberLaunch(resolved);
+  rememberLaunch(resolved, runtimeCwd);
   const probe = probeResolvedCli(resolved);
   const projectResolution = resolveProjectRoot();
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
@@ -1314,6 +1326,8 @@ async function main() {
       ...process.env,
       CODESTORY_PLUGIN_VERSION: resolved.version || '',
       CODESTORY_PLUGIN_ROOT: pluginRoot,
+      CODESTORY_PLUGIN_LAUNCH_CWD: launchCwd,
+      CODESTORY_PLUGIN_RUNTIME_CWD: runtimeCwd,
       CODESTORY_PLUGIN_CACHE_VERSION: pluginCacheVersion() || '',
       CODESTORY_PLUGIN_CLI_VERSION: resolved.cliVersion || resolved.version || '',
       CODESTORY_PLUGIN_CLI_SOURCE: resolved.source,
@@ -1363,6 +1377,7 @@ async function main() {
 }
 
 function runLauncherError(error) {
+  releasePluginCacheCwd();
   const resolved = {
     source: 'launcher',
     path: 'codestory-cli',
