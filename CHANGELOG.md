@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.13.4
+
+CodeStory 0.13.4 fixes the remaining first-turn Codex hook bridge failure found
+after the 0.13.3 release proof.
+
+### Fixed
+
+- Stopped hidden-MCP startup hooks from injecting `ground` output, which could
+  report local symbolic retrieval and mask the repaired agent sidecar state.
+- Made hidden-MCP prompt hooks call the managed Rust `packet` path directly
+  instead of rerunning a duplicate short-timeout `ready --goal agent` probe.
+- Extended the hook packet timeout to cover the measured Rust packet path while
+  preserving fast status-only startup when Codex still hides live MCP tools.
+
 ## 0.13.3
 
 CodeStory 0.13.3 fixes first-turn Codex plugin startup truth after the 0.13.2
