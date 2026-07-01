@@ -17,6 +17,8 @@ Windows dogfooding of the 0.13.1 release.
 - Updated Codex hook and user guidance for model-hidden plugin MCP sessions to
   request host deferred discovery/tool_search when available instead of
   treating reload as the first repair step.
+- Removed explicit `@CodeStory` tags from Codex marketplace prompt examples so
+  the installed plugin advertises natural fresh-thread usage.
 
 ## 0.13.1
 
