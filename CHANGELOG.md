@@ -8,6 +8,12 @@ CodeStory 0.13.6 fixes fresh Codex plugin MCP startup without the removed hook
 bridge, and hardens explicit sidecar repair so first-use threads can recover
 through the live MCP server.
 
+### Changed
+
+- Added Cargo registry/source/build-output caching to the default Rust CI
+  workspace checks so promotion PRs can reuse the cache already seeded by
+  sidecar smoke jobs instead of recompiling the workspace from scratch.
+
 ### Fixed
 
 - Removed the Codex hook bridge from the shipped plugin path. Codex hooks now

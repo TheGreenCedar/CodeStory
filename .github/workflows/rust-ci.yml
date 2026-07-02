@@ -42,6 +42,27 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
+      - name: Capture Rust cache key
+        id: rust-cache-key
+        shell: bash
+        run: |
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo registry, git sources, and build output
+        id: cargo-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-rust-ci-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rust-ci-stable-${{ steps.rust-cache-key.outputs.version }}-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
+            ${{ runner.os }}-cargo-stable-
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -53,3 +74,14 @@ jobs:
 
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Save Cargo registry, git sources, and build output
+        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
