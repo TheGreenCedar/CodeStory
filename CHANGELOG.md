@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.13.7
+
+CodeStory 0.13.7 fixes automatic first-start sidecar repair when a stale
+ready-repair record was left behind by an earlier failed startup.
+
+### Fixed
+
+- Let status auto-repair retry past abandoned ready-repair records when plugin
+  sidecar setup is enabled, so stale startup state cannot permanently block
+  agent packet/search repair.
+
 ## 0.13.6
 
 CodeStory 0.13.6 fixes fresh Codex plugin MCP startup without the removed hook

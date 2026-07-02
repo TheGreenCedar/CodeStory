@@ -2851,9 +2851,7 @@ fn stdio_status_resource_auto_repair(
     {
         return None;
     }
-    if stdio_sidecar_setup_has_active_repair(sidecar_setup)
-        || stdio_sidecar_setup_has_abandoned_repair(sidecar_setup)
-    {
+    if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
         return None;
     }
     let non_ready = crate::readiness::primary_non_ready(readiness)?;
@@ -3382,12 +3380,6 @@ fn stdio_status_repair_in_progress_next_calls() -> serde_json::Value {
 fn stdio_sidecar_setup_has_active_repair(sidecar_setup: &serde_json::Value) -> bool {
     sidecar_setup
         .get("active_repair")
-        .is_some_and(|value| !value.is_null())
-}
-
-fn stdio_sidecar_setup_has_abandoned_repair(sidecar_setup: &serde_json::Value) -> bool {
-    sidecar_setup
-        .get("abandoned_repair")
         .is_some_and(|value| !value.is_null())
 }
 
