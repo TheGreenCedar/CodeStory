@@ -8831,7 +8831,7 @@ impl AppController {
                     ),
                 )
             })?;
-        if let Some(reason) = agent::retrieval_primary::sidecar_result_rejection_reason(
+        if let Some(reason) = agent::retrieval_primary::sidecar_primary_result_rejection_reason(
             &query_result,
             &indexed_symbol_hits,
         ) {

@@ -12,7 +12,6 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
 const {
-  classifyMcpRuntime,
   dirtyMarkerPathForProject,
   dirtyHookStatus,
   installDirtyHooks,
@@ -102,6 +101,10 @@ test("plugin metadata maps skill and direct stdio server", async () => {
     await readFile(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
   );
   const mcp = JSON.parse(await readFile(join(pluginRoot, ".mcp.json"), "utf8"));
+  const agentMetadata = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
+    "utf8",
+  );
 
   assert.equal(manifest.name, "codestory");
   assert.equal(manifest.skills, "./skills/");
@@ -109,9 +112,13 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.equal(manifest.mcpServers, "./.mcp.json");
   assert.equal(manifest.interface.capabilities.includes("Read"), true);
   assert.equal(
-    manifest.interface.capabilities.includes("Lifecycle hooks"),
+    manifest.interface.capabilities.includes(["Lifecycle", "hooks"].join(" ")),
     true,
   );
+  assert.match(agentMetadata, /dependencies:\s*\r?\n\s+tools:/u);
+  assert.match(agentMetadata, /type: "mcp"/u);
+  assert.match(agentMetadata, /value: "codestory"/u);
+  assert.match(agentMetadata, /allow_implicit_invocation: true/u);
   assert.equal(mcp.mcpServers.codestory.command, "node");
   assert.deepEqual(mcp.mcpServers.codestory.args, [
     "./scripts/codestory-mcp.cjs",
@@ -493,7 +500,71 @@ test("mcp launcher uses active project state when host launches from plugin root
   }
 });
 
-test("mcp launcher rejects active project state from another Codex thread", async () => {
+test("mcp launcher fails open when delegated stdio runtime exits", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-exit-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-bin-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const realRepoRoot = await realpath(repoRoot);
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "status",
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  }) + "\n";
+  const cliPath = await writeNodeCli(
+    binDir,
+    [
+      "const args = process.argv.slice(2);",
+      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'serve') { process.exit(17); }",
+      "process.exit(2);",
+    ].join("\n"),
+  );
+
+  try {
+    await writeFile(
+      join(dataDir, ".codestory-active"),
+      JSON.stringify({
+        event: "SessionStart",
+        cwd: realRepoRoot,
+        updatedAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+
+    const result = spawnSync(process.execPath, [launcher], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+      },
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout.trim());
+    const status = JSON.parse(response.result.contents[0].text);
+    assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
+    assert.equal(status.project_root, realRepoRoot);
+    assert.equal(status.project_root_source, "plugin_active_state");
+    assert.equal(status.readiness[0].setup.probe_status, 17);
+    assert.match(
+      status.readiness[0].setup.probe_error,
+      /codestory-cli serve --stdio exited with status 17/u,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher uses fresh global active project state despite stale thread env", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-wrong-thread-active-project-"));
@@ -563,15 +634,14 @@ test("mcp launcher rejects active project state from another Codex thread", asyn
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_stale");
-    assert.equal(status.readiness[0].goal, "project_root");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.ok(serve, "expected serve call");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", previousRepo]);
+    assert.equal(serve.cwd, previousRepo);
+    assert.equal(serve.projectRoot, previousRepo);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -671,7 +741,7 @@ test("mcp launcher prefers thread-scoped active project over another thread's gl
   }
 });
 
-test("mcp launcher rejects thread-owned global state when current thread is unavailable", async () => {
+test("mcp launcher uses fresh global active project state when current thread is unavailable", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-missing-thread-active-project-"));
@@ -741,14 +811,14 @@ test("mcp launcher rejects thread-owned global state when current thread is unav
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_stale");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.ok(serve, "expected serve call");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", previousRepo]);
+    assert.equal(serve.cwd, previousRepo);
+    assert.equal(serve.projectRoot, previousRepo);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1523,41 +1593,16 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   }
 });
 
-test("startup hook bootstraps managed cli when MCP resources are visible", async (t) => {
-  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
-  if (tarProbe.status !== 0) {
-    t.skip("tar unavailable for archive fixture");
-    return;
-  }
-
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-bootstrap-"));
-  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-hook-release-"));
+test("startup hook records active project without runtime bootstrap", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-minimal-"));
   const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
-  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
-  const stageDir = join(releaseDir, archiveBase);
-  const cliPath = join(stageDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
-  const archivePath = join(releaseDir, archiveName);
 
   try {
-    await mkdir(stageDir, { recursive: true });
-    await writeFakeCli(cliPath);
-    const packArgs = archiveName.endsWith(".zip")
-      ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
-      : ["-czf", archivePath, "-C", releaseDir, archiveBase];
-    const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
-    assert.equal(pack.status, 0, pack.stderr);
-    const archiveSha256 = createHash("sha256")
-      .update(await readFile(archivePath))
-      .digest("hex");
-    await writeFile(join(releaseDir, "SHA256SUMS.txt"), `${archiveSha256}  ${archiveName}\n`, "utf8");
-
     const result = spawnSync(process.execPath, [hookPath], {
       env: {
         ...process.env,
-        CODESTORY_CLI: "",
-        CODESTORY_MCP_RESOURCES_EXPOSED: "1",
-        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+        CODESTORY_CLI: join(dataDir, "missing-codestory-cli"),
+        CODEX_THREAD_ID: "hook-thread-id",
         COPILOT_PLUGIN_DATA: "",
         PLUGIN_DATA: dataDir,
       },
@@ -1567,28 +1612,28 @@ test("startup hook bootstraps managed cli when MCP resources are visible", async
         cwd: repoRoot,
       }),
       encoding: "utf8",
-      timeout: 30000,
     });
 
     assert.equal(result.status, 0, result.stderr);
-    const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-    assert.match(context, /managed_bootstrap: ready/u);
-    assert.match(context, /managed_bootstrap_cli_source: managed/u);
-    assert.match(context, /managed_bootstrap_local_refresh: fresh/u);
-    assert.match(context, /mcp_resources_exposed: mcp_resources_exposed/u);
-    assert.match(context, /mcp_model_visible_blocked: no/u);
-    assert.match(context, /managed_cli_present: yes/u);
-    assert.doesNotMatch(context, /ambient CodeStory CLI discovery/u);
+    const output = JSON.parse(result.stdout);
+    const context = output.hookSpecificOutput.additionalContext;
+    assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
+    assert.match(context, /CODESTORY SESSION GROUNDING ACTIVE/u);
+    assert.match(context, /CodeStory MCP startup path/u);
+    assert.match(context, /tool_search/u);
+    assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
+    assert.doesNotMatch(context, /managed_bootstrap/u);
+    assert.doesNotMatch(context, /mcp_resources_exposed/u);
 
-    const manifest = JSON.parse(
-      await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),
-    );
-    assert.equal(manifest.version, version);
-    assert.equal(manifest.build_source, "github_release");
-    assert.equal(manifest.archive_sha256, archiveSha256);
+    const state = JSON.parse(await readFile(join(dataDir, ".codestory-active"), "utf8"));
+    const threadState = JSON.parse(await readFile(threadActiveStatePath(dataDir, "hook-thread-id"), "utf8"));
+    assert.equal(state.cwd, repoRoot);
+    assert.equal(state.codexThreadId, "hook-thread-id");
+    assert.equal(state.hook.bridge_removed, true);
+    assert.equal(threadState.cwd, repoRoot);
+    assert.equal(threadState.codexThreadId, "hook-thread-id");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
-    await rm(releaseDir, { recursive: true, force: true });
   }
 });
 
@@ -1757,45 +1802,12 @@ test("hook records Codex thread id in active project state", async () => {
   }
 });
 
-test("hook manifest timeouts cover managed bootstrap budget", async () => {
+test("hook manifest timeouts stay bounded for lightweight activation", async () => {
   const hookConfig = JSON.parse(
     await readFile(join(pluginRoot, "hooks", "claude-codex-hooks.json"), "utf8"),
   );
   const copilotHookConfig = JSON.parse(
     await readFile(join(pluginRoot, "hooks", "copilot-hooks.json"), "utf8"),
-  );
-  const runtimeSource = await readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8");
-  const mcpSource = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
-  const numberFrom = (text, pattern, label) => {
-    const match = text.match(pattern);
-    assert.ok(match, `missing ${label}`);
-    return Number.parseInt(match[1], 10);
-  };
-
-  const bootstrapTimeoutMs = numberFrom(
-    runtimeSource,
-    /function bootstrapTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
-    "bootstrap timeout default",
-  );
-  const releaseDownloadTimeoutMs = numberFrom(
-    mcpSource,
-    /const releaseDownloadTimeoutMs = (\d+);/u,
-    "release download timeout",
-  );
-  const releaseDownloadAttempts = numberFrom(
-    mcpSource,
-    /const releaseDownloadAttempts = (\d+);/u,
-    "release download attempts",
-  );
-  const localWaitFreshTimeoutMs = numberFrom(
-    mcpSource,
-    /function localWaitFreshTimeoutMs\(\) \{[\s\S]*?return Number\.isFinite\(parsed\) && parsed > 0 \? parsed : (\d+);/u,
-    "local wait-fresh timeout default",
-  );
-  assert.equal(localWaitFreshTimeoutMs, 30000, "local wait-fresh default must stay bounded for bootstrap diagnostics");
-  const requiredTimeoutSec = Math.max(
-    Math.ceil((bootstrapTimeoutMs + 30000) / 1000),
-    Math.ceil((releaseDownloadTimeoutMs * releaseDownloadAttempts + localWaitFreshTimeoutMs) / 1000),
   );
   const claudeTimeouts = Object.values(hookConfig.hooks)
     .flat()
@@ -1805,49 +1817,10 @@ test("hook manifest timeouts cover managed bootstrap budget", async () => {
 
   for (const timeoutSec of [...claudeTimeouts, ...copilotTimeouts]) {
     assert.equal(typeof timeoutSec, "number");
-    assert.ok(
-      timeoutSec >= requiredTimeoutSec,
-      `hook timeout ${timeoutSec}s must cover managed bootstrap budget ${requiredTimeoutSec}s`,
-    );
+    assert.ok(timeoutSec >= 5, `hook timeout ${timeoutSec}s is too short for node startup`);
+    assert.ok(timeoutSec <= 300, `hook timeout ${timeoutSec}s must stay bounded`);
   }
 });
-
-async function withFakeCodeStoryCli(callback) {
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-test-"));
-  const shPath = join(binDir, "codestory-cli");
-  const cmdPath = join(binDir, "codestory-cli.cmd");
-
-  await writeFile(
-    shPath,
-    "#!/bin/sh\nprintf 'FAKE_CODESTORY_CLI %s\\n' \"$*\"\n",
-    "utf8",
-  );
-  await chmod(shPath, 0o755);
-  await writeFile(
-    cmdPath,
-    "@echo off\r\necho FAKE_CODESTORY_CLI %*\r\n",
-    "utf8",
-  );
-
-  try {
-    await callback(binDir);
-  } finally {
-    await rm(binDir, { recursive: true, force: true });
-  }
-}
-
-async function withTempHookInstall(callback) {
-  const { cp } = await import("node:fs/promises");
-  const installRoot = await mkdtemp(join(tmpdir(), "codestory-hook-install-"));
-  try {
-    await cp(join(pluginRoot, "hooks"), join(installRoot, "hooks"), {
-      recursive: true,
-    });
-    await callback(installRoot);
-  } finally {
-    await rm(installRoot, { recursive: true, force: true });
-  }
-}
 
 async function writeNodeCli(binDir, source) {
   const scriptPath = join(binDir, "fake-codestory-cli.cjs");
@@ -1879,597 +1852,97 @@ function runCodexHook(input, env) {
   return JSON.parse(result.stdout);
 }
 
-test("hook output keeps CodeStory ambient and checks MCP before source fallback", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-mcp-first-"));
+test("hook emits MCP activation guidance without running CLI", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-mcp-guidance-"));
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-unused-cli-"));
+  const marker = join(dataDir, "cli-called.txt");
 
   try {
-    await withFakeCodeStoryCli(async (binDir) => {
-      const fakeCli = process.platform === "win32"
-        ? join(binDir, "codestory-cli.cmd")
-        : join(binDir, "codestory-cli");
-      const env = {
-        ...process.env,
-        CODESTORY_CLI: fakeCli,
-        COPILOT_PLUGIN_DATA: "",
-        PLUGIN_DATA: dataDir,
-      };
-
-      const sessionResult = spawnSync(process.execPath, [hookPath], {
-        env,
-        input: JSON.stringify({
-          hook_event_name: "SessionStart",
-          source: "startup",
-          cwd: repoRoot,
-        }),
-        encoding: "utf8",
-      });
-
-      assert.equal(sessionResult.status, 0, sessionResult.stderr);
-      const sessionOutput = JSON.parse(sessionResult.stdout);
-      const sessionContext = sessionOutput.hookSpecificOutput.additionalContext;
-      assert.equal(sessionOutput.systemMessage, "CODESTORY:BACKGROUND");
-      assert.match(sessionContext, /^CODESTORY SESSION GROUNDING ACTIVE \(startup\)/u);
-      assert.match(sessionContext, /CODESTORY MCP RUNTIME DETECTION/u);
-      assert.match(sessionContext, /mcp_config_installed: yes/u);
-      assert.match(sessionContext, /mcp_process_launchable: yes/u);
-      assert.match(sessionContext, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
-      assert.match(sessionContext, /CODESTORY HOOK MCP BRIDGE/u);
-      assert.match(sessionContext, /hook-bridged context, not live MCP tools/u);
-      assert.doesNotMatch(sessionContext, /## Runtime Truth/u);
-
-      const promptResult = spawnSync(process.execPath, [hookPath], {
-        env,
-        input: JSON.stringify({
-          hook_event_name: "UserPromptSubmit",
-          prompt: "Where is RefreshMode defined?",
-          cwd: repoRoot,
-        }),
-        encoding: "utf8",
-      });
-
-      assert.equal(promptResult.status, 0, promptResult.stderr);
-      const promptOutput = JSON.parse(promptResult.stdout);
-      const promptContext = promptOutput.hookSpecificOutput.additionalContext;
-      assert.equal(promptOutput.hookSpecificOutput.hookEventName, "UserPromptSubmit");
-      assert.match(promptContext, /Prompt: Where is RefreshMode defined\?/u);
-      assert.match(promptContext, /CODESTORY HOOK MCP BRIDGE/u);
-      assert.match(promptContext, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
-      assert.doesNotMatch(promptContext, /attempted request packet/u);
+    const cliPath = await writeNodeCli(binDir, "require(\"fs\").writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(\" \"));");
+    const output = runCodexHook({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Where is RefreshMode defined?",
+      cwd: repoRoot,
+    }, {
+      CODESTORY_CLI: cliPath,
+      PLUGIN_DATA: dataDir,
+      TEST_MARKER: marker,
+      PATH: "",
     });
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
 
-test("hook degraded output is short when no MCP or managed runtime is usable", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-degraded-"));
-  const pathDir = await mkdtemp(join(tmpdir(), "codestory-hook-path-"));
-
-  try {
-    await writeNodeCli(pathDir, "console.log('FAKE_CODESTORY_CLI');");
-    await withTempHookInstall(async (installRoot) => {
-      const result = spawnSync(process.execPath, [join(installRoot, "hooks", "codestory-activate.cjs")], {
-        env: {
-          ...process.env,
-          COPILOT_PLUGIN_DATA: "",
-          PLUGIN_DATA: dataDir,
-          PATH: pathDir,
-          ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
-        },
-        input: JSON.stringify({
-          hook_event_name: "UserPromptSubmit",
-          prompt: "Find the hook failure.",
-          cwd: repoRoot,
-        }),
-        encoding: "utf8",
-      });
-
-      assert.equal(result.status, 0, result.stderr);
-      const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-      assert.match(context, /CodeStory degraded mode: no MCP or managed runtime surface is usable/u);
-      assert.match(context, /First failing layer: MCP: no codestory server configured/u);
-      assert.doesNotMatch(context, /CODESTORY BACKGROUND GROUNDING/u);
-      assert.doesNotMatch(context, /FAKE_CODESTORY_CLI/u);
-      assert.ok(context.length < 1600, context);
-    });
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(pathDir, { recursive: true, force: true });
-  }
-});
-
-test("hook failed preflight switches degraded guidance to bounded source reads", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-preflight-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-preflight-bin-"));
-
-  try {
-    const cliPath = await writeNodeCli(
-      binDir,
-      "process.stderr.write('first preflight failed\\n' + 'x'.repeat(8000));process.exit(2);",
-    );
-    await withTempHookInstall(async (installRoot) => {
-      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
-      const first = spawnSync(process.execPath, [hookPath], {
-        env: {
-          ...process.env,
-          CODESTORY_CLI: cliPath,
-          COPILOT_PLUGIN_DATA: "",
-          PLUGIN_DATA: dataDir,
-        },
-        input: JSON.stringify({
-          hook_event_name: "UserPromptSubmit",
-          prompt: "Find the hook failure.",
-          cwd: repoRoot,
-        }),
-        encoding: "utf8",
-      });
-
-      assert.equal(first.status, 0, first.stderr);
-      const firstContext = JSON.parse(first.stdout).hookSpecificOutput.additionalContext;
-      assert.match(firstContext, /Reason: first preflight failed/u);
-      assert.match(firstContext, /CodeStory is unavailable for this session/u);
-      assert.match(firstContext, /hook output truncated by hook budget/u);
-      assert.doesNotMatch(firstContext, /CODESTORY BACKGROUND GROUNDING/u);
-      assert.ok(firstContext.length < 5600, firstContext);
-
-      const second = spawnSync(process.execPath, [hookPath], {
-        env: {
-          ...process.env,
-          CODESTORY_CLI: "",
-          COPILOT_PLUGIN_DATA: "",
-          PLUGIN_DATA: dataDir,
-        },
-        input: JSON.stringify({
-          hook_event_name: "SessionStart",
-          source: "resume",
-          cwd: repoRoot,
-        }),
-        encoding: "utf8",
-      });
-
-      assert.equal(second.status, 0, second.stderr);
-      const secondContext = JSON.parse(second.stdout).hookSpecificOutput.additionalContext;
-      assert.match(secondContext, /CodeStory is unavailable for this session/u);
-      assert.match(secondContext, /bounded source reads/u);
-      assert.doesNotMatch(secondContext, /repair archaeology/u);
-    });
+    const context = output.hookSpecificOutput.additionalContext;
+    assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
+    assert.match(context, /CODESTORY REQUEST GROUNDING ACTIVE/u);
+    assert.match(context, /CodeStory MCP startup path/u);
+    assert.match(context, /codestory mcp ground status packet search/u);
+    assert.match(context, /Do not treat hook text as grounding evidence/u);
+    assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
+    assert.doesNotMatch(context, /managed_bootstrap/u);
+    assert.doesNotMatch(context, /packet ok/u);
+    await assert.rejects(readFile(marker, "utf8"), /ENOENT/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });
   }
 });
 
-test("hook dedupes repeated request prompts within plugin state", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-dedupe-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-dedupe-bin-"));
-
-  try {
-    const cliPath = await writeNodeCli(binDir, "console.log('packet ok');");
-    await withTempHookInstall(async (installRoot) => {
-      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
-      const env = {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        COPILOT_PLUGIN_DATA: "",
-        PLUGIN_DATA: dataDir,
-      };
-      const input = JSON.stringify({
-        hook_event_name: "UserPromptSubmit",
-        prompt: "Where is RefreshMode defined?",
-        cwd: repoRoot,
-      });
-      const first = spawnSync(process.execPath, [hookPath], {
-        env,
-        input,
-        encoding: "utf8",
-      });
-      const second = spawnSync(process.execPath, [hookPath], {
-        env,
-        input,
-        encoding: "utf8",
-      });
-
-      assert.equal(first.status, 0, first.stderr);
-      assert.equal(second.status, 0, second.stderr);
-      const firstContext = JSON.parse(first.stdout).hookSpecificOutput.additionalContext;
-      const secondOutput = JSON.parse(second.stdout);
-      assert.match(firstContext, /event_taxonomy: user_prompt/u);
-      assert.match(firstContext, /Packet skipped: sidecar-backed packet\/search readiness is not proven full/u);
-      assert.equal(Object.hasOwn(secondOutput, "hookSpecificOutput"), false);
-    });
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
-  }
-});
-
-test("hook invokes packet when agent packet search readiness is ready", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-packet-ready-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-packet-ready-bin-"));
-  const logFile = join(dataDir, "calls.jsonl");
-
-  try {
-    const cliPath = await writeNodeCli(
-      binDir,
-      [
-        "const fs = require('fs');",
-        "const args = process.argv.slice(2);",
-        "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
-        "if (args[0] === 'ready') {",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', index: { freshness: { status: 'fresh', changed_file_count: 0, new_file_count: 0, removed_file_count: 0 } } }] }));",
-        "  process.exit(0);",
-        "}",
-        "if (args[0] === 'packet') { console.log('packet ok'); process.exit(0); }",
-        "process.exit(2);",
-      ].join("\n"),
-    );
-    await withTempHookInstall(async (installRoot) => {
-      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
-      const result = spawnSync(process.execPath, [hookPath], {
-        env: {
-          ...process.env,
-          CODESTORY_CLI: cliPath,
-          COPILOT_PLUGIN_DATA: "",
-          PLUGIN_DATA: dataDir,
-          TEST_LOG: logFile,
-        },
-        input: JSON.stringify({
-          hook_event_name: "UserPromptSubmit",
-          prompt: "Where is RefreshMode defined?",
-          cwd: repoRoot,
-        }),
-        encoding: "utf8",
-      });
-
-      assert.equal(result.status, 0, result.stderr);
-      const context = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
-      assert.match(context, /packet ok/u);
-      const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-      assert.deepEqual(calls.map((args) => args[0]), ["ready", "packet"]);
-      assert.deepEqual(calls[0].slice(0, 4), ["ready", "--goal", "agent", "--project"]);
-      assert.deepEqual(calls[1].slice(0, 4), ["packet", "--project", repoRoot, "--question"]);
-    });
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
-  }
-});
-
-test("hook resets instruction dedupe on fresh startup session boundary", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-startup-dedupe-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-startup-dedupe-bin-"));
-
-  try {
-    const cliPath = await writeNodeCli(binDir, "console.log('ground ok');");
-    await withTempHookInstall(async (installRoot) => {
-      const hookPath = join(installRoot, "hooks", "codestory-activate.cjs");
-      const env = {
-        ...process.env,
-        CODESTORY_CLI: cliPath,
-        COPILOT_PLUGIN_DATA: "",
-        PLUGIN_DATA: dataDir,
-      };
-      const startupInput = JSON.stringify({
-        hook_event_name: "SessionStart",
-        source: "startup",
-        cwd: repoRoot,
-      });
-      const resumeInput = JSON.stringify({
-        hook_event_name: "SessionStart",
-        source: "resume",
-        cwd: repoRoot,
-      });
-      const clearInput = JSON.stringify({
-        hook_event_name: "SessionStart",
-        source: "clear",
-        cwd: repoRoot,
-      });
-      const firstStartup = spawnSync(process.execPath, [hookPath], {
-        env,
-        input: startupInput,
-        encoding: "utf8",
-      });
-      const resume = spawnSync(process.execPath, [hookPath], {
-        env,
-        input: resumeInput,
-        encoding: "utf8",
-      });
-      const clear = spawnSync(process.execPath, [hookPath], {
-        env,
-        input: clearInput,
-        encoding: "utf8",
-      });
-      const secondStartup = spawnSync(process.execPath, [hookPath], {
-        env,
-        input: startupInput,
-        encoding: "utf8",
-      });
-
-      assert.equal(firstStartup.status, 0, firstStartup.stderr);
-      assert.equal(resume.status, 0, resume.stderr);
-      assert.equal(clear.status, 0, clear.stderr);
-      assert.equal(secondStartup.status, 0, secondStartup.stderr);
-      const firstContext = JSON.parse(firstStartup.stdout).hookSpecificOutput.additionalContext;
-      const resumeContext = JSON.parse(resume.stdout).hookSpecificOutput.additionalContext;
-      const clearContext = JSON.parse(clear.stdout).hookSpecificOutput.additionalContext;
-      const secondContext = JSON.parse(secondStartup.stdout).hookSpecificOutput.additionalContext;
-      const fullInstructions = /CODESTORY BACKGROUND GROUNDING (?:ACTIVE|RULES)/u;
-      assert.match(firstContext, fullInstructions);
-      assert.doesNotMatch(resumeContext, fullInstructions);
-      assert.match(clearContext, fullInstructions);
-      assert.match(clearContext, /ground ok/u);
-      assert.match(secondContext, fullInstructions);
-      assert.match(secondContext, /ground ok/u);
-    });
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
-  }
-});
-
-test("hook prompt output dedupes repeated prompts", async () => {
+test("hook dedupes repeated request prompts without storing prompt text", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-prompt-dedupe-"));
-  const env = {
-    PLUGIN_DATA: dataDir,
-    PATH: "",
-  };
 
   try {
     const first = runCodexHook({
       hook_event_name: "UserPromptSubmit",
       prompt: "Where is RefreshMode defined?",
       cwd: repoRoot,
-    }, env);
+    }, { PLUGIN_DATA: dataDir, PATH: "" });
     const second = runCodexHook({
       hook_event_name: "UserPromptSubmit",
       prompt: "Where is RefreshMode defined?",
       cwd: repoRoot,
-    }, env);
+    }, { PLUGIN_DATA: dataDir, PATH: "" });
     const third = runCodexHook({
       hook_event_name: "UserPromptSubmit",
       prompt: "Where is strict_sidecar_status defined?",
       cwd: repoRoot,
-    }, env);
+    }, { PLUGIN_DATA: dataDir, PATH: "" });
 
-    assert.match(first.hookSpecificOutput.additionalContext, /event_taxonomy: user_prompt/u);
+    assert.match(first.hookSpecificOutput.additionalContext, /Where is RefreshMode defined?/u);
     assert.equal(Object.hasOwn(second, "hookSpecificOutput"), false);
-    assert.match(third.hookSpecificOutput.additionalContext, /Where is strict_sidecar_status defined\?/u);
+    assert.match(third.hookSpecificOutput.additionalContext, /Where is strict_sidecar_status defined?/u);
     const stateText = await readFile(join(dataDir, ".codestory-hook-output-state.json"), "utf8");
     const promptHash = createHash("sha256")
       .update("Where is RefreshMode defined?")
       .digest("hex")
       .slice(0, 16);
-    assert.match(stateText, new RegExp(`prompt:${promptHash}`, "u"));
+    assert.match(stateText, new RegExp(promptHash, "u"));
     assert.doesNotMatch(stateText, /Where is RefreshMode defined/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("hook resume and compact output use short runtime caps", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-short-events-"));
-  const env = {
-    PLUGIN_DATA: dataDir,
-    PATH: "",
-  };
-
-  try {
-    for (const source of ["resume", "compact"]) {
-      const output = runCodexHook({
-        hook_event_name: "SessionStart",
-        source,
-        cwd: repoRoot,
-      }, env);
-      const context = output.hookSpecificOutput.additionalContext;
-      assert.match(context, new RegExp(`event_taxonomy: ${source}`, "u"));
-      assert.match(context, /output_cap_chars: 2200/u);
-      assert.equal(context.length <= 2200, true, `${source} context length ${context.length}`);
-      assert.doesNotMatch(context, /CODESTORY BACKGROUND GROUNDING RULES/u);
-      assert.doesNotMatch(context, /attempted session ground/u);
-    }
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("hook goal heartbeat is quiet until readiness or freshness evidence changes", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-bin-"));
-  const cliPath = await writeNodeCli(
-    binDir,
-    [
-      "const status = process.env.TEST_AGENT_STATUS || 'repair_retrieval';",
-      "const freshness = process.env.TEST_FRESHNESS_STATUS || 'stale';",
-      "const changed = Number(process.env.TEST_CHANGED_FILES || 1);",
-      "const args = process.argv.slice(2);",
-      "if (args[0] === 'ready') {",
-      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status, index: { freshness: { status: freshness, changed_file_count: changed, new_file_count: 0, removed_file_count: 0 } } }] }));",
-      "  process.exit(0);",
-      "}",
-      "process.exit(2);",
-    ].join("\n"),
-  );
-  const env = {
-    PLUGIN_DATA: dataDir,
-    CODESTORY_CLI: cliPath,
-    CODESTORY_MCP_RESOURCES_EXPOSED: "1",
-    TEST_AGENT_STATUS: "repair_retrieval",
-    TEST_FRESHNESS_STATUS: "stale",
-    TEST_CHANGED_FILES: "1",
-    PATH: "",
-  };
-
-  try {
-    const first = runCodexHook({
-      hook_event_name: "GoalLoopHeartbeat",
-      cwd: repoRoot,
-    }, env);
-    assert.equal(Object.hasOwn(first, "hookSpecificOutput"), false);
-
-    env.TEST_AGENT_STATUS = "ready";
-    env.TEST_FRESHNESS_STATUS = "fresh";
-    env.TEST_CHANGED_FILES = "0";
-    const changed = runCodexHook({
-      hook_event_name: "GoalLoopHeartbeat",
-      cwd: repoRoot,
-    }, env);
-    assert.match(changed.hookSpecificOutput.additionalContext, /event_taxonomy: goal_heartbeat/u);
-    assert.match(changed.hookSpecificOutput.additionalContext, /agent_readiness_evidence: agent_packet_search=ready/u);
-    assert.match(changed.hookSpecificOutput.additionalContext, /freshness_evidence: fresh changed=0 new=0 removed=0/u);
-
-    const repeated = runCodexHook({
-      hook_event_name: "GoalLoopHeartbeat",
-      cwd: repoRoot,
-    }, env);
-    assert.equal(Object.hasOwn(repeated, "hookSpecificOutput"), false);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
-  }
-});
-
-test("hook goal heartbeat bridges model-hidden MCP without live tools", async () => {
+test("hook heartbeat stays quiet and does not bridge hidden MCP", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-hidden-mcp-"));
-  const version = await readPluginVersion();
-  const cliDir = join(dataDir, "codestory-cli", version);
-  const marker = join(dataDir, "managed-cli-called.txt");
-  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-heartbeat-bin-"));
+  const marker = join(dataDir, "cli-called.txt");
 
   try {
-    await mkdir(cliDir, { recursive: true });
-    await writeNodeCli(
-      cliDir,
-      [
-        "const fs = require('node:fs');",
-        "fs.writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(' '));",
-        "if (process.argv[2] === 'ready') {",
-        "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready' }] }));",
-        "  process.exit(0);",
-        "}",
-        "process.exit(0);",
-      ].join("\n"),
-    );
-    await writeFile(
-      join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
-      "utf8",
-    );
-    await writeFile(
-      join(dataDir, ".codestory-mcp-runtime.json"),
-      JSON.stringify({ source: "managed", path: cliPath }),
-      "utf8",
-    );
-
+    const cliPath = await writeNodeCli(binDir, "require(\"fs\").writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(\" \"));");
     const output = runCodexHook({
       hook_event_name: "GoalLoopHeartbeat",
       cwd: repoRoot,
     }, {
+      CODESTORY_CLI: cliPath,
       PLUGIN_DATA: dataDir,
-      CODESTORY_MCP_RESOURCES_EXPOSED: "",
-      PATH: "",
       TEST_MARKER: marker,
+      PATH: "",
     });
 
     assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
-    const markerText = await readFile(marker, "utf8");
-    assert.match(markerText, /ready --goal agent/u);
-    assert.doesNotMatch(markerText, /--repair/u);
+    await assert.rejects(readFile(marker, "utf8"), /ENOENT/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("hook MCP classifier distinguishes configured launchable and model-visible states", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-classify-"));
-  const version = await readPluginVersion();
-  const cliDir = join(dataDir, "codestory-cli", version);
-  const cliPath = join(cliDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
-
-  try {
-    const configured = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
-    assert.equal(configured.mcp_config_installed, true);
-    assert.equal(configured.mcp_process_launchable, true);
-    assert.equal(configured.mcp_resources_exposed, false);
-    assert.equal(configured.mcp_resource_status, "mcp_resources_not_model_visible");
-    assert.equal(configured.mcp_model_visible_blocked, true);
-    assert.equal(configured.managed_cli_present, false);
-
-    await mkdir(cliDir, { recursive: true });
-    await writeFakeCli(cliPath);
-    await writeFile(
-      join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
-      "utf8",
-    );
-    const managed = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
-    assert.equal(managed.managed_cli_present, true);
-    assert.equal(managed.managed_cli_path, cliPath);
-    assert.equal(managed.mcp_model_visible_blocked, true);
-    assert.equal(managed.degraded_no_surface, true);
-
-    await writeFile(
-      join(dataDir, ".codestory-mcp-runtime.json"),
-      JSON.stringify({ source: "managed", path: cliPath }),
-      "utf8",
-    );
-    const runtimeStateOnly = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
-    assert.equal(runtimeStateOnly.mcp_runtime_state_present, true);
-    assert.equal(runtimeStateOnly.mcp_resources_exposed, false);
-    assert.equal(runtimeStateOnly.mcp_resource_status, "mcp_resources_not_model_visible");
-    assert.equal(runtimeStateOnly.mcp_model_visible_blocked, true);
-    assert.equal(runtimeStateOnly.degraded_no_surface, true);
-
-    const previous = process.env.CODESTORY_MCP_RESOURCES_EXPOSED;
-    try {
-      process.env.CODESTORY_MCP_RESOURCES_EXPOSED = "1";
-      const exposed = classifyMcpRuntime({ pluginRoot, pluginDataDir: dataDir });
-      assert.equal(exposed.mcp_resources_exposed, true);
-      assert.equal(exposed.mcp_resource_status, "mcp_resources_exposed");
-      assert.equal(exposed.mcp_model_visible_blocked, false);
-      assert.equal(exposed.degraded_no_surface, false);
-    } finally {
-      if (previous === undefined) {
-        delete process.env.CODESTORY_MCP_RESOURCES_EXPOSED;
-      } else {
-        process.env.CODESTORY_MCP_RESOURCES_EXPOSED = previous;
-      }
-    }
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("hook MCP classifier distinguishes launch failure and no runtime", async () => {
-  const brokenRoot = await mkdtemp(join(tmpdir(), "codestory-broken-mcp-"));
-  const emptyRoot = await mkdtemp(join(tmpdir(), "codestory-no-mcp-"));
-
-  try {
-    await writeFile(
-      join(brokenRoot, ".mcp.json"),
-      JSON.stringify({ mcpServers: { codestory: { command: "node", args: ["./missing.cjs"] } } }),
-      "utf8",
-    );
-    const broken = classifyMcpRuntime({ pluginRoot: brokenRoot, pluginDataDir: null });
-    assert.equal(broken.mcp_config_installed, true);
-    assert.equal(broken.mcp_process_launchable, false);
-    assert.equal(broken.mcp_resource_status, "mcp_resources_unavailable");
-    assert.equal(broken.managed_cli_present, false);
-
-    const none = classifyMcpRuntime({ pluginRoot: emptyRoot, pluginDataDir: null });
-    assert.equal(none.mcp_config_installed, false);
-    assert.equal(none.mcp_process_launchable, false);
-    assert.equal(none.managed_cli_present, false);
-    assert.equal(none.degraded_no_surface, true);
-  } finally {
-    await rm(brokenRoot, { recursive: true, force: true });
-    await rm(emptyRoot, { recursive: true, force: true });
+    await rm(binDir, { recursive: true, force: true });
   }
 });
 
@@ -2497,120 +1970,35 @@ test("hook script executes under Codex home module scope", async () => {
       { recursive: true },
     );
 
-    await withFakeCodeStoryCli(async (binDir) => {
-      const fakeCli = process.platform === "win32"
-        ? join(binDir, "codestory-cli.cmd")
-        : join(binDir, "codestory-cli");
-      const result = spawnSync(
-        process.execPath,
-        [join(installRoot, "hooks", "codestory-activate.cjs")],
-        {
-          env: {
-            ...process.env,
-            CODESTORY_CLI: fakeCli,
-            COPILOT_PLUGIN_DATA: "",
-            PLUGIN_DATA: join(codexHome, "plugin-data"),
-          },
-          input: JSON.stringify({
-            hook_event_name: "UserPromptSubmit",
-            prompt: "Explain hook loading.",
-            cwd: repoRoot,
-          }),
-          encoding: "utf8",
+    const result = spawnSync(
+      process.execPath,
+      [join(installRoot, "hooks", "codestory-activate.cjs")],
+      {
+        env: {
+          ...process.env,
+          CODESTORY_CLI: join(codexHome, "missing-codestory-cli"),
+          COPILOT_PLUGIN_DATA: "",
+          PLUGIN_DATA: join(codexHome, "plugin-data"),
+          PATH: "",
         },
-      );
+        input: JSON.stringify({
+          hook_event_name: "UserPromptSubmit",
+          prompt: "Explain hook loading.",
+          cwd: repoRoot,
+        }),
+        encoding: "utf8",
+      },
+    );
 
-      assert.equal(result.status, 0, result.stderr);
-      assert.doesNotMatch(result.stderr, /require is not defined/u);
-      assert.match(
-        JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-        /CODESTORY REQUEST GROUNDING ACTIVE/u,
-      );
-    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /require is not defined/u);
+    assert.match(
+      JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
+      /CODESTORY REQUEST GROUNDING ACTIVE/u,
+    );
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }
-});
-
-test("hook output bridges model-invisible MCP through managed runtime", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const hookPath = join(pluginRoot, "hooks", "codestory-activate.cjs");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-resources-"));
-  const version = await readPluginVersion();
-  const cliDir = join(dataDir, "codestory-cli", version);
-  const logFile = join(dataDir, "calls.jsonl");
-  await mkdir(cliDir, { recursive: true });
-  const cliPath = await writeNodeCli(
-    cliDir,
-    [
-      "const fs = require('node:fs');",
-      "const args = process.argv.slice(2);",
-      "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
-      "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
-      "if (args[0] === 'packet') { console.log('packet ok from managed runtime'); process.exit(0); }",
-      "if (args[0] === 'retrieval' && args[1] === 'status') { console.log(JSON.stringify({ retrieval_mode: 'full', embedding_accelerator_request_provider: 'vulkan', embedding_accelerator_request_device: 'Vulkan0', embedding_device_state: 'accelerated', embedding_cpu_allowed: false })); process.exit(0); }",
-      "if (args[0] === 'ready') { process.exit(9); }",
-      "process.exit(2);",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(cliDir, "manifest.json"),
-    JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli" }),
-    "utf8",
-  );
-  await writeFile(
-    join(dataDir, ".codestory-mcp-runtime.json"),
-    JSON.stringify({ source: "managed", path: cliPath }),
-    "utf8",
-  );
-  const result = spawnSync(process.execPath, [hookPath], {
-    env: {
-      ...process.env,
-      CODESTORY_MCP_RESOURCES_EXPOSED: "",
-      COPILOT_PLUGIN_DATA: "",
-      PLUGIN_DATA: dataDir,
-      PATH: "",
-      TEST_CODESTORY_VERSION: version,
-      TEST_LOG: logFile,
-    },
-    input: JSON.stringify({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Explain indexing flow.",
-      cwd: repoRoot,
-    }),
-    encoding: "utf8",
-  });
-
-  assert.equal(result.status, 0, result.stderr);
-  const output = JSON.parse(result.stdout);
-  const context = output.hookSpecificOutput.additionalContext;
-  assert.match(context, /mcp_config_installed: yes/u);
-  assert.match(context, /mcp_resources_exposed: mcp_resources_not_model_visible/u);
-  assert.match(context, /mcp_model_visible_blocked: yes/u);
-  assert.match(context, /managed_cli_present: yes/u);
-  assert.match(context, /degraded_no_surface: yes/u);
-  assert.match(context, /CODESTORY HOOK MCP BRIDGE/u);
-  assert.match(context, /bridge_context_label: hook-bridged context, not live MCP tools/u);
-  assert.match(context, /bridge_resource_uri: codestory:\/\/status/u);
-  assert.match(context, /hook_bridge_status: ready/u);
-  assert.match(context, /hook_bridge_agent_packet_search_status: ready/u);
-  assert.match(context, /hook_bridge_sidecar_mode: full/u);
-  assert.match(context, /hook_bridge_embedding_request: vulkan:Vulkan0 state=accelerated cpu_allowed=false/u);
-  assert.match(context, /hook_bridge_allowed_surfaces: agent_packet_search/u);
-  assert.match(context, /packet ok from managed runtime/u);
-  assert.match(context, /deferred discovery\/tool_search/u);
-  assert.match(context, /first repository-work tool action/u);
-  assert.match(context, /codestory mcp ground status packet search/u);
-  assert.match(context, /mcp_tools_visible: no/u);
-  assert.doesNotMatch(context, /codestory-cli ENOENT/u);
-  assert.doesNotMatch(context, /agent_readiness_evidence: unavailable/u);
-  assert.doesNotMatch(context, /retrieval: symbolic/u);
-  assert.doesNotMatch(context, /ambient CodeStory CLI discovery/u);
-  const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-  assert.deepEqual(calls.map((args) => args[0]), ["packet", "retrieval"]);
-  assert.deepEqual(calls[1].slice(0, 4), ["retrieval", "status", "--project", repoRoot]);
-  assert.match(calls[1].join(" "), /--run-id shared-agent/u);
-  await rm(dataDir, { recursive: true, force: true });
 });
 
 test("portable agent adapters are present", async () => {

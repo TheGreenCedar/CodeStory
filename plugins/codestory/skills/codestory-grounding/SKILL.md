@@ -16,9 +16,11 @@ checkout is only tool source unless the user is editing CodeStory itself.
 Use CodeStory before making source claims, planning edits, choosing tests, or
 reviewing changes in a repository. Do not wait for the user to mention it by name.
 
-Lifecycle hooks keep CodeStory ambient in hosts that support them. Hook output is
-a starting packet, not final proof. Before opening source files, read
-`codestory://status` when MCP is live.
+Before opening source files, read `codestory://status` when MCP is live. In
+Codex hosts where the server-specific `mcp__codestory__*` tool namespace is not
+initially visible, use host deferred discovery/tool_search with
+`codestory mcp ground status packet search`, then use the loaded CodeStory MCP
+tools. Treat this as MCP activation, not source fallback.
 
 If `status`, `ready`, or `ground` reports no repo, no supported files, or zero
 indexed files, stop the CodeStory path. Do not paste empty ground output as
@@ -30,16 +32,15 @@ path when ambiguous.
 When the plugin MCP server is available:
 
 1. Resolve `<target-workspace>` explicitly.
-2. Read `codestory://status` — field meanings in [status-contract](references/status-contract.md).
+2. Read `codestory://status` — field meanings in [status-contract](references/status-contract.md). If `mcp__codestory__*` tools are not initially visible and tool_search is available, query `codestory mcp ground status packet search`, then use the loaded CodeStory MCP tools.
 3. Obey `allowed_surfaces` and `retrieval_mode`.
 4. Call the allowed surface that fits the task; preserve cited anchors in answers.
 5. Read `codestory://agent-guide` when you need the runtime's recommended next calls.
 
 If the skill is visible but no `mcp__codestory` tools or `codestory://status`
-resource are exposed, first request CodeStory MCP through host deferred
-discovery/tool_search when that host surface exists. If it remains hidden, call
-it a plugin MCP visibility failure. Do not use CLI as CodeStory grounding; use
-ordinary source inspection and report that live MCP tools were not visible.
+resource are exposed, call it a plugin MCP visibility failure. Do not use CLI as
+CodeStory grounding; use ordinary source inspection and report that live MCP
+surfaces were not visible.
 
 ## Task Router
 
@@ -66,10 +67,18 @@ ordinary source inspection and report that live MCP tools were not visible.
 Supported agent repair is MCP-only:
 
 1. Read `codestory://status`.
-2. If `recommended_next_calls` says so, call MCP `repair_all` for
+2. If `status_resource_auto_repair.result.status` is `started` or
+   `already_running`, wait briefly and reread `codestory://status`.
+3. If `recommended_next_calls` says so and the `mcp__codestory__repair_all`
+   tool is visible, call MCP `repair_all` for
    `<target-workspace>`.
-3. Reread `codestory://status`.
-4. Use only the surfaces allowed by the refreshed status.
+4. Reread `codestory://status`.
+5. Use only the surfaces allowed by the refreshed status.
+
+If Codex exposes CodeStory resources but hides server-specific tools, keep using
+the read-only resource path. If status did not start auto-repair and tool
+actions such as `repair_all` are hidden, report the host tool-visibility
+blocker. Do not synthesize repair context or run CLI repair in the agent path.
 
 CLI commands such as `fix`, `doctor`, `ready`, and `retrieval status` are
 maintainer/debug transcript tools. They do not prove plugin MCP is live in the

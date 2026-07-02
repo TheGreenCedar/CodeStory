@@ -1,4 +1,12 @@
 interface:
   display_name: "CodeStory Grounding"
-  short_description: "Ground local repos through CodeStory's plugin MCP before planning, editing, or reviewing."
-  default_prompt: "Use $codestory-grounding: Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]? Or: I am editing a file in this repo — what symbols are affected and what tests should I run first? For first session or after repair: read codestory://status, call repair_all if status recommends it, reread status, and use packet/search only when sidecars report retrieval_mode=full."
+  short_description: "Ground local repositories through CodeStory MCP before source claims, edits, reviews, or test planning."
+  default_prompt: "Read codestory://status first; if status recommends repair_all and tools are visible, call it, reread status, then answer from allowed evidence."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "codestory"
+      description: "CodeStory plugin MCP server for local repository grounding, status, graph navigation, packets, and search."
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

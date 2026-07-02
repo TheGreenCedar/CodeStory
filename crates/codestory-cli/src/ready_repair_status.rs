@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const READY_REPAIR_STATUS_FILE: &str = "ready-repair-status.json";
@@ -285,6 +287,9 @@ fn ready_repair_status_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
 fn ready_repair_lock_file_is_stale(path: &Path) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_ready_repair_lock_file(path) {
+        if !ready_repair_pid_is_running(lock.pid) {
+            return true;
+        }
         return now.saturating_sub(lock.started_at_epoch_ms)
             > READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64;
     }
@@ -316,6 +321,9 @@ fn read_ready_repair_status(
     if age_ms > READY_REPAIR_STATUS_TTL.as_millis() as i64 {
         return None;
     }
+    if !ready_repair_pid_is_running(status.pid) {
+        return None;
+    }
     Some(status)
 }
 
@@ -333,12 +341,59 @@ fn read_abandoned_ready_repair_status(
         return None;
     }
     let age_ms = now_epoch_ms.saturating_sub(status.updated_at_epoch_ms);
+    if !ready_repair_pid_is_running(status.pid) {
+        return Some(status);
+    }
     if age_ms <= READY_REPAIR_STATUS_TTL.as_millis() as i64
         || age_ms > READY_REPAIR_ABANDONED_STATUS_TTL.as_millis() as i64
     {
         return None;
     }
     Some(status)
+}
+
+fn ready_repair_pid_is_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        let output = Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output();
+        let Ok(output) = output else {
+            return true;
+        };
+        let pid_text = pid.to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.lines().any(|line| {
+            let mut fields = line.split(',').map(|field| field.trim().trim_matches('"'));
+            let _image = fields.next();
+            fields.next() == Some(pid_text.as_str())
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        true
+    }
 }
 
 fn read_ready_repair_lock_file(path: &Path) -> Option<ReadyRepairLockFile> {
@@ -465,7 +520,7 @@ mod tests {
         let state = tempfile::tempdir().expect("state");
         let sidecar = test_sidecar(state.path());
         let started_at = now_epoch_ms();
-        let pid = 4242;
+        let pid = std::process::id();
 
         write_ready_repair_status(&sidecar, project.path(), "Qdrant finalize", started_at, pid)
             .expect("write repair status");
@@ -599,5 +654,71 @@ mod tests {
             None,
             "stale repair state must not mask final readiness"
         );
+    }
+
+    #[test]
+    fn dead_pid_repair_status_is_abandoned_immediately() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_status_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("repair status parent")).expect("state dir");
+        let now = now_epoch_ms();
+        let dead_pid = u32::MAX;
+        let status = ReadyRepairStatus {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            status: "repairing".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("test-proof".to_string()),
+            namespace: "codestory-agent-test-proof".to_string(),
+            compose_project: "codestory-agent-test-proof".to_string(),
+            phase: "graph artifact".to_string(),
+            pid: dead_pid,
+            started_at_epoch_ms: now,
+            updated_at_epoch_ms: now,
+        };
+        fs::write(&path, serde_json::to_string(&status).expect("status json"))
+            .expect("write dead-pid status");
+
+        assert_eq!(
+            read_ready_repair_status(&path, project.path(), now),
+            None,
+            "dead repair pid must not block a fresh MCP repair"
+        );
+        assert_eq!(
+            read_abandoned_ready_repair_status(&path, project.path(), now),
+            Some(status),
+            "dead repair pid should still be reported as abandoned evidence"
+        );
+    }
+
+    #[test]
+    fn dead_pid_repair_lock_is_reclaimable_immediately() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_lock_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("repair lock parent")).expect("state dir");
+        let now = now_epoch_ms();
+        let lock = ReadyRepairLockFile {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("test-proof".to_string()),
+            namespace: "codestory-agent-test-proof".to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms: now,
+            token: format!("{}:{now}", u32::MAX),
+        };
+        fs::write(&path, serde_json::to_string(&lock).expect("lock json"))
+            .expect("write dead-pid lock");
+
+        match try_acquire_ready_repair_lock(&sidecar, project.path()).expect("lock attempt") {
+            ReadyRepairLockAttempt::Acquired(_) => {}
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!("dead-pid repair lock should be reclaimed, got busy at {busy:?}")
+            }
+        }
     }
 }
