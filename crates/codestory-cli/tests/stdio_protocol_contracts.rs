@@ -2696,6 +2696,49 @@ fn resources_read_status_starts_sidecar_repair_when_policy_enabled() {
 }
 
 #[test]
+fn resources_read_status_starts_sidecar_repair_after_abandoned_repair_when_policy_enabled() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    let (status_path, _cleanup) = write_abandoned_repair_status_fixture(
+        &fixture,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        "graph artifact",
+    );
+    assert!(status_path.exists(), "repair status fixture should exist");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-sidecar-enabled-abandoned",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-sidecar-enabled-abandoned"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["sidecar_setup"]["state"], json!("enabled"));
+    assert_eq!(
+        status["sidecar_setup"]["abandoned_repair"]["status"],
+        json!("abandoned"),
+        "{status}"
+    );
+    assert!(
+        status["status_resource_auto_repair"]["result"]["status"] == json!("started")
+            || status["status_resource_auto_repair"]["result"]["status"]
+                == json!("already_running"),
+        "enabled policy should retry MCP-owned auto repair past abandoned records: {status}"
+    );
+    assert_eq!(
+        status["status_resource_auto_repair"]["result"]["previous_abandoned_repair"]["status"],
+        json!("abandoned"),
+        "{status}"
+    );
+}
+
+#[test]
 fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("disabled".to_string());
