@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 0.13.6
+
+CodeStory 0.13.6 fixes fresh Codex plugin MCP startup without the removed hook
+bridge, and hardens explicit sidecar repair so first-use threads can recover
+through the live MCP server.
+
+### Fixed
+
+- Removed the Codex hook bridge from the shipped plugin path. Codex hooks now
+  only record active project state and route agents back to live CodeStory MCP
+  resources; status reads can start Rust-owned sidecar repair without
+  hook-injected substitute grounding.
+- Kept the plugin MCP launcher alive in diagnostic fail-open mode when the
+  delegated `codestory-cli serve --stdio` runtime exits nonzero, so Codex gets a
+  `codestory://status` diagnostic instead of a closed transport.
+- Let the MCP launcher accept a fresh hook-written global active project even
+  when Codex gives the MCP process a stale thread id, fixing fresh app-server
+  threads that ran CodeStory hooks but still reported `project_root_unavailable`.
+- Let sidecar-backed search return resolved full-mode hits when a later
+  expansion stage reaches its deadline, matching the packet path instead of
+  rejecting otherwise usable MCP search results.
+- Let explicit MCP repair retry after an abandoned sidecar setup record and
+  return the foreground repair result instead of leaving the agent with only a
+  detached setup worker to poll.
+- Treat dead ready-repair owner processes as abandoned immediately so fresh MCP
+  repairs do not wait behind stale sidecar setup locks.
+- Let `codestory://status` start MCP-owned sidecar repair when plugin setup is
+  enabled and agent packet/search readiness is blocked, then recommend status
+  rereads instead of hidden tool calls.
+
 ## 0.13.5
 
 CodeStory 0.13.5 makes first-turn Codex hook bridge proof explicit enough for

@@ -151,11 +151,11 @@ function activeProjectStateMatchesHost(active) {
   return activeThread === currentThread;
 }
 
-function activeProjectStateFresh(active, statePath, nowMs = Date.now()) {
+function activeProjectStateFresh(active, statePath, nowMs = Date.now(), options = {}) {
   const timestamp = activeProjectStateTimestamp(active, statePath);
   return timestamp !== null
     && nowMs - timestamp <= activeProjectStateMaxAgeMs()
-    && activeProjectStateMatchesHost(active);
+    && (!options.requireThreadMatch || activeProjectStateMatchesHost(active));
 }
 
 function resolveProjectRoot(options = {}) {
@@ -172,7 +172,7 @@ function resolveProjectRoot(options = {}) {
   const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
   const threadStatePath = activeThreadStatePath(currentThread);
   const threadActive = threadStatePath ? readJson(threadStatePath) : null;
-  if (threadActive && !activeProjectStateFresh(threadActive, threadStatePath)) {
+  if (threadActive && !activeProjectStateFresh(threadActive, threadStatePath, Date.now(), { requireThreadMatch: true })) {
     return {
       projectRoot: null,
       source: 'plugin_active_thread_state_stale',
@@ -1028,10 +1028,10 @@ function projectRootUnavailableDiagnostic(resolved, probe, projectResolution) {
     status: 'repair_setup',
     summary: 'CodeStory plugin MCP could not determine the target project root before starting stdio.',
     minimumNext: [
-      'Restart/reload the Codex host from the target repo after a lifecycle hook records the active project, then read codestory://status.',
+      'Start or reload the Codex host from the target repo, then read codestory://status.',
     ],
     fullRepair: [
-      'Start or resume the Codex session in the target repo so CodeStory lifecycle hooks can write active project state.',
+      'Start or resume the Codex session in the target repo so CodeStory can infer the active project root.',
       'Restart/reload the Codex host from the target repo, then read codestory://status.',
     ],
   });
@@ -1450,7 +1450,24 @@ async function main() {
 
   child.on('exit', (code, signal) => {
     if (signal) process.kill(process.pid, signal);
-    process.exit(code || 0);
+    if (!code) {
+      process.exit(0);
+      return;
+    }
+    runFailOpenMcp(fallbackDiagnostic(resolved, {
+      ...probe,
+      status: code,
+      error: `codestory-cli serve --stdio exited with status ${code}`,
+      stderr: probe.stderr || '',
+    }, 'runtime_stdio_child_exit', {
+      projectRoot,
+      projectRootSource: projectResolution.source,
+      summary: 'CodeStory plugin MCP launched codestory-cli, but the stdio runtime exited before it could serve requests.',
+      minimumNext: [
+        'Read codestory://status for the active runtime diagnostic.',
+        'Restart/reload the Codex host/app after updating or repairing the CodeStory plugin runtime.',
+      ],
+    }));
   });
 
   child.on('error', (error) => {

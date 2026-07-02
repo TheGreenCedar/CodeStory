@@ -786,7 +786,7 @@ fn write_repair_status_fixture(
             "namespace": sidecar.namespace,
             "compose_project": sidecar.compose_project,
             "phase": phase,
-            "pid": 4242,
+            "pid": std::process::id(),
             "started_at_epoch_ms": updated_at_epoch_ms,
             "updated_at_epoch_ms": updated_at_epoch_ms
         })
@@ -2592,25 +2592,10 @@ fn resources_read_status_reports_abandoned_agent_repair_actions() {
         "abandoned repair should include an explicit cleanup command: {status}"
     );
 
-    let repair_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "sidecar-setup-repair-abandoned",
-            "method": "tools/call",
-            "params": {
-                "name": "sidecar_setup",
-                "arguments": {"action": "repair"}
-            }
-        }),
-    );
-    let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair-abandoned"));
-    assert_eq!(repair["status"], json!("abandoned_repair"), "{repair}");
-    assert_eq!(
-        repair["abandoned_repair"]["cleanup_command"],
-        status["sidecar_setup"]["abandoned_repair"]["cleanup_command"],
-        "{repair}"
-    );
+    // The explicit MCP repair action retries past abandoned records. Do not call
+    // it from this contract test: it intentionally launches a real repair
+    // worker, which belongs in the live MCP proof lane rather than the cheap
+    // status-shape suite.
 }
 
 #[test]
@@ -2656,7 +2641,7 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
 }
 
 #[test]
-fn resources_read_status_recommends_sidecar_repair_when_policy_enabled() {
+fn resources_read_status_starts_sidecar_repair_when_policy_enabled() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("enabled".to_string());
     let mut server = spawn_stdio_server(&fixture);
@@ -2685,14 +2670,24 @@ fn resources_read_status_recommends_sidecar_repair_when_policy_enabled() {
     );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
-        next_call_text.contains("\"tool\":\"repair_all\"")
-            && next_call_text.contains("\"debug_commands\"")
-            && next_call_text.contains("\"uri\":\"codestory://status\""),
-        "enabled policy should route agent repair through one MCP repair tool plus status readback: {status}"
+        status["status_resource_auto_repair"]["result"]["status"] == json!("started")
+            || status["status_resource_auto_repair"]["result"]["status"]
+                == json!("already_running"),
+        "enabled policy should start MCP-owned auto repair from the status resource: {status}"
     );
     assert!(
-        next_call_text.contains("--run-id") && next_call_text.contains("shared-agent"),
-        "enabled policy should point at the shared agent run id: {status}"
+        status["status_resource_auto_repair"]["result"]["next_status_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--run-id")
+                && command.contains("shared-agent")
+                && command.contains("retrieval status")),
+        "status-started repair should point at shared-agent status readback: {status}"
+    );
+    assert!(
+        next_call_text.contains("\"uri\":\"codestory://status\"")
+            && next_call_text.contains("\"uri\":\"codestory://agent-guide\"")
+            && !next_call_text.contains("\"tool\":\"repair_all\""),
+        "enabled policy should recommend rereading status after status-started repair: {status}"
     );
     assert!(
         !next_call_text.contains("\"method\":\"cli\""),
@@ -2800,11 +2795,18 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         json!("enabled"),
         "{status}"
     );
+    let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
-        status["recommended_next_calls"]
-            .to_string()
-            .contains("\"tool\":\"repair_all\""),
-        "status should keep recovery on the single MCP repair tool after sidecar_setup enable: {status}"
+        status["status_resource_auto_repair"]["result"]["status"] == json!("started")
+            || status["status_resource_auto_repair"]["result"]["status"]
+                == json!("already_running"),
+        "status should start Rust-owned repair after sidecar_setup enable: {status}"
+    );
+    assert!(
+        next_call_text.contains("\"uri\":\"codestory://status\"")
+            && next_call_text.contains("\"uri\":\"codestory://agent-guide\"")
+            && !next_call_text.contains("\"tool\":\"repair_all\""),
+        "status should recommend status reread after status-started repair: {status}"
     );
 }
 

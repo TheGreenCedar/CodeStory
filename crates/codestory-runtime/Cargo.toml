@@ -1,6 +1,6 @@
 [package]
 name = "codestory-runtime"
-version = "0.13.5"
+version = "0.13.6"
 edition = "2024"
 
 [dependencies]

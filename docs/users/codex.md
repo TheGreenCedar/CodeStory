@@ -1,18 +1,19 @@
 # Codex
 
-Use CodeStory in Codex with the full plugin path: MCP auto-start, lifecycle
-hooks, the grounding skill, and managed CLI bootstrap.
+Use CodeStory in Codex with the plugin MCP path: MCP auto-start, lightweight
+repo-state hooks, the grounding skill, and managed CLI bootstrap. Hooks route
+the agent back to live MCP; they do not inject substitute grounding context.
 
 ## What you get
 
 | You | Agent |
 | --- | --- |
 | Install the plugin once from `/plugins` | MCP starts via `scripts/codestory-mcp.cjs` |
-| Open your repo and start a fresh thread | Hooks ground on session start; request-aware packets on prompts |
+| Open your repo and start a fresh thread | Records the repo target, then reads live CodeStory MCP resources before source reads |
 | Ask repo questions with concrete terms | Reads `codestory://status`, uses allowed surfaces, cites sources |
 
-Codex is the reference host: MCP, hooks, skill, and managed CLI bootstrap all
-ship together. See [capability matrix](README.md#capability-matrix).
+Codex is the reference host for the managed MCP plugin path. See
+[capability matrix](README.md#capability-matrix).
 
 Surfaces and readiness: [Glossary](../glossary.md).
 
@@ -61,9 +62,9 @@ Run these three checks before your first real task:
 
 1. **Adapter present** — Open `/plugins` and confirm **TheGreenCedar -> codestory**
    is listed as installed.
-2. **MCP and hooks live** — Start a **new** Codex thread in the grounded repo.
-   CodeStory MCP should start automatically and session hooks should run without
-   blocking the host.
+2. **MCP live** — Start a **new** Codex thread in the grounded repo. CodeStory
+   MCP should be registered by the plugin and start when Codex reads its status
+   or tools.
 3. **First status read succeeds** — Use a normal repository question or the
    readiness probe in [First session](#first-session). The agent should answer
    in plain English whether your repo map is ready and whether broad search is
@@ -134,11 +135,12 @@ More pairs, anti-patterns, and language-flavored examples:
 
 | Symptom | What to try |
 | --- | --- |
-| Hook says `mcp_resources_not_model_visible` | Let the agent request CodeStory MCP through host deferred discovery/tool_search when available; reload only after plugin install or config changes |
+| No `codestory://status` resource is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
+| `codestory://status` is visible but `mcp__codestory` tools are hidden | Use the live resource path. If `status_resource_auto_repair` starts, reread status until repair finishes; otherwise report that tool actions are blocked by host visibility |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
 | Terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex plugin add codestory@TheGreenCedar` |
-| Packet/search blocked | Agent can call `sidecar_setup`; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
-| Hooks time out | Hooks fail open; ask the explicit status prompt above |
+| Packet/search blocked | Reread `codestory://status` after any `status_resource_auto_repair`; if tools are visible, follow `recommended_next_calls`; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
+| Status/grounding read times out | Restart stale CodeStory MCP processes, then read `codestory://status` in a fresh thread |
 
 Shared repair lanes: [Troubleshooting](troubleshooting.md).
 
@@ -150,8 +152,9 @@ node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> -
 
 ## Limitations
 
-None relative to other hosts -- Codex ships the full adapter set. Other hosts
-may lack auto MCP start, full hooks, or managed CLI bootstrap; compare
+None relative to other hosts -- Codex ships the managed MCP adapter and
+repo-state hook path. Other hosts may lack auto MCP start, hooks, or managed CLI
+bootstrap; compare
 [capability matrix](README.md#capability-matrix).
 
 Plugin package details: [Plugin README](../../plugins/codestory/README.md).
