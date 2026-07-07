@@ -1433,6 +1433,7 @@ async function main() {
       CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
       CODESTORY_PLUGIN_PROJECT_ROOT: projectRoot,
       CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE: projectResolution.source,
+      CODESTORY_PLUGIN_ACTIVE_STATE_PATH: projectResolution.statePath || activeStatePath() || '',
       CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
       CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
       CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
