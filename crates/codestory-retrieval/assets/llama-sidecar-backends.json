@@ -25,6 +25,62 @@
       ],
       "device_arg_policy": "none_by_default",
       "log_markers": ["metal", "offloaded"]
+    },
+    {
+      "id": "windows-x86_64-vulkan",
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "vulkan",
+      "artifact": "llama-b9902-bin-win-vulkan-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-win-vulkan-x64.zip",
+      "sha256": "66d6c78a45663cf3818caf962371f5d557a74ab8cc47b419d6be4b005b8a9d17",
+      "executable_archive_path": "llama-server.exe",
+      "executable_rel_path": "llama-server.exe",
+      "executable_sha256": "d772b1d999f9c7aaacebd2b08c8ba705f5e6b7891388c417b711b439d3185bc5",
+      "managed_cache_rel_dir": "managed-embeddings/llama/b9902/llama-b9902-bin-win-vulkan-x64",
+      "launch_args": [
+        "--embedding",
+        "--model",
+        "{model}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "{port}",
+        "--n-gpu-layers",
+        "{n_gpu_layers}",
+        "--device",
+        "{device}"
+      ],
+      "device_arg_policy": "request_device",
+      "log_markers": ["vulkan", "offloaded"]
+    },
+    {
+      "id": "windows-x86_64-vulkan-b9058-legacy",
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "vulkan",
+      "artifact": "llama-b9058-bin-win-vulkan-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-win-vulkan-x64.zip",
+      "sha256": "d0a52a50c021d80d49acfbdae38faafed2dd1e4923790bafb5e701f13548d893",
+      "executable_archive_path": "llama-server.exe",
+      "executable_rel_path": "llama-server.exe",
+      "executable_sha256": "cbae9326269e66c2acb67daf1e6e7ba31779badcde6e8b1312418909089a261f",
+      "managed_cache_rel_dir": "managed-embeddings/llama/b9058/llama-b9058-bin-win-vulkan-x64",
+      "launch_args": [
+        "--embedding",
+        "--model",
+        "{model}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "{port}",
+        "--n-gpu-layers",
+        "{n_gpu_layers}",
+        "--device",
+        "{device}"
+      ],
+      "device_arg_policy": "request_device",
+      "log_markers": ["vulkan", "offloaded"]
     }
   ]
 }

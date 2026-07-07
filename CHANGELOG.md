@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.13.9
+
+CodeStory 0.13.9 moves Windows native llama.cpp sidecar selection onto the same
+manifest-backed backend contract used by Apple Silicon.
+
+### Changed
+
+- Moved Windows x64 Vulkan native llama.cpp sidecar selection onto the
+  manifest-backed backend resolver while preserving the existing b9058 managed
+  cache path as a legacy fallback.
+
 ## 0.13.8
 
 CodeStory 0.13.8 fixes Apple Silicon sidecar acceleration by launching a native

@@ -527,7 +527,7 @@ fn native_embedding_server_launch(
     repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<NativeEmbeddingServerLaunch> {
-    ensure_selected_managed_native_llama_server()?;
+    ensure_selected_managed_native_llama_server(repo_root)?;
     let executable = native_llama_server_path(repo_root)?;
     let model_path =
         embed_model_dir(repo_root, &runtime.layout)?.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
@@ -548,11 +548,11 @@ fn native_embedding_server_launch_from_paths(
     runtime: &SidecarRuntimeConfig,
 ) -> NativeEmbeddingServerLaunch {
     let mut args = native_embedding_launch_args(&model_path, runtime);
-    if let Some(request) = crate::embeddings::embedding_accelerator_request() {
-        if selected_native_llama_backend().is_none() {
-            args.push("--n-gpu-layers".to_string());
-            args.push(request.n_gpu_layers);
-        }
+    if let Some(request) = crate::embeddings::embedding_accelerator_request()
+        && selected_native_llama_backend().is_none()
+    {
+        args.push("--n-gpu-layers".to_string());
+        args.push(request.n_gpu_layers.clone());
         if let Some(device) = request.device {
             args.push("--device".to_string());
             args.push(device);
@@ -568,18 +568,34 @@ fn native_embedding_server_launch_from_paths(
 
 fn native_embedding_launch_args(model_path: &Path, runtime: &SidecarRuntimeConfig) -> Vec<String> {
     if let Some(backend) = selected_native_llama_backend() {
-        let n_gpu_layers = crate::embeddings::embedding_accelerator_request()
-            .map(|request| request.n_gpu_layers)
-            .unwrap_or_else(|| "0".to_string());
-        return backend
-            .launch_args
-            .into_iter()
-            .map(|arg| {
-                arg.replace("{model}", &model_path.display().to_string())
-                    .replace("{port}", &runtime.embed_http_port.to_string())
-                    .replace("{n_gpu_layers}", &n_gpu_layers)
-            })
-            .collect();
+        let request = crate::embeddings::embedding_accelerator_request();
+        let n_gpu_layers = request
+            .as_ref()
+            .map(|request| request.n_gpu_layers.as_str())
+            .unwrap_or("0");
+        let device = request
+            .as_ref()
+            .and_then(|request| request.device.as_deref());
+        let model = model_path.display().to_string();
+        let port = runtime.embed_http_port.to_string();
+        let mut args = Vec::new();
+        let mut iter = backend.launch_args.into_iter().peekable();
+        while let Some(arg) = iter.next() {
+            if arg == "--device"
+                && iter.peek().is_some_and(|next| next == "{device}")
+                && device.is_none()
+            {
+                iter.next();
+                continue;
+            }
+            args.push(
+                arg.replace("{model}", &model)
+                    .replace("{port}", &port)
+                    .replace("{n_gpu_layers}", n_gpu_layers)
+                    .replace("{device}", device.unwrap_or_default()),
+            );
+        }
+        return args;
     }
     vec![
         "--embedding".to_string(),
@@ -619,14 +635,16 @@ fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> Stri
         return "env:CODESTORY_EMBED_NATIVE_LLAMA_SERVER".to_string();
     }
     if let Some(backend) = selected_native_llama_backend() {
-        let rel_path = native_llama_backend_rel_path(&backend);
-        if path == user_cache_root().join(&rel_path) {
-            return "managed_cache".to_string();
-        }
-        if let Some(root) = repo_root
-            && path == root.join(&rel_path)
-        {
-            return "repo_managed_cache".to_string();
+        for backend in matching_native_llama_backends(&backend.provider) {
+            let rel_path = native_llama_backend_rel_path(&backend);
+            if path == user_cache_root().join(&rel_path) {
+                return "managed_cache".to_string();
+            }
+            if let Some(root) = repo_root
+                && path == root.join(&rel_path)
+            {
+                return "repo_managed_cache".to_string();
+            }
         }
     }
     if path == user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
@@ -702,16 +720,19 @@ fn native_llama_server_path_from_candidates(
 
 fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<NativeLlamaCandidate> {
     if let Some(backend) = selected_native_llama_backend() {
-        let rel_path = native_llama_backend_rel_path(&backend);
-        let mut candidates = vec![NativeLlamaCandidate {
-            path: user_cache_root().join(&rel_path),
-            backend: Some(backend.clone()),
-        }];
-        if let Some(root) = repo_root {
+        let mut candidates = Vec::new();
+        for backend in matching_native_llama_backends(&backend.provider) {
+            let rel_path = native_llama_backend_rel_path(&backend);
             candidates.push(NativeLlamaCandidate {
-                path: root.join(rel_path),
-                backend: Some(backend),
+                path: user_cache_root().join(&rel_path),
+                backend: Some(backend.clone()),
             });
+            if let Some(root) = repo_root {
+                candidates.push(NativeLlamaCandidate {
+                    path: root.join(rel_path),
+                    backend: Some(backend),
+                });
+            }
         }
         return candidates;
     }
@@ -737,15 +758,24 @@ fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend>
         .and_then(|request| crate::config::selected_llama_sidecar_backend(&request.provider))
 }
 
+fn matching_native_llama_backends(provider: &str) -> Vec<crate::config::LlamaSidecarBackend> {
+    crate::config::llama_sidecar_backends(provider)
+}
+
 fn native_llama_backend_rel_path(backend: &crate::config::LlamaSidecarBackend) -> PathBuf {
     Path::new(&backend.managed_cache_rel_dir).join(&backend.executable_rel_path)
 }
 
-fn ensure_selected_managed_native_llama_server() -> Result<()> {
+fn ensure_selected_managed_native_llama_server(repo_root: Option<&Path>) -> Result<()> {
     if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
         return Ok(());
     }
     if let Some(backend) = selected_native_llama_backend() {
+        if native_llama_server_path_from_candidates(native_llama_server_candidates(repo_root))
+            .is_ok()
+        {
+            return Ok(());
+        }
         ensure_managed_native_llama_server(&backend)?;
     }
     Ok(())
@@ -1436,6 +1466,96 @@ mod tests {
                 .to_string()
                 .contains("ambient PATH lookup is not allowed")
         );
+    }
+
+    #[test]
+    fn windows_manifest_candidates_prefer_b9902_and_keep_legacy_b9058() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let candidates = native_llama_server_candidates(None);
+        let ids = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .backend
+                    .as_ref()
+                    .map(|backend| backend.id.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec![
+                "windows-x86_64-vulkan",
+                "windows-x86_64-vulkan-b9058-legacy"
+            ]
+        );
+        assert!(
+            candidates[0]
+                .path
+                .display()
+                .to_string()
+                .contains("llama-b9902-bin-win-vulkan-x64")
+        );
+        assert!(
+            candidates[1]
+                .path
+                .display()
+                .to_string()
+                .contains("llama-b9058-bin-win-vulkan-x64")
+        );
+    }
+
+    #[test]
+    fn legacy_windows_vulkan_cache_requires_matching_install_manifest() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
+        let legacy = crate::config::llama_sidecar_backends("vulkan")
+            .into_iter()
+            .find(|backend| backend.id == "windows-x86_64-vulkan-b9058-legacy")
+            .expect("legacy windows vulkan backend");
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        std::fs::write(&exe, b"legacy exe").expect("exe");
+
+        let missing_manifest =
+            native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+                path: exe.clone(),
+                backend: Some(legacy.clone()),
+            }])
+            .expect_err("legacy cache still needs install manifest");
+        assert!(
+            missing_manifest
+                .to_string()
+                .contains("install-manifest.json")
+        );
+
+        let exe_sha = sha256_file(&exe).expect("exe sha");
+        let manifest = serde_json::json!({
+            "backend": legacy.id,
+            "artifact": legacy.artifact,
+            "artifact_sha256": legacy.sha256,
+            "executable_rel_path": legacy.executable_rel_path,
+            "executable_sha256": exe_sha,
+            "source_url": legacy.url,
+        });
+        std::fs::write(
+            temp.path().join("install-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("manifest"),
+        )
+        .expect("manifest write");
+        let mut legacy = legacy;
+        legacy.executable_sha256 = exe_sha;
+        let selected = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+            path: exe.clone(),
+            backend: Some(legacy),
+        }])
+        .expect("legacy cache path with manifest");
+
+        assert_eq!(selected, exe);
     }
 
     #[test]
