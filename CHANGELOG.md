@@ -12,6 +12,9 @@
 - Made installed CodeStory MCP detect when its live stdio child is serving a
   stale workspace, report `workspace_mismatch` diagnostics, and block stale
   repo repair commands until the host relaunches MCP for the active workspace.
+- Added a macOS arm64 Metal llama.cpp backend resolver so Apple Silicon
+  accelerator-required sidecars launch natively without inheriting the Windows
+  Vulkan device default.
 
 ## 0.13.7
 
