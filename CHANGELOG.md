@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Pinned release artifact upload/download actions to Node 24-backed versions so
+  release runs stop emitting Node 20 deprecation annotations.
+
 ## 0.13.7
 
 CodeStory 0.13.7 fixes automatic first-start sidecar repair when a stale
