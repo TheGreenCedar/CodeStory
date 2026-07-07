@@ -147,11 +147,27 @@ only when overriding the managed binary with an absolute path.
 On Windows x64, the native llama.cpp resolver selects the manifest-backed b9902
 Vulkan cell by default and launches it with `Vulkan0` plus `99` GPU layers. A
 previous b9058 managed-cache install remains a recognized legacy cell only when
-its install manifest and executable checksum match. On Linux Docker Compose,
-the base file stays CPU-compatible and CodeStory adds a generated `/dev/dri`
-override only when accelerator mode is requested and the host render node
-exists. On other GPU setups, run an already-working native or external
-llama.cpp embedding endpoint and point CodeStory at it with
+its install manifest and executable checksum match.
+
+On Linux, accelerator-required setup remains Docker Compose based. The supported
+default cells are explicit Vulkan contracts for x64 and arm64, backed by the
+same b9902 Ubuntu Vulkan release artifacts used for launch-contract metadata.
+When Vulkan is selected, CodeStory writes a generated `/dev/dri` compose
+override only after the host render node exists; if `/dev/dri` is missing,
+bootstrap fails with `linux_accelerator_device_missing` instead of silently
+starting an unaccelerated embed container. CUDA, HIP/ROCm, SYCL, and OpenVINO
+are tracked as contract-only Linux x64 cells until package, launch, and live GPU
+evidence exist.
+
+| Linux host | Resolver request | Launch contract | Proof required before full readiness |
+|------------|------------------|-----------------|--------------------------------------|
+| x64 generic or AMD without HIP proof | `vulkan:Vulkan0` | Docker Compose plus generated `/dev/dri` override | native/container logs show Vulkan device use and offloaded layers |
+| arm64 with render node | `vulkan:Vulkan0` | Docker Compose plus generated `/dev/dri` override | native/container logs show Vulkan device use and offloaded layers |
+| NVIDIA/CUDA opt-in | `cuda` when `CODESTORY_EMBED_DEVICE_PROVIDER` names NVIDIA/CUDA | Contract-only until a CUDA image or external endpoint is proven | CUDA log markers plus offloaded layers from a real GPU run |
+| HIP/ROCm, SYCL, OpenVINO opt-in | matching provider override | Contract-only until packaging and launch args are proven | backend-specific log markers plus offloaded layers from a real GPU run |
+
+On other GPU setups, run an already-working native or external llama.cpp
+embedding endpoint and point CodeStory at it with
 `CODESTORY_EMBED_LLAMACPP_URL`; set the device/layer variables only when the
 resolver request does not match that endpoint.
 

@@ -257,17 +257,29 @@ pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
 
 fn default_embedding_accelerator_request() -> EmbeddingAcceleratorRequest {
     let host = crate::config::embedding_host_platform();
-    let provider = if host.os == "macos" && host.arch == "aarch64" {
-        "metal"
-    } else {
-        "vulkan"
-    };
+    let provider = default_embedding_accelerator_provider(&host);
     EmbeddingAcceleratorRequest {
-        provider: provider.to_string(),
+        provider: provider.clone(),
         device: env_trimmed(LLAMACPP_DEVICE_ENV)
             .or_else(|| (provider == "vulkan").then(|| "Vulkan0".to_string())),
         n_gpu_layers: env_trimmed(LLAMACPP_N_GPU_LAYERS_ENV).unwrap_or_else(|| "99".to_string()),
     }
+}
+
+fn default_embedding_accelerator_provider(host: &crate::config::EmbeddingHostPlatform) -> String {
+    if host.os == "macos" && host.arch == "aarch64" {
+        return "metal".to_string();
+    }
+    if host.os == "linux"
+        && let Some(provider) = env_trimmed(DEVICE_PROVIDER_ENV)
+            .map(|value| normalize_accelerator_request_provider(&value))
+            .filter(|provider| {
+                ["cuda", "hip", "vulkan", "sycl", "openvino"].contains(&provider.as_str())
+            })
+    {
+        return provider;
+    }
+    "vulkan".to_string()
 }
 
 fn explicit_cpu_allowed() -> bool {
@@ -297,7 +309,9 @@ fn observed_embedding_device_state(
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .and_then(|value| match value.as_str() {
-            "accelerated" | "gpu" | "vulkan" | "cuda" | "metal" => Some("accelerated"),
+            "accelerated" | "gpu" | "vulkan" | "cuda" | "hip" | "metal" | "sycl" | "openvino" => {
+                Some("accelerated")
+            }
             "cpu" => Some("cpu"),
             "unknown" => Some("unknown"),
             _ => None,
@@ -333,7 +347,7 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     for line in text.lines() {
         if line_reports_gpu_offload(line) == Some(true)
             || (line.contains("using device")
-                && ["vulkan", "cuda", "metal"]
+                && ["vulkan", "cuda", "hip", "metal", "sycl", "openvino"]
                     .iter()
                     .any(|needle| line.contains(needle)))
         {
@@ -448,6 +462,23 @@ fn normalize_gpu_provider(value: &str) -> String {
         || normalized.contains("advanced micro devices")
     {
         "amd".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_accelerator_request_provider(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.contains("nvidia") || normalized.contains("cuda") {
+        "cuda".to_string()
+    } else if normalized.contains("hip") || normalized.contains("rocm") {
+        "hip".to_string()
+    } else if normalized.contains("sycl") {
+        "sycl".to_string()
+    } else if normalized.contains("openvino") {
+        "openvino".to_string()
+    } else if normalized.contains("vulkan") {
+        "vulkan".to_string()
     } else {
         normalized
     }
@@ -1034,6 +1065,85 @@ mod tests {
             ),
             "cpu"
         );
+    }
+
+    #[test]
+    fn linux_provider_override_reports_selected_manifest_provider() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _ngl = EnvGuard::remove(LLAMACPP_N_GPU_LAYERS_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "linux/x86_64");
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "NVIDIA Corporation");
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+        let request = embedding_accelerator_request().expect("accelerator request");
+
+        assert_eq!(request.provider, "cuda");
+        assert_eq!(request.device, None);
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("cuda")
+        );
+        assert_eq!(readiness.accelerator_request_device, None);
+    }
+
+    #[test]
+    fn linux_default_request_uses_vulkan_cell_and_device() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "linux/aarch64");
+        let _provider = EnvGuard::remove(DEVICE_PROVIDER_ENV);
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let request = embedding_accelerator_request().expect("accelerator request");
+
+        assert_eq!(request.provider, "vulkan");
+        assert_eq!(request.device.as_deref(), Some("Vulkan0"));
+        assert_eq!(
+            crate::config::selected_llama_sidecar_backend(&request.provider)
+                .expect("linux arm64 vulkan cell")
+                .id,
+            "linux-aarch64-vulkan"
+        );
+    }
+
+    #[test]
+    fn linux_backend_log_markers_count_as_accelerator_evidence() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "linux/x86_64");
+
+        for (provider, marker) in [
+            ("cuda", "cuda backend ready"),
+            ("hip", "hip backend ready"),
+            ("vulkan", "vulkan backend ready"),
+            ("sycl", "sycl backend ready"),
+            ("openvino", "openvino backend ready"),
+        ] {
+            let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, provider);
+            assert_eq!(
+                observed_embedding_device_state_from_text(&format!(
+                    "{marker}\nload_tensors: offloaded layers\n"
+                )),
+                "accelerated",
+                "{provider} markers should prove acceleration"
+            );
+            assert_eq!(
+                observed_embedding_device_state_from_text(&format!("{marker}\n")),
+                "unknown",
+                "{provider} without offload marker is inconclusive"
+            );
+        }
     }
 
     #[test]
