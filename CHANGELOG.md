@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.8
+
+CodeStory 0.13.8 fixes Apple Silicon sidecar acceleration by launching a native
+Metal llama.cpp embedding sidecar on macOS arm64, hardens stale MCP workspace
+detection, and updates release artifact actions to Node 24-backed versions.
+
 ### Changed
 
 - Pinned release artifact upload/download actions to Node 24-backed versions so
