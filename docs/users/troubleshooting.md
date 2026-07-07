@@ -162,6 +162,40 @@ codestory-cli fix --project <repo> --format json
 Require `retrieval_mode: "full"` before trusting packet/search evidence.
 Command table: [CLI reference - readiness and repair](cli-reference.md#readiness-and-repair).
 
+### Apple Silicon acceleration
+
+On macOS arm64, the supported accelerated embedding path is the native Metal
+sidecar. A healthy repaired status should report the embedding launch as
+`native_spawned`, request provider `metal`, and then prove the observed device
+state from sidecar logs or an explicit operator assertion. The request fields
+show intent; `embedding_device_state`, `embedding_device_observation_source`,
+and `retrieval_mode` decide readiness.
+
+The old failure pattern is `accelerator_request_provider=vulkan`,
+`accelerator_request_device=Vulkan0`, Docker/Colima embed launch, and
+`accelerator_request_unobserved`. That is a stale or pre-release runtime for
+Apple Silicon, not a Colima tuning problem: the Linux Docker sidecar cannot
+observe macOS Metal and normally has no usable `/dev/dri`.
+
+**Agent:** Read `codestory://status`, follow `recommended_next_calls`, call MCP
+`repair_all` when recommended, and reread status. Keep local navigation separate
+from packet/search: a ready local graph can answer source-navigation questions
+while packet/search remains blocked until `retrieval_mode` is `full`.
+
+**You:** For a maintainer transcript, prewarm the managed Metal binary and then
+rerun bootstrap/status:
+
+```sh
+node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only
+codestory-cli retrieval bootstrap --project <repo> --format json
+codestory-cli retrieval status --project <repo> --format json
+```
+
+CPU-backed embeddings are degraded and explicit. Use
+`CODESTORY_EMBED_ALLOW_CPU=1` or `CODESTORY_EMBED_DEVICE_POLICY=allow_cpu` only
+when CPU retrieval is acceptable for that machine; CPU opt-in is not the default
+Apple Silicon success path.
+
 ## MCP visibility failure
 
 Symptoms: skill or rule loads but no `codestory://status` or `mcp__codestory` tools.

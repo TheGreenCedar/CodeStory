@@ -17,6 +17,9 @@
   Vulkan device default.
 - Added managed macOS arm64 Metal `llama-server` install/checksum handling so
   native sidecar launch only uses manifest-verified managed binaries.
+- Documented Apple Silicon sidecar repair/status interpretation so operators
+  and agents do not treat Docker Vulkan or CPU fallback as the default macOS
+  acceleration path.
 
 ## 0.13.7
 
