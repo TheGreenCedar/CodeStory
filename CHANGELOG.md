@@ -15,6 +15,8 @@
 - Added a macOS arm64 Metal llama.cpp backend resolver so Apple Silicon
   accelerator-required sidecars launch natively without inheriting the Windows
   Vulkan device default.
+- Added managed macOS arm64 Metal `llama-server` install/checksum handling so
+  native sidecar launch only uses manifest-verified managed binaries.
 
 ## 0.13.7
 
