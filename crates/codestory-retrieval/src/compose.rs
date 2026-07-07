@@ -309,7 +309,9 @@ fn docker_compose_up(
     let vulkan_override = maybe_write_vulkan_compose_override(
         &user_cache_root(),
         Path::new(LINUX_VULKAN_RENDER_NODE),
-        accelerator_request.is_some(),
+        accelerator_request
+            .as_ref()
+            .is_some_and(|request| request.provider == "vulkan"),
     )?;
     command
         .arg("compose")
@@ -370,12 +372,20 @@ fn docker_compose_up(
         let device = request.device;
         let n_gpu_layers = request.n_gpu_layers;
         command
-            .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
             .env("CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS", &n_gpu_layers)
-            .env("LLAMA_ARG_DEVICE", device)
             .env("LLAMA_ARG_N_GPU_LAYERS", n_gpu_layers);
+        if let Some(device) = device {
+            command
+                .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
+                .env("LLAMA_ARG_DEVICE", device);
+        } else {
+            command
+                .env_remove("CODESTORY_EMBED_LLAMACPP_DEVICE")
+                .env_remove("LLAMA_ARG_DEVICE");
+        }
     } else {
         command
+            .env_remove("CODESTORY_EMBED_LLAMACPP_DEVICE")
             .env_remove("LLAMA_ARG_DEVICE")
             .env_remove("LLAMA_ARG_N_GPU_LAYERS");
     }
@@ -520,18 +530,16 @@ fn native_embedding_server_launch_from_paths(
     model_path: PathBuf,
     runtime: &SidecarRuntimeConfig,
 ) -> NativeEmbeddingServerLaunch {
-    let mut args = vec![
-        "--embedding".to_string(),
-        "--model".to_string(),
-        model_path.display().to_string(),
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        runtime.embed_http_port.to_string(),
-    ];
+    let mut args = native_embedding_launch_args(&model_path, runtime);
     if let Some(request) = crate::embeddings::embedding_accelerator_request() {
-        args.push("--device".to_string());
-        args.push(request.device);
+        if selected_native_llama_backend().is_none() {
+            args.push("--n-gpu-layers".to_string());
+            args.push(request.n_gpu_layers);
+        }
+        if let Some(device) = request.device {
+            args.push("--device".to_string());
+            args.push(device);
+        }
     }
     NativeEmbeddingServerLaunch {
         executable,
@@ -539,6 +547,32 @@ fn native_embedding_server_launch_from_paths(
         args,
         log_path: crate::embeddings::native_embedding_log_path(runtime),
     }
+}
+
+fn native_embedding_launch_args(model_path: &Path, runtime: &SidecarRuntimeConfig) -> Vec<String> {
+    if let Some(backend) = selected_native_llama_backend() {
+        let n_gpu_layers = crate::embeddings::embedding_accelerator_request()
+            .map(|request| request.n_gpu_layers)
+            .unwrap_or_else(|| "0".to_string());
+        return backend
+            .launch_args
+            .into_iter()
+            .map(|arg| {
+                arg.replace("{model}", &model_path.display().to_string())
+                    .replace("{port}", &runtime.embed_http_port.to_string())
+                    .replace("{n_gpu_layers}", &n_gpu_layers)
+            })
+            .collect();
+    }
+    vec![
+        "--embedding".to_string(),
+        "--model".to_string(),
+        model_path.display().to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        runtime.embed_http_port.to_string(),
+    ]
 }
 
 fn embedding_launch_metadata(
@@ -559,13 +593,24 @@ fn embedding_launch_metadata(
         executable_path: Some(native_launch.executable.display().to_string()),
         model_path: Some(native_launch.model_path.display().to_string()),
         requested_device: crate::embeddings::embedding_accelerator_request()
-            .map(|request| request.device),
+            .and_then(|request| request.device),
     }
 }
 
 fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> String {
     if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
         return "env:CODESTORY_EMBED_NATIVE_LLAMA_SERVER".to_string();
+    }
+    if let Some(backend) = selected_native_llama_backend() {
+        let rel_path = native_llama_backend_rel_path(&backend);
+        if path == user_cache_root().join(&rel_path) {
+            return "managed_cache".to_string();
+        }
+        if let Some(root) = repo_root
+            && path == root.join(&rel_path)
+        {
+            return "repo_managed_cache".to_string();
+        }
     }
     if path == user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
         return "managed_cache".to_string();
@@ -591,7 +636,7 @@ fn native_llama_server_path(repo_root: Option<&Path>) -> Result<PathBuf> {
 fn validate_explicit_native_llama_server(path: PathBuf) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!(
-            "CODESTORY_EMBED_NATIVE_LLAMA_SERVER must be an absolute path to llama-server.exe; ambient PATH lookup is not allowed"
+            "CODESTORY_EMBED_NATIVE_LLAMA_SERVER must be an absolute path to llama-server; ambient PATH lookup is not allowed"
         );
     }
     if !path.is_file() {
@@ -609,7 +654,7 @@ fn native_llama_server_path_from_candidates(candidates: Vec<PathBuf>) -> Result<
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "native llama-server.exe not found; set CODESTORY_EMBED_NATIVE_LLAMA_SERVER to an absolute path or install managed llama.cpp assets under {}; ambient PATH lookup is not allowed",
+                "native llama-server not found; set CODESTORY_EMBED_NATIVE_LLAMA_SERVER to an absolute path or install managed llama.cpp assets under {}; ambient PATH lookup is not allowed",
                 user_cache_root()
                     .join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)
                     .display()
@@ -618,12 +663,29 @@ fn native_llama_server_path_from_candidates(candidates: Vec<PathBuf>) -> Result<
 }
 
 fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(backend) = selected_native_llama_backend() {
+        let rel_path = native_llama_backend_rel_path(&backend);
+        let mut candidates = vec![user_cache_root().join(&rel_path)];
+        if let Some(root) = repo_root {
+            candidates.push(root.join(rel_path));
+        }
+        return candidates;
+    }
     let mut candidates = vec![user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)];
     if let Some(root) = repo_root {
         candidates.push(root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH));
         candidates.push(root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH));
     }
     candidates
+}
+
+fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend> {
+    crate::embeddings::embedding_accelerator_request()
+        .and_then(|request| crate::config::selected_llama_sidecar_backend(&request.provider))
+}
+
+fn native_llama_backend_rel_path(backend: &crate::config::LlamaSidecarBackend) -> PathBuf {
+    Path::new(&backend.managed_cache_rel_dir).join(&backend.executable_rel_path)
 }
 
 fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result<()> {
@@ -1035,6 +1097,7 @@ mod tests {
         let _name = EnvGuard::remove("CODESTORY_EMBED_DEVICE_NAME");
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
 
         let temp = tempdir().expect("temp");
         let exe = temp.path().join("llama-server.exe");
@@ -1072,6 +1135,12 @@ mod tests {
             launch
                 .args
                 .windows(2)
+                .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
+        );
+        assert!(
+            launch
+                .args
+                .windows(2)
                 .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
         );
         let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
@@ -1080,6 +1149,34 @@ mod tests {
         assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
         assert_eq!(metadata.model_path, Some(model.display().to_string()));
         assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));
+    }
+
+    #[test]
+    fn metal_native_launch_uses_gpu_layers_without_device_arg() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server");
+        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        std::fs::write(&model, b"fake model").expect("model");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+
+        let launch =
+            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
+
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
+        );
+        assert!(!launch.args.iter().any(|arg| arg == "--device"));
+        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
+        assert_eq!(metadata.requested_device, None);
     }
 
     #[test]
@@ -1115,6 +1212,14 @@ mod tests {
     }
 
     impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             unsafe {

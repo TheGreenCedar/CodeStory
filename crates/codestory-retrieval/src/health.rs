@@ -957,6 +957,32 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_status_reports_metal_request_without_device() {
+        let embedding_device = crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "unknown",
+            observation_source: "accelerator_request_unobserved",
+            detected_provider: None,
+            detected_gpu: None,
+            accelerator_requested: true,
+            accelerator_request_provider: Some("metal".into()),
+            accelerator_request_device: None,
+            cpu_allowed: false,
+            full_retrieval_allowed: false,
+            degraded_reason: Some("embedding_device_unverified".into()),
+        };
+
+        let report =
+            unavailable_status_report_with_embedding_device("missing", None, &embedding_device);
+
+        assert_eq!(
+            report.embedding_accelerator_request_provider.as_deref(),
+            Some("metal")
+        );
+        assert_eq!(report.embedding_accelerator_request_device, None);
+    }
+
+    #[test]
     fn zero_dense_manifest_allows_explicit_cpu_opt_in() {
         let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "cpu_allowed",

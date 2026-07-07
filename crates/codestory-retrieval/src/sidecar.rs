@@ -584,6 +584,10 @@ mod tests {
 
     #[test]
     fn status_attaches_embedding_launch_metadata_from_state_file() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let root = TempDir::new().expect("root");
         let runtime = test_runtime(&root);
         let launch = EmbeddingLaunchMetadata {
@@ -591,14 +595,19 @@ mod tests {
             launch_mode: "native_spawned".to_string(),
             endpoint: "http://127.0.0.1:18080/v1/embeddings".to_string(),
             executable_source: Some("managed_cache".to_string()),
-            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            executable_path: Some("C:/cache/llama-server".to_string()),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
-            requested_device: Some("Vulkan0".to_string()),
+            requested_device: None,
         };
         let state =
             sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch.clone()))
                 .expect("write state");
         assert_eq!(state.embedding_launch, Some(launch.clone()));
+        assert_eq!(
+            state.embedding_accelerator_request_provider.as_deref(),
+            Some("metal")
+        );
+        assert_eq!(state.embedding_accelerator_request_device, None);
 
         let report = unavailable_status_report_with_embedding_device(
             "missing",
@@ -1025,6 +1034,15 @@ mod tests {
             // SAFETY: tests that mutate process environment hold crate::test_support::env_lock().
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate process environment hold crate::test_support::env_lock().
+            unsafe {
+                std::env::remove_var(key);
             }
             Self { key, previous }
         }

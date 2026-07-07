@@ -46,9 +46,75 @@ pub const DEFAULT_AGENT_RUN_ID: &str = "shared-agent";
 pub const NATIVE_LLAMA_MANAGED_CACHE_REL_PATH: &str =
     "managed-embeddings/llama/b9058/llama-b9058-bin-win-vulkan-x64/llama-server.exe";
 pub const NATIVE_LLAMA_SOURCE_CACHE_REL_PATH: &str = "target/llamacpp/b8840/llama-server.exe";
+const LLAMA_SIDECAR_BACKENDS_JSON: &str = include_str!("../assets/llama-sidecar-backends.json");
+const TEST_HOST_PLATFORM_ENV: &str = "CODESTORY_TEST_HOST_PLATFORM";
 
 pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbeddingHostPlatform {
+    pub os: String,
+    pub arch: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LlamaSidecarBackendManifest {
+    backends: Vec<LlamaSidecarBackend>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct LlamaSidecarBackend {
+    pub id: String,
+    pub os: String,
+    pub arch: String,
+    pub provider: String,
+    pub artifact: String,
+    pub url: String,
+    pub sha256: String,
+    pub executable_rel_path: String,
+    pub managed_cache_rel_dir: String,
+    pub launch_args: Vec<String>,
+    pub device_arg_policy: String,
+    pub log_markers: Vec<String>,
+}
+
+pub(crate) fn embedding_host_platform() -> EmbeddingHostPlatform {
+    if let Some((os, arch)) = std::env::var(TEST_HOST_PLATFORM_ENV)
+        .ok()
+        .and_then(|value| parse_test_host_platform(&value))
+    {
+        return EmbeddingHostPlatform { os, arch };
+    }
+    EmbeddingHostPlatform {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    }
+}
+
+fn parse_test_host_platform(value: &str) -> Option<(String, String)> {
+    let mut parts = value.trim().split('/');
+    let os = parts.next()?.trim().to_ascii_lowercase();
+    let arch = parts.next()?.trim().to_ascii_lowercase();
+    (!os.is_empty() && !arch.is_empty() && parts.next().is_none()).then_some((os, arch))
+}
+
+pub(crate) fn selected_llama_sidecar_backend(provider: &str) -> Option<LlamaSidecarBackend> {
+    let platform = embedding_host_platform();
+    llama_sidecar_backend_manifest()
+        .backends
+        .into_iter()
+        .find(|backend| {
+            backend.os == platform.os
+                && backend.arch == platform.arch
+                && backend.provider == provider
+        })
+}
+
+fn llama_sidecar_backend_manifest() -> LlamaSidecarBackendManifest {
+    serde_json::from_str(LLAMA_SIDECAR_BACKENDS_JSON)
+        .expect("embedded llama sidecar backend manifest must be valid")
+}
 
 #[derive(Debug, Clone)]
 pub struct SidecarLayout {
@@ -730,7 +796,10 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
             "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
         );
     }
-    if cfg!(target_os = "windows") && crate::embeddings::embedding_accelerator_request().is_some() {
+    let request = crate::embeddings::embedding_accelerator_request();
+    let host = embedding_host_platform();
+    if request.is_some() && ((host.os == "macos" && host.arch == "aarch64") || host.os == "windows")
+    {
         Ok(EmbeddingServerLaunchMode::NativeSpawned)
     } else {
         Ok(EmbeddingServerLaunchMode::DockerComposeEmbed)
@@ -949,6 +1018,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn simulated_macos_arm64_accelerator_required_selects_native_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "macos/aarch64");
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::NativeSpawned
+        );
+    }
+
+    #[test]
+    fn simulated_linux_accelerator_required_keeps_docker_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::DockerComposeEmbed
+        );
+    }
+
     struct EnvGuard {
         key: &'static str,
         previous: Option<String>,
@@ -959,6 +1056,14 @@ mod tests {
             let previous = std::env::var(key).ok();
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
             }
             Self { key, previous }
         }
