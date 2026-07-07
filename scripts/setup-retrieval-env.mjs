@@ -378,7 +378,11 @@ function selectedLlamaBackend(opts) {
   const arch = hostArch();
   const provider =
     process.env.CODESTORY_EMBED_DEVICE_PROVIDER?.trim().toLowerCase() ||
-    (osName === "macos" && arch === "aarch64" ? "metal" : "");
+    (osName === "macos" && arch === "aarch64"
+      ? "metal"
+      : osName === "windows" && arch === "x86_64"
+        ? "vulkan"
+        : "");
   const backend = backends.find(
     (candidate) =>
       candidate.os === osName && candidate.arch === arch && candidate.provider === provider,
@@ -526,8 +530,18 @@ async function fetchLlamaServer(opts) {
 async function runSelfTest() {
   const backends = readLlamaBackends();
   const macMetal = backends.find((backend) => backend.id === "macos-aarch64-metal");
+  const winVulkan = backends.find((backend) => backend.id === "windows-x86_64-vulkan");
+  const winLegacy = backends.find(
+    (backend) => backend.id === "windows-x86_64-vulkan-b9058-legacy",
+  );
   if (!macMetal) {
     throw new Error("missing macos-aarch64-metal backend");
+  }
+  if (!winVulkan) {
+    throw new Error("missing windows-x86_64-vulkan backend");
+  }
+  if (!winLegacy || !winLegacy.sha256 || !winLegacy.executable_sha256) {
+    throw new Error("missing checksum-backed legacy Windows Vulkan managed-cache fallback");
   }
   if (backends.some((backend) => backend.os === "macos" && backend.arch !== "aarch64")) {
     throw new Error("macOS Intel llama-server backend must not be present");
@@ -540,6 +554,15 @@ async function runSelfTest() {
   }
   if (!/^[0-9a-f]{64}$/.test(macMetal.executable_sha256)) {
     throw new Error(`unexpected executable sha256: ${macMetal.executable_sha256}`);
+  }
+  if (safeArchiveMemberPath(winVulkan.executable_archive_path) !== "llama-server.exe") {
+    throw new Error(`unexpected Windows executable archive path: ${winVulkan.executable_archive_path}`);
+  }
+  if (!winVulkan.managed_cache_rel_dir.includes("/llama/b9902/")) {
+    throw new Error(`unexpected Windows managed cache version path: ${winVulkan.managed_cache_rel_dir}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(winVulkan.executable_sha256)) {
+    throw new Error(`unexpected Windows executable sha256: ${winVulkan.executable_sha256}`);
   }
   const selected = selectedLlamaBackend({ llamaBackend: "macos-aarch64-metal" });
   if (managedLlamaServerPath(selected).split(path.sep).join("/").endsWith("llama-server") !== true) {

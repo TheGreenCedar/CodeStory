@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Moved Windows x64 Vulkan native llama.cpp sidecar selection onto the
+  manifest-backed backend resolver while preserving the existing b9058 managed
+  cache path as a legacy fallback.
+
 ## 0.13.8
 
 CodeStory 0.13.8 fixes Apple Silicon sidecar acceleration by launching a native

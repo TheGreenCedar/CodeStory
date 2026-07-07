@@ -102,15 +102,20 @@ fn parse_test_host_platform(value: &str) -> Option<(String, String)> {
 }
 
 pub(crate) fn selected_llama_sidecar_backend(provider: &str) -> Option<LlamaSidecarBackend> {
+    llama_sidecar_backends(provider).into_iter().next()
+}
+
+pub(crate) fn llama_sidecar_backends(provider: &str) -> Vec<LlamaSidecarBackend> {
     let platform = embedding_host_platform();
     llama_sidecar_backend_manifest()
         .backends
         .into_iter()
-        .find(|backend| {
+        .filter(|backend| {
             backend.os == platform.os
                 && backend.arch == platform.arch
                 && backend.provider == provider
         })
+        .collect()
 }
 
 fn llama_sidecar_backend_manifest() -> LlamaSidecarBackendManifest {
@@ -1045,6 +1050,28 @@ mod tests {
         assert_eq!(
             embedding_server_launch_mode().expect("launch mode"),
             EmbeddingServerLaunchMode::DockerComposeEmbed
+        );
+    }
+
+    #[test]
+    fn simulated_windows_x64_selects_current_vulkan_manifest_backend() {
+        let _lock = crate::test_support::env_lock();
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "windows/x86_64");
+
+        let selected = selected_llama_sidecar_backend("vulkan").expect("windows vulkan backend");
+        let matching = llama_sidecar_backends("vulkan");
+
+        assert_eq!(selected.id, "windows-x86_64-vulkan");
+        assert_eq!(selected.artifact, "llama-b9902-bin-win-vulkan-x64.zip");
+        assert_eq!(selected.executable_archive_path, "llama-server.exe");
+        assert!(selected.managed_cache_rel_dir.contains("/llama/b9902/"));
+        assert!(
+            matching
+                .iter()
+                .any(|backend| backend.id == "windows-x86_64-vulkan-b9058-legacy"
+                    && backend.artifact == "llama-b9058-bin-win-vulkan-x64.zip"
+                    && !backend.sha256.is_empty()
+                    && !backend.executable_sha256.is_empty())
         );
     }
 
