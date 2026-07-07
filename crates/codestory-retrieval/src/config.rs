@@ -69,6 +69,7 @@ pub(crate) struct LlamaSidecarBackend {
     pub os: String,
     pub arch: String,
     pub provider: String,
+    pub launch_mode: String,
     pub artifact: String,
     pub url: String,
     pub sha256: String,
@@ -1072,6 +1073,47 @@ mod tests {
                     && backend.artifact == "llama-b9058-bin-win-vulkan-x64.zip"
                     && !backend.sha256.is_empty()
                     && !backend.executable_sha256.is_empty())
+        );
+    }
+
+    #[test]
+    fn linux_backend_matrix_exposes_vulkan_and_contract_only_cells() {
+        let _lock = crate::test_support::env_lock();
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
+
+        let vulkan = selected_llama_sidecar_backend("vulkan").expect("linux vulkan backend");
+        let cuda = selected_llama_sidecar_backend("cuda").expect("linux cuda contract cell");
+        let hip = selected_llama_sidecar_backend("hip").expect("linux hip contract cell");
+        let sycl = selected_llama_sidecar_backend("sycl").expect("linux sycl contract cell");
+        let openvino =
+            selected_llama_sidecar_backend("openvino").expect("linux openvino contract cell");
+
+        assert_eq!(vulkan.id, "linux-x86_64-vulkan");
+        assert_eq!(vulkan.launch_mode, "docker_compose_embed");
+        assert_eq!(vulkan.artifact, "llama-b9902-bin-ubuntu-vulkan-x64.tar.gz");
+        assert!(!vulkan.sha256.is_empty());
+        for backend in [cuda, hip, sycl, openvino] {
+            assert_eq!(backend.launch_mode, "docker_compose_embed");
+            assert!(
+                backend.artifact.is_empty(),
+                "{} should stay contract-only until packaged proof exists",
+                backend.id
+            );
+        }
+    }
+
+    #[test]
+    fn linux_arm64_vulkan_cell_is_explicit() {
+        let _lock = crate::test_support::env_lock();
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/aarch64");
+
+        let vulkan = selected_llama_sidecar_backend("vulkan").expect("linux arm64 vulkan backend");
+
+        assert_eq!(vulkan.id, "linux-aarch64-vulkan");
+        assert_eq!(vulkan.launch_mode, "docker_compose_embed");
+        assert_eq!(
+            vulkan.artifact,
+            "llama-b9902-bin-ubuntu-vulkan-arm64.tar.gz"
         );
     }
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Added explicit Linux accelerated sidecar backend cells and Docker launch
+  diagnostics so Vulkan requires a host `/dev/dri` render node, while CUDA,
+  HIP/ROCm, SYCL, and OpenVINO remain contract-only until live GPU evidence is
+  attached.
+
 ## 0.13.9
 
 CodeStory 0.13.9 moves Windows native llama.cpp sidecar selection onto the same

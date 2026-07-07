@@ -244,6 +244,13 @@ blocker baseline.
 
 Release-readiness evidence is tiered:
 
+Linux accelerator cells have the same evidence boundary. CI runs prove resolver,
+manifest, compose, and log-marker contracts only; they do not prove CUDA, HIP,
+Vulkan, SYCL, or OpenVINO live GPU execution unless the run is explicitly backed
+by a GPU runner artifact. For Linux sidecar backend changes, attach manual or
+nightly evidence for every backend described as live-supported. Contract-only
+cells must stay labeled as contract-only in PRs, issues, and release notes.
+
 | Evidence tier | Required proof | Release meaning |
 | --- | --- | --- |
 | Stats-only / degraded sidecar | Diagnostic timing or contract evidence without prepared full sidecars, or stats output whose `proof_tier` is `stats_only` | Useful local regression signal only; not release proof for packet/search readiness. The current passing `codestory_repo_release_e2e_emits_stats` harness asserts full sidecar status instead of completing as a passing no-full-sidecar row. |

@@ -424,8 +424,14 @@ fn maybe_write_vulkan_compose_override(
     host_render_node: &Path,
     accelerator_requested: bool,
 ) -> Result<Option<PathBuf>> {
-    if !accelerator_requested || !host_render_node.exists() {
+    if !accelerator_requested {
         return Ok(None);
+    }
+    if !host_render_node.exists() {
+        bail!(
+            "linux_accelerator_device_missing: Vulkan acceleration was requested but {} is unavailable; expose a host render node, choose a proven non-Vulkan backend, or explicitly allow CPU fallback",
+            host_render_node.display()
+        );
     }
     std::fs::create_dir_all(cache_root)
         .with_context(|| format!("create CodeStory cache dir {}", cache_root.display()))?;
@@ -1390,9 +1396,13 @@ mod tests {
     fn vulkan_compose_override_is_only_written_when_host_render_node_exists() {
         let cache = tempdir().expect("cache");
         let missing = cache.path().join("missing-dri");
-        let skipped =
-            maybe_write_vulkan_compose_override(cache.path(), &missing, true).expect("skip");
-        assert_eq!(skipped, None);
+        let missing_error = maybe_write_vulkan_compose_override(cache.path(), &missing, true)
+            .expect_err("missing render node");
+        assert!(
+            missing_error
+                .to_string()
+                .contains("linux_accelerator_device_missing")
+        );
 
         let disabled =
             maybe_write_vulkan_compose_override(cache.path(), &missing, false).expect("disabled");
