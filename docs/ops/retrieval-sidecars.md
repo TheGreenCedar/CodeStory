@@ -138,11 +138,14 @@ defaults do not match your machine:
 If CPU is not explicitly allowed, CodeStory requests llama.cpp Vulkan device
 `Vulkan0` and `99` GPU layers by default. Linux Docker Compose keeps the base
 file CPU-compatible and adds a generated `/dev/dri` override only when
-accelerator mode is requested and the host render node exists. On Windows and
-macOS GPU setups, run an already-working native or external llama.cpp embedding
-endpoint and point CodeStory at it with `CODESTORY_EMBED_LLAMACPP_URL`; set the
-device/layer variables only when the default request does not match that
-endpoint.
+accelerator mode is requested and the host render node exists. On macOS arm64,
+bootstrap/repair installs the managed Metal `llama-server`; use
+`node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only` only to
+prewarm that cache cell. Set `CODESTORY_EMBED_NATIVE_LLAMA_SERVER` only when
+overriding the managed binary with an absolute path. On other GPU setups, run an
+already-working native or external llama.cpp embedding endpoint and point
+CodeStory at it with `CODESTORY_EMBED_LLAMACPP_URL`; set the device/layer
+variables only when the default request does not match that endpoint.
 
 If device state is unknown, full packet/search readiness fails closed by
 default. Use the CPU opt-in only as an explicit operator decision; otherwise
@@ -159,6 +162,8 @@ From the CodeStory repository root:
 
 ```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
+# macOS arm64 Metal native sidecar only:
+node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only
 cargo run -p codestory-cli -- retrieval bootstrap --project <repo> --format json
 ```
 

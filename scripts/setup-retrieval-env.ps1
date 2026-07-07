@@ -8,6 +8,11 @@ param(
     [switch]$SkipCompose,
     [switch]$SkipStatus,
     [switch]$WithHoldoutClone,
+    [switch]$FetchEmbedModel,
+    [switch]$FetchLlamaServer,
+    [string]$LlamaBackend,
+    [switch]$FetchOnly,
+    [switch]$SelfTest,
     [switch]$Release,
     [string]$Project,
     [int]$WaitSecs = 90
@@ -34,6 +39,11 @@ if ($SkipBuild) { $nodeArgs += "--skip-build" }
 if ($SkipCompose) { $nodeArgs += "--skip-compose" }
 if ($SkipStatus) { $nodeArgs += "--skip-status" }
 if ($WithHoldoutClone) { $nodeArgs += "--with-holdout-clone" }
+if ($FetchEmbedModel) { $nodeArgs += "--fetch-embed-model" }
+if ($FetchLlamaServer) { $nodeArgs += "--fetch-llama-server" }
+if ($LlamaBackend) { $nodeArgs += @("--llama-backend", $LlamaBackend) }
+if ($FetchOnly) { $nodeArgs += "--fetch-only" }
+if ($SelfTest) { $nodeArgs += "--self-test" }
 if ($Release) { $nodeArgs += "--release" }
 if ($Project) { $nodeArgs += @("--project", (Resolve-Path $Project).Path) }
 if ($WaitSecs -ge 0) { $nodeArgs += @("--wait-secs", "$WaitSecs") }

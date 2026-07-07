@@ -8,7 +8,9 @@
       "artifact": "llama-b9902-bin-macos-arm64.tar.gz",
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-macos-arm64.tar.gz",
       "sha256": "229db5607ffd2251cf836d76c36e8ff58de23dfba76e578e3a466235671bab0d",
+      "executable_archive_path": "llama-b9902/llama-server",
       "executable_rel_path": "llama-server",
+      "executable_sha256": "12df97ffa9d48545e96cd3237a71f78efd1cc0222f971cbd65f7ab57e793b128",
       "managed_cache_rel_dir": "managed-embeddings/llama/b9902/llama-b9902-bin-macos-arm64-metal",
       "launch_args": [
         "--embedding",
