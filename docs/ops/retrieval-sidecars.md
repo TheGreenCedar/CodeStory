@@ -144,14 +144,16 @@ a `vulkan:Vulkan0` request on Apple Silicon. Use
 prewarm the managed Metal cache cell. Set `CODESTORY_EMBED_NATIVE_LLAMA_SERVER`
 only when overriding the managed binary with an absolute path.
 
-On Linux Docker Compose, the base file stays CPU-compatible and CodeStory adds a
-generated `/dev/dri` override only when accelerator mode is requested and the
-host render node exists. On Windows and current non-macOS defaults, the resolver
-keeps the managed Vulkan request (`Vulkan0`, `99` GPU layers) unless an explicit
-endpoint or device override is configured. On other GPU setups, run an
-already-working native or external llama.cpp embedding endpoint and point
-CodeStory at it with `CODESTORY_EMBED_LLAMACPP_URL`; set the device/layer
-variables only when the resolver request does not match that endpoint.
+On Windows x64, the native llama.cpp resolver selects the manifest-backed b9902
+Vulkan cell by default and launches it with `Vulkan0` plus `99` GPU layers. A
+previous b9058 managed-cache install remains a recognized legacy cell only when
+its install manifest and executable checksum match. On Linux Docker Compose,
+the base file stays CPU-compatible and CodeStory adds a generated `/dev/dri`
+override only when accelerator mode is requested and the host render node
+exists. On other GPU setups, run an already-working native or external
+llama.cpp embedding endpoint and point CodeStory at it with
+`CODESTORY_EMBED_LLAMACPP_URL`; set the device/layer variables only when the
+resolver request does not match that endpoint.
 
 If device state is unknown, full packet/search readiness fails closed by
 default. Use the CPU opt-in only as an explicit operator decision; otherwise
