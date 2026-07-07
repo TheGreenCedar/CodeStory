@@ -61,6 +61,15 @@ surfaces were not visible.
 - When `packet` reports `partial`, run named follow-up commands before proof claims.
 - `retrieval_mode=full` is infrastructure eligibility, not answer-quality proof;
   anything weaker is navigation hints only.
+- On macOS arm64, expected accelerated sidecar intent is
+  `launch_mode=native_spawned` with request provider `metal`. Requested provider
+  and device are intent; observed device state and observation source are proof.
+  If status still reports `vulkan`/`Vulkan0` or
+  `accelerator_request_unobserved` on Apple Silicon, report a stale/pre-release
+  runtime or failed repair and follow the MCP repair loop.
+- CPU-backed retrieval is an explicit degraded policy. It does not make
+  packet/search evidence full unless refreshed status also allows those
+  surfaces and reports `retrieval_mode=full`.
 
 ## Repair Loop
 

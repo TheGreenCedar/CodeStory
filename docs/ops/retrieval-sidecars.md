@@ -126,7 +126,7 @@ defaults do not match your machine:
 | `CODESTORY_EMBED_MODEL_DIR` | Host path containing `bge-base-en-v1.5.Q8_0.gguf` for the compose embed service |
 | `CODESTORY_EMBED_BACKEND` | `llamacpp`; unset also means product llama.cpp mode for retrieval commands |
 | `CODESTORY_EMBED_LLAMACPP_URL` | Local embedding endpoint, default `http://127.0.0.1:8080/v1/embeddings` |
-| `CODESTORY_EMBED_LLAMACPP_DEVICE` | Optional llama.cpp accelerator request, default `Vulkan0` when CPU is not explicitly allowed |
+| `CODESTORY_EMBED_LLAMACPP_DEVICE` | Optional llama.cpp accelerator request override; leave unset for the platform resolver |
 | `CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS` | Optional llama.cpp GPU layer request, default `99` when CPU is not explicitly allowed |
 | `CODESTORY_EMBED_DEVICE_STATE` | Optional operator assertion for observed device state: `accelerated`, `cpu`, or unset/unknown |
 | `CODESTORY_EMBED_ALLOW_CPU` | Set to `1` only when intentional CPU-backed retrieval is acceptable on this machine |
@@ -135,14 +135,23 @@ defaults do not match your machine:
 | `CODESTORY_QDRANT_HTTP_PORT` | Override Qdrant HTTP port when `6333` is unavailable |
 | `CODESTORY_QDRANT_GRPC_PORT` | Override Qdrant gRPC port when `6334` is unavailable |
 
-If CPU is not explicitly allowed, CodeStory requests llama.cpp Vulkan device
-`Vulkan0` and `99` GPU layers by default. Linux Docker Compose keeps the base
-file CPU-compatible and adds a generated `/dev/dri` override only when
-accelerator mode is requested and the host render node exists. On Windows and
-macOS GPU setups, run an already-working native or external llama.cpp embedding
-endpoint and point CodeStory at it with `CODESTORY_EMBED_LLAMACPP_URL`; set the
-device/layer variables only when the default request does not match that
-endpoint.
+If CPU is not explicitly allowed, CodeStory asks the platform resolver for an
+accelerated llama.cpp backend. On macOS arm64, bootstrap/repair installs and
+launches the managed native Metal `llama-server` with
+`launch_mode=native_spawned`; a Linux Docker/Colima embed service cannot satisfy
+a `vulkan:Vulkan0` request on Apple Silicon. Use
+`node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only` only to
+prewarm the managed Metal cache cell. Set `CODESTORY_EMBED_NATIVE_LLAMA_SERVER`
+only when overriding the managed binary with an absolute path.
+
+On Linux Docker Compose, the base file stays CPU-compatible and CodeStory adds a
+generated `/dev/dri` override only when accelerator mode is requested and the
+host render node exists. On Windows and current non-macOS defaults, the resolver
+keeps the managed Vulkan request (`Vulkan0`, `99` GPU layers) unless an explicit
+endpoint or device override is configured. On other GPU setups, run an
+already-working native or external llama.cpp embedding endpoint and point
+CodeStory at it with `CODESTORY_EMBED_LLAMACPP_URL`; set the device/layer
+variables only when the resolver request does not match that endpoint.
 
 If device state is unknown, full packet/search readiness fails closed by
 default. Use the CPU opt-in only as an explicit operator decision; otherwise
@@ -159,6 +168,8 @@ From the CodeStory repository root:
 
 ```sh
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
+# macOS arm64 Metal native sidecar only:
+node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only
 cargo run -p codestory-cli -- retrieval bootstrap --project <repo> --format json
 ```
 

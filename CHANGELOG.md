@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.13.8
+
+CodeStory 0.13.8 fixes Apple Silicon sidecar acceleration by launching a native
+Metal llama.cpp embedding sidecar on macOS arm64, hardens stale MCP workspace
+detection, and updates release artifact actions to Node 24-backed versions.
+
+### Changed
+
+- Pinned release artifact upload/download actions to Node 24-backed versions so
+  release runs stop emitting Node 20 deprecation annotations.
+
+### Fixed
+
+- Made installed CodeStory MCP detect when its live stdio child is serving a
+  stale workspace, report `workspace_mismatch` diagnostics, and block stale
+  repo repair commands until the host relaunches MCP for the active workspace.
+- Added a macOS arm64 Metal llama.cpp backend resolver so Apple Silicon
+  accelerator-required sidecars launch natively without inheriting the Windows
+  Vulkan device default.
+- Added managed macOS arm64 Metal `llama-server` install/checksum handling so
+  native sidecar launch only uses manifest-verified managed binaries.
+- Documented Apple Silicon sidecar repair/status interpretation so operators
+  and agents do not treat Docker Vulkan or CPU fallback as the default macOS
+  acceleration path.
+
 ## 0.13.7
 
 CodeStory 0.13.7 fixes automatic first-start sidecar repair when a stale

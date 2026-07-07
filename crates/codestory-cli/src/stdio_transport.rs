@@ -197,6 +197,18 @@ struct StdioDirtyMarkerStatus {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct StdioActiveState {
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StdioWorkspaceMismatch {
+    active_state_path: PathBuf,
+    served_root: PathBuf,
+    active_root: PathBuf,
+}
+
 fn handle_stdio_message(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
@@ -2195,6 +2207,11 @@ fn read_stdio_status_resource_cached(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
 ) -> Result<serde_json::Value> {
+    if let Some(mismatch) = stdio_workspace_mismatch(runtime) {
+        state.status_cache = None;
+        return Ok(stdio_workspace_mismatch_status(&mismatch));
+    }
+
     let key = stdio_status_cache_key(runtime);
     if let Some(cached) = state.status_cache.as_ref()
         && cached.key == key
@@ -2347,6 +2364,13 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
             marker_path
                 .as_ref()
                 .map(|path| stdio_path_fingerprint(path))
+                .unwrap_or_else(|| "not_configured".to_string())
+        ),
+        format!(
+            "active_state:{}",
+            std::env::var_os("CODESTORY_PLUGIN_ACTIVE_STATE_PATH")
+                .map(PathBuf::from)
+                .map(|path| stdio_path_fingerprint(&path))
                 .unwrap_or_else(|| "not_configured".to_string())
         ),
         format!(
@@ -2541,6 +2565,225 @@ fn stdio_same_path_text(left: &Path, right: &Path) -> bool {
             .to_ascii_lowercase()
     };
     clean(left) == clean(right)
+}
+
+fn stdio_workspace_mismatch(runtime: &RuntimeContext) -> Option<StdioWorkspaceMismatch> {
+    let active_state_path =
+        std::env::var_os("CODESTORY_PLUGIN_ACTIVE_STATE_PATH").map(PathBuf::from)?;
+    let active_root = stdio_active_state_root(&active_state_path)?;
+    if stdio_same_path_text(&active_root, &runtime.project_root) {
+        return None;
+    }
+    Some(StdioWorkspaceMismatch {
+        active_state_path,
+        served_root: runtime.project_root.clone(),
+        active_root,
+    })
+}
+
+fn stdio_active_state_root(active_state_path: &Path) -> Option<PathBuf> {
+    if !stdio_active_state_fresh(active_state_path) {
+        return None;
+    }
+    let active: StdioActiveState =
+        serde_json::from_str(&fs::read_to_string(active_state_path).ok()?).ok()?;
+    let cwd = active.cwd?.trim().to_string();
+    (!cwd.is_empty()).then(|| PathBuf::from(cwd))
+}
+
+fn stdio_active_state_fresh(active_state_path: &Path) -> bool {
+    let max_age_ms = env_nonempty("CODESTORY_PLUGIN_ACTIVE_PROJECT_TTL_MS")
+        .and_then(|value| value.parse::<u128>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60 * 60 * 1000);
+    fs::metadata(active_state_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_none_or(|age| age.as_millis() <= max_age_ms)
+}
+
+fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_json::Value {
+    let plugin_runtime = stdio_plugin_runtime_status();
+    let diagnostic = stdio_workspace_mismatch_diagnostic(mismatch, &plugin_runtime);
+    let local_refresh = serde_json::json!({
+        "state": "blocked",
+        "reason": "workspace_mismatch",
+        "blocks_local_surfaces": true,
+        "readiness_status": "blocked",
+    });
+    serde_json::json!({
+        "status": "workspace_mismatch",
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "plugin_runtime": plugin_runtime,
+        "runtime_truth": {
+            "runtime_source": diagnostic["cli_source"].clone(),
+            "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
+            "managed_cli_path": diagnostic["managed_cli_path"].clone(),
+            "launcher_source": diagnostic["cli_source"].clone(),
+            "workspace": diagnostic.clone(),
+        },
+        "runtime_boundary": {
+            "restart_required_for_runtime_change": true,
+            "message": "The live CodeStory MCP child is serving a different workspace than the active plugin state. Restart/reload the host so MCP relaunches for the active workspace, then reread codestory://status."
+        },
+        "degraded_reason": "workspace_mismatch",
+        "project_root": diagnostic["served_root"].clone(),
+        "workspace_mismatch": diagnostic,
+        "local_refresh": local_refresh,
+        "readiness": [{
+            "goal": "workspace",
+            "status": "blocked",
+            "summary": "CodeStory MCP is serving a stale workspace; repo-specific tools and repairs are blocked until the host relaunches the MCP child for the active workspace.",
+            "repair_reason": "workspace_mismatch",
+            "minimum_next": [],
+            "full_repair": []
+        }],
+        "allowed_surfaces": stdio_workspace_mismatch_allowed_surfaces(),
+        "status_resource_auto_repair": null,
+        "recommended_next_calls": [{
+            "method": "host/restart",
+            "instruction": "Restart/reload the Codex host/app so CodeStory MCP relaunches for the active workspace; then read codestory://status."
+        }, {
+            "method": "resources/read",
+            "uri": "codestory://status"
+        }]
+    })
+}
+
+fn stdio_workspace_mismatch_diagnostic(
+    mismatch: &StdioWorkspaceMismatch,
+    plugin_runtime: &serde_json::Value,
+) -> serde_json::Value {
+    let cli_source = plugin_runtime
+        .get("cli_source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("direct_cli_launch");
+    serde_json::json!({
+        "code": "workspace_mismatch",
+        "served_root": crate::display::clean_path_string(&mismatch.served_root.to_string_lossy()),
+        "active_root": crate::display::clean_path_string(&mismatch.active_root.to_string_lossy()),
+        "active_state_path": crate::display::clean_path_string(&mismatch.active_state_path.to_string_lossy()),
+        "launch_cwd": env_nonempty("CODESTORY_PLUGIN_LAUNCH_CWD"),
+        "runtime_cwd": env_nonempty("CODESTORY_PLUGIN_RUNTIME_CWD"),
+        "cli_source": cli_source,
+        "managed_cli_path": if cli_source == "managed" {
+            plugin_runtime.get("managed_binary_path").cloned().unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+        "managed_cli_version": if cli_source == "managed" {
+            plugin_runtime.get("cli_version").cloned().unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+    })
+}
+
+fn stdio_workspace_mismatch_sidecar_setup(mismatch: &StdioWorkspaceMismatch) -> serde_json::Value {
+    let policy = stdio_sidecar_policy_file();
+    let env_state = env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE");
+    let state = match policy
+        .as_ref()
+        .and_then(|policy| policy.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .or(env_state.as_deref())
+    {
+        Some("enabled") => "enabled",
+        Some("disabled") => "disabled",
+        Some(_) => "ask",
+        None => "unmanaged",
+    };
+    serde_json::json!({
+        "state": state,
+        "auto_repair": false,
+        "prompt_required": false,
+        "prompt": null,
+        "status": "workspace_mismatch",
+        "blocked_reason": "CodeStory MCP is serving a stale workspace; sidecar repair commands are hidden until the host relaunches MCP for the active workspace.",
+        "workspace_mismatch": stdio_workspace_mismatch_diagnostic(
+            mismatch,
+            &stdio_plugin_runtime_status(),
+        ),
+        "mcp_control": {
+            "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
+            "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
+            "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "disable"}},
+            "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "ask"}},
+            "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}
+        },
+        "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
+        "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
+        "next_repair_command": null,
+        "policy_path": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH"),
+        "policy_updated_at": policy
+            .as_ref()
+            .and_then(|policy| policy.get("updated_at"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT")),
+        "last_repair": null,
+        "active_repair": null,
+        "abandoned_repair": null
+    })
+}
+
+fn stdio_workspace_mismatch_allowed_surfaces() -> serde_json::Value {
+    let mut surfaces = serde_json::Map::new();
+    for surface in [
+        "ground",
+        "files",
+        "symbol",
+        "definition",
+        "get_node",
+        "callers",
+        "callees",
+        "neighbors",
+        "shortest_path",
+        "query_subgraph",
+        "symbols",
+        "trace",
+        "trail",
+        "references",
+        "snippet",
+        "affected",
+        "packet",
+        "search",
+        "context",
+        "repair_all",
+    ] {
+        surfaces.insert(surface.to_string(), stdio_workspace_mismatch_surface());
+    }
+    serde_json::Value::Object(surfaces)
+}
+
+fn stdio_workspace_mismatch_surface() -> serde_json::Value {
+    serde_json::json!({
+        "allowed": false,
+        "readiness_goal": "workspace",
+        "status": "workspace_mismatch",
+        "failed_layer": "workspace_binding",
+        "summary": "CodeStory MCP is serving a stale workspace; restart/reload the host before using repo-specific tools or repairs.",
+        "repair_reason": "workspace_mismatch",
+        "blocked_reason": "CodeStory MCP is serving a stale workspace.",
+        "minimum_next": [],
+        "full_repair": [],
+    })
+}
+
+fn stdio_workspace_mismatch_error(runtime: &RuntimeContext) -> Option<serde_json::Value> {
+    let mismatch = stdio_workspace_mismatch(runtime)?;
+    Some(serde_json::json!({
+        "code": "workspace_mismatch",
+        "message": "CodeStory MCP is serving a stale workspace; repair is blocked until the host relaunches MCP for the active workspace.",
+        "workspace_mismatch": stdio_workspace_mismatch_diagnostic(
+            &mismatch,
+            &stdio_plugin_runtime_status(),
+        ),
+        "minimum_next": [],
+        "full_repair": [],
+    }))
 }
 
 fn stdio_effective_freshness(
@@ -3600,18 +3843,37 @@ fn handle_stdio_sidecar_setup(
         .pointer("/params/arguments/action")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("status");
+    let mismatch = stdio_workspace_mismatch(runtime);
     match action {
         "status" => {
+            if let Some(mismatch) = mismatch.as_ref() {
+                return serde_json::json!({"result": stdio_workspace_mismatch_sidecar_setup(mismatch)});
+            }
             serde_json::json!({"result": stdio_sidecar_setup_status(&runtime.project_root)})
         }
         "enable" | "disable" | "ask" => match stdio_write_sidecar_policy(action) {
             Ok(()) => {
                 state.status_cache = None;
+                if let Some(mismatch) = mismatch.as_ref() {
+                    return serde_json::json!({"result": stdio_workspace_mismatch_sidecar_setup(mismatch)});
+                }
                 serde_json::json!({"result": stdio_sidecar_setup_status(&runtime.project_root)})
             }
             Err(error) => serde_json::json!({"error": error.to_string()}),
         },
         "repair" => {
+            if let Some(mismatch) = mismatch.as_ref() {
+                return serde_json::json!({"error": {
+                    "code": "workspace_mismatch",
+                    "message": "CodeStory MCP is serving a stale workspace; repair is blocked until the host relaunches MCP for the active workspace.",
+                    "workspace_mismatch": stdio_workspace_mismatch_diagnostic(
+                        mismatch,
+                        &stdio_plugin_runtime_status(),
+                    ),
+                    "minimum_next": [],
+                    "full_repair": [],
+                }});
+            }
             state.status_cache = None;
             handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Foreground)
         }
@@ -3665,6 +3927,9 @@ fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
     mode: StdioSidecarRepairMode,
 ) -> serde_json::Value {
+    if let Some(error) = stdio_workspace_mismatch_error(runtime) {
+        return serde_json::json!({"error": error});
+    }
     if let Some(status) =
         crate::ready_repair_status::active_ready_repair_status(&runtime.project_root, None)
     {

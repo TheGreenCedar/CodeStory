@@ -10,12 +10,14 @@ use crate::qdrant_storage::{
 };
 use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime_and_launch_metadata};
 use anyhow::{Context, Result, bail};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Relative path from repository root to the retrieval compose file.
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
@@ -50,6 +52,20 @@ struct NativeEmbeddingServerLaunch {
     model_path: PathBuf,
     args: Vec<String>,
     log_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct NativeLlamaCandidate {
+    path: PathBuf,
+    backend: Option<crate::config::LlamaSidecarBackend>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeLlamaInstallManifest {
+    artifact: String,
+    artifact_sha256: String,
+    executable_rel_path: String,
+    executable_sha256: String,
 }
 
 /// Prepare cache dirs, optionally start Docker Compose, write sidecar state, wait for probes.
@@ -309,7 +325,9 @@ fn docker_compose_up(
     let vulkan_override = maybe_write_vulkan_compose_override(
         &user_cache_root(),
         Path::new(LINUX_VULKAN_RENDER_NODE),
-        accelerator_request.is_some(),
+        accelerator_request
+            .as_ref()
+            .is_some_and(|request| request.provider == "vulkan"),
     )?;
     command
         .arg("compose")
@@ -370,12 +388,20 @@ fn docker_compose_up(
         let device = request.device;
         let n_gpu_layers = request.n_gpu_layers;
         command
-            .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
             .env("CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS", &n_gpu_layers)
-            .env("LLAMA_ARG_DEVICE", device)
             .env("LLAMA_ARG_N_GPU_LAYERS", n_gpu_layers);
+        if let Some(device) = device {
+            command
+                .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
+                .env("LLAMA_ARG_DEVICE", device);
+        } else {
+            command
+                .env_remove("CODESTORY_EMBED_LLAMACPP_DEVICE")
+                .env_remove("LLAMA_ARG_DEVICE");
+        }
     } else {
         command
+            .env_remove("CODESTORY_EMBED_LLAMACPP_DEVICE")
             .env_remove("LLAMA_ARG_DEVICE")
             .env_remove("LLAMA_ARG_N_GPU_LAYERS");
     }
@@ -501,6 +527,7 @@ fn native_embedding_server_launch(
     repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<NativeEmbeddingServerLaunch> {
+    ensure_selected_managed_native_llama_server()?;
     let executable = native_llama_server_path(repo_root)?;
     let model_path =
         embed_model_dir(repo_root, &runtime.layout)?.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
@@ -520,18 +547,16 @@ fn native_embedding_server_launch_from_paths(
     model_path: PathBuf,
     runtime: &SidecarRuntimeConfig,
 ) -> NativeEmbeddingServerLaunch {
-    let mut args = vec![
-        "--embedding".to_string(),
-        "--model".to_string(),
-        model_path.display().to_string(),
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        runtime.embed_http_port.to_string(),
-    ];
+    let mut args = native_embedding_launch_args(&model_path, runtime);
     if let Some(request) = crate::embeddings::embedding_accelerator_request() {
-        args.push("--device".to_string());
-        args.push(request.device);
+        if selected_native_llama_backend().is_none() {
+            args.push("--n-gpu-layers".to_string());
+            args.push(request.n_gpu_layers);
+        }
+        if let Some(device) = request.device {
+            args.push("--device".to_string());
+            args.push(device);
+        }
     }
     NativeEmbeddingServerLaunch {
         executable,
@@ -539,6 +564,32 @@ fn native_embedding_server_launch_from_paths(
         args,
         log_path: crate::embeddings::native_embedding_log_path(runtime),
     }
+}
+
+fn native_embedding_launch_args(model_path: &Path, runtime: &SidecarRuntimeConfig) -> Vec<String> {
+    if let Some(backend) = selected_native_llama_backend() {
+        let n_gpu_layers = crate::embeddings::embedding_accelerator_request()
+            .map(|request| request.n_gpu_layers)
+            .unwrap_or_else(|| "0".to_string());
+        return backend
+            .launch_args
+            .into_iter()
+            .map(|arg| {
+                arg.replace("{model}", &model_path.display().to_string())
+                    .replace("{port}", &runtime.embed_http_port.to_string())
+                    .replace("{n_gpu_layers}", &n_gpu_layers)
+            })
+            .collect();
+    }
+    vec![
+        "--embedding".to_string(),
+        "--model".to_string(),
+        model_path.display().to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        runtime.embed_http_port.to_string(),
+    ]
 }
 
 fn embedding_launch_metadata(
@@ -559,13 +610,24 @@ fn embedding_launch_metadata(
         executable_path: Some(native_launch.executable.display().to_string()),
         model_path: Some(native_launch.model_path.display().to_string()),
         requested_device: crate::embeddings::embedding_accelerator_request()
-            .map(|request| request.device),
+            .and_then(|request| request.device),
     }
 }
 
 fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> String {
     if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
         return "env:CODESTORY_EMBED_NATIVE_LLAMA_SERVER".to_string();
+    }
+    if let Some(backend) = selected_native_llama_backend() {
+        let rel_path = native_llama_backend_rel_path(&backend);
+        if path == user_cache_root().join(&rel_path) {
+            return "managed_cache".to_string();
+        }
+        if let Some(root) = repo_root
+            && path == root.join(&rel_path)
+        {
+            return "repo_managed_cache".to_string();
+        }
     }
     if path == user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
         return "managed_cache".to_string();
@@ -591,7 +653,7 @@ fn native_llama_server_path(repo_root: Option<&Path>) -> Result<PathBuf> {
 fn validate_explicit_native_llama_server(path: PathBuf) -> Result<PathBuf> {
     if !path.is_absolute() {
         bail!(
-            "CODESTORY_EMBED_NATIVE_LLAMA_SERVER must be an absolute path to llama-server.exe; ambient PATH lookup is not allowed"
+            "CODESTORY_EMBED_NATIVE_LLAMA_SERVER must be an absolute path to llama-server; ambient PATH lookup is not allowed"
         );
     }
     if !path.is_file() {
@@ -603,27 +665,373 @@ fn validate_explicit_native_llama_server(path: PathBuf) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn native_llama_server_path_from_candidates(candidates: Vec<PathBuf>) -> Result<PathBuf> {
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "native llama-server.exe not found; set CODESTORY_EMBED_NATIVE_LLAMA_SERVER to an absolute path or install managed llama.cpp assets under {}; ambient PATH lookup is not allowed",
-                user_cache_root()
-                    .join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)
-                    .display()
-            )
-        })
+fn native_llama_server_path_from_candidates(
+    candidates: Vec<NativeLlamaCandidate>,
+) -> Result<PathBuf> {
+    let install_hint = candidates
+        .iter()
+        .find(|candidate| candidate.backend.is_some())
+        .map(|candidate| candidate.path.display().to_string())
+        .unwrap_or_else(|| {
+            user_cache_root()
+                .join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)
+                .display()
+                .to_string()
+        });
+    let mut invalid_managed_candidate = None;
+    for candidate in candidates {
+        if !candidate.path.is_file() {
+            continue;
+        }
+        if let Some(backend) = &candidate.backend
+            && let Err(error) = validate_managed_native_llama_server(&candidate.path, backend)
+        {
+            invalid_managed_candidate = Some(error.to_string());
+            continue;
+        }
+        return Ok(candidate.path);
+    }
+    let suffix = invalid_managed_candidate
+        .map(|error| format!(" Last managed candidate was rejected: {error}."))
+        .unwrap_or_default();
+    Err(anyhow::anyhow!(
+        "native llama-server not found; set CODESTORY_EMBED_NATIVE_LLAMA_SERVER to an absolute path or install managed llama.cpp assets under {}; ambient PATH lookup is not allowed{suffix}",
+        install_hint
+    ))
 }
 
-fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = vec![user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)];
+fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<NativeLlamaCandidate> {
+    if let Some(backend) = selected_native_llama_backend() {
+        let rel_path = native_llama_backend_rel_path(&backend);
+        let mut candidates = vec![NativeLlamaCandidate {
+            path: user_cache_root().join(&rel_path),
+            backend: Some(backend.clone()),
+        }];
+        if let Some(root) = repo_root {
+            candidates.push(NativeLlamaCandidate {
+                path: root.join(rel_path),
+                backend: Some(backend),
+            });
+        }
+        return candidates;
+    }
+    let mut candidates = vec![NativeLlamaCandidate {
+        path: user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH),
+        backend: None,
+    }];
     if let Some(root) = repo_root {
-        candidates.push(root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH));
-        candidates.push(root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH));
+        candidates.push(NativeLlamaCandidate {
+            path: root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH),
+            backend: None,
+        });
+        candidates.push(NativeLlamaCandidate {
+            path: root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH),
+            backend: None,
+        });
     }
     candidates
+}
+
+fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend> {
+    crate::embeddings::embedding_accelerator_request()
+        .and_then(|request| crate::config::selected_llama_sidecar_backend(&request.provider))
+}
+
+fn native_llama_backend_rel_path(backend: &crate::config::LlamaSidecarBackend) -> PathBuf {
+    Path::new(&backend.managed_cache_rel_dir).join(&backend.executable_rel_path)
+}
+
+fn ensure_selected_managed_native_llama_server() -> Result<()> {
+    if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
+        return Ok(());
+    }
+    if let Some(backend) = selected_native_llama_backend() {
+        ensure_managed_native_llama_server(&backend)?;
+    }
+    Ok(())
+}
+
+fn ensure_managed_native_llama_server(backend: &crate::config::LlamaSidecarBackend) -> Result<()> {
+    let executable = user_cache_root().join(native_llama_backend_rel_path(backend));
+    if executable.is_file() && validate_managed_native_llama_server(&executable, backend).is_ok() {
+        return Ok(());
+    }
+    let temp_root = managed_llama_temp_root()?;
+    let archive = temp_root.join(&backend.artifact);
+    let install_result = (|| {
+        download_managed_native_llama_server_archive(backend, &archive)?;
+        install_managed_native_llama_server_from_archive(backend, &archive, &executable)
+    })();
+    let cleanup_result = fs::remove_dir_all(&temp_root);
+    if let Err(error) = cleanup_result
+        && install_result.is_ok()
+    {
+        return Err(error).with_context(|| format!("remove {}", temp_root.display()));
+    }
+    install_result
+}
+
+fn managed_llama_temp_root() -> Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = user_cache_root()
+        .join("downloads")
+        .join(format!("llama-server-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
+    Ok(root)
+}
+
+fn download_managed_native_llama_server_archive(
+    backend: &crate::config::LlamaSidecarBackend,
+    archive: &Path,
+) -> Result<()> {
+    let response = ureq::get(&backend.url)
+        .call()
+        .with_context(|| format!("download {}", backend.url))?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", backend.url))?;
+    fs::write(archive, &bytes).with_context(|| format!("write {}", archive.display()))?;
+    verify_sha256(archive, &backend.sha256)
+        .with_context(|| format!("verify {}", archive.display()))?;
+    Ok(())
+}
+
+fn install_managed_native_llama_server_from_archive(
+    backend: &crate::config::LlamaSidecarBackend,
+    archive: &Path,
+    executable: &Path,
+) -> Result<()> {
+    verify_sha256(archive, &backend.sha256)
+        .with_context(|| format!("verify {}", archive.display()))?;
+    let extract_root = archive
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server archive has no parent"))?
+        .join("extract");
+    fs::create_dir_all(&extract_root)
+        .with_context(|| format!("create {}", extract_root.display()))?;
+    let member_path = safe_archive_member_path(&backend.executable_archive_path)?;
+    let output = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&extract_root)
+        .arg(&backend.executable_archive_path)
+        .output()
+        .with_context(|| format!("run tar for {}", archive.display()))?;
+    if !output.status.success() {
+        bail!(
+            "tar failed extracting {}: {}{}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let extracted = extract_root.join(&member_path);
+    validate_extracted_executable(&extracted, backend)?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server executable has no parent"))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let partial = executable.with_extension("download");
+    fs::copy(&extracted, &partial).with_context(|| {
+        format!(
+            "copy extracted llama-server {} to {}",
+            extracted.display(),
+            partial.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&partial)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&partial, permissions)?;
+    }
+    let executable_sha = sha256_file(&partial)?;
+    if !executable_sha.eq_ignore_ascii_case(&backend.executable_sha256) {
+        bail!(
+            "managed llama-server executable checksum mismatch for {}: expected {}, got {}",
+            partial.display(),
+            backend.executable_sha256,
+            executable_sha
+        );
+    }
+    fs::rename(&partial, executable).with_context(|| {
+        format!(
+            "move downloaded llama-server {} to {}",
+            partial.display(),
+            executable.display()
+        )
+    })?;
+    write_managed_native_llama_install_manifest(backend, executable, &executable_sha)?;
+    validate_managed_native_llama_server(executable, backend)
+}
+
+fn safe_archive_member_path(member: &str) -> Result<PathBuf> {
+    if member.trim().is_empty() || member.contains('\\') {
+        bail!("managed llama-server archive path is not portable: {member}");
+    }
+    let path = Path::new(member);
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("managed llama-server archive path must be relative and contained: {member}");
+            }
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        bail!("managed llama-server archive path is empty");
+    }
+    Ok(safe)
+}
+
+fn validate_extracted_executable(
+    extracted: &Path,
+    backend: &crate::config::LlamaSidecarBackend,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(extracted)
+        .with_context(|| format!("metadata {}", extracted.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "managed llama-server archive member is not a regular file: {}",
+            extracted.display()
+        );
+    }
+    let executable_sha = sha256_file(extracted)?;
+    if !executable_sha.eq_ignore_ascii_case(&backend.executable_sha256) {
+        bail!(
+            "managed llama-server executable checksum mismatch for {}: expected {}, got {}",
+            extracted.display(),
+            backend.executable_sha256,
+            executable_sha
+        );
+    }
+    Ok(())
+}
+
+fn write_managed_native_llama_install_manifest(
+    backend: &crate::config::LlamaSidecarBackend,
+    executable: &Path,
+    executable_sha: &str,
+) -> Result<()> {
+    let manifest_path = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server executable has no parent"))?
+        .join("install-manifest.json");
+    let manifest = serde_json::json!({
+        "backend": backend.id,
+        "artifact": backend.artifact,
+        "artifact_sha256": backend.sha256,
+        "executable_rel_path": backend.executable_rel_path,
+        "executable_sha256": executable_sha,
+        "source_url": backend.url,
+    });
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize managed llama-server manifest"),
+    )
+    .with_context(|| format!("write {}", manifest_path.display()))?;
+    Ok(())
+}
+
+fn validate_managed_native_llama_server(
+    executable: &Path,
+    backend: &crate::config::LlamaSidecarBackend,
+) -> Result<()> {
+    let manifest_path = executable
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server path has no parent"))?
+        .join("install-manifest.json");
+    let manifest: NativeLlamaInstallManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", manifest_path.display()))?;
+    if manifest.artifact != backend.artifact {
+        bail!(
+            "managed llama-server artifact mismatch for {}: expected {}, got {}",
+            executable.display(),
+            backend.artifact,
+            manifest.artifact
+        );
+    }
+    if !manifest
+        .artifact_sha256
+        .eq_ignore_ascii_case(&backend.sha256)
+    {
+        bail!(
+            "managed llama-server artifact checksum mismatch for {}: expected {}, got {}",
+            executable.display(),
+            backend.sha256,
+            manifest.artifact_sha256
+        );
+    }
+    if manifest.executable_rel_path != backend.executable_rel_path {
+        bail!(
+            "managed llama-server executable path mismatch for {}: expected {}, got {}",
+            executable.display(),
+            backend.executable_rel_path,
+            manifest.executable_rel_path
+        );
+    }
+    if !manifest
+        .executable_sha256
+        .eq_ignore_ascii_case(&backend.executable_sha256)
+    {
+        bail!(
+            "managed llama-server executable manifest checksum mismatch for {}: expected {}, got {}",
+            executable.display(),
+            backend.executable_sha256,
+            manifest.executable_sha256
+        );
+    }
+    let actual_executable_sha = sha256_file(executable)?;
+    if !actual_executable_sha.eq_ignore_ascii_case(&backend.executable_sha256) {
+        bail!(
+            "managed llama-server executable checksum mismatch for {}: expected {}, got {}",
+            executable.display(),
+            backend.executable_sha256,
+            actual_executable_sha
+        );
+    }
+    Ok(())
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    let actual = sha256_file(path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!(
+            "checksum mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result<()> {
@@ -1017,9 +1425,11 @@ mod tests {
 
     #[test]
     fn native_executable_candidates_do_not_fall_back_to_path() {
-        let error =
-            native_llama_server_path_from_candidates(vec![PathBuf::from("llama-server.exe")])
-                .expect_err("bare executable must not resolve through PATH");
+        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+            path: PathBuf::from("llama-server.exe"),
+            backend: None,
+        }])
+        .expect_err("bare executable must not resolve through PATH");
 
         assert!(
             error
@@ -1029,12 +1439,159 @@ mod tests {
     }
 
     #[test]
+    fn managed_native_candidate_requires_install_manifest() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let backend =
+            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server");
+        std::fs::write(&exe, b"fake exe").expect("exe");
+
+        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+            path: exe,
+            backend: Some(backend),
+        }])
+        .expect_err("missing install manifest must fail closed");
+
+        assert!(error.to_string().contains("install-manifest.json"));
+    }
+
+    #[test]
+    fn managed_native_candidate_accepts_matching_install_manifest() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let mut backend =
+            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server");
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        let executable_sha = sha256_file(&exe).expect("sha");
+        backend.executable_sha256 = executable_sha.clone();
+        std::fs::write(
+            temp.path().join("install-manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "artifact": backend.artifact,
+                "artifact_sha256": backend.sha256,
+                "executable_rel_path": backend.executable_rel_path,
+                "executable_sha256": executable_sha,
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest write");
+
+        let selected = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+            path: exe.clone(),
+            backend: Some(backend),
+        }])
+        .expect("valid managed candidate");
+
+        assert_eq!(selected, exe);
+    }
+
+    #[test]
+    fn managed_native_candidate_rejects_manifest_blessed_wrong_executable() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let backend =
+            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server");
+        std::fs::write(&exe, b"wrong exe").expect("exe");
+        let executable_sha = sha256_file(&exe).expect("sha");
+        std::fs::write(
+            temp.path().join("install-manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "artifact": backend.artifact,
+                "artifact_sha256": backend.sha256,
+                "executable_rel_path": backend.executable_rel_path,
+                "executable_sha256": executable_sha,
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest write");
+
+        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+            path: exe,
+            backend: Some(backend),
+        }])
+        .expect_err("cache manifest must not bless arbitrary executable bytes");
+
+        assert!(
+            error
+                .to_string()
+                .contains("executable manifest checksum mismatch")
+                || error.to_string().contains("executable checksum mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn managed_native_archive_member_path_must_be_contained() {
+        assert!(safe_archive_member_path("llama-b9902/llama-server").is_ok());
+        assert!(safe_archive_member_path("../llama-server").is_err());
+        assert!(safe_archive_member_path("/tmp/llama-server").is_err());
+        assert!(safe_archive_member_path("llama-b9902\\llama-server").is_err());
+    }
+
+    #[test]
+    fn managed_native_install_extracts_archive_and_writes_manifest() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let mut backend =
+            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
+        let temp = tempdir().expect("temp");
+        let archive_root = temp.path().join("archive-root");
+        let payload_dir = archive_root.join("llama-b9902");
+        std::fs::create_dir_all(&payload_dir).expect("payload dir");
+        std::fs::write(payload_dir.join("llama-server"), b"fake exe").expect("payload exe");
+        backend.executable_archive_path = "llama-b9902/llama-server".to_string();
+        backend.executable_sha256 =
+            sha256_file(&payload_dir.join("llama-server")).expect("executable sha");
+        let archive = temp.path().join("llama-test.tar.gz");
+        let output = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&archive_root)
+            .arg("llama-b9902")
+            .output()
+            .expect("tar");
+        assert!(
+            output.status.success(),
+            "tar failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        backend.artifact = "llama-test.tar.gz".to_string();
+        backend.sha256 = sha256_file(&archive).expect("archive sha");
+
+        let executable = temp
+            .path()
+            .join("managed-embeddings")
+            .join("llama")
+            .join("b9902")
+            .join("llama-b9902-bin-macos-arm64-metal")
+            .join("llama-server");
+        install_managed_native_llama_server_from_archive(&backend, &archive, &executable)
+            .expect("install");
+
+        assert_eq!(
+            std::fs::read(&executable).expect("installed exe"),
+            b"fake exe"
+        );
+        validate_managed_native_llama_server(&executable, &backend)
+            .expect("installed manifest validates");
+    }
+
+    #[test]
     fn native_launch_args_use_model_port_and_default_vulkan_device() {
         let _lock = crate::test_support::env_lock();
         let _provider = EnvGuard::remove("CODESTORY_EMBED_DEVICE_PROVIDER");
         let _name = EnvGuard::remove("CODESTORY_EMBED_DEVICE_NAME");
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
 
         let temp = tempdir().expect("temp");
         let exe = temp.path().join("llama-server.exe");
@@ -1072,6 +1629,12 @@ mod tests {
             launch
                 .args
                 .windows(2)
+                .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
+        );
+        assert!(
+            launch
+                .args
+                .windows(2)
                 .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
         );
         let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
@@ -1080,6 +1643,34 @@ mod tests {
         assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
         assert_eq!(metadata.model_path, Some(model.display().to_string()));
         assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));
+    }
+
+    #[test]
+    fn metal_native_launch_uses_gpu_layers_without_device_arg() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server");
+        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        std::fs::write(&model, b"fake model").expect("model");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+
+        let launch =
+            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
+
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
+        );
+        assert!(!launch.args.iter().any(|arg| arg == "--device"));
+        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
+        assert_eq!(metadata.requested_device, None);
     }
 
     #[test]
@@ -1115,6 +1706,14 @@ mod tests {
     }
 
     impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             unsafe {

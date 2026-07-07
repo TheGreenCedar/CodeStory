@@ -72,7 +72,8 @@ pub struct EmbeddingDeviceReadiness {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingAcceleratorRequest {
-    pub device: String,
+    pub provider: String,
+    pub device: Option<String>,
     pub n_gpu_layers: String,
 }
 
@@ -172,10 +173,12 @@ fn embedding_device_readiness_with_observed_state(
         detected_provider: detection.as_ref().map(|gpu| gpu.provider.clone()),
         detected_gpu: detection.map(|gpu| gpu.name),
         accelerator_requested,
-        accelerator_request_provider: accelerator_request.as_ref().map(|_| "vulkan".to_string()),
+        accelerator_request_provider: accelerator_request
+            .as_ref()
+            .map(|request| request.provider.clone()),
         accelerator_request_device: accelerator_request
             .as_ref()
-            .map(|request| request.device.clone()),
+            .and_then(|request| request.device.clone()),
         cpu_allowed,
         full_retrieval_allowed,
         degraded_reason,
@@ -253,8 +256,16 @@ pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
 }
 
 fn default_embedding_accelerator_request() -> EmbeddingAcceleratorRequest {
+    let host = crate::config::embedding_host_platform();
+    let provider = if host.os == "macos" && host.arch == "aarch64" {
+        "metal"
+    } else {
+        "vulkan"
+    };
     EmbeddingAcceleratorRequest {
-        device: env_trimmed(LLAMACPP_DEVICE_ENV).unwrap_or_else(|| "Vulkan0".to_string()),
+        provider: provider.to_string(),
+        device: env_trimmed(LLAMACPP_DEVICE_ENV)
+            .or_else(|| (provider == "vulkan").then(|| "Vulkan0".to_string())),
         n_gpu_layers: env_trimmed(LLAMACPP_N_GPU_LAYERS_ENV).unwrap_or_else(|| "99".to_string()),
     }
 }
@@ -317,8 +328,10 @@ fn observed_embedding_device_state(
 
 fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     let mut saw_cpu = false;
-    for line in text.lines().map(|line| line.to_ascii_lowercase()) {
-        if line_reports_gpu_offload(&line) == Some(true)
+    let text = text.to_ascii_lowercase();
+    let log_markers = selected_backend_log_markers();
+    for line in text.lines() {
+        if line_reports_gpu_offload(line) == Some(true)
             || (line.contains("using device")
                 && ["vulkan", "cuda", "metal"]
                     .iter()
@@ -326,13 +339,30 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         {
             return "accelerated";
         }
-        saw_cpu |= line_reports_gpu_offload(&line) == Some(false)
+        saw_cpu |= line_reports_gpu_offload(line) == Some(false)
             || line.contains("n_gpu_layers = 0")
             || line.contains("using cpu")
             || line.contains("no gpu")
             || line.contains("no vulkan device");
     }
-    if saw_cpu { "cpu" } else { "unknown" }
+    if saw_cpu {
+        "cpu"
+    } else if !log_markers.is_empty()
+        && log_markers
+            .iter()
+            .all(|marker| text.contains(&marker.to_ascii_lowercase()))
+    {
+        "accelerated"
+    } else {
+        "unknown"
+    }
+}
+
+fn selected_backend_log_markers() -> Vec<String> {
+    embedding_accelerator_request()
+        .and_then(|request| crate::config::selected_llama_sidecar_backend(&request.provider))
+        .map(|backend| backend.log_markers)
+        .unwrap_or_default()
 }
 
 fn line_reports_gpu_offload(line: &str) -> Option<bool> {
@@ -824,6 +854,7 @@ mod tests {
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
         let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
 
         let readiness = embedding_device_readiness();
@@ -913,6 +944,7 @@ mod tests {
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
         let _provider = EnvGuard::remove(DEVICE_PROVIDER_ENV);
         let _name = EnvGuard::remove(DEVICE_NAME_ENV);
         let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
@@ -948,8 +980,60 @@ mod tests {
                 .unwrap_or_default()
                 .contains("sidecar did not prove accelerator execution")
         );
-        assert_eq!(request.device, "Vulkan0");
+        assert_eq!(request.provider, "vulkan");
+        assert_eq!(request.device.as_deref(), Some("Vulkan0"));
         assert_eq!(request.n_gpu_layers, "99");
+    }
+
+    #[test]
+    fn simulated_macos_arm64_request_reports_metal_without_vulkan_device() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _ngl = EnvGuard::remove(LLAMACPP_N_GPU_LAYERS_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
+
+        let readiness = embedding_device_readiness();
+        let request = embedding_accelerator_request().expect("accelerator request");
+
+        assert_eq!(request.provider, "metal");
+        assert_eq!(request.device, None);
+        assert_eq!(request.n_gpu_layers, "99");
+        assert_eq!(
+            readiness.accelerator_request_provider.as_deref(),
+            Some("metal")
+        );
+        assert_eq!(readiness.accelerator_request_device, None);
+    }
+
+    #[test]
+    fn selected_backend_log_markers_count_as_accelerator_evidence() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+
+        assert_eq!(
+            observed_embedding_device_state_from_text(
+                "ggml_metal_init: metal backend ready\nload_tensors: offloaded layers\n"
+            ),
+            "accelerated"
+        );
+        assert_eq!(
+            observed_embedding_device_state_from_text("ggml_metal_init: metal backend ready\n"),
+            "unknown"
+        );
+        assert_eq!(
+            observed_embedding_device_state_from_text(
+                "ggml_metal_init: metal backend ready\nload_tensors: offloaded 0/33 layers\n"
+            ),
+            "cpu"
+        );
     }
 
     #[test]
@@ -958,6 +1042,7 @@ mod tests {
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
         let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
         let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
         let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);

@@ -29,10 +29,13 @@ Options:
   --skip-status             Skip final "retrieval status"
   --with-holdout-clone      Clone holdout-retrieval OSS repos (network; large)
   --fetch-embed-model       Download bge-base-en-v1.5.Q8_0.gguf into target/retrieval-models
-  --fetch-only              With --fetch-embed-model, fetch/verify the model and exit
+  --fetch-llama-server      Download the managed native llama-server for this host
+  --llama-backend <id>      Select a llama-server backend from llama-sidecar-backends.json
+  --fetch-only              With --fetch-embed-model/--fetch-llama-server, fetch/verify and exit
   --release                 Build and use release CLI (default: debug for speed)
   --project <path>          Project root for status (default: repo root)
   --wait-secs <n>           Bootstrap wait timeout (default: 90)
+  --self-test               Run script self-tests (no network)
 
 Examples:
   node scripts/setup-retrieval-env.mjs --check-only
@@ -49,10 +52,13 @@ function parseArgs(argv) {
     skipStatus: false,
     withHoldoutClone: false,
     fetchEmbedModel: false,
+    fetchLlamaServer: false,
+    llamaBackend: null,
     fetchOnly: false,
     release: false,
     project: repoRoot,
     waitSecs: 90,
+    selfTest: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -84,6 +90,14 @@ function parseArgs(argv) {
       opts.fetchEmbedModel = true;
       continue;
     }
+    if (arg === "--fetch-llama-server") {
+      opts.fetchLlamaServer = true;
+      continue;
+    }
+    if (arg === "--llama-backend") {
+      opts.llamaBackend = argv[++i];
+      continue;
+    }
     if (arg === "--fetch-only") {
       opts.fetchOnly = true;
       continue;
@@ -100,13 +114,20 @@ function parseArgs(argv) {
       opts.waitSecs = Number.parseInt(argv[++i], 10);
       continue;
     }
+    if (arg === "--self-test") {
+      opts.selfTest = true;
+      continue;
+    }
     throw new Error(`Unknown argument: ${arg}`);
   }
   if (!Number.isInteger(opts.waitSecs) || opts.waitSecs < 0) {
     throw new Error("--wait-secs must be a non-negative integer");
   }
-  if (opts.fetchOnly && !opts.fetchEmbedModel) {
-    throw new Error("--fetch-only requires --fetch-embed-model");
+  if (opts.fetchOnly && !opts.fetchEmbedModel && !opts.fetchLlamaServer) {
+    throw new Error("--fetch-only requires --fetch-embed-model or --fetch-llama-server");
+  }
+  if (opts.llamaBackend && !opts.fetchLlamaServer && !opts.selfTest) {
+    throw new Error("--llama-backend requires --fetch-llama-server");
   }
   return opts;
 }
@@ -169,6 +190,13 @@ function printPrereqReport(opts) {
       "docker",
       commandExists("docker"),
       opts.skipCompose || opts.fetchOnly ? "optional" : "required for live Qdrant",
+    ],
+    [
+      "tar",
+      commandExists("tar"),
+      opts.fetchLlamaServer && !opts.checkOnly
+        ? "required for llama-server archive extraction"
+        : "optional",
     ],
     [
       `compose file (${composeFile})`,
@@ -304,9 +332,232 @@ async function fetchEmbedModel() {
   throw new Error(`Failed to download embed model: ${lastError ?? "no URLs configured"}`);
 }
 
+const LLAMA_BACKENDS_MANIFEST = path.join(
+  repoRoot,
+  "crates",
+  "codestory-retrieval",
+  "assets",
+  "llama-sidecar-backends.json",
+);
+const LLAMA_INSTALL_MANIFEST = "install-manifest.json";
+
+function readLlamaBackends() {
+  return JSON.parse(fs.readFileSync(LLAMA_BACKENDS_MANIFEST, "utf8")).backends ?? [];
+}
+
+function hostOs() {
+  if (process.platform === "darwin") {
+    return "macos";
+  }
+  if (process.platform === "win32") {
+    return "windows";
+  }
+  return process.platform;
+}
+
+function hostArch() {
+  if (process.arch === "arm64") {
+    return "aarch64";
+  }
+  if (process.arch === "x64") {
+    return "x86_64";
+  }
+  return process.arch;
+}
+
+function selectedLlamaBackend(opts) {
+  const backends = readLlamaBackends();
+  if (opts.llamaBackend) {
+    const backend = backends.find((candidate) => candidate.id === opts.llamaBackend);
+    if (!backend) {
+      throw new Error(`Unknown llama backend ${opts.llamaBackend} in ${LLAMA_BACKENDS_MANIFEST}`);
+    }
+    return backend;
+  }
+  const osName = hostOs();
+  const arch = hostArch();
+  const provider =
+    process.env.CODESTORY_EMBED_DEVICE_PROVIDER?.trim().toLowerCase() ||
+    (osName === "macos" && arch === "aarch64" ? "metal" : "");
+  const backend = backends.find(
+    (candidate) =>
+      candidate.os === osName && candidate.arch === arch && candidate.provider === provider,
+  );
+  if (!backend) {
+    throw new Error(`No managed llama-server backend for ${osName}/${arch}/${provider || "default"}`);
+  }
+  return backend;
+}
+
+function managedLlamaServerPath(backend) {
+  return path.join(codestoryCacheRoot(), backend.managed_cache_rel_dir, backend.executable_rel_path);
+}
+
+async function verifySha256(file, expected, label) {
+  const actual = await sha256File(file);
+  if (actual !== expected.toLowerCase()) {
+    throw new Error(`${label} SHA-256 mismatch for ${file}: got ${actual}, expected ${expected}`);
+  }
+  return actual;
+}
+
+function safeArchiveMemberPath(member) {
+  if (!member || member.trim() === "" || member.includes("\\") || /^[A-Za-z]:/.test(member)) {
+    throw new Error(`Managed llama-server archive path is not portable: ${member}`);
+  }
+  const normalized = path.posix.normalize(member);
+  if (
+    normalized === "." ||
+    normalized.startsWith("../") ||
+    normalized.includes("/../") ||
+    path.posix.isAbsolute(normalized)
+  ) {
+    throw new Error(`Managed llama-server archive path must be relative and contained: ${member}`);
+  }
+  return normalized;
+}
+
+async function validateExtractedExecutable(file, backend) {
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Managed llama-server archive member is not a regular file: ${file}`);
+  }
+  const executableSha = await sha256File(file);
+  if (executableSha !== backend.executable_sha256.toLowerCase()) {
+    throw new Error(
+      `llama-server executable SHA-256 mismatch for ${file}: got ${executableSha}, expected ${backend.executable_sha256}`,
+    );
+  }
+  return executableSha;
+}
+
+function printLlamaServerPlan(backend) {
+  console.log("\nManaged llama-server:");
+  console.log(`  backend: ${backend.id}`);
+  console.log(`  artifact: ${backend.artifact}`);
+  console.log(`  url: ${backend.url}`);
+  console.log(`  sha256: ${backend.sha256}`);
+  console.log(`  executable_archive_path: ${backend.executable_archive_path}`);
+  console.log(`  executable_sha256: ${backend.executable_sha256}`);
+  console.log(`  target: ${managedLlamaServerPath(backend)}`);
+}
+
+async function fetchLlamaServer(opts) {
+  const backend = selectedLlamaBackend(opts);
+  const dest = managedLlamaServerPath(backend);
+  printLlamaServerPlan(backend);
+  if (opts.checkOnly) {
+    return dest;
+  }
+  if (!commandExists("tar")) {
+    throw new Error("tar is required to extract the managed llama-server archive");
+  }
+  const targetDir = path.dirname(dest);
+  fs.mkdirSync(targetDir, { recursive: true });
+  const existingManifest = path.join(targetDir, LLAMA_INSTALL_MANIFEST);
+  if (fs.existsSync(dest) && fs.existsSync(existingManifest)) {
+    const manifest = JSON.parse(fs.readFileSync(existingManifest, "utf8"));
+    const executableSha = await sha256File(dest);
+    if (
+      manifest.artifact === backend.artifact &&
+      manifest.artifact_sha256?.toLowerCase() === backend.sha256.toLowerCase() &&
+      manifest.executable_rel_path === backend.executable_rel_path &&
+      manifest.executable_sha256?.toLowerCase() === backend.executable_sha256.toLowerCase() &&
+      executableSha === backend.executable_sha256.toLowerCase()
+    ) {
+      console.log(`llama-server already present and verified: ${dest} sha256=${executableSha}`);
+      return dest;
+    }
+    console.log(`Managed llama-server install manifest is stale for ${dest}; redownloading.`);
+  }
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-llama-server-"));
+  const archive = path.join(tempRoot, backend.artifact);
+  const extractDir = path.join(tempRoot, "extract");
+  fs.mkdirSync(extractDir);
+  try {
+    console.log(`Downloading ${backend.artifact} from ${backend.url} to ${archive} ...`);
+    const response = await fetch(backend.url);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} from ${backend.url}`);
+    }
+    fs.writeFileSync(archive, Buffer.from(await response.arrayBuffer()));
+    await verifySha256(archive, backend.sha256, "llama-server artifact");
+    const member = safeArchiveMemberPath(backend.executable_archive_path);
+    const result = spawnSync(commandName("tar"), ["-xzf", archive, "-C", extractDir, member], {
+      encoding: "utf8",
+      shell: false,
+    });
+    if (result.status !== 0) {
+      throw new Error(`tar failed extracting ${archive}: ${result.stderr || result.stdout}`);
+    }
+    const extracted = path.join(extractDir, ...member.split("/"));
+    await validateExtractedExecutable(extracted, backend);
+    fs.copyFileSync(extracted, dest);
+    fs.chmodSync(dest, 0o755);
+    const executableSha = await sha256File(dest);
+    if (executableSha !== backend.executable_sha256.toLowerCase()) {
+      throw new Error(
+        `llama-server executable SHA-256 mismatch for ${dest}: got ${executableSha}, expected ${backend.executable_sha256}`,
+      );
+    }
+    fs.writeFileSync(
+      existingManifest,
+      `${JSON.stringify(
+        {
+          backend: backend.id,
+          artifact: backend.artifact,
+          artifact_sha256: backend.sha256,
+          executable_rel_path: backend.executable_rel_path,
+          executable_sha256: backend.executable_sha256,
+          source_url: backend.url,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    console.log(`Wrote ${dest} (sha256=${executableSha})`);
+    return dest;
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
+async function runSelfTest() {
+  const backends = readLlamaBackends();
+  const macMetal = backends.find((backend) => backend.id === "macos-aarch64-metal");
+  if (!macMetal) {
+    throw new Error("missing macos-aarch64-metal backend");
+  }
+  if (backends.some((backend) => backend.os === "macos" && backend.arch !== "aarch64")) {
+    throw new Error("macOS Intel llama-server backend must not be present");
+  }
+  if (!macMetal.managed_cache_rel_dir.includes("/llama/b9902/")) {
+    throw new Error(`unexpected managed cache version path: ${macMetal.managed_cache_rel_dir}`);
+  }
+  if (safeArchiveMemberPath(macMetal.executable_archive_path) !== "llama-b9902/llama-server") {
+    throw new Error(`unexpected executable archive path: ${macMetal.executable_archive_path}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(macMetal.executable_sha256)) {
+    throw new Error(`unexpected executable sha256: ${macMetal.executable_sha256}`);
+  }
+  const selected = selectedLlamaBackend({ llamaBackend: "macos-aarch64-metal" });
+  if (managedLlamaServerPath(selected).split(path.sep).join("/").endsWith("llama-server") !== true) {
+    throw new Error("managed llama-server target path should end in llama-server");
+  }
+  console.log("setup-retrieval-env self-test passed");
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.selfTest) {
+    await runSelfTest();
+    return;
+  }
   const failed = printPrereqReport(opts);
+  if (opts.fetchLlamaServer && opts.checkOnly) {
+    printLlamaServerPlan(selectedLlamaBackend(opts));
+  }
   if (opts.checkOnly) {
     process.exit(failed ? 1 : 0);
   }
@@ -316,10 +567,13 @@ async function main() {
 
   if (opts.fetchEmbedModel) {
     await fetchEmbedModel();
-    if (opts.fetchOnly) {
-      console.log("\nFetch-only setup complete.");
-      return;
-    }
+  }
+  if (opts.fetchLlamaServer) {
+    await fetchLlamaServer(opts);
+  }
+  if (opts.fetchOnly) {
+    console.log("\nFetch-only setup complete.");
+    return;
   }
 
   const bootstrapArgs = [

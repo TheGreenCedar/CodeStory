@@ -80,7 +80,7 @@ jobs:
 
       - name: Upload post-publish agent proof artifacts
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: post-publish-agent-proof-linux-x64-${{ steps.release.outputs.version }}
           path: target/post-publish-agent-proof

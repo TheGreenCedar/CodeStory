@@ -202,7 +202,7 @@ jobs:
 
       - name: Upload packaged agent proof artifacts
         if: always() && matrix.asset_target == 'linux-x64'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: packaged-agent-proof-${{ matrix.asset_target }}
           path: target/packaged-agent-proof
@@ -230,7 +230,7 @@ jobs:
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
       - name: Upload release asset
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: codestory-cli-${{ matrix.asset_target }}
           path: |
@@ -266,7 +266,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download release assets
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8.0.1
         with:
           path: target/release-assets
           pattern: codestory-cli-*
@@ -375,7 +375,7 @@ jobs:
 
       - name: Upload post-publish agent proof artifacts
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: post-publish-agent-proof-linux-x64
           path: target/post-publish-agent-proof
