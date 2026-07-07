@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.10
+
+CodeStory 0.13.10 defines the Linux accelerated sidecar backend matrix while
+keeping Linux launch behavior fail-closed until host GPU devices and live proof
+are available.
+
 ### Changed
 
 - Added explicit Linux accelerated sidecar backend cells and Docker launch
