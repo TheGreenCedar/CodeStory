@@ -69,7 +69,7 @@ function releaseAssetForPlatform(version) {
 }
 
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -370,6 +370,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.sha256, sha256);
     assert.equal(observed.pluginRoot, pluginRoot);
     assert.equal(observed.pluginCacheVersion, "");
+    assert.equal(observed.activeStatePath, join(dataDir, ".codestory-active"));
     assert.equal(observed.sidecarPolicy, "ask");
     assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
     assert.match(observed.sidecarEnable, /--policy-file/u);
@@ -498,6 +499,43 @@ test("mcp launcher uses active project state when host launches from plugin root
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test("stdio workspace mismatch blocks stale repo repair guidance", async () => {
+  const launcher = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
+  const transport = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_transport.rs"), "utf8");
+
+  assert.match(launcher, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH:\s*projectResolution\.statePath \|\| activeStatePath\(\) \|\| ''/u);
+  assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
+  assert.match(transport, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH/u);
+  assert.match(transport, /let active_root = stdio_active_state_root\(&active_state_path\)\?/u);
+  assert.match(transport, /if stdio_same_path_text\(&active_root, &runtime\.project_root\)/u);
+  assert.match(transport, /fn read_stdio_status_resource_cached[\s\S]*if let Some\(mismatch\) = stdio_workspace_mismatch\(runtime\)/u);
+  assert.match(transport, /"status": "workspace_mismatch"/u);
+  assert.match(transport, /"served_root"/u);
+  assert.match(transport, /"active_root"/u);
+  assert.match(transport, /"launch_cwd"/u);
+  assert.match(transport, /"runtime_cwd"/u);
+  assert.match(transport, /"managed_cli_path"/u);
+  assert.match(transport, /"managed_cli_version"/u);
+  assert.match(transport, /fn stdio_workspace_mismatch_sidecar_setup\(mismatch: &StdioWorkspaceMismatch\)/u);
+  assert.match(transport, /"status": "workspace_mismatch"[\s\S]*"next_repair_command": null/u);
+  assert.match(transport, /"last_repair": null/u);
+  assert.match(transport, /"status" => \{[\s\S]*stdio_workspace_mismatch_sidecar_setup\(mismatch\)[\s\S]*stdio_sidecar_setup_status/u);
+  assert.match(transport, /"enable" \| "disable" \| "ask"[\s\S]*stdio_workspace_mismatch_sidecar_setup\(mismatch\)[\s\S]*stdio_sidecar_setup_status/u);
+  assert.match(transport, /"repair_all"[\s\S]*stdio_workspace_mismatch_surface/u);
+  assert.match(transport, /"minimum_next": \[\]/u);
+  assert.match(transport, /"full_repair": \[\]/u);
+  assert.match(transport, /"repair" => \{[\s\S]*"code": "workspace_mismatch"[\s\S]*handle_stdio_sidecar_repair/u);
+  assert.match(transport, /fn handle_stdio_sidecar_repair[\s\S]*stdio_workspace_mismatch_error\(runtime\)/u);
+  assert.doesNotMatch(
+    transport.match(/fn stdio_workspace_mismatch_status[\s\S]*?fn stdio_workspace_mismatch_diagnostic/u)?.[0] || "",
+    /ready --goal agent --repair/u,
+  );
+  assert.doesNotMatch(
+    transport.match(/fn stdio_workspace_mismatch_sidecar_setup[\s\S]*?fn stdio_workspace_mismatch_allowed_surfaces/u)?.[0] || "",
+    /ready --goal agent --repair|next_repair_command":\s*"/u,
+  );
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
@@ -695,7 +733,8 @@ test("mcp launcher prefers thread-scoped active project over another thread's gl
         "  args,",
         "  cwd: process.cwd(),",
         "  projectRoot: process.env.CODESTORY_PLUGIN_PROJECT_ROOT || '',",
-        "  projectRootSource: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE || ''",
+        "  projectRootSource: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE || '',",
+        "  activeStatePath: process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH || ''",
         "}) + '\\n');",
         "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
         "if (args[0] === 'serve') { fs.writeFileSync(process.env.TEST_OUT, 'serve-called'); process.exit(0); }",
@@ -736,6 +775,7 @@ test("mcp launcher prefers thread-scoped active project over another thread's gl
     assert.equal(serve.cwd, currentRepo);
     assert.equal(serve.projectRoot, currentRepo);
     assert.equal(serve.projectRootSource, "plugin_active_thread_state");
+    assert.equal(serve.activeStatePath, threadActiveStatePath(dataDir, currentThread));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

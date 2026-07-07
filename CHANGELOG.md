@@ -7,6 +7,12 @@
 - Pinned release artifact upload/download actions to Node 24-backed versions so
   release runs stop emitting Node 20 deprecation annotations.
 
+### Fixed
+
+- Made installed CodeStory MCP detect when its live stdio child is serving a
+  stale workspace, report `workspace_mismatch` diagnostics, and block stale
+  repo repair commands until the host relaunches MCP for the active workspace.
+
 ## 0.13.7
 
 CodeStory 0.13.7 fixes automatic first-start sidecar repair when a stale
