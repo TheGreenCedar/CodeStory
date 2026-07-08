@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Fixed Windows native sidecar repair so Vulkan acceleration does not require
+  the Linux `/dev/dri` Compose override when Compose is only starting Qdrant and
+  Zoekt, managed llama.cpp installs restore the full Windows DLL payload, and
+  b9902 native sidecars can prove the requested Vulkan device through
+  `llama-server --list-devices`.
+
 ## 0.13.10
 
 CodeStory 0.13.10 defines the Linux accelerated sidecar backend matrix while
