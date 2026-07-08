@@ -194,7 +194,7 @@ mod windows_gate {
         let mut ids = Vec::with_capacity(docs.len());
         let mut id_to_doc = HashMap::with_capacity(docs.len());
         for (index, doc) in docs.iter().enumerate() {
-            // ponytail: local ids avoid unsigned casts for virtual graph ids; id_to_doc keeps real ids.
+            // ponytail: local ids avoid unsigned casts for virtual graph ids; use real ids if turbovec gains signed ids.
             let id = u64::try_from(index + 1).context("too many dense docs")?;
             if doc.embedding.len() != dim {
                 bail!(
