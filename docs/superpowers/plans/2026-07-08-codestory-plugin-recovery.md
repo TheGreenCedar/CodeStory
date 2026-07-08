@@ -42,7 +42,7 @@
 ### C. Operator Surfaces And Release Hygiene
 
 - [x] Update `CHANGELOG.md` under `Unreleased` before committing behavior, release, packaging, or operator-guidance changes.
-- [x] Update `docs/testing/codestory-plugin-friction-2026-07-07.md` as each hypothesis is confirmed or rejected.
+- [x] Retire the obsolete `docs/testing/codestory-plugin-friction-2026-07-07.md` note after the confirmed fixes moved into branch commits and verification evidence.
 - [x] If plugin source or packaged behavior changes, verify whether `TheGreenCedar/AgentPluginMarketplace` needs a corresponding pointer or metadata update before treating Codex plugin pickup as complete. This PR is verified through the local `CodeStoryLocal` override rather than a released marketplace pointer; marketplace follow-through is still required when the plugin release is published.
 - [x] Keep current-state proof separate from source proof: source changes are not enough until the managed plugin runtime or explicit target binary shows the fixed behavior.
 - [x] Keep MCP repair calls bounded: `sidecar_setup repair` starts Rust repair in background and returns status inspection guidance instead of blocking the stdio request through long sidecar rebuilds.
