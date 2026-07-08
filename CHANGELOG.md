@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.13.11
+
+CodeStory 0.13.11 fixes Windows native sidecar repair after the Linux
+accelerated backend work, keeping Windows on native Vulkan `llama-server.exe`
+without requiring Linux device mounts.
+
+### Fixed
+
+- Fixed Windows native sidecar repair so Vulkan acceleration does not require
+  the Linux `/dev/dri` Compose override when Compose is only starting Qdrant and
+  Zoekt, managed llama.cpp installs restore the full Windows DLL payload, and
+  b9902 native sidecars can prove the requested Vulkan device through
+  `llama-server --list-devices`.
 
 ## 0.13.10
 

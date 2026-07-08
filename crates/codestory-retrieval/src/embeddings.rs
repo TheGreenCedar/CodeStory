@@ -77,6 +77,17 @@ pub struct EmbeddingAcceleratorRequest {
     pub n_gpu_layers: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct NativeEmbeddingDeviceStateFile {
+    embedding_launch: Option<NativeEmbeddingDeviceLaunch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeEmbeddingDeviceLaunch {
+    executable_path: Option<String>,
+    requested_device: Option<String>,
+}
+
 /// Stable id stored on retrieval manifest rows (backend + model family).
 pub fn embedding_runtime_id() -> String {
     if llamacpp_backend_selected() {
@@ -223,14 +234,68 @@ fn observe_sidecar_embedding_device_state(
 fn observe_native_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    let text = std::fs::read_to_string(native_embedding_log_path(runtime)).ok()?;
-    match observed_embedding_device_state_from_text(native_embedding_log_current_launch(&text)) {
-        "unknown" => None,
-        state => Some(EmbeddingDeviceObservation {
-            state,
-            source: "native_log",
-        }),
+    let text = std::fs::read_to_string(native_embedding_log_path(runtime)).ok();
+    if let Some(text) = text.as_deref() {
+        match observed_embedding_device_state_from_text(native_embedding_log_current_launch(text)) {
+            "unknown" => {}
+            state => {
+                return Some(EmbeddingDeviceObservation {
+                    state,
+                    source: "native_log",
+                });
+            }
+        }
     }
+    observe_native_embedding_device_state_from_device_list(runtime)
+}
+
+fn observe_native_embedding_device_state_from_device_list(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<EmbeddingDeviceObservation> {
+    let request = embedding_accelerator_request()?;
+    let state: NativeEmbeddingDeviceStateFile =
+        serde_json::from_slice(&std::fs::read(&runtime.layout.state_file).ok()?).ok()?;
+    let launch = state.embedding_launch?;
+    let executable = launch.executable_path?;
+    let output = Command::new(executable)
+        .arg("--list-devices")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if native_device_list_proves_accelerator(&text, &request, launch.requested_device.as_deref()) {
+        Some(EmbeddingDeviceObservation {
+            state: "accelerated",
+            source: "native_device_list",
+        })
+    } else {
+        None
+    }
+}
+
+fn native_device_list_proves_accelerator(
+    text: &str,
+    request: &EmbeddingAcceleratorRequest,
+    requested_device: Option<&str>,
+) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    if let Some(device) = requested_device.or(request.device.as_deref()) {
+        let device = device.to_ascii_lowercase();
+        return text.lines().any(|line| {
+            let line = line.trim_start().to_ascii_lowercase();
+            line.starts_with(&format!("{device}:")) || line.contains(&device)
+        });
+    }
+    if request.provider.is_empty() {
+        return false;
+    }
+    normalized.contains(&request.provider.to_ascii_lowercase())
 }
 
 pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeConfig) -> PathBuf {
@@ -1232,6 +1297,49 @@ mod tests {
         assert_eq!(readiness.observed_state, "accelerated");
         assert_eq!(readiness.observation_source, "native_log");
         assert!(readiness.full_retrieval_allowed);
+    }
+
+    #[test]
+    fn native_device_list_proves_requested_vulkan_device() {
+        let request = EmbeddingAcceleratorRequest {
+            provider: "vulkan".to_string(),
+            device: Some("Vulkan0".to_string()),
+            n_gpu_layers: "99".to_string(),
+        };
+        let devices = "Available devices:\n  Vulkan0: AMD Radeon RX 7900 XT (20464 MiB)\n";
+
+        assert!(native_device_list_proves_accelerator(
+            devices,
+            &request,
+            Some("Vulkan0")
+        ));
+        assert!(!native_device_list_proves_accelerator(
+            "Available devices:\n  CUDA0: NVIDIA GPU\n",
+            &request,
+            Some("Vulkan0")
+        ));
+    }
+
+    #[test]
+    fn native_device_list_observation_allows_accelerator_required_readiness() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "amd");
+        let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
+        let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
+
+        let readiness =
+            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+                state: "accelerated",
+                source: "native_device_list",
+            }));
+
+        assert_eq!(readiness.observed_state, "accelerated");
+        assert_eq!(readiness.observation_source, "native_device_list");
+        assert!(readiness.full_retrieval_allowed);
+        assert!(readiness.degraded_reason.is_none());
     }
 
     #[test]

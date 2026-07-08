@@ -28,6 +28,7 @@ const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
 const LINUX_VULKAN_RENDER_NODE: &str = "/dev/dri";
 const VULKAN_COMPOSE_OVERRIDE: &str =
     "services:\n  embed:\n    devices:\n      - /dev/dri:/dev/dri\n";
+const MANAGED_LLAMA_EXTRACTED_MARKER: &str = ".codestory-extracted";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EmbedModelInventory {
@@ -325,9 +326,7 @@ fn docker_compose_up(
     let vulkan_override = maybe_write_vulkan_compose_override(
         &user_cache_root(),
         Path::new(LINUX_VULKAN_RENDER_NODE),
-        accelerator_request
-            .as_ref()
-            .is_some_and(|request| request.provider == "vulkan"),
+        vulkan_compose_override_requested(launch_mode, accelerator_request.as_ref()),
     )?;
     command
         .arg("compose")
@@ -527,6 +526,14 @@ fn docker_compose_services_for_launch_mode(
         EmbeddingServerLaunchMode::DockerComposeEmbed => &[],
         EmbeddingServerLaunchMode::NativeSpawned => &["qdrant", "zoekt"],
     }
+}
+
+fn vulkan_compose_override_requested(
+    mode: EmbeddingServerLaunchMode,
+    request: Option<&crate::embeddings::EmbeddingAcceleratorRequest>,
+) -> bool {
+    mode == EmbeddingServerLaunchMode::DockerComposeEmbed
+        && request.is_some_and(|request| request.provider == "vulkan")
 }
 
 fn native_embedding_server_launch(
@@ -856,7 +863,6 @@ fn install_managed_native_llama_server_from_archive(
         .arg(archive)
         .arg("-C")
         .arg(&extract_root)
-        .arg(&backend.executable_archive_path)
         .output()
         .with_context(|| format!("run tar for {}", archive.display()))?;
     if !output.status.success() {
@@ -869,42 +875,61 @@ fn install_managed_native_llama_server_from_archive(
     }
     let extracted = extract_root.join(&member_path);
     validate_extracted_executable(&extracted, backend)?;
-    let parent = executable
+    let target_dir = executable
         .parent()
         .ok_or_else(|| anyhow::anyhow!("managed llama-server executable has no parent"))?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let partial = executable.with_extension("download");
-    fs::copy(&extracted, &partial).with_context(|| {
+    let source_dir = extracted
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server archive member has no parent"))?;
+    let target_parent = target_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server install dir has no parent"))?;
+    fs::create_dir_all(target_parent)
+        .with_context(|| format!("create {}", target_parent.display()))?;
+    let staging_dir = target_dir.with_extension("download");
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .with_context(|| format!("remove {}", staging_dir.display()))?;
+    }
+    copy_dir_contents(source_dir, &staging_dir).with_context(|| {
         format!(
-            "copy extracted llama-server {} to {}",
-            extracted.display(),
-            partial.display()
+            "copy extracted llama-server payload {} to {}",
+            source_dir.display(),
+            staging_dir.display()
         )
     })?;
+    let executable_rel_path = safe_archive_member_path(&backend.executable_rel_path)?;
+    let staged_executable = staging_dir.join(executable_rel_path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&partial)?.permissions();
+        let mut permissions = fs::metadata(&staged_executable)?.permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&partial, permissions)?;
+        fs::set_permissions(&staged_executable, permissions)?;
     }
-    let executable_sha = sha256_file(&partial)?;
+    let executable_sha = sha256_file(&staged_executable)?;
     if !executable_sha.eq_ignore_ascii_case(&backend.executable_sha256) {
         bail!(
             "managed llama-server executable checksum mismatch for {}: expected {}, got {}",
-            partial.display(),
+            staged_executable.display(),
             backend.executable_sha256,
             executable_sha
         );
     }
-    fs::rename(&partial, executable).with_context(|| {
+    fs::write(staging_dir.join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
+        .with_context(|| format!("write extraction marker {}", staging_dir.display()))?;
+    write_managed_native_llama_install_manifest(backend, &staged_executable, &executable_sha)?;
+    if target_dir.exists() {
+        fs::remove_dir_all(target_dir)
+            .with_context(|| format!("remove {}", target_dir.display()))?;
+    }
+    fs::rename(&staging_dir, target_dir).with_context(|| {
         format!(
-            "move downloaded llama-server {} to {}",
-            partial.display(),
-            executable.display()
+            "move downloaded llama-server payload {} to {}",
+            staging_dir.display(),
+            target_dir.display()
         )
     })?;
-    write_managed_native_llama_install_manifest(backend, executable, &executable_sha)?;
     validate_managed_native_llama_server(executable, backend)
 }
 
@@ -927,6 +952,40 @@ fn safe_archive_member_path(member: &str) -> Result<PathBuf> {
         bail!("managed llama-server archive path is empty");
     }
     Ok(safe)
+}
+
+fn copy_dir_contents(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("create {}", target.display()))?;
+    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry.with_context(|| format!("read entry in {}", source.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read file type {}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            bail!(
+                "managed llama-server archive member must not be a symlink: {}",
+                entry.path().display()
+            );
+        }
+        let target_path = target.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_contents(&entry.path(), &target_path)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target_path).with_context(|| {
+                format!(
+                    "copy managed llama-server archive member {} to {}",
+                    entry.path().display(),
+                    target_path.display()
+                )
+            })?;
+        } else {
+            bail!(
+                "managed llama-server archive member is not a regular file or directory: {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_extracted_executable(
@@ -982,10 +1041,11 @@ fn validate_managed_native_llama_server(
     executable: &Path,
     backend: &crate::config::LlamaSidecarBackend,
 ) -> Result<()> {
-    let manifest_path = executable
+    let install_dir = executable
         .parent()
         .ok_or_else(|| anyhow::anyhow!("managed llama-server path has no parent"))?
-        .join("install-manifest.json");
+        .to_path_buf();
+    let manifest_path = install_dir.join("install-manifest.json");
     let manifest: NativeLlamaInstallManifest = serde_json::from_slice(
         &std::fs::read(&manifest_path)
             .with_context(|| format!("read {}", manifest_path.display()))?,
@@ -1036,6 +1096,14 @@ fn validate_managed_native_llama_server(
             executable.display(),
             backend.executable_sha256,
             actual_executable_sha
+        );
+    }
+    let extraction_marker = install_dir.join(MANAGED_LLAMA_EXTRACTED_MARKER);
+    if !extraction_marker.is_file() {
+        bail!(
+            "managed llama-server install is incomplete for {}; missing {}",
+            executable.display(),
+            extraction_marker.display()
         );
     }
     Ok(())
@@ -1430,6 +1498,28 @@ mod tests {
     }
 
     #[test]
+    fn native_launch_mode_does_not_require_vulkan_compose_override() {
+        let request = crate::embeddings::EmbeddingAcceleratorRequest {
+            provider: "vulkan".to_string(),
+            device: Some("Vulkan0".to_string()),
+            n_gpu_layers: "99".to_string(),
+        };
+
+        assert!(!vulkan_compose_override_requested(
+            EmbeddingServerLaunchMode::NativeSpawned,
+            Some(&request)
+        ));
+        assert!(vulkan_compose_override_requested(
+            EmbeddingServerLaunchMode::DockerComposeEmbed,
+            Some(&request)
+        ));
+        assert!(!vulkan_compose_override_requested(
+            EmbeddingServerLaunchMode::DockerComposeEmbed,
+            None
+        ));
+    }
+
+    #[test]
     fn bootstrap_progress_is_emitted_before_blocking_work() {
         let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let progress_phases = std::rc::Rc::clone(&phases);
@@ -1557,6 +1647,8 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).expect("manifest"),
         )
         .expect("manifest write");
+        std::fs::write(temp.path().join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
+            .expect("marker write");
         let mut legacy = legacy;
         legacy.executable_sha256 = exe_sha;
         let selected = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
@@ -1588,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_native_candidate_accepts_matching_install_manifest() {
+    fn managed_native_candidate_accepts_complete_extracted_install() {
         let _lock = crate::test_support::env_lock();
         let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
         let mut backend =
@@ -1609,6 +1701,8 @@ mod tests {
             .expect("manifest"),
         )
         .expect("manifest write");
+        std::fs::write(temp.path().join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
+            .expect("marker write");
 
         let selected = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
             path: exe.clone(),
@@ -1617,6 +1711,38 @@ mod tests {
         .expect("valid managed candidate");
 
         assert_eq!(selected, exe);
+    }
+
+    #[test]
+    fn managed_native_candidate_rejects_single_file_install() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
+        let mut backend = crate::config::selected_llama_sidecar_backend("vulkan")
+            .expect("windows vulkan backend");
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        let executable_sha = sha256_file(&exe).expect("sha");
+        backend.executable_sha256 = executable_sha.clone();
+        std::fs::write(
+            temp.path().join("install-manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "artifact": backend.artifact,
+                "artifact_sha256": backend.sha256,
+                "executable_rel_path": backend.executable_rel_path,
+                "executable_sha256": executable_sha,
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest write");
+
+        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
+            path: exe,
+            backend: Some(backend),
+        }])
+        .expect_err("single-file install must not validate");
+
+        assert!(error.to_string().contains("install is incomplete"));
     }
 
     #[test]
@@ -1640,6 +1766,8 @@ mod tests {
             .expect("manifest"),
         )
         .expect("manifest write");
+        std::fs::write(temp.path().join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
+            .expect("marker write");
 
         let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
             path: exe,
@@ -1675,6 +1803,8 @@ mod tests {
         let payload_dir = archive_root.join("llama-b9902");
         std::fs::create_dir_all(&payload_dir).expect("payload dir");
         std::fs::write(payload_dir.join("llama-server"), b"fake exe").expect("payload exe");
+        std::fs::write(payload_dir.join("libllama-test.dylib"), b"fake dylib")
+            .expect("payload dylib");
         backend.executable_archive_path = "llama-b9902/llama-server".to_string();
         backend.executable_sha256 =
             sha256_file(&payload_dir.join("llama-server")).expect("executable sha");
@@ -1709,6 +1839,18 @@ mod tests {
         assert_eq!(
             std::fs::read(&executable).expect("installed exe"),
             b"fake exe"
+        );
+        assert_eq!(
+            std::fs::read(executable.parent().unwrap().join("libllama-test.dylib"))
+                .expect("installed sibling"),
+            b"fake dylib"
+        );
+        assert!(
+            executable
+                .parent()
+                .unwrap()
+                .join(MANAGED_LLAMA_EXTRACTED_MARKER)
+                .is_file()
         );
         validate_managed_native_llama_server(&executable, &backend)
             .expect("installed manifest validates");
