@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.13.11
+
+CodeStory 0.13.11 fixes Windows native sidecar repair after the Linux
+accelerated backend work, keeping Windows on native Vulkan `llama-server.exe`
+without requiring Linux device mounts.
 
 ### Fixed
 
