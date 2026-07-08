@@ -34,6 +34,9 @@
   by requiring PID-backed state for CodeStory-spawned native endpoints,
   treating explicit `CODESTORY_EMBED_LLAMACPP_URL` endpoints as external, and
   publishing immediate MCP repair handoff state for `sidecar_setup repair`.
+- Fixed managed native bootstrap launch-mode selection so CodeStory-injected
+  `CODESTORY_EMBED_LLAMACPP_URL` defaults no longer force `external_endpoint`
+  before native spawn and broker locking on Windows and macOS arm64 hosts.
 
 ## 0.13.12
 

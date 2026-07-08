@@ -157,11 +157,11 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     mut progress: impl FnMut(&'static str),
 ) -> Result<BootstrapReport> {
     let layout = runtime.layout.clone();
-    runtime.activate_embed_url_default();
     layout.ensure_data_dirs()?;
     let storage_repair =
         repair_qdrant_storage(&layout, storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
     let launch_mode = embedding_server_launch_mode()?;
+    runtime.activate_embed_url_default();
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
         .then(|| native_embedding_server_launch(repo_root, runtime))
         .transpose()?;
