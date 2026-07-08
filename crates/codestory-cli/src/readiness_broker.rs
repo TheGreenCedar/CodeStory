@@ -208,6 +208,7 @@ pub(crate) struct BrokerMachineResourceBusy {
 pub(crate) struct BrokerMachineResourceLock {
     path: PathBuf,
     token: String,
+    release_on_drop: bool,
 }
 
 #[derive(Debug)]
@@ -218,6 +219,9 @@ struct BrokerMachineResourceReaperLock {
 
 impl Drop for BrokerMachineResourceLock {
     fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
         let Some(lock) = read_machine_resource_lock_file(&self.path) else {
             return;
         };
@@ -314,7 +318,11 @@ pub(crate) fn try_acquire_machine_resource_lock(
     match create_lock_file(&path, &content) {
         Ok(()) => {
             return Ok(BrokerMachineResourceLockAttempt::Acquired(
-                BrokerMachineResourceLock { path, token },
+                BrokerMachineResourceLock {
+                    path,
+                    token,
+                    release_on_drop: true,
+                },
             ));
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
@@ -338,7 +346,11 @@ pub(crate) fn try_acquire_machine_resource_lock(
     }
     match create_lock_file(&path, &content) {
         Ok(()) => Ok(BrokerMachineResourceLockAttempt::Acquired(
-            BrokerMachineResourceLock { path, token },
+            BrokerMachineResourceLock {
+                path,
+                token,
+                release_on_drop: true,
+            },
         )),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(
             BrokerMachineResourceLockAttempt::Busy(BrokerMachineResourceBusy {
@@ -347,6 +359,35 @@ pub(crate) fn try_acquire_machine_resource_lock(
         ),
         Err(error) => Err(error.into()),
     }
+}
+
+pub(crate) fn transfer_machine_resource_lock_to_pid(
+    lock: &mut BrokerMachineResourceLock,
+    pid: u32,
+) -> Result<bool> {
+    let Some(mut file_lock) = read_machine_resource_lock_file(&lock.path) else {
+        return Ok(false);
+    };
+    if file_lock.token != lock.token {
+        return Ok(false);
+    }
+    file_lock.pid = pid;
+    file_lock.started_at_epoch_ms = now_epoch_ms();
+    fs::write(&lock.path, serde_json::to_vec_pretty(&file_lock)?)?;
+    lock.release_on_drop = false;
+    Ok(true)
+}
+
+pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) -> Result<bool> {
+    let path = machine_resource_lock_path(resource);
+    let Some(file_lock) = read_machine_resource_lock_file(&path) else {
+        return Ok(false);
+    };
+    if file_lock.pid != pid {
+        return Ok(false);
+    }
+    let _ = fs::remove_file(path);
+    Ok(true)
 }
 
 fn reap_stale_machine_resource_lock(resource: &str, path: &Path) -> Result<bool> {
@@ -728,11 +769,7 @@ fn machine_resource_snapshot(resource: &str) -> BrokerResourceSnapshot {
 fn machine_lock_file_is_stale(path: &Path) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_machine_resource_lock_file(path) {
-        if !ready_repair_status::process_is_running(lock.pid) {
-            return true;
-        }
-        return now.saturating_sub(lock.started_at_epoch_ms)
-            > MACHINE_LOCK_STALE_TTL.as_millis() as i64;
+        return !ready_repair_status::process_is_running(lock.pid);
     }
     fs::metadata(path)
         .ok()
@@ -973,11 +1010,19 @@ mod tests {
     }
 
     fn write_machine_lock(resource: &str, scope: &BrokerScope, pid: u32) -> PathBuf {
+        write_machine_lock_at(resource, scope, pid, now_epoch_ms())
+    }
+
+    fn write_machine_lock_at(
+        resource: &str,
+        scope: &BrokerScope,
+        pid: u32,
+        started_at_epoch_ms: i64,
+    ) -> PathBuf {
         let path = machine_resource_lock_path(resource);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create lock parent");
         }
-        let started_at_epoch_ms = now_epoch_ms();
         let lock = BrokerMachineResourceLockFile {
             schema_version: MACHINE_LOCK_SCHEMA_VERSION,
             resource: resource.to_string(),
@@ -1112,6 +1157,68 @@ mod tests {
             snapshot.owner_operation_id,
             Some(broker_operation_id(&new_scope))
         );
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn machine_resource_lock_does_not_reclaim_live_old_owner() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("live-old-owner");
+        cleanup_machine_resource(&resource);
+        let old_scope = test_scope(project.path(), "live-old");
+        let new_scope = test_scope(project.path(), "new");
+        write_machine_lock_at(
+            &resource,
+            &old_scope,
+            std::process::id(),
+            now_epoch_ms() - MACHINE_LOCK_STALE_TTL.as_millis() as i64 - 10_000,
+        );
+
+        let busy = match try_acquire_machine_resource_lock(&resource, &new_scope)
+            .expect("acquire attempt")
+        {
+            BrokerMachineResourceLockAttempt::Acquired(_) => {
+                panic!("live owner should remain busy even when the lock is old")
+            }
+            BrokerMachineResourceLockAttempt::Busy(busy) => busy,
+        };
+
+        assert_eq!(busy.snapshot.status, "busy");
+        assert_eq!(busy.snapshot.owner_pid, Some(std::process::id()));
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn machine_resource_lock_transfers_to_spawned_pid_until_pid_release() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("pid-transfer");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "owner");
+
+        let mut lock = match try_acquire_machine_resource_lock(&resource, &scope)
+            .expect("acquire machine lock")
+        {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+
+        assert!(
+            transfer_machine_resource_lock_to_pid(&mut lock, std::process::id())
+                .expect("transfer lock")
+        );
+        drop(lock);
+        let path = machine_resource_lock_path(&resource);
+        assert!(
+            path.exists(),
+            "transferred lock should outlive launcher lock drop"
+        );
+        assert!(
+            release_machine_resource_lock_for_pid(&resource, std::process::id())
+                .expect("release pid lock")
+        );
+        assert!(!path.exists(), "pid release should remove lock file");
         cleanup_machine_resource(&resource);
     }
 

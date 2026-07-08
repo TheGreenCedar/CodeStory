@@ -51,7 +51,7 @@ surfaces were not visible.
 | Trace: "Who calls this?" | `callers`, `callees`, `trace`, or `trail --story --hide-speculative`. |
 | Impact: "What might this change touch?" | `affected` with changed files from git; planning hints only, not proof. |
 | Broad question | `packet`, `search`, or `context` only when allowed and `retrieval_mode=full`. |
-| Blocked surface | Follow `recommended_next_calls` from status; normally call MCP `repair_all`, then reread `codestory://status`. |
+| Blocked surface | Follow `recommended_next_calls` from status; normally call MCP `sidecar_setup` with `action=repair`, then reread `codestory://status`. |
 
 ## Evidence Rules
 
@@ -78,14 +78,14 @@ Supported agent repair is MCP-only:
 1. Read `codestory://status`.
 2. Inspect `readiness_broker` and `sidecar_setup`; status reads report state
    but do not start repairs.
-3. If `recommended_next_calls` says so and the `mcp__codestory__repair_all`
-   tool is visible, call MCP `repair_all` for
+3. If `recommended_next_calls` says so and the `mcp__codestory__sidecar_setup`
+   tool is visible, call MCP `sidecar_setup` with `action=repair` for
    `<target-workspace>`.
 4. Reread `codestory://status`.
 5. Use only the surfaces allowed by the refreshed status.
 
 If Codex exposes CodeStory resources but hides server-specific tools, keep using
-the read-only resource path. If tool actions such as `repair_all` are hidden,
+the read-only resource path. If tool actions such as `sidecar_setup` are hidden,
 report the host tool-visibility blocker. Do not synthesize repair context or
 run CLI repair in the agent path.
 

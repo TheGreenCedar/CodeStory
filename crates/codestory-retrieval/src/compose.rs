@@ -174,18 +174,20 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     } else {
         false
     };
-    if let Some(launch) = native_embedding.as_ref() {
+    let native_embedding_pid = if let Some(launch) = native_embedding.as_ref() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
             spawn_native_embedding_server(launch)
-        })?;
-    }
+        })?
+    } else {
+        None
+    };
 
     let state = sidecar_up_with_runtime_and_launch_metadata(
         runtime,
         resolved_compose.as_deref(),
-        native_embedding
-            .as_ref()
-            .map(|launch| embedding_launch_metadata(launch, runtime, repo_root)),
+        native_embedding.as_ref().map(|launch| {
+            embedding_launch_metadata(launch, runtime, repo_root, native_embedding_pid)
+        }),
     )?;
 
     let infrastructure = if !wait_timeout.is_zero() {
@@ -641,6 +643,7 @@ fn embedding_launch_metadata(
     native_launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
     repo_root: Option<&Path>,
+    pid: Option<u32>,
 ) -> crate::health::EmbeddingLaunchMetadata {
     crate::health::EmbeddingLaunchMetadata {
         provider: "llamacpp".to_string(),
@@ -648,6 +651,7 @@ fn embedding_launch_metadata(
             .as_str()
             .to_string(),
         endpoint: SidecarLayout::embed_base_url(runtime.embed_http_port),
+        pid,
         executable_source: Some(native_llama_executable_source(
             &native_launch.executable,
             repo_root,
@@ -1154,7 +1158,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result<()> {
+fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result<Option<u32>> {
     if let Some(parent) = launch.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create native llama.cpp log dir {}", parent.display()))?;
@@ -1172,7 +1176,7 @@ fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result
             probe.detail
         )
         .ok();
-        return Ok(());
+        return Ok(None);
     }
     writeln!(
         log,
@@ -1189,20 +1193,22 @@ fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result
     )
     .ok();
     match spawn_native_embedding_server_once(launch, &log, true) {
-        Ok(()) => Ok(()),
+        Ok(pid) => Ok(Some(pid)),
         Err(error) if native_embedding_retry_without_breakaway(&error) => {
             writeln!(
                 log,
                 "native llama.cpp spawn with breakaway-from-job failed ({error}); retrying without breakaway"
             )
             .ok();
-            spawn_native_embedding_server_once(launch, &log, false).with_context(|| {
-                format!(
-                    "spawn native llama.cpp server {}{} after breakaway retry",
-                    launch.executable.display(),
-                    native_embedding_spawn_detail(false)
-                )
-            })
+            spawn_native_embedding_server_once(launch, &log, false)
+                .map(Some)
+                .with_context(|| {
+                    format!(
+                        "spawn native llama.cpp server {}{} after breakaway retry",
+                        launch.executable.display(),
+                        native_embedding_spawn_detail(false)
+                    )
+                })
         }
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -1218,7 +1224,7 @@ fn spawn_native_embedding_server_once(
     launch: &NativeEmbeddingServerLaunch,
     log: &File,
     breakaway: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<u32> {
     let stdout = log.try_clone()?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(&launch.executable);
@@ -1229,7 +1235,7 @@ fn spawn_native_embedding_server_once(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     configure_native_embedding_command(&mut command, breakaway);
-    command.spawn().map(|_| ())
+    command.spawn().map(|child| child.id())
 }
 
 fn native_embedding_server_reusable(probe: &crate::embeddings::EmbeddingRuntimeProbe) -> bool {
@@ -2012,9 +2018,10 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
         );
-        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
+        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()), Some(1234));
         assert_eq!(metadata.provider, "llamacpp");
         assert_eq!(metadata.launch_mode, "native_spawned");
+        assert_eq!(metadata.pid, Some(1234));
         assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
         assert_eq!(metadata.model_path, Some(model.display().to_string()));
         assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));
@@ -2044,7 +2051,7 @@ mod tests {
                 .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
         );
         assert!(!launch.args.iter().any(|arg| arg == "--device"));
-        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
+        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()), None);
         assert_eq!(metadata.requested_device, None);
     }
 

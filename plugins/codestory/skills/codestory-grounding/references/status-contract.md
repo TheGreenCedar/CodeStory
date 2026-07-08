@@ -15,7 +15,7 @@ the agent-facing field glossary alongside runtime `codestory://agent-guide`.
 | `sidecar_contract_version` | Sidecar schema contract compiled into the active CLI. | Use to diagnose sidecar/runtime contract drift. |
 | `plugin_runtime` | Plugin launch source and managed CLI metadata, including `plugin_runtime.plugin_root`, `plugin_cache_version`, `build_source`, and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `managed_unavailable` as blocked managed setup. |
 | `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, sidecar policy/status, and readiness lanes. | Use as the concise bounded runtime summary; fall back to the source fields when a nested value needs detail. |
-| `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Diagnostic sidecar policy detail. For agent repair, follow `recommended_next_calls` and prefer MCP `repair_all`. |
+| `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Diagnostic sidecar policy detail. For agent repair, follow `recommended_next_calls` and prefer MCP `sidecar_setup` with `action=repair`. |
 | `embedding_launch_metadata.launch_mode` | Embedding sidecar launch mode when available, such as `native_spawned` or Docker Compose embed. | On macOS arm64, expect `native_spawned` for accelerated Metal; Docker/Vulkan on Apple Silicon is stale or unrepaired. |
 | `embedding_accelerator_request_provider` / `embedding_accelerator_request_device` | Requested accelerator provider/device. These fields are intent, not proof. | Use them to diagnose mismatched requests, for example `metal` with no device on Apple Silicon versus `vulkan`/`Vulkan0` on Windows or Linux Vulkan paths. |
 | `embedding_device_state` / `embedding_device_observation_source` | Observed embedding device state and where the observation came from. | Treat `accelerated` as acceleration proof when paired with full retrieval status. Treat `accelerator_request_unobserved` as blocked unless CPU mode is explicitly allowed. |
@@ -33,7 +33,7 @@ provisions from `github_release` when needed, and records the launch source in
 adapter stays up with `repair_setup` diagnostics instead of closing transport.
 
 If `codestory://status` reports a repairable state, run the MCP
-`recommended_next_calls` loop: call `repair_all` when recommended, then reread
-`codestory://status` before local navigation, packet, search, or context. Do not
-ask the human to install the binary unless network, permissions, host reload, or
-release assets block the repair.
+`recommended_next_calls` loop: call `sidecar_setup` with `action=repair` when
+recommended, then reread `codestory://status` before local navigation, packet,
+search, or context. Do not ask the human to install the binary unless network,
+permissions, host reload, or release assets block the repair.

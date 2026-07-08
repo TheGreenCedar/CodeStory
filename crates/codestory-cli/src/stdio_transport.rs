@@ -2980,7 +2980,6 @@ fn read_stdio_status_resource(
     });
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let status_resource_auto_repair = serde_json::Value::Null;
-    let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(
         runtime,
         &readiness,
@@ -2989,7 +2988,6 @@ fn read_stdio_status_resource(
     );
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
-    let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
     let local = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
@@ -3014,6 +3012,13 @@ fn read_stdio_status_resource(
     );
     let readiness_broker_json =
         serde_json::to_value(&readiness_broker).expect("serialize readiness broker");
+    let allowed_surfaces = stdio_allowed_surfaces_with_policy(
+        &readiness,
+        Some(&sidecar_setup),
+        Some(&readiness_broker),
+    );
+    let recommended_next_calls =
+        stdio_status_recommended_next_calls(&readiness, &sidecar_setup, Some(&readiness_broker));
     let runtime_truth = stdio_runtime_truth_status(
         &plugin_runtime,
         &sidecar_setup,
@@ -3456,103 +3461,38 @@ fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
 fn stdio_status_recommended_next_calls(
     readiness: &[ReadinessVerdictDto],
     sidecar_setup: &serde_json::Value,
+    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
 ) -> serde_json::Value {
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
         if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
             if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
                 return stdio_status_repair_in_progress_next_calls();
             }
+            if let Some(busy) = stdio_native_embedding_resource_busy(readiness_broker) {
+                return stdio_status_native_embedding_busy_next_calls(busy);
+            }
             match sidecar_setup
                 .get("state")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("ask")
             {
-                "ask" => {
-                    return serde_json::json!([
-                        {
-                            "method": "host/confirm",
-                            "instruction": sidecar_setup["prompt"],
-                            "confirm_next": [
-                                {
-                                    "method": "tools/call",
-                                    "tool": "sidecar_setup",
-                                    "arguments": {"action": "enable"},
-                                    "debug_command": sidecar_setup["enable_command"]
-                                },
-                                {
-                                    "method": "tools/call",
-                                    "tool": "repair_all",
-                                    "arguments": {}
-                                },
-                                {
-                                    "method": "resources/read",
-                                    "uri": "codestory://status"
-                                }
-                            ],
-                            "decline_next": [
-                                {
-                                    "method": "tools/call",
-                                    "tool": "sidecar_setup",
-                                    "arguments": {"action": "disable"},
-                                    "debug_command": sidecar_setup["disable_command"]
-                                },
-                                {
-                                    "method": "resources/read",
-                                    "uri": "codestory://status"
-                                }
-                            ]
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://agent-guide"
-                        }
-                    ]);
-                }
-                "disabled" => {
-                    return serde_json::json!([
-                        {
-                            "method": "host/instruction",
-                            "instruction": "CodeStory packet/search repair is disabled for this plugin install. Enable sidecar setup before running MCP repair."
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "sidecar_setup",
-                            "arguments": {"action": "enable"},
-                            "debug_command": sidecar_setup["enable_command"]
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://status"
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://agent-guide"
-                        }
-                    ]);
-                }
-                "unmanaged" => {
-                    return serde_json::json!([
-                        {
-                            "method": "host/instruction",
-                            "instruction": "Sidecar setup policy is not persisted for this host; explicit MCP repair can run for this session."
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "repair_all",
-                            "arguments": {}
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://status"
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://agent-guide"
-                        }
-                    ]);
+                "ask" | "disabled" | "unmanaged" => {
+                    return stdio_repair_policy_next_calls(sidecar_setup);
                 }
                 _ => {}
             }
+            return serde_json::json!([
+                {
+                    "method": "tools/call",
+                    "tool": "sidecar_setup",
+                    "arguments": {"action": "repair"},
+                    "debug_commands": non_ready.full_repair
+                },
+                {
+                    "method": "resources/read",
+                    "uri": "codestory://status"
+                }
+            ]);
         }
         if let Some(host_action) = non_ready
             .minimum_next
@@ -3624,6 +3564,39 @@ fn stdio_status_recommended_next_calls(
     ])
 }
 
+fn stdio_native_embedding_resource_busy(
+    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+) -> Option<&crate::readiness_broker::BrokerResourceSnapshot> {
+    readiness_broker?
+        .resources
+        .get(crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE)
+        .filter(|resource| resource.status == "busy")
+}
+
+fn stdio_status_native_embedding_busy_next_calls(
+    busy: &crate::readiness_broker::BrokerResourceSnapshot,
+) -> serde_json::Value {
+    let owner_workspace = busy.owner_workspace_root.as_deref().unwrap_or("unknown");
+    let owner_project = busy.owner_project_id.as_deref().unwrap_or("unknown");
+    serde_json::json!([
+        {
+            "method": "host/instruction",
+            "instruction": format!(
+                "CodeStory native embedding runtime is already owned by another operation; wait for it to finish before starting MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
+                busy.owner_pid
+            )
+        },
+        {
+            "method": "resources/read",
+            "uri": "codestory://status"
+        },
+        {
+            "method": "resources/read",
+            "uri": "codestory://agent-guide"
+        }
+    ])
+}
+
 fn stdio_status_repair_in_progress_next_calls() -> serde_json::Value {
     serde_json::json!([
         {
@@ -3643,6 +3616,37 @@ fn stdio_sidecar_setup_has_active_repair(sidecar_setup: &serde_json::Value) -> b
         .is_some_and(|value| !value.is_null())
 }
 
+fn stdio_sidecar_policy_state(sidecar_setup: &serde_json::Value) -> &str {
+    sidecar_setup
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ask")
+}
+
+fn stdio_repair_blocked_by_policy(
+    sidecar_setup: &serde_json::Value,
+) -> Option<(&'static str, &'static str)> {
+    match stdio_sidecar_policy_state(sidecar_setup) {
+        "enabled" => None,
+        "ask" => Some((
+            "confirm_required",
+            "MCP sidecar repair requires explicit confirmation before it can start.",
+        )),
+        "disabled" => Some((
+            "repair_disabled",
+            "MCP sidecar repair is disabled for this plugin install.",
+        )),
+        "unmanaged" => Some((
+            "repair_unmanaged",
+            "MCP sidecar repair policy is not persisted for this host.",
+        )),
+        _ => Some((
+            "confirm_required",
+            "MCP sidecar repair requires explicit confirmation before it can start.",
+        )),
+    }
+}
+
 fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     if command.starts_with("Restart/reload the Codex host/app") {
         return serde_json::json!({
@@ -3653,8 +3657,8 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     if command.contains("ready --goal agent --repair") {
         return serde_json::json!({
             "method": "tools/call",
-            "tool": "repair_all",
-            "arguments": {},
+            "tool": "sidecar_setup",
+            "arguments": {"action": "repair"},
             "debug_commands": [command]
         });
     }
@@ -3985,6 +3989,23 @@ fn handle_stdio_sidecar_repair(
             }
         });
     }
+    let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
+    if let Some(result) = stdio_sidecar_repair_policy_block_result(&sidecar_setup, mode) {
+        return result;
+    }
+    let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string()),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: None,
+            reconciliation: None,
+        },
+    );
+    if let Some(busy) = stdio_native_embedding_resource_busy(Some(&broker_snapshot)) {
+        return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup, mode);
+    }
     let broker_reconciliation = crate::readiness_broker::reconcile_before_enqueue(
         &runtime.project_root,
         &runtime.cache_root,
@@ -4111,6 +4132,135 @@ fn handle_stdio_sidecar_repair(
     }
 }
 
+fn stdio_sidecar_repair_policy_block_result(
+    sidecar_setup: &serde_json::Value,
+    mode: StdioSidecarRepairMode,
+) -> Option<serde_json::Value> {
+    let (status, message) = stdio_repair_blocked_by_policy(sidecar_setup)?;
+    Some(serde_json::json!({
+        "result": {
+            "status": status,
+            "mode": stdio_sidecar_repair_mode_label(mode),
+            "message": message,
+            "sidecar_setup": sidecar_setup,
+            "recommended_next_calls": stdio_repair_policy_next_calls(sidecar_setup)
+        }
+    }))
+}
+
+fn stdio_sidecar_repair_machine_busy_result(
+    busy: &crate::readiness_broker::BrokerResourceSnapshot,
+    sidecar_setup: &serde_json::Value,
+    mode: StdioSidecarRepairMode,
+) -> serde_json::Value {
+    serde_json::json!({
+        "result": {
+            "status": "native_embedding_runtime_busy",
+            "mode": stdio_sidecar_repair_mode_label(mode),
+            "message": "CodeStory native embedding runtime is already owned by another operation.",
+            "owner_pid": busy.owner_pid,
+            "owner_project_id": busy.owner_project_id,
+            "owner_workspace_root": busy.owner_workspace_root,
+            "sidecar_setup": sidecar_setup,
+            "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy)
+        }
+    })
+}
+
+fn stdio_sidecar_repair_mode_label(mode: StdioSidecarRepairMode) -> &'static str {
+    match mode {
+        StdioSidecarRepairMode::Background => "background",
+        StdioSidecarRepairMode::Foreground => "foreground",
+    }
+}
+
+fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_json::Value {
+    match stdio_sidecar_policy_state(sidecar_setup) {
+        "ask" => serde_json::json!([
+            {
+                "method": "host/confirm",
+                "instruction": sidecar_setup["prompt"],
+                "confirm_next": [
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "enable"},
+                        "debug_command": sidecar_setup["enable_command"]
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "repair"},
+                        "debug_command": sidecar_setup["next_repair_command"]
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }
+                ],
+                "decline_next": [
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "disable"},
+                        "debug_command": sidecar_setup["disable_command"]
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }
+                ]
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            }
+        ]),
+        "disabled" => serde_json::json!([
+            {
+                "method": "host/confirm",
+                "instruction": "CodeStory packet/search repair is disabled for this plugin install. Enable MCP sidecar repair for this plugin install?",
+                "confirm_next": [
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "enable"},
+                        "debug_command": sidecar_setup["enable_command"]
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }
+                ]
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            }
+        ]),
+        "unmanaged" => serde_json::json!([
+            {
+                "method": "host/instruction",
+                "instruction": "Sidecar setup policy is not persisted for this host, so MCP repair is blocked until the host/plugin provides CODESTORY_PLUGIN_SIDECAR_POLICY_PATH. Use codestory://status for current state or run CLI repair outside MCP."
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            }
+        ]),
+        _ => serde_json::json!([
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }
+        ]),
+    }
+}
+
 fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -4147,7 +4297,16 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(test)]
 fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+    stdio_allowed_surfaces_with_policy(readiness, None, None)
+}
+
+fn stdio_allowed_surfaces_with_policy(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: Option<&serde_json::Value>,
+    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+) -> serde_json::Value {
     let local = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation);
@@ -4181,17 +4340,50 @@ fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Valu
     }
     surfaces.insert(
         "repair_all".to_string(),
-        stdio_repair_all_surface(readiness),
+        stdio_repair_all_surface(readiness, sidecar_setup, readiness_broker),
     );
     serde_json::Value::Object(surfaces)
 }
 
-fn stdio_repair_all_surface(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+fn stdio_repair_all_surface(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: Option<&serde_json::Value>,
+    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+) -> serde_json::Value {
     if let Some(setup) = readiness
         .iter()
         .find(|verdict| verdict.status == ReadinessStatusDto::RepairSetup)
     {
         return stdio_allowed_surface(Some(setup));
+    }
+    if let Some((status, blocked_reason)) = sidecar_setup.and_then(stdio_repair_blocked_by_policy) {
+        return serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "agent_packet_search",
+            "status": status,
+            "failed_layer": "mcp_sidecar_policy",
+            "summary": blocked_reason,
+            "repair_reason": blocked_reason,
+            "blocked_reason": blocked_reason,
+            "minimum_next": [],
+            "full_repair": [],
+        });
+    }
+    if let Some(busy) = stdio_native_embedding_resource_busy(readiness_broker) {
+        return serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "agent_packet_search",
+            "status": "busy",
+            "failed_layer": "native_embedding_runtime",
+            "summary": "CodeStory native embedding runtime is already owned by another operation.",
+            "repair_reason": "native_embedding_runtime_busy",
+            "blocked_reason": "native_embedding_runtime_busy",
+            "owner_pid": busy.owner_pid,
+            "owner_project_id": busy.owner_project_id,
+            "owner_workspace_root": busy.owner_workspace_root,
+            "minimum_next": [],
+            "full_repair": [],
+        });
     }
 
     serde_json::json!({
@@ -4570,6 +4762,7 @@ mod tests {
                 sidecar: None,
             }],
             &json!({"state": "enabled"}),
+            None,
         );
 
         assert_eq!(calls[0]["method"], json!("host/restart"));

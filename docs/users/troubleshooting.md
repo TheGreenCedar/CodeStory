@@ -15,8 +15,8 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 
 | Symptom | Supported action | Check in output |
 | --- | --- | --- |
-| Repo map stale or blocked | Agent reads `codestory://status`, calls MCP `repair_all` if recommended, then rereads status | Local graph surfaces are allowed after the reread |
-| Broad search blocked | Same MCP `repair_all` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
+| Repo map stale or blocked | Agent reads `codestory://status`, calls MCP `sidecar_setup` with `action=repair` if recommended, then rereads status | Local graph surfaces are allowed after the reread |
+| Broad search blocked | Same MCP `sidecar_setup repair` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
 | MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
 | Sidecar health | MCP status first; CLI `retrieval status` only for maintainer evidence | `retrieval_mode` is `full` before trusting packet/search |
 
@@ -37,7 +37,7 @@ flowchart TD
   local --> fix_local[Refresh or repair local index]
   sidecar --> fix_sidecar[Sidecar setup or repair]
   fix_mcp --> host[Host guide]
-  fix_local --> mcp_repair["MCP: repair_all"]
+  fix_local --> mcp_repair["MCP: sidecar_setup repair"]
   fix_sidecar --> mcp_repair
   mcp_repair --> reread["Reread codestory://status"]
   host --> codex[Codex guide]
@@ -52,7 +52,7 @@ flowchart TD
 | --- | --- | --- | --- | --- |
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
 | Stale index / wrong symbols | New thread; hooks refresh on session start | Reload MCP; run local repair | New session; run local repair | New session; run [local repair](cli-reference.md#readiness-and-repair) |
-| Packet/search blocked | Agent calls MCP `repair_all` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
+| Packet/search blocked | Agent calls MCP `sidecar_setup repair` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
 | Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
 Host-specific steps: [Codex](codex.md#troubleshooting), [Cursor](cursor.md#troubleshooting), [Claude Code](claude-code.md#troubleshooting), [Copilot](copilot.md).
@@ -94,8 +94,8 @@ Ask the agent:
 Read codestory://status, report allowed_surfaces, and tell me what is blocked and the next repair action.
 ```
 
-The agent uses MCP status, `codestory://agent-guide`, and `repair_all` when
-status recommends repair. Re-read status after any repair.
+The agent uses MCP status, `codestory://agent-guide`, and `sidecar_setup repair`
+when status recommends repair. Re-read status after any repair.
 
 </details>
 
@@ -145,7 +145,7 @@ node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> -
 Symptoms: `packet`, `search`, or `context` not allowed; retrieval mode not
 `full`.
 
-**Agent:** Call MCP `repair_all` when status says so, then reread
+**Agent:** Call MCP `sidecar_setup repair` when status says so, then reread
 `codestory://status`. Do not treat degraded output as proof. See
 [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
@@ -178,7 +178,7 @@ Apple Silicon, not a Colima tuning problem: the Linux Docker sidecar cannot
 observe macOS Metal and normally has no usable `/dev/dri`.
 
 **Agent:** Read `codestory://status`, follow `recommended_next_calls`, call MCP
-`repair_all` when recommended, and reread status. Keep local navigation separate
+`sidecar_setup repair` when recommended, and reread status. Keep local navigation separate
 from packet/search: a ready local graph can answer source-navigation questions
 while packet/search remains blocked until `retrieval_mode` is `full`.
 

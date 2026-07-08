@@ -148,7 +148,7 @@ test("agent-facing guidance keeps MCP repair as the only supported repair path",
     assert.doesNotMatch(text, /CLI fallback/u, file);
     assert.doesNotMatch(text, /managed CLI or local-dev CODESTORY_CLI preflight/u, file);
     assert.doesNotMatch(text, /Call `sidecar_setup`/u, file);
-    assert.match(text, /repair_all/u, file);
+    assert.match(text, /sidecar_setup(?: repair|[\s\S]{0,80}action=repair)/u, file);
   }
 });
 

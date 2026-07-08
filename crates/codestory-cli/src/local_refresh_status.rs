@@ -237,8 +237,18 @@ pub(crate) fn cleanup_stale_local_refresh_state(
         (false, true) => "stale_lock",
         (false, false) => "clean",
     };
-    let removed_status_path = status.is_some() && fs::remove_file(&status_path).is_ok();
-    let removed_lock_path = lock.is_some() && fs::remove_file(&lock_path).is_ok();
+    let lock_matches_stale_status = status_stale
+        && status
+            .as_ref()
+            .zip(lock.as_ref())
+            .is_some_and(|(status, lock)| {
+                status.pid == lock.pid && status.started_at_epoch_ms == lock.started_at_epoch_ms
+            });
+    let removed_status_path =
+        status_stale && status.is_some() && fs::remove_file(&status_path).is_ok();
+    let removed_lock_path = lock.is_some()
+        && (lock_stale || lock_matches_stale_status)
+        && fs::remove_file(&lock_path).is_ok();
     Some(LocalRefreshCleanup {
         status,
         status_path,
@@ -534,5 +544,50 @@ mod tests {
         assert!(cleanup.removed_lock_path);
         assert!(!local_refresh_status_path(cache.path()).exists());
         assert!(!local_refresh_lock_path(cache.path()).exists());
+    }
+
+    #[test]
+    fn cleanup_stale_local_refresh_state_preserves_fresh_lock() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let old_started = now_epoch_ms() - LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64 - 1_000;
+        fs::write(
+            local_refresh_lock_path(cache.path()),
+            serde_json::to_string(&LocalRefreshLockFile {
+                schema_version: LOCAL_REFRESH_STATUS_SCHEMA_VERSION,
+                project_root: clean_path_text(project.path()),
+                pid: std::process::id(),
+                started_at_epoch_ms: now_epoch_ms(),
+                token: "fresh".to_string(),
+            })
+            .expect("lock json"),
+        )
+        .expect("write fresh lock");
+        fs::write(
+            local_refresh_status_path(cache.path()),
+            serde_json::to_string(&LocalRefreshStatus {
+                schema_version: LOCAL_REFRESH_STATUS_SCHEMA_VERSION,
+                status: "refreshing".to_string(),
+                project_root: clean_path_text(project.path()),
+                phase: "incremental_index".to_string(),
+                pid: u32::MAX,
+                started_at_epoch_ms: old_started,
+                updated_at_epoch_ms: old_started,
+                last_failure_reason: None,
+            })
+            .expect("status json"),
+        )
+        .expect("write stale status");
+
+        let cleanup = cleanup_stale_local_refresh_state(cache.path(), project.path())
+            .expect("stale status cleanup");
+        assert_eq!(cleanup.reason, "stale_status");
+        assert!(cleanup.removed_status_path);
+        assert!(!cleanup.removed_lock_path);
+        assert!(!local_refresh_status_path(cache.path()).exists());
+        assert!(
+            local_refresh_lock_path(cache.path()).exists(),
+            "fresh local refresh lock should remain owned"
+        );
     }
 }

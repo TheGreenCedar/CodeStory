@@ -15,6 +15,10 @@
   reaped under a separate atomic guard, final success snapshots are written
   after repair locks are released, and status recommendations distinguish
   consent, disabled, unmanaged, and enabled MCP repair policy.
+- Persisted native embedding ownership by transferring broker leases to the
+  spawned llama.cpp PID, releasing them on retrieval down, preserving fresh local
+  refresh locks when only status is stale, and routing MCP repair guidance
+  through `sidecar_setup repair` instead of raw `repair_all`.
 - Fixed Windows native llama.cpp startup under restrictive host job objects by
   retrying without `CREATE_BREAKAWAY_FROM_JOB` when Windows denies the
   best-effort detached spawn.

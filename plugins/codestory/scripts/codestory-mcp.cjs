@@ -1032,6 +1032,48 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     ...localSurfaces.map((surface) => [surface, blockedSurface(surface, 'local_navigation')]),
     ...sidecarSurfaces.map((surface) => [surface, blockedSurface(surface, 'agent_packet_search')]),
   ]);
+  allowedSurfaces.repair_all = {
+    ...blockedSurface('repair_all', 'agent_packet_search'),
+    blocked_reason: 'diagnostic_fail_open',
+  };
+  const sidecarSetup = {
+    state: sidecarPolicy.state || 'unavailable',
+    auto_repair: false,
+    status_triggered_repair: false,
+    explicit_repair_enabled: sidecarPolicy.state === 'enabled',
+    repair_mode: 'diagnostic_fail_open',
+    prompt_required: sidecarPolicy.state === 'ask',
+    prompt: sidecarPolicy.state === 'ask'
+      ? 'CodeStory packet/search needs retrieval sidecars. MCP repair may start or download retrieval sidecars for this project. Enable MCP sidecar repair for this plugin install?'
+      : null,
+    active_repair: null,
+    abandoned_repair: null,
+  };
+  const readinessBroker = {
+    schema_version: 1,
+    install_id: null,
+    project_id: null,
+    canonical_root_hash: null,
+    workspace_root: projectRoot,
+    cli_version: probe.version,
+    updated_at_epoch_ms: Date.now(),
+    snapshot_path: null,
+    persistence_status: 'unavailable',
+    persistence_error: 'diagnostic_fail_open',
+    operations: [],
+    resources: {},
+    reconciliation: {
+      status: 'diagnostic_fail_open',
+      cleanup_performed: false,
+      stale_status_paths_removed: [],
+      stale_lock_paths_removed: [],
+      abandoned_repairs: [],
+      local_refresh_cleanups: [],
+      active_repair: null,
+      unresolved_orphan_reason: reason,
+    },
+    gpu_proof: null,
+  };
   return {
     server_version: null,
     cli_version: probe.version,
@@ -1056,6 +1098,8 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     degraded_reason: reason,
     local_refresh: options.localRefresh || null,
     readiness: [repair],
+    sidecar_setup: sidecarSetup,
+    readiness_broker: readinessBroker,
     allowed_surfaces: allowedSurfaces,
     recommended_next_calls: singleRepairNextCalls(recommendedNext),
   };

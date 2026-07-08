@@ -19,6 +19,7 @@ use codestory_store::Store;
 use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Runtime state file written by `sidecar_up`.
@@ -139,18 +140,55 @@ pub fn sidecar_down_for_project(project_root: &Path, profile: SidecarProfile) ->
 pub fn sidecar_down_for_runtime(runtime: &SidecarRuntimeConfig) -> Result<()> {
     let layout = &runtime.layout;
     if layout.state_file.exists() {
-        if runtime.profile == SidecarProfile::Agent
-            && let Some(state) = std::fs::read_to_string(&layout.state_file)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
+        if let Some(state) = std::fs::read_to_string(&layout.state_file)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
             && state.owner == "codestory"
             && state.namespace == runtime.namespace
         {
-            crate::compose::docker_compose_down_for_state(&state)?;
+            if runtime.profile == SidecarProfile::Agent {
+                crate::compose::docker_compose_down_for_state(&state)?;
+            }
+            stop_native_embedding_process_for_state(&state);
         }
         std::fs::remove_file(&layout.state_file).context("remove retrieval-sidecars.json")?;
     }
     Ok(())
+}
+
+fn stop_native_embedding_process_for_state(state: &SidecarStateFile) {
+    let Some(launch) = state.embedding_launch.as_ref() else {
+        return;
+    };
+    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+        return;
+    }
+    let Some(pid) = launch.pid else {
+        return;
+    };
+    stop_native_embedding_process(pid);
+}
+
+fn stop_native_embedding_process(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
 }
 
 /// Probe sidecar health and attach the latest retrieval manifest when storage is available.
@@ -594,6 +632,7 @@ mod tests {
             provider: "llamacpp".to_string(),
             launch_mode: "native_spawned".to_string(),
             endpoint: "http://127.0.0.1:18080/v1/embeddings".to_string(),
+            pid: Some(1234),
             executable_source: Some("managed_cache".to_string()),
             executable_path: Some("C:/cache/llama-server".to_string()),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),

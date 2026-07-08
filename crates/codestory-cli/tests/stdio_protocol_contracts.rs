@@ -2466,11 +2466,11 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         !next_call_text.contains("codestory-cli index --project")
             && !next_call_text.contains("retrieval bootstrap")
             && !next_call_text.contains("retrieval index")
-            && next_call_text.contains("\"tool\":\"repair_all\"")
+            && !next_call_text.contains("\"tool\":\"repair_all\"")
             && next_call_text.contains("codestory://status")
             && next_call_text.contains("codestory://agent-guide")
             && next_call_text.contains("not persisted for this host"),
-        "status should recommend explicit MCP sidecar repair without repeating a fresh core index when mode is not full: {status}"
+        "status should block MCP sidecar repair without repeating a fresh core index when mode is not full and policy is unmanaged: {status}"
     );
     assert!(
         !next_call_text.contains("\"method\":\"cli\""),
@@ -2641,16 +2641,17 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
     );
     assert!(
         next_call_text.contains("confirm_next")
-            && next_call_text.contains("\"tool\":\"repair_all\""),
-        "ask policy should include repair only after consent: {status}"
+            && next_call_text.contains("\"tool\":\"sidecar_setup\"")
+            && next_call_text.contains("\"action\":\"repair\""),
+        "ask policy should include sidecar_setup repair only after consent: {status}"
     );
     assert!(
         next_call_text.contains("decline_next"),
         "ask policy should include a decline path: {status}"
     );
     assert!(
-        !next_call_text.contains("ready --goal agent --repair"),
-        "ask policy should not recommend heavy sidecar repair before consent: {status}"
+        !next_call_text.contains("\"tool\":\"repair_all\""),
+        "ask policy should not recommend raw repair_all before consent: {status}"
     );
     assert!(
         !next_call_text.contains("\"method\":\"cli\""),
@@ -2659,7 +2660,7 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
 }
 
 #[test]
-fn resources_read_status_allows_unmanaged_session_repair_without_persisted_policy() {
+fn resources_read_status_blocks_unmanaged_session_repair_without_persisted_policy() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -2686,8 +2687,13 @@ fn resources_read_status_allows_unmanaged_session_repair_without_persisted_polic
         "{status}"
     );
     assert!(
-        next_call_text.contains("\"tool\":\"repair_all\""),
-        "unmanaged policy should allow explicit repair for the session: {status}"
+        !next_call_text.contains("\"tool\":\"repair_all\""),
+        "unmanaged policy should block MCP repair until policy is persisted: {status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["repair_all"]["status"],
+        json!("repair_unmanaged"),
+        "{status}"
     );
     assert!(
         next_call_text.contains("\"uri\":\"codestory://status\"")
@@ -2743,8 +2749,10 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
         "status reads must not spawn sidecar repair: {status}"
     );
     assert!(
-        next_call_text.contains("\"tool\":\"repair_all\""),
-        "enabled policy should recommend explicit MCP repair: {status}"
+        next_call_text.contains("\"tool\":\"sidecar_setup\"")
+            && next_call_text.contains("\"action\":\"repair\"")
+            && !next_call_text.contains("\"tool\":\"repair_all\""),
+        "enabled policy should recommend explicit sidecar_setup repair: {status}"
     );
     assert!(
         status["readiness_broker"]["project_id"]
@@ -2805,7 +2813,7 @@ fn resources_read_status_reports_abandoned_repair_without_starting_when_policy_e
     assert!(
         status["recommended_next_calls"]
             .to_string()
-            .contains("\"tool\":\"repair_all\""),
+            .contains("\"tool\":\"sidecar_setup\""),
         "enabled policy should leave repair as an explicit MCP action: {status}"
     );
     assert_eq!(
@@ -4411,7 +4419,8 @@ fn search_tool_fails_closed_without_full_retrieval_sidecars() {
         minimum_next.iter().any(|call| call
             .get("tool")
             .and_then(Value::as_str)
-            .is_some_and(|tool| tool == "repair_all")
+            .is_some_and(|tool| tool == "sidecar_setup")
+            && call.pointer("/arguments/action").and_then(Value::as_str) == Some("repair")
             && call
                 .get("debug_commands")
                 .and_then(Value::as_array)

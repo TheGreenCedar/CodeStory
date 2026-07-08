@@ -76,6 +76,8 @@ pub struct EmbeddingLaunchMetadata {
     pub launch_mode: String,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
