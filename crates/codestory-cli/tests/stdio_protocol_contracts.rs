@@ -2467,11 +2467,10 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             && !next_call_text.contains("retrieval bootstrap")
             && !next_call_text.contains("retrieval index")
             && next_call_text.contains("\"tool\":\"repair_all\"")
-            && next_call_text.contains("\"debug_commands\"")
-            && next_call_text.contains("retrieval status")
             && next_call_text.contains("codestory://status")
-            && !next_call_text.contains("codestory://agent-guide"),
-        "status should recommend MCP-managed sidecar repair without repeating a fresh core index when mode is not full: {status}"
+            && next_call_text.contains("codestory://agent-guide")
+            && next_call_text.contains("not persisted for this host"),
+        "status should recommend explicit MCP sidecar repair without repeating a fresh core index when mode is not full: {status}"
     );
     assert!(
         !next_call_text.contains("\"method\":\"cli\""),
@@ -2619,6 +2618,16 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
     assert_eq!(status["sidecar_setup"]["state"], json!("ask"));
     assert_eq!(status["sidecar_setup"]["prompt_required"], json!(true));
     assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
+    assert_eq!(
+        status["sidecar_setup"]["repair_mode"],
+        json!("consent_required")
+    );
+    assert!(
+        status["sidecar_setup"]["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("may start or download retrieval sidecars")),
+        "{status}"
+    );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(next_call_text.contains("host/confirm"), "{status}");
     assert!(
@@ -2631,12 +2640,59 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
         "{status}"
     );
     assert!(
+        next_call_text.contains("confirm_next")
+            && next_call_text.contains("\"tool\":\"repair_all\""),
+        "ask policy should include repair only after consent: {status}"
+    );
+    assert!(
+        next_call_text.contains("decline_next"),
+        "ask policy should include a decline path: {status}"
+    );
+    assert!(
         !next_call_text.contains("ready --goal agent --repair"),
         "ask policy should not recommend heavy sidecar repair before consent: {status}"
     );
     assert!(
         !next_call_text.contains("\"method\":\"cli\""),
         "ask policy should not expose CLI as the normal consent path: {status}"
+    );
+}
+
+#[test]
+fn resources_read_status_allows_unmanaged_session_repair_without_persisted_policy() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-sidecar-unmanaged",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-sidecar-unmanaged"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["sidecar_setup"]["state"], json!("unmanaged"));
+    assert_eq!(
+        status["sidecar_setup"]["repair_mode"],
+        json!("explicit_mcp_unmanaged")
+    );
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        next_call_text.contains("not persisted for this host"),
+        "{status}"
+    );
+    assert!(
+        next_call_text.contains("\"tool\":\"repair_all\""),
+        "unmanaged policy should allow explicit repair for the session: {status}"
+    );
+    assert!(
+        next_call_text.contains("\"uri\":\"codestory://status\"")
+            && next_call_text.contains("\"uri\":\"codestory://agent-guide\""),
+        "{status}"
     );
 }
 
@@ -2779,9 +2835,10 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
 
     assert_eq!(status["sidecar_setup"]["state"], json!("disabled"));
     assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
+    assert_eq!(status["sidecar_setup"]["repair_mode"], json!("disabled"));
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
-        next_call_text.contains("Sidecar setup repair is disabled"),
+        next_call_text.contains("CodeStory packet/search repair is disabled"),
         "{status}"
     );
     assert!(

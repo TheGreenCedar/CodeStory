@@ -2243,23 +2243,12 @@ fn read_stdio_status_resource_cached(
     let key = stdio_status_cache_key(runtime);
     let value = read_stdio_status_resource(runtime, summary, local_refresh)?;
     // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
-    if !stdio_status_auto_repair_in_progress(&value) {
-        state.status_cache = Some(StdioStatusCacheEntry {
-            key,
-            value: value.clone(),
-            cached_at: Instant::now(),
-        });
-    }
+    state.status_cache = Some(StdioStatusCacheEntry {
+        key,
+        value: value.clone(),
+        cached_at: Instant::now(),
+    });
     Ok(value)
-}
-
-fn stdio_status_auto_repair_in_progress(value: &serde_json::Value) -> bool {
-    matches!(
-        value
-            .pointer("/status_resource_auto_repair/result/status")
-            .and_then(serde_json::Value::as_str),
-        Some("started" | "already_running")
-    )
 }
 
 fn wait_for_stdio_local_freshness(
@@ -2990,8 +2979,7 @@ fn read_stdio_status_resource(
         }),
     });
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
-    let status_resource_auto_repair =
-        stdio_status_resource_auto_repair(runtime, &readiness, &sidecar_setup);
+    let status_resource_auto_repair = serde_json::Value::Null;
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(
         runtime,
@@ -3001,12 +2989,7 @@ fn read_stdio_status_resource(
     );
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
-    let recommended_next_calls =
-        if stdio_status_auto_repair_result_in_progress(status_resource_auto_repair.as_ref()) {
-            stdio_status_repair_in_progress_next_calls()
-        } else {
-            stdio_status_recommended_next_calls(&readiness, &sidecar_setup)
-        };
+    let recommended_next_calls = stdio_status_recommended_next_calls(&readiness, &sidecar_setup);
     let local = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
@@ -3090,14 +3073,6 @@ fn read_stdio_status_resource(
     }))
 }
 
-fn stdio_status_resource_auto_repair(
-    _runtime: &RuntimeContext,
-    _readiness: &[ReadinessVerdictDto],
-    _sidecar_setup: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    None
-}
-
 fn stdio_broker_gpu_proof_input(
     sidecar: &args::DoctorSidecarStatusOutput,
 ) -> crate::readiness_broker::BrokerGpuProofInput {
@@ -3117,15 +3092,6 @@ fn stdio_broker_gpu_proof_input(
         embedding_cpu_allowed: Some(sidecar.embedding_cpu_allowed),
         degraded_reason: sidecar.degraded_reason.clone(),
     }
-}
-
-fn stdio_status_auto_repair_result_in_progress(value: Option<&serde_json::Value>) -> bool {
-    matches!(
-        value
-            .and_then(|value| value.pointer("/result/status"))
-            .and_then(serde_json::Value::as_str),
-        Some("started" | "already_running")
-    )
 }
 
 fn stdio_runtime_truth_status(
@@ -3505,23 +3471,36 @@ fn stdio_status_recommended_next_calls(
                     return serde_json::json!([
                         {
                             "method": "host/confirm",
-                            "instruction": sidecar_setup["prompt"]
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "sidecar_setup",
-                            "arguments": {"action": "enable"},
-                            "debug_command": sidecar_setup["enable_command"]
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "sidecar_setup",
-                            "arguments": {"action": "disable"},
-                            "debug_command": sidecar_setup["disable_command"]
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://status"
+                            "instruction": sidecar_setup["prompt"],
+                            "confirm_next": [
+                                {
+                                    "method": "tools/call",
+                                    "tool": "sidecar_setup",
+                                    "arguments": {"action": "enable"},
+                                    "debug_command": sidecar_setup["enable_command"]
+                                },
+                                {
+                                    "method": "tools/call",
+                                    "tool": "repair_all",
+                                    "arguments": {}
+                                },
+                                {
+                                    "method": "resources/read",
+                                    "uri": "codestory://status"
+                                }
+                            ],
+                            "decline_next": [
+                                {
+                                    "method": "tools/call",
+                                    "tool": "sidecar_setup",
+                                    "arguments": {"action": "disable"},
+                                    "debug_command": sidecar_setup["disable_command"]
+                                },
+                                {
+                                    "method": "resources/read",
+                                    "uri": "codestory://status"
+                                }
+                            ]
                         },
                         {
                             "method": "resources/read",
@@ -3533,13 +3512,34 @@ fn stdio_status_recommended_next_calls(
                     return serde_json::json!([
                         {
                             "method": "host/instruction",
-                            "instruction": "Sidecar setup repair is disabled for this plugin install."
+                            "instruction": "CodeStory packet/search repair is disabled for this plugin install. Enable sidecar setup before running MCP repair."
                         },
                         {
                             "method": "tools/call",
                             "tool": "sidecar_setup",
                             "arguments": {"action": "enable"},
                             "debug_command": sidecar_setup["enable_command"]
+                        },
+                        {
+                            "method": "resources/read",
+                            "uri": "codestory://status"
+                        },
+                        {
+                            "method": "resources/read",
+                            "uri": "codestory://agent-guide"
+                        }
+                    ]);
+                }
+                "unmanaged" => {
+                    return serde_json::json!([
+                        {
+                            "method": "host/instruction",
+                            "instruction": "Sidecar setup policy is not persisted for this host; explicit MCP repair can run for this session."
+                        },
+                        {
+                            "method": "tools/call",
+                            "tool": "repair_all",
+                            "arguments": {}
                         },
                         {
                             "method": "resources/read",
@@ -3743,6 +3743,12 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
     };
     let prompt_required = matches!(state, "ask");
     let explicit_repair_enabled = matches!(state, "enabled");
+    let repair_mode = match state {
+        "enabled" => "explicit_mcp",
+        "unmanaged" => "explicit_mcp_unmanaged",
+        "disabled" => "disabled",
+        _ => "consent_required",
+    };
     let project = crate::display::clean_path_string(&project_root.to_string_lossy());
     let default_repair = format!(
         "codestory-cli ready --goal agent --repair --project \"{project}\" --format json --run-id {}",
@@ -3761,9 +3767,9 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         "auto_repair": false,
         "status_triggered_repair": false,
         "explicit_repair_enabled": explicit_repair_enabled,
-        "repair_mode": if explicit_repair_enabled { "explicit_mcp" } else { "policy_gated" },
+        "repair_mode": repair_mode,
         "prompt_required": prompt_required,
-        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. Enable MCP sidecar repair for this plugin install?") } else { None },
+        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. MCP repair may start or download retrieval sidecars for this project. Enable MCP sidecar repair for this plugin install?") } else { None },
         "mcp_control": {
             "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
             "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},

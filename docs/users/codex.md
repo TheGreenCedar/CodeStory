@@ -142,6 +142,16 @@ More pairs, anti-patterns, and language-flavored examples:
 | Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Status/grounding read times out | Restart stale CodeStory MCP processes, then read `codestory://status` in a fresh thread |
 
+### Readiness broker fields
+
+| Field | Healthy value | Action value |
+| --- | --- | --- |
+| `readiness_broker.reconciliation.status` | `clean` or `observed` | `active_repair` means wait and reread status; `stale_state_cleaned` means retry repair once |
+| `readiness_broker.resources.native_embedding_runtime.status` | `available` | `busy` means another native embedding repair owns the GPU runtime; `stale` means retry repair so the broker can reclaim it |
+| `readiness_broker.gpu_proof.proof_status` | `verified` when accelerator is required | `gpu_unverified` means repair should stop before a long semantic rebuild |
+| `readiness_broker.persistence_status` | `persisted` | `failed` means inspect `persistence_error`; status may be live but not durable across processes |
+| `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup`, `repair_all`, and status read sequence |
+
 Shared repair lanes: [Troubleshooting](troubleshooting.md).
 
 Optional Git dirty-marker hooks (local graph freshness after checkout/merge):

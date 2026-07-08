@@ -2677,96 +2677,103 @@ fn repair_ready_state(
         sidecar.run_id.as_deref(),
         env!("CARGO_PKG_VERSION"),
     );
-    let _embedding_resource_lock = match readiness_broker::acquire_machine_resource_lock_with_wait(
-        readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-        &broker_scope,
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-    )? {
-        readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-        readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy) => {
-            let owner = busy
-                .snapshot
-                .owner_workspace_root
-                .as_deref()
-                .unwrap_or("unknown");
-            bail!(
-                "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}; retry after the current repair reaches full retrieval",
-                busy.snapshot.resource,
-                busy.snapshot
-                    .owner_project_id
-                    .as_deref()
-                    .unwrap_or("unknown"),
-                owner,
-                busy.snapshot.owner_pid
-            );
-        }
-    };
-    eprintln!(
-        "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
-        sidecar.run_id.as_deref().unwrap_or("none"),
-        sidecar.namespace,
-        sidecar.compose_project
-    );
-    let progress = ReadyRepairProgress::start(&sidecar, &runtime.project_root, &runtime.cache_root);
-    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
-        &sidecar,
-        Some(runtime.project_root.as_path()),
-        &storage_scope,
-        None,
-        false,
-        Duration::from_secs(90),
-        |phase| progress.set_phase(phase),
-    )
-    .context("ready repair retrieval bootstrap")?;
-    let infrastructure = ready_repair_infrastructure_with_runtime_observation(
-        &bootstrap.infrastructure,
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-    );
-    let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-        project_root: runtime.project_root.clone(),
-        cache_root: runtime.cache_root.clone(),
-        agent_run_id: sidecar.run_id.clone(),
-        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-        gpu_proof: Some(broker_gpu_proof_input_from_infrastructure(&infrastructure)),
-        reconciliation: None,
-    });
-    ensure_ready_repair_embed_liveness(&infrastructure)?;
-    progress.set_phase("Qdrant finalize");
-    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-    )
-    .context("ready repair project qdrant repair")?;
-    progress.set_phase("graph artifact");
-    runtime
-        .index
-        .run_indexing_blocking(IndexMode::Full)
-        .map_err(map_api_error)
-        .context("ready repair retrieval index refresh")?;
-    codestory_retrieval::finalize_index_for_runtime_with_progress(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-        |phase| progress.set_phase(phase),
-    )
-    .with_context(|| {
-        format!(
-            "ready repair retrieval index finalize using {}",
-            retrieval::format_sidecar_runtime(&sidecar)
+    let final_status = {
+        let _embedding_resource_lock =
+            match readiness_broker::acquire_native_embedding_resource_lock_if_needed(
+                &broker_scope,
+                Duration::from_secs(30),
+                Duration::from_millis(250),
+            )? {
+                None => None,
+                Some(readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock)) => {
+                    Some(lock)
+                }
+                Some(readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy)) => {
+                    let owner = busy
+                        .snapshot
+                        .owner_workspace_root
+                        .as_deref()
+                        .unwrap_or("unknown");
+                    bail!(
+                        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}; retry after the current repair reaches full retrieval",
+                        busy.snapshot.resource,
+                        busy.snapshot
+                            .owner_project_id
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        owner,
+                        busy.snapshot.owner_pid
+                    );
+                }
+            };
+        eprintln!(
+            "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
+            sidecar.run_id.as_deref().unwrap_or("none"),
+            sidecar.namespace,
+            sidecar.compose_project
+        );
+        let progress =
+            ReadyRepairProgress::start(&sidecar, &runtime.project_root, &runtime.cache_root);
+        let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
+            &sidecar,
+            Some(runtime.project_root.as_path()),
+            &storage_scope,
+            None,
+            false,
+            Duration::from_secs(90),
+            |phase| progress.set_phase(phase),
         )
-    })?;
-    progress.set_phase("readiness check");
-    let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        sidecar.clone(),
-    )
-    .context("ready repair final retrieval status")?;
-    ensure_ready_repair_full_sidecar(&final_status)?;
+        .context("ready repair retrieval bootstrap")?;
+        let infrastructure = ready_repair_infrastructure_with_runtime_observation(
+            &bootstrap.infrastructure,
+            &runtime.project_root,
+            &runtime.storage_path,
+            &sidecar,
+        );
+        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_infrastructure(&infrastructure)),
+            reconciliation: None,
+        });
+        ensure_ready_repair_embed_liveness(&infrastructure)?;
+        progress.set_phase("Qdrant finalize");
+        codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+            &runtime.project_root,
+            &runtime.storage_path,
+            &sidecar,
+        )
+        .context("ready repair project qdrant repair")?;
+        progress.set_phase("graph artifact");
+        runtime
+            .index
+            .run_indexing_blocking(IndexMode::Full)
+            .map_err(map_api_error)
+            .context("ready repair retrieval index refresh")?;
+        codestory_retrieval::finalize_index_for_runtime_with_progress(
+            &runtime.project_root,
+            &runtime.storage_path,
+            &sidecar,
+            |phase| progress.set_phase(phase),
+        )
+        .with_context(|| {
+            format!(
+                "ready repair retrieval index finalize using {}",
+                retrieval::format_sidecar_runtime(&sidecar)
+            )
+        })?;
+        progress.set_phase("readiness check");
+        let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+            sidecar.clone(),
+        )
+        .context("ready repair final retrieval status")?;
+        ensure_ready_repair_full_sidecar(&final_status)?;
+        final_status
+    };
     let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
         project_root: runtime.project_root.clone(),
         cache_root: runtime.cache_root.clone(),

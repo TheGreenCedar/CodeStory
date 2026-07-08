@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{display, local_refresh_status, ready_repair_status};
@@ -15,7 +16,9 @@ const BROKER_SNAPSHOT_FILE: &str = "snapshot.json";
 const MACHINE_RESOURCE_DIR: &str = "machine";
 const MACHINE_LOCK_SCHEMA_VERSION: u32 = 1;
 const MACHINE_LOCK_STALE_TTL: Duration = Duration::from_secs(20 * 60);
+const MACHINE_REAPER_LOCK_STALE_TTL: Duration = Duration::from_secs(2 * 60);
 pub(crate) const NATIVE_EMBEDDING_RESOURCE: &str = "native_embedding_runtime";
+static SNAPSHOT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerScope {
@@ -181,6 +184,15 @@ struct BrokerMachineResourceLockFile {
     operation_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BrokerMachineResourceReaperLockFile {
+    schema_version: u32,
+    resource: String,
+    pid: u32,
+    started_at_epoch_ms: i64,
+    token: String,
+}
+
 #[derive(Debug)]
 pub(crate) enum BrokerMachineResourceLockAttempt {
     Acquired(BrokerMachineResourceLock),
@@ -198,9 +210,26 @@ pub(crate) struct BrokerMachineResourceLock {
     token: String,
 }
 
+#[derive(Debug)]
+struct BrokerMachineResourceReaperLock {
+    path: PathBuf,
+    token: String,
+}
+
 impl Drop for BrokerMachineResourceLock {
     fn drop(&mut self) {
         let Some(lock) = read_machine_resource_lock_file(&self.path) else {
+            return;
+        };
+        if lock.token == self.token {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for BrokerMachineResourceReaperLock {
+    fn drop(&mut self) {
+        let Some(lock) = read_machine_resource_reaper_lock_file(&self.path) else {
             return;
         };
         if lock.token == self.token {
@@ -300,7 +329,13 @@ pub(crate) fn try_acquire_machine_resource_lock(
         ));
     }
 
-    let _ = fs::remove_file(&path);
+    if !reap_stale_machine_resource_lock(resource, &path)? {
+        return Ok(BrokerMachineResourceLockAttempt::Busy(
+            BrokerMachineResourceBusy {
+                snapshot: machine_resource_snapshot(resource),
+            },
+        ));
+    }
     match create_lock_file(&path, &content) {
         Ok(()) => Ok(BrokerMachineResourceLockAttempt::Acquired(
             BrokerMachineResourceLock { path, token },
@@ -312,6 +347,30 @@ pub(crate) fn try_acquire_machine_resource_lock(
         ),
         Err(error) => Err(error.into()),
     }
+}
+
+fn reap_stale_machine_resource_lock(resource: &str, path: &Path) -> Result<bool> {
+    let Some(_reaper) = try_acquire_machine_resource_reaper_lock(resource)? else {
+        return Ok(false);
+    };
+    if !machine_lock_file_is_stale(path) {
+        return Ok(false);
+    }
+    let _ = fs::remove_file(path);
+    Ok(true)
+}
+
+pub(crate) fn acquire_native_embedding_resource_lock_if_needed(
+    scope: &BrokerScope,
+    wait: Duration,
+    poll: Duration,
+) -> Result<Option<BrokerMachineResourceLockAttempt>> {
+    if codestory_retrieval::embedding_server_launch_mode()?
+        != codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
+    {
+        return Ok(None);
+    }
+    acquire_machine_resource_lock_with_wait(NATIVE_EMBEDDING_RESOURCE, scope, wait, poll).map(Some)
 }
 
 pub(crate) fn acquire_machine_resource_lock_with_wait(
@@ -693,6 +752,42 @@ fn create_lock_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn try_acquire_machine_resource_reaper_lock(
+    resource: &str,
+) -> Result<Option<BrokerMachineResourceReaperLock>> {
+    let path = machine_resource_reaper_lock_path(resource);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let started_at_epoch_ms = now_epoch_ms();
+    let pid = std::process::id();
+    let token = format!("{pid}:{started_at_epoch_ms}:reaper");
+    let lock = BrokerMachineResourceReaperLockFile {
+        schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+        resource: resource.to_string(),
+        pid,
+        started_at_epoch_ms,
+        token: token.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&lock)?;
+
+    match create_lock_file(&path, &content) {
+        Ok(()) => Ok(Some(BrokerMachineResourceReaperLock { path, token })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if !machine_reaper_lock_file_is_stale(&path) {
+                return Ok(None);
+            }
+            let _ = fs::remove_file(&path);
+            match create_lock_file(&path, &content) {
+                Ok(()) => Ok(Some(BrokerMachineResourceReaperLock { path, token })),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn read_machine_resource_lock_file(path: &Path) -> Option<BrokerMachineResourceLockFile> {
     fs::read_to_string(path)
         .ok()
@@ -702,19 +797,61 @@ fn read_machine_resource_lock_file(path: &Path) -> Option<BrokerMachineResourceL
         })
 }
 
+fn read_machine_resource_reaper_lock_file(
+    path: &Path,
+) -> Option<BrokerMachineResourceReaperLockFile> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .filter(|lock: &BrokerMachineResourceReaperLockFile| {
+            lock.schema_version == MACHINE_LOCK_SCHEMA_VERSION
+        })
+}
+
+fn machine_reaper_lock_file_is_stale(path: &Path) -> bool {
+    let now = now_epoch_ms();
+    if let Some(lock) = read_machine_resource_reaper_lock_file(path) {
+        if !ready_repair_status::process_is_running(lock.pid) {
+            return true;
+        }
+        return now.saturating_sub(lock.started_at_epoch_ms)
+            > MACHINE_REAPER_LOCK_STALE_TTL.as_millis() as i64;
+    }
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|modified| {
+            let modified_ms = modified.as_millis().min(i64::MAX as u128) as i64;
+            now.saturating_sub(modified_ms) > MACHINE_REAPER_LOCK_STALE_TTL.as_millis() as i64
+        })
+        .unwrap_or(true)
+}
+
 fn write_snapshot_file(path: &Path, snapshot: &ReadinessBrokerSnapshot) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let counter = SNAPSHOT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         BROKER_SNAPSHOT_FILE,
-        std::process::id()
+        std::process::id(),
+        counter
     ));
     fs::write(&temp_path, serde_json::to_string_pretty(snapshot)?)?;
-    let _ = fs::remove_file(path);
-    fs::rename(temp_path, path)?;
-    Ok(())
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(_error) if path.exists() => {
+            let _ = fs::remove_file(path);
+            fs::rename(&temp_path, path)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(error.into())
+        }
+    }
 }
 
 fn broker_snapshot_path(canonical_root_hash: &str) -> PathBuf {
@@ -730,6 +867,13 @@ fn machine_resource_lock_path(resource: &str) -> PathBuf {
         .join(BROKER_DIR)
         .join(MACHINE_RESOURCE_DIR)
         .join(format!("{}.lock", safe_name(resource)))
+}
+
+fn machine_resource_reaper_lock_path(resource: &str) -> PathBuf {
+    broker_cache_root()
+        .join(BROKER_DIR)
+        .join(MACHINE_RESOURCE_DIR)
+        .join(format!("{}.reap.lock", safe_name(resource)))
 }
 
 fn install_id() -> String {
@@ -812,7 +956,74 @@ fn now_epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
     use tempfile::tempdir;
+
+    fn unique_resource(prefix: &str) -> String {
+        format!("{prefix}-{}-{}", std::process::id(), now_epoch_ms())
+    }
+
+    fn cleanup_machine_resource(resource: &str) {
+        let _ = fs::remove_file(machine_resource_lock_path(resource));
+        let _ = fs::remove_file(machine_resource_reaper_lock_path(resource));
+    }
+
+    fn test_scope(project: &Path, run_id: &str) -> BrokerScope {
+        agent_repair_scope(project, Some(run_id), "9.9.9")
+    }
+
+    fn write_machine_lock(resource: &str, scope: &BrokerScope, pid: u32) -> PathBuf {
+        let path = machine_resource_lock_path(resource);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create lock parent");
+        }
+        let started_at_epoch_ms = now_epoch_ms();
+        let lock = BrokerMachineResourceLockFile {
+            schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+            resource: resource.to_string(),
+            scope: scope.clone(),
+            pid,
+            started_at_epoch_ms,
+            token: format!("test:{pid}:{started_at_epoch_ms}"),
+            operation_id: broker_operation_id(scope),
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&lock).expect("serialize lock"),
+        )
+        .expect("write lock");
+        path
+    }
+
+    fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
+        let canonical_root = clean_path_text(project);
+        let canonical_root_hash = hash_text(&canonical_root);
+        ReadinessBrokerSnapshot {
+            schema_version: BROKER_SCHEMA_VERSION,
+            install_id: "test-install".to_string(),
+            project_id: project_id_from_hash(&canonical_root_hash),
+            canonical_root_hash,
+            workspace_root: clean_path(project),
+            cli_version: "9.9.9".to_string(),
+            updated_at_epoch_ms: now_epoch_ms(),
+            snapshot_path: None,
+            persistence_status: "pending".to_string(),
+            persistence_error: None,
+            operations: Vec::new(),
+            resources: BTreeMap::new(),
+            reconciliation: BrokerReconciliationSnapshot {
+                status: "observed".to_string(),
+                cleanup_performed: false,
+                stale_status_paths_removed: Vec::new(),
+                stale_lock_paths_removed: Vec::new(),
+                abandoned_repairs: Vec::new(),
+                local_refresh_cleanups: Vec::new(),
+                active_repair: None,
+                unresolved_orphan_reason: None,
+            },
+            gpu_proof: None,
+        }
+    }
 
     #[test]
     fn gpu_proof_requires_observed_acceleration_when_requested() {
@@ -843,5 +1054,124 @@ mod tests {
         assert_eq!(scope.agent_id.as_deref(), Some("agent-1"));
         assert!(scope.project_id.starts_with("codestory-"));
         assert_eq!(scope.cli_version, "9.9.9");
+    }
+
+    #[test]
+    fn machine_resource_lock_reports_busy_until_owner_drops() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("single-owner");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "owner");
+
+        let lock = match try_acquire_machine_resource_lock(&resource, &scope)
+            .expect("acquire machine lock")
+        {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+        let busy =
+            match try_acquire_machine_resource_lock(&resource, &scope).expect("second acquire") {
+                BrokerMachineResourceLockAttempt::Acquired(_) => {
+                    panic!("second lock should be busy")
+                }
+                BrokerMachineResourceLockAttempt::Busy(busy) => busy,
+            };
+        assert_eq!(busy.snapshot.status, "busy");
+        assert_eq!(busy.snapshot.owner_pid, Some(std::process::id()));
+
+        drop(lock);
+        let reacquired =
+            try_acquire_machine_resource_lock(&resource, &scope).expect("reacquire after drop");
+        assert!(matches!(
+            reacquired,
+            BrokerMachineResourceLockAttempt::Acquired(_)
+        ));
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn machine_resource_lock_reclaims_dead_owner() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("dead-owner");
+        cleanup_machine_resource(&resource);
+        let old_scope = test_scope(project.path(), "dead");
+        let new_scope = test_scope(project.path(), "new");
+        write_machine_lock(&resource, &old_scope, u32::MAX);
+
+        let acquired =
+            try_acquire_machine_resource_lock(&resource, &new_scope).expect("reclaim dead owner");
+        assert!(matches!(
+            acquired,
+            BrokerMachineResourceLockAttempt::Acquired(_)
+        ));
+        let snapshot = machine_resource_snapshot(&resource);
+        assert_eq!(snapshot.status, "busy");
+        assert_eq!(
+            snapshot.owner_operation_id,
+            Some(broker_operation_id(&new_scope))
+        );
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn machine_resource_reaper_leaves_fresh_lock_owned() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("fresh-recheck");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "fresh");
+        let path = write_machine_lock(&resource, &scope, std::process::id());
+
+        assert!(
+            !reap_stale_machine_resource_lock(&resource, &path).expect("reap check"),
+            "fresh lock should not be reaped"
+        );
+        let lock = read_machine_resource_lock_file(&path).expect("fresh lock remains");
+        assert_eq!(lock.operation_id, broker_operation_id(&scope));
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn snapshot_file_round_trips_json() {
+        let dir = tempdir().expect("temp dir");
+        let snapshot = sample_snapshot(dir.path());
+        let path = dir.path().join("snapshot.json");
+
+        write_snapshot_file(&path, &snapshot).expect("write snapshot");
+
+        let parsed: ReadinessBrokerSnapshot =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read snapshot"))
+                .expect("parse snapshot");
+        assert_eq!(parsed.schema_version, BROKER_SCHEMA_VERSION);
+        assert_eq!(parsed.project_id, snapshot.project_id);
+    }
+
+    #[test]
+    fn snapshot_file_uses_unique_temp_names_for_same_process_writers() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("snapshot.json");
+        let snapshot = sample_snapshot(dir.path());
+        let mut handles = Vec::new();
+
+        for index in 0..4 {
+            let path = path.clone();
+            let mut snapshot = snapshot.clone();
+            snapshot.project_id = format!("codestory-thread-{index}");
+            handles.push(thread::spawn(move || {
+                for _ in 0..10 {
+                    write_snapshot_file(&path, &snapshot).expect("write snapshot");
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("snapshot writer thread");
+        }
+        let parsed: ReadinessBrokerSnapshot =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read final snapshot"))
+                .expect("parse final snapshot");
+        assert_eq!(parsed.schema_version, BROKER_SCHEMA_VERSION);
+        assert!(parsed.project_id.starts_with("codestory-thread-"));
     }
 }

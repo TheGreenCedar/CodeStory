@@ -205,6 +205,60 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
                 .map(|proof| proof.proof_status.as_str())
                 .unwrap_or("unknown")
         );
+        if broker.persistence_status != "persisted" {
+            let _ = writeln!(
+                markdown,
+                "readiness_broker_persistence_error: {}",
+                broker.persistence_error.as_deref().unwrap_or("unknown")
+            );
+        }
+        for operation in &broker.operations {
+            let _ = writeln!(
+                markdown,
+                "readiness_broker_operation: kind={} status={} phase={} pid={} run_id={}",
+                operation.operation_kind,
+                operation.status,
+                operation.phase.as_deref().unwrap_or("unknown"),
+                operation
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                operation.run_id.as_deref().unwrap_or("none")
+            );
+        }
+        if let Some(resource) = broker.resources.get("native_embedding_runtime")
+            && resource.status != "available"
+        {
+            let next = match resource.status.as_str() {
+                "stale" => "retry repair to reclaim stale native embedding lock",
+                "busy" => "wait for owner or retry after current repair completes",
+                _ => "inspect broker snapshot",
+            };
+            let _ = writeln!(
+                markdown,
+                "readiness_broker_resource: native_embedding_runtime status={} owner_project={} owner_pid={} next={}",
+                resource.status,
+                resource.owner_project_id.as_deref().unwrap_or("unknown"),
+                resource
+                    .owner_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                next
+            );
+        }
+        if let Some(proof) = broker.gpu_proof.as_ref()
+            && proof.proof_status != "unknown"
+        {
+            let _ = writeln!(
+                markdown,
+                "readiness_broker_gpu: status={} requested_provider={} requested_device={} observed={} cpu_allowed={}",
+                proof.proof_status,
+                proof.requested_provider.as_deref().unwrap_or("none"),
+                proof.requested_device.as_deref().unwrap_or("none"),
+                proof.observed_state.as_deref().unwrap_or("unknown"),
+                proof.cpu_allowed
+            );
+        }
     }
     markdown
 }

@@ -51,52 +51,58 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         "retrieval_bootstrap",
         env!("CARGO_PKG_VERSION"),
     );
-    let _embedding_resource_lock =
-        match crate::readiness_broker::acquire_machine_resource_lock_with_wait(
-            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-            &broker_scope,
-            Duration::from_secs(30),
-            Duration::from_millis(250),
-        )? {
-            crate::readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-            crate::readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy) => {
-                bail!(
-                    "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}",
-                    busy.snapshot.resource,
-                    busy.snapshot
-                        .owner_project_id
-                        .as_deref()
-                        .unwrap_or("unknown"),
-                    busy.snapshot
-                        .owner_workspace_root
-                        .as_deref()
-                        .unwrap_or("unknown"),
-                    busy.snapshot.owner_pid
-                );
-            }
-        };
-    let report = bootstrap_sidecars_with_runtime(
-        &sidecar,
-        Some(&runtime.project_root),
-        &storage_scope,
-        cmd.compose_file.as_deref(),
-        cmd.skip_compose,
-        Duration::from_secs(cmd.wait_secs),
-    )
-    .context("retrieval bootstrap")?;
-    activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
-    let project_qdrant_repair = codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-    )
-    .context("retrieval project qdrant repair")?;
-    let status = strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        sidecar.clone(),
-    )
-    .context("retrieval status after bootstrap")?;
+    let (report, project_qdrant_repair, status) = {
+        let _embedding_resource_lock =
+            match crate::readiness_broker::acquire_native_embedding_resource_lock_if_needed(
+                &broker_scope,
+                Duration::from_secs(30),
+                Duration::from_millis(250),
+            )? {
+                None => None,
+                Some(crate::readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock)) => {
+                    Some(lock)
+                }
+                Some(crate::readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy)) => {
+                    bail!(
+                        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}",
+                        busy.snapshot.resource,
+                        busy.snapshot
+                            .owner_project_id
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        busy.snapshot
+                            .owner_workspace_root
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        busy.snapshot.owner_pid
+                    );
+                }
+            };
+        let report = bootstrap_sidecars_with_runtime(
+            &sidecar,
+            Some(&runtime.project_root),
+            &storage_scope,
+            cmd.compose_file.as_deref(),
+            cmd.skip_compose,
+            Duration::from_secs(cmd.wait_secs),
+        )
+        .context("retrieval bootstrap")?;
+        activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
+        let project_qdrant_repair =
+            codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                &runtime.project_root,
+                &runtime.storage_path,
+                &sidecar,
+            )
+            .context("retrieval project qdrant repair")?;
+        let status = strict_sidecar_status_for_runtime(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+            sidecar.clone(),
+        )
+        .context("retrieval status after bootstrap")?;
+        (report, project_qdrant_repair, status)
+    };
     let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),

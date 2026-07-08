@@ -11,6 +11,10 @@
   cross-process snapshots, orphan repair reconciliation, machine-scoped native
   embedding locking, GPU proof reporting, and explicit-only MCP repair from
   status reads.
+- Hardened readiness broker state management so stale native embedding locks are
+  reaped under a separate atomic guard, final success snapshots are written
+  after repair locks are released, and status recommendations distinguish
+  consent, disabled, unmanaged, and enabled MCP repair policy.
 
 ## 0.13.12
 
