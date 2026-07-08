@@ -151,6 +151,12 @@ function activeProjectStateMatchesHost(active) {
   return activeThread === currentThread;
 }
 
+function activeProjectStateMatchesCurrentThread(active) {
+  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
+  if (!currentThread) return true;
+  return String(active?.codexThreadId || '').trim() === currentThread;
+}
+
 function activeProjectStateFresh(active, statePath, nowMs = Date.now(), options = {}) {
   const timestamp = activeProjectStateTimestamp(active, statePath);
   return timestamp !== null
@@ -218,6 +224,14 @@ function resolveProjectRoot(options = {}) {
     return {
       projectRoot: null,
       source: 'plugin_active_state_stale',
+      statePath,
+      reason: 'project_root_unavailable',
+    };
+  }
+  if (active && !activeProjectStateMatchesCurrentThread(active)) {
+    return {
+      projectRoot: null,
+      source: 'plugin_active_state_thread_mismatch',
       statePath,
       reason: 'project_root_unavailable',
     };
