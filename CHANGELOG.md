@@ -19,6 +19,14 @@
   spawned llama.cpp PID, releasing them on retrieval down, preserving fresh local
   refresh locks when only status is stale, and routing MCP repair guidance
   through `sidecar_setup repair` instead of raw `repair_all`.
+- Hardened native embedding teardown so `retrieval down` verifies the recorded
+  llama.cpp process identity before killing a PID, propagates stop and lock
+  release failures, and cleans up spawned processes if sidecar state persistence
+  fails.
+- Made `repair_all` a deprecated MCP compatibility alias for background
+  `sidecar_setup repair`, removed it from status recommendations, and made
+  diagnostic fail-open MCP reject fake repair attempts until the real stdio
+  runtime is restored.
 - Fixed Windows native llama.cpp startup under restrictive host job objects by
   retrying without `CREATE_BREAKAWAY_FROM_JOB` when Windows denies the
   best-effort detached spawn.

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -378,6 +378,82 @@ pub(crate) fn transfer_machine_resource_lock_to_pid(
     Ok(true)
 }
 
+pub(crate) fn transfer_native_embedding_resource_lock(
+    lock: &mut Option<BrokerMachineResourceLock>,
+    state: &codestory_retrieval::SidecarStateFile,
+) -> Result<()> {
+    let Some(pid) = native_embedding_pid_from_sidecar_state(state) else {
+        return Ok(());
+    };
+    let lock = lock
+        .as_mut()
+        .context("native embedding process spawned without broker machine lock")?;
+    if !transfer_machine_resource_lock_to_pid(lock, pid)? {
+        bail!("native embedding broker lock handoff failed for pid {pid}");
+    }
+    Ok(())
+}
+
+pub(crate) fn transfer_native_embedding_resource_lock_from_state_file(
+    lock: &mut Option<BrokerMachineResourceLock>,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    operation_started_at_epoch_ms: i64,
+) -> Result<()> {
+    let Some(state) = read_sidecar_state_file(sidecar)? else {
+        return Ok(());
+    };
+    if !sidecar_state_has_recent_native_embedding_spawn(&state, operation_started_at_epoch_ms) {
+        return Ok(());
+    }
+    transfer_native_embedding_resource_lock(lock, &state)
+}
+
+pub(crate) fn native_embedding_pid_from_sidecar_state_file(
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<Option<u32>> {
+    Ok(read_sidecar_state_file(sidecar)?
+        .and_then(|state| native_embedding_pid_from_sidecar_state(&state)))
+}
+
+fn read_sidecar_state_file(
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<Option<codestory_retrieval::SidecarStateFile>> {
+    if !sidecar.layout.state_file.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&sidecar.layout.state_file)
+        .with_context(|| format!("read {}", sidecar.layout.state_file.display()))?;
+    let state = serde_json::from_str(&contents)
+        .with_context(|| format!("parse {}", sidecar.layout.state_file.display()))?;
+    Ok(Some(state))
+}
+
+fn native_embedding_pid_from_sidecar_state(
+    state: &codestory_retrieval::SidecarStateFile,
+) -> Option<u32> {
+    let launch = state.embedding_launch.as_ref()?;
+    (launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str())
+        .then_some(launch.pid)
+        .flatten()
+}
+
+fn sidecar_state_has_recent_native_embedding_spawn(
+    state: &codestory_retrieval::SidecarStateFile,
+    operation_started_at_epoch_ms: i64,
+) -> bool {
+    let Some(launch) = state.embedding_launch.as_ref() else {
+        return false;
+    };
+    if launch.launch_mode != codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str()
+    {
+        return false;
+    }
+    matches!(
+        launch.spawned_at_epoch_ms,
+        Some(spawned_at_epoch_ms) if spawned_at_epoch_ms >= operation_started_at_epoch_ms
+    )
+}
+
 pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) -> Result<bool> {
     let path = machine_resource_lock_path(resource);
     let Some(file_lock) = read_machine_resource_lock_file(&path) else {
@@ -386,7 +462,7 @@ pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) ->
     if file_lock.pid != pid {
         return Ok(false);
     }
-    let _ = fs::remove_file(path);
+    fs::remove_file(path)?;
     Ok(true)
 }
 
@@ -397,7 +473,7 @@ fn reap_stale_machine_resource_lock(resource: &str, path: &Path) -> Result<bool>
     if !machine_lock_file_is_stale(path) {
         return Ok(false);
     }
-    let _ = fs::remove_file(path);
+    fs::remove_file(path)?;
     Ok(true)
 }
 
@@ -412,6 +488,10 @@ pub(crate) fn acquire_native_embedding_resource_lock_if_needed(
         return Ok(None);
     }
     acquire_machine_resource_lock_with_wait(NATIVE_EMBEDDING_RESOURCE, scope, wait, poll).map(Some)
+}
+
+pub(crate) fn current_epoch_ms() -> i64 {
+    now_epoch_ms()
 }
 
 pub(crate) fn acquire_machine_resource_lock_with_wait(
@@ -1070,6 +1150,54 @@ mod tests {
         }
     }
 
+    fn native_sidecar_state(
+        spawned_at_epoch_ms: Option<i64>,
+    ) -> codestory_retrieval::SidecarStateFile {
+        codestory_retrieval::SidecarStateFile {
+            owner: "codestory".to_string(),
+            profile: "agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            run_id: Some("shared-agent".to_string()),
+            zoekt_http_port: 37031,
+            qdrant_http_port: 37032,
+            qdrant_grpc_port: 37033,
+            embed_http_port: 37040,
+            embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "gpu_verified".to_string(),
+            embedding_device_observation_source: "test".to_string(),
+            embedding_detected_provider: Some("vulkan".to_string()),
+            embedding_detected_gpu: Some("Vulkan0".to_string()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("vulkan".to_string()),
+            embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+            embedding_cpu_allowed: false,
+            embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
+                provider: "llamacpp".to_string(),
+                launch_mode: codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
+                    .as_str()
+                    .to_string(),
+                endpoint: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+                pid: Some(1234),
+                spawned_at_epoch_ms,
+                launch_args: vec!["--port".to_string(), "37040".to_string()],
+                launch_fingerprint_sha256: Some("fingerprint".to_string()),
+                executable_source: Some("test".to_string()),
+                executable_path: Some("C:/cache/llama-server.exe".to_string()),
+                model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+                requested_device: Some("Vulkan0".to_string()),
+            }),
+            sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
+            zoekt_data_dir: "C:/cache/zoekt".to_string(),
+            qdrant_data_dir: "C:/cache/qdrant".to_string(),
+            scip_artifacts_root: "C:/cache/scip".to_string(),
+            compose_file: None,
+            cleanup_command: "codestory-cli retrieval down".to_string(),
+            started_at_epoch_ms: 100,
+        }
+    }
+
     #[test]
     fn gpu_proof_requires_observed_acceleration_when_requested() {
         let proof = gpu_proof(BrokerGpuProofInput {
@@ -1099,6 +1227,28 @@ mod tests {
         assert_eq!(scope.agent_id.as_deref(), Some("agent-1"));
         assert!(scope.project_id.starts_with("codestory-"));
         assert_eq!(scope.cli_version, "9.9.9");
+    }
+
+    #[test]
+    fn native_embedding_state_handoff_requires_current_operation_spawn() {
+        let operation_started_at_epoch_ms = 1_000;
+
+        assert!(sidecar_state_has_recent_native_embedding_spawn(
+            &native_sidecar_state(Some(1_000)),
+            operation_started_at_epoch_ms
+        ));
+        assert!(sidecar_state_has_recent_native_embedding_spawn(
+            &native_sidecar_state(Some(1_001)),
+            operation_started_at_epoch_ms
+        ));
+        assert!(!sidecar_state_has_recent_native_embedding_spawn(
+            &native_sidecar_state(Some(999)),
+            operation_started_at_epoch_ms
+        ));
+        assert!(!sidecar_state_has_recent_native_embedding_spawn(
+            &native_sidecar_state(None),
+            operation_started_at_epoch_ms
+        ));
     }
 
     #[test]

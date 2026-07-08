@@ -2678,6 +2678,7 @@ fn repair_ready_state(
         env!("CARGO_PKG_VERSION"),
     );
     let final_status = {
+        let operation_started_at_epoch_ms = readiness_broker::current_epoch_ms();
         let mut embedding_resource_lock =
             match readiness_broker::acquire_native_embedding_resource_lock_if_needed(
                 &broker_scope,
@@ -2726,14 +2727,38 @@ fn repair_ready_state(
         let bootstrap = match bootstrap_result {
             Ok(report) => report,
             Err(error) => {
-                transfer_native_embedding_lease_from_state_file(
-                    &mut embedding_resource_lock,
-                    &sidecar,
-                );
+                if let Err(lease_error) =
+                    readiness_broker::transfer_native_embedding_resource_lock_from_state_file(
+                        &mut embedding_resource_lock,
+                        &sidecar,
+                        operation_started_at_epoch_ms,
+                    )
+                {
+                    if let Err(cleanup_error) =
+                        codestory_retrieval::sidecar_down_for_runtime(&sidecar)
+                    {
+                        return Err(error).context(format!(
+                            "ready repair retrieval bootstrap; native embedding lease transfer failed: {lease_error}; cleanup failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(error).context(format!(
+                        "ready repair retrieval bootstrap; native embedding lease transfer failed: {lease_error}"
+                    ));
+                }
                 return Err(error).context("ready repair retrieval bootstrap");
             }
         };
-        transfer_native_embedding_lease(&mut embedding_resource_lock, &bootstrap.state);
+        if let Err(error) = readiness_broker::transfer_native_embedding_resource_lock(
+            &mut embedding_resource_lock,
+            &bootstrap.state,
+        ) {
+            codestory_retrieval::sidecar_down_for_runtime(&sidecar).with_context(|| {
+                format!(
+                    "cleanup ready repair sidecar after native embedding lease transfer failed: {error}"
+                )
+            })?;
+            return Err(error).context("native embedding lease transfer");
+        }
         let infrastructure = ready_repair_infrastructure_with_runtime_observation(
             &bootstrap.infrastructure,
             &runtime.project_root,
@@ -2793,44 +2818,6 @@ fn repair_ready_state(
         reconciliation: None,
     });
     Ok(Some(sidecar))
-}
-
-fn transfer_native_embedding_lease(
-    lock: &mut Option<readiness_broker::BrokerMachineResourceLock>,
-    state: &codestory_retrieval::SidecarStateFile,
-) {
-    let Some(pid) = native_embedding_pid_from_state(state) else {
-        return;
-    };
-    let Some(lock) = lock.as_mut() else {
-        return;
-    };
-    let _ = readiness_broker::transfer_machine_resource_lock_to_pid(lock, pid);
-}
-
-fn transfer_native_embedding_lease_from_state_file(
-    lock: &mut Option<readiness_broker::BrokerMachineResourceLock>,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) {
-    let Some(state) = read_sidecar_state_file(sidecar) else {
-        return;
-    };
-    transfer_native_embedding_lease(lock, &state);
-}
-
-fn read_sidecar_state_file(
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Option<codestory_retrieval::SidecarStateFile> {
-    fs::read_to_string(&sidecar.layout.state_file)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-}
-
-fn native_embedding_pid_from_state(state: &codestory_retrieval::SidecarStateFile) -> Option<u32> {
-    let launch = state.embedding_launch.as_ref()?;
-    (launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str())
-        .then_some(launch.pid)
-        .flatten()
 }
 
 fn ensure_ready_repair_embed_liveness(

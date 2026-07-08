@@ -78,6 +78,12 @@ pub struct EmbeddingLaunchMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_fingerprint_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,

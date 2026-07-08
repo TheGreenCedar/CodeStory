@@ -404,6 +404,11 @@ fn stdio_tool_blocked_error(
     {
         return Ok(None);
     }
+    if name == "repair_all"
+        && surface.get("status").and_then(serde_json::Value::as_str) == Some("compatibility_alias")
+    {
+        return Ok(None);
+    }
 
     let readiness_goal = surface
         .get("readiness_goal")
@@ -861,11 +866,32 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         "repair_all" => {
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Foreground)
+            stdio_deprecated_repair_all_response(handle_stdio_sidecar_repair(
+                runtime,
+                StdioSidecarRepairMode::Background,
+            ))
         }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
+}
+
+fn stdio_deprecated_repair_all_response(mut response: serde_json::Value) -> serde_json::Value {
+    if let Some(result) = response
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        result.insert("deprecated".to_string(), serde_json::json!(true));
+        result.insert(
+            "canonical_tool".to_string(),
+            serde_json::json!("sidecar_setup"),
+        );
+        result.insert(
+            "canonical_arguments".to_string(),
+            serde_json::json!({"action": "repair"}),
+        );
+    }
+    response
 }
 
 fn handle_stdio_ground(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
@@ -3509,12 +3535,14 @@ fn stdio_status_recommended_next_calls(
             ]);
         }
         return serde_json::json!([
-            {
-                "method": "tools/call",
-                "tool": "repair_all",
-                "arguments": {},
-                "debug_commands": non_ready.full_repair
-            },
+            stdio_recommended_next_call(
+                non_ready
+                    .full_repair
+                    .first()
+                    .or_else(|| non_ready.minimum_next.first())
+                    .map(String::as_str)
+                    .unwrap_or("Read codestory://status and follow sidecar_setup guidance.")
+            ),
             {
                 "method": "resources/read",
                 "uri": "codestory://status"
@@ -3766,6 +3794,15 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         .is_none()
         .then(|| crate::ready_repair_status::abandoned_ready_repair_status(project_root, None))
         .flatten();
+    let last_repair_command = env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND");
+    let active_cli_version = env_nonempty("CODESTORY_PLUGIN_CLI_VERSION")
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let active_cli_path = env_nonempty("CODESTORY_PLUGIN_CLI_PATH");
+    let last_repair_stale_reason = stdio_last_repair_stale_reason(
+        last_repair_command.as_deref(),
+        &active_cli_version,
+        active_cli_path.as_deref(),
+    );
     serde_json::json!({
         "state": state,
         "auto_repair": false,
@@ -3795,7 +3832,9 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "state": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE"),
             "updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT"),
             "project_root": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT"),
-            "command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND")
+            "command": last_repair_command,
+            "current": last_repair_command.is_some() && last_repair_stale_reason.is_none(),
+            "stale_reason": last_repair_stale_reason
         },
         "active_repair": active_repair.as_ref().map(|status| serde_json::json!({
             "status": &status.status,
@@ -3809,6 +3848,37 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         })),
         "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned"))
     })
+}
+
+fn stdio_last_repair_stale_reason(
+    command: Option<&str>,
+    active_cli_version: &str,
+    active_cli_path: Option<&str>,
+) -> Option<String> {
+    let command = command?;
+    if let Some(version) = first_semver_token(command)
+        && version != active_cli_version
+    {
+        return Some(format!(
+            "last_repair_cli_version_mismatch:{version}!={active_cli_version}"
+        ));
+    }
+    if let Some(path) = active_cli_path
+        && command.contains("codestory-cli")
+        && !command.contains(path)
+    {
+        return Some("last_repair_cli_path_mismatch".to_string());
+    }
+    None
+}
+
+fn first_semver_token(text: &str) -> Option<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-'))
+        .find(|token| {
+            token.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                && token.chars().filter(|ch| *ch == '.').count() >= 2
+        })
+        .map(str::to_string)
 }
 
 fn stdio_ready_repair_status_json(
@@ -3950,7 +4020,6 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StdioSidecarRepairMode {
     Background,
-    Foreground,
 }
 
 fn handle_stdio_sidecar_repair(
@@ -3970,10 +4039,7 @@ fn handle_stdio_sidecar_repair(
         return serde_json::json!({
             "result": {
                 "status": "already_running",
-                "mode": match mode {
-                    StdioSidecarRepairMode::Background => "background",
-                    StdioSidecarRepairMode::Foreground => "foreground",
-                },
+                "mode": stdio_sidecar_repair_mode_label(mode),
                 "project_root": status.project_root,
                 "profile": status.profile,
                 "run_id": status.run_id,
@@ -4039,96 +4105,23 @@ fn handle_stdio_sidecar_repair(
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
         .stdin(Stdio::null());
 
-    match mode {
-        StdioSidecarRepairMode::Background => {
-            match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-                Ok(child) => {
-                    serde_json::json!({
-                        "result": {
-                            "status": "started",
-                            "mode": "background",
-                            "pid": child.id(),
-                            "previous_abandoned_repair": previous_abandoned_repair,
-                            "broker_reconciliation": broker_reconciliation_json,
-                            "next_status_command": format!(
-                                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
-                                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                                codestory_retrieval::DEFAULT_AGENT_RUN_ID
-                            ),
-                            "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
-                        }
-                    })
-                }
-                Err(error) => serde_json::json!({"error": error.to_string()}),
+    match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(child) => serde_json::json!({
+            "result": {
+                "status": "started",
+                "mode": stdio_sidecar_repair_mode_label(mode),
+                "pid": child.id(),
+                "previous_abandoned_repair": previous_abandoned_repair,
+                "broker_reconciliation": broker_reconciliation_json,
+                "next_status_command": format!(
+                    "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                ),
+                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }
-        }
-        StdioSidecarRepairMode::Foreground => {
-            let child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
-            let child = match child {
-                Ok(child) => child,
-                Err(error) => return serde_json::json!({"error": error.to_string()}),
-            };
-            let pid = child.id();
-            let repair_status = match child.wait_with_output() {
-                Ok(output) => output.status,
-                Err(error) => return serde_json::json!({"error": error.to_string()}),
-            };
-            let ready_output = Command::new(&exe)
-                .arg("ready")
-                .arg("--goal")
-                .arg("agent")
-                .arg("--project")
-                .arg(&runtime.project_root)
-                .arg("--format")
-                .arg("json")
-                .arg("--run-id")
-                .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-                .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            let (ready_status_code, parsed_ready, ready_json_found, stdout_tail, stderr_tail) =
-                match ready_output {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        let parsed_ready = stdio_parse_trailing_json_object(&stdout);
-                        let ready_json_found = parsed_ready.is_some();
-                        (
-                            output.status.code(),
-                            parsed_ready,
-                            ready_json_found,
-                            stdio_tail_text(&stdout, 4000),
-                            stdio_tail_text(&stderr, 4000),
-                        )
-                    }
-                    Err(error) => (
-                        None,
-                        None,
-                        false,
-                        String::new(),
-                        format!("failed to run readiness probe after repair: {error}"),
-                    ),
-                };
-            serde_json::json!({
-                "result": {
-                    "status": if repair_status.success() { "completed" } else { "failed" },
-                    "mode": "foreground",
-                    "pid": pid,
-                    "exit_code": repair_status.code(),
-                    "repair_output_captured": false,
-                    "ready_probe_exit_code": ready_status_code,
-                    "ready": parsed_ready,
-                    "ready_json_found": ready_json_found,
-                    "previous_abandoned_repair": previous_abandoned_repair,
-                    "broker_reconciliation": broker_reconciliation_json,
-                    "stdout_tail": stdout_tail,
-                    "stderr_tail": stderr_tail,
-                    "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
-                }
-            })
-        }
+        }),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
     }
 }
 
@@ -4170,7 +4163,6 @@ fn stdio_sidecar_repair_machine_busy_result(
 fn stdio_sidecar_repair_mode_label(mode: StdioSidecarRepairMode) -> &'static str {
     match mode {
         StdioSidecarRepairMode::Background => "background",
-        StdioSidecarRepairMode::Foreground => "foreground",
     }
 }
 
@@ -4261,6 +4253,7 @@ fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_js
     }
 }
 
+#[cfg(test)]
 fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -4275,12 +4268,6 @@ fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
         }
     }
     None
-}
-
-fn stdio_tail_text(text: &str, max_chars: usize) -> String {
-    let mut chars: Vec<char> = text.chars().rev().take(max_chars).collect();
-    chars.reverse();
-    chars.into_iter().collect()
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -4387,11 +4374,14 @@ fn stdio_repair_all_surface(
     }
 
     serde_json::json!({
-        "allowed": true,
+        "allowed": false,
         "readiness_goal": "agent_packet_search",
-        "status": "ready",
+        "status": "compatibility_alias",
         "failed_layer": null,
-        "summary": "MCP repair_all may run bounded CodeStory agent repair for this runtime.",
+        "summary": "repair_all is a deprecated compatibility alias. Follow recommended_next_calls and call sidecar_setup with action=repair.",
+        "canonical_tool": "sidecar_setup",
+        "canonical_arguments": {"action": "repair"},
+        "deprecated": true,
         "repair_reason": null,
         "blocked_reason": null,
         "minimum_next": [],

@@ -71,6 +71,12 @@ struct NativeEmbeddingServerLaunch {
     log_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeEmbeddingSpawn {
+    pid: u32,
+    spawned_at_epoch_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 struct NativeLlamaCandidate {
     path: PathBuf,
@@ -174,7 +180,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     } else {
         false
     };
-    let native_embedding_pid = if let Some(launch) = native_embedding.as_ref() {
+    let native_embedding_spawn = if let Some(launch) = native_embedding.as_ref() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
             spawn_native_embedding_server(launch)
         })?
@@ -182,13 +188,27 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         None
     };
 
-    let state = sidecar_up_with_runtime_and_launch_metadata(
+    let embedding_launch = native_embedding.as_ref().map(|launch| {
+        embedding_launch_metadata(launch, runtime, repo_root, native_embedding_spawn)
+    });
+    let state = match sidecar_up_with_runtime_and_launch_metadata(
         runtime,
         resolved_compose.as_deref(),
-        native_embedding.as_ref().map(|launch| {
-            embedding_launch_metadata(launch, runtime, repo_root, native_embedding_pid)
-        }),
-    )?;
+        embedding_launch.clone(),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            if let Some(launch) = embedding_launch.as_ref()
+                && let Err(cleanup_error) =
+                    crate::sidecar::stop_native_embedding_process_for_launch(launch)
+            {
+                return Err(error).context(format!(
+                    "write retrieval-sidecars.json; native embedding cleanup failed: {cleanup_error}"
+                ));
+            }
+            return Err(error);
+        }
+    };
 
     let infrastructure = if !wait_timeout.is_zero() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
@@ -643,7 +663,7 @@ fn embedding_launch_metadata(
     native_launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
     repo_root: Option<&Path>,
-    pid: Option<u32>,
+    spawn: Option<NativeEmbeddingSpawn>,
 ) -> crate::health::EmbeddingLaunchMetadata {
     crate::health::EmbeddingLaunchMetadata {
         provider: "llamacpp".to_string(),
@@ -651,7 +671,10 @@ fn embedding_launch_metadata(
             .as_str()
             .to_string(),
         endpoint: SidecarLayout::embed_base_url(runtime.embed_http_port),
-        pid,
+        pid: spawn.map(|spawn| spawn.pid),
+        spawned_at_epoch_ms: spawn.map(|spawn| spawn.spawned_at_epoch_ms),
+        launch_args: native_launch.args.clone(),
+        launch_fingerprint_sha256: Some(native_embedding_launch_fingerprint(native_launch)),
         executable_source: Some(native_llama_executable_source(
             &native_launch.executable,
             repo_root,
@@ -661,6 +684,23 @@ fn embedding_launch_metadata(
         requested_device: crate::embeddings::embedding_accelerator_request()
             .and_then(|request| request.device),
     }
+}
+
+fn native_embedding_launch_fingerprint(native_launch: &NativeEmbeddingServerLaunch) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(native_launch.executable.display().to_string().as_bytes());
+    for arg in &native_launch.args {
+        hasher.update([0]);
+        hasher.update(arg.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> String {
@@ -1158,7 +1198,9 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result<Option<u32>> {
+fn spawn_native_embedding_server(
+    launch: &NativeEmbeddingServerLaunch,
+) -> Result<Option<NativeEmbeddingSpawn>> {
     if let Some(parent) = launch.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create native llama.cpp log dir {}", parent.display()))?;
@@ -1193,7 +1235,10 @@ fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result
     )
     .ok();
     match spawn_native_embedding_server_once(launch, &log, true) {
-        Ok(pid) => Ok(Some(pid)),
+        Ok(pid) => Ok(Some(NativeEmbeddingSpawn {
+            pid,
+            spawned_at_epoch_ms: now_epoch_ms(),
+        })),
         Err(error) if native_embedding_retry_without_breakaway(&error) => {
             writeln!(
                 log,
@@ -1201,7 +1246,12 @@ fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result
             )
             .ok();
             spawn_native_embedding_server_once(launch, &log, false)
-                .map(Some)
+                .map(|pid| {
+                    Some(NativeEmbeddingSpawn {
+                        pid,
+                        spawned_at_epoch_ms: now_epoch_ms(),
+                    })
+                })
                 .with_context(|| {
                     format!(
                         "spawn native llama.cpp server {}{} after breakaway retry",
@@ -2018,10 +2068,21 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
         );
-        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()), Some(1234));
+        let metadata = embedding_launch_metadata(
+            &launch,
+            &runtime,
+            Some(temp.path()),
+            Some(NativeEmbeddingSpawn {
+                pid: 1234,
+                spawned_at_epoch_ms: 456,
+            }),
+        );
         assert_eq!(metadata.provider, "llamacpp");
         assert_eq!(metadata.launch_mode, "native_spawned");
         assert_eq!(metadata.pid, Some(1234));
+        assert_eq!(metadata.spawned_at_epoch_ms, Some(456));
+        assert_eq!(metadata.launch_args, launch.args);
+        assert!(metadata.launch_fingerprint_sha256.is_some());
         assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
         assert_eq!(metadata.model_path, Some(model.display().to_string()));
         assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));

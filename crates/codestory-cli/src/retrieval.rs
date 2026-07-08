@@ -1,13 +1,13 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::IndexMode;
-use std::{fs, time::Duration};
+use std::time::Duration;
 
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarProfile, SidecarRuntimeConfig, SidecarStateFile, bootstrap_sidecars_with_runtime,
-    execute_retrieval_query, sidecar_down_for_runtime, sidecar_up_with_runtime,
-    strict_sidecar_status, strict_sidecar_status_for_runtime,
+    SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime, execute_retrieval_query,
+    sidecar_down_for_runtime, sidecar_up_with_runtime, strict_sidecar_status,
+    strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
@@ -52,6 +52,7 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     );
     let (report, project_qdrant_repair, status) = {
+        let operation_started_at_epoch_ms = crate::readiness_broker::current_epoch_ms();
         let mut embedding_resource_lock =
             match crate::readiness_broker::acquire_native_embedding_resource_lock_if_needed(
                 &broker_scope,
@@ -89,14 +90,36 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         let report = match bootstrap_result {
             Ok(report) => report,
             Err(error) => {
-                transfer_native_embedding_lease_from_state_file(
-                    &mut embedding_resource_lock,
-                    &sidecar,
-                );
+                if let Err(lease_error) =
+                    crate::readiness_broker::transfer_native_embedding_resource_lock_from_state_file(
+                        &mut embedding_resource_lock,
+                        &sidecar,
+                        operation_started_at_epoch_ms,
+                    )
+                {
+                    if let Err(cleanup_error) = sidecar_down_for_runtime(&sidecar) {
+                        return Err(error).context(format!(
+                            "retrieval bootstrap; native embedding lease transfer failed: {lease_error}; cleanup failed: {cleanup_error}"
+                        ));
+                    }
+                    return Err(error).context(format!(
+                        "retrieval bootstrap; native embedding lease transfer failed: {lease_error}"
+                    ));
+                }
                 return Err(error).context("retrieval bootstrap");
             }
         };
-        transfer_native_embedding_lease(&mut embedding_resource_lock, &report.state);
+        if let Err(error) = crate::readiness_broker::transfer_native_embedding_resource_lock(
+            &mut embedding_resource_lock,
+            &report.state,
+        ) {
+            sidecar_down_for_runtime(&sidecar).with_context(|| {
+                format!(
+                    "cleanup retrieval sidecar after native embedding lease transfer failed: {error}"
+                )
+            })?;
+            return Err(error).context("native embedding lease transfer");
+        }
         activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
         let project_qdrant_repair =
             codestory_retrieval::repair_project_qdrant_collection_for_runtime(
@@ -152,56 +175,18 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
-    let native_embedding_pid = native_embedding_pid_from_state_file(&sidecar);
+    let native_embedding_pid =
+        crate::readiness_broker::native_embedding_pid_from_sidecar_state_file(&sidecar)?;
     sidecar_down_for_runtime(&sidecar).context("retrieval down")?;
     if let Some(pid) = native_embedding_pid {
-        let _ = crate::readiness_broker::release_machine_resource_lock_for_pid(
+        crate::readiness_broker::release_machine_resource_lock_for_pid(
             crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
             pid,
-        );
+        )
+        .context("release native embedding broker lock")?;
     }
     println!("retrieval sidecar state cleared");
     Ok(())
-}
-
-fn transfer_native_embedding_lease(
-    lock: &mut Option<crate::readiness_broker::BrokerMachineResourceLock>,
-    state: &SidecarStateFile,
-) {
-    let Some(pid) = native_embedding_pid_from_state(state) else {
-        return;
-    };
-    let Some(lock) = lock.as_mut() else {
-        return;
-    };
-    let _ = crate::readiness_broker::transfer_machine_resource_lock_to_pid(lock, pid);
-}
-
-fn transfer_native_embedding_lease_from_state_file(
-    lock: &mut Option<crate::readiness_broker::BrokerMachineResourceLock>,
-    sidecar: &SidecarRuntimeConfig,
-) {
-    let Some(state) = read_sidecar_state_file(sidecar) else {
-        return;
-    };
-    transfer_native_embedding_lease(lock, &state);
-}
-
-fn native_embedding_pid_from_state_file(sidecar: &SidecarRuntimeConfig) -> Option<u32> {
-    read_sidecar_state_file(sidecar).and_then(|state| native_embedding_pid_from_state(&state))
-}
-
-fn read_sidecar_state_file(sidecar: &SidecarRuntimeConfig) -> Option<SidecarStateFile> {
-    fs::read_to_string(&sidecar.layout.state_file)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-}
-
-fn native_embedding_pid_from_state(state: &SidecarStateFile) -> Option<u32> {
-    let launch = state.embedding_launch.as_ref()?;
-    (launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str())
-        .then_some(launch.pid)
-        .flatten()
 }
 
 fn broker_gpu_proof_input_from_status(

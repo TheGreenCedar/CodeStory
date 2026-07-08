@@ -130,7 +130,7 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   });
 });
 
-test("agent-facing guidance keeps MCP repair as the only supported repair path", async () => {
+test("agent-facing guidance does not send agents to CLI fallback repair", async () => {
   const guidanceFiles = [
     join(pluginRoot, "hooks", "codestory-instructions.cjs"),
     join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
@@ -148,7 +148,6 @@ test("agent-facing guidance keeps MCP repair as the only supported repair path",
     assert.doesNotMatch(text, /CLI fallback/u, file);
     assert.doesNotMatch(text, /managed CLI or local-dev CODESTORY_CLI preflight/u, file);
     assert.doesNotMatch(text, /Call `sidecar_setup`/u, file);
-    assert.match(text, /sidecar_setup(?: repair|[\s\S]{0,80}action=repair)/u, file);
   }
 });
 
@@ -1233,6 +1232,10 @@ test("fail-open mcp hands off to stdio runtime after active project appears", as
 
     const failOpenTools = await sendRequest({ jsonrpc: "2.0", id: "fail-open-tools", method: "tools/list" });
     assert.deepEqual(failOpenTools.result.tools.map((tool) => tool.name), ["sidecar_setup"]);
+    assert.deepEqual(
+      failOpenTools.result.tools[0].inputSchema.properties.action.enum,
+      ["status", "enable", "disable", "ask"],
+    );
 
     await writeFile(
       activePath,
@@ -1482,7 +1485,8 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
-    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "repair" } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "ground", arguments: {} } }),
   ].join("\n") + "\n";
 
   try {
@@ -1501,7 +1505,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 4, result.stdout);
+    assert.equal(responses.length, 5, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.source_checkout_version, sourceVersion);
@@ -1521,9 +1525,18 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
     assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
-    assert.equal(responses[3].error.code, -32602);
-    assert.match(responses[3].error.message, /grounding tools are unavailable/u);
-    assert.match(responses[3].error.message, /restore a compatible stdio runtime/u);
+    assert.deepEqual(
+      responses[2].result.tools[0].inputSchema.properties.action.enum,
+      ["status", "enable", "disable", "ask"],
+    );
+    assert.equal(responses[3].result.isError, true);
+    assert.equal(
+      responses[3].result.structuredContent.code,
+      "repair_unavailable_diagnostic_fail_open",
+    );
+    assert.equal(responses[4].error.code, -32602);
+    assert.match(responses[4].error.message, /grounding tools are unavailable/u);
+    assert.match(responses[4].error.message, /restore a compatible stdio runtime/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

@@ -15,6 +15,7 @@ struct StdioFixture {
     latest_release_version: String,
     disable_installed_cli_probe: bool,
     sidecar_policy_state: Option<String>,
+    sidecar_last_repair_command: Option<String>,
     dirty_marker_path: Option<PathBuf>,
     dirty_marker_project_root: Option<PathBuf>,
     local_refresh_timeout_ms: Option<u64>,
@@ -176,6 +177,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
         disable_installed_cli_probe: false,
         sidecar_policy_state: None,
+        sidecar_last_repair_command: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
@@ -194,6 +196,7 @@ fn unindexed_fixture() -> StdioFixture {
         latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
         disable_installed_cli_probe: false,
         sidecar_policy_state: None,
+        sidecar_last_repair_command: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
@@ -304,6 +307,10 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
             "CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND",
             "node codestory-mcp.cjs sidecar-policy disable",
         );
+    }
+    if let Some(command_text) = &fixture.sidecar_last_repair_command {
+        command.env("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE", "completed");
+        command.env("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND", command_text);
     }
     if let Some(path) = &fixture.dirty_marker_path {
         command.env("CODESTORY_PLUGIN_DIRTY_MARKER_PATH", path);
@@ -2865,6 +2872,39 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
 }
 
 #[test]
+fn sidecar_setup_status_marks_old_last_repair_as_stale() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.sidecar_last_repair_command = Some(
+        r#""C:\\Users\\alber\\.codex\\plugins\\data\\codestory-TheGreenCedar\\codestory-cli\\0.12.3\\bin\\codestory-cli.exe" ready --goal agent --repair"#
+            .to_string(),
+    );
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-last-repair",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-stale-last-repair"));
+    let status = json_resource_content(result, "codestory://status");
+    assert_eq!(
+        status["sidecar_setup"]["last_repair"]["current"],
+        json!(false)
+    );
+    assert!(
+        status["sidecar_setup"]["last_repair"]["stale_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("last_repair_cli_version_mismatch")),
+        "old last_repair command should be marked stale: {status}"
+    );
+}
+
+#[test]
 fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("ask".to_string());
@@ -2908,6 +2948,31 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         "sidecar policy should record an update timestamp: {policy}"
     );
 
+    let repair_all_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "repair-all-compat",
+            "method": "tools/call",
+            "params": {
+                "name": "repair_all",
+                "arguments": {}
+            }
+        }),
+    );
+    let repair_all = assert_tool_success(&repair_all_response, json!("repair-all-compat"));
+    assert_eq!(repair_all["deprecated"], json!(true));
+    assert_eq!(repair_all["canonical_tool"], json!("sidecar_setup"));
+    assert_eq!(
+        repair_all["canonical_arguments"],
+        json!({"action": "repair"})
+    );
+    assert_eq!(
+        repair_all["mode"],
+        json!("background"),
+        "repair_all compatibility alias must not run foreground repair: {repair_all}"
+    );
+
     let repair_response = send_json(
         &mut server,
         json!({
@@ -2938,12 +3003,14 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
                 && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
         "sidecar_setup repair should point to cheap status inspection: {repair}"
     );
-    assert!(
-        repair["broker_reconciliation"]["status"]
-            .as_str()
-            .is_some_and(|status| matches!(status, "clean" | "abandoned_cleaned")),
-        "sidecar_setup repair should reconcile broker state before spawning: {repair}"
-    );
+    if repair["status"] == json!("started") {
+        assert!(
+            repair["broker_reconciliation"]["status"]
+                .as_str()
+                .is_some_and(|status| matches!(status, "clean" | "abandoned_cleaned")),
+            "sidecar_setup repair should reconcile broker state before spawning: {repair}"
+        );
+    }
 
     let status_response = send_json(
         &mut server,

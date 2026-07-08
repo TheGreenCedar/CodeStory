@@ -729,12 +729,11 @@ function singleRepairNextCalls(commands) {
   if (sidecarRepair) {
     return [
       {
-        method: 'tools/call',
-        tool: 'sidecar_setup',
-        arguments: { action: 'repair' },
+        method: 'resources/read',
+        uri: 'codestory://status',
+        instruction: 'Diagnostic MCP cannot run sidecar repair until a compatible stdio runtime starts; restore or reload the runtime before retrying grounding.',
         debug_command: sidecarRepair,
       },
-      { method: 'resources/read', uri: 'codestory://status' },
     ];
   }
   return [
@@ -1339,10 +1338,25 @@ function resourceContents(uri, value) {
 
 function failOpenSidecarSetupResult(request) {
   const action = request.params?.arguments?.action || 'status';
-  if (!['status', 'enable', 'disable', 'ask', 'repair'].includes(action)) {
+  if (action === 'repair') {
     return {
       isError: true,
-      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, ask, or repair while the runtime is in diagnostic mode.' }],
+      content: [{ type: 'text', text: 'sidecar_setup repair is unavailable while CodeStory is in diagnostic fail-open mode; reload the host or restore the stdio runtime first.' }],
+      structuredContent: {
+        code: 'repair_unavailable_diagnostic_fail_open',
+        action,
+        recommended_next_calls: [{
+          method: 'resources/read',
+          uri: 'codestory://status',
+          instruction: 'Read status again after restoring the compatible stdio runtime.',
+        }],
+      },
+    };
+  }
+  if (!['status', 'enable', 'disable', 'ask'].includes(action)) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, or ask while the runtime is in diagnostic mode.' }],
       structuredContent: { code: 'invalid_sidecar_setup_action', action },
     };
   }
@@ -1386,11 +1400,11 @@ function runFailOpenMcp(status, options = {}) {
   };
   const tools = [{
     name: 'sidecar_setup',
-    description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
+    description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode. Repair requires the real stdio runtime.',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask', 'repair'], default: 'status' },
+        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask'], default: 'status' },
       },
       additionalProperties: false,
     },
