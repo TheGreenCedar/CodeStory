@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
@@ -505,7 +506,8 @@ test("stdio workspace mismatch blocks stale repo repair guidance", async () => {
   const launcher = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
   const transport = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_transport.rs"), "utf8");
 
-  assert.match(launcher, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH:\s*projectResolution\.statePath \|\| activeStatePath\(\) \|\| ''/u);
+  assert.match(launcher, /function stdioRuntimeEnv\(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath\)/u);
+  assert.match(launcher, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH:\s*projectStatePath \|\| activeStatePath\(\) \|\| ''/u);
   assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
   assert.match(transport, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH/u);
   assert.match(transport, /let active_root = stdio_active_state_root\(&active_state_path\)\?/u);
@@ -1011,6 +1013,173 @@ test("mcp launcher rejects stale active project state from plugin root", async (
     assert.equal(status.project_root_source, "plugin_active_state_stale");
     assert.equal(status.readiness[0].goal, "project_root");
   } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fail-open mcp hands off to stdio runtime after active project appears", async () => {
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-live-active-project-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const cliScript = join(dataDir, "recording-codestory-cli.cjs");
+  const cliPath = join(
+    dataDir,
+    process.platform === "win32" ? "recording-codestory-cli.cmd" : "recording-codestory-cli",
+  );
+  const logFile = join(dataDir, "calls.jsonl");
+  const marker = join(dataDir, "serve-called.txt");
+  const realRepoRoot = await realpath(repoRoot);
+  const activePath = join(dataDir, ".codestory-active");
+  let child;
+
+  try {
+    await writeFile(
+      activePath,
+      JSON.stringify({ event: "SessionStart", cwd: realRepoRoot, updatedAt: "2000-01-01T00:00:00.000Z" }),
+      "utf8",
+    );
+    await writeFile(
+      cliScript,
+      [
+        "const fs = require('node:fs');",
+        "const args = process.argv.slice(2);",
+        "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify({ args, cwd: process.cwd(), projectRoot: process.env.CODESTORY_PLUGIN_PROJECT_ROOT || '', activeStatePath: process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH || '' }) + '\\n');",
+        "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+        "if (args[0] === 'ready') { fs.writeFileSync(process.env.TEST_OUT, args[0]); process.exit(0); }",
+        "if (args[0] === 'serve') {",
+        "  fs.writeFileSync(process.env.TEST_OUT, args[0]);",
+        "  let buffer = '';",
+        "  process.stdin.setEncoding('utf8');",
+        "  process.stdin.on('data', (chunk) => {",
+        "    buffer += chunk;",
+        "    const lines = buffer.split(/\\r?\\n/u);",
+        "    buffer = lines.pop() || '';",
+        "    for (const line of lines) {",
+        "      if (!line.trim()) continue;",
+        "      const request = JSON.parse(line);",
+      "      if (request.method === 'tools/list') {",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
+      "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'sidecar_setup') {",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { state: 'runtime-sidecar-setup' } } }) + '\\n');",
+      "      } else if (request.method === 'resources/read') {",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { contents: [{ uri: request.params.uri, mimeType: 'application/json', text: JSON.stringify({ project_root: process.env.CODESTORY_PLUGIN_PROJECT_ROOT, project_root_source: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE }) }] } }) + '\\n');",
+      "      }",
+        "    }",
+        "  });",
+        "  return;",
+        "}",
+        "process.exit(2);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    if (process.platform === "win32") {
+      await writeFile(cliPath, `@echo off\r\n"${process.execPath}" "${cliScript}" %*\r\n`, "utf8");
+    } else {
+      await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} ${JSON.stringify(cliScript)} "$@"\n`, "utf8");
+      await chmod(cliPath, 0o755);
+    }
+
+    child = spawn(process.execPath, [launcher], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+        TEST_OUT: marker,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const waiters = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      for (;;) {
+        const newline = stdout.indexOf("\n");
+        if (newline < 0) break;
+        const line = stdout.slice(0, newline).trim();
+        stdout = stdout.slice(newline + 1);
+        if (line && waiters.length > 0) {
+          waiters.shift().resolve(JSON.parse(line));
+        }
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const nextResponse = () => Promise.race([
+      new Promise((resolve, reject) => waiters.push({ resolve, reject })),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out waiting for MCP response: ${stderr}`)), 5000)),
+    ]);
+    const sendRequest = async (request) => {
+      const pending = nextResponse();
+      child.stdin.write(`${JSON.stringify(request)}\n`);
+      return pending;
+    };
+    const readStatus = async (id) => {
+      const response = await sendRequest({
+        jsonrpc: "2.0",
+        id,
+        method: "resources/read",
+        params: { uri: "codestory://status" },
+      });
+      return JSON.parse(response.result.contents[0].text);
+    };
+
+    const init = await sendRequest({
+      jsonrpc: "2.0",
+      id: "init",
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    assert.equal(init.result.serverInfo.name, "codestory");
+
+    const staleStatus = await readStatus("stale");
+    assert.equal(staleStatus.degraded_reason, "project_root_unavailable");
+    assert.equal(staleStatus.project_root, null);
+    assert.equal(staleStatus.project_root_source, "plugin_active_state_stale");
+
+    const failOpenTools = await sendRequest({ jsonrpc: "2.0", id: "fail-open-tools", method: "tools/list" });
+    assert.deepEqual(failOpenTools.result.tools.map((tool) => tool.name), ["sidecar_setup"]);
+
+    await writeFile(
+      activePath,
+      JSON.stringify({ event: "UserPromptSubmit", cwd: realRepoRoot, updatedAt: new Date().toISOString() }),
+      "utf8",
+    );
+
+    const repaired = await sendRequest({
+      jsonrpc: "2.0",
+      id: "repair",
+      method: "tools/call",
+      params: { name: "sidecar_setup", arguments: { action: "repair" } },
+    });
+    assert.equal(repaired.result.structuredContent.state, "runtime-sidecar-setup");
+
+    const tools = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
+    assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["ground"]);
+
+    const runtimeStatus = await readStatus("runtime-status");
+    assert.equal(runtimeStatus.project_root, realRepoRoot);
+    assert.equal(runtimeStatus.project_root_source, "plugin_active_state");
+    assert.equal(await readFile(marker, "utf8"), "serve");
+    const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.equal(serve.cwd, realRepoRoot);
+    assert.equal(serve.projectRoot, realRepoRoot);
+    assert.equal(serve.activeStatePath, activePath);
+  } finally {
+    if (child && !child.killed) {
+      child.kill();
+      await Promise.race([once(child, "exit"), new Promise((resolve) => setTimeout(resolve, 1000))]);
+    }
     await rm(dataDir, { recursive: true, force: true });
   }
 });

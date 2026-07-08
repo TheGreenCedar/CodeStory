@@ -3875,7 +3875,7 @@ fn handle_stdio_sidecar_setup(
                 }});
             }
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Foreground)
+            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Background)
         }
         _ => {
             serde_json::json!({"error": "sidecar_setup.action must be status, enable, disable, ask, or repair"})
