@@ -40,10 +40,11 @@ const WINDOWS_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(windows)]
-const NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS: u32 = WINDOWS_DETACHED_PROCESS
-    | WINDOWS_CREATE_NEW_PROCESS_GROUP
-    | WINDOWS_CREATE_BREAKAWAY_FROM_JOB
-    | WINDOWS_CREATE_NO_WINDOW;
+const NATIVE_EMBEDDING_WINDOWS_BASE_CREATION_FLAGS: u32 =
+    WINDOWS_DETACHED_PROCESS | WINDOWS_CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_NO_WINDOW;
+#[cfg(windows)]
+const NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS: u32 =
+    NATIVE_EMBEDDING_WINDOWS_BASE_CREATION_FLAGS | WINDOWS_CREATE_BREAKAWAY_FROM_JOB;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EmbedModelInventory {
@@ -1187,44 +1188,92 @@ fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result
         "native llama.cpp embedding server Windows creation_flags=0x{NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS:08x}"
     )
     .ok();
-    let stdout = log
-        .try_clone()
-        .context("clone native llama.cpp stdout log")?;
+    match spawn_native_embedding_server_once(launch, &log, true) {
+        Ok(()) => Ok(()),
+        Err(error) if native_embedding_retry_without_breakaway(&error) => {
+            writeln!(
+                log,
+                "native llama.cpp spawn with breakaway-from-job failed ({error}); retrying without breakaway"
+            )
+            .ok();
+            spawn_native_embedding_server_once(launch, &log, false).with_context(|| {
+                format!(
+                    "spawn native llama.cpp server {}{} after breakaway retry",
+                    launch.executable.display(),
+                    native_embedding_spawn_detail(false)
+                )
+            })
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "spawn native llama.cpp server {}{}",
+                launch.executable.display(),
+                native_embedding_spawn_detail(true)
+            )
+        }),
+    }
+}
+
+fn spawn_native_embedding_server_once(
+    launch: &NativeEmbeddingServerLaunch,
+    log: &File,
+    breakaway: bool,
+) -> std::io::Result<()> {
+    let stdout = log.try_clone()?;
+    let stderr = log.try_clone()?;
     let mut command = Command::new(&launch.executable);
     command
         .args(&launch.args)
         .current_dir(launch.executable.parent().unwrap_or_else(|| Path::new(".")))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(log));
-    configure_native_embedding_command(&mut command);
-    let _child = command.spawn().with_context(|| {
-        format!(
-            "spawn native llama.cpp server {}{}",
-            launch.executable.display(),
-            native_embedding_spawn_detail()
-        )
-    })?;
-    Ok(())
+        .stderr(Stdio::from(stderr));
+    configure_native_embedding_command(&mut command, breakaway);
+    command.spawn().map(|_| ())
 }
 
 fn native_embedding_server_reusable(probe: &crate::embeddings::EmbeddingRuntimeProbe) -> bool {
     probe.reachable
 }
 
-fn configure_native_embedding_command(_command: &mut Command) {
+fn configure_native_embedding_command(_command: &mut Command, _breakaway: bool) {
     #[cfg(windows)]
-    _command.creation_flags(NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS);
+    _command.creation_flags(native_embedding_windows_creation_flags(_breakaway));
 }
 
-fn native_embedding_spawn_detail() -> &'static str {
+fn native_embedding_spawn_detail(_breakaway: bool) -> &'static str {
     #[cfg(windows)]
     {
-        " with detached Windows creation flags"
+        if _breakaway {
+            " with detached Windows creation flags"
+        } else {
+            " with detached Windows creation flags without breakaway-from-job"
+        }
     }
     #[cfg(not(windows))]
     {
         ""
+    }
+}
+
+fn native_embedding_retry_without_breakaway(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(5)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn native_embedding_windows_creation_flags(breakaway: bool) -> u32 {
+    if breakaway {
+        NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS
+    } else {
+        NATIVE_EMBEDDING_WINDOWS_BASE_CREATION_FLAGS
     }
 }
 
@@ -2001,23 +2050,17 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn native_embedding_windows_spawn_detaches_from_ready_repair_process() {
-        assert_ne!(
-            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_DETACHED_PROCESS,
-            0
-        );
-        assert_ne!(
-            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_CREATE_NEW_PROCESS_GROUP,
-            0
-        );
-        assert_ne!(
-            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_CREATE_BREAKAWAY_FROM_JOB,
-            0
-        );
-        assert_ne!(
-            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_CREATE_NO_WINDOW,
-            0
-        );
+    fn native_embedding_windows_spawn_uses_breakaway_as_best_effort() {
+        let breakaway = native_embedding_windows_creation_flags(true);
+        let fallback = native_embedding_windows_creation_flags(false);
+        assert_ne!(breakaway & WINDOWS_DETACHED_PROCESS, 0);
+        assert_ne!(breakaway & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
+        assert_ne!(breakaway & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
+        assert_ne!(breakaway & WINDOWS_CREATE_NO_WINDOW, 0);
+        assert_ne!(fallback & WINDOWS_DETACHED_PROCESS, 0);
+        assert_ne!(fallback & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
+        assert_eq!(fallback & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
+        assert_ne!(fallback & WINDOWS_CREATE_NO_WINDOW, 0);
     }
 
     #[test]

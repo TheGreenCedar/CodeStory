@@ -15,6 +15,9 @@
   reaped under a separate atomic guard, final success snapshots are written
   after repair locks are released, and status recommendations distinguish
   consent, disabled, unmanaged, and enabled MCP repair policy.
+- Fixed Windows native llama.cpp startup under restrictive host job objects by
+  retrying without `CREATE_BREAKAWAY_FROM_JOB` when Windows denies the
+  best-effort detached spawn.
 
 ## 0.13.12
 
