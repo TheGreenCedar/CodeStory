@@ -99,8 +99,8 @@ pub use ranker::rank_candidates;
 pub use scip_client::ScipClient;
 pub use sidecar::{
     SidecarStateFile, sidecar_down, sidecar_down_for_project, sidecar_down_for_runtime,
-    sidecar_status, sidecar_up, sidecar_up_with_runtime, strict_sidecar_status,
-    strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
+    sidecar_status, sidecar_up, sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,
+    strict_sidecar_status, strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
 pub use zoekt_client::ZoektClient;

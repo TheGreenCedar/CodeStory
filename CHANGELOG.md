@@ -30,6 +30,10 @@
 - Fixed Windows native llama.cpp startup under restrictive host job objects by
   retrying without `CREATE_BREAKAWAY_FROM_JOB` when Windows denies the
   best-effort detached spawn.
+- Preserved native embedding ownership across endpoint reuse and `retrieval up`
+  by requiring PID-backed state for CodeStory-spawned native endpoints,
+  treating explicit `CODESTORY_EMBED_LLAMACPP_URL` endpoints as external, and
+  publishing immediate MCP repair handoff state for `sidecar_setup repair`.
 
 ## 0.13.12
 

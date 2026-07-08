@@ -89,6 +89,14 @@ pub fn sidecar_up_with_runtime(
     sidecar_up_with_runtime_and_launch_metadata(runtime, compose_file, None)
 }
 
+pub fn sidecar_up_with_runtime_preserving_launch(
+    runtime: &SidecarRuntimeConfig,
+    compose_file: Option<&Path>,
+) -> Result<SidecarStateFile> {
+    let embedding_launch = reusable_embedding_launch_from_state(runtime);
+    sidecar_up_with_runtime_and_launch_metadata(runtime, compose_file, embedding_launch)
+}
+
 pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     runtime: &SidecarRuntimeConfig,
     compose_file: Option<&Path>,
@@ -129,6 +137,22 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     let json = serde_json::to_string_pretty(&state).context("serialize sidecar state")?;
     std::fs::write(&layout.state_file, json).context("write retrieval-sidecars.json")?;
     Ok(state)
+}
+
+fn reusable_embedding_launch_from_state(
+    runtime: &SidecarRuntimeConfig,
+) -> Option<EmbeddingLaunchMetadata> {
+    let state = read_sidecar_state(&runtime.layout.state_file)?;
+    if state.owner != "codestory"
+        || state.namespace != runtime.namespace
+        || state.profile != runtime.profile.as_str()
+        || state.run_id.as_deref() != runtime.run_id.as_deref()
+        || state.embed_http_port != runtime.embed_http_port
+        || state.embed_url != SidecarLayout::embed_base_url(runtime.embed_http_port)
+    {
+        return None;
+    }
+    state.embedding_launch
 }
 
 pub fn sidecar_down() -> Result<()> {
@@ -824,6 +848,26 @@ mod tests {
         let report = attach_status_ownership(report, &runtime);
 
         assert_eq!(report.embedding_launch, Some(launch));
+    }
+
+    #[test]
+    fn sidecar_up_preserving_launch_keeps_native_embedding_pid() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        let launch = native_embedding_launch_fixture();
+        let initial =
+            sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch.clone()))
+                .expect("write initial state");
+        assert_eq!(initial.embedding_launch, Some(launch.clone()));
+
+        let preserved = sidecar_up_with_runtime_preserving_launch(&runtime, None)
+            .expect("rewrite state preserving launch");
+
+        assert_eq!(preserved.embedding_launch, Some(launch));
     }
 
     fn native_embedding_launch_fixture() -> EmbeddingLaunchMetadata {

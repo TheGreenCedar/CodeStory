@@ -402,7 +402,7 @@ pub(crate) fn transfer_native_embedding_resource_lock_from_state_file(
     let Some(state) = read_sidecar_state_file(sidecar)? else {
         return Ok(());
     };
-    if !sidecar_state_has_recent_native_embedding_spawn(&state, operation_started_at_epoch_ms) {
+    if !sidecar_state_has_current_native_embedding_launch(&state, operation_started_at_epoch_ms) {
         return Ok(());
     }
     transfer_native_embedding_resource_lock(lock, &state)
@@ -437,21 +437,14 @@ fn native_embedding_pid_from_sidecar_state(
         .flatten()
 }
 
-fn sidecar_state_has_recent_native_embedding_spawn(
+fn sidecar_state_has_current_native_embedding_launch(
     state: &codestory_retrieval::SidecarStateFile,
     operation_started_at_epoch_ms: i64,
 ) -> bool {
-    let Some(launch) = state.embedding_launch.as_ref() else {
-        return false;
-    };
-    if launch.launch_mode != codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str()
-    {
+    if native_embedding_pid_from_sidecar_state(state).is_none() {
         return false;
     }
-    matches!(
-        launch.spawned_at_epoch_ms,
-        Some(spawned_at_epoch_ms) if spawned_at_epoch_ms >= operation_started_at_epoch_ms
-    )
+    state.started_at_epoch_ms >= operation_started_at_epoch_ms
 }
 
 pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) -> Result<bool> {
@@ -894,11 +887,12 @@ fn try_acquire_machine_resource_reaper_lock(
             if !machine_reaper_lock_file_is_stale(&path) {
                 return Ok(None);
             }
-            let _ = fs::remove_file(&path);
-            match create_lock_file(&path, &content) {
-                Ok(()) => Ok(Some(BrokerMachineResourceReaperLock { path, token })),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
-                Err(error) => Err(error.into()),
+            fs::write(&path, &content)?;
+            match read_machine_resource_reaper_lock_file(&path) {
+                Some(current) if current.token == token => {
+                    Ok(Some(BrokerMachineResourceReaperLock { path, token }))
+                }
+                _ => Ok(None),
             }
         }
         Err(error) => Err(error.into()),
@@ -1230,23 +1224,30 @@ mod tests {
     }
 
     #[test]
-    fn native_embedding_state_handoff_requires_current_operation_spawn() {
+    fn native_embedding_state_handoff_requires_current_state_write() {
         let operation_started_at_epoch_ms = 1_000;
 
-        assert!(sidecar_state_has_recent_native_embedding_spawn(
-            &native_sidecar_state(Some(1_000)),
+        let mut reused_process = native_sidecar_state(Some(1));
+        reused_process.started_at_epoch_ms = operation_started_at_epoch_ms;
+        assert!(sidecar_state_has_current_native_embedding_launch(
+            &reused_process,
             operation_started_at_epoch_ms
         ));
-        assert!(sidecar_state_has_recent_native_embedding_spawn(
-            &native_sidecar_state(Some(1_001)),
+
+        let mut stale_state = native_sidecar_state(Some(1_000));
+        stale_state.started_at_epoch_ms = operation_started_at_epoch_ms - 1;
+        assert!(!sidecar_state_has_current_native_embedding_launch(
+            &stale_state,
             operation_started_at_epoch_ms
         ));
-        assert!(!sidecar_state_has_recent_native_embedding_spawn(
-            &native_sidecar_state(Some(999)),
-            operation_started_at_epoch_ms
-        ));
-        assert!(!sidecar_state_has_recent_native_embedding_spawn(
-            &native_sidecar_state(None),
+
+        let mut missing_pid = native_sidecar_state(None);
+        missing_pid.started_at_epoch_ms = operation_started_at_epoch_ms;
+        if let Some(launch) = missing_pid.embedding_launch.as_mut() {
+            launch.pid = None;
+        }
+        assert!(!sidecar_state_has_current_native_embedding_launch(
+            &missing_pid,
             operation_started_at_epoch_ms
         ));
     }

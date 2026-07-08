@@ -156,6 +156,7 @@ impl SidecarProfile {
 pub enum EmbeddingServerLaunchMode {
     DockerComposeEmbed,
     NativeSpawned,
+    ExternalEndpoint,
 }
 
 impl EmbeddingServerLaunchMode {
@@ -163,6 +164,7 @@ impl EmbeddingServerLaunchMode {
         match self {
             Self::DockerComposeEmbed => "docker_compose_embed",
             Self::NativeSpawned => "native_spawned",
+            Self::ExternalEndpoint => "external_endpoint",
         }
     }
 }
@@ -810,6 +812,9 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
             "docker_compose_embed" | "docker" | "compose" => {
                 Some(EmbeddingServerLaunchMode::DockerComposeEmbed)
             }
+            "external_endpoint" | "external" | "endpoint" => {
+                Some(EmbeddingServerLaunchMode::ExternalEndpoint)
+            }
             _ => None,
         })
     {
@@ -817,8 +822,11 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
     }
     if std::env::var("CODESTORY_EMBED_SERVER_LAUNCH").is_ok() {
         anyhow::bail!(
-            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
+            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed, native_spawned, or external_endpoint"
         );
+    }
+    if std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_ok() {
+        return Ok(EmbeddingServerLaunchMode::ExternalEndpoint);
     }
     let request = crate::embeddings::embedding_accelerator_request();
     let host = embedding_host_platform();
@@ -1023,6 +1031,7 @@ mod tests {
     fn explicit_embedding_launch_modes_parse() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
 
         assert_eq!(
             embedding_server_launch_mode().expect("launch mode"),
@@ -1031,15 +1040,33 @@ mod tests {
     }
 
     #[test]
+    fn explicit_llamacpp_url_selects_external_endpoint_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:37040/v1/embeddings",
+        );
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::ExternalEndpoint
+        );
+    }
+
+    #[test]
     fn invalid_embedding_launch_mode_fails_closed() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "llama-server.exe");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
 
         let error = embedding_server_launch_mode().expect_err("invalid mode");
 
-        assert!(error.to_string().contains(
-            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
-        ));
+        assert!(
+            error
+                .to_string()
+                .contains("CODESTORY_EMBED_SERVER_LAUNCH must be")
+        );
     }
 
     #[test]
@@ -1047,6 +1074,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "macos/aarch64");
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 
@@ -1061,6 +1089,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 

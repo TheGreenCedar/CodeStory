@@ -6,7 +6,7 @@ use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
     SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime, execute_retrieval_query,
-    sidecar_down_for_runtime, sidecar_up_with_runtime, strict_sidecar_status,
+    sidecar_down_for_runtime, sidecar_up_with_runtime_preserving_launch, strict_sidecar_status,
     strict_sidecar_status_for_runtime,
 };
 
@@ -163,7 +163,8 @@ fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
-    let state = sidecar_up_with_runtime(&sidecar, None).context("retrieval up")?;
+    let state =
+        sidecar_up_with_runtime_preserving_launch(&sidecar, None).context("retrieval up")?;
     println!("{}", serde_json::to_string_pretty(&state)?);
     Ok(())
 }

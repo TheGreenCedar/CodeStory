@@ -182,7 +182,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     };
     let native_embedding_spawn = if let Some(launch) = native_embedding.as_ref() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
-            spawn_native_embedding_server(launch)
+            spawn_native_embedding_server(launch, runtime)
         })?
     } else {
         None
@@ -562,7 +562,9 @@ fn docker_compose_services_for_launch_mode(
 ) -> &'static [&'static str] {
     match mode {
         EmbeddingServerLaunchMode::DockerComposeEmbed => &[],
-        EmbeddingServerLaunchMode::NativeSpawned => &["qdrant", "zoekt"],
+        EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint => {
+            &["qdrant", "zoekt"]
+        }
     }
 }
 
@@ -1200,6 +1202,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 fn spawn_native_embedding_server(
     launch: &NativeEmbeddingServerLaunch,
+    runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
     if let Some(parent) = launch.log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1212,13 +1215,24 @@ fn spawn_native_embedding_server(
         .with_context(|| format!("open native llama.cpp log {}", launch.log_path.display()))?;
     let probe = crate::embeddings::probe_product_embedding_runtime();
     if native_embedding_server_reusable(&probe) {
+        if let Some(spawn) = reusable_native_embedding_spawn_from_state(runtime, launch)? {
+            writeln!(
+                log,
+                "reusing existing native llama.cpp embedding server pid={}: {}",
+                spawn.pid, probe.detail
+            )
+            .ok();
+            return Ok(Some(spawn));
+        }
         writeln!(
             log,
-            "reusing existing native llama.cpp embedding server: {}",
+            "refusing ownerless native llama.cpp embedding server reuse: {}",
             probe.detail
         )
         .ok();
-        return Ok(None);
+        bail!(
+            "native llama.cpp embedding endpoint is reachable but no matching sidecar launch metadata with a pid was found; cannot safely transfer the native embedding broker lock"
+        );
     }
     writeln!(
         log,
@@ -1290,6 +1304,44 @@ fn spawn_native_embedding_server_once(
 
 fn native_embedding_server_reusable(probe: &crate::embeddings::EmbeddingRuntimeProbe) -> bool {
     probe.reachable
+}
+
+fn reusable_native_embedding_spawn_from_state(
+    runtime: &SidecarRuntimeConfig,
+    launch: &NativeEmbeddingServerLaunch,
+) -> Result<Option<NativeEmbeddingSpawn>> {
+    let state_file = &runtime.layout.state_file;
+    if !state_file.exists() {
+        return Ok(None);
+    }
+    let contents =
+        fs::read_to_string(state_file).with_context(|| format!("read {}", state_file.display()))?;
+    let state: SidecarStateFile = serde_json::from_str(&contents)
+        .with_context(|| format!("parse {}", state_file.display()))?;
+    if state.owner != "codestory"
+        || state.namespace != runtime.namespace
+        || state.profile != runtime.profile.as_str()
+        || state.run_id.as_deref() != runtime.run_id.as_deref()
+    {
+        return Ok(None);
+    }
+    let Some(metadata) = state.embedding_launch.as_ref() else {
+        return Ok(None);
+    };
+    let launch_fingerprint = native_embedding_launch_fingerprint(launch);
+    if metadata.launch_mode != EmbeddingServerLaunchMode::NativeSpawned.as_str()
+        || metadata.endpoint != SidecarLayout::embed_base_url(runtime.embed_http_port)
+        || metadata.launch_fingerprint_sha256.as_deref() != Some(launch_fingerprint.as_str())
+    {
+        return Ok(None);
+    }
+    let Some(pid) = metadata.pid else {
+        return Ok(None);
+    };
+    Ok(Some(NativeEmbeddingSpawn {
+        pid,
+        spawned_at_epoch_ms: metadata.spawned_at_epoch_ms.unwrap_or_else(now_epoch_ms),
+    }))
 }
 
 fn configure_native_embedding_command(_command: &mut Command, _breakaway: bool) {
@@ -1483,6 +1535,27 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn compose_test_runtime(root: &std::path::Path) -> SidecarRuntimeConfig {
+        SidecarRuntimeConfig {
+            layout: SidecarLayout {
+                zoekt_http_port: 16070,
+                qdrant_http_port: 16333,
+                qdrant_grpc_port: 16334,
+                zoekt_data_dir: root.join("zoekt"),
+                qdrant_data_dir: root.join("qdrant"),
+                scip_artifacts_root: root.join("scip"),
+                state_file: root.join("retrieval-sidecars.json"),
+            },
+            profile: SidecarProfile::Local,
+            run_id: None,
+            namespace: "test".to_string(),
+            compose_project: "test".to_string(),
+            embed_http_port: 18080,
+            cleanup_command: "codestory-cli retrieval down".to_string(),
+            labels: std::collections::BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn embed_model_dir_discovers_repo_models_layout() {
         let project = tempdir().expect("project");
@@ -1650,6 +1723,10 @@ mod tests {
             docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::NativeSpawned),
             &["qdrant", "zoekt"]
         );
+        assert_eq!(
+            docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::ExternalEndpoint),
+            &["qdrant", "zoekt"]
+        );
         assert!(
             docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::DockerComposeEmbed)
                 .is_empty()
@@ -1666,6 +1743,10 @@ mod tests {
 
         assert!(!vulkan_compose_override_requested(
             EmbeddingServerLaunchMode::NativeSpawned,
+            Some(&request)
+        ));
+        assert!(!vulkan_compose_override_requested(
+            EmbeddingServerLaunchMode::ExternalEndpoint,
             Some(&request)
         ));
         assert!(vulkan_compose_override_requested(
@@ -2144,6 +2225,74 @@ mod tests {
 
         assert!(native_embedding_server_reusable(&reachable));
         assert!(!native_embedding_server_reusable(&unreachable));
+    }
+
+    #[test]
+    fn native_embedding_reuse_attaches_matching_state_pid() {
+        let _lock = crate::test_support::env_lock();
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        std::fs::write(&model, b"fake model").expect("model");
+        let runtime = compose_test_runtime(temp.path());
+        let launch =
+            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
+        let launch_metadata = embedding_launch_metadata(
+            &launch,
+            &runtime,
+            Some(temp.path()),
+            Some(NativeEmbeddingSpawn {
+                pid: 4321,
+                spawned_at_epoch_ms: 123,
+            }),
+        );
+        sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
+            .expect("write state");
+
+        let spawn = reusable_native_embedding_spawn_from_state(&runtime, &launch)
+            .expect("read state")
+            .expect("matching pid");
+
+        assert_eq!(spawn.pid, 4321);
+        assert_eq!(spawn.spawned_at_epoch_ms, 123);
+    }
+
+    #[test]
+    fn native_embedding_reuse_rejects_matching_state_without_pid() {
+        let _lock = crate::test_support::env_lock();
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        std::fs::write(&model, b"fake model").expect("model");
+        let runtime = compose_test_runtime(temp.path());
+        let launch =
+            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
+        let mut launch_metadata = embedding_launch_metadata(
+            &launch,
+            &runtime,
+            Some(temp.path()),
+            Some(NativeEmbeddingSpawn {
+                pid: 4321,
+                spawned_at_epoch_ms: 123,
+            }),
+        );
+        launch_metadata.pid = None;
+        sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
+            .expect("write state");
+
+        assert!(
+            reusable_native_embedding_spawn_from_state(&runtime, &launch)
+                .expect("read state")
+                .is_none()
+        );
     }
 
     #[test]

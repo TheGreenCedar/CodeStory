@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -168,6 +169,7 @@ struct StdioServerState {
     packet_cache: StdioPacketCache,
     search_cache: StdioSearchFragmentCache,
     status_cache: Option<StdioStatusCacheEntry>,
+    recent_sidecar_repair: Option<StdioRecentSidecarRepair>,
 }
 
 #[derive(Clone)]
@@ -175,6 +177,17 @@ struct StdioStatusCacheEntry {
     key: String,
     value: serde_json::Value,
     cached_at: Instant,
+}
+
+#[derive(Clone)]
+struct StdioRecentSidecarRepair {
+    project_root: PathBuf,
+    run_id: String,
+    namespace: String,
+    compose_project: String,
+    pid: u32,
+    started_at_epoch_ms: i64,
+    observed_at: Instant,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -868,6 +881,7 @@ fn handle_stdio_tool_call(
             state.status_cache = None;
             stdio_deprecated_repair_all_response(handle_stdio_sidecar_repair(
                 runtime,
+                state,
                 StdioSidecarRepairMode::Background,
             ))
         }
@@ -2267,7 +2281,11 @@ fn read_stdio_status_resource_cached(
         (summary, None)
     };
     let key = stdio_status_cache_key(runtime);
-    let value = read_stdio_status_resource(runtime, summary, local_refresh)?;
+    let value = stdio_status_with_recent_sidecar_repair(
+        read_stdio_status_resource(runtime, summary, local_refresh)?,
+        &mut state.recent_sidecar_repair,
+        &runtime.project_root,
+    );
     // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
     state.status_cache = Some(StdioStatusCacheEntry {
         key,
@@ -2275,6 +2293,73 @@ fn read_stdio_status_resource_cached(
         cached_at: Instant::now(),
     });
     Ok(value)
+}
+
+fn stdio_status_with_recent_sidecar_repair(
+    mut status: serde_json::Value,
+    recent: &mut Option<StdioRecentSidecarRepair>,
+    project_root: &Path,
+) -> serde_json::Value {
+    let Some(repair) = recent.as_ref() else {
+        return status;
+    };
+    if repair.project_root != project_root || repair.observed_at.elapsed() > STDIO_RECENT_REPAIR_TTL
+    {
+        *recent = None;
+        return status;
+    }
+
+    let run_id = repair.run_id.clone();
+    let namespace = repair.namespace.clone();
+    let active_repair = serde_json::json!({
+        "status": "repairing",
+        "project_root": crate::display::clean_path_string(&repair.project_root.to_string_lossy()),
+        "profile": "agent",
+        "run_id": run_id,
+        "namespace": namespace,
+        "phase": "starting",
+        "pid": repair.pid,
+        "updated_at_epoch_ms": repair.started_at_epoch_ms
+    });
+    let active_repair_empty = status
+        .pointer("/sidecar_setup/active_repair")
+        .map_or(true, serde_json::Value::is_null);
+    if active_repair_empty
+        && let Some(sidecar_setup) = status
+            .get_mut("sidecar_setup")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        sidecar_setup.insert("active_repair".to_string(), active_repair);
+    }
+
+    if let Some(operations) = status
+        .pointer_mut("/readiness_broker/operations")
+        .and_then(serde_json::Value::as_array_mut)
+        && operations.is_empty()
+    {
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project_root,
+            Some(&repair.run_id),
+            env!("CARGO_PKG_VERSION"),
+        );
+        operations.push(serde_json::json!({
+            "operation_id": crate::readiness_broker::broker_operation_id(&scope),
+            "operation_kind": "agent_repair",
+            "status": "running",
+            "project_id": scope.project_id,
+            "workspace_root": scope.workspace_root,
+            "profile": "agent",
+            "run_id": repair.run_id.clone(),
+            "agent_id": repair.run_id.clone(),
+            "namespace": repair.namespace.clone(),
+            "compose_project": repair.compose_project.clone(),
+            "phase": "starting",
+            "pid": repair.pid,
+            "started_at_epoch_ms": repair.started_at_epoch_ms,
+            "updated_at_epoch_ms": repair.started_at_epoch_ms
+        }));
+    }
+    status
 }
 
 fn wait_for_stdio_local_freshness(
@@ -3975,7 +4060,7 @@ fn handle_stdio_sidecar_setup(
                 }});
             }
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Background)
+            handle_stdio_sidecar_repair(runtime, state, StdioSidecarRepairMode::Background)
         }
         _ => {
             serde_json::json!({"error": "sidecar_setup.action must be status, enable, disable, ask, or repair"})
@@ -4024,6 +4109,7 @@ enum StdioSidecarRepairMode {
 
 fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
+    state: &mut StdioServerState,
     mode: StdioSidecarRepairMode,
 ) -> serde_json::Value {
     if let Some(error) = stdio_workspace_mismatch_error(runtime) {
@@ -4106,21 +4192,59 @@ fn handle_stdio_sidecar_repair(
         .stdin(Stdio::null());
 
     match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(child) => serde_json::json!({
-            "result": {
-                "status": "started",
-                "mode": stdio_sidecar_repair_mode_label(mode),
-                "pid": child.id(),
-                "previous_abandoned_repair": previous_abandoned_repair,
-                "broker_reconciliation": broker_reconciliation_json,
-                "next_status_command": format!(
-                    "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
-                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                    codestory_retrieval::DEFAULT_AGENT_RUN_ID
-                ),
-                "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
-            }
-        }),
+        Ok(child) => {
+            let child_pid = child.id();
+            let repair_started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
+            let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+                &runtime.project_root,
+                codestory_retrieval::SidecarProfile::Agent,
+                Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+            );
+            let status_published = crate::ready_repair_status::write_ready_repair_status(
+                &repair_sidecar,
+                &runtime.project_root,
+                "starting",
+                repair_started_at_epoch_ms,
+                child_pid,
+            )
+            .is_ok();
+            let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
+                crate::readiness_broker::BrokerSnapshotInput {
+                    project_root: runtime.project_root.clone(),
+                    cache_root: runtime.cache_root.clone(),
+                    agent_run_id: repair_sidecar.run_id.clone(),
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    gpu_proof: None,
+                    reconciliation: None,
+                },
+            );
+            state.recent_sidecar_repair = Some(StdioRecentSidecarRepair {
+                project_root: runtime.project_root.clone(),
+                run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+                namespace: repair_sidecar.namespace.clone(),
+                compose_project: repair_sidecar.compose_project.clone(),
+                pid: child_pid,
+                started_at_epoch_ms: repair_started_at_epoch_ms,
+                observed_at: Instant::now(),
+            });
+            serde_json::json!({
+                "result": {
+                    "status": "started",
+                    "mode": stdio_sidecar_repair_mode_label(mode),
+                    "pid": child_pid,
+                    "status_published": status_published,
+                    "broker_snapshot": broker_snapshot,
+                    "previous_abandoned_repair": previous_abandoned_repair,
+                    "broker_reconciliation": broker_reconciliation_json,
+                    "next_status_command": format!(
+                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    ),
+                    "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
+                }
+            })
+        }
         Err(error) => serde_json::json!({"error": error.to_string()}),
     }
 }
