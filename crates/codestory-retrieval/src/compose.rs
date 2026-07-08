@@ -1310,6 +1310,18 @@ fn reusable_native_embedding_spawn_from_state(
     runtime: &SidecarRuntimeConfig,
     launch: &NativeEmbeddingServerLaunch,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
+    reusable_native_embedding_spawn_from_state_with_identity(
+        runtime,
+        launch,
+        crate::sidecar::ensure_native_embedding_launch_identity,
+    )
+}
+
+fn reusable_native_embedding_spawn_from_state_with_identity(
+    runtime: &SidecarRuntimeConfig,
+    launch: &NativeEmbeddingServerLaunch,
+    mut validate_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<u32>,
+) -> Result<Option<NativeEmbeddingSpawn>> {
     let state_file = &runtime.layout.state_file;
     if !state_file.exists() {
         return Ok(None);
@@ -1338,6 +1350,13 @@ fn reusable_native_embedding_spawn_from_state(
     let Some(pid) = metadata.pid else {
         return Ok(None);
     };
+    let validated_pid = validate_launch(metadata)
+        .with_context(|| format!("validate reusable native embedding pid {pid}"))?;
+    if validated_pid != pid {
+        bail!(
+            "validated reusable native embedding pid mismatch: expected {pid}, got {validated_pid}"
+        );
+    }
     Ok(Some(NativeEmbeddingSpawn {
         pid,
         spawned_at_epoch_ms: metadata.spawned_at_epoch_ms.unwrap_or_else(now_epoch_ms),
@@ -2253,12 +2272,61 @@ mod tests {
         sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
             .expect("write state");
 
-        let spawn = reusable_native_embedding_spawn_from_state(&runtime, &launch)
-            .expect("read state")
-            .expect("matching pid");
+        let mut validator_called = false;
+        let spawn = reusable_native_embedding_spawn_from_state_with_identity(
+            &runtime,
+            &launch,
+            |metadata| {
+                validator_called = true;
+                assert_eq!(metadata.pid, Some(4321));
+                Ok(4321)
+            },
+        )
+        .expect("read state")
+        .expect("matching pid");
 
         assert_eq!(spawn.pid, 4321);
         assert_eq!(spawn.spawned_at_epoch_ms, 123);
+        assert!(validator_called);
+    }
+
+    #[test]
+    fn native_embedding_reuse_rejects_identity_mismatch() {
+        let _lock = crate::test_support::env_lock();
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let temp = tempdir().expect("temp");
+        let exe = temp.path().join("llama-server.exe");
+        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&exe, b"fake exe").expect("exe");
+        std::fs::write(&model, b"fake model").expect("model");
+        let runtime = compose_test_runtime(temp.path());
+        let launch =
+            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
+        let launch_metadata = embedding_launch_metadata(
+            &launch,
+            &runtime,
+            Some(temp.path()),
+            Some(NativeEmbeddingSpawn {
+                pid: 4321,
+                spawned_at_epoch_ms: 123,
+            }),
+        );
+        sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
+            .expect("write state");
+
+        let error =
+            reusable_native_embedding_spawn_from_state_with_identity(&runtime, &launch, |_| {
+                bail!("identity_unverified: wrong executable")
+            })
+            .expect_err("identity mismatch should fail closed");
+
+        let error_text = format!("{error:?}");
+        assert!(
+            error_text.contains("identity_unverified"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

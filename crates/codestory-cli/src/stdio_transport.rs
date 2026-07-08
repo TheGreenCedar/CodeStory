@@ -2309,18 +2309,23 @@ fn stdio_status_with_recent_sidecar_repair(
         return status;
     }
 
-    let run_id = repair.run_id.clone();
-    let namespace = repair.namespace.clone();
-    let active_repair = serde_json::json!({
+    let fallback_active_repair = serde_json::json!({
         "status": "repairing",
         "project_root": crate::display::clean_path_string(&repair.project_root.to_string_lossy()),
         "profile": "agent",
-        "run_id": run_id,
-        "namespace": namespace,
+        "run_id": repair.run_id.clone(),
+        "namespace": repair.namespace.clone(),
         "phase": "starting",
         "pid": repair.pid,
         "updated_at_epoch_ms": repair.started_at_epoch_ms
     });
+    let live_active_repair = status
+        .pointer("/sidecar_setup/active_repair")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let active_repair = live_active_repair
+        .clone()
+        .unwrap_or_else(|| fallback_active_repair.clone());
     let active_repair_empty = status
         .pointer("/sidecar_setup/active_repair")
         .map_or(true, serde_json::Value::is_null);
@@ -2329,7 +2334,7 @@ fn stdio_status_with_recent_sidecar_repair(
             .get_mut("sidecar_setup")
             .and_then(serde_json::Value::as_object_mut)
     {
-        sidecar_setup.insert("active_repair".to_string(), active_repair);
+        sidecar_setup.insert("active_repair".to_string(), active_repair.clone());
     }
 
     if let Some(operations) = status
@@ -2353,10 +2358,19 @@ fn stdio_status_with_recent_sidecar_repair(
             "agent_id": repair.run_id.clone(),
             "namespace": repair.namespace.clone(),
             "compose_project": repair.compose_project.clone(),
-            "phase": "starting",
-            "pid": repair.pid,
+            "phase": active_repair
+                .get("phase")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("starting")),
+            "pid": active_repair
+                .get("pid")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(repair.pid)),
             "started_at_epoch_ms": repair.started_at_epoch_ms,
-            "updated_at_epoch_ms": repair.started_at_epoch_ms
+            "updated_at_epoch_ms": active_repair
+                .get("updated_at_epoch_ms")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(repair.started_at_epoch_ms))
         }));
     }
     status
@@ -4856,6 +4870,93 @@ mod tests {
             storage_fingerprint: storage_fingerprint.to_string(),
             ..base_packet_cache_key_input(question)
         })
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_keeps_live_status_phase() {
+        let project = tempfile::tempdir().expect("project");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: 11,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let status = json!({
+            "sidecar_setup": {
+                "active_repair": {
+                    "status": "repairing",
+                    "project_root": project.path().display().to_string(),
+                    "profile": "agent",
+                    "run_id": "shared-agent",
+                    "namespace": "codestory-test",
+                    "phase": "Qdrant finalize",
+                    "pid": 22,
+                    "updated_at_epoch_ms": 200
+                }
+            },
+            "readiness_broker": {
+                "operations": []
+            }
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(status, &mut recent, project.path());
+
+        assert_eq!(
+            updated["sidecar_setup"]["active_repair"]["phase"],
+            json!("Qdrant finalize")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["phase"],
+            json!("Qdrant finalize")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["pid"],
+            json!(22)
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["updated_at_epoch_ms"],
+            json!(200)
+        );
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_synthesizes_starting_when_status_is_empty() {
+        let project = tempfile::tempdir().expect("project");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: 11,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let status = json!({
+            "sidecar_setup": {
+                "active_repair": null
+            },
+            "readiness_broker": {
+                "operations": []
+            }
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(status, &mut recent, project.path());
+
+        assert_eq!(
+            updated["sidecar_setup"]["active_repair"]["phase"],
+            json!("starting")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["phase"],
+            json!("starting")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["pid"],
+            json!(11)
+        );
     }
 
     #[test]

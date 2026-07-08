@@ -201,6 +201,35 @@ pub(crate) fn stop_native_embedding_process_for_launch(
     stop_native_embedding_process(pid, launch)
 }
 
+pub fn ensure_native_embedding_launch_identity(launch: &EmbeddingLaunchMetadata) -> Result<u32> {
+    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+        bail!("identity_unverified: native embedding launch mode is not native_spawned");
+    }
+    let pid = launch
+        .pid
+        .context("identity_unverified: recorded native embedding launch is missing pid")?;
+    ensure_native_embedding_process_identity(pid, launch)?;
+    Ok(pid)
+}
+
+fn ensure_native_embedding_process_identity(
+    pid: u32,
+    launch: &EmbeddingLaunchMetadata,
+) -> Result<()> {
+    if pid == 0 {
+        bail!("identity_unverified: native embedding pid is zero");
+    }
+    if pid == std::process::id() {
+        bail!("identity_unverified: native embedding pid {pid} is the current CodeStory process");
+    }
+    let Some(snapshot) = native_embedding_process_snapshot(pid)? else {
+        bail!("identity_unverified: native embedding pid {pid} is not running");
+    };
+    ensure_native_embedding_process_matches(launch, &snapshot)
+        .with_context(|| format!("identity_unverified: native embedding pid {pid}"))?;
+    Ok(())
+}
+
 fn stop_native_embedding_process(pid: u32, launch: &EmbeddingLaunchMetadata) -> Result<()> {
     if pid == 0 {
         bail!("identity_unverified: native embedding pid is zero");

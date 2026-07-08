@@ -2678,35 +2678,13 @@ fn repair_ready_state(
         env!("CARGO_PKG_VERSION"),
     );
     let final_status = {
-        let operation_started_at_epoch_ms = readiness_broker::current_epoch_ms();
-        let mut embedding_resource_lock =
-            match readiness_broker::acquire_native_embedding_resource_lock_if_needed(
+        let mut embedding_resource_lease =
+            readiness_broker::acquire_native_embedding_resource_lease_if_needed(
                 &broker_scope,
+                &sidecar,
                 Duration::from_secs(30),
                 Duration::from_millis(250),
-            )? {
-                None => None,
-                Some(readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock)) => {
-                    Some(lock)
-                }
-                Some(readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy)) => {
-                    let owner = busy
-                        .snapshot
-                        .owner_workspace_root
-                        .as_deref()
-                        .unwrap_or("unknown");
-                    bail!(
-                        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}; retry after the current repair reaches full retrieval",
-                        busy.snapshot.resource,
-                        busy.snapshot
-                            .owner_project_id
-                            .as_deref()
-                            .unwrap_or("unknown"),
-                        owner,
-                        busy.snapshot.owner_pid
-                    );
-                }
-            };
+            )?;
         eprintln!(
             "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
             sidecar.run_id.as_deref().unwrap_or("none"),
@@ -2727,29 +2705,21 @@ fn repair_ready_state(
         let bootstrap = match bootstrap_result {
             Ok(report) => report,
             Err(error) => {
-                if let Err(lease_error) =
-                    readiness_broker::transfer_native_embedding_resource_lock_from_state_file(
-                        &mut embedding_resource_lock,
+                if let Err(cleanup_error) =
+                    readiness_broker::cleanup_native_embedding_resource_lease_after_bootstrap_error(
+                        &embedding_resource_lease,
                         &sidecar,
-                        operation_started_at_epoch_ms,
                     )
                 {
-                    if let Err(cleanup_error) =
-                        codestory_retrieval::sidecar_down_for_runtime(&sidecar)
-                    {
-                        return Err(error).context(format!(
-                            "ready repair retrieval bootstrap; native embedding lease transfer failed: {lease_error}; cleanup failed: {cleanup_error}"
-                        ));
-                    }
                     return Err(error).context(format!(
-                        "ready repair retrieval bootstrap; native embedding lease transfer failed: {lease_error}"
+                        "ready repair retrieval bootstrap; native embedding cleanup failed: {cleanup_error}"
                     ));
                 }
                 return Err(error).context("ready repair retrieval bootstrap");
             }
         };
-        if let Err(error) = readiness_broker::transfer_native_embedding_resource_lock(
-            &mut embedding_resource_lock,
+        if let Err(error) = readiness_broker::transfer_native_embedding_resource_lease(
+            &mut embedding_resource_lease,
             &bootstrap.state,
         ) {
             codestory_retrieval::sidecar_down_for_runtime(&sidecar).with_context(|| {

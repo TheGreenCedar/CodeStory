@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use codestory_contracts::api::IndexMode;
 use std::time::Duration;
 
@@ -52,33 +52,13 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     );
     let (report, project_qdrant_repair, status) = {
-        let operation_started_at_epoch_ms = crate::readiness_broker::current_epoch_ms();
-        let mut embedding_resource_lock =
-            match crate::readiness_broker::acquire_native_embedding_resource_lock_if_needed(
+        let mut embedding_resource_lease =
+            crate::readiness_broker::acquire_native_embedding_resource_lease_if_needed(
                 &broker_scope,
+                &sidecar,
                 Duration::from_secs(30),
                 Duration::from_millis(250),
-            )? {
-                None => None,
-                Some(crate::readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock)) => {
-                    Some(lock)
-                }
-                Some(crate::readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy)) => {
-                    bail!(
-                        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}",
-                        busy.snapshot.resource,
-                        busy.snapshot
-                            .owner_project_id
-                            .as_deref()
-                            .unwrap_or("unknown"),
-                        busy.snapshot
-                            .owner_workspace_root
-                            .as_deref()
-                            .unwrap_or("unknown"),
-                        busy.snapshot.owner_pid
-                    );
-                }
-            };
+            )?;
         let bootstrap_result = bootstrap_sidecars_with_runtime(
             &sidecar,
             Some(&runtime.project_root),
@@ -90,27 +70,21 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         let report = match bootstrap_result {
             Ok(report) => report,
             Err(error) => {
-                if let Err(lease_error) =
-                    crate::readiness_broker::transfer_native_embedding_resource_lock_from_state_file(
-                        &mut embedding_resource_lock,
+                if let Err(cleanup_error) =
+                    crate::readiness_broker::cleanup_native_embedding_resource_lease_after_bootstrap_error(
+                        &embedding_resource_lease,
                         &sidecar,
-                        operation_started_at_epoch_ms,
                     )
                 {
-                    if let Err(cleanup_error) = sidecar_down_for_runtime(&sidecar) {
-                        return Err(error).context(format!(
-                            "retrieval bootstrap; native embedding lease transfer failed: {lease_error}; cleanup failed: {cleanup_error}"
-                        ));
-                    }
                     return Err(error).context(format!(
-                        "retrieval bootstrap; native embedding lease transfer failed: {lease_error}"
+                        "retrieval bootstrap; native embedding cleanup failed: {cleanup_error}"
                     ));
                 }
                 return Err(error).context("retrieval bootstrap");
             }
         };
-        if let Err(error) = crate::readiness_broker::transfer_native_embedding_resource_lock(
-            &mut embedding_resource_lock,
+        if let Err(error) = crate::readiness_broker::transfer_native_embedding_resource_lease(
+            &mut embedding_resource_lease,
             &report.state,
         ) {
             sidecar_down_for_runtime(&sidecar).with_context(|| {

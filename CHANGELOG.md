@@ -37,6 +37,9 @@
 - Fixed managed native bootstrap launch-mode selection so CodeStory-injected
   `CODESTORY_EMBED_LLAMACPP_URL` defaults no longer force `external_endpoint`
   before native spawn and broker locking on Windows and macOS arm64 hosts.
+- Allowed sequential native sidecar repairs to reuse the same validated
+  CodeStory-spawned llama.cpp PID instead of treating the broker lease as a
+  foreign machine lock after the first successful repair.
 
 ## 0.13.12
 

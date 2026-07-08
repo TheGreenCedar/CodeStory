@@ -199,6 +199,12 @@ pub(crate) enum BrokerMachineResourceLockAttempt {
     Busy(BrokerMachineResourceBusy),
 }
 
+#[derive(Debug)]
+pub(crate) enum BrokerNativeEmbeddingResourceLease {
+    Acquired(BrokerMachineResourceLock),
+    Reused { pid: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BrokerMachineResourceBusy {
     pub(crate) snapshot: BrokerResourceSnapshot,
@@ -378,34 +384,63 @@ pub(crate) fn transfer_machine_resource_lock_to_pid(
     Ok(true)
 }
 
-pub(crate) fn transfer_native_embedding_resource_lock(
-    lock: &mut Option<BrokerMachineResourceLock>,
+pub(crate) fn transfer_native_embedding_resource_lease(
+    lease: &mut Option<BrokerNativeEmbeddingResourceLease>,
     state: &codestory_retrieval::SidecarStateFile,
 ) -> Result<()> {
-    let Some(pid) = native_embedding_pid_from_sidecar_state(state) else {
+    let Some(launch) = native_embedding_launch_from_sidecar_state(state) else {
+        if matches!(
+            lease,
+            Some(BrokerNativeEmbeddingResourceLease::Reused { .. })
+        ) {
+            bail!("reused native embedding broker lease missing final state pid");
+        }
         return Ok(());
     };
-    let lock = lock
-        .as_mut()
-        .context("native embedding process spawned without broker machine lock")?;
-    if !transfer_machine_resource_lock_to_pid(lock, pid)? {
-        bail!("native embedding broker lock handoff failed for pid {pid}");
+    let Some(pid) = launch.pid else {
+        if matches!(
+            lease,
+            Some(BrokerNativeEmbeddingResourceLease::Reused { .. })
+        ) {
+            bail!("reused native embedding broker lease missing final state pid");
+        }
+        return Ok(());
+    };
+    match lease {
+        Some(BrokerNativeEmbeddingResourceLease::Acquired(lock)) => {
+            let validated_pid = codestory_retrieval::ensure_native_embedding_launch_identity(
+                launch,
+            )
+            .with_context(|| format!("validate native embedding broker handoff pid {pid}"))?;
+            if validated_pid != pid {
+                bail!(
+                    "validated native embedding broker handoff pid mismatch: expected {pid}, got {validated_pid}"
+                );
+            }
+            if !transfer_machine_resource_lock_to_pid(lock, pid)? {
+                bail!("native embedding broker lock handoff failed for pid {pid}");
+            }
+        }
+        Some(BrokerNativeEmbeddingResourceLease::Reused { pid: reused_pid }) => {
+            if *reused_pid != pid {
+                bail!(
+                    "reused native embedding broker lease pid mismatch: expected {reused_pid}, got {pid}"
+                );
+            }
+        }
+        None => bail!("native embedding process spawned without broker machine lock"),
     }
     Ok(())
 }
 
-pub(crate) fn transfer_native_embedding_resource_lock_from_state_file(
-    lock: &mut Option<BrokerMachineResourceLock>,
+pub(crate) fn cleanup_native_embedding_resource_lease_after_bootstrap_error(
+    lease: &Option<BrokerNativeEmbeddingResourceLease>,
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-    operation_started_at_epoch_ms: i64,
 ) -> Result<()> {
-    let Some(state) = read_sidecar_state_file(sidecar)? else {
-        return Ok(());
-    };
-    if !sidecar_state_has_current_native_embedding_launch(&state, operation_started_at_epoch_ms) {
-        return Ok(());
+    if matches!(lease, Some(BrokerNativeEmbeddingResourceLease::Acquired(_))) {
+        codestory_retrieval::sidecar_down_for_runtime(sidecar)?;
     }
-    transfer_native_embedding_resource_lock(lock, &state)
+    Ok(())
 }
 
 pub(crate) fn native_embedding_pid_from_sidecar_state_file(
@@ -431,20 +466,15 @@ fn read_sidecar_state_file(
 fn native_embedding_pid_from_sidecar_state(
     state: &codestory_retrieval::SidecarStateFile,
 ) -> Option<u32> {
-    let launch = state.embedding_launch.as_ref()?;
-    (launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str())
-        .then_some(launch.pid)
-        .flatten()
+    native_embedding_launch_from_sidecar_state(state)?.pid
 }
 
-fn sidecar_state_has_current_native_embedding_launch(
+fn native_embedding_launch_from_sidecar_state(
     state: &codestory_retrieval::SidecarStateFile,
-    operation_started_at_epoch_ms: i64,
-) -> bool {
-    if native_embedding_pid_from_sidecar_state(state).is_none() {
-        return false;
-    }
-    state.started_at_epoch_ms >= operation_started_at_epoch_ms
+) -> Option<&codestory_retrieval::EmbeddingLaunchMetadata> {
+    state.embedding_launch.as_ref().filter(|launch| {
+        launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str()
+    })
 }
 
 pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) -> Result<bool> {
@@ -470,41 +500,127 @@ fn reap_stale_machine_resource_lock(resource: &str, path: &Path) -> Result<bool>
     Ok(true)
 }
 
-pub(crate) fn acquire_native_embedding_resource_lock_if_needed(
+pub(crate) fn acquire_native_embedding_resource_lease_if_needed(
     scope: &BrokerScope,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
     wait: Duration,
     poll: Duration,
-) -> Result<Option<BrokerMachineResourceLockAttempt>> {
+) -> Result<Option<BrokerNativeEmbeddingResourceLease>> {
+    acquire_native_embedding_resource_lease_if_needed_with_validator(
+        scope,
+        sidecar,
+        wait,
+        poll,
+        codestory_retrieval::ensure_native_embedding_launch_identity,
+    )
+}
+
+fn acquire_native_embedding_resource_lease_if_needed_with_validator(
+    scope: &BrokerScope,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    wait: Duration,
+    poll: Duration,
+    mut validate_launch: impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
+) -> Result<Option<BrokerNativeEmbeddingResourceLease>> {
     if codestory_retrieval::embedding_server_launch_mode()?
         != codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
     {
         return Ok(None);
     }
-    acquire_machine_resource_lock_with_wait(NATIVE_EMBEDDING_RESOURCE, scope, wait, poll).map(Some)
-}
-
-pub(crate) fn current_epoch_ms() -> i64 {
-    now_epoch_ms()
-}
-
-pub(crate) fn acquire_machine_resource_lock_with_wait(
-    resource: &str,
-    scope: &BrokerScope,
-    wait: Duration,
-    poll: Duration,
-) -> Result<BrokerMachineResourceLockAttempt> {
     let deadline = Instant::now() + wait;
     loop {
-        match try_acquire_machine_resource_lock(resource, scope)? {
-            acquired @ BrokerMachineResourceLockAttempt::Acquired(_) => return Ok(acquired),
-            busy @ BrokerMachineResourceLockAttempt::Busy(_) => {
+        match try_acquire_machine_resource_lock(NATIVE_EMBEDDING_RESOURCE, scope)? {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => {
+                return Ok(Some(BrokerNativeEmbeddingResourceLease::Acquired(lock)));
+            }
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                if let Some(pid) = reusable_native_embedding_resource_pid(
+                    scope,
+                    sidecar,
+                    &busy,
+                    &mut validate_launch,
+                )? {
+                    return Ok(Some(BrokerNativeEmbeddingResourceLease::Reused { pid }));
+                }
                 if Instant::now() >= deadline {
-                    return Ok(busy);
+                    return bail_native_embedding_busy(&busy);
                 }
                 std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
             }
         }
     }
+}
+
+fn reusable_native_embedding_resource_pid(
+    scope: &BrokerScope,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    busy: &BrokerMachineResourceBusy,
+    validate_launch: &mut impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
+) -> Result<Option<u32>> {
+    let Some(owner_pid) = busy.snapshot.owner_pid else {
+        return Ok(None);
+    };
+    if busy.snapshot.owner_project_id.as_deref() != Some(scope.project_id.as_str())
+        || busy.snapshot.owner_workspace_root.as_deref() != Some(scope.workspace_root.as_str())
+    {
+        return Ok(None);
+    }
+    let Some(state) = read_sidecar_state_file(sidecar)? else {
+        return Ok(None);
+    };
+    if !sidecar_state_matches_runtime(&state, sidecar) {
+        return Ok(None);
+    }
+    let Some(launch) = state.embedding_launch.as_ref() else {
+        return Ok(None);
+    };
+    if launch.launch_mode != codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str()
+        || launch.endpoint
+            != codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port)
+        || launch.pid != Some(owner_pid)
+    {
+        return Ok(None);
+    }
+    let validated_pid = validate_launch(launch)
+        .with_context(|| format!("validate reusable native embedding pid {owner_pid}"))?;
+    if validated_pid != owner_pid {
+        bail!(
+            "validated reusable native embedding pid mismatch: expected {owner_pid}, got {validated_pid}"
+        );
+    }
+    Ok(Some(owner_pid))
+}
+
+fn sidecar_state_matches_runtime(
+    state: &codestory_retrieval::SidecarStateFile,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> bool {
+    state.owner == "codestory"
+        && state.namespace == sidecar.namespace
+        && state.compose_project == sidecar.compose_project
+        && state.profile == sidecar.profile.as_str()
+        && state.run_id.as_deref() == sidecar.run_id.as_deref()
+        && state.embed_http_port == sidecar.embed_http_port
+        && state.embed_url
+            == codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port)
+}
+
+fn bail_native_embedding_busy<T>(busy: &BrokerMachineResourceBusy) -> Result<T> {
+    let owner = busy
+        .snapshot
+        .owner_workspace_root
+        .as_deref()
+        .unwrap_or("unknown");
+    bail!(
+        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}; retry after the current repair reaches full retrieval",
+        busy.snapshot.resource,
+        busy.snapshot
+            .owner_project_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        owner,
+        busy.snapshot.owner_pid
+    );
 }
 
 pub(crate) fn reconcile_before_enqueue(
@@ -1192,6 +1308,32 @@ mod tests {
         }
     }
 
+    fn write_matching_native_sidecar_state(
+        sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+        pid: u32,
+    ) {
+        let mut state = native_sidecar_state(Some(now_epoch_ms()));
+        state.profile = sidecar.profile.as_str().to_string();
+        state.namespace = sidecar.namespace.clone();
+        state.compose_project = sidecar.compose_project.clone();
+        state.run_id = sidecar.run_id.clone();
+        state.embed_http_port = sidecar.embed_http_port;
+        state.embed_url =
+            codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
+        if let Some(launch) = state.embedding_launch.as_mut() {
+            launch.endpoint = state.embed_url.clone();
+            launch.pid = Some(pid);
+        }
+        if let Some(parent) = sidecar.layout.state_file.parent() {
+            fs::create_dir_all(parent).expect("create state parent");
+        }
+        fs::write(
+            &sidecar.layout.state_file,
+            serde_json::to_vec_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+    }
+
     #[test]
     fn gpu_proof_requires_observed_acceleration_when_requested() {
         let proof = gpu_proof(BrokerGpuProofInput {
@@ -1224,32 +1366,92 @@ mod tests {
     }
 
     #[test]
-    fn native_embedding_state_handoff_requires_current_state_write() {
-        let operation_started_at_epoch_ms = 1_000;
+    fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("native-reuse");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "shared-agent");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        let owner_pid = std::process::id();
+        write_machine_lock(&resource, &scope, owner_pid);
+        write_matching_native_sidecar_state(&sidecar, owner_pid);
+        let busy = BrokerMachineResourceBusy {
+            snapshot: machine_resource_snapshot(&resource),
+        };
+        let mut validator_called = false;
 
-        let mut reused_process = native_sidecar_state(Some(1));
-        reused_process.started_at_epoch_ms = operation_started_at_epoch_ms;
-        assert!(sidecar_state_has_current_native_embedding_launch(
-            &reused_process,
-            operation_started_at_epoch_ms
-        ));
+        let reused =
+            reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut |launch| {
+                validator_called = true;
+                assert_eq!(launch.pid, Some(owner_pid));
+                Ok(owner_pid)
+            })
+            .expect("reuse check");
 
-        let mut stale_state = native_sidecar_state(Some(1_000));
-        stale_state.started_at_epoch_ms = operation_started_at_epoch_ms - 1;
-        assert!(!sidecar_state_has_current_native_embedding_launch(
-            &stale_state,
-            operation_started_at_epoch_ms
-        ));
+        assert_eq!(reused, Some(owner_pid));
+        assert!(validator_called);
+        cleanup_machine_resource(&resource);
+    }
 
-        let mut missing_pid = native_sidecar_state(None);
-        missing_pid.started_at_epoch_ms = operation_started_at_epoch_ms;
-        if let Some(launch) = missing_pid.embedding_launch.as_mut() {
-            launch.pid = None;
-        }
-        assert!(!sidecar_state_has_current_native_embedding_launch(
-            &missing_pid,
-            operation_started_at_epoch_ms
-        ));
+    #[test]
+    fn native_embedding_busy_lock_rejects_mismatched_state_pid() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("native-mismatch");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "shared-agent");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        let owner_pid = std::process::id();
+        write_machine_lock(&resource, &scope, owner_pid);
+        write_matching_native_sidecar_state(&sidecar, owner_pid.saturating_add(1));
+        let busy = BrokerMachineResourceBusy {
+            snapshot: machine_resource_snapshot(&resource),
+        };
+
+        let reused = reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut |_| {
+            panic!("mismatched pid must not reach live identity validation")
+        })
+        .expect("reuse check");
+
+        assert_eq!(reused, None);
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn native_embedding_acquired_lease_releases_without_handoff_on_error() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("native-error-release");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "shared-agent");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        let lock = match try_acquire_machine_resource_lock(&resource, &scope)
+            .expect("acquire machine lock")
+        {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+        let path = machine_resource_lock_path(&resource);
+        let lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+
+        cleanup_native_embedding_resource_lease_after_bootstrap_error(&lease, &sidecar)
+            .expect("cleanup after bootstrap error");
+        drop(lease);
+
+        assert!(!path.exists(), "untransferred lease should release on drop");
+        cleanup_machine_resource(&resource);
     }
 
     #[test]
