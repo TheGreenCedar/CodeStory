@@ -1,6 +1,6 @@
 [package]
 name = "codestory-bench"
-version = "0.13.11"
+version = "0.13.12"
 edition = "2024"
 publish = false
 

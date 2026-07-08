@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.13.12
+
+CodeStory 0.13.12 fixes the installed plugin MCP recovery path so Codex can
+reconnect to the runtime after startup drift without getting trapped in stale
+diagnostic mode or foreground sidecar repair.
+
 ### Fixed
 
 - Made diagnostic fail-open MCP re-read plugin active-state files and hand off
