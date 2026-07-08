@@ -1,6 +1,6 @@
 [package]
 name = "codestory-contracts"
-version = "0.13.10"
+version = "0.13.11"
 edition = "2024"
 
 [dependencies]
