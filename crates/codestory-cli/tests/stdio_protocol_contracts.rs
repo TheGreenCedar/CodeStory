@@ -2822,6 +2822,37 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         "sidecar policy should record an update timestamp: {policy}"
     );
 
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair"));
+    assert!(
+        repair["status"] == json!("started") || repair["status"] == json!("already_running"),
+        "sidecar_setup repair should return a bounded repair state: {repair}"
+    );
+    assert_eq!(
+        repair["mode"],
+        json!("background"),
+        "sidecar_setup repair should not wait for full repair inside the MCP request: {repair}"
+    );
+    assert!(
+        repair["next_status_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("retrieval status")
+                && command.contains("--profile agent")
+                && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
+        "sidecar_setup repair should point to cheap status inspection: {repair}"
+    );
+
     let status_response = send_json(
         &mut server,
         json!({
@@ -2842,8 +2873,9 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     assert!(
         status["status_resource_auto_repair"]["result"]["status"] == json!("started")
             || status["status_resource_auto_repair"]["result"]["status"]
-                == json!("already_running"),
-        "status should start Rust-owned repair after sidecar_setup enable: {status}"
+                == json!("already_running")
+            || status["sidecar_setup"]["active_repair"]["status"] == json!("repairing"),
+        "status should report Rust-owned repair after sidecar_setup enable: {status}"
     );
     assert!(
         next_call_text.contains("\"uri\":\"codestory://status\"")

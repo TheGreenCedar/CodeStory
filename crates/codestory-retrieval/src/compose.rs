@@ -14,6 +14,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -29,6 +31,19 @@ const LINUX_VULKAN_RENDER_NODE: &str = "/dev/dri";
 const VULKAN_COMPOSE_OVERRIDE: &str =
     "services:\n  embed:\n    devices:\n      - /dev/dri:/dev/dri\n";
 const MANAGED_LLAMA_EXTRACTED_MARKER: &str = ".codestory-extracted";
+#[cfg(windows)]
+const WINDOWS_DETACHED_PROCESS: u32 = 0x00000008;
+#[cfg(windows)]
+const WINDOWS_CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+#[cfg(windows)]
+const WINDOWS_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+#[cfg(windows)]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS: u32 = WINDOWS_DETACHED_PROCESS
+    | WINDOWS_CREATE_NEW_PROCESS_GROUP
+    | WINDOWS_CREATE_BREAKAWAY_FROM_JOB
+    | WINDOWS_CREATE_NO_WINDOW;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EmbedModelInventory {
@@ -1148,30 +1163,69 @@ fn spawn_native_embedding_server(launch: &NativeEmbeddingServerLaunch) -> Result
         .append(true)
         .open(&launch.log_path)
         .with_context(|| format!("open native llama.cpp log {}", launch.log_path.display()))?;
+    let probe = crate::embeddings::probe_product_embedding_runtime();
+    if native_embedding_server_reusable(&probe) {
+        writeln!(
+            log,
+            "reusing existing native llama.cpp embedding server: {}",
+            probe.detail
+        )
+        .ok();
+        return Ok(());
+    }
     writeln!(
         log,
-        "starting native llama.cpp embedding server: {} {}",
+        "starting native llama.cpp embedding server after probe failed ({}): {} {}",
+        probe.detail,
         launch.executable.display(),
         launch.args.join(" ")
+    )
+    .ok();
+    #[cfg(windows)]
+    writeln!(
+        log,
+        "native llama.cpp embedding server Windows creation_flags=0x{NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS:08x}"
     )
     .ok();
     let stdout = log
         .try_clone()
         .context("clone native llama.cpp stdout log")?;
-    let _child = Command::new(&launch.executable)
+    let mut command = Command::new(&launch.executable);
+    command
         .args(&launch.args)
         .current_dir(launch.executable.parent().unwrap_or_else(|| Path::new(".")))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .with_context(|| {
-            format!(
-                "spawn native llama.cpp server {}",
-                launch.executable.display()
-            )
-        })?;
+        .stderr(Stdio::from(log));
+    configure_native_embedding_command(&mut command);
+    let _child = command.spawn().with_context(|| {
+        format!(
+            "spawn native llama.cpp server {}{}",
+            launch.executable.display(),
+            native_embedding_spawn_detail()
+        )
+    })?;
     Ok(())
+}
+
+fn native_embedding_server_reusable(probe: &crate::embeddings::EmbeddingRuntimeProbe) -> bool {
+    probe.reachable
+}
+
+fn configure_native_embedding_command(_command: &mut Command) {
+    #[cfg(windows)]
+    _command.creation_flags(NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS);
+}
+
+fn native_embedding_spawn_detail() -> &'static str {
+    #[cfg(windows)]
+    {
+        " with detached Windows creation flags"
+    }
+    #[cfg(not(windows))]
+    {
+        ""
+    }
 }
 
 fn remove_container_if_present(name: &str) -> Result<()> {
@@ -1943,6 +1997,42 @@ mod tests {
         assert!(!launch.args.iter().any(|arg| arg == "--device"));
         let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()));
         assert_eq!(metadata.requested_device, None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_embedding_windows_spawn_detaches_from_ready_repair_process() {
+        assert_ne!(
+            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_DETACHED_PROCESS,
+            0
+        );
+        assert_ne!(
+            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_CREATE_NEW_PROCESS_GROUP,
+            0
+        );
+        assert_ne!(
+            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_CREATE_BREAKAWAY_FROM_JOB,
+            0
+        );
+        assert_ne!(
+            NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS & WINDOWS_CREATE_NO_WINDOW,
+            0
+        );
+    }
+
+    #[test]
+    fn native_embedding_reuses_healthy_existing_endpoint() {
+        let reachable = crate::embeddings::EmbeddingRuntimeProbe {
+            reachable: true,
+            detail: "llama.cpp embeddings reachable dim=768".into(),
+        };
+        let unreachable = crate::embeddings::EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: "llama.cpp embeddings unavailable".into(),
+        };
+
+        assert!(native_embedding_server_reusable(&reachable));
+        assert!(!native_embedding_server_reusable(&unreachable));
     }
 
     #[test]
