@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Made diagnostic fail-open MCP re-read plugin active-state files and hand off
+  to `codestory-cli serve --stdio` once a project root appears after startup,
+  instead of freezing the stale startup diagnosis.
+- Detached Windows native `llama-server.exe` embedding sidecars from the ready
+  repair process so semantic endpoints can survive after repair exits, or fail
+  spawn before claiming agent packet/search readiness.
+- Reused an already-healthy native embedding endpoint during sidecar bootstrap
+  so repeated CLI or MCP repairs do not spawn extra `llama-server.exe`
+  processes for the same agent sidecar port.
+- Made stdio `sidecar_setup repair` start the Rust repair in the background so
+  long sidecar rebuilds do not block the MCP request past the host tool timeout.
+
 ## 0.13.11
 
 CodeStory 0.13.11 fixes Windows native sidecar repair after the Linux

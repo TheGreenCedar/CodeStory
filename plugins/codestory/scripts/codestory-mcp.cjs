@@ -158,6 +158,33 @@ function activeProjectStateFresh(active, statePath, nowMs = Date.now(), options 
     && (!options.requireThreadMatch || activeProjectStateMatchesHost(active));
 }
 
+function activeProjectStateSummary(statePath, nowMs = Date.now()) {
+  const active = statePath ? readJson(statePath) : null;
+  const timestamp = activeProjectStateTimestamp(active, statePath);
+  return {
+    path: statePath,
+    cwd: active?.cwd || null,
+    updated_at: active?.updatedAt || active?.updated_at || null,
+    age_ms: timestamp === null ? null : Math.max(0, Math.round(nowMs - timestamp)),
+    codex_thread_id: active?.codexThreadId || null,
+  };
+}
+
+function projectResolutionDiagnostics(projectResolution, nowMs = Date.now()) {
+  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
+  const threadStatePath = activeThreadStatePath(currentThread);
+  return {
+    project_root_resolution_source: projectResolution.source || null,
+    project_root_resolution_state_path: projectResolution.statePath || null,
+    project_root_available_after_launch: Boolean(projectResolution.projectRoot),
+    active_state: activeProjectStateSummary(activeStatePath(), nowMs),
+    thread_state: activeProjectStateSummary(threadStatePath, nowMs),
+    codex_thread_id: currentThread || null,
+    launch_cwd: launchCwd,
+    runtime_cwd: process.cwd(),
+  };
+}
+
 function resolveProjectRoot(options = {}) {
   const explicit = existingProjectRoot(options.projectRoot || process.env.CODESTORY_PROJECT_ROOT);
   if (explicit) {
@@ -1021,19 +1048,29 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
 }
 
 function projectRootUnavailableDiagnostic(resolved, probe, projectResolution) {
-  return fallbackDiagnostic(resolved, probe, projectResolution.reason, {
-    projectRoot: null,
+  const projectRoot = projectResolution.projectRoot || null;
+  const reason = projectRoot ? 'project_root_recovered_after_launch' : projectResolution.reason;
+  return fallbackDiagnostic(resolved, probe, reason, {
+    projectRoot,
     projectRootSource: projectResolution.source,
     goal: 'project_root',
     status: 'repair_setup',
-    summary: 'CodeStory plugin MCP could not determine the target project root before starting stdio.',
-    minimumNext: [
-      'Start or reload the Codex host from the target repo, then read codestory://status.',
-    ],
-    fullRepair: [
-      'Start or resume the Codex session in the target repo so CodeStory can infer the active project root.',
-      'Restart/reload the Codex host from the target repo, then read codestory://status.',
-    ],
+    summary: projectRoot
+      ? 'CodeStory plugin MCP found a target project root after diagnostic startup and will hand off to the real stdio runtime on the next request.'
+      : 'CodeStory plugin MCP could not determine the target project root before starting stdio.',
+    minimumNext: projectRoot
+      ? ['Retry the CodeStory MCP request; this diagnostic wrapper will hand off to codestory-cli serve --stdio.']
+      : ['Start or reload the Codex host from the target repo, then read codestory://status.'],
+    fullRepair: projectRoot
+      ? [
+          'Retry the CodeStory MCP request; this diagnostic wrapper will hand off to codestory-cli serve --stdio.',
+          'If the client cached the earlier tool list, restart/reload the Codex host and read codestory://status.',
+        ]
+      : [
+          'Start or resume the Codex session in the target repo so CodeStory can infer the active project root.',
+          'Restart/reload the Codex host from the target repo, then read codestory://status.',
+        ],
+    setup: projectResolutionDiagnostics(projectResolution),
   });
 }
 
@@ -1266,7 +1303,29 @@ function failOpenSidecarSetupResult(request) {
   };
 }
 
-function runFailOpenMcp(status) {
+function runFailOpenMcp(status, options = {}) {
+  const currentStatus = () => (typeof status === 'function' ? status() : status);
+  let handoff = null;
+  const maybeHandoff = () => {
+    if (handoff || typeof options.startRuntime !== 'function') {
+      return handoff;
+    }
+    const liveStatus = currentStatus();
+    if (!liveStatus.project_root || liveStatus.degraded_reason !== 'project_root_recovered_after_launch') {
+      return null;
+    }
+    handoff = options.startRuntime(liveStatus);
+    handoff.stdout?.pipe(process.stdout);
+    handoff.stderr?.pipe(process.stderr);
+    handoff.on('exit', (code, signal) => {
+      if (signal) process.kill(process.pid, signal);
+      process.exit(code || 0);
+    });
+    handoff.on('error', (error) => {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32000, `CodeStory stdio handoff failed: ${error.message}`))}\n`);
+    });
+    return handoff;
+  };
   const tools = [{
     name: 'sidecar_setup',
     description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode.',
@@ -1296,10 +1355,13 @@ function runFailOpenMcp(status) {
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
   ];
-  const guide = {
-    status: 'repair_setup',
-    message: 'Read codestory://status, follow recommended_next_calls, restore a compatible stdio runtime, then retry grounding.',
-    recommended_next_calls: status.recommended_next_calls,
+  const guide = () => {
+    const liveStatus = currentStatus();
+    return {
+      status: 'repair_setup',
+      message: 'Read codestory://status, follow recommended_next_calls, restore a compatible stdio runtime, then retry grounding.',
+      recommended_next_calls: liveStatus.recommended_next_calls,
+    };
   };
   let buffer = '';
   process.stdin.setEncoding('utf8');
@@ -1316,13 +1378,19 @@ function runFailOpenMcp(status) {
         process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
         continue;
       }
+      const delegated = maybeHandoff();
+      if (delegated) {
+        delegated.stdin.write(`${line}\n`);
+        continue;
+      }
       if (request.id === undefined) continue;
       let response;
       if (request.method === 'initialize') {
+        const liveStatus = currentStatus();
         response = jsonrpcResult(request.id, {
           protocolVersion: request.params?.protocolVersion || '2024-11-05',
           capabilities: { tools: {}, resources: {} },
-          serverInfo: { name: 'codestory', version: resolvedVersionForStatus(status) },
+          serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
         });
       } else if (request.method === 'tools/list') {
         response = jsonrpcResult(request.id, { tools });
@@ -1331,9 +1399,9 @@ function runFailOpenMcp(status) {
       } else if (request.method === 'resources/read') {
         const uri = request.params?.uri;
         if (uri === 'codestory://status') {
-          response = jsonrpcResult(request.id, resourceContents(uri, status));
+          response = jsonrpcResult(request.id, resourceContents(uri, currentStatus()));
         } else if (uri === 'codestory://agent-guide') {
-          response = jsonrpcResult(request.id, resourceContents(uri, guide));
+          response = jsonrpcResult(request.id, resourceContents(uri, guide()));
         } else {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
@@ -1383,6 +1451,55 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
   }
 }
 
+function stdioRuntimeEnv(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath) {
+  const sidecarStatus = readSidecarPolicy();
+  const dirtyMarker = dirtyMarkerEnv(projectRoot);
+  return {
+    ...process.env,
+    CODESTORY_PLUGIN_VERSION: resolved.version || '',
+    CODESTORY_PLUGIN_ROOT: pluginRoot,
+    CODESTORY_PLUGIN_LAUNCH_CWD: launchCwd,
+    CODESTORY_PLUGIN_RUNTIME_CWD: runtimeCwd,
+    CODESTORY_PLUGIN_CACHE_VERSION: pluginCacheVersion() || '',
+    CODESTORY_PLUGIN_CLI_VERSION: resolved.cliVersion || resolved.version || '',
+    CODESTORY_PLUGIN_CLI_SOURCE: resolved.source,
+    CODESTORY_PLUGIN_CLI_PATH: resolved.path,
+    CODESTORY_PLUGIN_CLI_SHA256: resolved.sha256 || '',
+    CODESTORY_PLUGIN_CLI_MANIFEST_PATH: resolved.manifestPath || '',
+    CODESTORY_PLUGIN_CLI_BUILD_SOURCE: resolved.buildSource || '',
+    CODESTORY_PLUGIN_CLI_REPO_REF: resolved.repoRef || '',
+    CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256: resolved.archiveSha256 || '',
+    CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
+    CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
+    CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
+    CODESTORY_PLUGIN_PROJECT_ROOT: projectRoot,
+    CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE: projectRootSource,
+    CODESTORY_PLUGIN_ACTIVE_STATE_PATH: projectStatePath || activeStatePath() || '',
+    CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
+    CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
+    CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
+    CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
+    CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
+    CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, projectRoot),
+    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
+    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
+    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
+    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
+    CODESTORY_PLUGIN_DIRTY_MARKER_PATH: dirtyMarker.path,
+    CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT: dirtyMarker.projectRoot,
+  };
+}
+
+function spawnStdioRuntime(resolved, projectRoot, projectRootSource, runtimeCwd, stdio, projectStatePath = null) {
+  return spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none', '--project', projectRoot], {
+    cwd: projectRoot,
+    stdio,
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+    windowsHide: true,
+    env: stdioRuntimeEnv(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath),
+  });
+}
+
 async function main() {
   if (await handleBootstrapStatusCommand(process.argv)) return;
   handleSidecarPolicyCommand(process.argv);
@@ -1400,54 +1517,31 @@ async function main() {
     return;
   }
   if (!projectResolution.projectRoot) {
-    runFailOpenMcp(projectRootUnavailableDiagnostic(resolved, probe, projectResolution));
+    runFailOpenMcp(
+      () => projectRootUnavailableDiagnostic(resolved, probe, resolveProjectRoot()),
+      {
+        startRuntime: (liveStatus) => spawnStdioRuntime(
+          resolved,
+          liveStatus.project_root,
+          liveStatus.project_root_source,
+          runtimeCwd,
+          ['pipe', 'pipe', 'pipe'],
+          liveStatus.readiness?.[0]?.setup?.project_root_resolution_state_path || null,
+        ),
+      },
+    );
     return;
   }
   const projectRoot = projectResolution.projectRoot;
   // Keep the JSON-RPC server handshake first; codestory://status reports readiness after stdio is alive.
-  const sidecarStatus = readSidecarPolicy();
-  const dirtyMarker = dirtyMarkerEnv(projectRoot);
-
-  const child = spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none', '--project', projectRoot], {
-    cwd: projectRoot,
-    stdio: 'inherit',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
-    windowsHide: true,
-    env: {
-      ...process.env,
-      CODESTORY_PLUGIN_VERSION: resolved.version || '',
-      CODESTORY_PLUGIN_ROOT: pluginRoot,
-      CODESTORY_PLUGIN_LAUNCH_CWD: launchCwd,
-      CODESTORY_PLUGIN_RUNTIME_CWD: runtimeCwd,
-      CODESTORY_PLUGIN_CACHE_VERSION: pluginCacheVersion() || '',
-      CODESTORY_PLUGIN_CLI_VERSION: resolved.cliVersion || resolved.version || '',
-      CODESTORY_PLUGIN_CLI_SOURCE: resolved.source,
-      CODESTORY_PLUGIN_CLI_PATH: resolved.path,
-      CODESTORY_PLUGIN_CLI_SHA256: resolved.sha256 || '',
-      CODESTORY_PLUGIN_CLI_MANIFEST_PATH: resolved.manifestPath || '',
-      CODESTORY_PLUGIN_CLI_BUILD_SOURCE: resolved.buildSource || '',
-      CODESTORY_PLUGIN_CLI_REPO_REF: resolved.repoRef || '',
-      CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256: resolved.archiveSha256 || '',
-      CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
-      CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
-      CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
-      CODESTORY_PLUGIN_PROJECT_ROOT: projectRoot,
-      CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE: projectResolution.source,
-      CODESTORY_PLUGIN_ACTIVE_STATE_PATH: projectResolution.statePath || activeStatePath() || '',
-      CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
-      CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
-      CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
-      CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
-      CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-      CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, projectRoot),
-      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
-      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
-      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
-      CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
-      CODESTORY_PLUGIN_DIRTY_MARKER_PATH: dirtyMarker.path,
-      CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT: dirtyMarker.projectRoot,
-    },
-  });
+  const child = spawnStdioRuntime(
+    resolved,
+    projectRoot,
+    projectResolution.source,
+    runtimeCwd,
+    'inherit',
+    projectResolution.statePath || null,
+  );
 
   child.on('exit', (code, signal) => {
     if (signal) process.kill(process.pid, signal);
