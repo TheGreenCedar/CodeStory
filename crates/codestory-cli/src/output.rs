@@ -192,6 +192,20 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
             }
         }
     }
+    if let Some(broker) = output.readiness_broker.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "readiness_broker: project_id={} persistence={} operations={} gpu_proof={}",
+            broker.project_id,
+            broker.persistence_status,
+            broker.operations.len(),
+            broker
+                .gpu_proof
+                .as_ref()
+                .map(|proof| proof.proof_status.as_str())
+                .unwrap_or("unknown")
+        );
+    }
     markdown
 }
 

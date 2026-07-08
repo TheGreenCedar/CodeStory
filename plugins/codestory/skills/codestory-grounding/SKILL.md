@@ -76,8 +76,8 @@ surfaces were not visible.
 Supported agent repair is MCP-only:
 
 1. Read `codestory://status`.
-2. If `status_resource_auto_repair.result.status` is `started` or
-   `already_running`, wait briefly and reread `codestory://status`.
+2. Inspect `readiness_broker` and `sidecar_setup`; status reads report state
+   but do not start repairs.
 3. If `recommended_next_calls` says so and the `mcp__codestory__repair_all`
    tool is visible, call MCP `repair_all` for
    `<target-workspace>`.
@@ -85,9 +85,9 @@ Supported agent repair is MCP-only:
 5. Use only the surfaces allowed by the refreshed status.
 
 If Codex exposes CodeStory resources but hides server-specific tools, keep using
-the read-only resource path. If status did not start auto-repair and tool
-actions such as `repair_all` are hidden, report the host tool-visibility
-blocker. Do not synthesize repair context or run CLI repair in the agent path.
+the read-only resource path. If tool actions such as `repair_all` are hidden,
+report the host tool-visibility blocker. Do not synthesize repair context or
+run CLI repair in the agent path.
 
 CLI commands such as `fix`, `doctor`, `ready`, and `retrieval status` are
 maintainer/debug transcript tools. They do not prove plugin MCP is live in the

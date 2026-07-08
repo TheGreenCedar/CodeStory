@@ -53,6 +53,14 @@ pub(crate) struct ReadyRepairBusy {
     pub(crate) lock_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ReadyRepairCleanup {
+    pub(crate) status: ReadyRepairStatus,
+    pub(crate) status_path: PathBuf,
+    pub(crate) removed_status_path: bool,
+    pub(crate) removed_lock_paths: Vec<PathBuf>,
+}
+
 #[derive(Debug)]
 pub(crate) enum ReadyRepairLockAttempt {
     Acquired(ReadyRepairLock),
@@ -237,6 +245,34 @@ pub(crate) fn abandoned_ready_repair_status(
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
+pub(crate) fn cleanup_abandoned_ready_repair_status(
+    project_root: &Path,
+    run_id: Option<&str>,
+) -> Vec<ReadyRepairCleanup> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths(project_root, run_id)
+        .into_iter()
+        .filter_map(|path| {
+            let status = read_abandoned_ready_repair_status(&path, project_root, now)?;
+            let removed_status_path = fs::remove_file(&path).is_ok();
+            let mut removed_lock_paths = Vec::new();
+            for lock_path in ready_repair_lock_paths_for_status(project_root, &status) {
+                if ready_repair_lock_file_is_stale(&lock_path)
+                    && fs::remove_file(&lock_path).is_ok()
+                {
+                    removed_lock_paths.push(lock_path);
+                }
+            }
+            Some(ReadyRepairCleanup {
+                status,
+                status_path: path,
+                removed_status_path,
+                removed_lock_paths,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> String {
     ready_repair_status_paths(project_root, None)
         .into_iter()
@@ -287,7 +323,7 @@ fn ready_repair_status_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
 fn ready_repair_lock_file_is_stale(path: &Path) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_ready_repair_lock_file(path) {
-        if !ready_repair_pid_is_running(lock.pid) {
+        if !process_is_running(lock.pid) {
             return true;
         }
         return now.saturating_sub(lock.started_at_epoch_ms)
@@ -321,7 +357,7 @@ fn read_ready_repair_status(
     if age_ms > READY_REPAIR_STATUS_TTL.as_millis() as i64 {
         return None;
     }
-    if !ready_repair_pid_is_running(status.pid) {
+    if !process_is_running(status.pid) {
         return None;
     }
     Some(status)
@@ -341,7 +377,7 @@ fn read_abandoned_ready_repair_status(
         return None;
     }
     let age_ms = now_epoch_ms.saturating_sub(status.updated_at_epoch_ms);
-    if !ready_repair_pid_is_running(status.pid) {
+    if !process_is_running(status.pid) {
         return Some(status);
     }
     if age_ms <= READY_REPAIR_STATUS_TTL.as_millis() as i64
@@ -352,7 +388,7 @@ fn read_abandoned_ready_repair_status(
     Some(status)
 }
 
-fn ready_repair_pid_is_running(pid: u32) -> bool {
+pub(crate) fn process_is_running(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
@@ -394,6 +430,19 @@ fn ready_repair_pid_is_running(pid: u32) -> bool {
     {
         true
     }
+}
+
+fn ready_repair_lock_paths_for_status(
+    project_root: &Path,
+    status: &ReadyRepairStatus,
+) -> Vec<PathBuf> {
+    let run_id = status.run_id.as_deref().unwrap_or(DEFAULT_AGENT_RUN_ID);
+    let sidecar =
+        sidecar_runtime_for_project_with_run_id(project_root, SidecarProfile::Agent, Some(run_id));
+    vec![
+        ready_repair_lock_path(&sidecar),
+        project_ready_repair_lock_path(&sidecar),
+    ]
 }
 
 fn read_ready_repair_lock_file(path: &Path) -> Option<ReadyRepairLockFile> {

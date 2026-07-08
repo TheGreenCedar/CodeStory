@@ -136,10 +136,10 @@ More pairs, anti-patterns, and language-flavored examples:
 | Symptom | What to try |
 | --- | --- |
 | No `codestory://status` resource is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
-| `codestory://status` is visible but `mcp__codestory` tools are hidden | Use the live resource path. If `status_resource_auto_repair` starts, reread status until repair finishes; otherwise report that tool actions are blocked by host visibility |
+| `codestory://status` is visible but `mcp__codestory` tools are hidden | Use the live resource path and inspect `readiness_broker`; report that tool actions are blocked by host visibility |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
 | Terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex plugin add codestory@TheGreenCedar` |
-| Packet/search blocked | Reread `codestory://status` after any `status_resource_auto_repair`; if tools are visible, follow `recommended_next_calls`; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
+| Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Status/grounding read times out | Restart stale CodeStory MCP processes, then read `codestory://status` in a fresh thread |
 
 Shared repair lanes: [Troubleshooting](troubleshooting.md).

@@ -202,7 +202,7 @@ Symptoms: skill or rule loads but no `codestory://status` or `mcp__codestory` to
 
 | Host | Check |
 | --- | --- |
-| Codex | Read `codestory://status` through live MCP resources. If `status_resource_auto_repair` starts, reread status until the repair finishes. If resources are visible but `mcp__codestory` tools are hidden and status did not start repair, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
+| Codex | Read `codestory://status` through live MCP resources. Inspect `readiness_broker` and follow `recommended_next_calls`; status reads do not start repair. If resources are visible but `mcp__codestory` tools are hidden, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
 | Cursor | MCP config path to `plugins/codestory/scripts/codestory-mcp.cjs`; reload server |
 | Claude Code | MCP configured separately; hooks alone do not expose tools |
 | Copilot | MCP not auto-started; configure manually or use CLI |

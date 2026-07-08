@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::api::IndexMode;
 use std::time::Duration;
 
@@ -44,6 +44,37 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
+    let broker_scope = crate::readiness_broker::operation_scope(
+        &runtime.project_root,
+        sidecar.profile.as_str(),
+        sidecar.run_id.as_deref(),
+        "retrieval_bootstrap",
+        env!("CARGO_PKG_VERSION"),
+    );
+    let _embedding_resource_lock =
+        match crate::readiness_broker::acquire_machine_resource_lock_with_wait(
+            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
+            &broker_scope,
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+        )? {
+            crate::readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            crate::readiness_broker::BrokerMachineResourceLockAttempt::Busy(busy) => {
+                bail!(
+                    "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}",
+                    busy.snapshot.resource,
+                    busy.snapshot
+                        .owner_project_id
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    busy.snapshot
+                        .owner_workspace_root
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    busy.snapshot.owner_pid
+                );
+            }
+        };
     let report = bootstrap_sidecars_with_runtime(
         &sidecar,
         Some(&runtime.project_root),
@@ -63,14 +94,25 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
     let status = strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
-        sidecar,
+        sidecar.clone(),
     )
     .context("retrieval status after bootstrap")?;
+    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_status(&status)),
+            reconciliation: None,
+        },
+    );
     emit_retrieval_bootstrap(
         cmd.format,
         &report,
         project_qdrant_repair.as_ref(),
         &status,
+        &readiness_broker,
         cmd.output_file.as_deref(),
     )
 }
@@ -97,6 +139,27 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     sidecar_down_for_runtime(&sidecar).context("retrieval down")?;
     println!("retrieval sidecar state cleared");
     Ok(())
+}
+
+fn broker_gpu_proof_input_from_status(
+    status: &RetrievalStatusReport,
+) -> crate::readiness_broker::BrokerGpuProofInput {
+    crate::readiness_broker::BrokerGpuProofInput {
+        embedding_device_policy: Some(status.embedding_device_policy.clone()),
+        embedding_device_state: Some(status.embedding_device_state.clone()),
+        embedding_device_observation_source: Some(
+            status.embedding_device_observation_source.clone(),
+        ),
+        embedding_detected_provider: status.embedding_detected_provider.clone(),
+        embedding_detected_gpu: status.embedding_detected_gpu.clone(),
+        embedding_accelerator_requested: Some(status.embedding_accelerator_requested),
+        embedding_accelerator_request_provider: status
+            .embedding_accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: status.embedding_accelerator_request_device.clone(),
+        embedding_cpu_allowed: Some(status.embedding_cpu_allowed),
+        degraded_reason: status.degraded_reason.clone(),
+    }
 }
 
 pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
@@ -418,6 +481,7 @@ struct RetrievalBootstrapOutput<'a> {
     project_qdrant_repair: Option<&'a ProjectQdrantRepairOutcome>,
     sidecar_state: &'a codestory_retrieval::SidecarStateFile,
     project_status: &'a RetrievalStatusReport,
+    readiness_broker: &'a crate::readiness_broker::ReadinessBrokerSnapshot,
 }
 
 fn emit_retrieval_bootstrap(
@@ -425,6 +489,7 @@ fn emit_retrieval_bootstrap(
     report: &codestory_retrieval::BootstrapReport,
     project_qdrant_repair: Option<&ProjectQdrantRepairOutcome>,
     status: &RetrievalStatusReport,
+    readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let compose_path = report
@@ -444,6 +509,7 @@ fn emit_retrieval_bootstrap(
         project_qdrant_repair,
         sidecar_state: &report.state,
         project_status: status,
+        readiness_broker,
     };
     let repair = &report.storage_repair;
     let overflow_note = if repair.overflow_protected {

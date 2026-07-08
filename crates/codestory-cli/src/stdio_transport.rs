@@ -2989,12 +2989,9 @@ fn read_stdio_status_resource(
             manifest_input_hash: selected_agent_sidecar.manifest_input_hash.as_deref(),
         }),
     });
-    let mut sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
+    let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let status_resource_auto_repair =
         stdio_status_resource_auto_repair(runtime, &readiness, &sidecar_setup);
-    if status_resource_auto_repair.is_some() {
-        sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
-    }
     let allowed_surfaces = stdio_allowed_surfaces(&readiness);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(
         runtime,
@@ -3022,12 +3019,25 @@ fn read_stdio_status_resource(
     }
     let local_refresh_json =
         serde_json::to_value(&local_refresh_status).expect("serialize local refresh");
+    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: selected_agent_sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(stdio_broker_gpu_proof_input(&selected_agent_sidecar)),
+            reconciliation: None,
+        },
+    );
+    let readiness_broker_json =
+        serde_json::to_value(&readiness_broker).expect("serialize readiness broker");
     let runtime_truth = stdio_runtime_truth_status(
         &plugin_runtime,
         &sidecar_setup,
         &readiness_lanes_json,
         local,
         &local_refresh_json,
+        &readiness_broker_json,
     );
     Ok(serde_json::json!({
         "server_version": env!("CARGO_PKG_VERSION"),
@@ -3073,6 +3083,7 @@ fn read_stdio_status_resource(
         "local_refresh": local_refresh_json,
         "readiness": readiness,
         "readiness_lanes": readiness_lanes_json,
+        "readiness_broker": readiness_broker_json,
         "allowed_surfaces": allowed_surfaces,
         "status_resource_auto_repair": status_resource_auto_repair,
         "recommended_next_calls": recommended_next_calls
@@ -3080,39 +3091,32 @@ fn read_stdio_status_resource(
 }
 
 fn stdio_status_resource_auto_repair(
-    runtime: &RuntimeContext,
-    readiness: &[ReadinessVerdictDto],
-    sidecar_setup: &serde_json::Value,
+    _runtime: &RuntimeContext,
+    _readiness: &[ReadinessVerdictDto],
+    _sidecar_setup: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    if !stdio_status_auto_repair_enabled() {
-        return None;
+    None
+}
+
+fn stdio_broker_gpu_proof_input(
+    sidecar: &args::DoctorSidecarStatusOutput,
+) -> crate::readiness_broker::BrokerGpuProofInput {
+    crate::readiness_broker::BrokerGpuProofInput {
+        embedding_device_policy: Some(sidecar.embedding_device_policy.clone()),
+        embedding_device_state: Some(sidecar.embedding_device_state.clone()),
+        embedding_device_observation_source: Some(
+            sidecar.embedding_device_observation_source.clone(),
+        ),
+        embedding_detected_provider: sidecar.embedding_detected_provider.clone(),
+        embedding_detected_gpu: sidecar.embedding_detected_gpu.clone(),
+        embedding_accelerator_requested: Some(sidecar.embedding_accelerator_requested),
+        embedding_accelerator_request_provider: sidecar
+            .embedding_accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: sidecar.embedding_accelerator_request_device.clone(),
+        embedding_cpu_allowed: Some(sidecar.embedding_cpu_allowed),
+        degraded_reason: sidecar.degraded_reason.clone(),
     }
-    if sidecar_setup
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        != Some("enabled")
-    {
-        return None;
-    }
-    if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
-        return None;
-    }
-    let non_ready = crate::readiness::primary_non_ready(readiness)?;
-    if non_ready.goal != ReadinessGoalDto::AgentPacketSearch {
-        return None;
-    }
-    if non_ready
-        .minimum_next
-        .iter()
-        .chain(non_ready.full_repair.iter())
-        .any(|command| command.starts_with("Restart/reload the Codex host/app"))
-    {
-        return None;
-    }
-    Some(handle_stdio_sidecar_repair(
-        runtime,
-        StdioSidecarRepairMode::Background,
-    ))
 }
 
 fn stdio_status_auto_repair_result_in_progress(value: Option<&serde_json::Value>) -> bool {
@@ -3124,22 +3128,13 @@ fn stdio_status_auto_repair_result_in_progress(value: Option<&serde_json::Value>
     )
 }
 
-fn stdio_status_auto_repair_enabled() -> bool {
-    match env_nonempty("CODESTORY_STDIO_AUTO_REPAIR_ON_STATUS") {
-        Some(value) => !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        None => true,
-    }
-}
-
 fn stdio_runtime_truth_status(
     plugin_runtime: &serde_json::Value,
     sidecar_setup: &serde_json::Value,
     readiness_lanes: &serde_json::Value,
     local: &ReadinessVerdictDto,
     local_refresh: &serde_json::Value,
+    readiness_broker: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime_source": plugin_runtime
@@ -3205,6 +3200,28 @@ fn stdio_runtime_truth_status(
                 .pointer("/agent_packet_search")
                 .map(stdio_runtime_truth_sidecar_lane)
                 .unwrap_or(serde_json::Value::Null),
+        },
+        "readiness_broker": {
+            "project_id": readiness_broker
+                .get("project_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "persistence_status": readiness_broker
+                .get("persistence_status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "reconciliation": readiness_broker
+                .get("reconciliation")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "gpu_proof": readiness_broker
+                .get("gpu_proof")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "resources": readiness_broker
+                .get("resources")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
         }
     })
 }
@@ -3516,7 +3533,7 @@ fn stdio_status_recommended_next_calls(
                     return serde_json::json!([
                         {
                             "method": "host/instruction",
-                            "instruction": "Automatic sidecar setup is disabled for this plugin install."
+                            "instruction": "Sidecar setup repair is disabled for this plugin install."
                         },
                         {
                             "method": "tools/call",
@@ -3725,7 +3742,7 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         None => "unmanaged",
     };
     let prompt_required = matches!(state, "ask");
-    let auto_repair = matches!(state, "enabled");
+    let explicit_repair_enabled = matches!(state, "enabled");
     let project = crate::display::clean_path_string(&project_root.to_string_lossy());
     let default_repair = format!(
         "codestory-cli ready --goal agent --repair --project \"{project}\" --format json --run-id {}",
@@ -3741,9 +3758,12 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         .flatten();
     serde_json::json!({
         "state": state,
-        "auto_repair": auto_repair,
+        "auto_repair": false,
+        "status_triggered_repair": false,
+        "explicit_repair_enabled": explicit_repair_enabled,
+        "repair_mode": if explicit_repair_enabled { "explicit_mcp" } else { "policy_gated" },
         "prompt_required": prompt_required,
-        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. Enable automatic sidecar setup for this plugin install?") } else { None },
+        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. Enable MCP sidecar repair for this plugin install?") } else { None },
         "mcp_control": {
             "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
             "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
@@ -3959,10 +3979,19 @@ fn handle_stdio_sidecar_repair(
             }
         });
     }
-    let previous_abandoned_repair =
-        crate::ready_repair_status::abandoned_ready_repair_status(&runtime.project_root, None).map(
-            |status| stdio_ready_repair_status_json(&runtime.project_root, &status, "abandoned"),
-        );
+    let broker_reconciliation = crate::readiness_broker::reconcile_before_enqueue(
+        &runtime.project_root,
+        &runtime.cache_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let previous_abandoned_repair = broker_reconciliation
+        .abandoned_repairs
+        .first()
+        .cloned()
+        .map(|operation| serde_json::to_value(operation).expect("serialize broker operation"));
+    let broker_reconciliation_json =
+        serde_json::to_value(&broker_reconciliation).expect("serialize broker reconciliation");
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
@@ -3993,6 +4022,7 @@ fn handle_stdio_sidecar_repair(
                             "mode": "background",
                             "pid": child.id(),
                             "previous_abandoned_repair": previous_abandoned_repair,
+                            "broker_reconciliation": broker_reconciliation_json,
                             "next_status_command": format!(
                                 "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
                                 crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
@@ -4065,6 +4095,7 @@ fn handle_stdio_sidecar_repair(
                     "ready": parsed_ready,
                     "ready_json_found": ready_json_found,
                     "previous_abandoned_repair": previous_abandoned_repair,
+                    "broker_reconciliation": broker_reconciliation_json,
                     "stdout_tail": stdout_tail,
                     "stderr_tail": stderr_tail,
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)

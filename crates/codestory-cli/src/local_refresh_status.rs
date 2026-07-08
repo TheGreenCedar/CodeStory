@@ -41,6 +41,18 @@ pub(crate) struct LocalRefreshBusy {
     pub(crate) started_at_epoch_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct LocalRefreshCleanup {
+    pub(crate) status: Option<LocalRefreshStatus>,
+    pub(crate) status_path: PathBuf,
+    pub(crate) lock_path: PathBuf,
+    pub(crate) lock_pid: Option<u32>,
+    pub(crate) lock_started_at_epoch_ms: Option<i64>,
+    pub(crate) removed_status_path: bool,
+    pub(crate) removed_lock_path: bool,
+    pub(crate) reason: String,
+}
+
 #[derive(Debug)]
 pub(crate) enum LocalRefreshLockAttempt {
     Acquired(LocalRefreshLock),
@@ -191,6 +203,54 @@ pub(crate) fn active_local_refresh_status(
     read_local_refresh_status(&local_refresh_status_path(cache_root), project_root, now)
 }
 
+pub(crate) fn cleanup_stale_local_refresh_state(
+    cache_root: &Path,
+    project_root: &Path,
+) -> Option<LocalRefreshCleanup> {
+    let status_path = local_refresh_status_path(cache_root);
+    let lock_path = local_refresh_lock_path(cache_root);
+    let now = now_epoch_ms();
+    let status = read_local_refresh_status_file(&status_path).filter(|status| {
+        status.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
+            && status.status == "refreshing"
+            && same_path_text(Path::new(&status.project_root), project_root)
+    });
+    let lock = read_local_refresh_lock_file(&lock_path).filter(|lock| {
+        lock.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
+            && same_path_text(Path::new(&lock.project_root), project_root)
+    });
+    let status_stale = status.as_ref().is_some_and(|status| {
+        !crate::ready_repair_status::process_is_running(status.pid)
+            || now.saturating_sub(status.updated_at_epoch_ms)
+                > LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64
+    });
+    let lock_stale = lock
+        .as_ref()
+        .is_some_and(|_| local_refresh_lock_file_is_stale(&lock_path));
+    if !status_stale && !lock_stale {
+        return None;
+    }
+
+    let reason = match (status_stale, lock_stale) {
+        (true, true) => "stale_status_and_lock",
+        (true, false) => "stale_status",
+        (false, true) => "stale_lock",
+        (false, false) => "clean",
+    };
+    let removed_status_path = status.is_some() && fs::remove_file(&status_path).is_ok();
+    let removed_lock_path = lock.is_some() && fs::remove_file(&lock_path).is_ok();
+    Some(LocalRefreshCleanup {
+        status,
+        status_path,
+        lock_path,
+        lock_pid: lock.as_ref().map(|lock| lock.pid),
+        lock_started_at_epoch_ms: lock.as_ref().map(|lock| lock.started_at_epoch_ms),
+        removed_status_path,
+        removed_lock_path,
+        reason: reason.to_string(),
+    })
+}
+
 pub(crate) fn local_refresh_status_cache_fingerprint(cache_root: &Path) -> String {
     [
         local_refresh_status_path(cache_root),
@@ -220,6 +280,9 @@ fn local_refresh_lock_path(cache_root: &Path) -> PathBuf {
 fn local_refresh_lock_file_is_stale(path: &Path) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_local_refresh_lock_file(path) {
+        if !crate::ready_repair_status::process_is_running(lock.pid) {
+            return true;
+        }
         return now.saturating_sub(lock.started_at_epoch_ms)
             > LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64;
     }
@@ -429,5 +492,47 @@ mod tests {
                 )
             }
         }
+    }
+
+    #[test]
+    fn cleanup_stale_local_refresh_state_removes_dead_heartbeat_and_lock() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let old_started = now_epoch_ms() - LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64 - 1_000;
+        fs::write(
+            local_refresh_lock_path(cache.path()),
+            serde_json::to_string(&LocalRefreshLockFile {
+                schema_version: LOCAL_REFRESH_STATUS_SCHEMA_VERSION,
+                project_root: clean_path_text(project.path()),
+                pid: std::process::id(),
+                started_at_epoch_ms: old_started,
+                token: "stale".to_string(),
+            })
+            .expect("lock json"),
+        )
+        .expect("write stale lock");
+        fs::write(
+            local_refresh_status_path(cache.path()),
+            serde_json::to_string(&LocalRefreshStatus {
+                schema_version: LOCAL_REFRESH_STATUS_SCHEMA_VERSION,
+                status: "refreshing".to_string(),
+                project_root: clean_path_text(project.path()),
+                phase: "incremental_index".to_string(),
+                pid: std::process::id(),
+                started_at_epoch_ms: old_started,
+                updated_at_epoch_ms: old_started,
+                last_failure_reason: None,
+            })
+            .expect("status json"),
+        )
+        .expect("write stale status");
+
+        let cleanup = cleanup_stale_local_refresh_state(cache.path(), project.path())
+            .expect("stale local refresh cleanup");
+        assert_eq!(cleanup.reason, "stale_status_and_lock");
+        assert!(cleanup.removed_status_path);
+        assert!(cleanup.removed_lock_path);
+        assert!(!local_refresh_status_path(cache.path()).exists());
+        assert!(!local_refresh_lock_path(cache.path()).exists());
     }
 }

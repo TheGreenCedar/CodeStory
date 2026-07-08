@@ -335,6 +335,22 @@ impl SidecarRuntimeConfig {
         labels.insert("dev.codestory.owner".into(), "codestory".into());
         labels.insert("dev.codestory.profile".into(), profile.as_str().into());
         labels.insert("dev.codestory.namespace".into(), namespace.clone());
+        if let Some(project_root) = project_root {
+            let hash = project_hash(project_root);
+            labels.insert("dev.codestory.project_hash".into(), hash.clone());
+            labels.insert(
+                "dev.codestory.project_id".into(),
+                format!("codestory-{hash}"),
+            );
+            labels.insert(
+                "dev.codestory.workspace_root".into(),
+                project_root.to_string_lossy().to_string(),
+            );
+        }
+        if let Some(run_id) = run_id.as_deref() {
+            labels.insert("dev.codestory.run_id".into(), run_id.to_string());
+            labels.insert("dev.codestory.agent_id".into(), run_id.to_string());
+        }
         Self {
             layout,
             profile,

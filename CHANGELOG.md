@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- Prevented the installed MCP launcher from binding to another workspace's
+  global active-state file when the host has a current Codex thread but no
+  matching thread-scoped active-state file yet.
+- Added a durable readiness broker for CLI/MCP repair state, with
+  cross-process snapshots, orphan repair reconciliation, machine-scoped native
+  embedding locking, GPU proof reporting, and explicit-only MCP repair from
+  status reads.
+
 ## 0.13.12
 
 CodeStory 0.13.12 fixes the installed plugin MCP recovery path so Codex can

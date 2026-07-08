@@ -1599,6 +1599,8 @@ pub(crate) struct ReadyOutput {
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) readiness_broker: Option<crate::readiness_broker::ReadinessBrokerSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
