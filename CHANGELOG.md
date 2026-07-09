@@ -51,10 +51,11 @@ the installed runtime is stale, busy, or unavailable.
 - Kept native llama.cpp sidecars alive and accurately owned across Windows,
   macOS, Linux, endpoint reuse, `retrieval up`, `retrieval down`, failed repair,
   host job-object restrictions, and Unix shutdown.
-- Fixed Apple Silicon Metal repair so managed llama.cpp installs accept the
-  upstream macOS payload, existing cached models are discovered, and Metal logs
-  can prove accelerator-required packet/search readiness without manual device
-  assertions.
+- Fixed Apple Silicon Metal source contracts so managed llama.cpp installs
+  accept the upstream macOS payload, existing cached models are discovered, and
+  Metal logs can prove accelerator-required packet/search readiness without
+  manual device assertions; live post-repair endpoint survival still needs
+  macOS arm64 validation before release-level hardware proof.
 - Made diagnostic fail-open mode reject fake repairs, keep only safe status and
   setup surfaces callable, and mark old repair history stale when it points at
   an old CLI version or path.

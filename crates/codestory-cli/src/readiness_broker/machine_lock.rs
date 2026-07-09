@@ -183,8 +183,10 @@ pub(crate) fn transfer_machine_resource_lock_to_native_launch(
     file_lock.pid = pid;
     file_lock.started_at_epoch_ms = launch.spawned_at_epoch_ms.unwrap_or_else(now_epoch_ms);
     file_lock.native_embedding_launch = Some(launch.clone());
-    fs::write(&lock.path, serde_json::to_vec_pretty(&file_lock)?)?;
+    // Disable drop cleanup before publishing the native PID so a successful
+    // handoff cannot be removed by this process on the way out.
     lock.release_on_drop = false;
+    fs::write(&lock.path, serde_json::to_vec_pretty(&file_lock)?)?;
     Ok(true)
 }
 

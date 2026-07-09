@@ -321,14 +321,10 @@ fn ready_repair_status_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
 }
 
 fn ready_repair_lock_file_is_stale(path: &Path) -> bool {
-    let now = now_epoch_ms();
     if let Some(lock) = read_ready_repair_lock_file(path) {
-        if !process_is_running(lock.pid) {
-            return true;
-        }
-        return now.saturating_sub(lock.started_at_epoch_ms)
-            > READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64;
+        return !process_is_running(lock.pid);
     }
+    let now = now_epoch_ms();
     fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok())
@@ -624,6 +620,39 @@ mod tests {
                     "lock should be reusable after drop, got busy at {:?}",
                     busy.lock_path
                 )
+            }
+        }
+    }
+
+    #[test]
+    fn live_pid_repair_lock_does_not_age_out() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_lock_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("repair lock parent")).expect("state dir");
+        let now = now_epoch_ms();
+        let pid = std::process::id();
+        let lock = ReadyRepairLockFile {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("test-proof".to_string()),
+            namespace: "codestory-agent-test-proof".to_string(),
+            pid,
+            started_at_epoch_ms: now - READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64 - 1,
+            token: format!("{pid}:{now}"),
+        };
+        fs::write(&path, serde_json::to_string(&lock).expect("lock json"))
+            .expect("write live-pid lock");
+
+        match try_acquire_ready_repair_lock(&sidecar, project.path()).expect("lock attempt") {
+            ReadyRepairLockAttempt::Busy(busy) => {
+                assert!(busy.status.is_none());
+                assert_eq!(busy.lock_path, path);
+            }
+            ReadyRepairLockAttempt::Acquired(_) => {
+                panic!("live-pid repair lock must remain busy regardless of age")
             }
         }
     }
