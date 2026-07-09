@@ -234,7 +234,9 @@ install. Confirm with a fresh `codestory://status` read.
 
 ### Codex marketplace refresh vs runtime reload
 
-For Codex, marketplace refresh, package refresh, and runtime reload are separate:
+For Codex, marketplace refresh, package refresh, and runtime reload are separate.
+These are Windows terminal commands; in Unix shells, use `codex` instead of
+`codex.cmd`:
 
 ```powershell
 codex.cmd plugin marketplace upgrade TheGreenCedar
@@ -251,8 +253,8 @@ On Windows, older running CodeStory MCP processes can make
 backing up the plugin cache. Current MCP adapters move their long-lived working
 directory out of the plugin cache, but stale hosts from older packages can still
 hold files open. Quit stale Codex windows, start a fresh host session, and retry
-the `/plugins` refresh or terminal install. After refresh, confirm the active
-runtime through `codestory://status`, not only `codex.cmd plugin list`.
+the `/plugins` refresh or Windows terminal install. After refresh, confirm the
+active runtime through `codestory://status`, not only `codex.cmd plugin list`.
 
 ## Still stuck?
 

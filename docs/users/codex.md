@@ -28,7 +28,8 @@ Search or browse for **codestory** under the **TheGreenCedar** marketplace
 entry, then choose **Install**. Refresh or uninstall from the same `/plugins`
 screen.
 
-Optional on Windows, if your Codex build supports terminal marketplace management:
+Optional Windows terminal command, if your Codex build supports terminal
+marketplace management:
 
 ```powershell
 codex.cmd plugin marketplace add TheGreenCedar/AgentPluginMarketplace --ref main
@@ -42,10 +43,12 @@ at `plugins/codestory`.
 
 There are three separate steps:
 
-1. `codex.cmd plugin marketplace upgrade TheGreenCedar` refreshes the marketplace
-   snapshot only.
-2. `/plugins` refresh or `codex.cmd plugin add codestory@TheGreenCedar` updates
-   the installed plugin package.
+1. On Windows, `codex.cmd plugin marketplace upgrade TheGreenCedar` refreshes
+   the marketplace snapshot only. In Unix shells, use `codex` instead of
+   `codex.cmd`.
+2. `/plugins` refresh or, on Windows,
+   `codex.cmd plugin add codestory@TheGreenCedar` updates the installed plugin
+   package.
 3. A fresh Codex host session starts the new MCP adapter and lets it provision
    the matching managed CLI.
 
@@ -138,7 +141,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | No `codestory://status` resource is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
 | `codestory://status` is visible but `mcp__codestory` tools are hidden | Ground from resources only (`codestory://status`, `codestory://agent-guide`). Do not loop on `recommended_next_calls` entries that use `method: "tools/call"` until host tool visibility is fixed; report the host blocker |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
-| Terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
+| Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Status/grounding read times out | Restart stale CodeStory MCP processes, then read `codestory://status` in a fresh thread |
 
