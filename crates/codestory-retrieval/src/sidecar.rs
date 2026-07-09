@@ -22,8 +22,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+#[cfg(not(windows))]
+use std::time::{Duration, Instant};
 
 const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+#[cfg(not(windows))]
+const NATIVE_EMBEDDING_STOP_WAIT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
+const NATIVE_EMBEDDING_STOP_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeEmbeddingLaunchIdentityStatus {
@@ -306,11 +312,49 @@ fn stop_native_embedding_process(pid: u32, launch: &EmbeddingLaunchMetadata) -> 
             .arg(pid.to_string())
             .status()
             .with_context(|| format!("run kill for native embedding pid {pid}"))?;
-        if !status.success() && native_embedding_process_snapshot(pid)?.is_some() {
-            bail!("failed to stop native embedding pid {pid}: kill exited with {status}");
+        if !status.success() {
+            if native_embedding_process_snapshot(pid)?.is_some() {
+                bail!("failed to stop native embedding pid {pid}: kill exited with {status}");
+            }
+            return Ok(());
         }
+        wait_for_native_embedding_process_exit(pid)?;
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn wait_for_native_embedding_process_exit(pid: u32) -> Result<()> {
+    wait_for_native_embedding_process_exit_with(
+        pid,
+        NATIVE_EMBEDDING_STOP_WAIT,
+        NATIVE_EMBEDDING_STOP_POLL,
+        || native_embedding_process_snapshot(pid).map(|snapshot| snapshot.is_some()),
+    )
+}
+
+#[cfg(not(windows))]
+fn wait_for_native_embedding_process_exit_with<F>(
+    pid: u32,
+    timeout: Duration,
+    poll: Duration,
+    mut process_running: F,
+) -> Result<()>
+where
+    F: FnMut() -> Result<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_running()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("native embedding pid {pid} did not exit after SIGTERM");
+        }
+        if !poll.is_zero() {
+            std::thread::sleep(poll);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1104,6 +1148,25 @@ mod tests {
             error.to_string().contains("current CodeStory process"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_embedding_stop_wait_retries_until_process_exits() {
+        let mut checks = 0;
+
+        wait_for_native_embedding_process_exit_with(
+            1234,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(0),
+            || {
+                checks += 1;
+                Ok(checks < 3)
+            },
+        )
+        .expect("process exits after retries");
+
+        assert_eq!(checks, 3);
     }
 
     #[test]
