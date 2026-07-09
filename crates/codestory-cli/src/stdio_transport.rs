@@ -2871,6 +2871,20 @@ fn stdio_workspace_mismatch_allowed_surfaces() -> serde_json::Value {
     ] {
         surfaces.insert(surface.to_string(), stdio_workspace_mismatch_surface());
     }
+    surfaces.insert(
+        "sidecar_setup".to_string(),
+        serde_json::json!({
+            "allowed": true,
+            "readiness_goal": "agent_packet_search",
+            "status": "workspace_mismatch",
+            "summary": "sidecar_setup status and policy actions are available; repair is blocked until the host relaunches MCP for the active workspace.",
+            "blocked_reason": "workspace_mismatch_repair_blocked",
+            "allowed_actions": ["status", "enable", "disable", "ask"],
+            "canonical_arguments": {"action": "status"},
+            "minimum_next": [],
+            "full_repair": [],
+        }),
+    );
     serde_json::Value::Object(surfaces)
 }
 

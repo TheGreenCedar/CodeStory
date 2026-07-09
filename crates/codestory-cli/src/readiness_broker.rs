@@ -538,6 +538,12 @@ pub(crate) fn cleanup_transferred_native_embedding_resource_after_error(
     lease: &Option<BrokerNativeEmbeddingResourceLease>,
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<()> {
+    if matches!(
+        lease,
+        Some(BrokerNativeEmbeddingResourceLease::Reused { .. })
+    ) {
+        return Ok(());
+    }
     let launch = native_embedding_launch_from_sidecar_state_file(sidecar)?;
     cleanup_transferred_native_embedding_resource_after_error_with_cleanup(
         lease,
@@ -1846,6 +1852,24 @@ mod tests {
             |_| panic!("reused lease must not release the shared machine lock"),
         )
         .expect("reused cleanup is a no-op");
+    }
+
+    #[test]
+    fn native_embedding_reused_post_transfer_cleanup_skips_state_read() {
+        let project = tempdir().expect("temp project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        if let Some(parent) = sidecar.layout.state_file.parent() {
+            fs::create_dir_all(parent).expect("create state parent");
+        }
+        fs::write(&sidecar.layout.state_file, b"{not-json").expect("write corrupt state");
+        let lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: 4321 });
+
+        cleanup_transferred_native_embedding_resource_after_error(&lease, &sidecar)
+            .expect("reused post-transfer cleanup should skip state reads");
     }
 
     #[test]

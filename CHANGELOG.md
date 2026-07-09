@@ -57,6 +57,8 @@
 - Kept reused native embedding leases from running sidecar teardown when final
   lease transfer validation fails, so reuse-only repairs cannot stop the shared
   owner they did not spawn.
+- Declared `sidecar_setup` as a status/config surface during workspace-mismatch
+  diagnostics so MCP status matches the tools that remain callable.
 
 ## 0.13.12
 

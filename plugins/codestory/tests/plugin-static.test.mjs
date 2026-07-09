@@ -524,6 +524,7 @@ test("stdio workspace mismatch blocks stale repo repair guidance", async () => {
   assert.match(transport, /"status" => \{[\s\S]*stdio_workspace_mismatch_sidecar_setup\(mismatch\)[\s\S]*stdio_sidecar_setup_status/u);
   assert.match(transport, /"enable" \| "disable" \| "ask"[\s\S]*stdio_workspace_mismatch_sidecar_setup\(mismatch\)[\s\S]*stdio_sidecar_setup_status/u);
   assert.match(transport, /"repair_all"[\s\S]*stdio_workspace_mismatch_surface/u);
+  assert.match(transport, /"sidecar_setup"[\s\S]*"workspace_mismatch"[\s\S]*"allowed_actions": \["status", "enable", "disable", "ask"\]/u);
   assert.match(transport, /"minimum_next": \[\]/u);
   assert.match(transport, /"full_repair": \[\]/u);
   assert.match(transport, /"repair" => \{[\s\S]*"code": "workspace_mismatch"[\s\S]*handle_stdio_sidecar_repair/u);
