@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::ready_repair_status;
 
@@ -12,9 +12,10 @@ use super::paths::{
     machine_resource_reaper_takeover_lock_path, now_epoch_ms,
 };
 use super::scope::broker_operation_id;
+use super::scope::{BROKER_SCHEMA_VERSION, LEGACY_BROKER_SCHEMA_VERSION, effective_scope_identity};
 use super::types::{BrokerResourceSnapshot, BrokerScope};
 
-pub(crate) const MACHINE_LOCK_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MACHINE_LOCK_SCHEMA_VERSION: u32 = 2;
 pub(crate) const MACHINE_LOCK_STALE_TTL: Duration = Duration::from_secs(20 * 60);
 pub(crate) const MACHINE_REAPER_LOCK_STALE_TTL: Duration = Duration::from_secs(2 * 60);
 pub(crate) const NATIVE_EMBEDDING_RESOURCE: &str = "native_embedding_runtime";
@@ -203,24 +204,18 @@ pub(crate) fn transfer_machine_resource_lock_to_native_launch_with_publisher(
 }
 
 fn publish_machine_resource_lock(path: &Path, content: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_path = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("machine-resource.lock"),
-        std::process::id(),
-        now_epoch_ms()
-    ));
-    {
-        let mut temp = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| format!("create temporary lock file {}", temp_path.display()))?;
-        temp.write_all(content)?;
-        temp.sync_all()?;
-    }
+    let temp_path = crate::file_state::atomic_json_path(
+        path,
+        &format!(
+            "{}.{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("machine-resource.lock"),
+            now_epoch_ms()
+        ),
+    );
+    crate::file_state::write_synced_new_file(&temp_path, content)
+        .with_context(|| format!("create temporary lock file {}", temp_path.display()))?;
     replace_machine_resource_lock(&temp_path, path)
         .with_context(|| format!("replace machine resource lock {}", path.display()))
 }
@@ -349,15 +344,7 @@ pub(crate) fn machine_lock_file_is_stale(path: &Path) -> bool {
     if let Some(lock) = read_machine_resource_lock_file(path) {
         return machine_lock_is_stale(&lock);
     }
-    fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|modified| {
-            let modified_ms = modified.as_millis().min(i64::MAX as u128) as i64;
-            now.saturating_sub(modified_ms) > MACHINE_LOCK_STALE_TTL.as_millis() as i64
-        })
-        .unwrap_or(true)
+    crate::file_state::file_modified_age_exceeds(path, MACHINE_LOCK_STALE_TTL, now)
 }
 
 pub(crate) fn machine_lock_is_stale(lock: &BrokerMachineResourceLockFile) -> bool {
@@ -375,10 +362,7 @@ pub(crate) fn machine_lock_is_stale(lock: &BrokerMachineResourceLockFile) -> boo
 }
 
 pub(crate) fn create_lock_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-    Ok(())
+    crate::file_state::write_synced_new_file(path, content)
 }
 
 /// Shared create-or-takeover path for reaper and reaper-takeover lock files.
@@ -461,9 +445,18 @@ pub(crate) fn read_machine_resource_lock_file(
     fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .filter(|lock: &BrokerMachineResourceLockFile| {
-            lock.schema_version == MACHINE_LOCK_SCHEMA_VERSION
-        })
+        .filter(machine_lock_has_valid_identity)
+}
+
+fn machine_lock_has_valid_identity(lock: &BrokerMachineResourceLockFile) -> bool {
+    if effective_scope_identity(&lock.scope).is_none() {
+        return false;
+    }
+    match lock.schema_version {
+        MACHINE_LOCK_SCHEMA_VERSION => lock.scope.schema_version == BROKER_SCHEMA_VERSION,
+        LEGACY_BROKER_SCHEMA_VERSION => lock.scope.schema_version == LEGACY_BROKER_SCHEMA_VERSION,
+        _ => false,
+    }
 }
 
 pub(crate) fn read_machine_resource_reaper_lock_file(
@@ -473,7 +466,10 @@ pub(crate) fn read_machine_resource_reaper_lock_file(
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .filter(|lock: &BrokerMachineResourceReaperLockFile| {
-            lock.schema_version == MACHINE_LOCK_SCHEMA_VERSION
+            matches!(
+                lock.schema_version,
+                LEGACY_BROKER_SCHEMA_VERSION | MACHINE_LOCK_SCHEMA_VERSION
+            )
         })
 }
 
@@ -486,13 +482,5 @@ pub(crate) fn machine_reaper_lock_file_is_stale(path: &Path) -> bool {
         return now.saturating_sub(lock.started_at_epoch_ms)
             > MACHINE_REAPER_LOCK_STALE_TTL.as_millis() as i64;
     }
-    fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|modified| {
-            let modified_ms = modified.as_millis().min(i64::MAX as u128) as i64;
-            now.saturating_sub(modified_ms) > MACHINE_REAPER_LOCK_STALE_TTL.as_millis() as i64
-        })
-        .unwrap_or(true)
+    crate::file_state::file_modified_age_exceeds(path, MACHINE_REAPER_LOCK_STALE_TTL, now)
 }

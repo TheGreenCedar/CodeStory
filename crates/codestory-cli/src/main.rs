@@ -49,6 +49,7 @@ mod config;
 mod display;
 mod drill_targeting;
 mod explore;
+mod file_state;
 mod http_transport;
 mod local_refresh_status;
 mod managed_embeddings;
@@ -185,7 +186,12 @@ fn with_drill_command_duration(
     status
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    run_cli().await
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -218,7 +224,7 @@ fn main() -> Result<()> {
         Command::Files(cmd) => run_files(cmd),
         Command::Affected(cmd) => run_affected(cmd),
         Command::Bookmark(cmd) => run_bookmark(cmd),
-        Command::Serve(cmd) => run_serve(cmd),
+        Command::Serve(cmd) => run_serve(cmd).await,
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::Sidecar(cmd) => run_sidecar(cmd),
@@ -2237,14 +2243,8 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes = build_readiness_lanes_for_runtime(
-        &runtime,
-        &verdicts,
-        agent_run_id,
-        Some(&readiness_sidecar),
-    );
     let readiness_broker =
-        readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+        readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
             cache_root: runtime.cache_root.clone(),
             agent_run_id: agent_run_id.map(str::to_string),
@@ -2252,6 +2252,13 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
             gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&readiness_sidecar)),
             reconciliation: None,
         });
+    let readiness_lanes = build_readiness_lanes_for_runtime(
+        &runtime,
+        &verdicts,
+        agent_run_id,
+        Some(&readiness_sidecar),
+        Some(&readiness_broker),
+    );
     if let Some(goal) = cmd.goal {
         let goal = goal.as_dto();
         verdicts.retain(|verdict| verdict.goal == goal);
@@ -2479,8 +2486,13 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes =
-        build_readiness_lanes_for_runtime(&runtime, &readiness, None, Some(&readiness_sidecar));
+    let readiness_lanes = build_readiness_lanes_for_runtime(
+        &runtime,
+        &readiness,
+        None,
+        Some(&readiness_sidecar),
+        None,
+    );
     let output = build_agent_preflight_output(
         &readiness,
         Path::new(&summary.root),
@@ -2590,6 +2602,7 @@ fn repair_ready_state(
             sidecar.run_id.as_deref(),
             env!("CARGO_PKG_VERSION"),
         );
+        let enqueue_block_reason = reconciliation.enqueue_block_reason();
         let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
             cache_root: runtime.cache_root.clone(),
@@ -2598,6 +2611,16 @@ fn repair_ready_state(
             gpu_proof: None,
             reconciliation: Some(reconciliation),
         });
+        if let Some(reason) = enqueue_block_reason {
+            bail!(
+                "ready repair cannot start while broker ownership is unresolved: {reason}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                runtime.project_root.display(),
+                sidecar
+                    .run_id
+                    .as_deref()
+                    .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            );
+        }
     }
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
@@ -10668,14 +10691,14 @@ fn render_affected_footer(
     }
 }
 
-fn run_serve(cmd: ServeCommand) -> Result<()> {
+async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if !cmd.stdio {
         ensure_http_serve_bind_allowed(&cmd.addr, cmd.allow_non_loopback)?;
     }
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
-        return stdio_transport::run_stdio_server(runtime);
+        return stdio_transport::run_stdio_server(runtime).await;
     }
     ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)
@@ -10950,8 +10973,22 @@ fn build_doctor_output(
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes =
-        build_readiness_lanes_for_runtime(runtime, &readiness, None, Some(&readiness_sidecar));
+    let readiness_broker =
+        readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: readiness_sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&readiness_sidecar)),
+            reconciliation: None,
+        });
+    let readiness_lanes = build_readiness_lanes_for_runtime(
+        runtime,
+        &readiness,
+        None,
+        Some(&readiness_sidecar),
+        Some(&readiness_broker),
+    );
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -11043,6 +11080,7 @@ fn build_doctor_output(
         freshness: summary.freshness.clone(),
         readiness,
         readiness_lanes,
+        readiness_broker: Some(readiness_broker),
         checks,
         next_commands,
         environment,
@@ -11264,6 +11302,7 @@ pub(crate) fn build_readiness_lanes_for_runtime(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     agent_run_id: Option<&str>,
     selected_agent_status: Option<&DoctorSidecarStatusOutput>,
+    broker: Option<&readiness_broker::ReadinessBrokerSnapshot>,
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
@@ -11293,13 +11332,43 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
-    apply_ready_repair_status_overlay(
-        &mut lanes,
-        &runtime.project_root,
-        agent_run_id,
-        &project_arg,
-    );
+    if let Some(broker) = broker {
+        apply_broker_ready_repair_overlay(&mut lanes, broker, &project_arg);
+    } else {
+        apply_ready_repair_status_overlay(
+            &mut lanes,
+            &runtime.project_root,
+            agent_run_id,
+            &project_arg,
+        );
+    }
     lanes
+}
+
+fn apply_broker_ready_repair_overlay(
+    lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
+    broker: &readiness_broker::ReadinessBrokerSnapshot,
+    project_arg: &str,
+) {
+    let Some(operation) = broker.operations.iter().find(|operation| {
+        operation.operation_kind == "agent_repair" && operation.status == "running"
+    }) else {
+        return;
+    };
+    let Some(lane) = lanes.get_mut("agent_packet_search") else {
+        return;
+    };
+    lane.status = ReadinessStatusDto::Repairing;
+    lane.profile = operation.profile.clone();
+    lane.run_id = operation.run_id.clone();
+    lane.namespace = operation.namespace.clone();
+    lane.compose_project = operation.compose_project.clone();
+    lane.phase = operation.phase.clone();
+    lane.repair_updated_at_epoch_ms = operation.updated_at_epoch_ms;
+    lane.next_command = Some(retrieval_status_command_for_agent(
+        project_arg,
+        operation.run_id.as_deref(),
+    ));
 }
 
 fn agent_readiness_sidecar_runtime(
@@ -13314,6 +13383,7 @@ mod tests {
         }
         let root = tempdir().expect("temp dir");
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
+            project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,

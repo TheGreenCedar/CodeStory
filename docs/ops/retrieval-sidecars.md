@@ -372,11 +372,20 @@ To refresh an image pin safely:
 
 ### Manifest and generation contract
 
-Project id is a stable FNV-1a hex hash of the canonical repo root, matching CLI
-cache hashing. Sidecar artifacts are content-addressed by:
+CodeStory 0.14 separates three identities:
+
+- `project_id` identifies the logical repository when a canonical Git remote is
+  available, otherwise it falls back to the workspace id.
+- `workspace_id` is the existing FNV-1a hash of the canonical workspace root and
+  scopes live processes, locks, ports, and local state.
+- `artifact_scope_id` uses `project_id` only when portable reuse is eligible;
+  dirty or unidentified workspaces fail closed to `workspace_id`.
+
+Existing namespace and manifest paths are not renamed during the 0.14 upgrade.
+Sidecar artifacts are content-addressed by:
 
 ```text
-sidecar_generation = <project-id>-<input-hash-prefix>
+sidecar_generation = <artifact-scope-id>-<input-hash-prefix>
 ```
 
 The input hash covers local source lexical input, generated `symbol_search_doc`

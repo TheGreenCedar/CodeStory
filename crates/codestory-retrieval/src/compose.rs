@@ -4,6 +4,7 @@ use crate::config::{
     embedding_server_launch_mode, retrieval_compose_profile, user_cache_root,
 };
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
+use crate::outbound_http::read_bytes;
 use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
     repair_qdrant_storage,
@@ -433,6 +434,19 @@ fn docker_compose_up(
         .env("CODESTORY_SIDECAR_PROFILE", runtime.profile.as_str())
         .env("CODESTORY_SIDECAR_OWNER", "codestory")
         .env("COMPOSE_PROFILES", compose_profile);
+    if let Some(identity) = runtime.project_identity.as_ref() {
+        command
+            .env("CODESTORY_PROJECT_ID", &identity.project_id)
+            .env("CODESTORY_WORKSPACE_ID", &identity.workspace_id)
+            .env("CODESTORY_ARTIFACT_SCOPE_ID", &identity.artifact_scope_id)
+            .env(
+                "CODESTORY_PROJECT_IDENTITY_SCHEMA_VERSION",
+                identity.project_identity_schema_version.to_string(),
+            );
+    }
+    if let Some(workspace_root) = runtime.labels.get("dev.codestory.workspace_root") {
+        command.env("CODESTORY_WORKSPACE_ROOT", workspace_root);
+    }
     if let Some(provider) = embedding_device.detected_provider.as_deref() {
         command.env("CODESTORY_EMBED_DEVICE_PROVIDER", provider);
     }
@@ -549,16 +563,19 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
     if !compose_file.is_file() || !docker_available() {
         return Ok(());
     }
-    let output = docker_compose_command()?
+    let mut command = docker_compose_command()?;
+    command
         .arg("compose")
         .arg("-p")
         .arg(&state.compose_project)
         .arg("-f")
         .arg(&compose_file)
         .arg("down")
-        .arg("--remove-orphans")
-        .output()
-        .context("spawn docker compose down")?;
+        .arg("--remove-orphans");
+    for (name, value) in compose_down_environment(state) {
+        command.env(name, value);
+    }
+    let output = command.output().context("spawn docker compose down")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -569,6 +586,26 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn compose_down_environment(state: &SidecarStateFile) -> Vec<(&'static str, String)> {
+    vec![
+        ("CODESTORY_SIDECAR_NAMESPACE", state.namespace.clone()),
+        (
+            "CODESTORY_QDRANT_DATA_DIR",
+            docker_bind_path(Path::new(&state.qdrant_data_dir)),
+        ),
+        (
+            "CODESTORY_ZOEKT_DATA_DIR",
+            docker_bind_path(Path::new(&state.zoekt_data_dir)),
+        ),
+        // Compose requires this variable while parsing the file. `down` does not
+        // access the model mount, so an existing owned data path is sufficient.
+        (
+            "CODESTORY_EMBED_MODEL_DIR",
+            docker_bind_path(Path::new(&state.qdrant_data_dir)),
+        ),
+    ]
 }
 
 fn docker_compose_command() -> Result<Command> {
@@ -949,15 +986,19 @@ fn download_managed_native_llama_server_archive(
     backend: &crate::config::LlamaSidecarBackend,
     archive: &Path,
 ) -> Result<()> {
-    let response = ureq::get(&backend.url)
-        .call()
-        .with_context(|| format!("download {}", backend.url))?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", backend.url))?;
-    fs::write(archive, &bytes).with_context(|| format!("write {}", archive.display()))?;
+    let response = read_bytes(
+        ureq::get(&backend.url)
+            .timeout(Duration::from_secs(120))
+            .call(),
+    )
+    .with_context(|| format!("download {}", backend.url))?;
+    if !(200..300).contains(&response.status) {
+        bail!(
+            "download managed native llama-server archive http {}",
+            response.status
+        );
+    }
+    fs::write(archive, &response.body).with_context(|| format!("write {}", archive.display()))?;
     verify_sha256(archive, &backend.sha256)
         .with_context(|| format!("verify {}", archive.display()))?;
     Ok(())
@@ -1661,6 +1702,7 @@ mod tests {
 
     fn compose_test_runtime(root: &std::path::Path) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
@@ -1678,6 +1720,48 @@ mod tests {
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: std::collections::BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn compose_down_restores_required_interpolation_environment() {
+        let root = tempdir().expect("root");
+        let qdrant_data_dir = root.path().join("qdrant");
+        let zoekt_data_dir = root.path().join("zoekt");
+        let state: SidecarStateFile = serde_json::from_value(serde_json::json!({
+            "owner": "codestory",
+            "profile": "agent",
+            "namespace": "codestory-agent-test",
+            "compose_project": "codestory-agent-test",
+            "zoekt_http_port": 16070,
+            "qdrant_http_port": 16333,
+            "qdrant_grpc_port": 16334,
+            "zoekt_data_dir": zoekt_data_dir,
+            "qdrant_data_dir": qdrant_data_dir,
+            "scip_artifacts_root": root.path().join("scip"),
+            "cleanup_command": "codestory-cli retrieval down",
+            "started_at_epoch_ms": 1
+        }))
+        .expect("state");
+
+        let environment = compose_down_environment(&state)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("CODESTORY_SIDECAR_NAMESPACE"),
+            Some(&state.namespace)
+        );
+        assert_eq!(
+            environment.get("CODESTORY_QDRANT_DATA_DIR"),
+            Some(&docker_bind_path(Path::new(&state.qdrant_data_dir)))
+        );
+        assert_eq!(
+            environment.get("CODESTORY_ZOEKT_DATA_DIR"),
+            Some(&docker_bind_path(Path::new(&state.zoekt_data_dir)))
+        );
+        assert_eq!(
+            environment.get("CODESTORY_EMBED_MODEL_DIR"),
+            Some(&docker_bind_path(Path::new(&state.qdrant_data_dir)))
+        );
     }
 
     #[test]
@@ -1814,6 +1898,8 @@ mod tests {
         assert_eq!(path, cache.path().join("retrieval-compose.yml"));
         let contents = std::fs::read_to_string(path).expect("read bundled compose");
         assert!(contents.contains("name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}"));
+        assert!(contents.contains("dev.codestory.workspace_id"));
+        assert!(contents.contains("dev.codestory.artifact_scope_id"));
         for image in [
             crate::config::QDRANT_IMAGE_PIN,
             crate::config::ZOEKT_WEBSERVER_IMAGE_PIN,

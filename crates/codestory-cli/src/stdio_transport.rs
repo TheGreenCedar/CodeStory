@@ -20,13 +20,19 @@ use codestory_contracts::api::{
 use codestory_retrieval::SidecarLayout;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::args;
 use crate::http_transport::{
@@ -64,56 +70,244 @@ const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 ///
 /// The server is local, stateful only for small packet/search caches, and keeps
 /// telemetry on stderr so stdout remains a newline-delimited JSON stream.
-pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdin = stdin.lock();
-    let mut stdout = std::io::stdout();
-    let mut state = StdioServerState::default();
-    let mut line = Vec::new();
+pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut stdin = BufReader::new(stdin);
+    let mut stdout = tokio::io::stdout();
+    let mut runtime = Some(runtime);
+    let mut state = Some(StdioServerState::default());
+    let mut queued = VecDeque::new();
+    let mut active: Option<ActiveStdioRequest> = None;
+    let mut stdin_closed = false;
+
     loop {
-        line.clear();
-        let bytes_read = (&mut stdin)
-            .take((STDIO_MAX_FRAME_BYTES + 1) as u64)
-            .read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
-            break;
-        }
-        if line.len() > STDIO_MAX_FRAME_BYTES {
-            let tail_bytes = if line.ends_with(b"\n") {
-                0
-            } else {
-                discard_stdio_frame_tail(&mut stdin)?
-            };
-            let response = stdio_frame_too_large_error(line.len() + tail_bytes);
-            write_stdio_response(&mut stdout, &response)?;
-            continue;
-        }
-        let line = match std::str::from_utf8(&line) {
-            Ok(line) => line.trim_end_matches(['\r', '\n']),
-            Err(error) => {
-                let response = stdio_jsonrpc_error(
-                    serde_json::Value::Null,
-                    -32700,
-                    format!("Parse error: {error}"),
-                );
-                write_stdio_response(&mut stdout, &response)?;
-                continue;
+        if active.is_none() {
+            match queued.pop_front() {
+                Some(StdioQueuedWork::Response(response)) => {
+                    write_stdio_response(&mut stdout, &response).await?;
+                    continue;
+                }
+                Some(StdioQueuedWork::Message(message))
+                    if message.cancelled.load(Ordering::Acquire) =>
+                {
+                    continue;
+                }
+                Some(StdioQueuedWork::Message(message)) => {
+                    let request_runtime = runtime.take().expect("stdio runtime available");
+                    let mut request_state = state.take().expect("stdio state available");
+                    let line = message.line;
+                    active = Some(ActiveStdioRequest {
+                        id_key: message.id_key,
+                        cancelled: message.cancelled,
+                        task: tokio::task::spawn_blocking(move || {
+                            let response =
+                                handle_stdio_message(&request_runtime, &mut request_state, &line);
+                            (request_runtime, request_state, response)
+                        }),
+                    });
+                    continue;
+                }
+                None if stdin_closed => break,
+                None => {}
             }
-        };
-        if line.trim().is_empty() {
+        }
+
+        if active.is_none() {
+            let Some(frame) = read_stdio_frame(&mut stdin).await? else {
+                stdin_closed = true;
+                continue;
+            };
+            queue_stdio_frame(frame, &mut queued, None);
             continue;
         }
-        if let Some(response) = handle_stdio_message(&runtime, &mut state, line) {
-            write_stdio_response(&mut stdout, &response)?;
+
+        if stdin_closed {
+            finish_active_stdio_request(
+                active.take().expect("active stdio request"),
+                &mut runtime,
+                &mut state,
+                &mut stdout,
+            )
+            .await?;
+            continue;
+        }
+
+        let active_request = active.as_mut().expect("active stdio request");
+        tokio::select! {
+            frame = read_stdio_frame(&mut stdin) => {
+                match frame? {
+                    Some(frame) => queue_stdio_frame(frame, &mut queued, Some(active_request)),
+                    None => stdin_closed = true,
+                }
+            }
+            completed = &mut active_request.task => {
+                let completed = completed.context("stdio request worker failed")?;
+                let active_request = active.take().expect("completed stdio request");
+                runtime = Some(completed.0);
+                state = Some(completed.1);
+                if !active_request.cancelled.load(Ordering::Acquire)
+                    && let Some(response) = completed.2
+                {
+                    write_stdio_response(&mut stdout, &response).await?;
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn discard_stdio_frame_tail<R: BufRead>(reader: &mut R) -> Result<usize> {
+struct ActiveStdioRequest {
+    id_key: Option<String>,
+    cancelled: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<(RuntimeContext, StdioServerState, Option<serde_json::Value>)>,
+}
+
+struct StdioQueuedMessage {
+    line: String,
+    id_key: Option<String>,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum StdioQueuedWork {
+    Message(StdioQueuedMessage),
+    Response(serde_json::Value),
+}
+
+fn queue_stdio_frame(
+    frame: StdioFrame,
+    queued: &mut VecDeque<StdioQueuedWork>,
+    active: Option<&ActiveStdioRequest>,
+) {
+    let line = match frame {
+        StdioFrame::Line(line) => match String::from_utf8(line) {
+            Ok(line) => line.trim_end_matches(['\r', '\n']).to_string(),
+            Err(error) => {
+                queued.push_back(StdioQueuedWork::Response(stdio_jsonrpc_error(
+                    serde_json::Value::Null,
+                    -32700,
+                    format!("Parse error: {error}"),
+                )));
+                return;
+            }
+        },
+        StdioFrame::TooLarge(line_bytes) => {
+            queued.push_back(StdioQueuedWork::Response(stdio_frame_too_large_error(
+                line_bytes,
+            )));
+            return;
+        }
+    };
+    if line.trim().is_empty() {
+        return;
+    }
+    if let Some(target) = stdio_cancellation_target_key(&line) {
+        if let Some(active) = active
+            && active.id_key.as_deref() == Some(target.as_str())
+        {
+            active.cancelled.store(true, Ordering::Release);
+        }
+        for work in queued.iter_mut() {
+            if let StdioQueuedWork::Message(message) = work
+                && message.id_key.as_deref() == Some(target.as_str())
+            {
+                message.cancelled.store(true, Ordering::Release);
+            }
+        }
+        return;
+    }
+    queued.push_back(StdioQueuedWork::Message(StdioQueuedMessage {
+        id_key: stdio_message_id_key(&line),
+        line,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    }));
+}
+
+fn stdio_message_id_key(line: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    serde_json::to_string(message.get("id")?).ok()
+}
+
+fn stdio_cancellation_target_key(line: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    if message.get("method")?.as_str()? != "notifications/cancelled" {
+        return None;
+    }
+    serde_json::to_string(message.pointer("/params/requestId")?).ok()
+}
+
+async fn finish_active_stdio_request<W: AsyncWrite + Unpin>(
+    active: ActiveStdioRequest,
+    runtime: &mut Option<RuntimeContext>,
+    state: &mut Option<StdioServerState>,
+    stdout: &mut W,
+) -> Result<()> {
+    let completed = active.task.await.context("stdio request worker failed")?;
+    *runtime = Some(completed.0);
+    *state = Some(completed.1);
+    if !active.cancelled.load(Ordering::Acquire)
+        && let Some(response) = completed.2
+    {
+        write_stdio_response(stdout, &response).await?;
+    }
+    Ok(())
+}
+
+enum StdioFrame {
+    Line(Vec<u8>),
+    TooLarge(usize),
+}
+
+async fn read_stdio_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<StdioFrame>> {
+    let mut line = Vec::new();
+    loop {
+        let (available_len, newline_index, at_eof) = {
+            let available = reader.fill_buf().await?;
+            (
+                available.len(),
+                available.iter().position(|byte| *byte == b'\n'),
+                available.is_empty(),
+            )
+        };
+        if at_eof {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(StdioFrame::Line(line)))
+            };
+        }
+        if let Some(index) = newline_index {
+            let bytes_to_newline = index + 1;
+            if line.len() + bytes_to_newline > STDIO_MAX_FRAME_BYTES {
+                reader.consume(bytes_to_newline);
+                return Ok(Some(StdioFrame::TooLarge(line.len() + bytes_to_newline)));
+            }
+            {
+                let available = reader.fill_buf().await?;
+                line.extend_from_slice(&available[..bytes_to_newline]);
+            }
+            reader.consume(bytes_to_newline);
+            return Ok(Some(StdioFrame::Line(line)));
+        }
+        let remaining = STDIO_MAX_FRAME_BYTES.saturating_sub(line.len());
+        if available_len > remaining {
+            reader.consume(available_len);
+            let tail_bytes = discard_stdio_frame_tail(reader).await?;
+            return Ok(Some(StdioFrame::TooLarge(
+                line.len() + available_len + tail_bytes,
+            )));
+        }
+        {
+            let available = reader.fill_buf().await?;
+            line.extend_from_slice(available);
+        }
+        reader.consume(available_len);
+    }
+}
+
+async fn discard_stdio_frame_tail<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<usize> {
     let mut discarded = 0;
     loop {
-        let available = reader.fill_buf()?;
+        let available = reader.fill_buf().await?;
         if available.is_empty() {
             return Ok(discarded);
         }
@@ -149,16 +343,20 @@ fn stdio_frame_too_large_error(line_bytes: usize) -> serde_json::Value {
     response
 }
 
-fn write_stdio_response<W: Write>(stdout: &mut W, response: &serde_json::Value) -> Result<()> {
+async fn write_stdio_response<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    response: &serde_json::Value,
+) -> Result<()> {
     let response_id = stdio_response_id_label(response);
     let serialize_started = Instant::now();
-    serde_json::to_writer(&mut *stdout, response)?;
+    let response_bytes = serde_json::to_vec(response)?;
     let serialization_ms = stdio_elapsed_ms(serialize_started);
     let newline_started = Instant::now();
-    stdout.write_all(b"\n")?;
+    stdout.write_all(&response_bytes).await?;
+    stdout.write_all(b"\n").await?;
     let newline_write_ms = stdio_elapsed_ms(newline_started);
     let flush_started = Instant::now();
-    stdout.flush()?;
+    stdout.flush().await?;
     let flush_ms = stdio_elapsed_ms(flush_started);
     report_stdio_server_phase(&response_id, "response_serialization", serialization_ms);
     report_stdio_server_phase(&response_id, "newline_write", newline_write_ms);
@@ -3000,14 +3198,15 @@ fn read_stdio_status_resource(
         stdio_server_executable_status();
     let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
     let plugin_runtime = stdio_plugin_runtime_status();
+    let broker = build_stdio_status_broker(runtime, &sidecar.selected_agent_sidecar);
     let readiness = build_stdio_status_readiness(
         runtime,
         &summary,
         local_refresh,
         server_executable.as_deref(),
         &sidecar,
+        &broker.readiness_broker,
     );
-    let broker = build_stdio_status_broker(runtime, &sidecar.selected_agent_sidecar);
     let surfaces = build_stdio_status_surfaces(
         runtime,
         &readiness,
@@ -3197,6 +3396,7 @@ fn build_stdio_status_readiness(
     local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     server_executable: Option<&str>,
     sidecar: &StdioSidecarStatusParts,
+    broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
 ) -> StdioStatusReadinessParts {
     let setup_repair = stdio_setup_repair_input(server_executable);
     let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
@@ -3239,6 +3439,7 @@ fn build_stdio_status_readiness(
         &readiness,
         None,
         Some(selected_agent_sidecar),
+        Some(broker),
     );
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
@@ -3270,7 +3471,7 @@ fn build_stdio_status_broker(
     runtime: &RuntimeContext,
     selected_agent_sidecar: &args::DoctorSidecarStatusOutput,
 ) -> StdioStatusBrokerParts {
-    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
+    let readiness_broker = crate::readiness_broker::observe_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
             cache_root: runtime.cache_root.clone(),
@@ -3663,12 +3864,13 @@ fn stdio_latest_release_version() -> Option<String> {
     {
         return Some(version);
     }
-    let response =
+    let response = codestory_retrieval::outbound_http::read_text(
         ureq::get("https://api.github.com/repos/TheGreenCedar/CodeStory/releases/latest")
             .timeout(StdDuration::from_secs(2))
-            .call()
-            .ok()?;
-    let body: serde_json::Value = serde_json::from_str(&response.into_string().ok()?).ok()?;
+            .call(),
+    )
+    .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&response.body).ok()?;
     body.get("tag_name")
         .and_then(|value| value.as_str())
         .and_then(normalize_release_version)
@@ -4408,7 +4610,7 @@ fn handle_stdio_sidecar_repair(
         codestory_retrieval::SidecarProfile::Agent,
         Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
     );
-    let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
+    let broker_snapshot = crate::readiness_broker::observe_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
             cache_root: runtime.cache_root.clone(),
@@ -4449,6 +4651,15 @@ fn handle_stdio_sidecar_repair(
         .map(|operation| serde_json::to_value(operation).expect("serialize broker operation"));
     let broker_reconciliation_json =
         serde_json::to_value(&broker_reconciliation).expect("serialize broker reconciliation");
+    if let Some(result) = stdio_sidecar_repair_reconciliation_block_result(
+        &runtime.project_root,
+        &repair_sidecar,
+        &sidecar_setup,
+        &broker_reconciliation,
+        &broker_reconciliation_json,
+    ) {
+        return result;
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
@@ -4470,17 +4681,24 @@ fn handle_stdio_sidecar_repair(
         .stdin(Stdio::null());
 
     match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(child) => {
+        Ok(mut child) => {
             let child_pid = child.id();
             let repair_started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
-            let status_published = crate::ready_repair_status::write_ready_repair_status(
+            if let Err(error) = crate::ready_repair_status::write_ready_repair_status(
                 &repair_sidecar,
                 &runtime.project_root,
                 "starting",
                 repair_started_at_epoch_ms,
                 child_pid,
-            )
-            .is_ok();
+            ) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return serde_json::json!({
+                    "error": format!(
+                        "repair process was stopped because its durable status could not be published: {error}"
+                    )
+                });
+            }
             let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
                 crate::readiness_broker::BrokerSnapshotInput {
                     project_root: runtime.project_root.clone(),
@@ -4491,25 +4709,21 @@ fn handle_stdio_sidecar_repair(
                     reconciliation: None,
                 },
             );
-            if status_published {
-                state.recent_sidecar_repair = Some(StdioRecentSidecarRepair {
-                    project_root: runtime.project_root.clone(),
-                    run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
-                    namespace: repair_sidecar.namespace.clone(),
-                    compose_project: repair_sidecar.compose_project.clone(),
-                    pid: child_pid,
-                    started_at_epoch_ms: repair_started_at_epoch_ms,
-                    observed_at: Instant::now(),
-                });
-            } else {
-                state.recent_sidecar_repair = None;
-            }
+            state.recent_sidecar_repair = Some(StdioRecentSidecarRepair {
+                project_root: runtime.project_root.clone(),
+                run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+                namespace: repair_sidecar.namespace.clone(),
+                compose_project: repair_sidecar.compose_project.clone(),
+                pid: child_pid,
+                started_at_epoch_ms: repair_started_at_epoch_ms,
+                observed_at: Instant::now(),
+            });
             serde_json::json!({
                 "result": {
                     "status": "started",
                     "mode": "background",
                     "pid": child_pid,
-                    "status_published": status_published,
+                    "status_published": true,
                     "broker_snapshot": broker_snapshot,
                     "previous_abandoned_repair": previous_abandoned_repair,
                     "broker_reconciliation": broker_reconciliation_json,
@@ -4598,6 +4812,50 @@ fn stdio_sidecar_repair_already_starting_result(
             "sidecar_setup": sidecar_setup
         }
     })
+}
+
+fn stdio_sidecar_repair_reconciliation_block_result(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar_setup: &serde_json::Value,
+    reconciliation: &crate::readiness_broker::BrokerReconciliationSnapshot,
+    reconciliation_json: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let reason = reconciliation.enqueue_block_reason()?;
+    let active = reconciliation.active_repair.as_ref();
+    let status = if active.is_some() || reason.starts_with("live_ready_repair_heartbeat_stale") {
+        "already_running"
+    } else {
+        "repair_blocked"
+    };
+    Some(serde_json::json!({
+        "result": {
+            "status": status,
+            "mode": "background",
+            "reason": reason,
+            "project_root": crate::display::clean_path_string(&project_root.to_string_lossy()),
+            "profile": "agent",
+            "run_id": active
+                .and_then(|operation| operation.run_id.clone())
+                .or_else(|| sidecar.run_id.clone()),
+            "phase": active.and_then(|operation| operation.phase.clone()),
+            "pid": active.and_then(|operation| operation.pid),
+            "broker_reconciliation": reconciliation_json,
+            "next_status_command": format!(
+                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                crate::display::clean_path_string(&project_root.to_string_lossy()),
+                active
+                    .and_then(|operation| operation.run_id.as_deref())
+                    .or(sidecar.run_id.as_deref())
+                    .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            ),
+            "recommended_next_calls": [{
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }],
+            "sidecar_setup": sidecar_setup
+        }
+    }))
 }
 
 fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_json::Value {
@@ -5232,6 +5490,53 @@ mod tests {
     }
 
     #[test]
+    fn stdio_cancellation_marks_matching_queued_request() {
+        let mut queued = VecDeque::new();
+        queue_stdio_frame(
+            StdioFrame::Line(
+                br#"{"jsonrpc":"2.0","id":"request-1","method":"tools/call"}
+"#
+                .to_vec(),
+            ),
+            &mut queued,
+            None,
+        );
+        let cancelled = match queued.front().expect("queued request") {
+            StdioQueuedWork::Message(message) => Arc::clone(&message.cancelled),
+            StdioQueuedWork::Response(response) => panic!("unexpected response: {response}"),
+        };
+
+        queue_stdio_frame(
+            StdioFrame::Line(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"request-1"}}
+"#
+                .to_vec(),
+            ),
+            &mut queued,
+            None,
+        );
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            queued.len(),
+            1,
+            "cancellation notifications have no response"
+        );
+    }
+
+    #[test]
+    fn stdio_cancellation_keeps_json_id_types_distinct() {
+        assert_eq!(stdio_message_id_key(r#"{"id":7}"#).as_deref(), Some("7"));
+        assert_eq!(
+            stdio_cancellation_target_key(
+                r#"{"method":"notifications/cancelled","params":{"requestId":"7"}}"#
+            )
+            .as_deref(),
+            Some("\"7\"")
+        );
+    }
+
+    #[test]
     fn sidecar_repair_enqueue_lock_is_single_flight() {
         let project = tempfile::tempdir().expect("project");
         let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
@@ -5286,7 +5591,8 @@ mod tests {
             resource,
         );
         crate::readiness_broker::ReadinessBrokerSnapshot {
-            schema_version: 1,
+            schema_version: crate::readiness_broker::BROKER_SCHEMA_VERSION,
+            identity: scope.identity.clone(),
             install_id: "test-install".to_string(),
             project_id: scope.project_id,
             canonical_root_hash: "test-root-hash".to_string(),

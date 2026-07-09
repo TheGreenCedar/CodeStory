@@ -2511,6 +2511,8 @@ pub(crate) struct DoctorOutput {
     pub(crate) readiness: Vec<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) readiness_broker: Option<crate::readiness_broker::ReadinessBrokerSnapshot>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,

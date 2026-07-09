@@ -5,11 +5,12 @@ use codestory_retrieval::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const READY_REPAIR_STATUS_FILE: &str = "ready-repair-status.json";
@@ -30,6 +31,8 @@ pub(crate) struct ReadyRepairStatus {
     pub(crate) compose_project: String,
     pub(crate) phase: String,
     pub(crate) pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) process_start_identity: Option<String>,
     pub(crate) started_at_epoch_ms: i64,
     pub(crate) updated_at_epoch_ms: i64,
 }
@@ -42,6 +45,8 @@ struct ReadyRepairLockFile {
     run_id: Option<String>,
     namespace: String,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_identity: Option<String>,
     started_at_epoch_ms: i64,
     token: String,
 }
@@ -64,7 +69,21 @@ pub(crate) struct ReadyRepairCleanup {
 #[derive(Debug)]
 pub(crate) enum ReadyRepairLockAttempt {
     Acquired(ReadyRepairLock),
-    Busy(ReadyRepairBusy),
+    Busy(Box<ReadyRepairBusy>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessOwnerState {
+    Matching,
+    GoneOrReused,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessProbe {
+    Running { start_identity: Option<String> },
+    NotRunning,
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -127,6 +146,7 @@ fn try_acquire_ready_repair_lock_at(
 
     let started_at_epoch_ms = now_epoch_ms();
     let pid = std::process::id();
+    let process_start_identity = recorded_process_start_identity(pid);
     let token = format!("{pid}:{started_at_epoch_ms}");
     let lock = ReadyRepairLockFile {
         schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
@@ -135,6 +155,7 @@ fn try_acquire_ready_repair_lock_at(
         run_id: sidecar.run_id.clone(),
         namespace: sidecar.namespace.clone(),
         pid,
+        process_start_identity,
         started_at_epoch_ms,
         token: token.clone(),
     };
@@ -152,20 +173,20 @@ fn try_acquire_ready_repair_lock_at(
     }
 
     if let Some(status) = active_ready_repair_status(project_root, active_run_id) {
-        return Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
+        return Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
             status: Some(status),
             lock_path: path,
             reason: None,
-        }));
+        })));
     }
     let stale_live_status = stale_live_ready_repair_status(project_root, active_run_id);
 
     if !ready_repair_lock_file_is_stale(&path) {
-        return Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
+        return Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
             status: stale_live_status,
             lock_path: path,
             reason: Some("live_repair_lock".to_string()),
-        }));
+        })));
     }
 
     let _ = fs::remove_file(&path);
@@ -175,11 +196,11 @@ fn try_acquire_ready_repair_lock_at(
             token,
         })),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
+            Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
                 status: active_ready_repair_status(project_root, active_run_id),
                 lock_path: path,
                 reason: Some("lock_contention".to_string()),
-            }))
+            })))
         }
         Err(error) => Err(error.into()),
     }
@@ -193,9 +214,6 @@ pub(crate) fn write_ready_repair_status(
     pid: u32,
 ) -> Result<()> {
     let path = ready_repair_status_path(sidecar);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let status = ReadyRepairStatus {
         schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
         status: "repairing".to_string(),
@@ -206,11 +224,11 @@ pub(crate) fn write_ready_repair_status(
         compose_project: sidecar.compose_project.clone(),
         phase: phase.to_string(),
         pid,
+        process_start_identity: recorded_process_start_identity(pid),
         started_at_epoch_ms,
         updated_at_epoch_ms: now_epoch_ms(),
     };
-    let json = serde_json::to_string_pretty(&status)?;
-    Ok(fs::write(path, json)?)
+    crate::file_state::write_json_atomic(&path, "ready-repair-status", &status)
 }
 
 pub(crate) fn clear_ready_repair_status(
@@ -297,10 +315,7 @@ pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> Stri
 }
 
 fn create_ready_repair_lock_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-    Ok(())
+    crate::file_state::write_synced_new_file(path, content)
 }
 
 fn ready_repair_lock_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
@@ -337,18 +352,11 @@ fn ready_repair_status_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
 
 fn ready_repair_lock_file_is_stale(path: &Path) -> bool {
     if let Some(lock) = read_ready_repair_lock_file(path) {
-        return !process_is_running(lock.pid);
+        return process_owner_state(lock.pid, lock.process_start_identity.as_deref())
+            == ProcessOwnerState::GoneOrReused;
     }
     let now = now_epoch_ms();
-    fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|modified| {
-            let modified_ms = modified.as_millis().min(i64::MAX as u128) as i64;
-            now.saturating_sub(modified_ms) > READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64
-        })
-        .unwrap_or(true)
+    crate::file_state::file_modified_age_exceeds(path, READY_REPAIR_LOCK_STALE_TTL, now)
 }
 
 fn read_ready_repair_status(
@@ -368,7 +376,9 @@ fn read_ready_repair_status(
     if age_ms > READY_REPAIR_STATUS_TTL.as_millis() as i64 {
         return None;
     }
-    if !process_is_running(status.pid) {
+    if process_owner_state(status.pid, status.process_start_identity.as_deref())
+        == ProcessOwnerState::GoneOrReused
+    {
         return None;
     }
     Some(status)
@@ -387,7 +397,9 @@ fn read_abandoned_ready_repair_status(
     {
         return None;
     }
-    if process_is_running(status.pid) {
+    if process_owner_state(status.pid, status.process_start_identity.as_deref())
+        != ProcessOwnerState::GoneOrReused
+    {
         return None;
     }
     Some(status)
@@ -410,54 +422,145 @@ fn read_stale_live_ready_repair_status(
     if age_ms <= READY_REPAIR_STATUS_TTL.as_millis() as i64 {
         return None;
     }
-    if !process_is_running(status.pid) {
+    if process_owner_state(status.pid, status.process_start_identity.as_deref())
+        == ProcessOwnerState::GoneOrReused
+    {
         return None;
     }
     Some(status)
 }
 
 pub(crate) fn process_is_running(pid: u32) -> bool {
-    if pid == std::process::id() {
-        return true;
-    }
+    process_owner_state(pid, None) != ProcessOwnerState::GoneOrReused
+}
 
-    #[cfg(windows)]
+pub(crate) fn process_owner_state(
+    pid: u32,
+    expected_start_identity: Option<&str>,
+) -> ProcessOwnerState {
+    process_owner_state_with(pid, expected_start_identity, probe_process)
+}
+
+fn process_owner_state_with(
+    pid: u32,
+    expected_start_identity: Option<&str>,
+    probe: impl FnOnce(u32) -> ProcessProbe,
+) -> ProcessOwnerState {
+    match probe(pid) {
+        ProcessProbe::NotRunning => ProcessOwnerState::GoneOrReused,
+        ProcessProbe::Unknown => ProcessOwnerState::Unknown,
+        ProcessProbe::Running { start_identity } => match expected_start_identity {
+            None => ProcessOwnerState::Matching,
+            Some(expected) => match start_identity {
+                Some(actual) if actual == expected => ProcessOwnerState::Matching,
+                Some(_) => ProcessOwnerState::GoneOrReused,
+                None => ProcessOwnerState::Unknown,
+            },
+        },
+    }
+}
+
+pub(crate) fn recorded_process_start_identity(pid: u32) -> Option<String> {
+    match probe_process(pid) {
+        ProcessProbe::Running { start_identity } => start_identity,
+        ProcessProbe::NotRunning | ProcessProbe::Unknown => None,
+    }
+}
+
+fn probe_process(pid: u32) -> ProcessProbe {
+    static CURRENT_PROCESS_START_IDENTITY: OnceLock<String> = OnceLock::new();
+
+    if pid == std::process::id()
+        && let Some(identity) = CURRENT_PROCESS_START_IDENTITY.get()
     {
-        let filter = format!("PID eq {pid}");
-        let output = Command::new("tasklist")
-            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-            .output();
-        let Ok(output) = output else {
-            return true;
+        return ProcessProbe::Running {
+            start_identity: Some(identity.clone()),
         };
-        let pid_text = pid.to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.lines().any(|line| {
-            let mut fields = line.split(',').map(|field| field.trim().trim_matches('"'));
-            let _image = fields.next();
-            fields.next() == Some(pid_text.as_str())
-        })
     }
 
-    #[cfg(target_os = "linux")]
+    let probe = probe_process_platform(pid);
+    if pid == std::process::id()
+        && let ProcessProbe::Running {
+            start_identity: Some(identity),
+        } = &probe
     {
-        Path::new("/proc").join(pid.to_string()).exists()
+        let _ = CURRENT_PROCESS_START_IDENTITY.set(identity.clone());
     }
+    probe
+}
 
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(true)
+#[cfg(windows)]
+fn probe_process_platform(pid: u32) -> ProcessProbe {
+    let script = format!(
+        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\" -ErrorAction Stop; if ($null -eq $p) {{ exit 2 }}; $p.CreationDate.ToUniversalTime().Ticks"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+    let Ok(output) = output else {
+        return ProcessProbe::Unknown;
+    };
+    if output.status.code() == Some(2) {
+        return ProcessProbe::NotRunning;
     }
+    if !output.status.success() {
+        return ProcessProbe::Unknown;
+    }
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if identity.is_empty() {
+        return ProcessProbe::Unknown;
+    }
+    ProcessProbe::Running {
+        start_identity: Some(format!("windows:{identity}")),
+    }
+}
 
-    #[cfg(not(any(windows, unix)))]
-    {
-        true
+#[cfg(target_os = "linux")]
+fn probe_process_platform(pid: u32) -> ProcessProbe {
+    let path = Path::new("/proc").join(pid.to_string()).join("stat");
+    let stat = match fs::read_to_string(path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == ErrorKind::NotFound => return ProcessProbe::NotRunning,
+        Err(_) => return ProcessProbe::Unknown,
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return ProcessProbe::Unknown;
+    };
+    let Some(start_ticks) = fields.split_whitespace().nth(19) else {
+        return ProcessProbe::Unknown;
+    };
+    ProcessProbe::Running {
+        start_identity: Some(format!("linux:{start_ticks}")),
     }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn probe_process_platform(pid: u32) -> ProcessProbe {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output();
+    let Ok(output) = output else {
+        return ProcessProbe::Unknown;
+    };
+    if !output.status.success() {
+        return if output.status.code() == Some(1) {
+            ProcessProbe::NotRunning
+        } else {
+            ProcessProbe::Unknown
+        };
+    }
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if identity.is_empty() {
+        return ProcessProbe::Unknown;
+    }
+    ProcessProbe::Running {
+        start_identity: Some(format!("unix:{identity}")),
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn probe_process_platform(_pid: u32) -> ProcessProbe {
+    ProcessProbe::Unknown
 }
 
 fn ready_repair_lock_paths_for_status(
@@ -480,9 +583,7 @@ fn read_ready_repair_lock_file(path: &Path) -> Option<ReadyRepairLockFile> {
 }
 
 fn read_ready_repair_status_file(path: &Path) -> Option<ReadyRepairStatus> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+    crate::file_state::read_json(path)
 }
 
 fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<PathBuf> {
@@ -564,6 +665,9 @@ fn path_fingerprint(path: &Path) -> String {
 mod tests {
     use super::*;
     use codestory_retrieval::SidecarLayout;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
 
     fn test_sidecar(root: &Path) -> SidecarRuntimeConfig {
         test_sidecar_with_run_id(root, "test-proof")
@@ -572,6 +676,7 @@ mod tests {
     fn test_sidecar_with_run_id(root: &Path, run_id: &str) -> SidecarRuntimeConfig {
         let namespace = format!("codestory-agent-{run_id}");
         SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 6070,
                 qdrant_http_port: 6333,
@@ -592,6 +697,47 @@ mod tests {
     }
 
     #[test]
+    fn process_owner_probe_matches_live_process_identity() {
+        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
+            start_identity: Some("start-a".to_string()),
+        });
+
+        assert_eq!(state, ProcessOwnerState::Matching);
+    }
+
+    #[test]
+    fn process_owner_probe_detects_dead_process() {
+        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::NotRunning);
+
+        assert_eq!(state, ProcessOwnerState::GoneOrReused);
+    }
+
+    #[test]
+    fn process_owner_probe_detects_pid_reuse() {
+        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
+            start_identity: Some("start-b".to_string()),
+        });
+
+        assert_eq!(state, ProcessOwnerState::GoneOrReused);
+    }
+
+    #[test]
+    fn process_owner_probe_uncertainty_preserves_ownership() {
+        let failed_probe = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Unknown);
+        let missing_identity =
+            process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
+                start_identity: None,
+            });
+        let legacy_live = process_owner_state_with(42, None, |_| ProcessProbe::Running {
+            start_identity: Some("start-b".to_string()),
+        });
+
+        assert_eq!(failed_probe, ProcessOwnerState::Unknown);
+        assert_eq!(missing_identity, ProcessOwnerState::Unknown);
+        assert_eq!(legacy_live, ProcessOwnerState::Matching);
+    }
+
+    #[test]
     fn repair_status_file_round_trips_current_phase_and_clears() {
         let project = tempfile::tempdir().expect("project");
         let state = tempfile::tempdir().expect("state");
@@ -609,12 +755,66 @@ mod tests {
         assert_eq!(status.phase, "Qdrant finalize");
         assert_eq!(status.run_id.as_deref(), Some("test-proof"));
         assert_eq!(status.namespace, "codestory-agent-test-proof");
+        assert!(status.process_start_identity.is_some());
 
         clear_ready_repair_status(&sidecar, started_at, pid);
         assert!(
             !path.exists(),
             "drop cleanup should remove the matching repair state file"
         );
+    }
+
+    #[test]
+    fn ready_repair_status_publication_never_exposes_partial_json() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_status_path(&sidecar);
+        let started_at = now_epoch_ms();
+        let pid = std::process::id();
+        write_ready_repair_status(&sidecar, project.path(), "initial", started_at, pid)
+            .expect("initial repair status");
+
+        let reader_path = path.clone();
+        let reader_started = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let reader_started = Arc::clone(&reader_started);
+            let writer_done = Arc::clone(&writer_done);
+            thread::spawn(move || {
+                reader_started.store(true, Ordering::Release);
+                let mut reads = 0;
+                while !writer_done.load(Ordering::Acquire) {
+                    let status = read_ready_repair_status_file(&reader_path)
+                        .expect("complete repair status json");
+                    assert_eq!(status.schema_version, READY_REPAIR_STATUS_SCHEMA_VERSION);
+                    assert_eq!(status.pid, pid);
+                    reads += 1;
+                    thread::yield_now();
+                }
+                reads
+            })
+        };
+        while !reader_started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+
+        let payload = "x".repeat(32 * 1024);
+        for iteration in 0..200 {
+            write_ready_repair_status(
+                &sidecar,
+                project.path(),
+                &format!("iteration-{iteration}-{payload}"),
+                started_at,
+                pid,
+            )
+            .expect("replace repair status");
+            thread::yield_now();
+        }
+        writer_done.store(true, Ordering::Release);
+
+        assert!(reader.join().expect("repair status reader") > 0);
+        assert!(read_ready_repair_status_file(&path).is_some());
     }
 
     #[test]
@@ -672,6 +872,7 @@ mod tests {
             run_id: Some("test-proof".to_string()),
             namespace: "codestory-agent-test-proof".to_string(),
             pid,
+            process_start_identity: None,
             started_at_epoch_ms: now - READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64 - 1,
             token: format!("{pid}:{now}"),
         };
@@ -753,6 +954,7 @@ mod tests {
             compose_project: "codestory-agent-test-proof".to_string(),
             phase: "embeddings".to_string(),
             pid: 4242,
+            process_start_identity: None,
             started_at_epoch_ms: now - 60_000,
             updated_at_epoch_ms: now - READY_REPAIR_STATUS_TTL.as_millis() as i64 - 1,
         };
@@ -785,6 +987,7 @@ mod tests {
             compose_project: "codestory-agent-test-proof".to_string(),
             phase: "graph artifact".to_string(),
             pid: dead_pid,
+            process_start_identity: None,
             started_at_epoch_ms: now,
             updated_at_epoch_ms: now,
         };
@@ -827,6 +1030,7 @@ mod tests {
             compose_project: "codestory-agent-test-proof".to_string(),
             phase: "Embedding documents".to_string(),
             pid,
+            process_start_identity: None,
             started_at_epoch_ms: old,
             updated_at_epoch_ms: old,
         };
@@ -844,6 +1048,7 @@ mod tests {
                 run_id: Some("test-proof".to_string()),
                 namespace: "codestory-agent-test-proof".to_string(),
                 pid,
+                process_start_identity: None,
                 started_at_epoch_ms: old,
                 token: format!("{pid}:{old}"),
             })
@@ -886,6 +1091,7 @@ mod tests {
             run_id: Some("test-proof".to_string()),
             namespace: "codestory-agent-test-proof".to_string(),
             pid: u32::MAX,
+            process_start_identity: None,
             started_at_epoch_ms: now,
             token: format!("{}:{now}", u32::MAX),
         };
@@ -896,6 +1102,37 @@ mod tests {
             ReadyRepairLockAttempt::Acquired(_) => {}
             ReadyRepairLockAttempt::Busy(busy) => {
                 panic!("dead-pid repair lock should be reclaimed, got busy at {busy:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn reused_pid_repair_lock_is_reclaimable_immediately() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_lock_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("repair lock parent")).expect("state dir");
+        let now = now_epoch_ms();
+        let pid = std::process::id();
+        let lock = ReadyRepairLockFile {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("test-proof".to_string()),
+            namespace: "codestory-agent-test-proof".to_string(),
+            pid,
+            process_start_identity: Some("different-process-start".to_string()),
+            started_at_epoch_ms: now,
+            token: format!("{pid}:{now}"),
+        };
+        fs::write(&path, serde_json::to_string(&lock).expect("lock json"))
+            .expect("write reused-pid lock");
+
+        match try_acquire_ready_repair_lock(&sidecar, project.path()).expect("lock attempt") {
+            ReadyRepairLockAttempt::Acquired(_) => {}
+            ReadyRepairLockAttempt::Busy(busy) => {
+                panic!("reused-pid repair lock should be reclaimed, got busy at {busy:?}")
             }
         }
     }
@@ -926,6 +1163,7 @@ mod tests {
             compose_project: sidecar.compose_project.clone(),
             phase: "graph artifact".to_string(),
             pid: u32::MAX,
+            process_start_identity: None,
             started_at_epoch_ms: now,
             updated_at_epoch_ms: now,
         };
@@ -941,6 +1179,7 @@ mod tests {
             run_id: Some("shared-agent".to_string()),
             namespace: sidecar.namespace.clone(),
             pid: u32::MAX,
+            process_start_identity: None,
             started_at_epoch_ms: now,
             token: format!("{}:{now}", u32::MAX),
         };

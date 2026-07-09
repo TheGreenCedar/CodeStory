@@ -36,9 +36,11 @@ pub(crate) use paths::machine_resource_cache_fingerprint;
 #[allow(unused_imports)]
 pub(crate) use reconcile::reconcile_before_enqueue;
 #[allow(unused_imports)]
-pub(crate) use scope::{agent_repair_scope, broker_operation_id, operation_scope};
+pub(crate) use scope::{
+    BROKER_SCHEMA_VERSION, agent_repair_scope, broker_operation_id, operation_scope,
+};
 #[allow(unused_imports)]
-pub(crate) use snapshot::refresh_broker_snapshot;
+pub(crate) use snapshot::{observe_broker_snapshot, refresh_broker_snapshot};
 #[allow(unused_imports)]
 pub(crate) use types::{
     BrokerGpuProofInput, BrokerGpuProofSnapshot, BrokerOperationSnapshot,

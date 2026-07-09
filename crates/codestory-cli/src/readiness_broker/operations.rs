@@ -3,7 +3,6 @@ use std::path::Path;
 use crate::display;
 use crate::{local_refresh_status, ready_repair_status};
 
-use super::paths::{clean_path_text, hash_text, project_id_from_hash};
 use super::scope::{agent_repair_scope, broker_operation_id};
 use super::types::BrokerOperationSnapshot;
 
@@ -48,11 +47,11 @@ pub(crate) fn operation_from_local_refresh_status(
     operation_status: &str,
     degraded_reason: Option<String>,
 ) -> BrokerOperationSnapshot {
-    let canonical_root = clean_path_text(project_root);
-    let canonical_root_hash = hash_text(&canonical_root);
-    let project_id = project_id_from_hash(&canonical_root_hash);
+    let identity = codestory_workspace::project_identity_v2(project_root);
+    let project_id = identity.project_id;
+    let workspace_id = identity.workspace_id;
     BrokerOperationSnapshot {
-        operation_id: format!("local_graph_refresh:{project_id}"),
+        operation_id: format!("local_graph_refresh:{workspace_id}"),
         operation_kind: "local_graph_refresh".to_string(),
         status: operation_status.to_string(),
         project_id,
@@ -77,11 +76,11 @@ pub(crate) fn operation_from_local_refresh_lock_cleanup(
     cli_version: &str,
     cleanup: local_refresh_status::LocalRefreshCleanup,
 ) -> BrokerOperationSnapshot {
-    let canonical_root = clean_path_text(project_root);
-    let canonical_root_hash = hash_text(&canonical_root);
-    let project_id = project_id_from_hash(&canonical_root_hash);
+    let identity = codestory_workspace::project_identity_v2(project_root);
+    let project_id = identity.project_id;
+    let workspace_id = identity.workspace_id;
     BrokerOperationSnapshot {
-        operation_id: format!("local_graph_refresh:{project_id}"),
+        operation_id: format!("local_graph_refresh:{workspace_id}"),
         operation_kind: "local_graph_refresh".to_string(),
         status: "stale_cleaned".to_string(),
         project_id,

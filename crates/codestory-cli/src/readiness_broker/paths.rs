@@ -101,10 +101,6 @@ pub(crate) fn broker_cache_root() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-pub(crate) fn project_id_from_hash(hash: &str) -> String {
-    format!("codestory-{}", &hash[..16])
-}
-
 pub(crate) fn safe_name(value: &str) -> String {
     let mut name = value
         .chars()

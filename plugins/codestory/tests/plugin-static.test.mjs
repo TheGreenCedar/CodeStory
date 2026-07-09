@@ -1377,7 +1377,7 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
       "  process.exit(0);",
       "}",
       "if (args[0] === 'ready' && args.includes('--goal') && args.includes('agent')) {",
-      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'zoekt_unreachable' } } }));",
+      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'zoekt_unreachable' } }, readiness_broker: { schema_version: 2, project_id: 'project-123', persistence_status: 'observed' } }));",
       "  process.exit(0);",
       "}",
       "process.exit(2);",
@@ -1405,6 +1405,11 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     assert.equal(status.runtime_truth.sidecar_status.run_id, "shared-agent");
     assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.status, "ready");
     assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
+    assert.deepEqual(status.readiness_broker, {
+      schema_version: 2,
+      project_id: "project-123",
+      persistence_status: "observed",
+    });
     assert.equal(status.readiness.some((verdict) => verdict.goal === "agent_packet_search" && verdict.status === "ready"), true);
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.deepEqual(calls.map((args) => args.slice(0, 3)), [

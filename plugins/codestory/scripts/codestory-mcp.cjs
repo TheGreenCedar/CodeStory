@@ -1091,7 +1091,8 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     full_repair: fullRepair,
   };
   const readinessBroker = {
-    schema_version: 1,
+    schema_version: 2,
+    identity: null,
     install_id: null,
     project_id: null,
     canonical_root_hash: null,
@@ -1258,6 +1259,7 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     local_refresh: localRefresh,
     readiness,
     readiness_lanes: agentReadiness.parsed?.readiness_lanes || null,
+    readiness_broker: agentReadiness.parsed?.readiness_broker || null,
     recommended_next_calls: [{ method: 'resources/read', uri: 'codestory://status' }],
   };
 }

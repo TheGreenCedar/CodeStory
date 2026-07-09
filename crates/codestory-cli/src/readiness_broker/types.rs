@@ -1,9 +1,12 @@
+use codestory_workspace::ProjectIdentityV2;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<ProjectIdentityV2>,
     pub(crate) install_id: String,
     pub(crate) project_id: String,
     pub(crate) canonical_root_hash: String,
@@ -21,23 +24,20 @@ pub(crate) struct BrokerScope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReadinessBrokerSnapshot {
     pub(crate) schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity: Option<ProjectIdentityV2>,
     pub(crate) install_id: String,
     pub(crate) project_id: String,
     pub(crate) canonical_root_hash: String,
     pub(crate) workspace_root: String,
     pub(crate) cli_version: String,
     pub(crate) updated_at_epoch_ms: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) snapshot_path: Option<String>,
     pub(crate) persistence_status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) persistence_error: Option<String>,
-    #[serde(default)]
     pub(crate) operations: Vec<BrokerOperationSnapshot>,
-    #[serde(default)]
     pub(crate) resources: BTreeMap<String, BrokerResourceSnapshot>,
     pub(crate) reconciliation: BrokerReconciliationSnapshot,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gpu_proof: Option<BrokerGpuProofSnapshot>,
 }
 
@@ -107,6 +107,22 @@ pub(crate) struct BrokerReconciliationSnapshot {
     pub(crate) unresolved_orphan_reason: Option<String>,
 }
 
+impl BrokerReconciliationSnapshot {
+    pub(crate) fn enqueue_block_reason(&self) -> Option<String> {
+        if let Some(active) = self.active_repair.as_ref() {
+            return Some(format!(
+                "active_ready_repair:pid={}:phase={}",
+                active
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                active.phase.as_deref().unwrap_or("unknown")
+            ));
+        }
+        self.unresolved_orphan_reason.clone()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerGpuProofInput {
     pub(crate) embedding_device_policy: Option<String>,
@@ -121,6 +137,20 @@ pub(crate) struct BrokerGpuProofInput {
     pub(crate) embed_smoke_ok: Option<bool>,
     pub(crate) embed_smoke_ms: Option<u64>,
     pub(crate) degraded_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BrokerGpuRuntimeIdentity {
+    pub(crate) workspace_id: String,
+    pub(crate) profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) namespace: String,
+    pub(crate) compose_project: String,
+    pub(crate) embed_url: String,
+    pub(crate) started_at_epoch_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_launch: Option<codestory_retrieval::EmbeddingLaunchMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +179,8 @@ pub(crate) struct BrokerGpuProofSnapshot {
     pub(crate) embed_smoke_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_identity: Option<BrokerGpuRuntimeIdentity>,
 }
 
 #[derive(Debug, Clone)]

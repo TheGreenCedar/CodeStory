@@ -45,6 +45,8 @@ pub enum NativeEmbeddingLaunchIdentityStatus {
 /// The file records local sidecar endpoints and data roots only. It is not a readiness manifest;
 /// callers must use `sidecar_status` or `strict_sidecar_status` before trusting retrieval output.
 pub struct SidecarStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
     #[serde(default = "default_sidecar_owner")]
     pub owner: String,
     #[serde(default = "default_sidecar_profile")]
@@ -122,6 +124,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness();
     let state = SidecarStateFile {
+        project_identity: runtime.project_identity.clone(),
         owner: "codestory".into(),
         profile: runtime.profile.as_str().into(),
         namespace: runtime.namespace.clone(),
@@ -167,6 +170,17 @@ pub fn sidecar_state_matches_runtime(
         && state.run_id.as_deref() == runtime.run_id.as_deref()
         && state.embed_http_port == runtime.embed_http_port
         && state.embed_url == SidecarLayout::embed_base_url(runtime.embed_http_port)
+        && state
+            .project_identity
+            .as_ref()
+            .is_none_or(|state_identity| {
+                runtime
+                    .project_identity
+                    .as_ref()
+                    .is_some_and(|runtime_identity| {
+                        state_identity.workspace_id == runtime_identity.workspace_id
+                    })
+            })
 }
 
 fn reusable_embedding_launch_from_state(
@@ -999,6 +1013,7 @@ mod tests {
 
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
@@ -1049,7 +1064,8 @@ mod tests {
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let root = TempDir::new().expect("root");
-        let runtime = test_runtime(&root);
+        let mut runtime = test_runtime(&root);
+        runtime.project_identity = Some(codestory_workspace::project_identity_v2(root.path()));
         let launch = EmbeddingLaunchMetadata {
             provider: "llamacpp".to_string(),
             launch_mode: "native_spawned".to_string(),
@@ -1066,6 +1082,14 @@ mod tests {
         let state =
             sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch.clone()))
                 .expect("write state");
+        assert_eq!(state.project_identity, runtime.project_identity);
+        let mut foreign_runtime = runtime.clone();
+        foreign_runtime
+            .project_identity
+            .as_mut()
+            .expect("foreign identity")
+            .workspace_id = "foreign-workspace".to_string();
+        assert!(!sidecar_state_matches_runtime(&state, &foreign_runtime));
         assert_eq!(state.embedding_launch, Some(launch.clone()));
         assert_eq!(
             state.embedding_accelerator_request_provider.as_deref(),

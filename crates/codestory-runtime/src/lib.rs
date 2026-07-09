@@ -3804,11 +3804,9 @@ fn summarize_symbol_doc(
     {
         request = request.set("Authorization", &format!("Bearer {}", api_key.trim()));
     }
-    let response_body = request
-        .send_string(&body)
+    let response_body = codestory_retrieval::outbound_http::read_text(request.send_string(&body))
         .map_err(summary_endpoint_http_error)?
-        .into_string()
-        .map_err(|e| ApiError::internal(format!("Summary endpoint response failed: {e}")))?;
+        .body;
     let response: serde_json::Value = serde_json::from_str(&response_body)
         .map_err(|e| ApiError::internal(format!("Summary endpoint returned invalid JSON: {e}")))?;
     let summary = response
@@ -3838,30 +3836,19 @@ fn summary_endpoint_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn summary_endpoint_http_error(error: ureq::Error) -> ApiError {
-    match error {
-        ureq::Error::Status(status, response) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|read_error| format!("failed to read error body: {read_error}"));
-            ApiError::internal(format!(
-                "Summary endpoint failed with status {status}: {}",
-                truncate_error_body(&body)
-            ))
-        }
-        ureq::Error::Transport(error) => {
-            ApiError::internal(format!("Summary endpoint request failed: {error}"))
-        }
+fn summary_endpoint_http_error(
+    error: codestory_retrieval::outbound_http::OutboundHttpError,
+) -> ApiError {
+    if let Some(status) = error.status() {
+        return ApiError::internal(format!(
+            "Summary endpoint failed with status {status}: {}",
+            codestory_retrieval::outbound_http::truncate_http_body_to(
+                error.body().unwrap_or_default(),
+                2_048
+            )
+        ));
     }
-}
-
-fn truncate_error_body(body: &str) -> String {
-    const MAX_ERROR_BODY_CHARS: usize = 2_048;
-    let mut truncated = body.chars().take(MAX_ERROR_BODY_CHARS).collect::<String>();
-    if body.chars().count() > MAX_ERROR_BODY_CHARS {
-        truncated.push_str("...");
-    }
-    truncated
+    ApiError::internal(format!("Summary endpoint request failed: {error}"))
 }
 
 fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {

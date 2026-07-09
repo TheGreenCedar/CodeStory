@@ -103,8 +103,9 @@ fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
     let canonical_root_hash = hash_text(&canonical_root);
     ReadinessBrokerSnapshot {
         schema_version: BROKER_SCHEMA_VERSION,
+        identity: Some(codestory_workspace::project_identity_v2(project)),
         install_id: "test-install".to_string(),
-        project_id: project_id_from_hash(&canonical_root_hash),
+        project_id: codestory_workspace::project_identity_v2(project).project_id,
         canonical_root_hash,
         workspace_root: clean_path(project),
         cli_version: "9.9.9".to_string(),
@@ -130,6 +131,7 @@ fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
 
 fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval::SidecarStateFile {
     codestory_retrieval::SidecarStateFile {
+        project_identity: None,
         owner: "codestory".to_string(),
         profile: "agent".to_string(),
         namespace: "codestory-test".to_string(),
@@ -171,6 +173,36 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
         compose_file: None,
         cleanup_command: "codestory-cli retrieval down".to_string(),
         started_at_epoch_ms: 100,
+    }
+}
+
+fn verified_gpu_proof_input(embed_smoke_ok: Option<bool>) -> BrokerGpuProofInput {
+    BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("accelerated".to_string()),
+        embedding_device_observation_source: Some("sidecar_log".to_string()),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok,
+        embed_smoke_ms: embed_smoke_ok.map(|_| 12),
+        degraded_reason: None,
+    }
+}
+
+fn gpu_runtime_identity(project: &Path, started_at_epoch_ms: i64) -> BrokerGpuRuntimeIdentity {
+    BrokerGpuRuntimeIdentity {
+        workspace_id: codestory_workspace::workspace_id_for_root(project),
+        profile: "agent".to_string(),
+        run_id: Some("shared-agent".to_string()),
+        namespace: "codestory-test".to_string(),
+        compose_project: "codestory-test".to_string(),
+        embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        started_at_epoch_ms,
+        embedding_launch: None,
     }
 }
 
@@ -298,8 +330,48 @@ fn broker_scope_carries_project_and_run_identity() {
     assert_eq!(scope.profile, "agent");
     assert_eq!(scope.run_id.as_deref(), Some("agent-1"));
     assert_eq!(scope.agent_id.as_deref(), Some("agent-1"));
-    assert!(scope.project_id.starts_with("codestory-"));
+    let identity = scope.identity.as_ref().expect("broker identity");
+    assert_eq!(scope.project_id, identity.project_id);
+    assert_eq!(
+        identity.workspace_id,
+        codestory_workspace::workspace_id_for_root(project.path())
+    );
     assert_eq!(scope.cli_version, "9.9.9");
+}
+
+#[test]
+fn native_embedding_reuse_does_not_cross_workspace_roots() {
+    let project = tempdir().expect("project");
+    let other_worktree = tempdir().expect("other worktree");
+    let scope = test_scope(project.path(), "shared-agent");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    let busy = BrokerMachineResourceBusy {
+        snapshot: BrokerResourceSnapshot {
+            resource: NATIVE_EMBEDDING_RESOURCE.to_string(),
+            scope: "machine".to_string(),
+            status: "busy".to_string(),
+            owner_pid: Some(std::process::id()),
+            owner_operation_id: Some("other-worktree".to_string()),
+            owner_project_id: Some(scope.project_id.clone()),
+            owner_workspace_root: Some(clean_path(other_worktree.path())),
+            started_at_epoch_ms: Some(now_epoch_ms()),
+            lock_path: "other-worktree.lock".to_string(),
+            queued_reason: Some("machine_resource_busy".to_string()),
+        },
+    };
+    let mut validate = |_launch: &codestory_retrieval::EmbeddingLaunchMetadata| {
+        panic!("different workspace must not reach launch validation")
+    };
+
+    assert_eq!(
+        reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut validate)
+            .expect("workspace comparison"),
+        None
+    );
 }
 
 #[test]
@@ -868,7 +940,7 @@ fn snapshot_file_uses_unique_temp_names_for_same_process_writers() {
     for index in 0..4 {
         let path = path.clone();
         let mut snapshot = snapshot.clone();
-        snapshot.project_id = format!("codestory-thread-{index}");
+        snapshot.cli_version = format!("9.9.{index}");
         handles.push(thread::spawn(move || {
             for _ in 0..10 {
                 write_snapshot_file(&path, &snapshot).expect("write snapshot");
@@ -883,7 +955,7 @@ fn snapshot_file_uses_unique_temp_names_for_same_process_writers() {
         serde_json::from_str(&fs::read_to_string(&path).expect("read final snapshot"))
             .expect("parse final snapshot");
     assert_eq!(parsed.schema_version, BROKER_SCHEMA_VERSION);
-    assert!(parsed.project_id.starts_with("codestory-thread-"));
+    assert!(parsed.cli_version.starts_with("9.9."));
 }
 
 fn write_ready_repair_status_file(
@@ -1191,6 +1263,7 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
         Some(run_id),
     );
     let started_at = now_epoch_ms();
+    let runtime_identity = gpu_runtime_identity(project.path(), started_at);
     crate::ready_repair_status::write_ready_repair_status(
         &sidecar,
         project.path(),
@@ -1200,27 +1273,17 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
     )
     .expect("write live repair status");
 
-    let during = refresh_broker_snapshot(BrokerSnapshotInput {
-        project_root: project.path().to_path_buf(),
-        cache_root: cache.path().to_path_buf(),
-        agent_run_id: Some(run_id.to_string()),
-        cli_version: "9.9.9".to_string(),
-        gpu_proof: Some(BrokerGpuProofInput {
-            embedding_device_policy: Some("accelerator_required".to_string()),
-            embedding_device_state: Some("accelerated".to_string()),
-            embedding_device_observation_source: Some("native_log".to_string()),
-            embedding_detected_provider: Some("vulkan".to_string()),
-            embedding_detected_gpu: Some("Vulkan0".to_string()),
-            embedding_accelerator_requested: Some(true),
-            embedding_accelerator_request_provider: Some("vulkan".to_string()),
-            embedding_accelerator_request_device: Some("Vulkan0".to_string()),
-            embedding_cpu_allowed: Some(false),
-            embed_smoke_ok: Some(true),
-            embed_smoke_ms: Some(12),
-            degraded_reason: None,
-        }),
-        reconciliation: None,
-    });
+    let during = refresh_broker_snapshot_with_runtime_identity(
+        BrokerSnapshotInput {
+            project_root: project.path().to_path_buf(),
+            cache_root: cache.path().to_path_buf(),
+            agent_run_id: Some(run_id.to_string()),
+            cli_version: "9.9.9".to_string(),
+            gpu_proof: Some(verified_gpu_proof_input(Some(true))),
+            reconciliation: None,
+        },
+        Some(&runtime_identity),
+    );
     assert!(
         during
             .operations
@@ -1231,27 +1294,17 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
 
     crate::ready_repair_status::clear_ready_repair_status(&sidecar, started_at, std::process::id());
 
-    let after = refresh_broker_snapshot(BrokerSnapshotInput {
-        project_root: project.path().to_path_buf(),
-        cache_root: cache.path().to_path_buf(),
-        agent_run_id: Some(run_id.to_string()),
-        cli_version: "9.9.9".to_string(),
-        gpu_proof: Some(BrokerGpuProofInput {
-            embedding_device_policy: Some("accelerator_required".to_string()),
-            embedding_device_state: Some("accelerated".to_string()),
-            embedding_device_observation_source: Some("native_log".to_string()),
-            embedding_detected_provider: Some("vulkan".to_string()),
-            embedding_detected_gpu: Some("Vulkan0".to_string()),
-            embedding_accelerator_requested: Some(true),
-            embedding_accelerator_request_provider: Some("vulkan".to_string()),
-            embedding_accelerator_request_device: Some("Vulkan0".to_string()),
-            embedding_cpu_allowed: Some(false),
-            embed_smoke_ok: Some(true),
-            embed_smoke_ms: Some(12),
-            degraded_reason: None,
-        }),
-        reconciliation: None,
-    });
+    let after = refresh_broker_snapshot_with_runtime_identity(
+        BrokerSnapshotInput {
+            project_root: project.path().to_path_buf(),
+            cache_root: cache.path().to_path_buf(),
+            agent_run_id: Some(run_id.to_string()),
+            cli_version: "9.9.9".to_string(),
+            gpu_proof: Some(verified_gpu_proof_input(Some(true))),
+            reconciliation: None,
+        },
+        Some(&runtime_identity),
+    );
     assert!(
         after
             .operations
@@ -1263,4 +1316,207 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
     let proof = after.gpu_proof.expect("gpu proof on final snapshot");
     assert_eq!(proof.embed_smoke_ok, Some(true));
     assert_eq!(proof.embed_smoke_ms, Some(12));
+}
+
+#[test]
+fn observe_broker_snapshot_is_stable_and_does_not_publish() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    let snapshot_path = broker_snapshot_path(&canonical_root_hash);
+    let _ = fs::remove_file(&snapshot_path);
+
+    let observe = || {
+        observe_broker_snapshot(BrokerSnapshotInput {
+            project_root: project.path().to_path_buf(),
+            cache_root: cache.path().to_path_buf(),
+            agent_run_id: Some("shared-agent".to_string()),
+            cli_version: "9.9.9".to_string(),
+            gpu_proof: None,
+            reconciliation: None,
+        })
+    };
+
+    let first = observe();
+    let second = observe();
+
+    assert_eq!(first, second);
+    assert_eq!(first.updated_at_epoch_ms, 0);
+    assert_eq!(first.persistence_status, "observed");
+    assert!(!snapshot_path.exists());
+}
+
+#[test]
+fn observe_broker_snapshot_reuses_matching_persisted_transition() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let input = || BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: None,
+        reconciliation: None,
+    };
+
+    let published = refresh_broker_snapshot(input());
+    let observed = observe_broker_snapshot(input());
+
+    assert_eq!(observed.updated_at_epoch_ms, published.updated_at_epoch_ms);
+    assert_eq!(observed.persistence_status, "persisted");
+    assert!(observed.persistence_error.is_none());
+}
+
+#[test]
+fn observe_broker_snapshot_preserves_verified_smoke_for_current_runtime() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let runtime_identity = gpu_runtime_identity(project.path(), now_epoch_ms());
+    let input = |embed_smoke_ok| BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: Some(verified_gpu_proof_input(embed_smoke_ok)),
+        reconciliation: None,
+    };
+
+    let refreshed =
+        refresh_broker_snapshot_with_runtime_identity(input(Some(true)), Some(&runtime_identity));
+    let observed =
+        observe_broker_snapshot_with_runtime_identity(input(None), Some(&runtime_identity));
+
+    assert_eq!(
+        refreshed.gpu_proof.as_ref().unwrap().proof_status,
+        "verified"
+    );
+    assert_eq!(
+        observed.gpu_proof.as_ref().unwrap().proof_status,
+        "verified"
+    );
+    assert_eq!(
+        observed.gpu_proof.as_ref().unwrap().embed_smoke_ok,
+        Some(true)
+    );
+    assert_eq!(
+        observed.gpu_proof.as_ref().unwrap().embed_smoke_ms,
+        Some(12)
+    );
+    assert_eq!(observed.updated_at_epoch_ms, refreshed.updated_at_epoch_ms);
+    assert_eq!(observed.persistence_status, "persisted");
+}
+
+#[test]
+fn observe_broker_snapshot_invalidates_verified_smoke_for_changed_runtime_identity() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let original_runtime = gpu_runtime_identity(project.path(), now_epoch_ms());
+    let mut changed_runtime = original_runtime.clone();
+    changed_runtime.started_at_epoch_ms += 1;
+    let input = |embed_smoke_ok| BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: Some(verified_gpu_proof_input(embed_smoke_ok)),
+        reconciliation: None,
+    };
+
+    let refreshed =
+        refresh_broker_snapshot_with_runtime_identity(input(Some(true)), Some(&original_runtime));
+    let observed =
+        observe_broker_snapshot_with_runtime_identity(input(None), Some(&changed_runtime));
+
+    assert_eq!(
+        refreshed.gpu_proof.as_ref().unwrap().proof_status,
+        "verified"
+    );
+    let proof = observed.gpu_proof.expect("observed gpu proof");
+    assert_eq!(proof.proof_status, "gpu_unverified");
+    assert!(!proof.meaningful_accelerator_work_proven);
+    assert_eq!(proof.embed_smoke_ok, None);
+    assert_eq!(proof.runtime_identity, None);
+    assert_eq!(observed.persistence_status, "observed");
+}
+
+#[test]
+fn legacy_snapshot_observation_is_read_only_and_refresh_migrates_to_v2() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    let snapshot_path = broker_snapshot_path(&canonical_root_hash);
+    fs::create_dir_all(snapshot_path.parent().expect("snapshot parent"))
+        .expect("create snapshot parent");
+    let mut legacy = sample_snapshot(project.path());
+    legacy.schema_version = LEGACY_BROKER_SCHEMA_VERSION;
+    legacy.identity = None;
+    legacy.project_id = format!("codestory-{}", &canonical_root_hash[..16]);
+    let legacy_json = serde_json::to_vec_pretty(&legacy).expect("serialize legacy snapshot");
+    fs::write(&snapshot_path, &legacy_json).expect("write legacy snapshot");
+    let input = || BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: None,
+        reconciliation: None,
+    };
+
+    let observed = observe_broker_snapshot(input());
+    assert_eq!(observed.schema_version, BROKER_SCHEMA_VERSION);
+    assert_eq!(observed.persistence_status, "observed");
+    assert_eq!(
+        fs::read(&snapshot_path).expect("legacy snapshot remains"),
+        legacy_json,
+        "observational reads must not migrate persisted state"
+    );
+
+    let refreshed = refresh_broker_snapshot(input());
+    assert_eq!(refreshed.schema_version, BROKER_SCHEMA_VERSION);
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot_path).expect("read migrated snapshot"))
+            .expect("parse migrated snapshot");
+    assert_eq!(migrated["schema_version"], BROKER_SCHEMA_VERSION);
+    assert_eq!(
+        migrated["identity"]["workspace_id"],
+        codestory_workspace::workspace_id_for_root(project.path())
+    );
+    let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn legacy_machine_lock_derives_identity_without_rewriting() {
+    let project = tempdir().expect("project");
+    let resource = unique_resource("legacy-identity");
+    cleanup_machine_resource(&resource);
+    let mut scope = test_scope(project.path(), "shared-agent");
+    scope.schema_version = LEGACY_BROKER_SCHEMA_VERSION;
+    scope.identity = None;
+    scope.project_id = format!(
+        "codestory-{}",
+        &hash_text(&clean_path_text(project.path()))[..16]
+    );
+    let lock = BrokerMachineResourceLockFile {
+        schema_version: LEGACY_BROKER_SCHEMA_VERSION,
+        resource: resource.clone(),
+        operation_id: "legacy-operation".to_string(),
+        scope,
+        pid: std::process::id(),
+        started_at_epoch_ms: now_epoch_ms(),
+        token: "legacy-token".to_string(),
+        native_embedding_launch: None,
+    };
+    let path = machine_resource_lock_path(&resource);
+    fs::create_dir_all(path.parent().expect("lock parent")).expect("create lock parent");
+    let legacy_json = serde_json::to_vec_pretty(&lock).expect("serialize legacy lock");
+    fs::write(&path, &legacy_json).expect("write legacy lock");
+
+    let parsed = read_machine_resource_lock_file(&path).expect("read legacy machine lock");
+    let identity = effective_scope_identity(&parsed.scope).expect("derive legacy identity");
+    assert_eq!(
+        identity.workspace_id,
+        codestory_workspace::workspace_id_for_root(project.path())
+    );
+    assert_eq!(fs::read(&path).expect("lock remains"), legacy_json);
+    cleanup_machine_resource(&resource);
 }

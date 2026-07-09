@@ -850,6 +850,7 @@ mod tests {
 
     fn state(namespace: &str, root: &Path, started_at_epoch_ms: i64) -> SidecarStateFile {
         SidecarStateFile {
+            project_identity: None,
             owner: "codestory".to_string(),
             profile: "agent".to_string(),
             namespace: namespace.to_string(),

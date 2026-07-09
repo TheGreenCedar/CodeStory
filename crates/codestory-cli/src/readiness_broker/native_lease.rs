@@ -365,9 +365,19 @@ pub(crate) fn reusable_native_embedding_resource_pid(
     let Some(owner_pid) = busy.snapshot.owner_pid else {
         return Ok(None);
     };
-    if busy.snapshot.owner_project_id.as_deref() != Some(scope.project_id.as_str())
-        || busy.snapshot.owner_workspace_root.as_deref() != Some(scope.workspace_root.as_str())
-    {
+    let Some(scope_identity) = super::scope::effective_scope_identity(scope) else {
+        return Ok(None);
+    };
+    let Some(owner_workspace_root) = busy.snapshot.owner_workspace_root.as_deref() else {
+        return Ok(None);
+    };
+    let Some(owner_identity) = super::scope::identity_from_workspace_root(owner_workspace_root)
+    else {
+        return Ok(None);
+    };
+    let same_normalized_root = super::scope::normalized_workspace_root(owner_workspace_root)
+        == super::scope::normalized_workspace_root(&scope.workspace_root);
+    if owner_identity.workspace_id != scope_identity.workspace_id || !same_normalized_root {
         return Ok(None);
     }
     let Some(state) = read_sidecar_state_file(sidecar)? else {

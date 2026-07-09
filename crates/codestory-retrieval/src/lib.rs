@@ -21,6 +21,7 @@ mod health;
 mod index;
 mod inventory;
 mod mode;
+pub mod outbound_http;
 mod planner;
 mod qdrant_client;
 mod qdrant_storage;

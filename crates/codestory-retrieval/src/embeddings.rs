@@ -4,6 +4,7 @@
 //! uses **BAAI/bge-base-en-v1.5** (768-dim) via llama.cpp `/v1/embeddings` for query vectors and
 //! semantic smoke checks.
 
+use crate::outbound_http::read_text;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -805,17 +806,18 @@ fn llamacpp_embed_with_timeout(
         "model": "bge-base-en-v1.5",
     });
     let payload = serde_json::to_string(&body).context("serialize embeddings request")?;
-    let response = ureq::post(url)
-        .timeout(timeout)
-        .set("Content-Type", "application/json")
-        .send_string(&payload)
-        .map_err(|error| anyhow!("llama.cpp embeddings request failed: {error}"))?;
-    let status = response.status();
+    let response = read_text(
+        ureq::post(url)
+            .timeout(timeout)
+            .set("Content-Type", "application/json")
+            .send_string(&payload),
+    )
+    .map_err(|error| anyhow!("llama.cpp embeddings request failed: {error}"))?;
+    let status = response.status;
     if !(200..300).contains(&status) {
         bail!("llama.cpp embeddings http {status}");
     }
-    let response_body = response.into_string().unwrap_or_default();
-    parse_openai_embeddings(&response_body, true)
+    parse_openai_embeddings(&response.body, true)
 }
 
 #[derive(Deserialize)]
@@ -1497,6 +1499,7 @@ mod tests {
         let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
@@ -1546,6 +1549,7 @@ mod tests {
         let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,

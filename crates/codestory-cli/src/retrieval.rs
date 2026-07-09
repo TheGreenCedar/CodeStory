@@ -176,7 +176,7 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
         strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
     }
     .context("retrieval status")?;
-    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
+    let readiness_broker = crate::readiness_broker::observe_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
             cache_root: runtime.cache_root.clone(),

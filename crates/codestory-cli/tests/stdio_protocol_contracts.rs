@@ -754,6 +754,19 @@ fn write_abandoned_repair_status_fixture(
     write_repair_status_fixture(fixture, run_id, phase, updated_at, u32::MAX)
 }
 
+fn write_stale_live_repair_status_fixture(
+    fixture: &StdioFixture,
+    run_id: &str,
+    phase: &str,
+) -> (PathBuf, RemoveDirOnDrop) {
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64
+        - 60_000;
+    write_repair_status_fixture(fixture, run_id, phase, updated_at, std::process::id())
+}
+
 fn write_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
@@ -2520,6 +2533,19 @@ fn resources_read_status_reports_active_agent_repair_phase() {
     assert_eq!(agent_lane["profile"], json!("agent"), "{status}");
     assert_eq!(agent_lane["run_id"], json!("issue-661-proof"), "{status}");
     assert_eq!(agent_lane["phase"], json!("Qdrant finalize"), "{status}");
+    let broker_operation = status["readiness_broker"]["operations"]
+        .as_array()
+        .and_then(|operations| {
+            operations.iter().find(|operation| {
+                operation["operation_kind"] == json!("agent_repair")
+                    && operation["status"] == json!("running")
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!("active repair lane requires matching broker operation: {status}")
+        });
+    assert_eq!(broker_operation["run_id"], agent_lane["run_id"], "{status}");
+    assert_eq!(broker_operation["phase"], agent_lane["phase"], "{status}");
     assert!(
         agent_lane["namespace"]
             .as_str()
@@ -2782,11 +2808,16 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
             && !next_call_text.contains("\"tool\":\"repair_all\""),
         "enabled policy should recommend explicit sidecar_setup repair: {status}"
     );
+    assert_eq!(
+        status["readiness_broker"]["project_id"],
+        status["readiness_broker"]["identity"]["project_id"],
+        "status should expose the durable readiness broker identity: {status}"
+    );
     assert!(
-        status["readiness_broker"]["project_id"]
+        status["readiness_broker"]["identity"]["workspace_id"]
             .as_str()
-            .is_some_and(|project_id| project_id.starts_with("codestory-")),
-        "status should expose the durable readiness broker snapshot: {status}"
+            .is_some_and(|workspace_id| !workspace_id.is_empty()),
+        "status should expose workspace ownership separately: {status}"
     );
     assert_eq!(
         status["readiness_broker"]["resources"]["native_embedding_runtime"]["scope"],
@@ -3214,6 +3245,46 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
                 && command.contains("--profile agent")
                 && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
         "already-running response should point to cheap status inspection: {repair}"
+    );
+}
+
+#[test]
+fn tools_call_sidecar_setup_preserves_stale_live_repair_ownership() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    let (status_path, _cleanup) = write_stale_live_repair_status_fixture(
+        &fixture,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        "Embedding documents",
+    );
+    let status_before = fs::read_to_string(&status_path).expect("read stale live status fixture");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let repair_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "sidecar-setup-repair-stale-live",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
+        }),
+    );
+    let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair-stale-live"));
+    assert_eq!(repair["status"], json!("already_running"), "{repair}");
+    assert!(
+        repair["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("live_ready_repair_heartbeat_stale")),
+        "stale heartbeat should be reported without reclaiming the live owner: {repair}"
+    );
+    assert_eq!(repair["pid"], Value::Null, "{repair}");
+    assert_eq!(
+        fs::read_to_string(&status_path).expect("stale live status should remain"),
+        status_before,
+        "repair enqueue must not rewrite or delete stale status owned by a live PID"
     );
 }
 

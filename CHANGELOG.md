@@ -1,15 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Fixed
-
-- Hardened durable readiness repair ownership so live local-refresh and ready
-  repair locks are not age-reclaimed, MCP sidecar repair spawn is single-flight,
-  GPU proof requires runtime/log evidence, native lock handoff publishes safely,
-  Linux `native_spawned` rejects compose-only metadata, and `retrieval status`
-  includes the readiness broker snapshot.
-
 ## 0.14.0
 
 CodeStory 0.14.0 turns the 0.13.x MCP recovery fixes into a durable readiness
@@ -31,6 +21,15 @@ the installed runtime is stale, busy, or unavailable.
 
 ### Changed
 
+- Made the CLI entrypoint and stdio transport async with Tokio, including
+  bounded blocking work, ordered responses, frame limits, queued-request
+  cancellation, and canceled-response suppression without changing command
+  names or MCP wire contracts.
+- Consolidated outbound sidecar HTTP status/body handling behind shared `ureq`
+  helpers while keeping the loopback browser HTTP server unchanged.
+- Added versioned project, workspace, and artifact-scope identity to readiness
+  snapshots and sidecar ownership. Existing cache namespaces remain compatible,
+  and dirty or unidentified worktrees fail closed to workspace-local reuse.
 - Split readiness into local-navigation and agent-packet/search lanes so stale
   local indexes, sidecar policy, native embedding ownership, and packet/search
   readiness no longer collapse into one ambiguous ready/not-ready result.
@@ -47,6 +46,18 @@ the installed runtime is stale, busy, or unavailable.
 
 ### Fixed
 
+- Hardened durable readiness repair ownership so live local-refresh and ready
+  repair locks are not age-reclaimed, concurrent MCP repair is single-flight,
+  and intentionally preserved live ownership reports an explicit orphan reason.
+- Made readiness locks and broker snapshots publish atomically, including safe
+  native lock handoff and Windows replacement, without changing PID, TTL,
+  heartbeat, or ownership semantics.
+- Required runtime/log-backed accelerator observation plus a successful smoke
+  before GPU proof is verified; device inventory and operator assertions remain
+  diagnostic evidence only.
+- Made explicit `native_spawned` selection reject compose-only Linux backends,
+  and exposed the durable broker snapshot consistently through `doctor`,
+  `retrieval status`, and plugin bootstrap status.
 - Prevented installed MCP from binding to another workspace's global active-state
   file when the host has a current Codex thread but no matching thread-scoped
   active-state file yet.

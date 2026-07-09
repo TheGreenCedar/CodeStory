@@ -180,6 +180,8 @@ pub struct SidecarPorts {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SidecarOwnership {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
     pub owner: String,
     pub profile: String,
     pub namespace: String,
@@ -192,6 +194,7 @@ pub struct SidecarOwnership {
 
 #[derive(Debug, Clone)]
 pub struct SidecarRuntimeConfig {
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
     pub layout: SidecarLayout,
     pub profile: SidecarProfile,
     pub run_id: Option<String>,
@@ -333,6 +336,7 @@ impl SidecarRuntimeConfig {
         let cleanup_command = project_root
             .map(|path| retrieval_command("down", path, profile, run_id.as_deref(), None))
             .unwrap_or_else(|| "codestory-cli retrieval down".to_string());
+        let project_identity = project_root.map(codestory_workspace::cached_project_identity_v2);
         let mut labels = BTreeMap::new();
         labels.insert("dev.codestory.owner".into(), "codestory".into());
         labels.insert("dev.codestory.profile".into(), profile.as_str().into());
@@ -340,10 +344,24 @@ impl SidecarRuntimeConfig {
         if let Some(project_root) = project_root {
             let hash = project_hash(project_root);
             labels.insert("dev.codestory.project_hash".into(), hash.clone());
-            labels.insert(
-                "dev.codestory.project_id".into(),
-                format!("codestory-{hash}"),
-            );
+            if let Some(identity) = project_identity.as_ref() {
+                labels.insert(
+                    "dev.codestory.project_id".into(),
+                    identity.project_id.clone(),
+                );
+                labels.insert(
+                    "dev.codestory.workspace_id".into(),
+                    identity.workspace_id.clone(),
+                );
+                labels.insert(
+                    "dev.codestory.artifact_scope_id".into(),
+                    identity.artifact_scope_id.clone(),
+                );
+                labels.insert(
+                    "dev.codestory.project_identity_schema_version".into(),
+                    identity.project_identity_schema_version.to_string(),
+                );
+            }
             labels.insert(
                 "dev.codestory.workspace_root".into(),
                 project_root.to_string_lossy().to_string(),
@@ -354,6 +372,7 @@ impl SidecarRuntimeConfig {
             labels.insert("dev.codestory.agent_id".into(), run_id.to_string());
         }
         Self {
+            project_identity,
             layout,
             profile,
             run_id,
@@ -367,6 +386,7 @@ impl SidecarRuntimeConfig {
 
     pub fn ownership(&self) -> SidecarOwnership {
         SidecarOwnership {
+            project_identity: self.project_identity.clone(),
             owner: "codestory".into(),
             profile: self.profile.as_str().into(),
             namespace: self.namespace.clone(),
@@ -929,6 +949,43 @@ mod tests {
         );
         assert_eq!(first.embed_http_port, second.embed_http_port);
         assert!(first.cleanup_command.contains("--run-id shared-agent"));
+    }
+
+    #[test]
+    fn project_runtime_exposes_v2_identity_without_changing_namespace_contract() {
+        let _lock = crate::test_support::env_lock();
+        let project = tempdir().expect("project");
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            project.path().join("cache").to_str().expect("utf8 cache"),
+        );
+        let runtime =
+            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+        let identity = runtime.project_identity.as_ref().expect("project identity");
+
+        assert_eq!(
+            runtime.labels.get("dev.codestory.project_id"),
+            Some(&identity.project_id)
+        );
+        assert_eq!(
+            runtime.labels.get("dev.codestory.workspace_id"),
+            Some(&identity.workspace_id)
+        );
+        assert_eq!(
+            runtime.labels.get("dev.codestory.artifact_scope_id"),
+            Some(&identity.artifact_scope_id)
+        );
+        assert!(
+            runtime.namespace.starts_with(&format!(
+                "codestory-agent-{}-",
+                project_hash(project.path())
+            )),
+            "0.14 identity metadata must not rename existing sidecar namespaces"
+        );
+        assert_eq!(
+            runtime.ownership().project_identity.as_ref(),
+            Some(identity)
+        );
     }
 
     #[test]

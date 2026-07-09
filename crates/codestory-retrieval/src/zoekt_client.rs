@@ -1,4 +1,5 @@
 use crate::config::{SidecarLayout, ZOEKT_HEALTH_BUDGET};
+use crate::outbound_http::read_text;
 use crate::zoekt_index::{search_lexical_index, shard_dir_for, shard_has_lexical_index};
 use anyhow::Result;
 use std::time::{Duration, Instant};
@@ -28,9 +29,9 @@ impl ZoektClient {
     pub fn health_probe(&self) -> ZoektHealthProbe {
         let started = Instant::now();
         let url = format!("{}/", self.base_url);
-        match ureq::get(&url).timeout(self.timeout).call() {
+        match read_text(ureq::get(&url).timeout(self.timeout).call()) {
             Ok(response) => {
-                let status = response.status();
+                let status = response.status;
                 ZoektHealthProbe {
                     reachable: (200..500).contains(&status),
                     latency_ms: started.elapsed().as_millis() as u64,
