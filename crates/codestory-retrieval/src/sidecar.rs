@@ -561,22 +561,40 @@ fn native_embedding_linux_process_state(process_dir: &Path) -> Result<Option<cha
 #[cfg(all(not(windows), not(target_os = "linux")))]
 fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingProcessSnapshot>> {
     let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
+        .args(["-p", &pid.to_string(), "-o", "state=", "-o", "command="])
         .output()
         .with_context(|| format!("query native embedding pid {pid}"))?;
     if !output.status.success() {
         return Ok(None);
     }
-    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if command_line.is_empty() {
-        return Ok(None);
+    let mut snapshot =
+        native_embedding_non_linux_unix_process_snapshot_from_ps_output(&output.stdout);
+    if let Some(snapshot) = &mut snapshot {
+        snapshot.started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
     }
-    let started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
-    Ok(Some(NativeEmbeddingProcessSnapshot {
+    Ok(snapshot)
+}
+
+#[cfg(any(test, all(not(windows), not(target_os = "linux"))))]
+fn native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+    output: &[u8],
+) -> Option<NativeEmbeddingProcessSnapshot> {
+    let row = String::from_utf8_lossy(output);
+    let row = row.trim();
+    let state_end = row.find(char::is_whitespace).unwrap_or(row.len());
+    let state = &row[..state_end];
+    if state.is_empty() || state.starts_with('Z') {
+        return None;
+    }
+    let command_line = row[state_end..].trim().to_string();
+    if command_line.is_empty() {
+        return None;
+    }
+    Some(NativeEmbeddingProcessSnapshot {
         executable_path: None,
         command_line: Some(command_line),
-        started_at_epoch_ms,
-    }))
+        started_at_epoch_ms: None,
+    })
 }
 
 #[cfg(not(windows))]
@@ -1224,6 +1242,32 @@ mod tests {
         test_result?;
         reap_result?;
         Ok(())
+    }
+
+    #[test]
+    fn native_embedding_non_linux_unix_ps_parser_treats_zombie_as_not_running() {
+        assert_eq!(
+            native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+                b"Z    /tmp/llama-server --port 18080\n"
+            ),
+            None
+        );
+        assert_eq!(
+            native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+                b"Z+   /tmp/llama-server --port 18080\n"
+            ),
+            None
+        );
+        assert_eq!(
+            native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+                b"S    /tmp/llama-server --port 18080\n"
+            ),
+            Some(NativeEmbeddingProcessSnapshot {
+                executable_path: None,
+                command_line: Some("/tmp/llama-server --port 18080".to_string()),
+                started_at_epoch_ms: None,
+            })
+        );
     }
 
     #[test]
