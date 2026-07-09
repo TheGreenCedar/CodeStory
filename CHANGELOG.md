@@ -19,6 +19,8 @@
   spawned llama.cpp PID, releasing them on retrieval down, preserving fresh local
   refresh locks when only status is stale, and routing MCP repair guidance
   through `sidecar_setup repair` instead of raw `repair_all`.
+- Preserved live local refresh locks past the stale-status TTL so long-running
+  local index refreshes cannot be unlocked by age-only cleanup.
 - Hardened native embedding teardown so `retrieval down` verifies the recorded
   llama.cpp process identity before killing a PID, propagates stop and lock
   release failures, and cleans up spawned processes if sidecar state persistence
