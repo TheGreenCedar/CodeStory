@@ -10255,10 +10255,9 @@ impl AppController {
         let canonical_id = node.canonical_id.as_deref()?;
         let mut metadata = if let Some(raw) = canonical_id.strip_prefix("route_endpoint:") {
             route_endpoint_metadata_from_canonical(raw, node, source_file).ok()?
-        } else if let Some(label) = canonical_id.strip_prefix("openapi:endpoint:") {
-            route_endpoint_metadata_from_openapi_label(label, node, source_file)?
         } else {
-            return None;
+            let label = canonical_id.strip_prefix("openapi:endpoint:")?;
+            route_endpoint_metadata_from_openapi_label(label, node, source_file)?
         };
 
         if metadata.handler.is_none() {
