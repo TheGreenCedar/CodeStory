@@ -437,12 +437,11 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         "accelerated"
     } else if saw_cpu {
         "cpu"
-    } else if saw_metal {
-        "accelerated"
-    } else if !log_markers.is_empty()
-        && log_markers
-            .iter()
-            .all(|marker| text.contains(&marker.to_ascii_lowercase()))
+    } else if saw_metal
+        || (!log_markers.is_empty()
+            && log_markers
+                .iter()
+                .all(|marker| text.contains(&marker.to_ascii_lowercase())))
     {
         "accelerated"
     } else {
@@ -467,10 +466,9 @@ fn selected_backend_log_markers() -> Vec<String> {
 fn line_reports_gpu_offload(line: &str) -> Option<bool> {
     let keyword = if let Some(offset) = line.find("offloaded ") {
         offset + "offloaded ".len()
-    } else if let Some(offset) = line.find("offloading ") {
-        offset + "offloading ".len()
     } else {
-        return None;
+        let offset = line.find("offloading ")?;
+        offset + "offloading ".len()
     };
     let digits = line[keyword..]
         .chars()

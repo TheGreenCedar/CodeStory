@@ -860,11 +860,13 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
 }
 
 fn env_port(name: &str, default: u16) -> Option<u16> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|port| *port != 0)
-        .or(Some(default).filter(|_| std::env::var(name).is_ok()))
+    std::env::var(name).ok().map(|value| {
+        value
+            .parse()
+            .ok()
+            .filter(|port| *port != 0)
+            .unwrap_or(default)
+    })
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
