@@ -2,111 +2,60 @@
 
 ## Unreleased
 
-### Fixed
+## 0.14.0
 
-- Preserved ready-repair GPU smoke proof through the final broker snapshot,
-  reaped stale malformed readiness locks, bounded orphaned local refresh locks,
-  and marked diagnostic fail-open repair history stale when it points at an old
-  CLI.
-- Cleared MCP recent-repair status overlays unless the repair PID is still alive
-  or durable on-disk active repair status exists, so a dead spawn cannot look
-  like a live repair for 30s.
-- Stopped age-only reclaim of live pre-handoff native embedding broker locks;
-  pre-handoff locks stay held while the owner PID is running.
-- Failed closed when Windows `CREATE_BREAKAWAY_FROM_JOB` is denied for native
-  llama.cpp spawn, instead of retrying into a job-bound child that dies when
-  repair exits.
-- Required a live timed embedding smoke before long ready-repair semantic work
-  when accelerator is required; `gpu_proof` now reports `embed_smoke_ok` /
-  `embed_smoke_ms` and only marks `verified` when smoke succeeds.
-- Retargeted CodeStory-managed llama.cpp embedding URLs during repair so stale
-  managed endpoints from a long-lived MCP parent cannot pin a new native sidecar
-  probe to the wrong port.
-- Waited for Unix native llama.cpp processes to exit after `SIGTERM` before
-  releasing native embedding broker ownership.
-- Corrected shipped CodeStory status and Windows terminal plugin guidance to
-  use the actual `gpu_proof` fields and `codex.cmd` command surface.
+CodeStory 0.14.0 turns the 0.13.x MCP recovery fixes into a durable readiness
+contract. Compared with 0.13.12, agents now get lane-specific status, explicit
+sidecar setup controls, GPU proof, and repair guidance that stays honest when
+the installed runtime is stale, busy, or unavailable.
+
+### Added
+
+- Added a durable readiness broker for CLI/MCP repair state, with cross-process
+  snapshots for active repairs, abandoned repairs, local refresh cleanup,
+  machine-scoped native embedding locks, resource ownership, and GPU proof.
+- Added explicit MCP `sidecar_setup` status/config/repair guidance for
+  packet/search sidecars, including enabled/disabled/ask policy states and
+  diagnostic fail-open status when the real stdio runtime cannot start.
+- Added accelerator proof fields to status output so operators can see the
+  requested device, observed device, provider, live embedding smoke result,
+  elapsed smoke time, and degraded reason before trusting agent packet/search.
 
 ### Changed
 
-- Split the durable readiness broker into focused modules under
-  `crates/codestory-cli/src/readiness_broker/` while keeping the same
-  `readiness_broker::` call paths.
-- Extracted shared native-embedding lease lifecycle ordering for ready-repair and
-  retrieval bootstrap, and decomposed stdio status assembly into sidecar,
-  readiness, broker, and surfaces builders without changing status JSON keys.
-- Aligned diagnostic fail-open MCP `readiness_broker` stubs with the Rust
-  snapshot schema, including `gpu_proof.embed_smoke_ok` and `embed_smoke_ms`.
-- Bundled bootstrap sidecar knobs into `BootstrapSidecarsOptions` for the
-  progress-aware bootstrap entrypoint.
-
-## 0.14.0
-
-CodeStory 0.14.0 ships the durable readiness broker and hardens native
-embedding sidecar ownership so CLI and MCP repair paths preserve exclusive
-locks while reporting status truthfully.
+- Split readiness into local-navigation and agent-packet/search lanes so stale
+  local indexes, sidecar policy, native embedding ownership, and packet/search
+  readiness no longer collapse into one ambiguous ready/not-ready result.
+- Made status reads observational: MCP status no longer starts background
+  sidecar repair by itself, and recovery instructions point agents to the
+  allowed `sidecar_setup` action instead of raw CLI repair commands.
+- Made ready-repair and retrieval bootstrap share native embedding ownership
+  rules. Existing CodeStory-owned sidecars can be reused only when recorded
+  PID/launch metadata still match, and reuse-only repairs do not tear down
+  sidecars they did not start.
+- Updated plugin/operator guidance for the current status contract, including
+  `gpu_proof` interpretation, diagnostic fail-open limits, stale workspace
+  behavior, and Windows `codex.cmd` invocation.
 
 ### Fixed
 
-- Prevented the installed MCP launcher from binding to another workspace's
-  global active-state file when the host has a current Codex thread but no
-  matching thread-scoped active-state file yet.
-- Added a durable readiness broker for CLI/MCP repair state, with
-  cross-process snapshots, orphan repair reconciliation, machine-scoped native
-  embedding locking, GPU proof reporting, and explicit-only MCP repair from
-  status reads.
-- Hardened readiness broker state management so stale native embedding locks are
-  reaped under a separate atomic guard, final success snapshots are written
-  after repair locks are released, and status recommendations distinguish
-  consent, disabled, unmanaged, and enabled MCP repair policy.
-- Persisted native embedding ownership by transferring broker leases to the
-  spawned llama.cpp PID, releasing them on retrieval down, preserving fresh local
-  refresh locks when only status is stale, and routing MCP repair guidance
-  through `sidecar_setup repair` instead of raw `repair_all`.
-- Preserved live local refresh locks past the stale-status TTL so long-running
-  local index refreshes cannot be unlocked by age-only cleanup.
-- Hardened native embedding teardown so `retrieval down` verifies the recorded
-  llama.cpp process identity before killing a PID, propagates stop and lock
-  release failures, and cleans up spawned processes if sidecar state persistence
-  fails.
-- Made `repair_all` a deprecated MCP compatibility alias for background
-  `sidecar_setup repair`, removed it from status recommendations, and made
-  diagnostic fail-open MCP reject fake repair attempts until the real stdio
-  runtime is restored.
-- Fixed Windows native llama.cpp startup under restrictive host job objects by
-  retrying without `CREATE_BREAKAWAY_FROM_JOB` when Windows denies the
-  best-effort detached spawn.
-- Preserved native embedding ownership across endpoint reuse and `retrieval up`
-  by requiring PID-backed state for CodeStory-spawned native endpoints,
-  treating explicit `CODESTORY_EMBED_LLAMACPP_URL` endpoints as external, and
-  publishing immediate MCP repair handoff state for `sidecar_setup repair`.
-- Fixed managed native bootstrap launch-mode selection so CodeStory-injected
-  `CODESTORY_EMBED_LLAMACPP_URL` defaults no longer force `external_endpoint`
-  before native spawn and broker locking on Windows and macOS arm64 hosts.
-- Allowed sequential native sidecar repairs to reuse the same validated
-  CodeStory-spawned llama.cpp PID instead of treating the broker lease as a
-  foreign machine lock after the first successful repair.
-- Closed native embedding broker lease and stale-reaper races by making reused
-  leases reuse-only, revalidating reused PID handoffs, preserving same-project
-  MCP repair reuse, and invalidating status cache entries when broker locks
-  change.
-- Hardened follow-up native embedding cleanup and status contracts so transferred
-  broker locks are released by launch identity, failed post-transfer repairs
-  tear down their sidecars, blank explicit endpoints no longer select external
-  mode, and `allowed_surfaces.sidecar_setup` matches repair recommendations.
-- Kept reused native embedding leases from stopping shared sidecars on later
-  repair failures, preserved native broker locks when process identity cannot be
-  verified, and kept `sidecar_setup status` available while native repair is
-  blocked.
-- Kept reused native embedding leases from running sidecar teardown when final
-  lease transfer validation fails, so reuse-only repairs cannot stop the shared
-  owner they did not spawn.
-- Declared `sidecar_setup` as a status/config surface during workspace-mismatch
-  diagnostics so MCP status matches the tools that remain callable.
-- Serialized native launch lock release with stale-lock reaping and required
-  exact launch metadata before removing a machine lock.
-- Made deprecated `repair_all` obey its `allowed=false` status while returning
-  canonical `sidecar_setup repair` guidance in the readiness block.
+- Prevented installed MCP from binding to another workspace's global active-state
+  file when the host has a current Codex thread but no matching thread-scoped
+  active-state file yet.
+- Prevented stale repair records, malformed machine locks, PID reuse, stale
+  local-refresh status, and broker-lock races from making CodeStory surfaces
+  look busy or ready after the owning process has gone away.
+- Preserved live GPU smoke proof through final broker snapshots and refused to
+  report accelerator-required packet/search as verified without a live timed
+  embedding smoke.
+- Kept native llama.cpp sidecars alive and accurately owned across Windows,
+  macOS, Linux, endpoint reuse, `retrieval up`, `retrieval down`, failed repair,
+  host job-object restrictions, and Unix shutdown.
+- Made diagnostic fail-open mode reject fake repairs, keep only safe status and
+  setup surfaces callable, and mark old repair history stale when it points at
+  an old CLI version or path.
+- Made deprecated `repair_all` obey its blocked status while returning canonical
+  `sidecar_setup repair` guidance for compatibility callers.
 
 ## 0.13.12
 
