@@ -23,6 +23,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Runtime state file written by `sidecar_up`.
 ///
@@ -273,6 +275,7 @@ fn stop_native_embedding_process(pid: u32, launch: &EmbeddingLaunchMetadata) -> 
 struct NativeEmbeddingProcessSnapshot {
     executable_path: Option<String>,
     command_line: Option<String>,
+    started_at_epoch_ms: Option<i64>,
 }
 
 fn ensure_native_embedding_process_matches(
@@ -313,6 +316,14 @@ fn ensure_native_embedding_process_matches(
             bail!("live native embedding command line is missing recorded launch arg {arg:?}");
         }
     }
+    if let (Some(expected), Some(actual)) =
+        (launch.spawned_at_epoch_ms, snapshot.started_at_epoch_ms)
+        && expected.abs_diff(actual) > NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS as u64
+    {
+        bail!(
+            "live process start time does not match recorded native embedding launch: expected around {expected}, got {actual}"
+        );
+    }
     Ok(())
 }
 
@@ -341,10 +352,12 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
         executable_path: Option<String>,
         #[serde(rename = "CommandLine")]
         command_line: Option<String>,
+        #[serde(rename = "StartedAtEpochMs")]
+        started_at_epoch_ms: Option<i64>,
     }
 
     let script = format!(
-        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 2 }}; $p | Select-Object -First 1 -Property ExecutablePath,CommandLine | ConvertTo-Json -Compress"
+        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 2 }}; $started=[int64](([Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds); [pscustomobject]@{{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine;StartedAtEpochMs=$started}} | ConvertTo-Json -Compress"
     );
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -364,6 +377,7 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
     Ok(Some(NativeEmbeddingProcessSnapshot {
         executable_path: info.executable_path,
         command_line: info.command_line,
+        started_at_epoch_ms: info.started_at_epoch_ms,
     }))
 }
 
@@ -384,9 +398,11 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
             .collect::<Vec<_>>()
             .join(" ")
     });
+    let started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
     Ok(Some(NativeEmbeddingProcessSnapshot {
         executable_path,
         command_line,
+        started_at_epoch_ms,
     }))
 }
 
@@ -403,10 +419,28 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
     if command_line.is_empty() {
         return Ok(None);
     }
+    let started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
     Ok(Some(NativeEmbeddingProcessSnapshot {
         executable_path: None,
         command_line: Some(command_line),
+        started_at_epoch_ms,
     }))
+}
+
+#[cfg(not(windows))]
+fn native_embedding_process_started_at_epoch_ms(pid: u32) -> Option<i64> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "etimes="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let elapsed_secs = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    Some(chrono::Utc::now().timestamp_millis() - elapsed_secs.saturating_mul(1000))
 }
 
 /// Probe sidecar health and attach the latest retrieval manifest when storage is available.
@@ -929,6 +963,7 @@ mod tests {
                 "\"C:\\cache\\llama-server.exe\" --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
                     .to_string(),
             ),
+            started_at_epoch_ms: Some(123),
         };
 
         ensure_native_embedding_process_matches(&launch, &snapshot).expect("matching snapshot");
@@ -943,6 +978,7 @@ mod tests {
                 "C:/Windows/System32/notepad.exe --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
                     .to_string(),
             ),
+            started_at_epoch_ms: Some(123),
         };
 
         let error = ensure_native_embedding_process_matches(&launch, &snapshot)
@@ -960,6 +996,7 @@ mod tests {
         let snapshot = NativeEmbeddingProcessSnapshot {
             executable_path: Some("C:/cache/llama-server.exe".to_string()),
             command_line: Some("\"C:/cache/llama-server.exe\" --port 18080".to_string()),
+            started_at_epoch_ms: Some(123),
         };
 
         let error = ensure_native_embedding_process_matches(&launch, &snapshot)
@@ -979,6 +1016,30 @@ mod tests {
             .expect_err("current process pid should fail closed");
         assert!(
             error.to_string().contains("current CodeStory process"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_embedding_identity_rejects_reused_pid_with_same_command() {
+        let launch = native_embedding_launch_fixture();
+        let snapshot = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            command_line: Some(
+                "\"C:/cache/llama-server.exe\" --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
+                    .to_string(),
+            ),
+            started_at_epoch_ms: Some(
+                launch.spawned_at_epoch_ms.unwrap()
+                    + NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS
+                    + 1,
+            ),
+        };
+
+        let error = ensure_native_embedding_process_matches(&launch, &snapshot)
+            .expect_err("same command with reused pid start time should fail");
+        assert!(
+            error.to_string().contains("start time"),
             "unexpected error: {error:?}"
         );
     }

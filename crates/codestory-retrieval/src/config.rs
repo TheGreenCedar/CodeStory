@@ -808,7 +808,9 @@ pub fn retrieval_compose_profile() -> String {
 const MANAGED_LLAMACPP_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL_MANAGED";
 
 fn operator_explicit_llamacpp_endpoint_configured() -> bool {
-    std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_ok()
+    std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
         && std::env::var(MANAGED_LLAMACPP_URL_ENV).is_err()
 }
 
@@ -821,7 +823,12 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
             "docker_compose_embed" | "docker" | "compose" => {
                 Some(EmbeddingServerLaunchMode::DockerComposeEmbed)
             }
-            "external_endpoint" | "external" | "endpoint" => {
+            "external_endpoint" | "external" | "endpoint"
+                if !std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty() =>
+            {
                 Some(EmbeddingServerLaunchMode::ExternalEndpoint)
             }
             _ => None,
@@ -1061,6 +1068,38 @@ mod tests {
         assert_eq!(
             embedding_server_launch_mode().expect("launch mode"),
             EmbeddingServerLaunchMode::ExternalEndpoint
+        );
+    }
+
+    #[test]
+    fn blank_llamacpp_url_does_not_select_external_endpoint_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
+        let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", " ");
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::DockerComposeEmbed
+        );
+    }
+
+    #[test]
+    fn explicit_external_launch_requires_non_empty_llamacpp_url() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "external_endpoint");
+        let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", " ");
+
+        let error = embedding_server_launch_mode().expect_err("blank external url");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CODESTORY_EMBED_SERVER_LAUNCH must be"),
+            "unexpected error: {error:?}"
         );
     }
 

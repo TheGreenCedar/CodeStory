@@ -46,6 +46,10 @@
   leases reuse-only, revalidating reused PID handoffs, preserving same-project
   MCP repair reuse, and invalidating status cache entries when broker locks
   change.
+- Hardened follow-up native embedding cleanup and status contracts so transferred
+  broker locks are released by launch identity, failed post-transfer repairs
+  tear down their sidecars, blank explicit endpoints no longer select external
+  mode, and `allowed_surfaces.sidecar_setup` matches repair recommendations.
 
 ## 0.13.12
 

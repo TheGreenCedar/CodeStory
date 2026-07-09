@@ -15,7 +15,7 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 
 | Symptom | Supported action | Check in output |
 | --- | --- | --- |
-| Repo map stale or blocked | Agent reads `codestory://status`, calls MCP `sidecar_setup` with `action=repair` if recommended, then rereads status | Local graph surfaces are allowed after the reread |
+| Repo map stale or blocked | Agent reads `codestory://status`, follows `recommended_next_calls`, then rereads status | Local graph surfaces are allowed after the reread |
 | Broad search blocked | Same MCP `sidecar_setup repair` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
 | MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
 | Sidecar health | MCP status first; CLI `retrieval status` only for maintainer evidence | `retrieval_mode` is `full` before trusting packet/search |
@@ -37,7 +37,7 @@ flowchart TD
   local --> fix_local[Refresh or repair local index]
   sidecar --> fix_sidecar[Sidecar setup or repair]
   fix_mcp --> host[Host guide]
-  fix_local --> mcp_repair["MCP: sidecar_setup repair"]
+  fix_local --> reread
   fix_sidecar --> mcp_repair
   mcp_repair --> reread["Reread codestory://status"]
   host --> codex[Codex guide]

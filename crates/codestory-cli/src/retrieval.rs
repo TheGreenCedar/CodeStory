@@ -77,7 +77,7 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             Err(error) => {
                 if let Err(cleanup_error) =
                     crate::readiness_broker::cleanup_native_embedding_resource_lease_after_bootstrap_error(
-                        &embedding_resource_lease,
+                        &mut embedding_resource_lease,
                         &sidecar,
                     )
                 {
@@ -100,19 +100,34 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             return Err(error).context("native embedding lease transfer");
         }
         activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
-        let project_qdrant_repair =
-            codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+        let post_transfer_result = (|| -> Result<_> {
+            let project_qdrant_repair =
+                codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                    &runtime.project_root,
+                    &runtime.storage_path,
+                    &sidecar,
+                )
+                .context("retrieval project qdrant repair")?;
+            let status = strict_sidecar_status_for_runtime(
                 &runtime.project_root,
-                &runtime.storage_path,
-                &sidecar,
+                Some(&runtime.storage_path),
+                sidecar.clone(),
             )
-            .context("retrieval project qdrant repair")?;
-        let status = strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            sidecar.clone(),
-        )
-        .context("retrieval status after bootstrap")?;
+            .context("retrieval status after bootstrap")?;
+            Ok((project_qdrant_repair, status))
+        })();
+        let (project_qdrant_repair, status) = match post_transfer_result {
+            Ok(result) => result,
+            Err(error) => {
+                crate::readiness_broker::cleanup_transferred_native_embedding_resource_after_error(
+                    &sidecar,
+                )
+                .with_context(|| {
+                    format!("cleanup retrieval sidecar after post-transfer failure: {error}")
+                })?;
+                return Err(error);
+            }
+        };
         (report, project_qdrant_repair, status)
     };
     let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
@@ -155,13 +170,13 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
-    let native_embedding_pid =
-        crate::readiness_broker::native_embedding_pid_from_sidecar_state_file(&sidecar)?;
+    let native_embedding_launch =
+        crate::readiness_broker::native_embedding_launch_from_sidecar_state_file(&sidecar)?;
     sidecar_down_for_runtime(&sidecar).context("retrieval down")?;
-    if let Some(pid) = native_embedding_pid {
-        crate::readiness_broker::release_machine_resource_lock_for_pid(
+    if let Some(launch) = native_embedding_launch.as_ref() {
+        crate::readiness_broker::release_machine_resource_lock_for_native_launch(
             crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-            pid,
+            launch,
         )
         .context("release native embedding broker lock")?;
     }

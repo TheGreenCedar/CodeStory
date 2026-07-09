@@ -2712,7 +2712,7 @@ fn repair_ready_state(
             Err(error) => {
                 if let Err(cleanup_error) =
                     readiness_broker::cleanup_native_embedding_resource_lease_after_bootstrap_error(
-                        &embedding_resource_lease,
+                        &mut embedding_resource_lease,
                         &sidecar,
                     )
                 {
@@ -2734,55 +2734,70 @@ fn repair_ready_state(
             })?;
             return Err(error).context("native embedding lease transfer");
         }
-        let infrastructure = ready_repair_infrastructure_with_runtime_observation(
-            &bootstrap.infrastructure,
-            &runtime.project_root,
-            &runtime.storage_path,
-            &sidecar,
-        );
-        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id: sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(broker_gpu_proof_input_from_infrastructure(&infrastructure)),
-            reconciliation: None,
-        });
-        ensure_ready_repair_embed_liveness(&infrastructure)?;
-        progress.set_phase("Qdrant finalize");
-        codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-            &runtime.project_root,
-            &runtime.storage_path,
-            &sidecar,
-        )
-        .context("ready repair project qdrant repair")?;
-        progress.set_phase("graph artifact");
-        runtime
-            .index
-            .run_indexing_blocking(IndexMode::Full)
-            .map_err(map_api_error)
-            .context("ready repair retrieval index refresh")?;
-        codestory_retrieval::finalize_index_for_runtime_with_progress(
-            &runtime.project_root,
-            &runtime.storage_path,
-            &sidecar,
-            |phase| progress.set_phase(phase),
-        )
-        .with_context(|| {
-            format!(
-                "ready repair retrieval index finalize using {}",
-                retrieval::format_sidecar_runtime(&sidecar)
+        let post_transfer_result = (|| -> Result<_> {
+            let infrastructure = ready_repair_infrastructure_with_runtime_observation(
+                &bootstrap.infrastructure,
+                &runtime.project_root,
+                &runtime.storage_path,
+                &sidecar,
+            );
+            let _ =
+                readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+                    project_root: runtime.project_root.clone(),
+                    cache_root: runtime.cache_root.clone(),
+                    agent_run_id: sidecar.run_id.clone(),
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    gpu_proof: Some(broker_gpu_proof_input_from_infrastructure(&infrastructure)),
+                    reconciliation: None,
+                });
+            ensure_ready_repair_embed_liveness(&infrastructure)?;
+            progress.set_phase("Qdrant finalize");
+            codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                &runtime.project_root,
+                &runtime.storage_path,
+                &sidecar,
             )
-        })?;
-        progress.set_phase("readiness check");
-        let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            sidecar.clone(),
-        )
-        .context("ready repair final retrieval status")?;
-        ensure_ready_repair_full_sidecar(&final_status)?;
-        final_status
+            .context("ready repair project qdrant repair")?;
+            progress.set_phase("graph artifact");
+            runtime
+                .index
+                .run_indexing_blocking(IndexMode::Full)
+                .map_err(map_api_error)
+                .context("ready repair retrieval index refresh")?;
+            codestory_retrieval::finalize_index_for_runtime_with_progress(
+                &runtime.project_root,
+                &runtime.storage_path,
+                &sidecar,
+                |phase| progress.set_phase(phase),
+            )
+            .with_context(|| {
+                format!(
+                    "ready repair retrieval index finalize using {}",
+                    retrieval::format_sidecar_runtime(&sidecar)
+                )
+            })?;
+            progress.set_phase("readiness check");
+            let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
+                &runtime.project_root,
+                Some(&runtime.storage_path),
+                sidecar.clone(),
+            )
+            .context("ready repair final retrieval status")?;
+            ensure_ready_repair_full_sidecar(&final_status)?;
+            Ok(final_status)
+        })();
+        match post_transfer_result {
+            Ok(final_status) => final_status,
+            Err(error) => {
+                readiness_broker::cleanup_transferred_native_embedding_resource_after_error(
+                    &sidecar,
+                )
+                .with_context(|| {
+                    format!("cleanup ready repair sidecar after post-transfer failure: {error}")
+                })?;
+                return Err(error);
+            }
+        }
     };
     let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
         project_root: runtime.project_root.clone(),

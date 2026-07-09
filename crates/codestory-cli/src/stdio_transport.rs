@@ -4501,10 +4501,71 @@ fn stdio_allowed_surfaces_with_policy(
         surfaces.insert(surface.to_string(), stdio_allowed_surface(agent));
     }
     surfaces.insert(
+        "sidecar_setup".to_string(),
+        stdio_sidecar_setup_surface(readiness, sidecar_setup, native_embedding_hard_busy),
+    );
+    surfaces.insert(
         "repair_all".to_string(),
         stdio_repair_all_surface(readiness, sidecar_setup, native_embedding_hard_busy),
     );
     serde_json::Value::Object(surfaces)
+}
+
+fn stdio_sidecar_setup_surface(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: Option<&serde_json::Value>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
+) -> serde_json::Value {
+    let Some(non_ready) = crate::readiness::primary_non_ready(readiness) else {
+        return serde_json::json!({
+            "allowed": true,
+            "readiness_goal": "agent_packet_search",
+            "status": "ready",
+            "summary": "sidecar_setup status is available; repair is not currently required.",
+            "allowed_actions": ["status"],
+            "canonical_arguments": {"action": "status"},
+        });
+    };
+    if non_ready.goal != ReadinessGoalDto::AgentPacketSearch {
+        return serde_json::json!({
+            "allowed": true,
+            "readiness_goal": crate::readiness::goal_label(non_ready.goal),
+            "status": crate::readiness::status_label(non_ready.status),
+            "summary": "sidecar_setup status is available; repair actions are for agent packet/search sidecars.",
+            "allowed_actions": ["status"],
+            "canonical_arguments": {"action": "status"},
+        });
+    }
+    if let Some(busy) = native_embedding_hard_busy {
+        return serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "agent_packet_search",
+            "status": "busy",
+            "failed_layer": "native_embedding_runtime",
+            "summary": "CodeStory native embedding runtime is already owned by another operation.",
+            "owner_pid": busy.owner_pid,
+            "owner_project_id": busy.owner_project_id,
+            "owner_workspace_root": busy.owner_workspace_root,
+            "allowed_actions": ["status"],
+            "canonical_arguments": {"action": "status"},
+        });
+    }
+    let allowed_actions = match sidecar_setup.map(stdio_sidecar_policy_state) {
+        Some("ask") => serde_json::json!(["status", "enable", "repair"]),
+        Some("disabled") | Some("unmanaged") => serde_json::json!(["status", "enable"]),
+        _ => serde_json::json!(["status", "repair"]),
+    };
+    serde_json::json!({
+        "allowed": true,
+        "readiness_goal": "agent_packet_search",
+        "status": crate::readiness::status_label(non_ready.status),
+        "failed_layer": crate::readiness::failed_layer(non_ready),
+        "summary": "Use sidecar_setup for the MCP-managed agent packet/search repair path.",
+        "allowed_actions": allowed_actions,
+        "canonical_arguments": {"action": "repair"},
+        "minimum_next": non_ready.minimum_next,
+        "full_repair": non_ready.full_repair,
+    })
 }
 
 fn stdio_repair_all_surface(
@@ -5132,11 +5193,21 @@ mod tests {
             &json!({"state": "enabled"}),
             hard_busy,
         );
+        let surfaces = stdio_allowed_surfaces_with_policy(
+            &[agent_packet_search_not_ready()],
+            Some(&json!({"state": "enabled"})),
+            hard_busy,
+        );
 
         assert!(classifier_called);
         assert!(hard_busy.is_none());
         assert_eq!(calls[0]["tool"], json!("sidecar_setup"));
         assert_eq!(calls[0]["arguments"]["action"], json!("repair"));
+        assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(true));
+        assert_eq!(
+            surfaces["sidecar_setup"]["canonical_arguments"]["action"],
+            json!("repair")
+        );
     }
 
     #[test]
@@ -5175,6 +5246,8 @@ mod tests {
 
         assert!(hard_busy.is_some());
         assert_eq!(calls[0]["method"], json!("host/instruction"));
+        assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(false));
+        assert_eq!(surfaces["sidecar_setup"]["status"], json!("busy"));
         assert_eq!(surfaces["repair_all"]["status"], json!("busy"));
         assert_eq!(
             surfaces["repair_all"]["repair_reason"],

@@ -182,6 +182,8 @@ struct BrokerMachineResourceLockFile {
     started_at_epoch_ms: i64,
     token: String,
     operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_embedding_launch: Option<codestory_retrieval::EmbeddingLaunchMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,6 +327,7 @@ pub(crate) fn try_acquire_machine_resource_lock(
         started_at_epoch_ms,
         token: token.clone(),
         operation_id,
+        native_embedding_launch: None,
     };
     let content = serde_json::to_vec_pretty(&lock)?;
 
@@ -374,10 +377,13 @@ pub(crate) fn try_acquire_machine_resource_lock(
     }
 }
 
-pub(crate) fn transfer_machine_resource_lock_to_pid(
+fn transfer_machine_resource_lock_to_native_launch(
     lock: &mut BrokerMachineResourceLock,
-    pid: u32,
+    launch: &codestory_retrieval::EmbeddingLaunchMetadata,
 ) -> Result<bool> {
+    let pid = launch
+        .pid
+        .context("native embedding launch missing pid for broker handoff")?;
     let Some(mut file_lock) = read_machine_resource_lock_file(&lock.path) else {
         return Ok(false);
     };
@@ -385,7 +391,8 @@ pub(crate) fn transfer_machine_resource_lock_to_pid(
         return Ok(false);
     }
     file_lock.pid = pid;
-    file_lock.started_at_epoch_ms = now_epoch_ms();
+    file_lock.started_at_epoch_ms = launch.spawned_at_epoch_ms.unwrap_or_else(now_epoch_ms);
+    file_lock.native_embedding_launch = Some(launch.clone());
     fs::write(&lock.path, serde_json::to_vec_pretty(&file_lock)?)?;
     lock.release_on_drop = false;
     Ok(true)
@@ -434,7 +441,7 @@ fn transfer_native_embedding_resource_lease_with_validator(
                     "validated native embedding broker handoff pid mismatch: expected {pid}, got {validated_pid}"
                 );
             }
-            if !transfer_machine_resource_lock_to_pid(lock, pid)? {
+            if !transfer_machine_resource_lock_to_native_launch(lock, launch)? {
                 bail!("native embedding broker lock handoff failed for pid {pid}");
             }
         }
@@ -458,20 +465,70 @@ fn transfer_native_embedding_resource_lease_with_validator(
 }
 
 pub(crate) fn cleanup_native_embedding_resource_lease_after_bootstrap_error(
-    lease: &Option<BrokerNativeEmbeddingResourceLease>,
+    lease: &mut Option<BrokerNativeEmbeddingResourceLease>,
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<()> {
+    cleanup_native_embedding_resource_lease_after_bootstrap_error_with_cleanup(
+        lease,
+        sidecar,
+        || codestory_retrieval::sidecar_down_for_runtime(sidecar),
+        codestory_retrieval::ensure_native_embedding_launch_identity,
+    )
+}
+
+fn cleanup_native_embedding_resource_lease_after_bootstrap_error_with_cleanup(
+    lease: &mut Option<BrokerNativeEmbeddingResourceLease>,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    cleanup: impl FnOnce() -> Result<()>,
+    validate_launch: impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
+) -> Result<()> {
     if matches!(lease, Some(BrokerNativeEmbeddingResourceLease::Acquired(_))) {
-        codestory_retrieval::sidecar_down_for_runtime(sidecar)?;
+        match cleanup() {
+            Ok(()) => {}
+            Err(cleanup_error) => {
+                if let Some(state) = read_sidecar_state_file(sidecar)? {
+                    transfer_native_embedding_resource_lease_with_validator(
+                        lease,
+                        &state,
+                        validate_launch,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "preserve native embedding broker lock after cleanup failed: {cleanup_error}"
+                        )
+                    })?;
+                }
+                return Err(cleanup_error);
+            }
+        }
     }
     Ok(())
 }
 
-pub(crate) fn native_embedding_pid_from_sidecar_state_file(
+pub(crate) fn native_embedding_launch_from_sidecar_state_file(
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Result<Option<u32>> {
+) -> Result<Option<codestory_retrieval::EmbeddingLaunchMetadata>> {
     Ok(read_sidecar_state_file(sidecar)?
-        .and_then(|state| native_embedding_pid_from_sidecar_state(&state)))
+        .and_then(|state| native_embedding_launch_from_sidecar_state(&state).cloned()))
+}
+
+pub(crate) fn cleanup_transferred_native_embedding_resource_after_error(
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<()> {
+    let launch = native_embedding_launch_from_sidecar_state_file(sidecar)?;
+    codestory_retrieval::sidecar_down_for_runtime(sidecar)?;
+    if let Some(launch) = launch.as_ref() {
+        release_machine_resource_lock_for_native_launch(NATIVE_EMBEDDING_RESOURCE, launch)?;
+    }
+    Ok(())
+}
+
+fn native_embedding_launch_from_sidecar_state(
+    state: &codestory_retrieval::SidecarStateFile,
+) -> Option<&codestory_retrieval::EmbeddingLaunchMetadata> {
+    state.embedding_launch.as_ref().filter(|launch| {
+        launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str()
+    })
 }
 
 fn read_sidecar_state_file(
@@ -487,26 +544,23 @@ fn read_sidecar_state_file(
     Ok(Some(state))
 }
 
-fn native_embedding_pid_from_sidecar_state(
-    state: &codestory_retrieval::SidecarStateFile,
-) -> Option<u32> {
-    native_embedding_launch_from_sidecar_state(state)?.pid
-}
-
-fn native_embedding_launch_from_sidecar_state(
-    state: &codestory_retrieval::SidecarStateFile,
-) -> Option<&codestory_retrieval::EmbeddingLaunchMetadata> {
-    state.embedding_launch.as_ref().filter(|launch| {
-        launch.launch_mode == codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned.as_str()
-    })
-}
-
-pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) -> Result<bool> {
+pub(crate) fn release_machine_resource_lock_for_native_launch(
+    resource: &str,
+    launch: &codestory_retrieval::EmbeddingLaunchMetadata,
+) -> Result<bool> {
+    let Some(pid) = launch.pid else {
+        return Ok(false);
+    };
     let path = machine_resource_lock_path(resource);
     let Some(file_lock) = read_machine_resource_lock_file(&path) else {
         return Ok(false);
     };
     if file_lock.pid != pid {
+        return Ok(false);
+    }
+    if let Some(recorded_launch) = file_lock.native_embedding_launch.as_ref()
+        && recorded_launch != launch
+    {
         return Ok(false);
     }
     fs::remove_file(path)?;
@@ -1024,6 +1078,11 @@ fn machine_lock_file_is_stale(path: &Path) -> bool {
 }
 
 fn machine_lock_is_stale(lock: &BrokerMachineResourceLockFile) -> bool {
+    if lock.resource == NATIVE_EMBEDDING_RESOURCE
+        && let Some(launch) = lock.native_embedding_launch.as_ref()
+    {
+        return codestory_retrieval::ensure_native_embedding_launch_identity(launch).is_err();
+    }
     !ready_repair_status::process_is_running(lock.pid)
 }
 
@@ -1174,10 +1233,9 @@ fn write_snapshot_file(path: &Path, snapshot: &ReadinessBrokerSnapshot) -> Resul
     fs::write(&temp_path, serde_json::to_string_pretty(snapshot)?)?;
     match fs::rename(&temp_path, path) {
         Ok(()) => Ok(()),
-        Err(_error) if path.exists() => {
-            let _ = fs::remove_file(path);
-            fs::rename(&temp_path, path)?;
-            Ok(())
+        Err(error) if path.exists() => {
+            let _ = fs::remove_file(&temp_path);
+            Err(error.into())
         }
         Err(error) => {
             let _ = fs::remove_file(&temp_path);
@@ -1227,13 +1285,25 @@ fn path_fingerprint(path: &Path) -> String {
     let Ok(metadata) = fs::metadata(path) else {
         return "missing".to_string();
     };
-    let modified_ms = metadata
+    let modified_ns = metadata
         .modified()
         .ok()
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    format!("len:{}:mtime_ms:{}", metadata.len(), modified_ms)
+    let content_hash = fs::read(path)
+        .map(|bytes| {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            format!("{:x}", hasher.finalize())
+        })
+        .unwrap_or_else(|error| format!("read_error:{error}"));
+    format!(
+        "len:{}:mtime_ns:{}:sha256:{}",
+        metadata.len(),
+        modified_ns,
+        &content_hash[..content_hash.len().min(16)]
+    )
 }
 
 fn install_id() -> String {
@@ -1352,6 +1422,7 @@ mod tests {
             started_at_epoch_ms,
             token: format!("test:{pid}:{started_at_epoch_ms}"),
             operation_id: broker_operation_id(scope),
+            native_embedding_launch: None,
         };
         fs::write(
             &path,
@@ -1622,13 +1693,56 @@ mod tests {
             }
         };
         let path = machine_resource_lock_path(&resource);
-        let lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+        let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
 
-        cleanup_native_embedding_resource_lease_after_bootstrap_error(&lease, &sidecar)
+        cleanup_native_embedding_resource_lease_after_bootstrap_error(&mut lease, &sidecar)
             .expect("cleanup after bootstrap error");
         drop(lease);
 
         assert!(!path.exists(), "untransferred lease should release on drop");
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn native_embedding_cleanup_failure_preserves_acquired_lock_for_recorded_launch() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("native-cleanup-failure-preserve");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "shared-agent");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        let owner_pid = 4321;
+        write_matching_native_sidecar_state(&sidecar, owner_pid);
+        let lock = match try_acquire_machine_resource_lock(&resource, &scope)
+            .expect("acquire machine lock")
+        {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+        let path = machine_resource_lock_path(&resource);
+        let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+
+        let error = cleanup_native_embedding_resource_lease_after_bootstrap_error_with_cleanup(
+            &mut lease,
+            &sidecar,
+            || Err(anyhow::anyhow!("cleanup_failed")),
+            |launch| {
+                assert_eq!(launch.pid, Some(owner_pid));
+                Ok(owner_pid)
+            },
+        )
+        .expect_err("cleanup failure should be reported");
+        drop(lease);
+
+        assert!(format!("{error:?}").contains("cleanup_failed"));
+        let preserved = read_machine_resource_lock_file(&path).expect("lock remains");
+        assert_eq!(preserved.pid, owner_pid);
+        assert!(preserved.native_embedding_launch.is_some());
         cleanup_machine_resource(&resource);
     }
 
@@ -1770,7 +1884,20 @@ mod tests {
     }
 
     #[test]
-    fn machine_resource_lock_transfers_to_spawned_pid_until_pid_release() {
+    fn path_fingerprint_tracks_same_length_content_changes() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("lock.json");
+        fs::write(&path, b"aaaa").expect("write first");
+        let first = path_fingerprint(&path);
+
+        fs::write(&path, b"bbbb").expect("write second");
+        let second = path_fingerprint(&path);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn machine_resource_lock_transfers_to_native_launch_until_launch_release() {
         let project = tempdir().expect("temp project");
         let resource = unique_resource("pid-transfer");
         cleanup_machine_resource(&resource);
@@ -1785,8 +1912,11 @@ mod tests {
             }
         };
 
+        let mut state = native_sidecar_state(Some(now_epoch_ms()));
+        let launch = state.embedding_launch.as_mut().expect("launch");
+        launch.pid = Some(std::process::id());
         assert!(
-            transfer_machine_resource_lock_to_pid(&mut lock, std::process::id())
+            transfer_machine_resource_lock_to_native_launch(&mut lock, launch)
                 .expect("transfer lock")
         );
         drop(lock);
@@ -1796,7 +1926,7 @@ mod tests {
             "transferred lock should outlive launcher lock drop"
         );
         assert!(
-            release_machine_resource_lock_for_pid(&resource, std::process::id())
+            release_machine_resource_lock_for_native_launch(&resource, launch)
                 .expect("release pid lock")
         );
         assert!(!path.exists(), "pid release should remove lock file");
