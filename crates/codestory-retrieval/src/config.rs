@@ -1070,7 +1070,7 @@ mod tests {
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
         let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
-        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "windows");
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "windows/x86_64");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
         let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
