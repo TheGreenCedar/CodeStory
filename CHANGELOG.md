@@ -59,6 +59,8 @@
   owner they did not spawn.
 - Declared `sidecar_setup` as a status/config surface during workspace-mismatch
   diagnostics so MCP status matches the tools that remain callable.
+- Serialized native launch lock release with stale-lock reaping and required
+  exact launch metadata before removing a machine lock.
 
 ## 0.13.12
 

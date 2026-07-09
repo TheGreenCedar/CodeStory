@@ -601,15 +601,16 @@ pub(crate) fn release_machine_resource_lock_for_native_launch(
         return Ok(false);
     };
     let path = machine_resource_lock_path(resource);
+    let Some(_release_guard) = try_acquire_machine_resource_reaper_lock(resource)? else {
+        return Ok(false);
+    };
     let Some(file_lock) = read_machine_resource_lock_file(&path) else {
         return Ok(false);
     };
     if file_lock.pid != pid {
         return Ok(false);
     }
-    if let Some(recorded_launch) = file_lock.native_embedding_launch.as_ref()
-        && recorded_launch != launch
-    {
+    if file_lock.native_embedding_launch.as_ref() != Some(launch) {
         return Ok(false);
     }
     fs::remove_file(path)?;
@@ -2077,6 +2078,28 @@ mod tests {
                 .expect("release pid lock")
         );
         assert!(!path.exists(), "pid release should remove lock file");
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn native_launch_release_does_not_remove_pre_handoff_lock() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("native-release-pre-handoff");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "owner");
+        let mut state = native_sidecar_state(Some(now_epoch_ms()));
+        let launch = state.embedding_launch.as_mut().expect("launch");
+        launch.pid = Some(4321);
+        let path = write_machine_lock(&resource, &scope, 4321);
+
+        assert!(
+            !release_machine_resource_lock_for_native_launch(&resource, launch)
+                .expect("release pre-handoff")
+        );
+        assert!(
+            path.exists(),
+            "native launch release must not remove a lock before launch handoff"
+        );
         cleanup_machine_resource(&resource);
     }
 
