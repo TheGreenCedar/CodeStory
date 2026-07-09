@@ -4,6 +4,39 @@
 
 ### Fixed
 
+- Cleared MCP recent-repair status overlays unless the repair PID is still alive
+  or durable on-disk active repair status exists, so a dead spawn cannot look
+  like a live repair for 30s.
+- Stopped age-only reclaim of live pre-handoff native embedding broker locks;
+  pre-handoff locks stay held while the owner PID is running.
+- Failed closed when Windows `CREATE_BREAKAWAY_FROM_JOB` is denied for native
+  llama.cpp spawn, instead of retrying into a job-bound child that dies when
+  repair exits.
+- Required a live timed embedding smoke before long ready-repair semantic work
+  when accelerator is required; `gpu_proof` now reports `embed_smoke_ok` /
+  `embed_smoke_ms` and only marks `verified` when smoke succeeds.
+
+### Changed
+
+- Split the durable readiness broker into focused modules under
+  `crates/codestory-cli/src/readiness_broker/` while keeping the same
+  `readiness_broker::` call paths.
+- Extracted shared native-embedding lease lifecycle ordering for ready-repair and
+  retrieval bootstrap, and decomposed stdio status assembly into sidecar,
+  readiness, broker, and surfaces builders without changing status JSON keys.
+- Aligned diagnostic fail-open MCP `readiness_broker` stubs with the Rust
+  snapshot schema, including `gpu_proof.embed_smoke_ok` and `embed_smoke_ms`.
+- Bundled bootstrap sidecar knobs into `BootstrapSidecarsOptions` for the
+  progress-aware bootstrap entrypoint.
+
+## 0.14.0
+
+CodeStory 0.14.0 ships the durable readiness broker and hardens native
+embedding sidecar ownership so CLI and MCP repair paths preserve exclusive
+locks while reporting status truthfully.
+
+### Fixed
+
 - Prevented the installed MCP launcher from binding to another workspace's
   global active-state file when the host has a current Codex thread but no
   matching thread-scoped active-state file yet.

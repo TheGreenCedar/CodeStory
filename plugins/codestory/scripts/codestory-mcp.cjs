@@ -1083,7 +1083,22 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
       active_repair: null,
       unresolved_orphan_reason: reason,
     },
-    gpu_proof: null,
+    gpu_proof: {
+      requested: false,
+      requested_provider: null,
+      requested_device: null,
+      policy: null,
+      observed_state: null,
+      observation_source: null,
+      detected_provider: null,
+      detected_gpu: null,
+      cpu_allowed: false,
+      proof_status: 'diagnostic_fail_open',
+      meaningful_accelerator_work_proven: false,
+      embed_smoke_ok: null,
+      embed_smoke_ms: null,
+      degraded_reason: reason,
+    },
   };
   return {
     server_version: null,

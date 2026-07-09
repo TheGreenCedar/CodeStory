@@ -53,6 +53,7 @@ const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 6;
 pub struct EmbeddingRuntimeProbe {
     pub reachable: bool,
     pub detail: String,
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,6 +703,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 }
 
 pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
+    let started = Instant::now();
     let result = llamacpp_url().and_then(|url| {
         llamacpp_embed_with_timeout(
             &["codestory health probe".to_string()],
@@ -709,6 +711,7 @@ pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
             HEALTH_TIMEOUT,
         )
     });
+    let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     match result {
         Ok(vectors) => EmbeddingRuntimeProbe {
             reachable: true,
@@ -716,10 +719,12 @@ pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
                 "llama.cpp embeddings reachable dim={}",
                 vectors.first().map(|vector| vector.len()).unwrap_or(0)
             ),
+            elapsed_ms,
         },
         Err(error) => EmbeddingRuntimeProbe {
             reachable: false,
             detail: format!("llama.cpp embeddings unavailable: {error}"),
+            elapsed_ms,
         },
     }
 }

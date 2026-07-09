@@ -26,7 +26,9 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 flowchart TD
   start([Session feels wrong]) --> q1{Can the agent read<br/>CodeStory status?}
   q1 -->|No| mcp[MCP not connected]
-  q1 -->|Yes| q2{Is the repo map ready?}
+  q1 -->|Yes| qTools{Are mcp__codestory<br/>tools visible?}
+  qTools -->|No| toolsHidden[Resources only]
+  qTools -->|Yes| q2{Is the repo map ready?}
   q2 -->|No| local[Local navigation lane]
   q2 -->|Yes| q3{Need packet or search?}
   q3 -->|No| ok[Local tools should work]
@@ -34,11 +36,18 @@ flowchart TD
   q4 -->|No| sidecar[Packet/search lane]
   q4 -->|Yes| ok2[Broad search should work]
   mcp --> fix_mcp[MCP registration]
+  toolsHidden --> hostBlocker[Report host tool visibility]
   local --> fix_local[Refresh or repair local index]
-  sidecar --> fix_sidecar[Sidecar setup or repair]
+  sidecar --> nativeBusy{Native embedding busy?}
+  nativeBusy -->|stale| fix_sidecar[Sidecar setup or repair]
+  nativeBusy -->|same project reusable| fix_sidecar
+  nativeBusy -->|foreign or unverifiable| waitBusy[Wait and reread status]
+  nativeBusy -->|no| fix_sidecar
   fix_mcp --> host[Host guide]
+  hostBlocker --> host
   fix_local --> reread
   fix_sidecar --> mcp_repair
+  waitBusy --> reread
   mcp_repair --> reread["Reread codestory://status"]
   host --> codex[Codex guide]
   host --> cursor[Cursor guide]
@@ -146,7 +155,11 @@ Symptoms: `packet`, `search`, or `context` not allowed; retrieval mode not
 `full`.
 
 **Agent:** Call MCP `sidecar_setup repair` when status says so, then reread
-`codestory://status`. Do not treat degraded output as proof. See
+`codestory://status`. Before repairing, classify
+`readiness_broker.resources.native_embedding_runtime`: `stale` or same-project
+reusable `busy` can proceed; foreign/unverifiable `busy` means wait. If status
+resources are visible but tools are hidden, do not loop on `tools/call`
+recommendations. Do not treat degraded output as proof. See
 [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
 **You:** Sidecar model download and lifecycle:

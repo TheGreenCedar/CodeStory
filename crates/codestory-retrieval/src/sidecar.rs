@@ -149,17 +149,25 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     Ok(state)
 }
 
+/// Returns true when a sidecar state file matches the runtime identity used for reuse/handoff.
+pub fn sidecar_state_matches_runtime(
+    state: &SidecarStateFile,
+    runtime: &SidecarRuntimeConfig,
+) -> bool {
+    state.owner == "codestory"
+        && state.namespace == runtime.namespace
+        && state.compose_project == runtime.compose_project
+        && state.profile == runtime.profile.as_str()
+        && state.run_id.as_deref() == runtime.run_id.as_deref()
+        && state.embed_http_port == runtime.embed_http_port
+        && state.embed_url == SidecarLayout::embed_base_url(runtime.embed_http_port)
+}
+
 fn reusable_embedding_launch_from_state(
     runtime: &SidecarRuntimeConfig,
 ) -> Option<EmbeddingLaunchMetadata> {
     let state = read_sidecar_state(&runtime.layout.state_file)?;
-    if state.owner != "codestory"
-        || state.namespace != runtime.namespace
-        || state.profile != runtime.profile.as_str()
-        || state.run_id.as_deref() != runtime.run_id.as_deref()
-        || state.embed_http_port != runtime.embed_http_port
-        || state.embed_url != SidecarLayout::embed_base_url(runtime.embed_http_port)
-    {
+    if !sidecar_state_matches_runtime(&state, runtime) {
         return None;
     }
     state.embedding_launch

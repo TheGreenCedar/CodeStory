@@ -136,11 +136,18 @@ More pairs, anti-patterns, and language-flavored examples:
 | Symptom | What to try |
 | --- | --- |
 | No `codestory://status` resource is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
-| `codestory://status` is visible but `mcp__codestory` tools are hidden | Use the live resource path and inspect `readiness_broker`; report that tool actions are blocked by host visibility |
+| `codestory://status` is visible but `mcp__codestory` tools are hidden | Ground from resources only (`codestory://status`, `codestory://agent-guide`). Do not loop on `recommended_next_calls` entries that use `method: "tools/call"` until host tool visibility is fixed; report the host blocker |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
 | Terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Status/grounding read times out | Restart stale CodeStory MCP processes, then read `codestory://status` in a fresh thread |
+
+### Native embedding busy decision tree
+
+1. `native_embedding_runtime.status=stale` → call `sidecar_setup repair` (or follow `recommended_next_calls`) so the broker can reclaim.
+2. `status=busy` and owner is same-project / reusable → continue; do not treat as a hard block.
+3. `status=busy` and owner is foreign or unverifiable → wait and reread status; do not start a competing repair.
+4. `status=available` → repair is free to proceed when policy allows.
 
 ### Readiness broker fields
 
@@ -148,9 +155,9 @@ More pairs, anti-patterns, and language-flavored examples:
 | --- | --- | --- |
 | `readiness_broker.reconciliation.status` | `clean` or `observed` | `active_repair` means wait and reread status; `stale_state_cleaned` means retry repair once |
 | `readiness_broker.resources.native_embedding_runtime.status` | `available` | `busy` blocks repair only when the owner is foreign or unverifiable; same-project reusable owners should continue through `recommended_next_calls`; `stale` means retry repair so the broker can reclaim it |
-| `readiness_broker.gpu_proof.proof_status` | `verified` when accelerator is required | `gpu_unverified` means repair should stop before a long semantic rebuild |
+| `readiness_broker.gpu_proof.proof_status` | `verified` when accelerator is required and live embed smoke succeeded | `gpu_unverified` means repair should stop before a long semantic rebuild; inspect `embed_smoke_ok` / `embed_smoke_ms` |
 | `readiness_broker.persistence_status` | `persisted` | `failed` means inspect `persistence_error`; status may be live but not durable across processes |
-| `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup repair` and status read sequence |
+| `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup repair` and status read sequence; if tools are hidden, stop and report host visibility |
 
 Shared repair lanes: [Troubleshooting](troubleshooting.md).
 

@@ -770,4 +770,80 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn cleanup_abandoned_ready_repair_status_removes_dead_pid_status_and_stale_locks() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        let status_path = ready_repair_status_path(&sidecar);
+        let lock_path = ready_repair_lock_path(&sidecar);
+        let project_lock_path = project_ready_repair_lock_path(&sidecar);
+        fs::create_dir_all(status_path.parent().expect("status parent")).expect("state dir");
+        if let Some(parent) = project_lock_path.parent() {
+            fs::create_dir_all(parent).expect("project lock parent");
+        }
+        let now = now_epoch_ms();
+        let status = ReadyRepairStatus {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            status: "repairing".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("shared-agent".to_string()),
+            namespace: sidecar.namespace.clone(),
+            compose_project: sidecar.compose_project.clone(),
+            phase: "graph artifact".to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms: now,
+            updated_at_epoch_ms: now,
+        };
+        fs::write(
+            &status_path,
+            serde_json::to_string(&status).expect("status json"),
+        )
+        .expect("write abandoned status");
+        let stale_lock = ReadyRepairLockFile {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("shared-agent".to_string()),
+            namespace: sidecar.namespace.clone(),
+            pid: u32::MAX,
+            started_at_epoch_ms: now,
+            token: format!("{}:{now}", u32::MAX),
+        };
+        fs::write(
+            &lock_path,
+            serde_json::to_string(&stale_lock).expect("lock json"),
+        )
+        .expect("write stale namespace lock");
+        fs::write(
+            &project_lock_path,
+            serde_json::to_string(&stale_lock).expect("project lock json"),
+        )
+        .expect("write stale project lock");
+
+        let cleanups =
+            cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+
+        assert_eq!(cleanups.len(), 1);
+        assert!(cleanups[0].removed_status_path);
+        assert!(!status_path.exists());
+        assert!(
+            cleanups[0]
+                .removed_lock_paths
+                .iter()
+                .any(|path| path == &lock_path)
+                || !lock_path.exists(),
+            "stale namespace lock should be cleaned: {:?}",
+            cleanups[0].removed_lock_paths
+        );
+        assert!(
+            active_ready_repair_status(project.path(), Some("shared-agent")).is_none(),
+            "abandoned cleanup must leave no active repair"
+        );
+    }
 }

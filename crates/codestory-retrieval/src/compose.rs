@@ -63,6 +63,15 @@ pub struct BootstrapReport {
     pub storage_repair: QdrantStorageRepairReport,
 }
 
+#[derive(Debug, Clone)]
+pub struct BootstrapSidecarsOptions {
+    pub storage_scope: BootstrapStorageScope,
+    pub compose_file: Option<PathBuf>,
+    pub skip_compose: bool,
+    pub wait_timeout: Duration,
+    pub allow_native_embedding_spawn: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeEmbeddingServerLaunch {
     executable: PathBuf,
@@ -141,11 +150,13 @@ pub fn bootstrap_sidecars_with_runtime(
     bootstrap_sidecars_with_runtime_progress(
         runtime,
         repo_root,
-        storage_scope,
-        compose_file,
-        skip_compose,
-        wait_timeout,
-        allow_native_embedding_spawn,
+        BootstrapSidecarsOptions {
+            storage_scope: storage_scope.clone(),
+            compose_file: compose_file.map(Path::to_path_buf),
+            skip_compose,
+            wait_timeout,
+            allow_native_embedding_spawn,
+        },
         |_| {},
     )
 }
@@ -153,17 +164,20 @@ pub fn bootstrap_sidecars_with_runtime(
 pub fn bootstrap_sidecars_with_runtime_progress(
     runtime: &SidecarRuntimeConfig,
     repo_root: Option<&Path>,
-    storage_scope: &BootstrapStorageScope,
-    compose_file: Option<&Path>,
-    skip_compose: bool,
-    wait_timeout: Duration,
-    allow_native_embedding_spawn: bool,
+    options: BootstrapSidecarsOptions,
     mut progress: impl FnMut(&'static str),
 ) -> Result<BootstrapReport> {
+    let BootstrapSidecarsOptions {
+        storage_scope,
+        compose_file,
+        skip_compose,
+        wait_timeout,
+        allow_native_embedding_spawn,
+    } = options;
     let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
     let storage_repair =
-        repair_qdrant_storage(&layout, storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
+        repair_qdrant_storage(&layout, &storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
     let launch_mode = embedding_server_launch_mode()?;
     runtime.activate_embed_url_default();
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
@@ -173,7 +187,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     let resolved_compose = if skip_compose {
         None
     } else {
-        Some(resolve_compose_file(repo_root, compose_file)?)
+        Some(resolve_compose_file(repo_root, compose_file.as_deref())?)
     };
 
     let compose_started = if let Some(path) = resolved_compose.as_ref() {
@@ -1273,37 +1287,19 @@ fn spawn_native_embedding_server_with_probe(
         "native llama.cpp embedding server Windows creation_flags=0x{NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS:08x}"
     )
     .ok();
-    match spawn_native_embedding_server_once(launch, &log, true) {
+    match spawn_native_embedding_server_once(launch, &log) {
         Ok(pid) => Ok(Some(NativeEmbeddingSpawn {
             pid,
             spawned_at_epoch_ms: now_epoch_ms(),
         })),
-        Err(error) if native_embedding_retry_without_breakaway(&error) => {
-            writeln!(
-                log,
-                "native llama.cpp spawn with breakaway-from-job failed ({error}); retrying without breakaway"
-            )
-            .ok();
-            spawn_native_embedding_server_once(launch, &log, false)
-                .map(|pid| {
-                    Some(NativeEmbeddingSpawn {
-                        pid,
-                        spawned_at_epoch_ms: now_epoch_ms(),
-                    })
-                })
-                .with_context(|| {
-                    format!(
-                        "spawn native llama.cpp server {}{} after breakaway retry",
-                        launch.executable.display(),
-                        native_embedding_spawn_detail(false)
-                    )
-                })
-        }
+        Err(error) if native_embedding_breakaway_denied(&error) => Err(error).context(
+            "native_embedding_breakaway_denied: host job object blocked CREATE_BREAKAWAY_FROM_JOB; native embedding cannot survive repair exit",
+        ),
         Err(error) => Err(error).with_context(|| {
             format!(
                 "spawn native llama.cpp server {}{}",
                 launch.executable.display(),
-                native_embedding_spawn_detail(true)
+                native_embedding_spawn_detail()
             )
         }),
     }
@@ -1312,7 +1308,6 @@ fn spawn_native_embedding_server_with_probe(
 fn spawn_native_embedding_server_once(
     launch: &NativeEmbeddingServerLaunch,
     log: &File,
-    breakaway: bool,
 ) -> std::io::Result<u32> {
     let stdout = log.try_clone()?;
     let stderr = log.try_clone()?;
@@ -1323,7 +1318,7 @@ fn spawn_native_embedding_server_once(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    configure_native_embedding_command(&mut command, breakaway);
+    configure_native_embedding_command(&mut command);
     command.spawn().map(|child| child.id())
 }
 
@@ -1388,19 +1383,15 @@ fn reusable_native_embedding_spawn_from_state_with_identity(
     }))
 }
 
-fn configure_native_embedding_command(_command: &mut Command, _breakaway: bool) {
+fn configure_native_embedding_command(_command: &mut Command) {
     #[cfg(windows)]
-    _command.creation_flags(native_embedding_windows_creation_flags(_breakaway));
+    _command.creation_flags(NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS);
 }
 
-fn native_embedding_spawn_detail(_breakaway: bool) -> &'static str {
+fn native_embedding_spawn_detail() -> &'static str {
     #[cfg(windows)]
     {
-        if _breakaway {
-            " with detached Windows creation flags"
-        } else {
-            " with detached Windows creation flags without breakaway-from-job"
-        }
+        " with detached Windows creation flags including breakaway-from-job"
     }
     #[cfg(not(windows))]
     {
@@ -1408,7 +1399,7 @@ fn native_embedding_spawn_detail(_breakaway: bool) -> &'static str {
     }
 }
 
-fn native_embedding_retry_without_breakaway(error: &std::io::Error) -> bool {
+fn native_embedding_breakaway_denied(error: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
         error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(5)
@@ -1417,15 +1408,6 @@ fn native_embedding_retry_without_breakaway(error: &std::io::Error) -> bool {
     {
         let _ = error;
         false
-    }
-}
-
-#[cfg(windows)]
-fn native_embedding_windows_creation_flags(breakaway: bool) -> u32 {
-    if breakaway {
-        NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS
-    } else {
-        NATIVE_EMBEDDING_WINDOWS_BASE_CREATION_FLAGS
     }
 }
 
@@ -2243,17 +2225,26 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn native_embedding_windows_spawn_uses_breakaway_as_best_effort() {
-        let breakaway = native_embedding_windows_creation_flags(true);
-        let fallback = native_embedding_windows_creation_flags(false);
-        assert_ne!(breakaway & WINDOWS_DETACHED_PROCESS, 0);
-        assert_ne!(breakaway & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
-        assert_ne!(breakaway & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
-        assert_ne!(breakaway & WINDOWS_CREATE_NO_WINDOW, 0);
-        assert_ne!(fallback & WINDOWS_DETACHED_PROCESS, 0);
-        assert_ne!(fallback & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
-        assert_eq!(fallback & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
-        assert_ne!(fallback & WINDOWS_CREATE_NO_WINDOW, 0);
+    fn native_embedding_windows_spawn_requires_breakaway_from_job() {
+        let flags = NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS;
+        assert_ne!(flags & WINDOWS_DETACHED_PROCESS, 0);
+        assert_ne!(flags & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
+        assert_ne!(flags & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
+        assert_ne!(flags & WINDOWS_CREATE_NO_WINDOW, 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_embedding_breakaway_denied_classifies_permission_errors() {
+        assert!(native_embedding_breakaway_denied(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(native_embedding_breakaway_denied(&std::io::Error::from_raw_os_error(
+            5
+        )));
+        assert!(!native_embedding_breakaway_denied(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
     }
 
     #[test]
@@ -2261,10 +2252,12 @@ mod tests {
         let reachable = crate::embeddings::EmbeddingRuntimeProbe {
             reachable: true,
             detail: "llama.cpp embeddings reachable dim=768".into(),
+            elapsed_ms: Some(12),
         };
         let unreachable = crate::embeddings::EmbeddingRuntimeProbe {
             reachable: false,
             detail: "llama.cpp embeddings unavailable".into(),
+            elapsed_ms: Some(5),
         };
 
         assert!(native_embedding_server_reusable(&reachable));
@@ -2283,6 +2276,7 @@ mod tests {
         let probe = crate::embeddings::EmbeddingRuntimeProbe {
             reachable: false,
             detail: "llama.cpp embeddings unavailable".into(),
+            elapsed_ms: Some(5),
         };
 
         let error = spawn_native_embedding_server_with_probe(&launch, &runtime, false, probe)

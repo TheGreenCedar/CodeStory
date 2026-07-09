@@ -504,39 +504,25 @@ test("stdio workspace mismatch blocks stale repo repair guidance", async () => {
   const launcher = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
   const transport = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_transport.rs"), "utf8");
 
+  // Keep a light structural smoke check for launcher wiring, then rely on the
+  // Rust behavioral unit test for status/setup payload shape.
   assert.match(launcher, /function stdioRuntimeEnv\(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath\)/u);
   assert.match(launcher, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH:\s*projectStatePath \|\| activeStatePath\(\) \|\| ''/u);
   assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
   assert.match(transport, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH/u);
-  assert.match(transport, /let active_root = stdio_active_state_root\(&active_state_path\)\?/u);
-  assert.match(transport, /if stdio_same_path_text\(&active_root, &runtime\.project_root\)/u);
-  assert.match(transport, /fn read_stdio_status_resource_cached[\s\S]*if let Some\(mismatch\) = stdio_workspace_mismatch\(runtime\)/u);
-  assert.match(transport, /"status": "workspace_mismatch"/u);
-  assert.match(transport, /"served_root"/u);
-  assert.match(transport, /"active_root"/u);
-  assert.match(transport, /"launch_cwd"/u);
-  assert.match(transport, /"runtime_cwd"/u);
-  assert.match(transport, /"managed_cli_path"/u);
-  assert.match(transport, /"managed_cli_version"/u);
-  assert.match(transport, /fn stdio_workspace_mismatch_sidecar_setup\(mismatch: &StdioWorkspaceMismatch\)/u);
-  assert.match(transport, /"status": "workspace_mismatch"[\s\S]*"next_repair_command": null/u);
-  assert.match(transport, /"last_repair": null/u);
-  assert.match(transport, /"status" => \{[\s\S]*stdio_workspace_mismatch_sidecar_setup\(mismatch\)[\s\S]*stdio_sidecar_setup_status/u);
-  assert.match(transport, /"enable" \| "disable" \| "ask"[\s\S]*stdio_workspace_mismatch_sidecar_setup\(mismatch\)[\s\S]*stdio_sidecar_setup_status/u);
-  assert.match(transport, /"repair_all"[\s\S]*stdio_workspace_mismatch_surface/u);
-  assert.match(transport, /"sidecar_setup"[\s\S]*"workspace_mismatch"[\s\S]*"allowed_actions": \["status", "enable", "disable", "ask"\]/u);
-  assert.match(transport, /"minimum_next": \[\]/u);
-  assert.match(transport, /"full_repair": \[\]/u);
+  assert.match(transport, /fn stdio_workspace_mismatch_status\(/u);
+  assert.match(transport, /fn stdio_workspace_mismatch_sidecar_setup\(/u);
+  // Prefer includes for large-file symbols; full-file regex can flake under truncated reads.
+  assert.ok(
+    transport.includes("fn stdio_workspace_mismatch_status_blocks_repo_repair_guidance"),
+    "stdio_transport must keep the workspace-mismatch status unit test",
+  );
+  assert.match(
+    transport,
+    /fn read_stdio_status_resource_cached[\s\S]*if let Some\(mismatch\) = stdio_workspace_mismatch\(runtime\)/u,
+  );
   assert.match(transport, /"repair" => \{[\s\S]*"code": "workspace_mismatch"[\s\S]*handle_stdio_sidecar_repair/u);
   assert.match(transport, /fn handle_stdio_sidecar_repair[\s\S]*stdio_workspace_mismatch_error\(runtime\)/u);
-  assert.doesNotMatch(
-    transport.match(/fn stdio_workspace_mismatch_status[\s\S]*?fn stdio_workspace_mismatch_diagnostic/u)?.[0] || "",
-    /ready --goal agent --repair/u,
-  );
-  assert.doesNotMatch(
-    transport.match(/fn stdio_workspace_mismatch_sidecar_setup[\s\S]*?fn stdio_workspace_mismatch_allowed_surfaces/u)?.[0] || "",
-    /ready --goal agent --repair|next_repair_command":\s*"/u,
-  );
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
@@ -1522,6 +1508,50 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.profile, "agent");
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
+    for (const key of [
+      "schema_version",
+      "install_id",
+      "project_id",
+      "canonical_root_hash",
+      "workspace_root",
+      "cli_version",
+      "updated_at_epoch_ms",
+      "snapshot_path",
+      "persistence_status",
+      "persistence_error",
+      "operations",
+      "resources",
+      "reconciliation",
+      "gpu_proof",
+    ]) {
+      assert.ok(Object.hasOwn(status.readiness_broker, key), `readiness_broker missing ${key}`);
+    }
+    assert.equal(status.readiness_broker.persistence_status, "unavailable");
+    assert.equal(typeof status.readiness_broker.gpu_proof, "object");
+    assert.notEqual(status.readiness_broker.gpu_proof, null);
+    for (const key of [
+      "requested",
+      "requested_provider",
+      "requested_device",
+      "policy",
+      "observed_state",
+      "observation_source",
+      "detected_provider",
+      "detected_gpu",
+      "cpu_allowed",
+      "proof_status",
+      "meaningful_accelerator_work_proven",
+      "embed_smoke_ok",
+      "embed_smoke_ms",
+      "degraded_reason",
+    ]) {
+      assert.ok(
+        Object.hasOwn(status.readiness_broker.gpu_proof, key),
+        `readiness_broker.gpu_proof missing ${key}`,
+      );
+    }
+    assert.equal(status.readiness_broker.gpu_proof.embed_smoke_ok, null);
+    assert.equal(status.readiness_broker.gpu_proof.embed_smoke_ms, null);
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
     assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);

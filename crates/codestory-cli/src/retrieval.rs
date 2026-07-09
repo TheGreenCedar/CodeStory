@@ -51,90 +51,46 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         "retrieval_bootstrap",
         env!("CARGO_PKG_VERSION"),
     );
-    let (report, project_qdrant_repair, status) = {
-        let mut embedding_resource_lease =
-            crate::readiness_broker::acquire_native_embedding_resource_lease_if_needed(
-                &broker_scope,
-                &sidecar,
-                Duration::from_secs(30),
-                Duration::from_millis(250),
-            )?;
-        let allow_native_embedding_spawn = !matches!(
-            embedding_resource_lease,
-            Some(crate::readiness_broker::BrokerNativeEmbeddingResourceLease::Reused { .. })
-        );
-        let bootstrap_result = bootstrap_sidecars_with_runtime(
-            &sidecar,
-            Some(&runtime.project_root),
-            &storage_scope,
-            cmd.compose_file.as_deref(),
-            cmd.skip_compose,
-            Duration::from_secs(cmd.wait_secs),
-            allow_native_embedding_spawn,
-        );
-        let report = match bootstrap_result {
-            Ok(report) => report,
-            Err(error) => {
-                if let Err(cleanup_error) =
-                    crate::readiness_broker::cleanup_native_embedding_resource_lease_after_bootstrap_error(
-                        &mut embedding_resource_lease,
+    let (report, project_qdrant_repair, status) =
+        crate::readiness_broker::run_with_native_embedding_lease_lifecycle(
+            crate::readiness_broker::NativeEmbeddingLeaseLifecycleParams {
+                scope: &broker_scope,
+                sidecar: &sidecar,
+                wait: Duration::from_secs(30),
+                poll: Duration::from_millis(250),
+                bootstrap_context: "retrieval bootstrap",
+                sidecar_cleanup_label: "retrieval sidecar",
+            },
+            |allow_native_embedding_spawn| {
+                bootstrap_sidecars_with_runtime(
+                    &sidecar,
+                    Some(&runtime.project_root),
+                    &storage_scope,
+                    cmd.compose_file.as_deref(),
+                    cmd.skip_compose,
+                    Duration::from_secs(cmd.wait_secs),
+                    allow_native_embedding_spawn,
+                )
+            },
+            |report| &report.state,
+            |report| {
+                activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
+                let project_qdrant_repair =
+                    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                        &runtime.project_root,
+                        &runtime.storage_path,
                         &sidecar,
                     )
-                {
-                    return Err(error).context(format!(
-                        "retrieval bootstrap; native embedding cleanup failed: {cleanup_error}"
-                    ));
-                }
-                return Err(error).context("retrieval bootstrap");
-            }
-        };
-        if let Err(error) = crate::readiness_broker::transfer_native_embedding_resource_lease(
-            &mut embedding_resource_lease,
-            &report.state,
-        ) {
-            crate::readiness_broker::cleanup_native_embedding_resource_lease_after_transfer_error(
-                &embedding_resource_lease,
-                &sidecar,
-            )
-            .with_context(|| {
-                format!(
-                    "cleanup retrieval sidecar after native embedding lease transfer failed: {error}"
-                )
-            })?;
-            return Err(error).context("native embedding lease transfer");
-        }
-        activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
-        let post_transfer_result = (|| -> Result<_> {
-            let project_qdrant_repair =
-                codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                    .context("retrieval project qdrant repair")?;
+                let status = strict_sidecar_status_for_runtime(
                     &runtime.project_root,
-                    &runtime.storage_path,
-                    &sidecar,
+                    Some(&runtime.storage_path),
+                    sidecar.clone(),
                 )
-                .context("retrieval project qdrant repair")?;
-            let status = strict_sidecar_status_for_runtime(
-                &runtime.project_root,
-                Some(&runtime.storage_path),
-                sidecar.clone(),
-            )
-            .context("retrieval status after bootstrap")?;
-            Ok((project_qdrant_repair, status))
-        })();
-        let (project_qdrant_repair, status) = match post_transfer_result {
-            Ok(result) => result,
-            Err(error) => {
-                crate::readiness_broker::cleanup_transferred_native_embedding_resource_after_error(
-                    &embedding_resource_lease,
-                    &sidecar,
-                )
-                .with_context(|| {
-                    format!("cleanup retrieval sidecar after post-transfer failure: {error}")
-                })?;
-                return Err(error);
-            }
-        };
-        (report, project_qdrant_repair, status)
-    };
+                .context("retrieval status after bootstrap")?;
+                Ok((report, project_qdrant_repair, status))
+            },
+        )?;
     let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
@@ -192,22 +148,7 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
 fn broker_gpu_proof_input_from_status(
     status: &RetrievalStatusReport,
 ) -> crate::readiness_broker::BrokerGpuProofInput {
-    crate::readiness_broker::BrokerGpuProofInput {
-        embedding_device_policy: Some(status.embedding_device_policy.clone()),
-        embedding_device_state: Some(status.embedding_device_state.clone()),
-        embedding_device_observation_source: Some(
-            status.embedding_device_observation_source.clone(),
-        ),
-        embedding_detected_provider: status.embedding_detected_provider.clone(),
-        embedding_detected_gpu: status.embedding_detected_gpu.clone(),
-        embedding_accelerator_requested: Some(status.embedding_accelerator_requested),
-        embedding_accelerator_request_provider: status
-            .embedding_accelerator_request_provider
-            .clone(),
-        embedding_accelerator_request_device: status.embedding_accelerator_request_device.clone(),
-        embedding_cpu_allowed: Some(status.embedding_cpu_allowed),
-        degraded_reason: status.degraded_reason.clone(),
-    }
+    crate::broker_gpu_proof_input_from_report(status)
 }
 
 pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {

@@ -2848,6 +2848,26 @@ fn resources_read_status_reports_abandoned_repair_without_starting_when_policy_e
         json!("observed"),
         "{status}"
     );
+    if let Some(gpu_proof) = status["readiness_broker"]["gpu_proof"].as_object() {
+        assert!(
+            gpu_proof.contains_key("proof_status"),
+            "gpu_proof should expose proof_status when present: {status}"
+        );
+        // embed_smoke_* are optional and may be omitted when None; when present they
+        // must be typed smoke evidence fields on the gpu_proof object.
+        if let Some(ok) = gpu_proof.get("embed_smoke_ok") {
+            assert!(
+                ok.is_boolean() || ok.is_null(),
+                "embed_smoke_ok must be bool|null when present: {status}"
+            );
+        }
+        if let Some(ms) = gpu_proof.get("embed_smoke_ms") {
+            assert!(
+                ms.is_u64() || ms.is_null(),
+                "embed_smoke_ms must be u64|null when present: {status}"
+            );
+        }
+    }
 }
 
 #[test]
