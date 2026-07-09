@@ -879,11 +879,7 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         "repair_all" => {
             state.status_cache = None;
-            stdio_deprecated_repair_all_response(handle_stdio_sidecar_repair(
-                runtime,
-                state,
-                StdioSidecarRepairMode::Background,
-            ))
+            stdio_deprecated_repair_all_response(handle_stdio_sidecar_repair(runtime, state))
         }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
@@ -2458,6 +2454,12 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
             stdio_path_fingerprint(&layout.state_file)
         ),
         format!(
+            "native_embedding_broker:{}",
+            crate::readiness_broker::machine_resource_cache_fingerprint(
+                crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE
+            )
+        ),
+        format!(
             "repair_state:{}",
             crate::ready_repair_status::ready_repair_status_cache_fingerprint(
                 &runtime.project_root
@@ -3137,13 +3139,23 @@ fn read_stdio_status_resource(
     );
     let readiness_broker_json =
         serde_json::to_value(&readiness_broker).expect("serialize readiness broker");
+    let selected_agent_runtime = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        selected_agent_sidecar.run_id.as_deref(),
+    );
+    let native_embedding_hard_busy = stdio_native_embedding_resource_hard_busy(
+        &runtime.project_root,
+        &selected_agent_runtime,
+        Some(&readiness_broker),
+    );
     let allowed_surfaces = stdio_allowed_surfaces_with_policy(
         &readiness,
         Some(&sidecar_setup),
-        Some(&readiness_broker),
+        native_embedding_hard_busy,
     );
     let recommended_next_calls =
-        stdio_status_recommended_next_calls(&readiness, &sidecar_setup, Some(&readiness_broker));
+        stdio_status_recommended_next_calls(&readiness, &sidecar_setup, native_embedding_hard_busy);
     let runtime_truth = stdio_runtime_truth_status(
         &plugin_runtime,
         &sidecar_setup,
@@ -3586,14 +3598,14 @@ fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
 fn stdio_status_recommended_next_calls(
     readiness: &[ReadinessVerdictDto],
     sidecar_setup: &serde_json::Value,
-    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
 ) -> serde_json::Value {
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
         if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
             if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
                 return stdio_status_repair_in_progress_next_calls();
             }
-            if let Some(busy) = stdio_native_embedding_resource_busy(readiness_broker) {
+            if let Some(busy) = native_embedding_hard_busy {
                 return stdio_status_native_embedding_busy_next_calls(busy);
             }
             match sidecar_setup
@@ -3698,6 +3710,41 @@ fn stdio_native_embedding_resource_busy(
         .resources
         .get(crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE)
         .filter(|resource| resource.status == "busy")
+}
+
+fn stdio_native_embedding_resource_hard_busy<'a>(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    readiness_broker: Option<&'a crate::readiness_broker::ReadinessBrokerSnapshot>,
+) -> Option<&'a crate::readiness_broker::BrokerResourceSnapshot> {
+    stdio_native_embedding_resource_hard_busy_with_classifier(
+        project_root,
+        sidecar,
+        readiness_broker,
+        crate::readiness_broker::reusable_native_embedding_resource_pid_for_snapshot,
+    )
+}
+
+fn stdio_native_embedding_resource_hard_busy_with_classifier<'a>(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    readiness_broker: Option<&'a crate::readiness_broker::ReadinessBrokerSnapshot>,
+    mut reusable_pid_for_snapshot: impl FnMut(
+        &crate::readiness_broker::BrokerScope,
+        &codestory_retrieval::SidecarRuntimeConfig,
+        &crate::readiness_broker::BrokerResourceSnapshot,
+    ) -> Result<Option<u32>>,
+) -> Option<&'a crate::readiness_broker::BrokerResourceSnapshot> {
+    let resource = stdio_native_embedding_resource_busy(readiness_broker)?;
+    let scope = crate::readiness_broker::agent_repair_scope(
+        project_root,
+        sidecar.run_id.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    match reusable_pid_for_snapshot(&scope, sidecar, resource) {
+        Ok(Some(_)) => None,
+        Ok(None) | Err(_) => Some(resource),
+    }
 }
 
 fn stdio_status_native_embedding_busy_next_calls(
@@ -4074,7 +4121,7 @@ fn handle_stdio_sidecar_setup(
                 }});
             }
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime, state, StdioSidecarRepairMode::Background)
+            handle_stdio_sidecar_repair(runtime, state)
         }
         _ => {
             serde_json::json!({"error": "sidecar_setup.action must be status, enable, disable, ask, or repair"})
@@ -4116,15 +4163,9 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StdioSidecarRepairMode {
-    Background,
-}
-
 fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
-    mode: StdioSidecarRepairMode,
 ) -> serde_json::Value {
     if let Some(error) = stdio_workspace_mismatch_error(runtime) {
         return serde_json::json!({"error": error});
@@ -4139,7 +4180,7 @@ fn handle_stdio_sidecar_repair(
         return serde_json::json!({
             "result": {
                 "status": "already_running",
-                "mode": stdio_sidecar_repair_mode_label(mode),
+                "mode": "background",
                 "project_root": status.project_root,
                 "profile": status.profile,
                 "run_id": status.run_id,
@@ -4156,21 +4197,30 @@ fn handle_stdio_sidecar_repair(
         });
     }
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
-    if let Some(result) = stdio_sidecar_repair_policy_block_result(&sidecar_setup, mode) {
+    if let Some(result) = stdio_sidecar_repair_policy_block_result(&sidecar_setup) {
         return result;
     }
+    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
     let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
             cache_root: runtime.cache_root.clone(),
-            agent_run_id: Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string()),
+            agent_run_id: repair_sidecar.run_id.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
             gpu_proof: None,
             reconciliation: None,
         },
     );
-    if let Some(busy) = stdio_native_embedding_resource_busy(Some(&broker_snapshot)) {
-        return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup, mode);
+    if let Some(busy) = stdio_native_embedding_resource_hard_busy(
+        &runtime.project_root,
+        &repair_sidecar,
+        Some(&broker_snapshot),
+    ) {
+        return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup);
     }
     let broker_reconciliation = crate::readiness_broker::reconcile_before_enqueue(
         &runtime.project_root,
@@ -4209,11 +4259,6 @@ fn handle_stdio_sidecar_repair(
         Ok(child) => {
             let child_pid = child.id();
             let repair_started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
-            let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-                &runtime.project_root,
-                codestory_retrieval::SidecarProfile::Agent,
-                Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-            );
             let status_published = crate::ready_repair_status::write_ready_repair_status(
                 &repair_sidecar,
                 &runtime.project_root,
@@ -4244,7 +4289,7 @@ fn handle_stdio_sidecar_repair(
             serde_json::json!({
                 "result": {
                     "status": "started",
-                    "mode": stdio_sidecar_repair_mode_label(mode),
+                    "mode": "background",
                     "pid": child_pid,
                     "status_published": status_published,
                     "broker_snapshot": broker_snapshot,
@@ -4265,13 +4310,12 @@ fn handle_stdio_sidecar_repair(
 
 fn stdio_sidecar_repair_policy_block_result(
     sidecar_setup: &serde_json::Value,
-    mode: StdioSidecarRepairMode,
 ) -> Option<serde_json::Value> {
     let (status, message) = stdio_repair_blocked_by_policy(sidecar_setup)?;
     Some(serde_json::json!({
         "result": {
             "status": status,
-            "mode": stdio_sidecar_repair_mode_label(mode),
+            "mode": "background",
             "message": message,
             "sidecar_setup": sidecar_setup,
             "recommended_next_calls": stdio_repair_policy_next_calls(sidecar_setup)
@@ -4282,12 +4326,11 @@ fn stdio_sidecar_repair_policy_block_result(
 fn stdio_sidecar_repair_machine_busy_result(
     busy: &crate::readiness_broker::BrokerResourceSnapshot,
     sidecar_setup: &serde_json::Value,
-    mode: StdioSidecarRepairMode,
 ) -> serde_json::Value {
     serde_json::json!({
         "result": {
             "status": "native_embedding_runtime_busy",
-            "mode": stdio_sidecar_repair_mode_label(mode),
+            "mode": "background",
             "message": "CodeStory native embedding runtime is already owned by another operation.",
             "owner_pid": busy.owner_pid,
             "owner_project_id": busy.owner_project_id,
@@ -4296,12 +4339,6 @@ fn stdio_sidecar_repair_machine_busy_result(
             "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy)
         }
     })
-}
-
-fn stdio_sidecar_repair_mode_label(mode: StdioSidecarRepairMode) -> &'static str {
-    match mode {
-        StdioSidecarRepairMode::Background => "background",
-    }
 }
 
 fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_json::Value {
@@ -4430,7 +4467,7 @@ fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Valu
 fn stdio_allowed_surfaces_with_policy(
     readiness: &[ReadinessVerdictDto],
     sidecar_setup: Option<&serde_json::Value>,
-    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
 ) -> serde_json::Value {
     let local = readiness
         .iter()
@@ -4465,7 +4502,7 @@ fn stdio_allowed_surfaces_with_policy(
     }
     surfaces.insert(
         "repair_all".to_string(),
-        stdio_repair_all_surface(readiness, sidecar_setup, readiness_broker),
+        stdio_repair_all_surface(readiness, sidecar_setup, native_embedding_hard_busy),
     );
     serde_json::Value::Object(surfaces)
 }
@@ -4473,7 +4510,7 @@ fn stdio_allowed_surfaces_with_policy(
 fn stdio_repair_all_surface(
     readiness: &[ReadinessVerdictDto],
     sidecar_setup: Option<&serde_json::Value>,
-    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
 ) -> serde_json::Value {
     if let Some(setup) = readiness
         .iter()
@@ -4494,7 +4531,7 @@ fn stdio_repair_all_surface(
             "full_repair": [],
         });
     }
-    if let Some(busy) = stdio_native_embedding_resource_busy(readiness_broker) {
+    if let Some(busy) = native_embedding_hard_busy {
         return serde_json::json!({
             "allowed": false,
             "readiness_goal": "agent_packet_search",
@@ -4872,6 +4909,79 @@ mod tests {
         })
     }
 
+    fn agent_packet_search_not_ready() -> ReadinessVerdictDto {
+        ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::RepairRetrieval,
+            summary: "agent packet/search sidecars need repair".to_string(),
+            minimum_next: vec!["codestory-cli ready --goal agent --repair".to_string()],
+            full_repair: vec!["codestory-cli ready --goal agent --repair".to_string()],
+            setup: None,
+            index: None,
+            sidecar: None,
+        }
+    }
+
+    fn broker_snapshot_with_native_resource(
+        project_root: &Path,
+        resource: crate::readiness_broker::BrokerResourceSnapshot,
+    ) -> crate::readiness_broker::ReadinessBrokerSnapshot {
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project_root,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let mut resources = std::collections::BTreeMap::new();
+        resources.insert(
+            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE.to_string(),
+            resource,
+        );
+        crate::readiness_broker::ReadinessBrokerSnapshot {
+            schema_version: 1,
+            install_id: "test-install".to_string(),
+            project_id: scope.project_id,
+            canonical_root_hash: "test-root-hash".to_string(),
+            workspace_root: scope.workspace_root,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            updated_at_epoch_ms: crate::ready_repair_status::now_epoch_ms(),
+            snapshot_path: None,
+            persistence_status: "pending".to_string(),
+            persistence_error: None,
+            operations: Vec::new(),
+            resources,
+            reconciliation: crate::readiness_broker::BrokerReconciliationSnapshot {
+                status: "observed".to_string(),
+                cleanup_performed: false,
+                stale_status_paths_removed: Vec::new(),
+                stale_lock_paths_removed: Vec::new(),
+                abandoned_repairs: Vec::new(),
+                local_refresh_cleanups: Vec::new(),
+                active_repair: None,
+                unresolved_orphan_reason: None,
+            },
+            gpu_proof: None,
+        }
+    }
+
+    fn native_resource_snapshot_for_scope(
+        scope: &crate::readiness_broker::BrokerScope,
+        status: &str,
+        owner_pid: u32,
+    ) -> crate::readiness_broker::BrokerResourceSnapshot {
+        crate::readiness_broker::BrokerResourceSnapshot {
+            resource: crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE.to_string(),
+            scope: "machine".to_string(),
+            status: status.to_string(),
+            owner_pid: Some(owner_pid),
+            owner_operation_id: None,
+            owner_project_id: Some(scope.project_id.clone()),
+            owner_workspace_root: Some(scope.workspace_root.clone()),
+            started_at_epoch_ms: Some(crate::ready_repair_status::now_epoch_ms()),
+            lock_path: "C:/cache/readiness-broker/machine/native.lock".to_string(),
+            queued_reason: (status == "busy").then(|| "machine_resource_busy".to_string()),
+        }
+    }
+
     #[test]
     fn stdio_status_recent_repair_keeps_live_status_phase() {
         let project = tempfile::tempdir().expect("project");
@@ -4986,6 +5096,125 @@ mod tests {
             calls[0].get("command").is_none(),
             "restart boundary should not be exposed as a CLI command: {calls}"
         );
+    }
+
+    #[test]
+    fn stdio_native_embedding_same_project_reusable_lock_does_not_block_repair() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let resource = native_resource_snapshot_for_scope(&scope, "busy", 44);
+        let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
+        let mut classifier_called = false;
+
+        let hard_busy = stdio_native_embedding_resource_hard_busy_with_classifier(
+            project.path(),
+            &sidecar,
+            Some(&snapshot),
+            |classifier_scope, classifier_sidecar, classifier_resource| {
+                classifier_called = true;
+                assert_eq!(classifier_scope.project_id, scope.project_id);
+                assert_eq!(classifier_sidecar.run_id, sidecar.run_id);
+                assert_eq!(classifier_resource.owner_pid, Some(44));
+                Ok(Some(44))
+            },
+        );
+        let calls = stdio_status_recommended_next_calls(
+            &[agent_packet_search_not_ready()],
+            &json!({"state": "enabled"}),
+            hard_busy,
+        );
+
+        assert!(classifier_called);
+        assert!(hard_busy.is_none());
+        assert_eq!(calls[0]["tool"], json!("sidecar_setup"));
+        assert_eq!(calls[0]["arguments"]["action"], json!("repair"));
+    }
+
+    #[test]
+    fn stdio_native_embedding_foreign_lock_blocks_repair() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let mut resource = native_resource_snapshot_for_scope(&scope, "busy", 45);
+        resource.owner_project_id = Some("foreign-project".to_string());
+        let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
+
+        let hard_busy = stdio_native_embedding_resource_hard_busy_with_classifier(
+            project.path(),
+            &sidecar,
+            Some(&snapshot),
+            |_classifier_scope, _classifier_sidecar, _classifier_resource| Ok(None),
+        );
+        let calls = stdio_status_recommended_next_calls(
+            &[agent_packet_search_not_ready()],
+            &json!({"state": "enabled"}),
+            hard_busy,
+        );
+        let surfaces = stdio_allowed_surfaces_with_policy(
+            &[agent_packet_search_not_ready()],
+            Some(&json!({"state": "enabled"})),
+            hard_busy,
+        );
+
+        assert!(hard_busy.is_some());
+        assert_eq!(calls[0]["method"], json!("host/instruction"));
+        assert_eq!(surfaces["repair_all"]["status"], json!("busy"));
+        assert_eq!(
+            surfaces["repair_all"]["repair_reason"],
+            json!("native_embedding_runtime_busy")
+        );
+    }
+
+    #[test]
+    fn stdio_native_embedding_stale_snapshot_does_not_block_repair() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let resource = native_resource_snapshot_for_scope(&scope, "stale", 46);
+        let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
+
+        let hard_busy = stdio_native_embedding_resource_hard_busy_with_classifier(
+            project.path(),
+            &sidecar,
+            Some(&snapshot),
+            |_classifier_scope, _classifier_sidecar, _classifier_resource| {
+                panic!("stale native lock snapshots must not reach busy classification")
+            },
+        );
+        let calls = stdio_status_recommended_next_calls(
+            &[agent_packet_search_not_ready()],
+            &json!({"state": "enabled"}),
+            hard_busy,
+        );
+
+        assert!(hard_busy.is_none());
+        assert_eq!(calls[0]["tool"], json!("sidecar_setup"));
+        assert_eq!(calls[0]["arguments"]["action"], json!("repair"));
     }
 
     #[test]

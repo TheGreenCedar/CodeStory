@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::{display, local_refresh_status, ready_repair_status};
 
@@ -223,6 +223,13 @@ struct BrokerMachineResourceReaperLock {
     token: String,
 }
 
+impl BrokerMachineResourceReaperLock {
+    fn is_current(&self) -> bool {
+        read_machine_resource_reaper_lock_file(&self.path)
+            .is_some_and(|lock| lock.token == self.token)
+    }
+}
+
 impl Drop for BrokerMachineResourceLock {
     fn drop(&mut self) {
         if !self.release_on_drop {
@@ -388,6 +395,18 @@ pub(crate) fn transfer_native_embedding_resource_lease(
     lease: &mut Option<BrokerNativeEmbeddingResourceLease>,
     state: &codestory_retrieval::SidecarStateFile,
 ) -> Result<()> {
+    transfer_native_embedding_resource_lease_with_validator(
+        lease,
+        state,
+        codestory_retrieval::ensure_native_embedding_launch_identity,
+    )
+}
+
+fn transfer_native_embedding_resource_lease_with_validator(
+    lease: &mut Option<BrokerNativeEmbeddingResourceLease>,
+    state: &codestory_retrieval::SidecarStateFile,
+    mut validate_launch: impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
+) -> Result<()> {
     let Some(launch) = native_embedding_launch_from_sidecar_state(state) else {
         if matches!(
             lease,
@@ -408,10 +427,8 @@ pub(crate) fn transfer_native_embedding_resource_lease(
     };
     match lease {
         Some(BrokerNativeEmbeddingResourceLease::Acquired(lock)) => {
-            let validated_pid = codestory_retrieval::ensure_native_embedding_launch_identity(
-                launch,
-            )
-            .with_context(|| format!("validate native embedding broker handoff pid {pid}"))?;
+            let validated_pid = validate_launch(launch)
+                .with_context(|| format!("validate native embedding broker handoff pid {pid}"))?;
             if validated_pid != pid {
                 bail!(
                     "validated native embedding broker handoff pid mismatch: expected {pid}, got {validated_pid}"
@@ -422,6 +439,13 @@ pub(crate) fn transfer_native_embedding_resource_lease(
             }
         }
         Some(BrokerNativeEmbeddingResourceLease::Reused { pid: reused_pid }) => {
+            let validated_pid = validate_launch(launch)
+                .with_context(|| format!("validate reused native embedding broker pid {pid}"))?;
+            if validated_pid != pid {
+                bail!(
+                    "validated reused native embedding broker pid mismatch: expected {pid}, got {validated_pid}"
+                );
+            }
             if *reused_pid != pid {
                 bail!(
                     "reused native embedding broker lease pid mismatch: expected {reused_pid}, got {pid}"
@@ -490,13 +514,26 @@ pub(crate) fn release_machine_resource_lock_for_pid(resource: &str, pid: u32) ->
 }
 
 fn reap_stale_machine_resource_lock(resource: &str, path: &Path) -> Result<bool> {
-    let Some(_reaper) = try_acquire_machine_resource_reaper_lock(resource)? else {
+    let Some(reaper) = try_acquire_machine_resource_reaper_lock(resource)? else {
         return Ok(false);
     };
-    if !machine_lock_file_is_stale(path) {
+    let Some(stale_lock) = read_machine_resource_lock_file(path) else {
+        return Ok(false);
+    };
+    if !machine_lock_is_stale(&stale_lock) || !reaper.is_current() {
         return Ok(false);
     }
-    fs::remove_file(path)?;
+    let Some(current) = read_machine_resource_lock_file(path) else {
+        return Ok(false);
+    };
+    if current.token != stale_lock.token || !machine_lock_is_stale(&current) {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
     Ok(true)
 }
 
@@ -549,6 +586,21 @@ fn acquire_native_embedding_resource_lease_if_needed_with_validator(
             }
         }
     }
+}
+
+pub(crate) fn reusable_native_embedding_resource_pid_for_snapshot(
+    scope: &BrokerScope,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    snapshot: &BrokerResourceSnapshot,
+) -> Result<Option<u32>> {
+    if snapshot.status != "busy" || snapshot.resource != NATIVE_EMBEDDING_RESOURCE {
+        return Ok(None);
+    }
+    let busy = BrokerMachineResourceBusy {
+        snapshot: snapshot.clone(),
+    };
+    let mut validate_launch = codestory_retrieval::ensure_native_embedding_launch_identity;
+    reusable_native_embedding_resource_pid(scope, sidecar, &busy, &mut validate_launch)
 }
 
 fn reusable_native_embedding_resource_pid(
@@ -958,7 +1010,7 @@ fn machine_resource_snapshot(resource: &str) -> BrokerResourceSnapshot {
 fn machine_lock_file_is_stale(path: &Path) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_machine_resource_lock_file(path) {
-        return !ready_repair_status::process_is_running(lock.pid);
+        return machine_lock_is_stale(&lock);
     }
     fs::metadata(path)
         .ok()
@@ -969,6 +1021,10 @@ fn machine_lock_file_is_stale(path: &Path) -> bool {
             now.saturating_sub(modified_ms) > MACHINE_LOCK_STALE_TTL.as_millis() as i64
         })
         .unwrap_or(true)
+}
+
+fn machine_lock_is_stale(lock: &BrokerMachineResourceLockFile) -> bool {
+    !ready_repair_status::process_is_running(lock.pid)
 }
 
 fn create_lock_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -1003,12 +1059,61 @@ fn try_acquire_machine_resource_reaper_lock(
             if !machine_reaper_lock_file_is_stale(&path) {
                 return Ok(None);
             }
-            fs::write(&path, &content)?;
-            match read_machine_resource_reaper_lock_file(&path) {
-                Some(current) if current.token == token => {
-                    Ok(Some(BrokerMachineResourceReaperLock { path, token }))
-                }
-                _ => Ok(None),
+            let Some(_takeover) = try_acquire_machine_resource_reaper_takeover_lock(resource)?
+            else {
+                return Ok(None);
+            };
+            if !machine_reaper_lock_file_is_stale(&path) {
+                return Ok(None);
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            match create_lock_file(&path, &content) {
+                Ok(()) => Ok(Some(BrokerMachineResourceReaperLock { path, token })),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn try_acquire_machine_resource_reaper_takeover_lock(
+    resource: &str,
+) -> Result<Option<BrokerMachineResourceReaperLock>> {
+    let path = machine_resource_reaper_takeover_lock_path(resource);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let started_at_epoch_ms = now_epoch_ms();
+    let pid = std::process::id();
+    let token = format!("{pid}:{started_at_epoch_ms}:reaper-takeover");
+    let lock = BrokerMachineResourceReaperLockFile {
+        schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+        resource: resource.to_string(),
+        pid,
+        started_at_epoch_ms,
+        token: token.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&lock)?;
+    match create_lock_file(&path, &content) {
+        Ok(()) => Ok(Some(BrokerMachineResourceReaperLock { path, token })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if !machine_reaper_lock_file_is_stale(&path) {
+                return Ok(None);
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            match create_lock_file(&path, &content) {
+                Ok(()) => Ok(Some(BrokerMachineResourceReaperLock { path, token })),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+                Err(error) => Err(error.into()),
             }
         }
         Err(error) => Err(error.into()),
@@ -1103,6 +1208,34 @@ fn machine_resource_reaper_lock_path(resource: &str) -> PathBuf {
         .join(format!("{}.reap.lock", safe_name(resource)))
 }
 
+fn machine_resource_reaper_takeover_lock_path(resource: &str) -> PathBuf {
+    broker_cache_root()
+        .join(BROKER_DIR)
+        .join(MACHINE_RESOURCE_DIR)
+        .join(format!("{}.reap.takeover.lock", safe_name(resource)))
+}
+
+pub(crate) fn machine_resource_cache_fingerprint(resource: &str) -> String {
+    format!(
+        "lock:{}|reaper:{}",
+        path_fingerprint(&machine_resource_lock_path(resource)),
+        path_fingerprint(&machine_resource_reaper_lock_path(resource))
+    )
+}
+
+fn path_fingerprint(path: &Path) -> String {
+    let Ok(metadata) = fs::metadata(path) else {
+        return "missing".to_string();
+    };
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("len:{}:mtime_ms:{}", metadata.len(), modified_ms)
+}
+
 fn install_id() -> String {
     for name in [
         "CODESTORY_INSTALL_ID",
@@ -1174,10 +1307,7 @@ fn hash_text(value: &str) -> String {
 }
 
 fn now_epoch_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
+    ready_repair_status::now_epoch_ms()
 }
 
 #[cfg(test)]
@@ -1193,6 +1323,7 @@ mod tests {
     fn cleanup_machine_resource(resource: &str) {
         let _ = fs::remove_file(machine_resource_lock_path(resource));
         let _ = fs::remove_file(machine_resource_reaper_lock_path(resource));
+        let _ = fs::remove_file(machine_resource_reaper_takeover_lock_path(resource));
     }
 
     fn test_scope(project: &Path, run_id: &str) -> BrokerScope {
@@ -1227,6 +1358,28 @@ mod tests {
             serde_json::to_vec_pretty(&lock).expect("serialize lock"),
         )
         .expect("write lock");
+        path
+    }
+
+    fn write_stale_reaper_lock(resource: &str) -> PathBuf {
+        let path = machine_resource_reaper_lock_path(resource);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create reaper lock parent");
+        }
+        let started_at_epoch_ms =
+            now_epoch_ms() - MACHINE_REAPER_LOCK_STALE_TTL.as_millis() as i64 - 10_000;
+        let lock = BrokerMachineResourceReaperLockFile {
+            schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+            resource: resource.to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms,
+            token: format!("stale-reaper:{started_at_epoch_ms}"),
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&lock).expect("serialize reaper lock"),
+        )
+        .expect("write reaper lock");
         path
     }
 
@@ -1425,6 +1578,31 @@ mod tests {
     }
 
     #[test]
+    fn native_embedding_reused_lease_revalidates_handoff_identity() {
+        let owner_pid = 4321;
+        let mut lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: owner_pid });
+        let mut state = native_sidecar_state(Some(now_epoch_ms()));
+        if let Some(launch) = state.embedding_launch.as_mut() {
+            launch.pid = Some(owner_pid);
+        }
+        let mut validator_called = false;
+
+        let error =
+            transfer_native_embedding_resource_lease_with_validator(&mut lease, &state, |launch| {
+                validator_called = true;
+                assert_eq!(launch.pid, Some(owner_pid));
+                Err(anyhow::anyhow!("identity_unverified"))
+            })
+            .expect_err("reused handoff must fail closed when identity validation fails");
+
+        assert!(validator_called);
+        assert!(
+            format!("{error:?}").contains("identity_unverified"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
     fn native_embedding_acquired_lease_releases_without_handoff_on_error() {
         let project = tempdir().expect("temp project");
         let resource = unique_resource("native-error-release");
@@ -1538,6 +1716,56 @@ mod tests {
 
         assert_eq!(busy.snapshot.status, "busy");
         assert_eq!(busy.snapshot.owner_pid, Some(std::process::id()));
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn machine_resource_reaper_stale_takeover_has_single_winner() {
+        let resource = unique_resource("stale-reaper-single-winner");
+        cleanup_machine_resource(&resource);
+        write_stale_reaper_lock(&resource);
+        let contender_count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(contender_count));
+        let mut handles = Vec::new();
+
+        for _ in 0..contender_count {
+            let resource = resource.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                try_acquire_machine_resource_reaper_lock(&resource).expect("try reaper")
+            }));
+        }
+
+        let locks: Vec<Option<BrokerMachineResourceReaperLock>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reaper contender thread"))
+            .collect();
+
+        assert_eq!(
+            locks.iter().filter(|lock| lock.is_some()).count(),
+            1,
+            "stale reaper takeover must have exactly one winner"
+        );
+        drop(locks);
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn machine_resource_cache_fingerprint_tracks_lock_and_reaper_changes() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("cache-fingerprint");
+        cleanup_machine_resource(&resource);
+        let before = machine_resource_cache_fingerprint(&resource);
+        let scope = test_scope(project.path(), "owner");
+
+        write_machine_lock(&resource, &scope, std::process::id());
+        let after_lock = machine_resource_cache_fingerprint(&resource);
+        assert_ne!(before, after_lock);
+
+        write_stale_reaper_lock(&resource);
+        let after_reaper = machine_resource_cache_fingerprint(&resource);
+        assert_ne!(after_lock, after_reaper);
         cleanup_machine_resource(&resource);
     }
 

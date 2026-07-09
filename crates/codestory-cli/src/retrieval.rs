@@ -59,6 +59,10 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
                 Duration::from_secs(30),
                 Duration::from_millis(250),
             )?;
+        let allow_native_embedding_spawn = !matches!(
+            embedding_resource_lease,
+            Some(crate::readiness_broker::BrokerNativeEmbeddingResourceLease::Reused { .. })
+        );
         let bootstrap_result = bootstrap_sidecars_with_runtime(
             &sidecar,
             Some(&runtime.project_root),
@@ -66,6 +70,7 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             cmd.compose_file.as_deref(),
             cmd.skip_compose,
             Duration::from_secs(cmd.wait_secs),
+            allow_native_embedding_spawn,
         );
         let report = match bootstrap_result {
             Ok(report) => report,

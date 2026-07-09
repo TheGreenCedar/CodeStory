@@ -42,6 +42,10 @@
 - Allowed sequential native sidecar repairs to reuse the same validated
   CodeStory-spawned llama.cpp PID instead of treating the broker lease as a
   foreign machine lock after the first successful repair.
+- Closed native embedding broker lease and stale-reaper races by making reused
+  leases reuse-only, revalidating reused PID handoffs, preserving same-project
+  MCP repair reuse, and invalidating status cache entries when broker locks
+  change.
 
 ## 0.13.12
 

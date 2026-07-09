@@ -125,6 +125,7 @@ pub fn bootstrap_sidecars_with_profile(
         compose_file,
         skip_compose,
         wait_timeout,
+        true,
     )
 }
 
@@ -135,6 +136,7 @@ pub fn bootstrap_sidecars_with_runtime(
     compose_file: Option<&Path>,
     skip_compose: bool,
     wait_timeout: Duration,
+    allow_native_embedding_spawn: bool,
 ) -> Result<BootstrapReport> {
     bootstrap_sidecars_with_runtime_progress(
         runtime,
@@ -143,6 +145,7 @@ pub fn bootstrap_sidecars_with_runtime(
         compose_file,
         skip_compose,
         wait_timeout,
+        allow_native_embedding_spawn,
         |_| {},
     )
 }
@@ -154,6 +157,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     compose_file: Option<&Path>,
     skip_compose: bool,
     wait_timeout: Duration,
+    allow_native_embedding_spawn: bool,
     mut progress: impl FnMut(&'static str),
 ) -> Result<BootstrapReport> {
     let layout = runtime.layout.clone();
@@ -182,7 +186,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     };
     let native_embedding_spawn = if let Some(launch) = native_embedding.as_ref() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
-            spawn_native_embedding_server(launch, runtime)
+            spawn_native_embedding_server(launch, runtime, allow_native_embedding_spawn)
         })?
     } else {
         None
@@ -1203,6 +1207,17 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn spawn_native_embedding_server(
     launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
+    allow_spawn: bool,
+) -> Result<Option<NativeEmbeddingSpawn>> {
+    let probe = crate::embeddings::probe_product_embedding_runtime();
+    spawn_native_embedding_server_with_probe(launch, runtime, allow_spawn, probe)
+}
+
+fn spawn_native_embedding_server_with_probe(
+    launch: &NativeEmbeddingServerLaunch,
+    runtime: &SidecarRuntimeConfig,
+    allow_spawn: bool,
+    probe: crate::embeddings::EmbeddingRuntimeProbe,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
     if let Some(parent) = launch.log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1213,7 +1228,6 @@ fn spawn_native_embedding_server(
         .append(true)
         .open(&launch.log_path)
         .with_context(|| format!("open native llama.cpp log {}", launch.log_path.display()))?;
-    let probe = crate::embeddings::probe_product_embedding_runtime();
     if native_embedding_server_reusable(&probe) {
         if let Some(spawn) = reusable_native_embedding_spawn_from_state(runtime, launch)? {
             writeln!(
@@ -1232,6 +1246,17 @@ fn spawn_native_embedding_server(
         .ok();
         bail!(
             "native llama.cpp embedding endpoint is reachable but no matching sidecar launch metadata with a pid was found; cannot safely transfer the native embedding broker lock"
+        );
+    }
+    if !allow_spawn {
+        writeln!(
+            log,
+            "refusing native llama.cpp embedding server spawn under reuse-only broker lease after probe failed: {}",
+            probe.detail
+        )
+        .ok();
+        bail!(
+            "native llama.cpp embedding endpoint is unreachable and the broker lease is reuse-only; refusing to start another native embedding server"
         );
     }
     writeln!(
@@ -2244,6 +2269,34 @@ mod tests {
 
         assert!(native_embedding_server_reusable(&reachable));
         assert!(!native_embedding_server_reusable(&unreachable));
+    }
+
+    #[test]
+    fn native_embedding_reuse_only_refuses_unreachable_endpoint_before_spawn() {
+        let temp = tempdir().expect("temp");
+        let runtime = compose_test_runtime(temp.path());
+        let launch = native_embedding_server_launch_from_paths(
+            temp.path().join("missing-llama-server.exe"),
+            temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
+            &runtime,
+        );
+        let probe = crate::embeddings::EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: "llama.cpp embeddings unavailable".into(),
+        };
+
+        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, false, probe)
+            .expect_err("reuse-only lease must not fall through to spawn");
+
+        let error_text = format!("{error:?}");
+        assert!(
+            error_text.contains("reuse-only"),
+            "expected reuse-only error before spawn attempt, got {error:?}"
+        );
+        assert!(
+            !error_text.contains("missing-llama-server"),
+            "spawn path should not run under reuse-only lease: {error:?}"
+        );
     }
 
     #[test]

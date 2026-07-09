@@ -2685,6 +2685,10 @@ fn repair_ready_state(
                 Duration::from_secs(30),
                 Duration::from_millis(250),
             )?;
+        let allow_native_embedding_spawn = !matches!(
+            embedding_resource_lease,
+            Some(readiness_broker::BrokerNativeEmbeddingResourceLease::Reused { .. })
+        );
         eprintln!(
             "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
             sidecar.run_id.as_deref().unwrap_or("none"),
@@ -2700,6 +2704,7 @@ fn repair_ready_state(
             None,
             false,
             Duration::from_secs(90),
+            allow_native_embedding_spawn,
             |phase| progress.set_phase(phase),
         );
         let bootstrap = match bootstrap_result {
