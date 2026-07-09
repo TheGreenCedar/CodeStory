@@ -2328,7 +2328,7 @@ fn stdio_status_with_recent_sidecar_repair(
         .unwrap_or_else(|| fallback_active_repair.clone());
     let active_repair_empty = status
         .pointer("/sidecar_setup/active_repair")
-        .map_or(true, serde_json::Value::is_null);
+        .is_none_or(serde_json::Value::is_null);
     if active_repair_empty
         && let Some(sidecar_setup) = status
             .get_mut("sidecar_setup")
