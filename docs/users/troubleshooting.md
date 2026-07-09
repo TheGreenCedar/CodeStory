@@ -236,9 +236,9 @@ install. Confirm with a fresh `codestory://status` read.
 
 For Codex, marketplace refresh, package refresh, and runtime reload are separate:
 
-```sh
-codex plugin marketplace upgrade TheGreenCedar
-codex plugin add codestory@TheGreenCedar
+```powershell
+codex.cmd plugin marketplace upgrade TheGreenCedar
+codex.cmd plugin add codestory@TheGreenCedar
 ```
 
 The first command only updates Codex's marketplace snapshot. The second refreshes
@@ -247,12 +247,12 @@ management. A running Codex host can still keep the old MCP adapter and managed
 CLI alive until you start a fresh host session.
 
 On Windows, older running CodeStory MCP processes can make
-`codex plugin add codestory@TheGreenCedar` fail with `Access is denied` while
+`codex.cmd plugin add codestory@TheGreenCedar` fail with `Access is denied` while
 backing up the plugin cache. Current MCP adapters move their long-lived working
 directory out of the plugin cache, but stale hosts from older packages can still
 hold files open. Quit stale Codex windows, start a fresh host session, and retry
 the `/plugins` refresh or terminal install. After refresh, confirm the active
-runtime through `codestory://status`, not only `codex plugin list`.
+runtime through `codestory://status`, not only `codex.cmd plugin list`.
 
 ## Still stuck?
 

@@ -15,6 +15,13 @@
 - Required a live timed embedding smoke before long ready-repair semantic work
   when accelerator is required; `gpu_proof` now reports `embed_smoke_ok` /
   `embed_smoke_ms` and only marks `verified` when smoke succeeds.
+- Retargeted CodeStory-managed llama.cpp embedding URLs during repair so stale
+  managed endpoints from a long-lived MCP parent cannot pin a new native sidecar
+  probe to the wrong port.
+- Waited for Unix native llama.cpp processes to exit after `SIGTERM` before
+  releasing native embedding broker ownership.
+- Corrected shipped CodeStory status and Windows terminal plugin guidance to
+  use the actual `gpu_proof` fields and `codex.cmd` command surface.
 
 ### Changed
 
