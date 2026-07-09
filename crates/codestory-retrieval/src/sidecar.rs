@@ -517,6 +517,12 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
     if !process_dir.exists() {
         return Ok(None);
     }
+    let Some(process_state) = native_embedding_linux_process_state(&process_dir)? else {
+        return Ok(None);
+    };
+    if process_state == 'Z' {
+        return Ok(None);
+    }
     let executable_path = fs::read_link(process_dir.join("exe"))
         .ok()
         .map(|path| path.display().to_string());
@@ -534,6 +540,22 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
         command_line,
         started_at_epoch_ms,
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn native_embedding_linux_process_state(process_dir: &Path) -> Result<Option<char>> {
+    let stat_path = process_dir.join("stat");
+    let stat = match fs::read_to_string(&stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", stat_path.display())),
+    };
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|state| state.chars().next())
+        .with_context(|| format!("parse Linux process state from {}", stat_path.display()))?;
+    Ok(Some(state))
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
@@ -1167,6 +1189,41 @@ mod tests {
         .expect("process exits after retries");
 
         assert_eq!(checks, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_embedding_process_snapshot_treats_zombie_child_as_not_running() -> Result<()> {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .context("spawn short-lived child")?;
+        let pid = child.id();
+        let process_dir = Path::new("/proc").join(pid.to_string());
+
+        let test_result = (|| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if matches!(
+                    native_embedding_linux_process_state(&process_dir)?,
+                    Some('Z')
+                ) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("child pid {pid} did not become zombie");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            assert_eq!(native_embedding_process_snapshot(pid)?, None);
+            Ok(())
+        })();
+
+        let reap_result = child.wait().context("reap zombie child");
+        test_result?;
+        reap_result?;
+        Ok(())
     }
 
     #[test]
