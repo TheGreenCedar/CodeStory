@@ -385,7 +385,12 @@ impl SidecarRuntimeConfig {
     }
 
     pub fn activate_embed_url_default(&self) {
-        if std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err() {
+        let url_missing_or_blank = std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
+            .ok()
+            .is_none_or(|value| value.trim().is_empty());
+        let managed_url = std::env::var(MANAGED_LLAMACPP_URL_ENV).is_ok();
+
+        if url_missing_or_blank || managed_url {
             // SAFETY: this is command-local setup before sidecar probes/query embedding calls.
             unsafe {
                 std::env::set_var(
@@ -1119,6 +1124,25 @@ mod tests {
         assert_eq!(
             embedding_server_launch_mode().expect("launch mode"),
             EmbeddingServerLaunchMode::NativeSpawned
+        );
+    }
+
+    #[test]
+    fn managed_llamacpp_url_after_activation_retargets_runtime_url() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:11111/v1/embeddings",
+        );
+        let _managed = EnvGuard::set(MANAGED_LLAMACPP_URL_ENV, "1");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+
+        runtime.activate_embed_url_default();
+
+        assert_eq!(
+            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").expect("managed embed url"),
+            SidecarLayout::embed_base_url(runtime.embed_http_port)
         );
     }
 
