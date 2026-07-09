@@ -4192,6 +4192,15 @@ fn handle_stdio_sidecar_repair(
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     run_id
                 ),
+                "debug_status_command": format!(
+                    "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    run_id
+                ),
+                "recommended_next_calls": [{
+                    "method": "resources/read",
+                    "uri": "codestory://status"
+                }],
                 "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }
         });
@@ -4300,6 +4309,15 @@ fn handle_stdio_sidecar_repair(
                         crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                         codestory_retrieval::DEFAULT_AGENT_RUN_ID
                     ),
+                    "debug_status_command": format!(
+                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    ),
+                    "recommended_next_calls": [{
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }],
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
                 }
             })
@@ -4538,11 +4556,11 @@ fn stdio_sidecar_setup_surface(
     }
     if let Some(busy) = native_embedding_hard_busy {
         return serde_json::json!({
-            "allowed": false,
+            "allowed": true,
             "readiness_goal": "agent_packet_search",
             "status": "busy",
             "failed_layer": "native_embedding_runtime",
-            "summary": "CodeStory native embedding runtime is already owned by another operation.",
+            "summary": "sidecar_setup status is available; repair is blocked because CodeStory native embedding runtime is already owned by another operation.",
             "owner_pid": busy.owner_pid,
             "owner_project_id": busy.owner_project_id,
             "owner_workspace_root": busy.owner_workspace_root,
@@ -4550,10 +4568,12 @@ fn stdio_sidecar_setup_surface(
             "canonical_arguments": {"action": "status"},
         });
     }
-    let allowed_actions = match sidecar_setup.map(stdio_sidecar_policy_state) {
-        Some("ask") => serde_json::json!(["status", "enable", "repair"]),
-        Some("disabled") | Some("unmanaged") => serde_json::json!(["status", "enable"]),
-        _ => serde_json::json!(["status", "repair"]),
+    let (allowed_actions, canonical_action) = match sidecar_setup.map(stdio_sidecar_policy_state) {
+        Some("enabled") => (serde_json::json!(["status", "repair"]), "repair"),
+        Some("ask") => (serde_json::json!(["status", "enable", "disable"]), "status"),
+        Some("disabled") => (serde_json::json!(["status", "enable"]), "status"),
+        Some("unmanaged") => (serde_json::json!(["status"]), "status"),
+        _ => (serde_json::json!(["status"]), "status"),
     };
     serde_json::json!({
         "allowed": true,
@@ -4562,7 +4582,7 @@ fn stdio_sidecar_setup_surface(
         "failed_layer": crate::readiness::failed_layer(non_ready),
         "summary": "Use sidecar_setup for the MCP-managed agent packet/search repair path.",
         "allowed_actions": allowed_actions,
-        "canonical_arguments": {"action": "repair"},
+        "canonical_arguments": {"action": canonical_action},
         "minimum_next": non_ready.minimum_next,
         "full_repair": non_ready.full_repair,
     })
@@ -5246,8 +5266,16 @@ mod tests {
 
         assert!(hard_busy.is_some());
         assert_eq!(calls[0]["method"], json!("host/instruction"));
-        assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(false));
+        assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(true));
         assert_eq!(surfaces["sidecar_setup"]["status"], json!("busy"));
+        assert_eq!(
+            surfaces["sidecar_setup"]["allowed_actions"],
+            json!(["status"])
+        );
+        assert_eq!(
+            surfaces["sidecar_setup"]["canonical_arguments"]["action"],
+            json!("status")
+        );
         assert_eq!(surfaces["repair_all"]["status"], json!("busy"));
         assert_eq!(
             surfaces["repair_all"]["repair_reason"],

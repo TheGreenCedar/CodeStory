@@ -147,7 +147,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | Field | Healthy value | Action value |
 | --- | --- | --- |
 | `readiness_broker.reconciliation.status` | `clean` or `observed` | `active_repair` means wait and reread status; `stale_state_cleaned` means retry repair once |
-| `readiness_broker.resources.native_embedding_runtime.status` | `available` | `busy` means another native embedding repair owns the GPU runtime; `stale` means retry repair so the broker can reclaim it |
+| `readiness_broker.resources.native_embedding_runtime.status` | `available` | `busy` blocks repair only when the owner is foreign or unverifiable; same-project reusable owners should continue through `recommended_next_calls`; `stale` means retry repair so the broker can reclaim it |
 | `readiness_broker.gpu_proof.proof_status` | `verified` when accelerator is required | `gpu_unverified` means repair should stop before a long semantic rebuild |
 | `readiness_broker.persistence_status` | `persisted` | `failed` means inspect `persistence_error`; status may be live but not durable across processes |
 | `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup repair` and status read sequence |

@@ -120,6 +120,7 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             Ok(result) => result,
             Err(error) => {
                 crate::readiness_broker::cleanup_transferred_native_embedding_resource_after_error(
+                    &embedding_resource_lease,
                     &sidecar,
                 )
                 .with_context(|| {

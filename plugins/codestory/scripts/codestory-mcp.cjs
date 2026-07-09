@@ -1048,6 +1048,18 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     active_repair: null,
     abandoned_repair: null,
   };
+  allowedSurfaces.sidecar_setup = {
+    allowed: true,
+    readiness_goal: 'agent_packet_search',
+    status: repair.status,
+    repair_reason: reason,
+    blocked_reason: 'diagnostic_fail_open_repair_unavailable',
+    summary: 'sidecar_setup status and policy actions are available in diagnostic fail-open mode; repair requires the real stdio runtime.',
+    allowed_actions: ['status', 'enable', 'disable', 'ask'],
+    canonical_arguments: { action: 'status' },
+    minimum_next: minimumNext,
+    full_repair: fullRepair,
+  };
   const readinessBroker = {
     schema_version: 1,
     install_id: null,

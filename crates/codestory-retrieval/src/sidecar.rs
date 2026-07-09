@@ -25,6 +25,14 @@ use std::process::Command;
 
 const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeEmbeddingLaunchIdentityStatus {
+    Matched { pid: u32 },
+    NotRunning { pid: u32 },
+    Mismatched { pid: u32, reason: String },
+    Unverified { pid: Option<u32>, reason: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Runtime state file written by `sidecar_up`.
 ///
@@ -204,32 +212,58 @@ pub(crate) fn stop_native_embedding_process_for_launch(
 }
 
 pub fn ensure_native_embedding_launch_identity(launch: &EmbeddingLaunchMetadata) -> Result<u32> {
-    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
-        bail!("identity_unverified: native embedding launch mode is not native_spawned");
+    match native_embedding_launch_identity_status(launch) {
+        NativeEmbeddingLaunchIdentityStatus::Matched { pid } => Ok(pid),
+        NativeEmbeddingLaunchIdentityStatus::NotRunning { pid } => {
+            bail!("identity_not_running: native embedding pid {pid} is not running")
+        }
+        NativeEmbeddingLaunchIdentityStatus::Mismatched { pid, reason } => {
+            bail!("identity_mismatch: native embedding pid {pid}: {reason}")
+        }
+        NativeEmbeddingLaunchIdentityStatus::Unverified { pid, reason } => {
+            bail!("identity_unverified: native embedding pid {pid:?}: {reason}")
+        }
     }
-    let pid = launch
-        .pid
-        .context("identity_unverified: recorded native embedding launch is missing pid")?;
-    ensure_native_embedding_process_identity(pid, launch)?;
-    Ok(pid)
 }
 
-fn ensure_native_embedding_process_identity(
-    pid: u32,
+pub fn native_embedding_launch_identity_status(
     launch: &EmbeddingLaunchMetadata,
-) -> Result<()> {
+) -> NativeEmbeddingLaunchIdentityStatus {
+    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: launch.pid,
+            reason: "native embedding launch mode is not native_spawned".to_string(),
+        };
+    }
+    let Some(pid) = launch.pid else {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: None,
+            reason: "recorded native embedding launch is missing pid".to_string(),
+        };
+    };
     if pid == 0 {
-        bail!("identity_unverified: native embedding pid is zero");
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "native embedding pid is zero".to_string(),
+        };
     }
     if pid == std::process::id() {
-        bail!("identity_unverified: native embedding pid {pid} is the current CodeStory process");
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: format!("native embedding pid {pid} is the current CodeStory process"),
+        };
     }
-    let Some(snapshot) = native_embedding_process_snapshot(pid)? else {
-        bail!("identity_unverified: native embedding pid {pid} is not running");
+    let snapshot = match native_embedding_process_snapshot(pid) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return NativeEmbeddingLaunchIdentityStatus::NotRunning { pid },
+        Err(error) => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: error.to_string(),
+            };
+        }
     };
-    ensure_native_embedding_process_matches(launch, &snapshot)
-        .with_context(|| format!("identity_unverified: native embedding pid {pid}"))?;
-    Ok(())
+    native_embedding_process_match_status(launch, &snapshot, pid)
 }
 
 fn stop_native_embedding_process(pid: u32, launch: &EmbeddingLaunchMetadata) -> Result<()> {
@@ -282,49 +316,93 @@ fn ensure_native_embedding_process_matches(
     launch: &EmbeddingLaunchMetadata,
     snapshot: &NativeEmbeddingProcessSnapshot,
 ) -> Result<()> {
-    let expected_executable = launch
-        .executable_path
-        .as_deref()
-        .context("recorded native embedding launch is missing executable_path")?;
+    match native_embedding_process_match_status(launch, snapshot, 0) {
+        NativeEmbeddingLaunchIdentityStatus::Matched { .. } => Ok(()),
+        NativeEmbeddingLaunchIdentityStatus::Mismatched { reason, .. }
+        | NativeEmbeddingLaunchIdentityStatus::Unverified { reason, .. } => bail!("{reason}"),
+        NativeEmbeddingLaunchIdentityStatus::NotRunning { .. } => {
+            bail!("native embedding pid is not running")
+        }
+    }
+}
+
+fn native_embedding_process_match_status(
+    launch: &EmbeddingLaunchMetadata,
+    snapshot: &NativeEmbeddingProcessSnapshot,
+    pid: u32,
+) -> NativeEmbeddingLaunchIdentityStatus {
+    let expected_executable = match launch.executable_path.as_deref() {
+        Some(path) => path,
+        None => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: "recorded native embedding launch is missing executable_path".to_string(),
+            };
+        }
+    };
     match snapshot.executable_path.as_deref() {
         Some(actual) if same_identity_path(expected_executable, actual) => {}
-        Some(actual) => bail!(
-            "live executable path does not match recorded native embedding launch: expected {expected_executable}, got {actual}"
-        ),
+        Some(actual) => {
+            return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                pid,
+                reason: format!(
+                    "live executable path does not match recorded native embedding launch: expected {expected_executable}, got {actual}"
+                ),
+            };
+        }
         None => {
-            let command_line = snapshot
-                .command_line
-                .as_deref()
-                .context("live process has no executable path or command line")?;
+            let Some(command_line) = snapshot.command_line.as_deref() else {
+                return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                    pid: Some(pid),
+                    reason: "live process has no executable path or command line".to_string(),
+                };
+            };
             if !command_mentions_path(command_line, expected_executable) {
-                bail!(
-                    "live command line does not mention recorded executable path {expected_executable}"
-                );
+                return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                    pid,
+                    reason: format!(
+                        "live command line does not mention recorded executable path {expected_executable}"
+                    ),
+                };
             }
         }
     }
 
-    let command_line = snapshot
-        .command_line
-        .as_deref()
-        .context("live native embedding process has no command line for launch-arg validation")?;
+    let Some(command_line) = snapshot.command_line.as_deref() else {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "live native embedding process has no command line for launch-arg validation"
+                .to_string(),
+        };
+    };
     if launch.launch_args.is_empty() {
-        bail!("recorded native embedding launch is missing launch_args");
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "recorded native embedding launch is missing launch_args".to_string(),
+        };
     }
     for arg in &launch.launch_args {
         if !arg.is_empty() && !command_line.contains(arg) {
-            bail!("live native embedding command line is missing recorded launch arg {arg:?}");
+            return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                pid,
+                reason: format!(
+                    "live native embedding command line is missing recorded launch arg {arg:?}"
+                ),
+            };
         }
     }
     if let (Some(expected), Some(actual)) =
         (launch.spawned_at_epoch_ms, snapshot.started_at_epoch_ms)
         && expected.abs_diff(actual) > NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS as u64
     {
-        bail!(
-            "live process start time does not match recorded native embedding launch: expected around {expected}, got {actual}"
-        );
+        return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+            pid,
+            reason: format!(
+                "live process start time does not match recorded native embedding launch: expected around {expected}, got {actual}"
+            ),
+        };
     }
-    Ok(())
+    NativeEmbeddingLaunchIdentityStatus::Matched { pid }
 }
 
 fn command_mentions_path(command_line: &str, expected_path: &str) -> bool {
@@ -1042,6 +1120,33 @@ mod tests {
             error.to_string().contains("start time"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn native_embedding_identity_status_distinguishes_mismatch_from_unverified() {
+        let launch = native_embedding_launch_fixture();
+        let mismatch = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/Windows/System32/notepad.exe".to_string()),
+            command_line: Some(
+                "C:/Windows/System32/notepad.exe --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
+                    .to_string(),
+            ),
+            started_at_epoch_ms: Some(123),
+        };
+        assert!(matches!(
+            native_embedding_process_match_status(&launch, &mismatch, 1234),
+            NativeEmbeddingLaunchIdentityStatus::Mismatched { .. }
+        ));
+
+        let unverified = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            command_line: None,
+            started_at_epoch_ms: Some(123),
+        };
+        assert!(matches!(
+            native_embedding_process_match_status(&launch, &unverified, 1234),
+            NativeEmbeddingLaunchIdentityStatus::Unverified { .. }
+        ));
     }
 
     #[test]

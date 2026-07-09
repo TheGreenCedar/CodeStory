@@ -1522,6 +1522,9 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
+    assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
+    assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);
+    assert.deepEqual(status.allowed_surfaces.sidecar_setup.canonical_arguments, { action: "status" });
     assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
     assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
@@ -1656,6 +1659,8 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
     assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
     assert.equal(status.readiness[0].repair_reason, "local_dev_override_cli_unspawnable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
+    assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
+    assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);
     assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });

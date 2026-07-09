@@ -2629,6 +2629,16 @@ fn resources_read_status_prompts_before_sidecar_repair_when_policy_is_ask() {
         status["sidecar_setup"]["repair_mode"],
         json!("consent_required")
     );
+    assert_eq!(
+        status["allowed_surfaces"]["sidecar_setup"]["allowed_actions"],
+        json!(["status", "enable", "disable"]),
+        "{status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["sidecar_setup"]["canonical_arguments"]["action"],
+        json!("status"),
+        "{status}"
+    );
     assert!(
         status["sidecar_setup"]["prompt"]
             .as_str()
@@ -2687,6 +2697,16 @@ fn resources_read_status_blocks_unmanaged_session_repair_without_persisted_polic
     assert_eq!(
         status["sidecar_setup"]["repair_mode"],
         json!("explicit_mcp_unmanaged")
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["sidecar_setup"]["allowed_actions"],
+        json!(["status"]),
+        "{status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["sidecar_setup"]["canonical_arguments"]["action"],
+        json!("status"),
+        "{status}"
     );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
@@ -2851,6 +2871,16 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
     assert_eq!(status["sidecar_setup"]["state"], json!("disabled"));
     assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
     assert_eq!(status["sidecar_setup"]["repair_mode"], json!("disabled"));
+    assert_eq!(
+        status["allowed_surfaces"]["sidecar_setup"]["allowed_actions"],
+        json!(["status", "enable"]),
+        "{status}"
+    );
+    assert_eq!(
+        status["allowed_surfaces"]["sidecar_setup"]["canonical_arguments"]["action"],
+        json!("status"),
+        "{status}"
+    );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
         next_call_text.contains("CodeStory packet/search repair is disabled"),
@@ -2996,12 +3026,22 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         "sidecar_setup repair should not wait for full repair inside the MCP request: {repair}"
     );
     assert!(
-        repair["next_status_command"]
+        repair["debug_status_command"]
             .as_str()
             .is_some_and(|command| command.contains("retrieval status")
                 && command.contains("--profile agent")
                 && command.contains(codestory_retrieval::DEFAULT_AGENT_RUN_ID)),
-        "sidecar_setup repair should point to cheap status inspection: {repair}"
+        "sidecar_setup repair should keep CLI status as debug evidence: {repair}"
+    );
+    assert!(
+        repair["recommended_next_calls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(|call| call
+                .get("method")
+                .and_then(Value::as_str)
+                == Some("resources/read")
+                && call.get("uri").and_then(Value::as_str) == Some("codestory://status"))),
+        "sidecar_setup repair should point agents back to codestory://status: {repair}"
     );
     if repair["status"] == json!("started") {
         assert!(

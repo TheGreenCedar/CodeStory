@@ -50,6 +50,10 @@
   broker locks are released by launch identity, failed post-transfer repairs
   tear down their sidecars, blank explicit endpoints no longer select external
   mode, and `allowed_surfaces.sidecar_setup` matches repair recommendations.
+- Kept reused native embedding leases from stopping shared sidecars on later
+  repair failures, preserved native broker locks when process identity cannot be
+  verified, and kept `sidecar_setup status` available while native repair is
+  blocked.
 
 ## 0.13.12
 

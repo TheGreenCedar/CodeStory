@@ -2790,6 +2790,7 @@ fn repair_ready_state(
             Ok(final_status) => final_status,
             Err(error) => {
                 readiness_broker::cleanup_transferred_native_embedding_resource_after_error(
+                    &embedding_resource_lease,
                     &sidecar,
                 )
                 .with_context(|| {

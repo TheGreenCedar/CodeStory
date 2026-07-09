@@ -513,12 +513,33 @@ pub(crate) fn native_embedding_launch_from_sidecar_state_file(
 }
 
 pub(crate) fn cleanup_transferred_native_embedding_resource_after_error(
+    lease: &Option<BrokerNativeEmbeddingResourceLease>,
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<()> {
     let launch = native_embedding_launch_from_sidecar_state_file(sidecar)?;
-    codestory_retrieval::sidecar_down_for_runtime(sidecar)?;
-    if let Some(launch) = launch.as_ref() {
-        release_machine_resource_lock_for_native_launch(NATIVE_EMBEDDING_RESOURCE, launch)?;
+    cleanup_transferred_native_embedding_resource_after_error_with_cleanup(
+        lease,
+        launch.as_ref(),
+        || codestory_retrieval::sidecar_down_for_runtime(sidecar),
+        |launch| release_machine_resource_lock_for_native_launch(NATIVE_EMBEDDING_RESOURCE, launch),
+    )
+}
+
+fn cleanup_transferred_native_embedding_resource_after_error_with_cleanup(
+    lease: &Option<BrokerNativeEmbeddingResourceLease>,
+    launch: Option<&codestory_retrieval::EmbeddingLaunchMetadata>,
+    cleanup: impl FnOnce() -> Result<()>,
+    mut release: impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<bool>,
+) -> Result<()> {
+    if matches!(
+        lease,
+        Some(BrokerNativeEmbeddingResourceLease::Reused { .. })
+    ) {
+        return Ok(());
+    }
+    cleanup()?;
+    if let Some(launch) = launch {
+        release(launch)?;
     }
     Ok(())
 }
@@ -1081,9 +1102,15 @@ fn machine_lock_is_stale(lock: &BrokerMachineResourceLockFile) -> bool {
     if lock.resource == NATIVE_EMBEDDING_RESOURCE
         && let Some(launch) = lock.native_embedding_launch.as_ref()
     {
-        return codestory_retrieval::ensure_native_embedding_launch_identity(launch).is_err();
+        return matches!(
+            codestory_retrieval::native_embedding_launch_identity_status(launch),
+            codestory_retrieval::NativeEmbeddingLaunchIdentityStatus::NotRunning { .. }
+                | codestory_retrieval::NativeEmbeddingLaunchIdentityStatus::Mismatched { .. }
+        );
     }
     !ready_repair_status::process_is_running(lock.pid)
+        || now_epoch_ms().saturating_sub(lock.started_at_epoch_ms)
+            > MACHINE_LOCK_STALE_TTL.as_millis() as i64
 }
 
 fn create_lock_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -1747,6 +1774,22 @@ mod tests {
     }
 
     #[test]
+    fn native_embedding_reused_post_transfer_cleanup_is_noop() {
+        let lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: 4321 });
+        let launch = native_sidecar_state(Some(now_epoch_ms()))
+            .embedding_launch
+            .expect("native launch");
+
+        cleanup_transferred_native_embedding_resource_after_error_with_cleanup(
+            &lease,
+            Some(&launch),
+            || panic!("reused lease must not stop the shared sidecar"),
+            |_| panic!("reused lease must not release the shared machine lock"),
+        )
+        .expect("reused cleanup is a no-op");
+    }
+
+    #[test]
     fn machine_resource_lock_reports_busy_until_owner_drops() {
         let project = tempdir().expect("temp project");
         let resource = unique_resource("single-owner");
@@ -1806,9 +1849,9 @@ mod tests {
     }
 
     #[test]
-    fn machine_resource_lock_does_not_reclaim_live_old_owner() {
+    fn machine_resource_lock_reclaims_pre_handoff_lock_after_ttl() {
         let project = tempdir().expect("temp project");
-        let resource = unique_resource("live-old-owner");
+        let resource = unique_resource("old-pre-handoff-owner");
         cleanup_machine_resource(&resource);
         let old_scope = test_scope(project.path(), "live-old");
         let new_scope = test_scope(project.path(), "new");
@@ -1819,18 +1862,39 @@ mod tests {
             now_epoch_ms() - MACHINE_LOCK_STALE_TTL.as_millis() as i64 - 10_000,
         );
 
-        let busy = match try_acquire_machine_resource_lock(&resource, &new_scope)
-            .expect("acquire attempt")
-        {
-            BrokerMachineResourceLockAttempt::Acquired(_) => {
-                panic!("live owner should remain busy even when the lock is old")
-            }
-            BrokerMachineResourceLockAttempt::Busy(busy) => busy,
+        let acquired =
+            try_acquire_machine_resource_lock(&resource, &new_scope).expect("reclaim old owner");
+
+        assert!(
+            matches!(acquired, BrokerMachineResourceLockAttempt::Acquired(_)),
+            "old pre-handoff locks should age out even if the pid was reused"
+        );
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn native_embedding_lock_is_not_stale_when_identity_is_unverified() {
+        let project = tempdir().expect("temp project");
+        let scope = test_scope(project.path(), "native-unverified");
+        let mut state = native_sidecar_state(Some(now_epoch_ms()));
+        if let Some(launch) = state.embedding_launch.as_mut() {
+            launch.pid = Some(std::process::id());
+        }
+        let lock = BrokerMachineResourceLockFile {
+            schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+            resource: NATIVE_EMBEDDING_RESOURCE.to_string(),
+            scope,
+            pid: std::process::id(),
+            started_at_epoch_ms: now_epoch_ms() - MACHINE_LOCK_STALE_TTL.as_millis() as i64 - 1,
+            token: "native-unverified".to_string(),
+            operation_id: "native-unverified".to_string(),
+            native_embedding_launch: state.embedding_launch,
         };
 
-        assert_eq!(busy.snapshot.status, "busy");
-        assert_eq!(busy.snapshot.owner_pid, Some(std::process::id()));
-        cleanup_machine_resource(&resource);
+        assert!(
+            !machine_lock_is_stale(&lock),
+            "native locks should stay held when identity inspection is unverified"
+        );
     }
 
     #[test]
