@@ -2618,15 +2618,16 @@ fn repair_ready_state(
     )? {
         ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
         ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
-            if let Some(status) = busy.status {
+            if let Some(status) = busy.status.as_ref() {
                 bail!(
-                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={} reason={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
                     status.project_root,
                     status.profile,
                     status.run_id.as_deref().unwrap_or("none"),
                     status.namespace,
                     status.phase,
                     status.pid,
+                    busy.reason.as_deref().unwrap_or("active_status"),
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     sidecar
                         .run_id
@@ -2635,10 +2636,11 @@ fn repair_ready_state(
                 );
             }
             bail!(
-                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                "ready repair already starting for project={} profile=agent run_id={} namespace={} reason={}; lock_path={}",
                 crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                 sidecar.run_id.as_deref().unwrap_or("none"),
                 sidecar.namespace,
+                busy.reason.as_deref().unwrap_or("lock_present"),
                 busy.lock_path.display()
             );
         }
@@ -2649,15 +2651,16 @@ fn repair_ready_state(
     )? {
         ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
         ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
-            if let Some(status) = busy.status {
+            if let Some(status) = busy.status.as_ref() {
                 bail!(
-                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={} reason={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
                     status.project_root,
                     status.profile,
                     status.run_id.as_deref().unwrap_or("none"),
                     status.namespace,
                     status.phase,
                     status.pid,
+                    busy.reason.as_deref().unwrap_or("active_status"),
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     sidecar
                         .run_id
@@ -2666,10 +2669,11 @@ fn repair_ready_state(
                 );
             }
             bail!(
-                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                "ready repair already starting for project={} profile=agent run_id={} namespace={} reason={}; lock_path={}",
                 crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                 sidecar.run_id.as_deref().unwrap_or("none"),
                 sidecar.namespace,
+                busy.reason.as_deref().unwrap_or("lock_present"),
                 busy.lock_path.display()
             );
         }

@@ -157,12 +157,16 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     let profile = cmd
         .profile
         .or_else(|| cmd.run_id.as_ref().map(|_| CliSidecarProfile::Agent));
+    let mut agent_run_id = None;
     let report = if let Some(profile) = profile {
         let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
             &runtime.project_root,
             profile.into(),
             cmd.run_id.as_deref(),
         );
+        if profile == CliSidecarProfile::Agent {
+            agent_run_id = sidecar.run_id.clone();
+        }
         codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
@@ -172,7 +176,22 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
         strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
     }
     .context("retrieval status")?;
-    emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
+    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_status(&report)),
+            reconciliation: None,
+        },
+    );
+    emit_retrieval_status(
+        cmd.format,
+        &report,
+        &readiness_broker,
+        cmd.output_file.as_deref(),
+    )
 }
 
 pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
@@ -583,8 +602,16 @@ fn emit_retrieval_bootstrap(
 fn emit_retrieval_status(
     format: OutputFormat,
     report: &RetrievalStatusReport,
+    readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
+    let mut payload = serde_json::to_value(report)?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "readiness_broker".to_string(),
+            serde_json::to_value(readiness_broker)?,
+        );
+    }
     let manifest_vector_backend = report
         .manifest_vector_embedding_backend
         .as_deref()
@@ -640,8 +667,19 @@ fn emit_retrieval_status(
         "- sidecar_images: qdrant=`{}` zoekt=`{}` embed=`{}`\n",
         report.sidecar_images.qdrant, report.sidecar_images.zoekt, report.sidecar_images.embed
     );
+    let broker_note = format!(
+        "- readiness_broker: project_id={} persistence={} operations={} gpu_proof={}\n",
+        readiness_broker.project_id,
+        readiness_broker.persistence_status,
+        readiness_broker.operations.len(),
+        readiness_broker
+            .gpu_proof
+            .as_ref()
+            .map(|proof| proof.proof_status.as_str())
+            .unwrap_or("unknown")
+    );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -663,6 +701,7 @@ fn emit_retrieval_status(
         repair_note,
         ownership_note,
         sidecar_images_note,
+        broker_note,
         report.zoekt.status,
         report.zoekt.detail,
         report.zoekt.capabilities.lexical,
@@ -673,7 +712,7 @@ fn emit_retrieval_status(
         report.scip.detail,
         report.scip.capabilities.graph,
     );
-    emit(format, report, markdown, output_file)
+    emit(format, &payload, markdown, output_file)
 }
 
 fn emit_retrieval_inventory(

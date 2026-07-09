@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Hardened durable readiness repair ownership so live local-refresh and ready
+  repair locks are not age-reclaimed, MCP sidecar repair spawn is single-flight,
+  GPU proof requires runtime/log evidence, native lock handoff publishes safely,
+  Linux `native_spawned` rejects compose-only metadata, and `retrieval status`
+  includes the readiness broker snapshot.
+
 ## 0.14.0
 
 CodeStory 0.14.0 turns the 0.13.x MCP recovery fixes into a durable readiness

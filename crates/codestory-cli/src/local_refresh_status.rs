@@ -219,27 +219,30 @@ pub(crate) fn cleanup_stale_local_refresh_state(
         lock.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
             && same_path_text(Path::new(&lock.project_root), project_root)
     });
-    let status_owner_dead = status
+    let status_owner_live = status
         .as_ref()
-        .is_some_and(|status| !crate::ready_repair_status::process_is_running(status.pid));
+        .is_some_and(|status| crate::ready_repair_status::process_is_running(status.pid));
+    let status_owner_dead = status.as_ref().is_some_and(|_| !status_owner_live);
     let status_age_stale = status.as_ref().is_some_and(|status| {
         now.saturating_sub(status.updated_at_epoch_ms)
             > LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64
     });
-    let status_stale = status_owner_dead || status_age_stale;
+    let status_stale = status_owner_dead || (status_age_stale && !status_owner_live);
+    let live_status_heartbeat_stale = status_age_stale && status_owner_live;
     let active_status = status.as_ref().filter(|_| !status_stale);
     let lock_stale = lock
         .as_ref()
         .is_some_and(|_| local_refresh_lock_file_is_stale(&lock_path, active_status));
-    if !status_stale && !lock_stale {
+    if !status_stale && !lock_stale && !live_status_heartbeat_stale {
         return None;
     }
 
-    let reason = match (status_stale, lock_stale) {
-        (true, true) => "stale_status_and_lock",
-        (true, false) => "stale_status",
-        (false, true) => "stale_lock",
-        (false, false) => "clean",
+    let reason = match (status_stale, lock_stale, live_status_heartbeat_stale) {
+        (_, _, true) => "live_status_heartbeat_stale",
+        (true, true, false) => "stale_status_and_lock",
+        (true, false, false) => "stale_status",
+        (false, true, false) => "stale_lock",
+        (false, false, false) => "clean",
     };
     let lock_matches_stale_status = status_owner_dead
         && status
@@ -293,20 +296,11 @@ fn local_refresh_lock_path(cache_root: &Path) -> PathBuf {
 
 fn local_refresh_lock_file_is_stale(
     path: &Path,
-    active_status: Option<&LocalRefreshStatus>,
+    _active_status: Option<&LocalRefreshStatus>,
 ) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_local_refresh_lock_file(path) {
-        if !crate::ready_repair_status::process_is_running(lock.pid) {
-            return true;
-        }
-        if active_status.is_some_and(|status| {
-            status.pid == lock.pid && status.started_at_epoch_ms == lock.started_at_epoch_ms
-        }) {
-            return false;
-        }
-        return now.saturating_sub(lock.started_at_epoch_ms)
-            > LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64;
+        return !crate::ready_repair_status::process_is_running(lock.pid);
     }
     fs::metadata(path)
         .ok()
@@ -559,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_stale_local_refresh_state_reclaims_live_pid_lock_without_active_status() {
+    fn cleanup_stale_local_refresh_state_preserves_live_pid_lock_without_active_status() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let old_started = now_epoch_ms() - LOCAL_REFRESH_LOCK_STALE_TTL.as_millis() as i64 - 1_000;
@@ -592,16 +586,21 @@ mod tests {
         .expect("write old live status");
 
         let cleanup = cleanup_stale_local_refresh_state(cache.path(), project.path())
-            .expect("stale status cleanup");
-        assert_eq!(cleanup.reason, "stale_status_and_lock");
-        assert!(cleanup.removed_status_path);
-        assert!(cleanup.removed_lock_path);
-        assert!(!local_refresh_lock_path(cache.path()).exists());
-        assert!(matches!(
-            try_acquire_local_refresh_lock(cache.path(), project.path())
-                .expect("old orphaned lock attempt"),
-            LocalRefreshLockAttempt::Acquired(_)
-        ));
+            .expect("stale live heartbeat evidence");
+        assert_eq!(cleanup.reason, "live_status_heartbeat_stale");
+        assert!(!cleanup.removed_status_path);
+        assert!(!cleanup.removed_lock_path);
+        assert!(local_refresh_status_path(cache.path()).exists());
+        assert!(local_refresh_lock_path(cache.path()).exists());
+        match try_acquire_local_refresh_lock(cache.path(), project.path())
+            .expect("old live lock attempt")
+        {
+            LocalRefreshLockAttempt::Busy(busy) => {
+                assert!(busy.status.is_none());
+                assert_eq!(busy.pid, Some(std::process::id()));
+            }
+            LocalRefreshLockAttempt::Acquired(_) => panic!("live-pid lock must not be reclaimed"),
+        }
     }
 
     #[test]

@@ -38,6 +38,13 @@ pub(crate) fn reconcile_before_enqueue(
     let mut stale_lock_paths_removed = Vec::new();
     let mut abandoned_repairs = Vec::new();
     let mut local_refresh_cleanups = Vec::new();
+    let mut unresolved_orphan_reason =
+        ready_repair_status::stale_live_ready_repair_status(project_root, run_id).map(|status| {
+            format!(
+                "live_ready_repair_heartbeat_stale:pid={}:phase={}",
+                status.pid, status.phase
+            )
+        });
     for cleanup in cleanups {
         if cleanup.removed_status_path {
             stale_status_paths_removed.push(clean_path(&cleanup.status_path));
@@ -64,12 +71,20 @@ pub(crate) fn reconcile_before_enqueue(
         if cleanup.removed_lock_path {
             stale_lock_paths_removed.push(clean_path(&cleanup.lock_path));
         }
+        if !cleanup.removed_status_path && !cleanup.removed_lock_path {
+            unresolved_orphan_reason =
+                Some(format!("local_refresh_cleanup_blocked:{}", cleanup.reason));
+        }
         let operation = match cleanup.status {
             Some(status) => operation_from_local_refresh_status(
                 project_root,
                 cli_version,
                 status,
-                "stale_cleaned",
+                if cleanup.removed_status_path || cleanup.removed_lock_path {
+                    "stale_cleaned"
+                } else {
+                    "stale_live"
+                },
                 Some(cleanup.reason),
             ),
             None => operation_from_local_refresh_lock_cleanup(project_root, cli_version, cleanup),
@@ -81,6 +96,8 @@ pub(crate) fn reconcile_before_enqueue(
     BrokerReconciliationSnapshot {
         status: if cleanup_performed {
             "stale_state_cleaned".to_string()
+        } else if unresolved_orphan_reason.is_some() {
+            "orphan_unresolved".to_string()
         } else {
             "clean".to_string()
         },
@@ -90,6 +107,6 @@ pub(crate) fn reconcile_before_enqueue(
         abandoned_repairs,
         local_refresh_cleanups,
         active_repair: None,
-        unresolved_orphan_reason: None,
+        unresolved_orphan_reason,
     }
 }

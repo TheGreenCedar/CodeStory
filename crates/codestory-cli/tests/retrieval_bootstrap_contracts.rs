@@ -7,6 +7,7 @@ use tempfile::tempdir;
 
 fn run_bootstrap(project: &std::path::Path, extra_args: &[&str]) -> Value {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args(["retrieval", "bootstrap", "--project"]);
     command.arg(project);
     command.args(extra_args);
@@ -21,6 +22,7 @@ fn run_bootstrap(project: &std::path::Path, extra_args: &[&str]) -> Value {
 
 fn run_status(project: &std::path::Path, extra_args: &[&str]) -> Value {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args(["retrieval", "status", "--project"]);
     command.arg(project);
     command.args(extra_args);
@@ -35,6 +37,7 @@ fn run_status(project: &std::path::Path, extra_args: &[&str]) -> Value {
 
 fn run_down(project: &std::path::Path, extra_args: &[&str]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args(["retrieval", "down", "--project"]);
     command.arg(project);
     command.args(extra_args);
@@ -60,6 +63,7 @@ fn assert_digest_image_pins(json: &Value) {
 
 fn create_valid_cache_with_cli(project: &std::path::Path, cache: &std::path::Path) {
     let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .args(["index", "--project"])
         .arg(project)
         .args(["--cache-dir"])
@@ -166,6 +170,14 @@ fn bootstrap_then_status_reports_manifest_missing_before_indexing() {
         &["--cache-dir", cache_arg, "--format", "json"],
     );
     assert_digest_image_pins(&status["sidecar_images"]);
+    assert!(
+        status["readiness_broker"].is_object(),
+        "retrieval status should include durable broker parity: {status}"
+    );
+    assert!(
+        status["readiness_broker"]["gpu_proof"].is_object(),
+        "retrieval status broker should include GPU proof shape: {status}"
+    );
     assert_eq!(
         status["degraded_reason"].as_str(),
         Some("retrieval_manifest_missing"),
@@ -406,6 +418,7 @@ fn bootstrap_json_surfaces_prune_suppressed_reason_on_scan_errors() {
     fs::write(corrupt_subdir.join("codestory.db"), b"not sqlite").expect("corrupt hashed db");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args([
         "retrieval",
         "bootstrap",

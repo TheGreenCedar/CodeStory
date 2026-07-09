@@ -270,6 +270,27 @@ fn gpu_proof_requires_live_embed_smoke_for_verified() {
 }
 
 #[test]
+fn gpu_proof_does_not_verify_from_device_inventory() {
+    let proof = gpu_proof(BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("accelerated".to_string()),
+        embedding_device_observation_source: Some("native_device_list".to_string()),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok: Some(true),
+        embed_smoke_ms: Some(42),
+        degraded_reason: None,
+    });
+    assert_eq!(proof.proof_status, "gpu_unverified");
+    assert!(!proof.meaningful_accelerator_work_proven);
+    assert_eq!(proof.degraded_reason.as_deref(), Some("gpu_unverified"));
+}
+
+#[test]
 fn broker_scope_carries_project_and_run_identity() {
     let project = tempdir().expect("temp project");
     let scope = agent_repair_scope(project.path(), Some("agent-1"), "9.9.9");
@@ -745,6 +766,45 @@ fn machine_resource_lock_transfers_to_native_launch_until_launch_release() {
 }
 
 #[test]
+fn native_launch_handoff_publish_failure_keeps_drop_cleanup_enabled() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("pid-transfer-fail");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "owner");
+
+    let mut lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    let launch = state.embedding_launch.as_mut().expect("launch");
+    launch.pid = Some(std::process::id());
+    let error = transfer_machine_resource_lock_to_native_launch_with_publisher(
+        &mut lock,
+        launch,
+        |_path, _content| Err(anyhow::anyhow!("simulated publish failure")),
+    )
+    .expect_err("publish failure should be reported");
+    assert!(error.to_string().contains("simulated publish failure"));
+    assert!(
+        lock.release_on_drop,
+        "failed handoff must leave launcher cleanup enabled"
+    );
+
+    let path = machine_resource_lock_path(&resource);
+    drop(lock);
+    assert!(
+        !path.exists(),
+        "failed handoff should remove the original pre-handoff lock on drop"
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
 fn native_launch_release_does_not_remove_pre_handoff_lock() {
     let project = tempdir().expect("temp project");
     let resource = unique_resource("native-release-pre-handoff");
@@ -988,6 +1048,90 @@ fn reconcile_before_enqueue_cleans_stale_local_refresh() {
     );
     assert!(!cache.path().join("local-refresh-status.json").exists());
     assert!(!cache.path().join("local-refresh.lock").exists());
+}
+
+#[test]
+fn reconcile_before_enqueue_reports_live_stale_ready_repair_without_cleanup() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let run_id = "shared-agent";
+    let old = now_epoch_ms() - 180_000;
+    let status_path = write_ready_repair_status_file(
+        project.path(),
+        run_id,
+        std::process::id(),
+        old,
+        "Embedding documents",
+    );
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some(run_id), "9.9.9");
+
+    assert_eq!(reconciliation.status, "orphan_unresolved");
+    assert!(!reconciliation.cleanup_performed);
+    assert!(reconciliation.abandoned_repairs.is_empty());
+    assert!(
+        status_path.exists(),
+        "live stale repair status should remain for the owner to update or clear"
+    );
+    assert!(
+        reconciliation
+            .unresolved_orphan_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("live_ready_repair_heartbeat_stale")),
+        "{reconciliation:?}"
+    );
+}
+
+#[test]
+fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let old = now_epoch_ms() - 180_000;
+    fs::write(
+        cache.path().join("local-refresh-status.json"),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": clean_path_text(project.path()),
+            "phase": "incremental_index",
+            "pid": std::process::id(),
+            "started_at_epoch_ms": old,
+            "updated_at_epoch_ms": old,
+            "last_failure_reason": null
+        }))
+        .expect("status json"),
+    )
+    .expect("write live stale local refresh status");
+    fs::write(
+        cache.path().join("local-refresh.lock"),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_root": clean_path_text(project.path()),
+            "pid": std::process::id(),
+            "started_at_epoch_ms": old,
+            "token": "live-stale"
+        }))
+        .expect("lock json"),
+    )
+    .expect("write live stale local refresh lock");
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
+
+    assert_eq!(reconciliation.status, "orphan_unresolved");
+    assert!(!reconciliation.cleanup_performed);
+    assert_eq!(reconciliation.local_refresh_cleanups.len(), 1);
+    assert_eq!(
+        reconciliation.local_refresh_cleanups[0].status,
+        "stale_live"
+    );
+    assert!(cache.path().join("local-refresh-status.json").exists());
+    assert!(cache.path().join("local-refresh.lock").exists());
+    assert_eq!(
+        reconciliation.unresolved_orphan_reason.as_deref(),
+        Some("local_refresh_cleanup_blocked:live_status_heartbeat_stale")
+    );
 }
 
 #[test]

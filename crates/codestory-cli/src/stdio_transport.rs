@@ -18,10 +18,10 @@ use codestory_contracts::api::{
     TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{BufRead, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -51,6 +51,8 @@ use std::time::{Duration, Instant};
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
+const STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE: &str = "ready-repair-enqueue.lock";
+const STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL: Duration = Duration::from_secs(15);
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -4267,6 +4269,94 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StdioReadyRepairEnqueueLockFile {
+    schema_version: u32,
+    pid: u32,
+    started_at_epoch_ms: i64,
+    token: String,
+}
+
+#[derive(Debug)]
+struct StdioReadyRepairEnqueueLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for StdioReadyRepairEnqueueLock {
+    fn drop(&mut self) {
+        let Some(lock) = read_stdio_ready_repair_enqueue_lock(&self.path) else {
+            return;
+        };
+        if lock.token == self.token {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn try_acquire_stdio_ready_repair_enqueue_lock(
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> std::io::Result<Option<StdioReadyRepairEnqueueLock>> {
+    let path = sidecar
+        .layout
+        .state_file
+        .with_file_name(STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
+    let pid = std::process::id();
+    let token = format!("{pid}:{started_at_epoch_ms}");
+    let lock = StdioReadyRepairEnqueueLockFile {
+        schema_version: 1,
+        pid,
+        started_at_epoch_ms,
+        token: token.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&lock)?;
+    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
+        Ok(()) => {
+            return Ok(Some(StdioReadyRepairEnqueueLock { path, token }));
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !stdio_ready_repair_enqueue_lock_is_stale(&path) {
+        return Ok(None);
+    }
+    let _ = fs::remove_file(&path);
+    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
+        Ok(()) => Ok(Some(StdioReadyRepairEnqueueLock { path, token })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn create_stdio_ready_repair_enqueue_lock(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn stdio_ready_repair_enqueue_lock_is_stale(path: &Path) -> bool {
+    let Some(lock) = read_stdio_ready_repair_enqueue_lock(path) else {
+        return true;
+    };
+    if !crate::ready_repair_status::process_is_running(lock.pid) {
+        return true;
+    }
+    let now = crate::ready_repair_status::now_epoch_ms();
+    now.saturating_sub(lock.started_at_epoch_ms)
+        > STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL.as_millis() as i64
+}
+
+fn read_stdio_ready_repair_enqueue_lock(path: &Path) -> Option<StdioReadyRepairEnqueueLockFile> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
 fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
@@ -4335,6 +4425,17 @@ fn handle_stdio_sidecar_repair(
     ) {
         return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup);
     }
+    let _enqueue_lock = match try_acquire_stdio_ready_repair_enqueue_lock(&repair_sidecar) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return stdio_sidecar_repair_already_starting_result(
+                &runtime.project_root,
+                &repair_sidecar,
+                &sidecar_setup,
+            );
+        }
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
     let broker_reconciliation = crate::readiness_broker::reconcile_before_enqueue(
         &runtime.project_root,
         &runtime.cache_root,
@@ -4463,6 +4564,38 @@ fn stdio_sidecar_repair_machine_busy_result(
             "owner_workspace_root": busy.owner_workspace_root,
             "sidecar_setup": sidecar_setup,
             "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy)
+        }
+    })
+}
+
+fn stdio_sidecar_repair_already_starting_result(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar_setup: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "result": {
+            "status": "already_starting",
+            "mode": "background",
+            "project_root": crate::display::clean_path_string(&project_root.to_string_lossy()),
+            "profile": "agent",
+            "run_id": sidecar.run_id.clone(),
+            "namespace": sidecar.namespace.clone(),
+            "next_status_command": format!(
+                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                crate::display::clean_path_string(&project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            ),
+            "debug_status_command": format!(
+                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                crate::display::clean_path_string(&project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            ),
+            "recommended_next_calls": [{
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }],
+            "sidecar_setup": sidecar_setup
         }
     })
 }
@@ -5096,6 +5229,33 @@ mod tests {
             storage_fingerprint: storage_fingerprint.to_string(),
             ..base_packet_cache_key_input(question)
         })
+    }
+
+    #[test]
+    fn sidecar_repair_enqueue_lock_is_single_flight() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+
+        let first = try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+            .expect("first enqueue lock")
+            .expect("first enqueue lock acquired");
+        assert!(
+            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+                .expect("second enqueue lock")
+                .is_none(),
+            "concurrent stdio repair enqueue should be blocked"
+        );
+        drop(first);
+        assert!(
+            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+                .expect("third enqueue lock")
+                .is_some(),
+            "enqueue lock should be reusable after drop"
+        );
     }
 
     fn agent_packet_search_not_ready() -> ReadinessVerdictDto {

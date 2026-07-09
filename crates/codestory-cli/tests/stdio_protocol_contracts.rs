@@ -738,7 +738,7 @@ fn write_active_repair_status_fixture(
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_millis() as i64;
-    write_repair_status_fixture(fixture, run_id, phase, now)
+    write_repair_status_fixture(fixture, run_id, phase, now, std::process::id())
 }
 
 fn write_abandoned_repair_status_fixture(
@@ -751,7 +751,7 @@ fn write_abandoned_repair_status_fixture(
         .expect("system time")
         .as_millis() as i64
         - 60_000;
-    write_repair_status_fixture(fixture, run_id, phase, updated_at)
+    write_repair_status_fixture(fixture, run_id, phase, updated_at, u32::MAX)
 }
 
 fn write_repair_status_fixture(
@@ -759,6 +759,7 @@ fn write_repair_status_fixture(
     run_id: &str,
     phase: &str,
     updated_at_epoch_ms: i64,
+    pid: u32,
 ) -> (PathBuf, RemoveDirOnDrop) {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
@@ -793,7 +794,7 @@ fn write_repair_status_fixture(
             "namespace": sidecar.namespace,
             "compose_project": sidecar.compose_project,
             "phase": phase,
-            "pid": std::process::id(),
+            "pid": pid,
             "started_at_epoch_ms": updated_at_epoch_ms,
             "updated_at_epoch_ms": updated_at_epoch_ms
         })
@@ -3037,7 +3038,10 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     );
     let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair"));
     assert!(
-        repair["status"] == json!("started") || repair["status"] == json!("already_running"),
+        matches!(
+            repair["status"].as_str(),
+            Some("started" | "already_running" | "already_starting")
+        ),
         "sidecar_setup repair should return a bounded repair state: {repair}"
     );
     assert_eq!(

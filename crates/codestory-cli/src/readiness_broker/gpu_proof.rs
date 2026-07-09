@@ -5,8 +5,12 @@ pub(crate) fn gpu_proof(input: BrokerGpuProofInput) -> BrokerGpuProofSnapshot {
     let cpu_allowed = input.embedding_cpu_allowed.unwrap_or(false);
     let observed_state = input.embedding_device_state.clone();
     let accelerated = observed_state.as_deref() == Some("accelerated");
+    let runtime_observed = matches!(
+        input.embedding_device_observation_source.as_deref(),
+        Some("native_log" | "sidecar_log")
+    );
     let smoke_ok = input.embed_smoke_ok == Some(true);
-    let proof_status = if accelerated && !cpu_allowed && smoke_ok {
+    let proof_status = if accelerated && runtime_observed && !cpu_allowed && smoke_ok {
         "verified"
     } else if (accelerated && !cpu_allowed) || requested {
         "gpu_unverified"

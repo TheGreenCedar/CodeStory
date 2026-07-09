@@ -17,7 +17,6 @@ const READY_REPAIR_LOCK_FILE: &str = "ready-repair.lock";
 const READY_REPAIR_PROJECT_LOCK_FILE: &str = "ready-repair-project.lock";
 const READY_REPAIR_STATUS_SCHEMA_VERSION: u32 = 1;
 const READY_REPAIR_STATUS_TTL: Duration = Duration::from_secs(30);
-const READY_REPAIR_ABANDONED_STATUS_TTL: Duration = Duration::from_secs(15 * 60);
 const READY_REPAIR_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +50,7 @@ struct ReadyRepairLockFile {
 pub(crate) struct ReadyRepairBusy {
     pub(crate) status: Option<ReadyRepairStatus>,
     pub(crate) lock_path: PathBuf,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -155,13 +155,16 @@ fn try_acquire_ready_repair_lock_at(
         return Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
             status: Some(status),
             lock_path: path,
+            reason: None,
         }));
     }
+    let stale_live_status = stale_live_ready_repair_status(project_root, active_run_id);
 
     if !ready_repair_lock_file_is_stale(&path) {
         return Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
-            status: None,
+            status: stale_live_status,
             lock_path: path,
+            reason: Some("live_repair_lock".to_string()),
         }));
     }
 
@@ -175,6 +178,7 @@ fn try_acquire_ready_repair_lock_at(
             Ok(ReadyRepairLockAttempt::Busy(ReadyRepairBusy {
                 status: active_ready_repair_status(project_root, active_run_id),
                 lock_path: path,
+                reason: Some("lock_contention".to_string()),
             }))
         }
         Err(error) => Err(error.into()),
@@ -242,6 +246,17 @@ pub(crate) fn abandoned_ready_repair_status(
     ready_repair_status_paths(project_root, run_id)
         .into_iter()
         .filter_map(|path| read_abandoned_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+pub(crate) fn stale_live_ready_repair_status(
+    project_root: &Path,
+    run_id: Option<&str>,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths(project_root, run_id)
+        .into_iter()
+        .filter_map(|path| read_stale_live_ready_repair_status(&path, project_root, now))
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
@@ -362,6 +377,25 @@ fn read_ready_repair_status(
 fn read_abandoned_ready_repair_status(
     path: &Path,
     project_root: &Path,
+    _now_epoch_ms: i64,
+) -> Option<ReadyRepairStatus> {
+    let status = read_ready_repair_status_file(path)?;
+    if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
+        || status.status != "repairing"
+        || status.profile != SidecarProfile::Agent.as_str()
+        || !same_path_text(Path::new(&status.project_root), project_root)
+    {
+        return None;
+    }
+    if process_is_running(status.pid) {
+        return None;
+    }
+    Some(status)
+}
+
+fn read_stale_live_ready_repair_status(
+    path: &Path,
+    project_root: &Path,
     now_epoch_ms: i64,
 ) -> Option<ReadyRepairStatus> {
     let status = read_ready_repair_status_file(path)?;
@@ -373,12 +407,10 @@ fn read_abandoned_ready_repair_status(
         return None;
     }
     let age_ms = now_epoch_ms.saturating_sub(status.updated_at_epoch_ms);
-    if !process_is_running(status.pid) {
-        return Some(status);
+    if age_ms <= READY_REPAIR_STATUS_TTL.as_millis() as i64 {
+        return None;
     }
-    if age_ms <= READY_REPAIR_STATUS_TTL.as_millis() as i64
-        || age_ms > READY_REPAIR_ABANDONED_STATUS_TTL.as_millis() as i64
-    {
+    if !process_is_running(status.pid) {
         return None;
     }
     Some(status)
@@ -769,6 +801,74 @@ mod tests {
             Some(status),
             "dead repair pid should still be reported as abandoned evidence"
         );
+    }
+
+    #[test]
+    fn live_pid_stale_repair_status_is_preserved_and_reported_busy() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some("test-proof"),
+        );
+        let status_path = ready_repair_status_path(&sidecar);
+        let lock_path = ready_repair_lock_path(&sidecar);
+        fs::create_dir_all(status_path.parent().expect("repair status parent")).expect("state dir");
+        let now = now_epoch_ms();
+        let old = now - READY_REPAIR_STATUS_TTL.as_millis() as i64 - 1_000;
+        let pid = std::process::id();
+        let status = ReadyRepairStatus {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            status: "repairing".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("test-proof".to_string()),
+            namespace: "codestory-agent-test-proof".to_string(),
+            compose_project: "codestory-agent-test-proof".to_string(),
+            phase: "Embedding documents".to_string(),
+            pid,
+            started_at_epoch_ms: old,
+            updated_at_epoch_ms: old,
+        };
+        fs::write(
+            &status_path,
+            serde_json::to_string(&status).expect("status json"),
+        )
+        .expect("write live stale status");
+        fs::write(
+            &lock_path,
+            serde_json::to_string(&ReadyRepairLockFile {
+                schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+                project_root: clean_path_text(project.path()),
+                profile: "agent".to_string(),
+                run_id: Some("test-proof".to_string()),
+                namespace: "codestory-agent-test-proof".to_string(),
+                pid,
+                started_at_epoch_ms: old,
+                token: format!("{pid}:{old}"),
+            })
+            .expect("lock json"),
+        )
+        .expect("write live stale lock");
+
+        assert_eq!(
+            read_abandoned_ready_repair_status(&status_path, project.path(), now),
+            None,
+            "live repair status must not be treated as abandoned by age"
+        );
+        assert!(
+            cleanup_abandoned_ready_repair_status(project.path(), Some("test-proof")).is_empty(),
+            "cleanup must not remove live repair status"
+        );
+        match try_acquire_ready_repair_lock(&sidecar, project.path()).expect("repair lock") {
+            ReadyRepairLockAttempt::Busy(busy) => {
+                let busy_status = busy.status.expect("stale live repair status");
+                assert_eq!(busy_status.pid, pid);
+                assert_eq!(busy_status.phase, "Embedding documents");
+                assert_eq!(busy.reason.as_deref(), Some("live_repair_lock"));
+            }
+            ReadyRepairLockAttempt::Acquired(_) => panic!("live stale repair lock must stay busy"),
+        }
     }
 
     #[test]

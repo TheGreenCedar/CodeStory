@@ -598,6 +598,7 @@ fn native_embedding_server_launch(
     repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<NativeEmbeddingServerLaunch> {
+    ensure_native_launch_backend_supported()?;
     ensure_selected_managed_native_llama_server(repo_root)?;
     let executable = native_llama_server_path(repo_root)?;
     let model_path =
@@ -847,12 +848,50 @@ fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<NativeLlamaCa
 }
 
 fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend> {
-    crate::embeddings::embedding_accelerator_request()
-        .and_then(|request| crate::config::selected_llama_sidecar_backend(&request.provider))
+    crate::embeddings::embedding_accelerator_request().and_then(|request| {
+        matching_native_llama_backends(&request.provider)
+            .into_iter()
+            .next()
+    })
 }
 
 fn matching_native_llama_backends(provider: &str) -> Vec<crate::config::LlamaSidecarBackend> {
     crate::config::llama_sidecar_backends(provider)
+        .into_iter()
+        .filter(|backend| backend.launch_mode == EmbeddingServerLaunchMode::NativeSpawned.as_str())
+        .collect()
+}
+
+fn ensure_native_launch_backend_supported() -> Result<()> {
+    if crate::config::embedding_server_launch_mode()? != EmbeddingServerLaunchMode::NativeSpawned {
+        return Ok(());
+    }
+    let Some(request) = crate::embeddings::embedding_accelerator_request() else {
+        return Ok(());
+    };
+    if selected_native_llama_backend().is_some() {
+        return Ok(());
+    }
+    let host = crate::config::embedding_host_platform();
+    let available = crate::config::llama_sidecar_backends(&request.provider)
+        .into_iter()
+        .map(|backend| backend.launch_mode)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let available = if available.is_empty() {
+        "none".to_string()
+    } else {
+        available
+    };
+    anyhow::bail!(
+        "CODESTORY_EMBED_SERVER_LAUNCH=native_spawned is unsupported for provider={} on {}/{}; available launch modes: {}; use docker_compose_embed or choose a provider with native_spawned metadata",
+        request.provider,
+        host.os,
+        host.arch,
+        available
+    )
 }
 
 fn native_llama_backend_rel_path(backend: &crate::config::LlamaSidecarBackend) -> PathBuf {
@@ -1955,6 +1994,27 @@ mod tests {
                 .display()
                 .to_string()
                 .contains("llama-b9058-bin-win-vulkan-x64")
+        );
+    }
+
+    #[test]
+    fn native_spawned_rejects_linux_compose_only_backend_metadata() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "linux/x86_64");
+        let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _provider = EnvGuard::set("CODESTORY_EMBED_DEVICE_PROVIDER", "vulkan");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+
+        let error = native_embedding_server_launch(None, &runtime)
+            .expect_err("linux compose-only backend must not satisfy native_spawned");
+
+        assert!(
+            error
+                .to_string()
+                .contains("native_spawned is unsupported for provider=vulkan on linux/x86_64"),
+            "{error}"
         );
     }
 

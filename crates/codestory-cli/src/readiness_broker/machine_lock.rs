@@ -171,6 +171,18 @@ pub(crate) fn transfer_machine_resource_lock_to_native_launch(
     lock: &mut BrokerMachineResourceLock,
     launch: &codestory_retrieval::EmbeddingLaunchMetadata,
 ) -> Result<bool> {
+    transfer_machine_resource_lock_to_native_launch_with_publisher(
+        lock,
+        launch,
+        publish_machine_resource_lock,
+    )
+}
+
+pub(crate) fn transfer_machine_resource_lock_to_native_launch_with_publisher(
+    lock: &mut BrokerMachineResourceLock,
+    launch: &codestory_retrieval::EmbeddingLaunchMetadata,
+    publisher: impl FnOnce(&Path, &[u8]) -> Result<()>,
+) -> Result<bool> {
     let pid = launch
         .pid
         .context("native embedding launch missing pid for broker handoff")?;
@@ -183,11 +195,73 @@ pub(crate) fn transfer_machine_resource_lock_to_native_launch(
     file_lock.pid = pid;
     file_lock.started_at_epoch_ms = launch.spawned_at_epoch_ms.unwrap_or_else(now_epoch_ms);
     file_lock.native_embedding_launch = Some(launch.clone());
-    // Disable drop cleanup before publishing the native PID so a successful
-    // handoff cannot be removed by this process on the way out.
+    let content = serde_json::to_vec_pretty(&file_lock)?;
+    publisher(&lock.path, &content)?;
+    // Disable drop cleanup only after publishing the native PID.
     lock.release_on_drop = false;
-    fs::write(&lock.path, serde_json::to_vec_pretty(&file_lock)?)?;
     Ok(true)
+}
+
+fn publish_machine_resource_lock(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("machine-resource.lock"),
+        std::process::id(),
+        now_epoch_ms()
+    ));
+    {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("create temporary lock file {}", temp_path.display()))?;
+        temp.write_all(content)?;
+        temp.sync_all()?;
+    }
+    replace_machine_resource_lock(&temp_path, path)
+        .with_context(|| format!("replace machine resource lock {}", path.display()))
+}
+
+#[cfg(windows)]
+fn replace_machine_resource_lock(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+
+    let existing = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let new = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            existing.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_machine_resource_lock(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temp_path, path)
 }
 
 pub(crate) fn release_machine_resource_lock_for_native_launch(
