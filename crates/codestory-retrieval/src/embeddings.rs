@@ -408,16 +408,24 @@ fn observed_embedding_device_state(
 
 fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     let mut saw_cpu = false;
+    let mut saw_accelerated = false;
+    let mut saw_metal = false;
     let text = text.to_ascii_lowercase();
     let log_markers = selected_backend_log_markers();
+    let metal_requested = log_markers.iter().any(|marker| marker == "metal");
     for line in text.lines() {
-        if line_reports_gpu_offload(line) == Some(true)
-            || (line.contains("using device")
-                && ["vulkan", "cuda", "hip", "metal", "sycl", "openvino"]
-                    .iter()
-                    .any(|needle| line.contains(needle)))
+        if line_reports_gpu_offload(line) == Some(true) {
+            saw_accelerated = true;
+        }
+        if line.contains("using device")
+            && ["vulkan", "cuda", "hip", "metal", "sycl", "openvino"]
+                .iter()
+                .any(|needle| line.contains(needle))
         {
-            return "accelerated";
+            saw_accelerated = true;
+        }
+        if metal_requested && line_reports_metal_evidence(line) {
+            saw_metal = true;
         }
         saw_cpu |= line_reports_gpu_offload(line) == Some(false)
             || line.contains("n_gpu_layers = 0")
@@ -425,8 +433,12 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
             || line.contains("no gpu")
             || line.contains("no vulkan device");
     }
-    if saw_cpu {
+    if saw_accelerated {
+        "accelerated"
+    } else if saw_cpu {
         "cpu"
+    } else if saw_metal {
+        "accelerated"
     } else if !log_markers.is_empty()
         && log_markers
             .iter()
@@ -436,6 +448,13 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     } else {
         "unknown"
     }
+}
+
+fn line_reports_metal_evidence(line: &str) -> bool {
+    line.contains("ggml_metal_init")
+        || line.contains("metal backend")
+        || line.trim_start().starts_with("mtl0")
+        || line.trim_start().starts_with("mtl :")
 }
 
 fn selected_backend_log_markers() -> Vec<String> {
@@ -1127,7 +1146,13 @@ mod tests {
         );
         assert_eq!(
             observed_embedding_device_state_from_text("ggml_metal_init: metal backend ready\n"),
-            "unknown"
+            "accelerated"
+        );
+        assert_eq!(
+            observed_embedding_device_state_from_text(
+                "MTL0 : Apple M4 Pro\nMTL : EMBED_LIBRARY = 1\n"
+            ),
+            "accelerated"
         );
         assert_eq!(
             observed_embedding_device_state_from_text(
@@ -1363,6 +1388,33 @@ mod tests {
         assert!(current.contains("current --device Vulkan0"));
         assert!(!current.contains("old --device Vulkan0"));
         assert_eq!(observed_embedding_device_state_from_text(current), "cpu");
+    }
+
+    #[test]
+    fn native_log_current_launch_accepts_spawn_log_prefix() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let text = concat!(
+            "starting native llama.cpp embedding server: old --device Vulkan0\n",
+            "using device Vulkan0\n",
+            "offloaded 33/33 layers to GPU\n",
+            "starting native llama.cpp embedding server: after probe failed (unreachable) /cache/llama-server --port 18080\n",
+            "MTL0 : Apple M4 Pro\n",
+            "MTL : EMBED_LIBRARY = 1\n",
+        );
+
+        let current = native_embedding_log_current_launch(text);
+
+        assert!(current.contains("after probe failed"));
+        assert!(!current.contains("old --device Vulkan0"));
+        assert_eq!(
+            observed_embedding_device_state_from_text(current),
+            "accelerated"
+        );
     }
 
     #[test]

@@ -1035,21 +1035,23 @@ fn safe_archive_member_path(member: &str) -> Result<PathBuf> {
 }
 
 fn copy_dir_contents(source: &Path, target: &Path) -> Result<()> {
+    let source_root =
+        fs::canonicalize(source).with_context(|| format!("canonicalize {}", source.display()))?;
+    copy_dir_contents_with_root(source, target, &source_root)
+}
+
+fn copy_dir_contents_with_root(source: &Path, target: &Path, source_root: &Path) -> Result<()> {
     fs::create_dir_all(target).with_context(|| format!("create {}", target.display()))?;
     for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
         let entry = entry.with_context(|| format!("read entry in {}", source.display()))?;
         let file_type = entry
             .file_type()
             .with_context(|| format!("read file type {}", entry.path().display()))?;
-        if file_type.is_symlink() {
-            bail!(
-                "managed llama-server archive member must not be a symlink: {}",
-                entry.path().display()
-            );
-        }
         let target_path = target.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_contents(&entry.path(), &target_path)?;
+        if file_type.is_symlink() {
+            copy_archive_symlinked_file(&entry.path(), &target_path, source_root)?;
+        } else if file_type.is_dir() {
+            copy_dir_contents_with_root(&entry.path(), &target_path, source_root)?;
         } else if file_type.is_file() {
             fs::copy(entry.path(), &target_path).with_context(|| {
                 format!(
@@ -1065,6 +1067,62 @@ fn copy_dir_contents(source: &Path, target: &Path) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn copy_archive_symlinked_file(source: &Path, target: &Path, source_root: &Path) -> Result<()> {
+    let link_target =
+        fs::read_link(source).with_context(|| format!("read symlink {}", source.display()))?;
+    copy_archive_symlinked_file_target(source, target, source_root, &link_target)
+}
+
+fn copy_archive_symlinked_file_target(
+    source: &Path,
+    target: &Path,
+    source_root: &Path,
+    link_target: &Path,
+) -> Result<()> {
+    if link_target.is_absolute() {
+        bail!(
+            "managed llama-server archive symlink must be relative: {} -> {}",
+            source.display(),
+            link_target.display()
+        );
+    }
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("managed llama-server archive symlink has no parent"))?;
+    let resolved = source_parent.join(link_target);
+    let resolved = fs::canonicalize(&resolved).with_context(|| {
+        format!(
+            "resolve managed llama-server archive symlink {} -> {}",
+            source.display(),
+            link_target.display()
+        )
+    })?;
+    if !resolved.starts_with(source_root) {
+        bail!(
+            "managed llama-server archive symlink escapes payload: {} -> {}",
+            source.display(),
+            resolved.display()
+        );
+    }
+    let metadata = fs::metadata(&resolved)
+        .with_context(|| format!("metadata symlink target {}", resolved.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "managed llama-server archive symlink target is not a regular file: {} -> {}",
+            source.display(),
+            resolved.display()
+        );
+    }
+    fs::copy(&resolved, target).with_context(|| {
+        format!(
+            "copy managed llama-server archive symlink target {} to {}",
+            resolved.display(),
+            target.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1275,7 +1333,7 @@ fn spawn_native_embedding_server_with_probe(
     }
     writeln!(
         log,
-        "starting native llama.cpp embedding server after probe failed ({}): {} {}",
+        "starting native llama.cpp embedding server: after probe failed ({}) {} {}",
         probe.detail,
         launch.executable.display(),
         launch.args.join(" ")
@@ -1509,6 +1567,7 @@ fn embed_model_candidates(repo_root: Option<&Path>, layout: &SidecarLayout) -> V
     for candidate in [
         workdir.join("target").join("retrieval-models"),
         workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
+        user_cache_root().join("retrieval-models"),
         user_cache_root().join("embed-models"),
         fallback,
     ] {
@@ -1619,6 +1678,30 @@ mod tests {
         assert_eq!(
             embed_model_dir_from_candidates([empty.path().to_path_buf(), model_dir.clone()])
                 .expect("fallback model dir"),
+            model_dir
+        );
+    }
+
+    #[test]
+    fn embed_model_dir_discovers_user_cache_retrieval_models() {
+        let _lock = crate::test_support::env_lock();
+        let cache = tempdir().expect("cache");
+        let _cache_root = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            cache.path().to_str().expect("cache path"),
+        );
+        let project = tempdir().expect("project");
+        let model_dir = cache.path().join("retrieval-models");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(
+            model_dir.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
+            b"model placeholder",
+        )
+        .expect("model file");
+        let layout = compose_test_runtime(project.path()).layout;
+
+        assert_eq!(
+            embed_model_dir(Some(project.path()), &layout).expect("model dir"),
             model_dir
         );
     }
@@ -2056,6 +2139,50 @@ mod tests {
         assert!(safe_archive_member_path("../llama-server").is_err());
         assert!(safe_archive_member_path("/tmp/llama-server").is_err());
         assert!(safe_archive_member_path("llama-b9902\\llama-server").is_err());
+    }
+
+    #[test]
+    fn managed_native_copy_materializes_safe_internal_symlink_target() {
+        let temp = tempdir().expect("temp");
+        let source_dir = temp.path().join("payload");
+        let target_dir = temp.path().join("install");
+        std::fs::create_dir_all(&source_dir).expect("payload dir");
+        std::fs::create_dir_all(&target_dir).expect("target dir");
+        let real = source_dir.join("libggml-rpc.dylib");
+        std::fs::write(&real, b"fake dylib").expect("real dylib");
+
+        copy_archive_symlinked_file_target(
+            &source_dir.join("libggml-rpc.0.dylib"),
+            &target_dir.join("libggml-rpc.0.dylib"),
+            &std::fs::canonicalize(&source_dir).expect("canonical source"),
+            Path::new("libggml-rpc.dylib"),
+        )
+        .expect("materialize symlink target");
+
+        assert_eq!(
+            std::fs::read(target_dir.join("libggml-rpc.0.dylib")).expect("copied dylib"),
+            b"fake dylib"
+        );
+    }
+
+    #[test]
+    fn managed_native_copy_rejects_symlink_escape() {
+        let temp = tempdir().expect("temp");
+        let source_dir = temp.path().join("payload");
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&source_dir).expect("payload dir");
+        std::fs::create_dir_all(&outside_dir).expect("outside dir");
+        std::fs::write(outside_dir.join("lib.dylib"), b"outside").expect("outside file");
+
+        let error = copy_archive_symlinked_file_target(
+            &source_dir.join("libggml-rpc.0.dylib"),
+            &temp.path().join("install").join("libggml-rpc.0.dylib"),
+            &std::fs::canonicalize(&source_dir).expect("canonical source"),
+            Path::new("../outside/lib.dylib"),
+        )
+        .expect_err("escaping symlink should fail");
+
+        assert!(error.to_string().contains("escapes payload"));
     }
 
     #[test]
