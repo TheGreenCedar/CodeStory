@@ -2727,7 +2727,11 @@ fn repair_ready_state(
             &mut embedding_resource_lease,
             &bootstrap.state,
         ) {
-            codestory_retrieval::sidecar_down_for_runtime(&sidecar).with_context(|| {
+            readiness_broker::cleanup_native_embedding_resource_lease_after_transfer_error(
+                &embedding_resource_lease,
+                &sidecar,
+            )
+            .with_context(|| {
                 format!(
                     "cleanup ready repair sidecar after native embedding lease transfer failed: {error}"
                 )

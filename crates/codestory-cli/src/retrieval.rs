@@ -92,7 +92,11 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             &mut embedding_resource_lease,
             &report.state,
         ) {
-            sidecar_down_for_runtime(&sidecar).with_context(|| {
+            crate::readiness_broker::cleanup_native_embedding_resource_lease_after_transfer_error(
+                &embedding_resource_lease,
+                &sidecar,
+            )
+            .with_context(|| {
                 format!(
                     "cleanup retrieval sidecar after native embedding lease transfer failed: {error}"
                 )

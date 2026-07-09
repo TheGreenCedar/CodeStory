@@ -505,6 +505,28 @@ fn cleanup_native_embedding_resource_lease_after_bootstrap_error_with_cleanup(
     Ok(())
 }
 
+pub(crate) fn cleanup_native_embedding_resource_lease_after_transfer_error(
+    lease: &Option<BrokerNativeEmbeddingResourceLease>,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<()> {
+    cleanup_native_embedding_resource_lease_after_transfer_error_with_cleanup(lease, || {
+        codestory_retrieval::sidecar_down_for_runtime(sidecar)
+    })
+}
+
+fn cleanup_native_embedding_resource_lease_after_transfer_error_with_cleanup(
+    lease: &Option<BrokerNativeEmbeddingResourceLease>,
+    cleanup: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if matches!(
+        lease,
+        Some(BrokerNativeEmbeddingResourceLease::Reused { .. })
+    ) {
+        return Ok(());
+    }
+    cleanup()
+}
+
 pub(crate) fn native_embedding_launch_from_sidecar_state_file(
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<Option<codestory_retrieval::EmbeddingLaunchMetadata>> {
@@ -1770,6 +1792,43 @@ mod tests {
         let preserved = read_machine_resource_lock_file(&path).expect("lock remains");
         assert_eq!(preserved.pid, owner_pid);
         assert!(preserved.native_embedding_launch.is_some());
+        cleanup_machine_resource(&resource);
+    }
+
+    #[test]
+    fn native_embedding_reused_transfer_error_cleanup_is_noop() {
+        let lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: 4321 });
+
+        cleanup_native_embedding_resource_lease_after_transfer_error_with_cleanup(&lease, || {
+            panic!("reused lease must not stop the shared sidecar on transfer failure")
+        })
+        .expect("reused transfer cleanup is a no-op");
+    }
+
+    #[test]
+    fn native_embedding_acquired_transfer_error_runs_cleanup() {
+        let project = tempdir().expect("temp project");
+        let resource = unique_resource("native-transfer-cleanup");
+        cleanup_machine_resource(&resource);
+        let scope = test_scope(project.path(), "shared-agent");
+        let lock = match try_acquire_machine_resource_lock(&resource, &scope)
+            .expect("acquire machine lock")
+        {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+        let lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+        let mut cleanup_called = false;
+
+        cleanup_native_embedding_resource_lease_after_transfer_error_with_cleanup(&lease, || {
+            cleanup_called = true;
+            Ok(())
+        })
+        .expect("acquired transfer cleanup");
+
+        assert!(cleanup_called);
         cleanup_machine_resource(&resource);
     }
 

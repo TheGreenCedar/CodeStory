@@ -54,6 +54,9 @@
   repair failures, preserved native broker locks when process identity cannot be
   verified, and kept `sidecar_setup status` available while native repair is
   blocked.
+- Kept reused native embedding leases from running sidecar teardown when final
+  lease transfer validation fails, so reuse-only repairs cannot stop the shared
+  owner they did not spawn.
 
 ## 0.13.12
 
