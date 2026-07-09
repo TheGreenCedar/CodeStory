@@ -61,6 +61,8 @@
   diagnostics so MCP status matches the tools that remain callable.
 - Serialized native launch lock release with stale-lock reaping and required
   exact launch metadata before removing a machine lock.
+- Made deprecated `repair_all` obey its `allowed=false` status while returning
+  canonical `sidecar_setup repair` guidance in the readiness block.
 
 ## 0.13.12
 

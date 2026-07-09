@@ -2990,17 +2990,17 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
             }
         }),
     );
-    let repair_all = assert_tool_success(&repair_all_response, json!("repair-all-compat"));
-    assert_eq!(repair_all["deprecated"], json!(true));
-    assert_eq!(repair_all["canonical_tool"], json!("sidecar_setup"));
+    let repair_all = assert_tool_error(&repair_all_response, json!("repair-all-compat"));
+    assert_eq!(repair_all["code"], json!("codestory_tool_blocked"));
+    assert_eq!(repair_all["tool"], json!("repair_all"));
     assert_eq!(
         repair_all["canonical_arguments"],
         json!({"action": "repair"})
     );
     assert_eq!(
-        repair_all["mode"],
-        json!("background"),
-        "repair_all compatibility alias must not run foreground repair: {repair_all}"
+        repair_all["canonical_tool"],
+        json!("sidecar_setup"),
+        "repair_all should be blocked and point at canonical sidecar_setup repair: {repair_all}"
     );
 
     let repair_response = send_json(

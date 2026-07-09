@@ -417,12 +417,6 @@ fn stdio_tool_blocked_error(
     {
         return Ok(None);
     }
-    if name == "repair_all"
-        && surface.get("status").and_then(serde_json::Value::as_str) == Some("compatibility_alias")
-    {
-        return Ok(None);
-    }
-
     let readiness_goal = surface
         .get("readiness_goal")
         .and_then(serde_json::Value::as_str);
@@ -449,6 +443,9 @@ fn stdio_tool_blocked_error(
         "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "canonical_tool": surface.get("canonical_tool").cloned().unwrap_or(serde_json::Value::Null),
+        "canonical_arguments": surface.get("canonical_arguments").cloned().unwrap_or(serde_json::Value::Null),
+        "deprecated": surface.get("deprecated").cloned().unwrap_or(serde_json::Value::Null),
         "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
         "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next")),
         "full_repair": stdio_repair_calls_from_value(surface.get("full_repair")),
