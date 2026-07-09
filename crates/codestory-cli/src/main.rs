@@ -2679,7 +2679,10 @@ fn repair_ready_state(
         sidecar.run_id.as_deref(),
         env!("CARGO_PKG_VERSION"),
     );
-    let final_status = run_ready_repair_with_native_embedding_lease(
+    let ReadyRepairResult {
+        final_status: _final_status,
+        gpu_proof,
+    } = run_ready_repair_with_native_embedding_lease(
         runtime,
         &sidecar,
         &broker_scope,
@@ -2690,10 +2693,16 @@ fn repair_ready_state(
         cache_root: runtime.cache_root.clone(),
         agent_run_id: sidecar.run_id.clone(),
         cli_version: env!("CARGO_PKG_VERSION").to_string(),
-        gpu_proof: Some(broker_gpu_proof_input_from_report(&final_status)),
+        gpu_proof: Some(gpu_proof),
         reconciliation: None,
     });
     Ok(Some(sidecar))
+}
+
+#[derive(Debug, Clone)]
+struct ReadyRepairResult {
+    final_status: codestory_retrieval::RetrievalStatusReport,
+    gpu_proof: readiness_broker::BrokerGpuProofInput,
 }
 
 fn run_ready_repair_with_native_embedding_lease(
@@ -2701,15 +2710,14 @@ fn run_ready_repair_with_native_embedding_lease(
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
     broker_scope: &readiness_broker::BrokerScope,
     storage_scope: &codestory_retrieval::BootstrapStorageScope,
-) -> Result<codestory_retrieval::RetrievalStatusReport> {
+) -> Result<ReadyRepairResult> {
     eprintln!(
         "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
         sidecar.run_id.as_deref().unwrap_or("none"),
         sidecar.namespace,
         sidecar.compose_project
     );
-    let progress =
-        ReadyRepairProgress::start(sidecar, &runtime.project_root, &runtime.cache_root);
+    let progress = ReadyRepairProgress::start(sidecar, &runtime.project_root, &runtime.cache_root);
     readiness_broker::run_with_native_embedding_lease_lifecycle(
         readiness_broker::NativeEmbeddingLeaseLifecycleParams {
             scope: broker_scope,
@@ -2742,16 +2750,15 @@ fn run_ready_repair_with_native_embedding_lease(
                 sidecar,
             );
             let embed_smoke = ensure_ready_repair_embed_liveness(&infrastructure)?;
+            let gpu_proof =
+                broker_gpu_proof_input_from_infrastructure_with_smoke(&infrastructure, embed_smoke);
             let _ =
                 readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
                     project_root: runtime.project_root.clone(),
                     cache_root: runtime.cache_root.clone(),
                     agent_run_id: sidecar.run_id.clone(),
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                    gpu_proof: Some(broker_gpu_proof_input_from_infrastructure_with_smoke(
-                        &infrastructure,
-                        embed_smoke,
-                    )),
+                    gpu_proof: Some(gpu_proof.clone()),
                     reconciliation: None,
                 });
             progress.set_phase("Qdrant finalize");
@@ -2787,7 +2794,10 @@ fn run_ready_repair_with_native_embedding_lease(
             )
             .context("ready repair final retrieval status")?;
             ensure_ready_repair_full_sidecar(&final_status)?;
-            Ok(final_status)
+            Ok(ReadyRepairResult {
+                final_status,
+                gpu_proof,
+            })
         },
     )
 }
@@ -2820,10 +2830,7 @@ fn ensure_ready_repair_embed_liveness_with_probe(
         );
     }
     if infrastructure.embedding_cpu_allowed {
-        return Ok(ReadyRepairEmbedSmoke {
-            ok: None,
-            ms: None,
-        });
+        return Ok(ReadyRepairEmbedSmoke { ok: None, ms: None });
     }
     let smoke = probe();
     if !smoke.reachable {
@@ -2865,9 +2872,8 @@ fn broker_gpu_proof_input_from_infrastructure_with_smoke(
         embed_smoke_ok: smoke.ok,
         embed_smoke_ms: smoke.ms,
         degraded_reason: (!infrastructure.embedding_cpu_allowed
-            && (infrastructure.embedding_device_state != "accelerated"
-                || smoke.ok != Some(true)))
-            .then(|| "gpu_unverified".to_string()),
+            && (infrastructure.embedding_device_state != "accelerated" || smoke.ok != Some(true)))
+        .then(|| "gpu_unverified".to_string()),
     }
 }
 
@@ -13126,6 +13132,48 @@ mod tests {
         let report = ready_repair_test_report("full", None);
 
         ensure_ready_repair_full_sidecar(&report).expect("full mode should pass");
+    }
+
+    #[test]
+    fn ready_repair_final_snapshot_preserves_embed_smoke_proof() {
+        let final_status = ready_repair_test_report("full", None);
+        let infrastructure = codestory_retrieval::InfrastructureHealth {
+            zoekt_reachable: true,
+            qdrant_reachable: true,
+            embed_reachable: true,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "accelerated".into(),
+            embedding_device_observation_source: "native_log".into(),
+            embedding_detected_provider: Some("amd".into()),
+            embedding_detected_gpu: Some("Vulkan0".into()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("vulkan".into()),
+            embedding_accelerator_request_device: Some("Vulkan0".into()),
+            embedding_cpu_allowed: false,
+            zoekt_detail: "http 200".into(),
+            qdrant_detail: "http 200".into(),
+            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
+        };
+        let result = ReadyRepairResult {
+            final_status,
+            gpu_proof: broker_gpu_proof_input_from_infrastructure_with_smoke(
+                &infrastructure,
+                ReadyRepairEmbedSmoke {
+                    ok: Some(true),
+                    ms: Some(17),
+                },
+            ),
+        };
+
+        let final_proof = readiness_broker::gpu_proof(result.gpu_proof.clone());
+        assert_eq!(final_proof.proof_status, "verified");
+        assert_eq!(final_proof.embed_smoke_ok, Some(true));
+        assert_eq!(final_proof.embed_smoke_ms, Some(17));
+
+        let report_only =
+            readiness_broker::gpu_proof(broker_gpu_proof_input_from_report(&result.final_status));
+        assert_eq!(report_only.proof_status, "gpu_unverified");
+        assert_eq!(report_only.embed_smoke_ok, None);
     }
 
     #[test]

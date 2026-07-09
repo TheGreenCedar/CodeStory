@@ -112,7 +112,10 @@ pub(crate) fn build_broker_snapshot(input: BrokerSnapshotInput) -> ReadinessBrok
     }
 }
 
-pub(crate) fn write_snapshot_file(path: &std::path::Path, snapshot: &ReadinessBrokerSnapshot) -> Result<()> {
+pub(crate) fn write_snapshot_file(
+    path: &std::path::Path,
+    snapshot: &ReadinessBrokerSnapshot,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

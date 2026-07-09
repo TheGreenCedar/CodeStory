@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Preserved ready-repair GPU smoke proof through the final broker snapshot,
+  reaped stale malformed readiness locks, bounded orphaned local refresh locks,
+  and marked diagnostic fail-open repair history stale when it points at an old
+  CLI.
 - Cleared MCP recent-repair status overlays unless the repair PID is still alive
   or durable on-disk active repair status exists, so a dead spawn cannot look
   like a live repair for 30s.

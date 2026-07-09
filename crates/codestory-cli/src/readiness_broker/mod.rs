@@ -27,8 +27,9 @@ pub(crate) use native_lease::{
     cleanup_native_embedding_resource_lease_after_bootstrap_error,
     cleanup_native_embedding_resource_lease_after_transfer_error,
     cleanup_transferred_native_embedding_resource_after_error,
-    native_embedding_launch_from_sidecar_state_file, reusable_native_embedding_resource_pid_for_snapshot,
-    run_with_native_embedding_lease_lifecycle, transfer_native_embedding_resource_lease,
+    native_embedding_launch_from_sidecar_state_file,
+    reusable_native_embedding_resource_pid_for_snapshot, run_with_native_embedding_lease_lifecycle,
+    transfer_native_embedding_resource_lease,
 };
 #[allow(unused_imports)]
 pub(crate) use paths::machine_resource_cache_fingerprint;

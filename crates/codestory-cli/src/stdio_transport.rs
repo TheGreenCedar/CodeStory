@@ -3274,7 +3274,9 @@ fn build_stdio_status_broker(
             cache_root: runtime.cache_root.clone(),
             agent_run_id: selected_agent_sidecar.run_id.clone(),
             cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(crate::broker_gpu_proof_input_from_sidecar(selected_agent_sidecar)),
+            gpu_proof: Some(crate::broker_gpu_proof_input_from_sidecar(
+                selected_agent_sidecar,
+            )),
             reconciliation: None,
         },
     );
@@ -5320,7 +5322,10 @@ mod tests {
             project.path(),
         );
 
-        assert!(recent.is_none(), "dead pid without durable status must clear overlay");
+        assert!(
+            recent.is_none(),
+            "dead pid without durable status must clear overlay"
+        );
         assert!(updated["sidecar_setup"]["active_repair"].is_null());
         assert_eq!(updated["readiness_broker"]["operations"], json!([]));
     }

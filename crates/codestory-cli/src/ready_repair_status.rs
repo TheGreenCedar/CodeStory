@@ -826,8 +826,7 @@ mod tests {
         )
         .expect("write stale project lock");
 
-        let cleanups =
-            cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let cleanups = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
 
         assert_eq!(cleanups.len(), 1);
         assert!(cleanups[0].removed_status_path);

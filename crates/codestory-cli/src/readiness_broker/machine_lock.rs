@@ -216,8 +216,15 @@ pub(crate) fn reap_stale_machine_resource_lock(resource: &str, path: &Path) -> R
     let Some(reaper) = try_acquire_machine_resource_reaper_lock(resource)? else {
         return Ok(false);
     };
-    let Some(stale_lock) = read_machine_resource_lock_file(path) else {
+    if !machine_lock_file_is_stale(path) || !reaper.is_current() {
         return Ok(false);
+    }
+    let Some(stale_lock) = read_machine_resource_lock_file(path) else {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
     };
     if !machine_lock_is_stale(&stale_lock) || !reaper.is_current() {
         return Ok(false);
@@ -372,7 +379,9 @@ pub(crate) fn try_acquire_machine_resource_reaper_takeover_lock(
     )
 }
 
-pub(crate) fn read_machine_resource_lock_file(path: &Path) -> Option<BrokerMachineResourceLockFile> {
+pub(crate) fn read_machine_resource_lock_file(
+    path: &Path,
+) -> Option<BrokerMachineResourceLockFile> {
     fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())

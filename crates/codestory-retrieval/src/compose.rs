@@ -2239,9 +2239,9 @@ mod tests {
         assert!(native_embedding_breakaway_denied(&std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )));
-        assert!(native_embedding_breakaway_denied(&std::io::Error::from_raw_os_error(
-            5
-        )));
+        assert!(native_embedding_breakaway_denied(
+            &std::io::Error::from_raw_os_error(5)
+        ));
         assert!(!native_embedding_breakaway_denied(&std::io::Error::from(
             std::io::ErrorKind::NotFound
         )));

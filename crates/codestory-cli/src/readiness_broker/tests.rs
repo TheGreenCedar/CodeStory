@@ -1,14 +1,15 @@
-use super::*;
 use super::machine_lock::*;
 use super::native_lease::*;
 use super::paths::*;
 use super::scope::*;
 use super::snapshot::*;
 use super::types::*;
+use super::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
+use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
 
 fn unique_resource(prefix: &str) -> String {
@@ -79,6 +80,24 @@ fn write_stale_reaper_lock(resource: &str) -> PathBuf {
     path
 }
 
+fn write_malformed_machine_lock(resource: &str) -> PathBuf {
+    let path = machine_resource_lock_path(resource);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create lock parent");
+    }
+    fs::write(&path, b"{not-json").expect("write malformed lock");
+    path
+}
+
+fn set_file_age(path: &Path, age: Duration) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open file for mtime")
+        .set_modified(SystemTime::now() - age)
+        .expect("set file mtime");
+}
+
 fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
     let canonical_root = clean_path_text(project);
     let canonical_root_hash = hash_text(&canonical_root);
@@ -109,9 +128,7 @@ fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
     }
 }
 
-fn native_sidecar_state(
-    spawned_at_epoch_ms: Option<i64>,
-) -> codestory_retrieval::SidecarStateFile {
+fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval::SidecarStateFile {
     codestory_retrieval::SidecarStateFile {
         owner: "codestory".to_string(),
         profile: "agent".to_string(),
@@ -167,8 +184,7 @@ fn write_matching_native_sidecar_state(
     state.compose_project = sidecar.compose_project.clone();
     state.run_id = sidecar.run_id.clone();
     state.embed_http_port = sidecar.embed_http_port;
-    state.embed_url =
-        codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
+    state.embed_url = codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
     if let Some(launch) = state.embedding_launch.as_mut() {
         launch.endpoint = state.embed_url.clone();
         launch.pid = Some(pid);
@@ -284,13 +300,12 @@ fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
     };
     let mut validator_called = false;
 
-    let reused =
-        reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut |launch| {
-            validator_called = true;
-            assert_eq!(launch.pid, Some(owner_pid));
-            Ok(owner_pid)
-        })
-        .expect("reuse check");
+    let reused = reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut |launch| {
+        validator_called = true;
+        assert_eq!(launch.pid, Some(owner_pid));
+        Ok(owner_pid)
+    })
+    .expect("reuse check");
 
     assert_eq!(reused, Some(owner_pid));
     assert!(validator_called);
@@ -360,14 +375,13 @@ fn native_embedding_acquired_lease_releases_without_handoff_on_error() {
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
     );
-    let lock = match try_acquire_machine_resource_lock(&resource, &scope)
-        .expect("acquire machine lock")
-    {
-        BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-        BrokerMachineResourceLockAttempt::Busy(busy) => {
-            panic!("first lock should acquire, got {busy:?}")
-        }
-    };
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
     let path = machine_resource_lock_path(&resource);
     let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
 
@@ -392,14 +406,13 @@ fn native_embedding_cleanup_failure_preserves_acquired_lock_for_recorded_launch(
     );
     let owner_pid = 4321;
     write_matching_native_sidecar_state(&sidecar, owner_pid);
-    let lock = match try_acquire_machine_resource_lock(&resource, &scope)
-        .expect("acquire machine lock")
-    {
-        BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-        BrokerMachineResourceLockAttempt::Busy(busy) => {
-            panic!("first lock should acquire, got {busy:?}")
-        }
-    };
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
     let path = machine_resource_lock_path(&resource);
     let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
 
@@ -438,14 +451,13 @@ fn native_embedding_acquired_transfer_error_runs_cleanup() {
     let resource = unique_resource("native-transfer-cleanup");
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "shared-agent");
-    let lock = match try_acquire_machine_resource_lock(&resource, &scope)
-        .expect("acquire machine lock")
-    {
-        BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-        BrokerMachineResourceLockAttempt::Busy(busy) => {
-            panic!("first lock should acquire, got {busy:?}")
-        }
-    };
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
     let lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
     let mut cleanup_called = false;
 
@@ -500,21 +512,19 @@ fn machine_resource_lock_reports_busy_until_owner_drops() {
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "owner");
 
-    let lock = match try_acquire_machine_resource_lock(&resource, &scope)
-        .expect("acquire machine lock")
-    {
-        BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-        BrokerMachineResourceLockAttempt::Busy(busy) => {
-            panic!("first lock should acquire, got {busy:?}")
-        }
-    };
-    let busy =
-        match try_acquire_machine_resource_lock(&resource, &scope).expect("second acquire") {
-            BrokerMachineResourceLockAttempt::Acquired(_) => {
-                panic!("second lock should be busy")
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
             }
-            BrokerMachineResourceLockAttempt::Busy(busy) => busy,
         };
+    let busy = match try_acquire_machine_resource_lock(&resource, &scope).expect("second acquire") {
+        BrokerMachineResourceLockAttempt::Acquired(_) => {
+            panic!("second lock should be busy")
+        }
+        BrokerMachineResourceLockAttempt::Busy(busy) => busy,
+    };
     assert_eq!(busy.snapshot.status, "busy");
     assert_eq!(busy.snapshot.owner_pid, Some(std::process::id()));
 
@@ -548,6 +558,41 @@ fn machine_resource_lock_reclaims_dead_owner() {
     assert_eq!(
         snapshot.owner_operation_id,
         Some(broker_operation_id(&new_scope))
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_lock_reclaims_stale_malformed_file() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("malformed-stale");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "new");
+    let path = write_malformed_machine_lock(&resource);
+    set_file_age(&path, MACHINE_LOCK_STALE_TTL + Duration::from_secs(1));
+
+    let acquired =
+        try_acquire_machine_resource_lock(&resource, &scope).expect("reclaim malformed lock");
+    assert!(matches!(
+        acquired,
+        BrokerMachineResourceLockAttempt::Acquired(_)
+    ));
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_lock_keeps_fresh_malformed_file_busy() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("malformed-fresh");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "new");
+    write_malformed_machine_lock(&resource);
+
+    let acquired =
+        try_acquire_machine_resource_lock(&resource, &scope).expect("probe malformed lock");
+    assert!(
+        matches!(acquired, BrokerMachineResourceLockAttempt::Busy(_)),
+        "fresh malformed lock should stay busy until it ages out"
     );
     cleanup_machine_resource(&resource);
 }
@@ -671,21 +716,19 @@ fn machine_resource_lock_transfers_to_native_launch_until_launch_release() {
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "owner");
 
-    let mut lock = match try_acquire_machine_resource_lock(&resource, &scope)
-        .expect("acquire machine lock")
-    {
-        BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
-        BrokerMachineResourceLockAttempt::Busy(busy) => {
-            panic!("first lock should acquire, got {busy:?}")
-        }
-    };
+    let mut lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
 
     let mut state = native_sidecar_state(Some(now_epoch_ms()));
     let launch = state.embedding_launch.as_mut().expect("launch");
     launch.pid = Some(std::process::id());
     assert!(
-        transfer_machine_resource_lock_to_native_launch(&mut lock, launch)
-            .expect("transfer lock")
+        transfer_machine_resource_lock_to_native_launch(&mut lock, launch).expect("transfer lock")
     );
     drop(lock);
     let path = machine_resource_lock_path(&resource);
@@ -815,8 +858,11 @@ fn write_ready_repair_status_file(
         "started_at_epoch_ms": updated_at_epoch_ms,
         "updated_at_epoch_ms": updated_at_epoch_ms,
     });
-    fs::write(&path, serde_json::to_vec_pretty(&status).expect("status json"))
-        .expect("write repair status");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&status).expect("status json"),
+    )
+    .expect("write repair status");
     path
 }
 
@@ -866,12 +912,8 @@ fn reconcile_before_enqueue_returns_active_repair_when_live() {
         "Qdrant finalize",
     );
 
-    let reconciliation = reconcile_before_enqueue(
-        project.path(),
-        cache.path(),
-        Some(run_id),
-        "9.9.9",
-    );
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some(run_id), "9.9.9");
 
     assert_eq!(reconciliation.status, "active_repair");
     assert!(!reconciliation.cleanup_performed);
@@ -896,12 +938,8 @@ fn reconcile_before_enqueue_cleans_abandoned_repair_for_dead_pid() {
         "graph artifact",
     );
 
-    let reconciliation = reconcile_before_enqueue(
-        project.path(),
-        cache.path(),
-        Some(run_id),
-        "9.9.9",
-    );
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some(run_id), "9.9.9");
 
     assert_eq!(reconciliation.status, "stale_state_cleaned");
     assert!(reconciliation.cleanup_performed);
@@ -911,7 +949,10 @@ fn reconcile_before_enqueue_cleans_abandoned_repair_for_dead_pid() {
         reconciliation.abandoned_repairs[0].status,
         "abandoned_cleaned"
     );
-    assert!(!status_path.exists(), "abandoned status file should be removed");
+    assert!(
+        !status_path.exists(),
+        "abandoned status file should be removed"
+    );
 }
 
 #[test]
@@ -919,12 +960,8 @@ fn reconcile_before_enqueue_reports_clean_when_empty() {
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");
 
-    let reconciliation = reconcile_before_enqueue(
-        project.path(),
-        cache.path(),
-        Some("shared-agent"),
-        "9.9.9",
-    );
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
 
     assert_eq!(reconciliation.status, "clean");
     assert!(!reconciliation.cleanup_performed);
@@ -939,12 +976,8 @@ fn reconcile_before_enqueue_cleans_stale_local_refresh() {
     let cache = tempdir().expect("cache");
     write_stale_local_refresh(cache.path(), project.path());
 
-    let reconciliation = reconcile_before_enqueue(
-        project.path(),
-        cache.path(),
-        Some("shared-agent"),
-        "9.9.9",
-    );
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
 
     assert_eq!(reconciliation.status, "stale_state_cleaned");
     assert!(reconciliation.cleanup_performed);
@@ -990,7 +1023,10 @@ fn machine_resource_lock_contention_has_single_winner_across_threads() {
         .filter(|outcome| matches!(outcome, BrokerMachineResourceLockAttempt::Busy(_)))
         .count();
 
-    assert_eq!(winners, 1, "machine lock contention must have exactly one winner");
+    assert_eq!(
+        winners, 1,
+        "machine lock contention must have exactly one winner"
+    );
     assert_eq!(busy, contender_count - 1);
     drop(outcomes);
     cleanup_machine_resource(&resource);
@@ -1049,11 +1085,7 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
         "in-flight repair must appear before status clear: {during:?}"
     );
 
-    crate::ready_repair_status::clear_ready_repair_status(
-        &sidecar,
-        started_at,
-        std::process::id(),
-    );
+    crate::ready_repair_status::clear_ready_repair_status(&sidecar, started_at, std::process::id());
 
     let after = refresh_broker_snapshot(BrokerSnapshotInput {
         project_root: project.path().to_path_buf(),
