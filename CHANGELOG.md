@@ -1,6 +1,88 @@
 # Changelog
 
-## Unreleased
+## 0.14.0
+
+CodeStory 0.14.0 turns the 0.13.x MCP recovery fixes into a durable readiness
+contract. Compared with 0.13.12, agents now get lane-specific status, explicit
+sidecar setup controls, GPU proof, and repair guidance that stays honest when
+the installed runtime is stale, busy, or unavailable.
+
+### Added
+
+- Added a durable readiness broker for CLI/MCP repair state, with cross-process
+  snapshots for active repairs, abandoned repairs, local refresh cleanup,
+  machine-scoped native embedding locks, resource ownership, and GPU proof.
+- Added explicit MCP `sidecar_setup` status/config/repair guidance for
+  packet/search sidecars, including enabled/disabled/ask policy states and
+  diagnostic fail-open status when the real stdio runtime cannot start.
+- Added accelerator proof fields to status output so operators can see the
+  requested device, observed device, provider, live embedding smoke result,
+  elapsed smoke time, and degraded reason before trusting agent packet/search.
+
+### Changed
+
+- Made the CLI entrypoint and stdio transport async with Tokio, including
+  bounded blocking work, ordered responses, frame limits, queued-request
+  cancellation, and canceled-response suppression without changing command
+  names or MCP wire contracts.
+- Consolidated outbound sidecar HTTP status/body handling behind shared `ureq`
+  helpers while keeping the loopback browser HTTP server unchanged.
+- Added versioned project, workspace, and artifact-scope identity to readiness
+  snapshots and sidecar ownership. Existing cache namespaces remain compatible,
+  and dirty or unidentified worktrees fail closed to workspace-local reuse.
+- Split readiness into local-navigation and agent-packet/search lanes so stale
+  local indexes, sidecar policy, native embedding ownership, and packet/search
+  readiness no longer collapse into one ambiguous ready/not-ready result.
+- Made status reads observational: MCP status no longer starts background
+  sidecar repair by itself, and recovery instructions point agents to the
+  allowed `sidecar_setup` action instead of raw CLI repair commands.
+- Made ready-repair and retrieval bootstrap share native embedding ownership
+  rules. Existing CodeStory-owned sidecars can be reused only when recorded
+  PID/launch metadata still match, and reuse-only repairs do not tear down
+  sidecars they did not start.
+- Updated plugin/operator guidance for the current status contract, including
+  `gpu_proof` interpretation, diagnostic fail-open limits, stale workspace
+  behavior, and Windows `codex.cmd` invocation.
+
+### Fixed
+
+- Hardened durable readiness repair ownership so live local-refresh and ready
+  repair locks are not age-reclaimed, concurrent MCP repair is single-flight,
+  and intentionally preserved live ownership reports an explicit orphan reason.
+- Made readiness locks and broker snapshots publish atomically, including safe
+  native lock handoff and Windows replacement, without changing PID, TTL,
+  heartbeat, or ownership semantics.
+- Required runtime/log-backed accelerator observation plus a successful smoke
+  before GPU proof is verified; device inventory and operator assertions remain
+  diagnostic evidence only.
+- Made explicit `native_spawned` selection reject compose-only Linux backends,
+  and exposed the durable broker snapshot consistently through `doctor`,
+  `retrieval status`, and plugin bootstrap status.
+- Prevented installed MCP from binding to another workspace's global active-state
+  file when the host has a current Codex thread but no matching thread-scoped
+  active-state file yet.
+- Prevented stale repair records, malformed machine locks, PID reuse, stale
+  local-refresh status, and broker-lock races from making CodeStory surfaces
+  look busy or ready after the owning process has gone away.
+- Preserved live GPU smoke proof through final broker snapshots and refused to
+  report accelerator-required packet/search as verified without a live timed
+  embedding smoke.
+- Kept native llama.cpp sidecars alive and accurately owned across Windows,
+  macOS, Linux, endpoint reuse, `retrieval up`, `retrieval down`, failed repair,
+  host job-object restrictions, and Unix shutdown.
+- Prevented detached Windows llama.cpp sidecars from retaining the CLI's
+  redirected standard handles, so callers capturing bootstrap output can
+  complete while the owned sidecar remains alive.
+- Fixed Apple Silicon Metal source contracts so managed llama.cpp installs
+  accept the upstream macOS payload, existing cached models are discovered, and
+  Metal logs can prove accelerator-required packet/search readiness without
+  manual device assertions; live post-repair endpoint survival still needs
+  macOS arm64 validation before release-level hardware proof.
+- Made diagnostic fail-open mode reject fake repairs, keep only safe status and
+  setup surfaces callable, and mark old repair history stale when it points at
+  an old CLI version or path.
+- Made deprecated `repair_all` obey its blocked status while returning canonical
+  `sidecar_setup repair` guidance for compatibility callers.
 
 ## 0.13.12
 

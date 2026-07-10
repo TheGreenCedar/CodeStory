@@ -614,6 +614,65 @@ fn new_openapi_with_late_paths_marks_freshness_stale() {
 }
 
 #[test]
+fn doctor_reports_readiness_broker_without_publishing_snapshot() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let doctor = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+    );
+    let broker = doctor["readiness_broker"]
+        .as_object()
+        .unwrap_or_else(|| panic!("doctor should include a typed readiness broker: {doctor:#}"));
+    assert!(
+        broker.get("schema_version").is_some_and(Value::is_number),
+        "doctor broker should expose its schema version: {broker:#?}"
+    );
+    assert!(
+        broker.get("project_id").is_some_and(Value::is_string),
+        "doctor broker should expose its project identity: {broker:#?}"
+    );
+    assert_eq!(
+        broker.get("persistence_status").and_then(Value::as_str),
+        Some("observed"),
+        "doctor should observe broker state without publishing it: {broker:#?}"
+    );
+    let snapshot_path = broker
+        .get("snapshot_path")
+        .and_then(Value::as_str)
+        .expect("doctor broker snapshot path");
+    assert!(
+        !Path::new(snapshot_path).exists(),
+        "doctor must not create or rewrite the broker snapshot: {snapshot_path}"
+    );
+
+    let markdown = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "markdown"],
+    );
+    assert!(
+        markdown.status.success(),
+        "doctor markdown failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&markdown.stdout),
+        String::from_utf8_lossy(&markdown.stderr)
+    );
+    let markdown = String::from_utf8_lossy(&markdown.stdout);
+    assert!(
+        markdown.contains("readiness_broker: project_id=")
+            && markdown.contains("persistence=observed"),
+        "doctor markdown should use the ready broker rendering:\n{markdown}"
+    );
+    assert!(
+        !Path::new(snapshot_path).exists(),
+        "doctor markdown must remain read-only for the broker snapshot: {snapshot_path}"
+    );
+}
+
+#[test]
 fn doctor_next_commands_stop_at_index_repair_when_inventory_is_stale() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");

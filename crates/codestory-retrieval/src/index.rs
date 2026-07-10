@@ -65,15 +65,11 @@ const QDRANT_SEMANTIC_SMOKE_RETRY_ATTEMPTS: usize = 2;
 const QDRANT_SEMANTIC_SMOKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub fn project_id_for_root(project_root: &Path) -> String {
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    fnv1a_hex(canonical.to_string_lossy().as_bytes())
+    codestory_workspace::workspace_id_for_root(project_root)
 }
 
 pub fn sidecar_project_id_for_root(project_root: &Path) -> String {
-    codestory_workspace::sidecar_project_identity(project_root, project_id_for_root(project_root))
-        .project_id
+    codestory_workspace::project_identity_v2(project_root).artifact_scope_id
 }
 
 pub fn repair_project_qdrant_collection(
@@ -1149,15 +1145,6 @@ fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String
     }
 }
 
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,6 +1320,7 @@ mod tests {
         }
 
         let runtime = SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 9,
                 qdrant_http_port: 9,

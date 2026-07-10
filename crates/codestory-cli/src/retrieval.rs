@@ -6,7 +6,7 @@ use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
     SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime, execute_retrieval_query,
-    sidecar_down_for_runtime, sidecar_up_with_runtime, strict_sidecar_status,
+    sidecar_down_for_runtime, sidecar_up_with_runtime_preserving_launch, strict_sidecar_status,
     strict_sidecar_status_for_runtime,
 };
 
@@ -44,33 +44,69 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
-    let report = bootstrap_sidecars_with_runtime(
-        &sidecar,
-        Some(&runtime.project_root),
-        &storage_scope,
-        cmd.compose_file.as_deref(),
-        cmd.skip_compose,
-        Duration::from_secs(cmd.wait_secs),
-    )
-    .context("retrieval bootstrap")?;
-    activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
-    let project_qdrant_repair = codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+    let broker_scope = crate::readiness_broker::operation_scope(
         &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-    )
-    .context("retrieval project qdrant repair")?;
-    let status = strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        sidecar,
-    )
-    .context("retrieval status after bootstrap")?;
+        sidecar.profile.as_str(),
+        sidecar.run_id.as_deref(),
+        "retrieval_bootstrap",
+        env!("CARGO_PKG_VERSION"),
+    );
+    let (report, project_qdrant_repair, status) =
+        crate::readiness_broker::run_with_native_embedding_lease_lifecycle(
+            crate::readiness_broker::NativeEmbeddingLeaseLifecycleParams {
+                scope: &broker_scope,
+                sidecar: &sidecar,
+                wait: Duration::from_secs(30),
+                poll: Duration::from_millis(250),
+                bootstrap_context: "retrieval bootstrap",
+                sidecar_cleanup_label: "retrieval sidecar",
+            },
+            |allow_native_embedding_spawn| {
+                bootstrap_sidecars_with_runtime(
+                    &sidecar,
+                    Some(&runtime.project_root),
+                    &storage_scope,
+                    cmd.compose_file.as_deref(),
+                    cmd.skip_compose,
+                    Duration::from_secs(cmd.wait_secs),
+                    allow_native_embedding_spawn,
+                )
+            },
+            |report| &report.state,
+            |report| {
+                activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
+                let project_qdrant_repair =
+                    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                        &runtime.project_root,
+                        &runtime.storage_path,
+                        &sidecar,
+                    )
+                    .context("retrieval project qdrant repair")?;
+                let status = strict_sidecar_status_for_runtime(
+                    &runtime.project_root,
+                    Some(&runtime.storage_path),
+                    sidecar.clone(),
+                )
+                .context("retrieval status after bootstrap")?;
+                Ok((report, project_qdrant_repair, status))
+            },
+        )?;
+    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_status(&status)),
+            reconciliation: None,
+        },
+    );
     emit_retrieval_bootstrap(
         cmd.format,
         &report,
         project_qdrant_repair.as_ref(),
         &status,
+        &readiness_broker,
         cmd.output_file.as_deref(),
     )
 }
@@ -82,7 +118,8 @@ fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
-    let state = sidecar_up_with_runtime(&sidecar, None).context("retrieval up")?;
+    let state =
+        sidecar_up_with_runtime_preserving_launch(&sidecar, None).context("retrieval up")?;
     println!("{}", serde_json::to_string_pretty(&state)?);
     Ok(())
 }
@@ -94,9 +131,24 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
+    let native_embedding_launch =
+        crate::readiness_broker::native_embedding_launch_from_sidecar_state_file(&sidecar)?;
     sidecar_down_for_runtime(&sidecar).context("retrieval down")?;
+    if let Some(launch) = native_embedding_launch.as_ref() {
+        crate::readiness_broker::release_machine_resource_lock_for_native_launch(
+            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
+            launch,
+        )
+        .context("release native embedding broker lock")?;
+    }
     println!("retrieval sidecar state cleared");
     Ok(())
+}
+
+fn broker_gpu_proof_input_from_status(
+    status: &RetrievalStatusReport,
+) -> crate::readiness_broker::BrokerGpuProofInput {
+    crate::broker_gpu_proof_input_from_report(status)
 }
 
 pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
@@ -105,12 +157,16 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     let profile = cmd
         .profile
         .or_else(|| cmd.run_id.as_ref().map(|_| CliSidecarProfile::Agent));
+    let mut agent_run_id = None;
     let report = if let Some(profile) = profile {
         let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
             &runtime.project_root,
             profile.into(),
             cmd.run_id.as_deref(),
         );
+        if profile == CliSidecarProfile::Agent {
+            agent_run_id = sidecar.run_id.clone();
+        }
         codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
@@ -120,7 +176,22 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
         strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
     }
     .context("retrieval status")?;
-    emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
+    let readiness_broker = crate::readiness_broker::observe_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_status(&report)),
+            reconciliation: None,
+        },
+    );
+    emit_retrieval_status(
+        cmd.format,
+        &report,
+        &readiness_broker,
+        cmd.output_file.as_deref(),
+    )
 }
 
 pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
@@ -418,6 +489,7 @@ struct RetrievalBootstrapOutput<'a> {
     project_qdrant_repair: Option<&'a ProjectQdrantRepairOutcome>,
     sidecar_state: &'a codestory_retrieval::SidecarStateFile,
     project_status: &'a RetrievalStatusReport,
+    readiness_broker: &'a crate::readiness_broker::ReadinessBrokerSnapshot,
 }
 
 fn emit_retrieval_bootstrap(
@@ -425,6 +497,7 @@ fn emit_retrieval_bootstrap(
     report: &codestory_retrieval::BootstrapReport,
     project_qdrant_repair: Option<&ProjectQdrantRepairOutcome>,
     status: &RetrievalStatusReport,
+    readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let compose_path = report
@@ -444,6 +517,7 @@ fn emit_retrieval_bootstrap(
         project_qdrant_repair,
         sidecar_state: &report.state,
         project_status: status,
+        readiness_broker,
     };
     let repair = &report.storage_repair;
     let overflow_note = if repair.overflow_protected {
@@ -528,8 +602,16 @@ fn emit_retrieval_bootstrap(
 fn emit_retrieval_status(
     format: OutputFormat,
     report: &RetrievalStatusReport,
+    readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
+    let mut payload = serde_json::to_value(report)?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "readiness_broker".to_string(),
+            serde_json::to_value(readiness_broker)?,
+        );
+    }
     let manifest_vector_backend = report
         .manifest_vector_embedding_backend
         .as_deref()
@@ -585,8 +667,19 @@ fn emit_retrieval_status(
         "- sidecar_images: qdrant=`{}` zoekt=`{}` embed=`{}`\n",
         report.sidecar_images.qdrant, report.sidecar_images.zoekt, report.sidecar_images.embed
     );
+    let broker_note = format!(
+        "- readiness_broker: project_id={} persistence={} operations={} gpu_proof={}\n",
+        readiness_broker.project_id,
+        readiness_broker.persistence_status,
+        readiness_broker.operations.len(),
+        readiness_broker
+            .gpu_proof
+            .as_ref()
+            .map(|proof| proof.proof_status.as_str())
+            .unwrap_or("unknown")
+    );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -608,6 +701,7 @@ fn emit_retrieval_status(
         repair_note,
         ownership_note,
         sidecar_images_note,
+        broker_note,
         report.zoekt.status,
         report.zoekt.detail,
         report.zoekt.capabilities.lexical,
@@ -618,7 +712,7 @@ fn emit_retrieval_status(
         report.scip.detail,
         report.scip.capabilities.graph,
     );
-    emit(format, report, markdown, output_file)
+    emit(format, &payload, markdown, output_file)
 }
 
 fn emit_retrieval_inventory(

@@ -49,12 +49,14 @@ mod config;
 mod display;
 mod drill_targeting;
 mod explore;
+mod file_state;
 mod http_transport;
 mod local_refresh_status;
 mod managed_embeddings;
 mod output;
 mod query_resolution;
 mod readiness;
+mod readiness_broker;
 mod ready_repair_status;
 mod report;
 mod retrieval;
@@ -184,7 +186,12 @@ fn with_drill_command_duration(
     status
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    run_cli().await
+}
+
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -217,7 +224,7 @@ fn main() -> Result<()> {
         Command::Files(cmd) => run_files(cmd),
         Command::Affected(cmd) => run_affected(cmd),
         Command::Bookmark(cmd) => run_bookmark(cmd),
-        Command::Serve(cmd) => run_serve(cmd),
+        Command::Serve(cmd) => run_serve(cmd).await,
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::Sidecar(cmd) => run_sidecar(cmd),
@@ -644,6 +651,7 @@ struct ReadyRepairProgress {
     run_id: String,
     namespace: String,
     project_root: PathBuf,
+    cache_root: PathBuf,
     phase: Arc<Mutex<&'static str>>,
     done: Arc<AtomicBool>,
     start: Instant,
@@ -654,7 +662,11 @@ struct ReadyRepairProgress {
 }
 
 impl ReadyRepairProgress {
-    fn start(sidecar: &codestory_retrieval::SidecarRuntimeConfig, project_root: &Path) -> Self {
+    fn start(
+        sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+        project_root: &Path,
+        cache_root: &Path,
+    ) -> Self {
         let phase = Arc::new(Mutex::new("starting"));
         let done = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
@@ -664,12 +676,14 @@ impl ReadyRepairProgress {
         let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
         let namespace = sidecar.namespace.clone();
         let project_root = project_root.to_path_buf();
+        let cache_root = cache_root.to_path_buf();
         let sidecar_for_worker = sidecar.clone();
         let worker_phase = Arc::clone(&phase);
         let worker_done = Arc::clone(&done);
         let worker_run_id = run_id.clone();
         let worker_namespace = namespace.clone();
         let worker_project_root = project_root.clone();
+        let worker_cache_root = cache_root.clone();
         let _ = ready_repair_status::write_ready_repair_status(
             sidecar,
             &project_root,
@@ -677,6 +691,14 @@ impl ReadyRepairProgress {
             started_at_epoch_ms,
             pid,
         );
+        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: project_root.clone(),
+            cache_root: cache_root.clone(),
+            agent_run_id: sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: None,
+            reconciliation: None,
+        });
         let handle = std::thread::spawn(move || {
             while !worker_done.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(100));
@@ -706,6 +728,16 @@ impl ReadyRepairProgress {
                     started_at_epoch_ms,
                     pid,
                 );
+                let _ = readiness_broker::refresh_broker_snapshot(
+                    readiness_broker::BrokerSnapshotInput {
+                        project_root: worker_project_root.clone(),
+                        cache_root: worker_cache_root.clone(),
+                        agent_run_id: sidecar_for_worker.run_id.clone(),
+                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                        gpu_proof: None,
+                        reconciliation: None,
+                    },
+                );
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
@@ -714,6 +746,7 @@ impl ReadyRepairProgress {
             run_id,
             namespace,
             project_root,
+            cache_root,
             phase,
             done,
             start,
@@ -744,6 +777,14 @@ impl ReadyRepairProgress {
             self.started_at_epoch_ms,
             self.pid,
         );
+        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: self.project_root.clone(),
+            cache_root: self.cache_root.clone(),
+            agent_run_id: self.sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: None,
+            reconciliation: None,
+        });
     }
 }
 
@@ -2202,11 +2243,21 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
+    let readiness_broker =
+        readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: agent_run_id.map(str::to_string),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&readiness_sidecar)),
+            reconciliation: None,
+        });
     let readiness_lanes = build_readiness_lanes_for_runtime(
         &runtime,
         &verdicts,
         agent_run_id,
         Some(&readiness_sidecar),
+        Some(&readiness_broker),
     );
     if let Some(goal) = cmd.goal {
         let goal = goal.as_dto();
@@ -2216,8 +2267,32 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         verdicts,
         local_refresh,
         readiness_lanes,
+        readiness_broker: Some(readiness_broker),
     };
     Ok(output)
+}
+
+pub(crate) fn broker_gpu_proof_input_from_sidecar(
+    sidecar: &DoctorSidecarStatusOutput,
+) -> readiness_broker::BrokerGpuProofInput {
+    readiness_broker::BrokerGpuProofInput {
+        embedding_device_policy: Some(sidecar.embedding_device_policy.clone()),
+        embedding_device_state: Some(sidecar.embedding_device_state.clone()),
+        embedding_device_observation_source: Some(
+            sidecar.embedding_device_observation_source.clone(),
+        ),
+        embedding_detected_provider: sidecar.embedding_detected_provider.clone(),
+        embedding_detected_gpu: sidecar.embedding_detected_gpu.clone(),
+        embedding_accelerator_requested: Some(sidecar.embedding_accelerator_requested),
+        embedding_accelerator_request_provider: sidecar
+            .embedding_accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: sidecar.embedding_accelerator_request_device.clone(),
+        embedding_cpu_allowed: Some(sidecar.embedding_cpu_allowed),
+        embed_smoke_ok: None,
+        embed_smoke_ms: None,
+        degraded_reason: sidecar.degraded_reason.clone(),
+    }
 }
 
 fn fix_status(output: &ReadyOutput) -> &'static str {
@@ -2411,8 +2486,13 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes =
-        build_readiness_lanes_for_runtime(&runtime, &readiness, None, Some(&readiness_sidecar));
+    let readiness_lanes = build_readiness_lanes_for_runtime(
+        &runtime,
+        &readiness,
+        None,
+        Some(&readiness_sidecar),
+        None,
+    );
     let output = build_agent_preflight_output(
         &readiness,
         Path::new(&summary.root),
@@ -2515,6 +2595,34 @@ fn repair_ready_state(
         return Ok(Some(sidecar.clone()));
     }
 
+    if let Some(sidecar) = sidecar.as_ref() {
+        let reconciliation = readiness_broker::reconcile_before_enqueue(
+            &runtime.project_root,
+            &runtime.cache_root,
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let enqueue_block_reason = reconciliation.enqueue_block_reason();
+        let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: None,
+            reconciliation: Some(reconciliation),
+        });
+        if let Some(reason) = enqueue_block_reason {
+            bail!(
+                "ready repair cannot start while broker ownership is unresolved: {reason}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                runtime.project_root.display(),
+                sidecar
+                    .run_id
+                    .as_deref()
+                    .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            );
+        }
+    }
+
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
     if !agent_goal {
@@ -2533,15 +2641,16 @@ fn repair_ready_state(
     )? {
         ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
         ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
-            if let Some(status) = busy.status {
+            if let Some(status) = busy.status.as_ref() {
                 bail!(
-                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={} reason={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
                     status.project_root,
                     status.profile,
                     status.run_id.as_deref().unwrap_or("none"),
                     status.namespace,
                     status.phase,
                     status.pid,
+                    busy.reason.as_deref().unwrap_or("active_status"),
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     sidecar
                         .run_id
@@ -2550,10 +2659,11 @@ fn repair_ready_state(
                 );
             }
             bail!(
-                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                "ready repair already starting for project={} profile=agent run_id={} namespace={} reason={}; lock_path={}",
                 crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                 sidecar.run_id.as_deref().unwrap_or("none"),
                 sidecar.namespace,
+                busy.reason.as_deref().unwrap_or("lock_present"),
                 busy.lock_path.display()
             );
         }
@@ -2564,15 +2674,16 @@ fn repair_ready_state(
     )? {
         ready_repair_status::ReadyRepairLockAttempt::Acquired(lock) => lock,
         ready_repair_status::ReadyRepairLockAttempt::Busy(busy) => {
-            if let Some(status) = busy.status {
+            if let Some(status) = busy.status.as_ref() {
                 bail!(
-                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
+                    "ready repair already running for project={} profile={} run_id={} namespace={} phase={} pid={} reason={}; inspect with `codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}`",
                     status.project_root,
                     status.profile,
                     status.run_id.as_deref().unwrap_or("none"),
                     status.namespace,
                     status.phase,
                     status.pid,
+                    busy.reason.as_deref().unwrap_or("active_status"),
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     sidecar
                         .run_id
@@ -2581,97 +2692,239 @@ fn repair_ready_state(
                 );
             }
             bail!(
-                "ready repair already starting for project={} profile=agent run_id={} namespace={}; lock_path={}",
+                "ready repair already starting for project={} profile=agent run_id={} namespace={} reason={}; lock_path={}",
                 crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                 sidecar.run_id.as_deref().unwrap_or("none"),
                 sidecar.namespace,
+                busy.reason.as_deref().unwrap_or("lock_present"),
                 busy.lock_path.display()
             );
         }
     };
+    let broker_scope = readiness_broker::agent_repair_scope(
+        &runtime.project_root,
+        sidecar.run_id.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let ReadyRepairResult {
+        final_status: _final_status,
+        gpu_proof,
+    } = run_ready_repair_with_native_embedding_lease(
+        runtime,
+        &sidecar,
+        &broker_scope,
+        &storage_scope,
+    )?;
+    let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+        project_root: runtime.project_root.clone(),
+        cache_root: runtime.cache_root.clone(),
+        agent_run_id: sidecar.run_id.clone(),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        gpu_proof: Some(gpu_proof),
+        reconciliation: None,
+    });
+    Ok(Some(sidecar))
+}
+
+#[derive(Debug, Clone)]
+struct ReadyRepairResult {
+    final_status: codestory_retrieval::RetrievalStatusReport,
+    gpu_proof: readiness_broker::BrokerGpuProofInput,
+}
+
+fn run_ready_repair_with_native_embedding_lease(
+    runtime: &RuntimeContext,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    broker_scope: &readiness_broker::BrokerScope,
+    storage_scope: &codestory_retrieval::BootstrapStorageScope,
+) -> Result<ReadyRepairResult> {
     eprintln!(
         "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
         sidecar.run_id.as_deref().unwrap_or("none"),
         sidecar.namespace,
         sidecar.compose_project
     );
-    let progress = ReadyRepairProgress::start(&sidecar, &runtime.project_root);
-    let bootstrap = codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
-        &sidecar,
-        Some(runtime.project_root.as_path()),
-        &storage_scope,
-        None,
-        false,
-        Duration::from_secs(90),
-        |phase| progress.set_phase(phase),
+    let progress = ReadyRepairProgress::start(sidecar, &runtime.project_root, &runtime.cache_root);
+    readiness_broker::run_with_native_embedding_lease_lifecycle(
+        readiness_broker::NativeEmbeddingLeaseLifecycleParams {
+            scope: broker_scope,
+            sidecar,
+            wait: Duration::from_secs(30),
+            poll: Duration::from_millis(250),
+            bootstrap_context: "ready repair retrieval bootstrap",
+            sidecar_cleanup_label: "ready repair sidecar",
+        },
+        |allow_native_embedding_spawn| {
+            codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
+                sidecar,
+                Some(runtime.project_root.as_path()),
+                codestory_retrieval::BootstrapSidecarsOptions {
+                    storage_scope: storage_scope.clone(),
+                    compose_file: None,
+                    skip_compose: false,
+                    wait_timeout: Duration::from_secs(90),
+                    allow_native_embedding_spawn,
+                },
+                |phase| progress.set_phase(phase),
+            )
+        },
+        |bootstrap| &bootstrap.state,
+        |bootstrap| {
+            let infrastructure = ready_repair_infrastructure_with_runtime_observation(
+                &bootstrap.infrastructure,
+                &runtime.project_root,
+                &runtime.storage_path,
+                sidecar,
+            );
+            let embed_smoke = ensure_ready_repair_embed_liveness(&infrastructure)?;
+            let gpu_proof =
+                broker_gpu_proof_input_from_infrastructure_with_smoke(&infrastructure, embed_smoke);
+            let _ =
+                readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+                    project_root: runtime.project_root.clone(),
+                    cache_root: runtime.cache_root.clone(),
+                    agent_run_id: sidecar.run_id.clone(),
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    gpu_proof: Some(gpu_proof.clone()),
+                    reconciliation: None,
+                });
+            progress.set_phase("Qdrant finalize");
+            codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                &runtime.project_root,
+                &runtime.storage_path,
+                sidecar,
+            )
+            .context("ready repair project qdrant repair")?;
+            progress.set_phase("graph artifact");
+            runtime
+                .index
+                .run_indexing_blocking(IndexMode::Full)
+                .map_err(map_api_error)
+                .context("ready repair retrieval index refresh")?;
+            codestory_retrieval::finalize_index_for_runtime_with_progress(
+                &runtime.project_root,
+                &runtime.storage_path,
+                sidecar,
+                |phase| progress.set_phase(phase),
+            )
+            .with_context(|| {
+                format!(
+                    "ready repair retrieval index finalize using {}",
+                    retrieval::format_sidecar_runtime(sidecar)
+                )
+            })?;
+            progress.set_phase("readiness check");
+            let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
+                &runtime.project_root,
+                Some(&runtime.storage_path),
+                sidecar.clone(),
+            )
+            .context("ready repair final retrieval status")?;
+            ensure_ready_repair_full_sidecar(&final_status)?;
+            Ok(ReadyRepairResult {
+                final_status,
+                gpu_proof,
+            })
+        },
     )
-    .context("ready repair retrieval bootstrap")?;
-    let infrastructure = ready_repair_infrastructure_with_runtime_observation(
-        &bootstrap.infrastructure,
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-    );
-    ensure_ready_repair_embed_liveness(&infrastructure)?;
-    progress.set_phase("Qdrant finalize");
-    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-    )
-    .context("ready repair project qdrant repair")?;
-    progress.set_phase("graph artifact");
-    runtime
-        .index
-        .run_indexing_blocking(IndexMode::Full)
-        .map_err(map_api_error)
-        .context("ready repair retrieval index refresh")?;
-    codestory_retrieval::finalize_index_for_runtime_with_progress(
-        &runtime.project_root,
-        &runtime.storage_path,
-        &sidecar,
-        |phase| progress.set_phase(phase),
-    )
-    .with_context(|| {
-        format!(
-            "ready repair retrieval index finalize using {}",
-            retrieval::format_sidecar_runtime(&sidecar)
-        )
-    })?;
-    progress.set_phase("readiness check");
-    let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        sidecar.clone(),
-    )
-    .context("ready repair final retrieval status")?;
-    ensure_ready_repair_full_sidecar(&final_status)?;
-    Ok(Some(sidecar))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadyRepairEmbedSmoke {
+    ok: Option<bool>,
+    ms: Option<u64>,
 }
 
 fn ensure_ready_repair_embed_liveness(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
-) -> Result<()> {
+) -> Result<ReadyRepairEmbedSmoke> {
+    ensure_ready_repair_embed_liveness_with_probe(infrastructure, || {
+        codestory_retrieval::probe_product_embedding_runtime()
+    })
+}
+
+fn ensure_ready_repair_embed_liveness_with_probe(
+    infrastructure: &codestory_retrieval::InfrastructureHealth,
+    probe: impl FnOnce() -> codestory_retrieval::EmbeddingRuntimeProbe,
+) -> Result<ReadyRepairEmbedSmoke> {
     if !infrastructure.embedding_cpu_allowed
         && infrastructure.embedding_device_state != "accelerated"
     {
         bail!(
-            "ready repair embedding device policy failed before long semantic indexing: requested_policy={} observed_device={}; set CODESTORY_EMBED_ALLOW_CPU=1 or CODESTORY_EMBED_DEVICE_POLICY=allow_cpu for intentional CPU-backed retrieval",
+            "gpu_unverified: ready repair embedding device policy failed before long semantic indexing: requested_policy={} observed_device={}; set CODESTORY_EMBED_ALLOW_CPU=1 or CODESTORY_EMBED_DEVICE_POLICY=allow_cpu for intentional CPU-backed retrieval",
             infrastructure.embedding_device_policy,
             infrastructure.embedding_device_state
         );
     }
-    if infrastructure.embed_reachable {
-        return Ok(());
+    if infrastructure.embedding_cpu_allowed {
+        return Ok(ReadyRepairEmbedSmoke { ok: None, ms: None });
     }
-    bail!(
-        "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; zoekt_reachable={} ({}); qdrant_reachable={} ({})",
-        infrastructure.embed_detail,
-        infrastructure.zoekt_reachable,
-        infrastructure.zoekt_detail,
-        infrastructure.qdrant_reachable,
-        infrastructure.qdrant_detail
-    )
+    let smoke = probe();
+    if !smoke.reachable {
+        bail!(
+            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; zoekt_reachable={} ({}); qdrant_reachable={} ({})",
+            smoke.detail,
+            infrastructure.zoekt_reachable,
+            infrastructure.zoekt_detail,
+            infrastructure.qdrant_reachable,
+            infrastructure.qdrant_detail
+        );
+    }
+    Ok(ReadyRepairEmbedSmoke {
+        ok: Some(true),
+        ms: smoke.elapsed_ms,
+    })
+}
+
+fn broker_gpu_proof_input_from_infrastructure_with_smoke(
+    infrastructure: &codestory_retrieval::InfrastructureHealth,
+    smoke: ReadyRepairEmbedSmoke,
+) -> readiness_broker::BrokerGpuProofInput {
+    readiness_broker::BrokerGpuProofInput {
+        embedding_device_policy: Some(infrastructure.embedding_device_policy.clone()),
+        embedding_device_state: Some(infrastructure.embedding_device_state.clone()),
+        embedding_device_observation_source: Some(
+            infrastructure.embedding_device_observation_source.clone(),
+        ),
+        embedding_detected_provider: infrastructure.embedding_detected_provider.clone(),
+        embedding_detected_gpu: infrastructure.embedding_detected_gpu.clone(),
+        embedding_accelerator_requested: Some(infrastructure.embedding_accelerator_requested),
+        embedding_accelerator_request_provider: infrastructure
+            .embedding_accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: infrastructure
+            .embedding_accelerator_request_device
+            .clone(),
+        embedding_cpu_allowed: Some(infrastructure.embedding_cpu_allowed),
+        embed_smoke_ok: smoke.ok,
+        embed_smoke_ms: smoke.ms,
+        degraded_reason: (!infrastructure.embedding_cpu_allowed
+            && (infrastructure.embedding_device_state != "accelerated" || smoke.ok != Some(true)))
+        .then(|| "gpu_unverified".to_string()),
+    }
+}
+
+pub(crate) fn broker_gpu_proof_input_from_report(
+    report: &codestory_retrieval::RetrievalStatusReport,
+) -> readiness_broker::BrokerGpuProofInput {
+    readiness_broker::BrokerGpuProofInput {
+        embedding_device_policy: Some(report.embedding_device_policy.clone()),
+        embedding_device_state: Some(report.embedding_device_state.clone()),
+        embedding_device_observation_source: Some(
+            report.embedding_device_observation_source.clone(),
+        ),
+        embedding_detected_provider: report.embedding_detected_provider.clone(),
+        embedding_detected_gpu: report.embedding_detected_gpu.clone(),
+        embedding_accelerator_requested: Some(report.embedding_accelerator_requested),
+        embedding_accelerator_request_provider: report
+            .embedding_accelerator_request_provider
+            .clone(),
+        embedding_accelerator_request_device: report.embedding_accelerator_request_device.clone(),
+        embedding_cpu_allowed: Some(report.embedding_cpu_allowed),
+        embed_smoke_ok: None,
+        embed_smoke_ms: None,
+        degraded_reason: report.degraded_reason.clone(),
+    }
 }
 
 fn ready_repair_infrastructure_with_runtime_observation(
@@ -10438,14 +10691,14 @@ fn render_affected_footer(
     }
 }
 
-fn run_serve(cmd: ServeCommand) -> Result<()> {
+async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if !cmd.stdio {
         ensure_http_serve_bind_allowed(&cmd.addr, cmd.allow_non_loopback)?;
     }
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
-        return stdio_transport::run_stdio_server(runtime);
+        return stdio_transport::run_stdio_server(runtime).await;
     }
     ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)
@@ -10720,8 +10973,22 @@ fn build_doctor_output(
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_lanes =
-        build_readiness_lanes_for_runtime(runtime, &readiness, None, Some(&readiness_sidecar));
+    let readiness_broker =
+        readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: readiness_sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&readiness_sidecar)),
+            reconciliation: None,
+        });
+    let readiness_lanes = build_readiness_lanes_for_runtime(
+        runtime,
+        &readiness,
+        None,
+        Some(&readiness_sidecar),
+        Some(&readiness_broker),
+    );
     let next_commands = readiness::compatibility_next_commands(&readiness);
     let mut checks = Vec::new();
     checks.push(doctor_check(
@@ -10813,6 +11080,7 @@ fn build_doctor_output(
         freshness: summary.freshness.clone(),
         readiness,
         readiness_lanes,
+        readiness_broker: Some(readiness_broker),
         checks,
         next_commands,
         environment,
@@ -11034,6 +11302,7 @@ pub(crate) fn build_readiness_lanes_for_runtime(
     readiness: &[codestory_contracts::api::ReadinessVerdictDto],
     agent_run_id: Option<&str>,
     selected_agent_status: Option<&DoctorSidecarStatusOutput>,
+    broker: Option<&readiness_broker::ReadinessBrokerSnapshot>,
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
@@ -11063,13 +11332,43 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
-    apply_ready_repair_status_overlay(
-        &mut lanes,
-        &runtime.project_root,
-        agent_run_id,
-        &project_arg,
-    );
+    if let Some(broker) = broker {
+        apply_broker_ready_repair_overlay(&mut lanes, broker, &project_arg);
+    } else {
+        apply_ready_repair_status_overlay(
+            &mut lanes,
+            &runtime.project_root,
+            agent_run_id,
+            &project_arg,
+        );
+    }
     lanes
+}
+
+fn apply_broker_ready_repair_overlay(
+    lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
+    broker: &readiness_broker::ReadinessBrokerSnapshot,
+    project_arg: &str,
+) {
+    let Some(operation) = broker.operations.iter().find(|operation| {
+        operation.operation_kind == "agent_repair" && operation.status == "running"
+    }) else {
+        return;
+    };
+    let Some(lane) = lanes.get_mut("agent_packet_search") else {
+        return;
+    };
+    lane.status = ReadinessStatusDto::Repairing;
+    lane.profile = operation.profile.clone();
+    lane.run_id = operation.run_id.clone();
+    lane.namespace = operation.namespace.clone();
+    lane.compose_project = operation.compose_project.clone();
+    lane.phase = operation.phase.clone();
+    lane.repair_updated_at_epoch_ms = operation.updated_at_epoch_ms;
+    lane.next_command = Some(retrieval_status_command_for_agent(
+        project_arg,
+        operation.run_id.as_deref(),
+    ));
 }
 
 fn agent_readiness_sidecar_runtime(
@@ -12909,6 +13208,48 @@ mod tests {
     }
 
     #[test]
+    fn ready_repair_final_snapshot_preserves_embed_smoke_proof() {
+        let final_status = ready_repair_test_report("full", None);
+        let infrastructure = codestory_retrieval::InfrastructureHealth {
+            zoekt_reachable: true,
+            qdrant_reachable: true,
+            embed_reachable: true,
+            embedding_device_policy: "accelerator_required".into(),
+            embedding_device_state: "accelerated".into(),
+            embedding_device_observation_source: "native_log".into(),
+            embedding_detected_provider: Some("amd".into()),
+            embedding_detected_gpu: Some("Vulkan0".into()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("vulkan".into()),
+            embedding_accelerator_request_device: Some("Vulkan0".into()),
+            embedding_cpu_allowed: false,
+            zoekt_detail: "http 200".into(),
+            qdrant_detail: "http 200".into(),
+            embed_detail: "llama.cpp embeddings reachable dim=768".into(),
+        };
+        let result = ReadyRepairResult {
+            final_status,
+            gpu_proof: broker_gpu_proof_input_from_infrastructure_with_smoke(
+                &infrastructure,
+                ReadyRepairEmbedSmoke {
+                    ok: Some(true),
+                    ms: Some(17),
+                },
+            ),
+        };
+
+        let final_proof = readiness_broker::gpu_proof(result.gpu_proof.clone());
+        assert_eq!(final_proof.proof_status, "verified");
+        assert_eq!(final_proof.embed_smoke_ok, Some(true));
+        assert_eq!(final_proof.embed_smoke_ms, Some(17));
+
+        let report_only =
+            readiness_broker::gpu_proof(broker_gpu_proof_input_from_report(&result.final_status));
+        assert_eq!(report_only.proof_status, "gpu_unverified");
+        assert_eq!(report_only.embed_smoke_ok, None);
+    }
+
+    #[test]
     fn ready_repair_reuses_only_accelerated_cpu_disabled_sidecar() {
         let full_accelerated = ready_repair_test_report("full", None);
         assert!(ready_repair_existing_sidecar_is_reusable(&full_accelerated));
@@ -12982,8 +13323,15 @@ mod tests {
                     .into(),
         };
 
-        let error = ensure_ready_repair_embed_liveness(&infrastructure)
-            .expect_err("unreachable embedding endpoint must stop ready repair");
+        let error = ensure_ready_repair_embed_liveness_with_probe(&infrastructure, || {
+            codestory_retrieval::EmbeddingRuntimeProbe {
+                reachable: false,
+                detail: "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
+                    .into(),
+                elapsed_ms: Some(8),
+            }
+        })
+        .expect_err("unreachable embedding endpoint must stop ready repair");
         let message = format!("{error:#}");
 
         assert!(message.contains("embedding sidecar liveness failed"));
@@ -13035,6 +13383,7 @@ mod tests {
         }
         let root = tempdir().expect("temp dir");
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
+            project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
@@ -13072,8 +13421,10 @@ mod tests {
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
-        ensure_ready_repair_embed_liveness(&stale)
-            .expect_err("stale bootstrap observation should fail before re-observation");
+        ensure_ready_repair_embed_liveness_with_probe(&stale, || {
+            panic!("probe must not run when device state is unknown")
+        })
+        .expect_err("stale bootstrap observation should fail before re-observation");
 
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
@@ -13093,8 +13444,16 @@ mod tests {
 
         assert_eq!(refreshed.embedding_device_state, "accelerated");
         assert_eq!(refreshed.embedding_device_observation_source, "native_log");
-        ensure_ready_repair_embed_liveness(&refreshed)
-            .expect("native log observation should allow repair to continue");
+        let smoke = ensure_ready_repair_embed_liveness_with_probe(&refreshed, || {
+            codestory_retrieval::EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: "llama.cpp embeddings reachable dim=768".into(),
+                elapsed_ms: Some(15),
+            }
+        })
+        .expect("native log observation should allow repair to continue");
+        assert_eq!(smoke.ok, Some(true));
+        assert_eq!(smoke.ms, Some(15));
     }
 
     #[test]

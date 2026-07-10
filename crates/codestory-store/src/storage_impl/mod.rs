@@ -1764,7 +1764,7 @@ impl Storage {
     }
 
     fn clear_legacy_index_artifact_cache(&self) -> Result<usize, StorageError> {
-        // ponytail: v2 artifact keys are root-portable; older rows predate that contract.
+        // ponytail: v2 artifact keys are root-portable; delete this cleanup when migrations no longer see pre-v2 caches.
         Ok(self.conn.execute(
             "DELETE FROM index_artifact_cache
              WHERE cache_key NOT LIKE 'v2:%'",

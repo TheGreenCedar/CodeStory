@@ -66,7 +66,7 @@ Before manually opening source files, first read codestory://status when MCP is 
 For broad user requests, prefer a packet tied to the user's actual question. For concrete symbols, files, or routes, use search/context/trail/snippet. For no request context, use a compact ground snapshot only after confirming the target repo is indexable.
 Avoid no-op grounding context in huge or non-code folders.
 When retrieval sidecars are full and allowed, use packet, search, and context confidently.
-Use status recommended_next_calls as the setup path once a repository target is known: call MCP repair_all when recommended, then reread codestory://status.
+Use status recommended_next_calls as the setup path once a repository target is known: call MCP sidecar_setup with action=repair when recommended, then reread codestory://status.
 
 ${body}`;
 }

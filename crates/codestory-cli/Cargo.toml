@@ -1,6 +1,6 @@
 [package]
 name = "codestory-cli"
-version = "0.13.12"
+version = "0.14.0"
 edition = "2024"
 description = "Local repository evidence and grounding CLI for source-backed coding workflows."
 license = "Apache-2.0"
@@ -13,12 +13,14 @@ categories = ["command-line-utilities", "development-tools"]
 codestory-contracts = { workspace = true }
 codestory-retrieval = { workspace = true }
 codestory-runtime = { workspace = true }
+codestory-workspace = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 directories = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true }

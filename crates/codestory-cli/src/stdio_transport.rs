@@ -18,15 +18,21 @@ use codestory_contracts::api::{
     TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{BufRead, Read, Write};
+use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::args;
 use crate::http_transport::{
@@ -50,6 +56,9 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
+const STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE: &str = "ready-repair-enqueue.lock";
+const STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL: Duration = Duration::from_secs(15);
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -61,56 +70,244 @@ const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 ///
 /// The server is local, stateful only for small packet/search caches, and keeps
 /// telemetry on stderr so stdout remains a newline-delimited JSON stream.
-pub(crate) fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdin = stdin.lock();
-    let mut stdout = std::io::stdout();
-    let mut state = StdioServerState::default();
-    let mut line = Vec::new();
+pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut stdin = BufReader::new(stdin);
+    let mut stdout = tokio::io::stdout();
+    let mut runtime = Some(runtime);
+    let mut state = Some(StdioServerState::default());
+    let mut queued = VecDeque::new();
+    let mut active: Option<ActiveStdioRequest> = None;
+    let mut stdin_closed = false;
+
     loop {
-        line.clear();
-        let bytes_read = (&mut stdin)
-            .take((STDIO_MAX_FRAME_BYTES + 1) as u64)
-            .read_until(b'\n', &mut line)?;
-        if bytes_read == 0 {
-            break;
-        }
-        if line.len() > STDIO_MAX_FRAME_BYTES {
-            let tail_bytes = if line.ends_with(b"\n") {
-                0
-            } else {
-                discard_stdio_frame_tail(&mut stdin)?
-            };
-            let response = stdio_frame_too_large_error(line.len() + tail_bytes);
-            write_stdio_response(&mut stdout, &response)?;
-            continue;
-        }
-        let line = match std::str::from_utf8(&line) {
-            Ok(line) => line.trim_end_matches(['\r', '\n']),
-            Err(error) => {
-                let response = stdio_jsonrpc_error(
-                    serde_json::Value::Null,
-                    -32700,
-                    format!("Parse error: {error}"),
-                );
-                write_stdio_response(&mut stdout, &response)?;
-                continue;
+        if active.is_none() {
+            match queued.pop_front() {
+                Some(StdioQueuedWork::Response(response)) => {
+                    write_stdio_response(&mut stdout, &response).await?;
+                    continue;
+                }
+                Some(StdioQueuedWork::Message(message))
+                    if message.cancelled.load(Ordering::Acquire) =>
+                {
+                    continue;
+                }
+                Some(StdioQueuedWork::Message(message)) => {
+                    let request_runtime = runtime.take().expect("stdio runtime available");
+                    let mut request_state = state.take().expect("stdio state available");
+                    let line = message.line;
+                    active = Some(ActiveStdioRequest {
+                        id_key: message.id_key,
+                        cancelled: message.cancelled,
+                        task: tokio::task::spawn_blocking(move || {
+                            let response =
+                                handle_stdio_message(&request_runtime, &mut request_state, &line);
+                            (request_runtime, request_state, response)
+                        }),
+                    });
+                    continue;
+                }
+                None if stdin_closed => break,
+                None => {}
             }
-        };
-        if line.trim().is_empty() {
+        }
+
+        if active.is_none() {
+            let Some(frame) = read_stdio_frame(&mut stdin).await? else {
+                stdin_closed = true;
+                continue;
+            };
+            queue_stdio_frame(frame, &mut queued, None);
             continue;
         }
-        if let Some(response) = handle_stdio_message(&runtime, &mut state, line) {
-            write_stdio_response(&mut stdout, &response)?;
+
+        if stdin_closed {
+            finish_active_stdio_request(
+                active.take().expect("active stdio request"),
+                &mut runtime,
+                &mut state,
+                &mut stdout,
+            )
+            .await?;
+            continue;
+        }
+
+        let active_request = active.as_mut().expect("active stdio request");
+        tokio::select! {
+            frame = read_stdio_frame(&mut stdin) => {
+                match frame? {
+                    Some(frame) => queue_stdio_frame(frame, &mut queued, Some(active_request)),
+                    None => stdin_closed = true,
+                }
+            }
+            completed = &mut active_request.task => {
+                let completed = completed.context("stdio request worker failed")?;
+                let active_request = active.take().expect("completed stdio request");
+                runtime = Some(completed.0);
+                state = Some(completed.1);
+                if !active_request.cancelled.load(Ordering::Acquire)
+                    && let Some(response) = completed.2
+                {
+                    write_stdio_response(&mut stdout, &response).await?;
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn discard_stdio_frame_tail<R: BufRead>(reader: &mut R) -> Result<usize> {
+struct ActiveStdioRequest {
+    id_key: Option<String>,
+    cancelled: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<(RuntimeContext, StdioServerState, Option<serde_json::Value>)>,
+}
+
+struct StdioQueuedMessage {
+    line: String,
+    id_key: Option<String>,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum StdioQueuedWork {
+    Message(StdioQueuedMessage),
+    Response(serde_json::Value),
+}
+
+fn queue_stdio_frame(
+    frame: StdioFrame,
+    queued: &mut VecDeque<StdioQueuedWork>,
+    active: Option<&ActiveStdioRequest>,
+) {
+    let line = match frame {
+        StdioFrame::Line(line) => match String::from_utf8(line) {
+            Ok(line) => line.trim_end_matches(['\r', '\n']).to_string(),
+            Err(error) => {
+                queued.push_back(StdioQueuedWork::Response(stdio_jsonrpc_error(
+                    serde_json::Value::Null,
+                    -32700,
+                    format!("Parse error: {error}"),
+                )));
+                return;
+            }
+        },
+        StdioFrame::TooLarge(line_bytes) => {
+            queued.push_back(StdioQueuedWork::Response(stdio_frame_too_large_error(
+                line_bytes,
+            )));
+            return;
+        }
+    };
+    if line.trim().is_empty() {
+        return;
+    }
+    if let Some(target) = stdio_cancellation_target_key(&line) {
+        if let Some(active) = active
+            && active.id_key.as_deref() == Some(target.as_str())
+        {
+            active.cancelled.store(true, Ordering::Release);
+        }
+        for work in queued.iter_mut() {
+            if let StdioQueuedWork::Message(message) = work
+                && message.id_key.as_deref() == Some(target.as_str())
+            {
+                message.cancelled.store(true, Ordering::Release);
+            }
+        }
+        return;
+    }
+    queued.push_back(StdioQueuedWork::Message(StdioQueuedMessage {
+        id_key: stdio_message_id_key(&line),
+        line,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    }));
+}
+
+fn stdio_message_id_key(line: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    serde_json::to_string(message.get("id")?).ok()
+}
+
+fn stdio_cancellation_target_key(line: &str) -> Option<String> {
+    let message: serde_json::Value = serde_json::from_str(line).ok()?;
+    if message.get("method")?.as_str()? != "notifications/cancelled" {
+        return None;
+    }
+    serde_json::to_string(message.pointer("/params/requestId")?).ok()
+}
+
+async fn finish_active_stdio_request<W: AsyncWrite + Unpin>(
+    active: ActiveStdioRequest,
+    runtime: &mut Option<RuntimeContext>,
+    state: &mut Option<StdioServerState>,
+    stdout: &mut W,
+) -> Result<()> {
+    let completed = active.task.await.context("stdio request worker failed")?;
+    *runtime = Some(completed.0);
+    *state = Some(completed.1);
+    if !active.cancelled.load(Ordering::Acquire)
+        && let Some(response) = completed.2
+    {
+        write_stdio_response(stdout, &response).await?;
+    }
+    Ok(())
+}
+
+enum StdioFrame {
+    Line(Vec<u8>),
+    TooLarge(usize),
+}
+
+async fn read_stdio_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<StdioFrame>> {
+    let mut line = Vec::new();
+    loop {
+        let (available_len, newline_index, at_eof) = {
+            let available = reader.fill_buf().await?;
+            (
+                available.len(),
+                available.iter().position(|byte| *byte == b'\n'),
+                available.is_empty(),
+            )
+        };
+        if at_eof {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(StdioFrame::Line(line)))
+            };
+        }
+        if let Some(index) = newline_index {
+            let bytes_to_newline = index + 1;
+            if line.len() + bytes_to_newline > STDIO_MAX_FRAME_BYTES {
+                reader.consume(bytes_to_newline);
+                return Ok(Some(StdioFrame::TooLarge(line.len() + bytes_to_newline)));
+            }
+            {
+                let available = reader.fill_buf().await?;
+                line.extend_from_slice(&available[..bytes_to_newline]);
+            }
+            reader.consume(bytes_to_newline);
+            return Ok(Some(StdioFrame::Line(line)));
+        }
+        let remaining = STDIO_MAX_FRAME_BYTES.saturating_sub(line.len());
+        if available_len > remaining {
+            reader.consume(available_len);
+            let tail_bytes = discard_stdio_frame_tail(reader).await?;
+            return Ok(Some(StdioFrame::TooLarge(
+                line.len() + available_len + tail_bytes,
+            )));
+        }
+        {
+            let available = reader.fill_buf().await?;
+            line.extend_from_slice(available);
+        }
+        reader.consume(available_len);
+    }
+}
+
+async fn discard_stdio_frame_tail<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<usize> {
     let mut discarded = 0;
     loop {
-        let available = reader.fill_buf()?;
+        let available = reader.fill_buf().await?;
         if available.is_empty() {
             return Ok(discarded);
         }
@@ -146,16 +343,20 @@ fn stdio_frame_too_large_error(line_bytes: usize) -> serde_json::Value {
     response
 }
 
-fn write_stdio_response<W: Write>(stdout: &mut W, response: &serde_json::Value) -> Result<()> {
+async fn write_stdio_response<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    response: &serde_json::Value,
+) -> Result<()> {
     let response_id = stdio_response_id_label(response);
     let serialize_started = Instant::now();
-    serde_json::to_writer(&mut *stdout, response)?;
+    let response_bytes = serde_json::to_vec(response)?;
     let serialization_ms = stdio_elapsed_ms(serialize_started);
     let newline_started = Instant::now();
-    stdout.write_all(b"\n")?;
+    stdout.write_all(&response_bytes).await?;
+    stdout.write_all(b"\n").await?;
     let newline_write_ms = stdio_elapsed_ms(newline_started);
     let flush_started = Instant::now();
-    stdout.flush()?;
+    stdout.flush().await?;
     let flush_ms = stdio_elapsed_ms(flush_started);
     report_stdio_server_phase(&response_id, "response_serialization", serialization_ms);
     report_stdio_server_phase(&response_id, "newline_write", newline_write_ms);
@@ -168,6 +369,7 @@ struct StdioServerState {
     packet_cache: StdioPacketCache,
     search_cache: StdioSearchFragmentCache,
     status_cache: Option<StdioStatusCacheEntry>,
+    recent_sidecar_repair: Option<StdioRecentSidecarRepair>,
 }
 
 #[derive(Clone)]
@@ -175,6 +377,17 @@ struct StdioStatusCacheEntry {
     key: String,
     value: serde_json::Value,
     cached_at: Instant,
+}
+
+#[derive(Clone)]
+struct StdioRecentSidecarRepair {
+    project_root: PathBuf,
+    run_id: String,
+    namespace: String,
+    compose_project: String,
+    pid: u32,
+    started_at_epoch_ms: i64,
+    observed_at: Instant,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -404,7 +617,6 @@ fn stdio_tool_blocked_error(
     {
         return Ok(None);
     }
-
     let readiness_goal = surface
         .get("readiness_goal")
         .and_then(serde_json::Value::as_str);
@@ -431,6 +643,9 @@ fn stdio_tool_blocked_error(
         "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "canonical_tool": surface.get("canonical_tool").cloned().unwrap_or(serde_json::Value::Null),
+        "canonical_arguments": surface.get("canonical_arguments").cloned().unwrap_or(serde_json::Value::Null),
+        "deprecated": surface.get("deprecated").cloned().unwrap_or(serde_json::Value::Null),
         "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
         "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next")),
         "full_repair": stdio_repair_calls_from_value(surface.get("full_repair")),
@@ -861,11 +1076,29 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         "repair_all" => {
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Foreground)
+            stdio_deprecated_repair_all_response(handle_stdio_sidecar_repair(runtime, state))
         }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
+}
+
+fn stdio_deprecated_repair_all_response(mut response: serde_json::Value) -> serde_json::Value {
+    if let Some(result) = response
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        result.insert("deprecated".to_string(), serde_json::json!(true));
+        result.insert(
+            "canonical_tool".to_string(),
+            serde_json::json!("sidecar_setup"),
+        );
+        result.insert(
+            "canonical_arguments".to_string(),
+            serde_json::json!({"action": "repair"}),
+        );
+    }
+    response
 }
 
 fn handle_stdio_ground(runtime: &RuntimeContext, request: &serde_json::Value) -> serde_json::Value {
@@ -2241,25 +2474,106 @@ fn read_stdio_status_resource_cached(
         (summary, None)
     };
     let key = stdio_status_cache_key(runtime);
-    let value = read_stdio_status_resource(runtime, summary, local_refresh)?;
+    let value = stdio_status_with_recent_sidecar_repair(
+        read_stdio_status_resource(runtime, summary, local_refresh)?,
+        &mut state.recent_sidecar_repair,
+        &runtime.project_root,
+    );
     // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
-    if !stdio_status_auto_repair_in_progress(&value) {
-        state.status_cache = Some(StdioStatusCacheEntry {
-            key,
-            value: value.clone(),
-            cached_at: Instant::now(),
-        });
-    }
+    state.status_cache = Some(StdioStatusCacheEntry {
+        key,
+        value: value.clone(),
+        cached_at: Instant::now(),
+    });
     Ok(value)
 }
 
-fn stdio_status_auto_repair_in_progress(value: &serde_json::Value) -> bool {
-    matches!(
-        value
-            .pointer("/status_resource_auto_repair/result/status")
-            .and_then(serde_json::Value::as_str),
-        Some("started" | "already_running")
+fn stdio_status_with_recent_sidecar_repair(
+    mut status: serde_json::Value,
+    recent: &mut Option<StdioRecentSidecarRepair>,
+    project_root: &Path,
+) -> serde_json::Value {
+    let Some(repair) = recent.as_ref() else {
+        return status;
+    };
+    let same_project = repair.project_root == project_root;
+    let within_ttl = repair.observed_at.elapsed() <= STDIO_RECENT_REPAIR_TTL;
+    let pid_alive = crate::ready_repair_status::process_is_running(repair.pid);
+    let durable_active = crate::ready_repair_status::active_ready_repair_status(
+        project_root,
+        Some(repair.run_id.as_str()),
     )
+    .is_some();
+    if !same_project || !within_ttl || !(pid_alive || durable_active) {
+        *recent = None;
+        return status;
+    }
+
+    let fallback_active_repair = serde_json::json!({
+        "status": "repairing",
+        "project_root": crate::display::clean_path_string(&repair.project_root.to_string_lossy()),
+        "profile": "agent",
+        "run_id": repair.run_id.clone(),
+        "namespace": repair.namespace.clone(),
+        "phase": "starting",
+        "pid": repair.pid,
+        "updated_at_epoch_ms": repair.started_at_epoch_ms
+    });
+    let live_active_repair = status
+        .pointer("/sidecar_setup/active_repair")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let active_repair = live_active_repair
+        .clone()
+        .unwrap_or_else(|| fallback_active_repair.clone());
+    let active_repair_empty = status
+        .pointer("/sidecar_setup/active_repair")
+        .is_none_or(serde_json::Value::is_null);
+    if active_repair_empty
+        && let Some(sidecar_setup) = status
+            .get_mut("sidecar_setup")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        sidecar_setup.insert("active_repair".to_string(), active_repair.clone());
+    }
+
+    if let Some(operations) = status
+        .pointer_mut("/readiness_broker/operations")
+        .and_then(serde_json::Value::as_array_mut)
+        && operations.is_empty()
+    {
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project_root,
+            Some(&repair.run_id),
+            env!("CARGO_PKG_VERSION"),
+        );
+        operations.push(serde_json::json!({
+            "operation_id": crate::readiness_broker::broker_operation_id(&scope),
+            "operation_kind": "agent_repair",
+            "status": "running",
+            "project_id": scope.project_id,
+            "workspace_root": scope.workspace_root,
+            "profile": "agent",
+            "run_id": repair.run_id.clone(),
+            "agent_id": repair.run_id.clone(),
+            "namespace": repair.namespace.clone(),
+            "compose_project": repair.compose_project.clone(),
+            "phase": active_repair
+                .get("phase")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("starting")),
+            "pid": active_repair
+                .get("pid")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(repair.pid)),
+            "started_at_epoch_ms": repair.started_at_epoch_ms,
+            "updated_at_epoch_ms": active_repair
+                .get("updated_at_epoch_ms")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(repair.started_at_epoch_ms))
+        }));
+    }
+    status
 }
 
 fn wait_for_stdio_local_freshness(
@@ -2342,6 +2656,12 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
         format!(
             "sidecar_state:{}",
             stdio_path_fingerprint(&layout.state_file)
+        ),
+        format!(
+            "native_embedding_broker:{}",
+            crate::readiness_broker::machine_resource_cache_fingerprint(
+                crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE
+            )
         ),
         format!(
             "repair_state:{}",
@@ -2683,18 +3003,7 @@ fn stdio_workspace_mismatch_diagnostic(
 
 fn stdio_workspace_mismatch_sidecar_setup(mismatch: &StdioWorkspaceMismatch) -> serde_json::Value {
     let policy = stdio_sidecar_policy_file();
-    let env_state = env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE");
-    let state = match policy
-        .as_ref()
-        .and_then(|policy| policy.get("state"))
-        .and_then(serde_json::Value::as_str)
-        .or(env_state.as_deref())
-    {
-        Some("enabled") => "enabled",
-        Some("disabled") => "disabled",
-        Some(_) => "ask",
-        None => "unmanaged",
-    };
+    let state = stdio_sidecar_policy_state_from_file(policy.as_ref());
     serde_json::json!({
         "state": state,
         "auto_repair": false,
@@ -2706,23 +3015,12 @@ fn stdio_workspace_mismatch_sidecar_setup(mismatch: &StdioWorkspaceMismatch) -> 
             mismatch,
             &stdio_plugin_runtime_status(),
         ),
-        "mcp_control": {
-            "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
-            "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
-            "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "disable"}},
-            "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "ask"}},
-            "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}
-        },
+        "mcp_control": stdio_sidecar_setup_mcp_control(),
         "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
         "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
         "next_repair_command": null,
         "policy_path": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH"),
-        "policy_updated_at": policy
-            .as_ref()
-            .and_then(|policy| policy.get("updated_at"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .or_else(|| env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT")),
+        "policy_updated_at": stdio_sidecar_policy_updated_at(policy.as_ref()),
         "last_repair": null,
         "active_repair": null,
         "abandoned_repair": null
@@ -2755,6 +3053,20 @@ fn stdio_workspace_mismatch_allowed_surfaces() -> serde_json::Value {
     ] {
         surfaces.insert(surface.to_string(), stdio_workspace_mismatch_surface());
     }
+    surfaces.insert(
+        "sidecar_setup".to_string(),
+        serde_json::json!({
+            "allowed": true,
+            "readiness_goal": "agent_packet_search",
+            "status": "workspace_mismatch",
+            "summary": "sidecar_setup status and policy actions are available; repair is blocked until the host relaunches MCP for the active workspace.",
+            "blocked_reason": "workspace_mismatch_repair_blocked",
+            "allowed_actions": ["status", "enable", "disable", "ask"],
+            "canonical_arguments": {"action": "status"},
+            "minimum_next": [],
+            "full_repair": [],
+        }),
+    );
     serde_json::Value::Object(surfaces)
 }
 
@@ -2838,15 +3150,125 @@ fn stdio_dirty_marker_json(marker: &StdioDirtyMarkerStatus) -> serde_json::Value
     })
 }
 
+struct StdioSidecarStatusParts {
+    retrieval_mode: String,
+    degraded_reason: Option<String>,
+    embedding_device_policy: String,
+    embedding_device_state: String,
+    embedding_device_observation_source: String,
+    embedding_detected_provider: Option<String>,
+    embedding_detected_gpu: Option<String>,
+    embedding_accelerator_requested: bool,
+    embedding_accelerator_request_provider: Option<String>,
+    embedding_accelerator_request_device: Option<String>,
+    embedding_cpu_allowed: bool,
+    sidecar_retrieval: serde_json::Value,
+    selected_agent_sidecar: args::DoctorSidecarStatusOutput,
+}
+
+struct StdioStatusReadinessParts {
+    readiness: Vec<ReadinessVerdictDto>,
+    readiness_lanes_json: serde_json::Value,
+    local_refresh_json: serde_json::Value,
+    sidecar_setup: serde_json::Value,
+    dirty_marker: StdioDirtyMarkerStatus,
+    effective_freshness: Option<IndexFreshnessDto>,
+    local: ReadinessVerdictDto,
+}
+
+struct StdioStatusBrokerParts {
+    readiness_broker: crate::readiness_broker::ReadinessBrokerSnapshot,
+    readiness_broker_json: serde_json::Value,
+}
+
+struct StdioStatusSurfacesParts {
+    allowed_surfaces: serde_json::Value,
+    recommended_next_calls: serde_json::Value,
+    runtime_truth: serde_json::Value,
+}
+
 fn read_stdio_status_resource(
     runtime: &RuntimeContext,
     summary: ProjectSummary,
     local_refresh: Option<crate::readiness::LocalRefreshOutput>,
 ) -> Result<serde_json::Value> {
     let retrieval = summary.retrieval.as_ref();
+    let sidecar = build_stdio_status_sidecar(runtime);
+    let (server_executable, server_executable_sha256, server_warnings) =
+        stdio_server_executable_status();
+    let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
+    let plugin_runtime = stdio_plugin_runtime_status();
+    let broker = build_stdio_status_broker(runtime, &sidecar.selected_agent_sidecar);
+    let readiness = build_stdio_status_readiness(
+        runtime,
+        &summary,
+        local_refresh,
+        server_executable.as_deref(),
+        &sidecar,
+        &broker.readiness_broker,
+    );
+    let surfaces = build_stdio_status_surfaces(
+        runtime,
+        &readiness,
+        &broker,
+        &sidecar.selected_agent_sidecar,
+        &plugin_runtime,
+    );
+    Ok(serde_json::json!({
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "server_executable": server_executable,
+        "server_executable_sha256": server_executable_sha256,
+        "source_checkout_version": source_checkout_version,
+        "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
+        "plugin_runtime": plugin_runtime,
+        "runtime_truth": surfaces.runtime_truth,
+        "runtime_boundary": {
+            "restart_required_for_runtime_change": true,
+            "message": "A running MCP server keeps using the CLI process it was launched with; install or explicit override changes require a host reload/restart and a fresh codestory://status readback."
+        },
+        "warnings": server_warnings,
+        "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+        "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
+        "storage_exists": runtime.storage_path.exists(),
+        "retrieval_mode": sidecar.retrieval_mode,
+        "degraded_reason": sidecar.degraded_reason,
+        "embedding_device_policy": sidecar.embedding_device_policy,
+        "embedding_device_state": sidecar.embedding_device_state,
+        "embedding_device_observation_source": sidecar.embedding_device_observation_source,
+        "embedding_detected_provider": sidecar.embedding_detected_provider,
+        "embedding_detected_gpu": sidecar.embedding_detected_gpu,
+        "embedding_accelerator_requested": sidecar.embedding_accelerator_requested,
+        "embedding_accelerator_request_provider": sidecar.embedding_accelerator_request_provider,
+        "embedding_accelerator_request_device": sidecar.embedding_accelerator_request_device,
+        "embedding_cpu_allowed": sidecar.embedding_cpu_allowed,
+        "sidecar_retrieval": sidecar.sidecar_retrieval,
+        "sidecar_setup": readiness.sidecar_setup,
+        "dirty_marker": stdio_dirty_marker_json(&readiness.dirty_marker),
+        "legacy_semantic_diagnostics": {
+            "mode": retrieval.map(|state| state.mode),
+            "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
+            "semantic_doc_count": retrieval.map(|state| state.semantic_doc_count).unwrap_or(0),
+            "fallback_reason": retrieval.and_then(|state| state.fallback_reason),
+            "fallback_message": retrieval.and_then(|state| state.fallback_message.as_deref()),
+            "diagnostic_only": true
+        },
+        "index_freshness": summary.freshness,
+        "effective_index_freshness": readiness.effective_freshness,
+        "local_refresh": readiness.local_refresh_json,
+        "readiness": readiness.readiness,
+        "readiness_lanes": readiness.readiness_lanes_json,
+        "readiness_broker": broker.readiness_broker_json,
+        "allowed_surfaces": surfaces.allowed_surfaces,
+        "status_resource_auto_repair": serde_json::Value::Null,
+        "recommended_next_calls": surfaces.recommended_next_calls
+    }))
+}
+
+fn build_stdio_status_sidecar(runtime: &RuntimeContext) -> StdioSidecarStatusParts {
     let sidecar_runtime = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
     let (
-        sidecar_mode,
+        retrieval_mode,
         degraded_reason,
         embedding_device_policy,
         embedding_device_state,
@@ -2908,8 +3330,8 @@ fn read_stdio_status_resource(
             None,
         ),
     };
-    let sidecar = serde_json::json!({
-        "retrieval_mode": sidecar_mode.clone(),
+    let sidecar_retrieval = serde_json::json!({
+        "retrieval_mode": retrieval_mode.clone(),
         "degraded_reason": degraded_reason.clone(),
         "embedding_device_policy": embedding_device_policy.clone(),
         "embedding_device_state": embedding_device_state.clone(),
@@ -2925,17 +3347,10 @@ fn read_stdio_status_resource(
         "manifest_input_hash": manifest_input_hash.clone(),
         "ownership": ownership,
     });
-    let (server_executable, server_executable_sha256, server_warnings) =
-        stdio_server_executable_status();
-    let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
-    let plugin_runtime = stdio_plugin_runtime_status();
-    let setup_repair = stdio_setup_repair_input(server_executable.as_deref());
-    let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
-    let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
     let raw_sidecar_status = crate::DoctorSidecarStatusOutput {
         profile: Some(sidecar_runtime.profile.as_str().to_string()),
         run_id: sidecar_runtime.run_id.clone(),
-        retrieval_mode: sidecar_mode.clone(),
+        retrieval_mode: retrieval_mode.clone(),
         degraded_reason: degraded_reason.clone(),
         embedding_device_policy: embedding_device_policy.clone(),
         embedding_device_state: embedding_device_state.clone(),
@@ -2957,6 +3372,38 @@ fn read_stdio_status_resource(
         runtime,
         sidecar_runtime.run_id.as_deref(),
         &raw_sidecar_status,
+    );
+    StdioSidecarStatusParts {
+        retrieval_mode,
+        degraded_reason,
+        embedding_device_policy,
+        embedding_device_state,
+        embedding_device_observation_source,
+        embedding_detected_provider,
+        embedding_detected_gpu,
+        embedding_accelerator_requested,
+        embedding_accelerator_request_provider,
+        embedding_accelerator_request_device,
+        embedding_cpu_allowed,
+        sidecar_retrieval,
+        selected_agent_sidecar,
+    }
+}
+
+fn build_stdio_status_readiness(
+    runtime: &RuntimeContext,
+    summary: &ProjectSummary,
+    local_refresh: Option<crate::readiness::LocalRefreshOutput>,
+    server_executable: Option<&str>,
+    sidecar: &StdioSidecarStatusParts,
+    broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
+) -> StdioStatusReadinessParts {
+    let setup_repair = stdio_setup_repair_input(server_executable);
+    let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
+    let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
+    let selected_agent_sidecar = stdio_agent_sidecar_with_gpu_proof(
+        &sidecar.selected_agent_sidecar,
+        broker.gpu_proof.as_ref(),
     );
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
@@ -2989,148 +3436,117 @@ fn read_stdio_status_resource(
             manifest_input_hash: selected_agent_sidecar.manifest_input_hash.as_deref(),
         }),
     });
-    let mut sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
-    let status_resource_auto_repair =
-        stdio_status_resource_auto_repair(runtime, &readiness, &sidecar_setup);
-    if status_resource_auto_repair.is_some() {
-        sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
-    }
-    let allowed_surfaces = stdio_allowed_surfaces(&readiness);
+    let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(
         runtime,
         &readiness,
         None,
         Some(&selected_agent_sidecar),
+        Some(broker),
     );
     let readiness_lanes_json =
         serde_json::to_value(&readiness_lanes).expect("serialize readiness lanes");
-    let recommended_next_calls =
-        if stdio_status_auto_repair_result_in_progress(status_resource_auto_repair.as_ref()) {
-            stdio_status_repair_in_progress_next_calls()
-        } else {
-            stdio_status_recommended_next_calls(&readiness, &sidecar_setup)
-        };
     let local = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
+        .cloned()
         .expect("local_navigation readiness verdict");
     let mut local_refresh_status =
-        local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(local));
+        local_refresh.unwrap_or_else(|| crate::readiness::local_refresh_output(&local));
     if dirty_marker.blocks_local_surfaces {
-        local_refresh_status = crate::readiness::local_refresh_output(local);
+        local_refresh_status = crate::readiness::local_refresh_output(&local);
         local_refresh_status.reason = dirty_marker.reason.clone();
     }
     let local_refresh_json =
         serde_json::to_value(&local_refresh_status).expect("serialize local refresh");
-    let runtime_truth = stdio_runtime_truth_status(
-        &plugin_runtime,
-        &sidecar_setup,
-        &readiness_lanes_json,
+    StdioStatusReadinessParts {
+        readiness,
+        readiness_lanes_json,
+        local_refresh_json,
+        sidecar_setup,
+        dirty_marker,
+        effective_freshness,
         local,
-        &local_refresh_json,
-    );
-    Ok(serde_json::json!({
-        "server_version": env!("CARGO_PKG_VERSION"),
-        "cli_version": env!("CARGO_PKG_VERSION"),
-        "server_executable": server_executable,
-        "server_executable_sha256": server_executable_sha256,
-        "source_checkout_version": source_checkout_version,
-        "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
-        "plugin_runtime": plugin_runtime,
-        "runtime_truth": runtime_truth,
-        "runtime_boundary": {
-            "restart_required_for_runtime_change": true,
-            "message": "A running MCP server keeps using the CLI process it was launched with; install or explicit override changes require a host reload/restart and a fresh codestory://status readback."
-        },
-        "warnings": server_warnings,
-        "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-        "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
-        "storage_exists": runtime.storage_path.exists(),
-        "retrieval_mode": sidecar_mode,
-        "degraded_reason": degraded_reason,
-        "embedding_device_policy": embedding_device_policy,
-        "embedding_device_state": embedding_device_state,
-        "embedding_device_observation_source": embedding_device_observation_source,
-        "embedding_detected_provider": embedding_detected_provider,
-        "embedding_detected_gpu": embedding_detected_gpu,
-        "embedding_accelerator_requested": embedding_accelerator_requested,
-        "embedding_accelerator_request_provider": embedding_accelerator_request_provider,
-        "embedding_accelerator_request_device": embedding_accelerator_request_device,
-        "embedding_cpu_allowed": embedding_cpu_allowed,
-        "sidecar_retrieval": sidecar,
-        "sidecar_setup": sidecar_setup,
-        "dirty_marker": stdio_dirty_marker_json(&dirty_marker),
-        "legacy_semantic_diagnostics": {
-            "mode": retrieval.map(|state| state.mode),
-            "semantic_ready": retrieval.is_some_and(|state| state.semantic_ready),
-            "semantic_doc_count": retrieval.map(|state| state.semantic_doc_count).unwrap_or(0),
-            "fallback_reason": retrieval.and_then(|state| state.fallback_reason),
-            "fallback_message": retrieval.and_then(|state| state.fallback_message.as_deref()),
-            "diagnostic_only": true
-        },
-        "index_freshness": summary.freshness,
-        "effective_index_freshness": effective_freshness,
-        "local_refresh": local_refresh_json,
-        "readiness": readiness,
-        "readiness_lanes": readiness_lanes_json,
-        "allowed_surfaces": allowed_surfaces,
-        "status_resource_auto_repair": status_resource_auto_repair,
-        "recommended_next_calls": recommended_next_calls
-    }))
+    }
 }
 
-fn stdio_status_resource_auto_repair(
+fn stdio_agent_sidecar_with_gpu_proof(
+    sidecar: &args::DoctorSidecarStatusOutput,
+    gpu_proof: Option<&crate::readiness_broker::BrokerGpuProofSnapshot>,
+) -> args::DoctorSidecarStatusOutput {
+    let mut sidecar = sidecar.clone();
+    if sidecar.retrieval_mode == "full"
+        && gpu_proof.is_some_and(|proof| proof.proof_status == "gpu_unverified")
+    {
+        sidecar.retrieval_mode = "unavailable".to_string();
+        sidecar.degraded_reason = Some("gpu_unverified".to_string());
+    }
+    sidecar
+}
+
+fn build_stdio_status_broker(
     runtime: &RuntimeContext,
-    readiness: &[ReadinessVerdictDto],
-    sidecar_setup: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    if !stdio_status_auto_repair_enabled() {
-        return None;
+    selected_agent_sidecar: &args::DoctorSidecarStatusOutput,
+) -> StdioStatusBrokerParts {
+    let readiness_broker = crate::readiness_broker::observe_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: selected_agent_sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(crate::broker_gpu_proof_input_from_sidecar(
+                selected_agent_sidecar,
+            )),
+            reconciliation: None,
+        },
+    );
+    let readiness_broker_json =
+        serde_json::to_value(&readiness_broker).expect("serialize readiness broker");
+    StdioStatusBrokerParts {
+        readiness_broker,
+        readiness_broker_json,
     }
-    if sidecar_setup
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        != Some("enabled")
-    {
-        return None;
-    }
-    if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
-        return None;
-    }
-    let non_ready = crate::readiness::primary_non_ready(readiness)?;
-    if non_ready.goal != ReadinessGoalDto::AgentPacketSearch {
-        return None;
-    }
-    if non_ready
-        .minimum_next
-        .iter()
-        .chain(non_ready.full_repair.iter())
-        .any(|command| command.starts_with("Restart/reload the Codex host/app"))
-    {
-        return None;
-    }
-    Some(handle_stdio_sidecar_repair(
-        runtime,
-        StdioSidecarRepairMode::Background,
-    ))
 }
 
-fn stdio_status_auto_repair_result_in_progress(value: Option<&serde_json::Value>) -> bool {
-    matches!(
-        value
-            .and_then(|value| value.pointer("/result/status"))
-            .and_then(serde_json::Value::as_str),
-        Some("started" | "already_running")
-    )
-}
-
-fn stdio_status_auto_repair_enabled() -> bool {
-    match env_nonempty("CODESTORY_STDIO_AUTO_REPAIR_ON_STATUS") {
-        Some(value) => !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        None => true,
+fn build_stdio_status_surfaces(
+    runtime: &RuntimeContext,
+    readiness: &StdioStatusReadinessParts,
+    broker: &StdioStatusBrokerParts,
+    selected_agent_sidecar: &args::DoctorSidecarStatusOutput,
+    plugin_runtime: &serde_json::Value,
+) -> StdioStatusSurfacesParts {
+    let selected_agent_runtime = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        selected_agent_sidecar.run_id.as_deref(),
+    );
+    let native_embedding_hard_busy = stdio_native_embedding_resource_hard_busy(
+        &runtime.project_root,
+        &selected_agent_runtime,
+        Some(&broker.readiness_broker),
+    );
+    let allowed_surfaces = stdio_allowed_surfaces_with_policy(
+        &readiness.readiness,
+        Some(&readiness.sidecar_setup),
+        native_embedding_hard_busy,
+    );
+    let recommended_next_calls = stdio_status_recommended_next_calls(
+        &readiness.readiness,
+        &readiness.sidecar_setup,
+        native_embedding_hard_busy,
+    );
+    let runtime_truth = stdio_runtime_truth_status(
+        plugin_runtime,
+        &readiness.sidecar_setup,
+        &readiness.readiness_lanes_json,
+        &readiness.local,
+        &readiness.local_refresh_json,
+        &broker.readiness_broker_json,
+    );
+    StdioStatusSurfacesParts {
+        allowed_surfaces,
+        recommended_next_calls,
+        runtime_truth,
     }
 }
 
@@ -3140,6 +3556,7 @@ fn stdio_runtime_truth_status(
     readiness_lanes: &serde_json::Value,
     local: &ReadinessVerdictDto,
     local_refresh: &serde_json::Value,
+    readiness_broker: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime_source": plugin_runtime
@@ -3205,6 +3622,28 @@ fn stdio_runtime_truth_status(
                 .pointer("/agent_packet_search")
                 .map(stdio_runtime_truth_sidecar_lane)
                 .unwrap_or(serde_json::Value::Null),
+        },
+        "readiness_broker": {
+            "project_id": readiness_broker
+                .get("project_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "persistence_status": readiness_broker
+                .get("persistence_status")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "reconciliation": readiness_broker
+                .get("reconciliation")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "gpu_proof": readiness_broker
+                .get("gpu_proof")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "resources": readiness_broker
+                .get("resources")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
         }
     })
 }
@@ -3442,12 +3881,13 @@ fn stdio_latest_release_version() -> Option<String> {
     {
         return Some(version);
     }
-    let response =
+    let response = codestory_retrieval::outbound_http::read_text(
         ureq::get("https://api.github.com/repos/TheGreenCedar/CodeStory/releases/latest")
             .timeout(StdDuration::from_secs(2))
-            .call()
-            .ok()?;
-    let body: serde_json::Value = serde_json::from_str(&response.into_string().ok()?).ok()?;
+            .call(),
+    )
+    .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&response.body).ok()?;
     body.get("tag_name")
         .and_then(|value| value.as_str())
         .and_then(normalize_release_version)
@@ -3473,69 +3913,38 @@ fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
 fn stdio_status_recommended_next_calls(
     readiness: &[ReadinessVerdictDto],
     sidecar_setup: &serde_json::Value,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
 ) -> serde_json::Value {
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
         if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
             if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
                 return stdio_status_repair_in_progress_next_calls();
             }
+            if let Some(busy) = native_embedding_hard_busy {
+                return stdio_status_native_embedding_busy_next_calls(busy);
+            }
             match sidecar_setup
                 .get("state")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("ask")
             {
-                "ask" => {
-                    return serde_json::json!([
-                        {
-                            "method": "host/confirm",
-                            "instruction": sidecar_setup["prompt"]
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "sidecar_setup",
-                            "arguments": {"action": "enable"},
-                            "debug_command": sidecar_setup["enable_command"]
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "sidecar_setup",
-                            "arguments": {"action": "disable"},
-                            "debug_command": sidecar_setup["disable_command"]
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://status"
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://agent-guide"
-                        }
-                    ]);
-                }
-                "disabled" => {
-                    return serde_json::json!([
-                        {
-                            "method": "host/instruction",
-                            "instruction": "Automatic sidecar setup is disabled for this plugin install."
-                        },
-                        {
-                            "method": "tools/call",
-                            "tool": "sidecar_setup",
-                            "arguments": {"action": "enable"},
-                            "debug_command": sidecar_setup["enable_command"]
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://status"
-                        },
-                        {
-                            "method": "resources/read",
-                            "uri": "codestory://agent-guide"
-                        }
-                    ]);
+                "ask" | "disabled" | "unmanaged" => {
+                    return stdio_repair_policy_next_calls(sidecar_setup);
                 }
                 _ => {}
             }
+            return serde_json::json!([
+                {
+                    "method": "tools/call",
+                    "tool": "sidecar_setup",
+                    "arguments": {"action": "repair"},
+                    "debug_commands": non_ready.full_repair
+                },
+                {
+                    "method": "resources/read",
+                    "uri": "codestory://status"
+                }
+            ]);
         }
         if let Some(host_action) = non_ready
             .minimum_next
@@ -3552,12 +3961,14 @@ fn stdio_status_recommended_next_calls(
             ]);
         }
         return serde_json::json!([
-            {
-                "method": "tools/call",
-                "tool": "repair_all",
-                "arguments": {},
-                "debug_commands": non_ready.full_repair
-            },
+            stdio_recommended_next_call(
+                non_ready
+                    .full_repair
+                    .first()
+                    .or_else(|| non_ready.minimum_next.first())
+                    .map(String::as_str)
+                    .unwrap_or("Read codestory://status and follow sidecar_setup guidance.")
+            ),
             {
                 "method": "resources/read",
                 "uri": "codestory://status"
@@ -3607,6 +4018,74 @@ fn stdio_status_recommended_next_calls(
     ])
 }
 
+fn stdio_native_embedding_resource_busy(
+    readiness_broker: Option<&crate::readiness_broker::ReadinessBrokerSnapshot>,
+) -> Option<&crate::readiness_broker::BrokerResourceSnapshot> {
+    readiness_broker?
+        .resources
+        .get(crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE)
+        .filter(|resource| resource.status == "busy")
+}
+
+fn stdio_native_embedding_resource_hard_busy<'a>(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    readiness_broker: Option<&'a crate::readiness_broker::ReadinessBrokerSnapshot>,
+) -> Option<&'a crate::readiness_broker::BrokerResourceSnapshot> {
+    stdio_native_embedding_resource_hard_busy_with_classifier(
+        project_root,
+        sidecar,
+        readiness_broker,
+        crate::readiness_broker::reusable_native_embedding_resource_pid_for_snapshot,
+    )
+}
+
+fn stdio_native_embedding_resource_hard_busy_with_classifier<'a>(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    readiness_broker: Option<&'a crate::readiness_broker::ReadinessBrokerSnapshot>,
+    mut reusable_pid_for_snapshot: impl FnMut(
+        &crate::readiness_broker::BrokerScope,
+        &codestory_retrieval::SidecarRuntimeConfig,
+        &crate::readiness_broker::BrokerResourceSnapshot,
+    ) -> Result<Option<u32>>,
+) -> Option<&'a crate::readiness_broker::BrokerResourceSnapshot> {
+    let resource = stdio_native_embedding_resource_busy(readiness_broker)?;
+    let scope = crate::readiness_broker::agent_repair_scope(
+        project_root,
+        sidecar.run_id.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    match reusable_pid_for_snapshot(&scope, sidecar, resource) {
+        Ok(Some(_)) => None,
+        Ok(None) | Err(_) => Some(resource),
+    }
+}
+
+fn stdio_status_native_embedding_busy_next_calls(
+    busy: &crate::readiness_broker::BrokerResourceSnapshot,
+) -> serde_json::Value {
+    let owner_workspace = busy.owner_workspace_root.as_deref().unwrap_or("unknown");
+    let owner_project = busy.owner_project_id.as_deref().unwrap_or("unknown");
+    serde_json::json!([
+        {
+            "method": "host/instruction",
+            "instruction": format!(
+                "CodeStory native embedding runtime is already owned by another operation; wait for it to finish before starting MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
+                busy.owner_pid
+            )
+        },
+        {
+            "method": "resources/read",
+            "uri": "codestory://status"
+        },
+        {
+            "method": "resources/read",
+            "uri": "codestory://agent-guide"
+        }
+    ])
+}
+
 fn stdio_status_repair_in_progress_next_calls() -> serde_json::Value {
     serde_json::json!([
         {
@@ -3626,6 +4105,37 @@ fn stdio_sidecar_setup_has_active_repair(sidecar_setup: &serde_json::Value) -> b
         .is_some_and(|value| !value.is_null())
 }
 
+fn stdio_sidecar_policy_state(sidecar_setup: &serde_json::Value) -> &str {
+    sidecar_setup
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ask")
+}
+
+fn stdio_repair_blocked_by_policy(
+    sidecar_setup: &serde_json::Value,
+) -> Option<(&'static str, &'static str)> {
+    match stdio_sidecar_policy_state(sidecar_setup) {
+        "enabled" => None,
+        "ask" => Some((
+            "confirm_required",
+            "MCP sidecar repair requires explicit confirmation before it can start.",
+        )),
+        "disabled" => Some((
+            "repair_disabled",
+            "MCP sidecar repair is disabled for this plugin install.",
+        )),
+        "unmanaged" => Some((
+            "repair_unmanaged",
+            "MCP sidecar repair policy is not persisted for this host.",
+        )),
+        _ => Some((
+            "confirm_required",
+            "MCP sidecar repair requires explicit confirmation before it can start.",
+        )),
+    }
+}
+
 fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     if command.starts_with("Restart/reload the Codex host/app") {
         return serde_json::json!({
@@ -3636,8 +4146,8 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
     if command.contains("ready --goal agent --repair") {
         return serde_json::json!({
             "method": "tools/call",
-            "tool": "repair_all",
-            "arguments": {},
+            "tool": "sidecar_setup",
+            "arguments": {"action": "repair"},
             "debug_commands": [command]
         });
     }
@@ -3710,11 +4220,19 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
     })
 }
 
-pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Value {
-    let policy = stdio_sidecar_policy_file();
+fn stdio_sidecar_setup_mcp_control() -> serde_json::Value {
+    serde_json::json!({
+        "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
+        "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
+        "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "disable"}},
+        "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "ask"}},
+        "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}
+    })
+}
+
+fn stdio_sidecar_policy_state_from_file(policy: Option<&serde_json::Value>) -> &'static str {
     let env_state = env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE");
-    let state = match policy
-        .as_ref()
+    match policy
         .and_then(|policy| policy.get("state"))
         .and_then(serde_json::Value::as_str)
         .or(env_state.as_deref())
@@ -3723,9 +4241,28 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         Some("disabled") => "disabled",
         Some(_) => "ask",
         None => "unmanaged",
-    };
+    }
+}
+
+fn stdio_sidecar_policy_updated_at(policy: Option<&serde_json::Value>) -> Option<String> {
+    policy
+        .and_then(|policy| policy.get("updated_at"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT"))
+}
+
+pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Value {
+    let policy = stdio_sidecar_policy_file();
+    let state = stdio_sidecar_policy_state_from_file(policy.as_ref());
     let prompt_required = matches!(state, "ask");
-    let auto_repair = matches!(state, "enabled");
+    let explicit_repair_enabled = matches!(state, "enabled");
+    let repair_mode = match state {
+        "enabled" => "explicit_mcp",
+        "unmanaged" => "explicit_mcp_unmanaged",
+        "disabled" => "disabled",
+        _ => "consent_required",
+    };
     let project = crate::display::clean_path_string(&project_root.to_string_lossy());
     let default_repair = format!(
         "codestory-cli ready --goal agent --repair --project \"{project}\" --format json --run-id {}",
@@ -3739,33 +4276,36 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         .is_none()
         .then(|| crate::ready_repair_status::abandoned_ready_repair_status(project_root, None))
         .flatten();
+    let last_repair_command = env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND");
+    let active_cli_version = env_nonempty("CODESTORY_PLUGIN_CLI_VERSION")
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let active_cli_path = env_nonempty("CODESTORY_PLUGIN_CLI_PATH");
+    let last_repair_stale_reason = stdio_last_repair_stale_reason(
+        last_repair_command.as_deref(),
+        &active_cli_version,
+        active_cli_path.as_deref(),
+    );
     serde_json::json!({
         "state": state,
-        "auto_repair": auto_repair,
+        "auto_repair": false,
+        "status_triggered_repair": false,
+        "explicit_repair_enabled": explicit_repair_enabled,
+        "repair_mode": repair_mode,
         "prompt_required": prompt_required,
-        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. Enable automatic sidecar setup for this plugin install?") } else { None },
-        "mcp_control": {
-            "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
-            "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
-            "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "disable"}},
-            "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "ask"}},
-            "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}
-        },
+        "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. MCP repair may start or download retrieval sidecars for this project. Enable MCP sidecar repair for this plugin install?") } else { None },
+        "mcp_control": stdio_sidecar_setup_mcp_control(),
         "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
         "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
         "next_repair_command": next_repair_command,
         "policy_path": env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_PATH"),
-        "policy_updated_at": policy
-            .as_ref()
-            .and_then(|policy| policy.get("updated_at"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .or_else(|| env_nonempty("CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT")),
+        "policy_updated_at": stdio_sidecar_policy_updated_at(policy.as_ref()),
         "last_repair": {
             "state": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE"),
             "updated_at": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT"),
             "project_root": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT"),
-            "command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND")
+            "command": last_repair_command,
+            "current": last_repair_command.is_some() && last_repair_stale_reason.is_none(),
+            "stale_reason": last_repair_stale_reason
         },
         "active_repair": active_repair.as_ref().map(|status| serde_json::json!({
             "status": &status.status,
@@ -3779,6 +4319,37 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         })),
         "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned"))
     })
+}
+
+fn stdio_last_repair_stale_reason(
+    command: Option<&str>,
+    active_cli_version: &str,
+    active_cli_path: Option<&str>,
+) -> Option<String> {
+    let command = command?;
+    if let Some(version) = first_semver_token(command)
+        && version != active_cli_version
+    {
+        return Some(format!(
+            "last_repair_cli_version_mismatch:{version}!={active_cli_version}"
+        ));
+    }
+    if let Some(path) = active_cli_path
+        && command.contains("codestory-cli")
+        && !command.contains(path)
+    {
+        return Some("last_repair_cli_path_mismatch".to_string());
+    }
+    None
+}
+
+fn first_semver_token(text: &str) -> Option<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-'))
+        .find(|token| {
+            token.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                && token.chars().filter(|ch| *ch == '.').count() >= 2
+        })
+        .map(str::to_string)
 }
 
 fn stdio_ready_repair_status_json(
@@ -3875,7 +4446,7 @@ fn handle_stdio_sidecar_setup(
                 }});
             }
             state.status_cache = None;
-            handle_stdio_sidecar_repair(runtime, StdioSidecarRepairMode::Background)
+            handle_stdio_sidecar_repair(runtime, state)
         }
         _ => {
             serde_json::json!({"error": "sidecar_setup.action must be status, enable, disable, ask, or repair"})
@@ -3917,15 +4488,97 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StdioSidecarRepairMode {
-    Background,
-    Foreground,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StdioReadyRepairEnqueueLockFile {
+    schema_version: u32,
+    pid: u32,
+    started_at_epoch_ms: i64,
+    token: String,
+}
+
+#[derive(Debug)]
+struct StdioReadyRepairEnqueueLock {
+    path: PathBuf,
+    token: String,
+}
+
+impl Drop for StdioReadyRepairEnqueueLock {
+    fn drop(&mut self) {
+        let Some(lock) = read_stdio_ready_repair_enqueue_lock(&self.path) else {
+            return;
+        };
+        if lock.token == self.token {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn try_acquire_stdio_ready_repair_enqueue_lock(
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> std::io::Result<Option<StdioReadyRepairEnqueueLock>> {
+    let path = sidecar
+        .layout
+        .state_file
+        .with_file_name(STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
+    let pid = std::process::id();
+    let token = format!("{pid}:{started_at_epoch_ms}");
+    let lock = StdioReadyRepairEnqueueLockFile {
+        schema_version: 1,
+        pid,
+        started_at_epoch_ms,
+        token: token.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&lock)?;
+    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
+        Ok(()) => {
+            return Ok(Some(StdioReadyRepairEnqueueLock { path, token }));
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !stdio_ready_repair_enqueue_lock_is_stale(&path) {
+        return Ok(None);
+    }
+    let _ = fs::remove_file(&path);
+    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
+        Ok(()) => Ok(Some(StdioReadyRepairEnqueueLock { path, token })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn create_stdio_ready_repair_enqueue_lock(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn stdio_ready_repair_enqueue_lock_is_stale(path: &Path) -> bool {
+    let Some(lock) = read_stdio_ready_repair_enqueue_lock(path) else {
+        return true;
+    };
+    if !crate::ready_repair_status::process_is_running(lock.pid) {
+        return true;
+    }
+    let now = crate::ready_repair_status::now_epoch_ms();
+    now.saturating_sub(lock.started_at_epoch_ms)
+        > STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL.as_millis() as i64
+}
+
+fn read_stdio_ready_repair_enqueue_lock(path: &Path) -> Option<StdioReadyRepairEnqueueLockFile> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
 }
 
 fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
-    mode: StdioSidecarRepairMode,
+    state: &mut StdioServerState,
 ) -> serde_json::Value {
     if let Some(error) = stdio_workspace_mismatch_error(runtime) {
         return serde_json::json!({"error": error});
@@ -3940,10 +4593,7 @@ fn handle_stdio_sidecar_repair(
         return serde_json::json!({
             "result": {
                 "status": "already_running",
-                "mode": match mode {
-                    StdioSidecarRepairMode::Background => "background",
-                    StdioSidecarRepairMode::Foreground => "foreground",
-                },
+                "mode": "background",
                 "project_root": status.project_root,
                 "profile": status.profile,
                 "run_id": status.run_id,
@@ -3955,14 +4605,78 @@ fn handle_stdio_sidecar_repair(
                     crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
                     run_id
                 ),
+                "debug_status_command": format!(
+                    "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                    crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                    run_id
+                ),
+                "recommended_next_calls": [{
+                    "method": "resources/read",
+                    "uri": "codestory://status"
+                }],
                 "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }
         });
     }
-    let previous_abandoned_repair =
-        crate::ready_repair_status::abandoned_ready_repair_status(&runtime.project_root, None).map(
-            |status| stdio_ready_repair_status_json(&runtime.project_root, &status, "abandoned"),
-        );
+    let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
+    if let Some(result) = stdio_sidecar_repair_policy_block_result(&sidecar_setup) {
+        return result;
+    }
+    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &runtime.project_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
+    let broker_snapshot = crate::readiness_broker::observe_broker_snapshot(
+        crate::readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: repair_sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: None,
+            reconciliation: None,
+        },
+    );
+    if let Some(busy) = stdio_native_embedding_resource_hard_busy(
+        &runtime.project_root,
+        &repair_sidecar,
+        Some(&broker_snapshot),
+    ) {
+        return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup);
+    }
+    let _enqueue_lock = match try_acquire_stdio_ready_repair_enqueue_lock(&repair_sidecar) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return stdio_sidecar_repair_already_starting_result(
+                &runtime.project_root,
+                &repair_sidecar,
+                &sidecar_setup,
+            );
+        }
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let broker_reconciliation = crate::readiness_broker::reconcile_before_enqueue(
+        &runtime.project_root,
+        &runtime.cache_root,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let previous_abandoned_repair = broker_reconciliation
+        .abandoned_repairs
+        .first()
+        .cloned()
+        .map(|operation| serde_json::to_value(operation).expect("serialize broker operation"));
+    let broker_reconciliation_json =
+        serde_json::to_value(&broker_reconciliation).expect("serialize broker reconciliation");
+    if let Some(result) = stdio_sidecar_repair_reconciliation_block_result(
+        &runtime.project_root,
+        &repair_sidecar,
+        &sidecar_setup,
+        &broker_reconciliation,
+        &broker_reconciliation_json,
+    ) {
+        return result;
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
@@ -3983,97 +4697,272 @@ fn handle_stdio_sidecar_repair(
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
         .stdin(Stdio::null());
 
-    match mode {
-        StdioSidecarRepairMode::Background => {
-            match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-                Ok(child) => {
-                    serde_json::json!({
-                        "result": {
-                            "status": "started",
-                            "mode": "background",
-                            "pid": child.id(),
-                            "previous_abandoned_repair": previous_abandoned_repair,
-                            "next_status_command": format!(
-                                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
-                                crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-                                codestory_retrieval::DEFAULT_AGENT_RUN_ID
-                            ),
-                            "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
-                        }
-                    })
-                }
-                Err(error) => serde_json::json!({"error": error.to_string()}),
+    match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(mut child) => {
+            let child_pid = child.id();
+            let repair_started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
+            if let Err(error) = crate::ready_repair_status::write_ready_repair_status(
+                &repair_sidecar,
+                &runtime.project_root,
+                "starting",
+                repair_started_at_epoch_ms,
+                child_pid,
+            ) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return serde_json::json!({
+                    "error": format!(
+                        "repair process was stopped because its durable status could not be published: {error}"
+                    )
+                });
             }
-        }
-        StdioSidecarRepairMode::Foreground => {
-            let child = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
-            let child = match child {
-                Ok(child) => child,
-                Err(error) => return serde_json::json!({"error": error.to_string()}),
-            };
-            let pid = child.id();
-            let repair_status = match child.wait_with_output() {
-                Ok(output) => output.status,
-                Err(error) => return serde_json::json!({"error": error.to_string()}),
-            };
-            let ready_output = Command::new(&exe)
-                .arg("ready")
-                .arg("--goal")
-                .arg("agent")
-                .arg("--project")
-                .arg(&runtime.project_root)
-                .arg("--format")
-                .arg("json")
-                .arg("--run-id")
-                .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-                .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
-            let (ready_status_code, parsed_ready, ready_json_found, stdout_tail, stderr_tail) =
-                match ready_output {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        let parsed_ready = stdio_parse_trailing_json_object(&stdout);
-                        let ready_json_found = parsed_ready.is_some();
-                        (
-                            output.status.code(),
-                            parsed_ready,
-                            ready_json_found,
-                            stdio_tail_text(&stdout, 4000),
-                            stdio_tail_text(&stderr, 4000),
-                        )
-                    }
-                    Err(error) => (
-                        None,
-                        None,
-                        false,
-                        String::new(),
-                        format!("failed to run readiness probe after repair: {error}"),
-                    ),
-                };
+            let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
+                crate::readiness_broker::BrokerSnapshotInput {
+                    project_root: runtime.project_root.clone(),
+                    cache_root: runtime.cache_root.clone(),
+                    agent_run_id: repair_sidecar.run_id.clone(),
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    gpu_proof: None,
+                    reconciliation: None,
+                },
+            );
+            state.recent_sidecar_repair = Some(StdioRecentSidecarRepair {
+                project_root: runtime.project_root.clone(),
+                run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+                namespace: repair_sidecar.namespace.clone(),
+                compose_project: repair_sidecar.compose_project.clone(),
+                pid: child_pid,
+                started_at_epoch_ms: repair_started_at_epoch_ms,
+                observed_at: Instant::now(),
+            });
             serde_json::json!({
                 "result": {
-                    "status": if repair_status.success() { "completed" } else { "failed" },
-                    "mode": "foreground",
-                    "pid": pid,
-                    "exit_code": repair_status.code(),
-                    "repair_output_captured": false,
-                    "ready_probe_exit_code": ready_status_code,
-                    "ready": parsed_ready,
-                    "ready_json_found": ready_json_found,
+                    "status": "started",
+                    "mode": "background",
+                    "pid": child_pid,
+                    "status_published": true,
+                    "broker_snapshot": broker_snapshot,
                     "previous_abandoned_repair": previous_abandoned_repair,
-                    "stdout_tail": stdout_tail,
-                    "stderr_tail": stderr_tail,
+                    "broker_reconciliation": broker_reconciliation_json,
+                    "next_status_command": format!(
+                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    ),
+                    "debug_status_command": format!(
+                        "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                        crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+                        codestory_retrieval::DEFAULT_AGENT_RUN_ID
+                    ),
+                    "recommended_next_calls": [{
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }],
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
                 }
             })
         }
+        Err(error) => serde_json::json!({"error": error.to_string()}),
     }
 }
 
+fn stdio_sidecar_repair_policy_block_result(
+    sidecar_setup: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (status, message) = stdio_repair_blocked_by_policy(sidecar_setup)?;
+    Some(serde_json::json!({
+        "result": {
+            "status": status,
+            "mode": "background",
+            "message": message,
+            "sidecar_setup": sidecar_setup,
+            "recommended_next_calls": stdio_repair_policy_next_calls(sidecar_setup)
+        }
+    }))
+}
+
+fn stdio_sidecar_repair_machine_busy_result(
+    busy: &crate::readiness_broker::BrokerResourceSnapshot,
+    sidecar_setup: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "result": {
+            "status": "native_embedding_runtime_busy",
+            "mode": "background",
+            "message": "CodeStory native embedding runtime is already owned by another operation.",
+            "owner_pid": busy.owner_pid,
+            "owner_project_id": busy.owner_project_id,
+            "owner_workspace_root": busy.owner_workspace_root,
+            "sidecar_setup": sidecar_setup,
+            "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy)
+        }
+    })
+}
+
+fn stdio_sidecar_repair_already_starting_result(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar_setup: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "result": {
+            "status": "already_starting",
+            "mode": "background",
+            "project_root": crate::display::clean_path_string(&project_root.to_string_lossy()),
+            "profile": "agent",
+            "run_id": sidecar.run_id.clone(),
+            "namespace": sidecar.namespace.clone(),
+            "next_status_command": format!(
+                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                crate::display::clean_path_string(&project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            ),
+            "debug_status_command": format!(
+                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                crate::display::clean_path_string(&project_root.to_string_lossy()),
+                sidecar.run_id.as_deref().unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            ),
+            "recommended_next_calls": [{
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }],
+            "sidecar_setup": sidecar_setup
+        }
+    })
+}
+
+fn stdio_sidecar_repair_reconciliation_block_result(
+    project_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar_setup: &serde_json::Value,
+    reconciliation: &crate::readiness_broker::BrokerReconciliationSnapshot,
+    reconciliation_json: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let reason = reconciliation.enqueue_block_reason()?;
+    let active = reconciliation.active_repair.as_ref();
+    let status = if active.is_some() || reason.starts_with("live_ready_repair_heartbeat_stale") {
+        "already_running"
+    } else {
+        "repair_blocked"
+    };
+    Some(serde_json::json!({
+        "result": {
+            "status": status,
+            "mode": "background",
+            "reason": reason,
+            "project_root": crate::display::clean_path_string(&project_root.to_string_lossy()),
+            "profile": "agent",
+            "run_id": active
+                .and_then(|operation| operation.run_id.clone())
+                .or_else(|| sidecar.run_id.clone()),
+            "phase": active.and_then(|operation| operation.phase.clone()),
+            "pid": active.and_then(|operation| operation.pid),
+            "broker_reconciliation": reconciliation_json,
+            "next_status_command": format!(
+                "codestory-cli retrieval status --project \"{}\" --profile agent --run-id {}",
+                crate::display::clean_path_string(&project_root.to_string_lossy()),
+                active
+                    .and_then(|operation| operation.run_id.as_deref())
+                    .or(sidecar.run_id.as_deref())
+                    .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            ),
+            "recommended_next_calls": [{
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }],
+            "sidecar_setup": sidecar_setup
+        }
+    }))
+}
+
+fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_json::Value {
+    match stdio_sidecar_policy_state(sidecar_setup) {
+        "ask" => serde_json::json!([
+            {
+                "method": "host/confirm",
+                "instruction": sidecar_setup["prompt"],
+                "confirm_next": [
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "enable"},
+                        "debug_command": sidecar_setup["enable_command"]
+                    },
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "repair"},
+                        "debug_command": sidecar_setup["next_repair_command"]
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }
+                ],
+                "decline_next": [
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "disable"},
+                        "debug_command": sidecar_setup["disable_command"]
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }
+                ]
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            }
+        ]),
+        "disabled" => serde_json::json!([
+            {
+                "method": "host/confirm",
+                "instruction": "CodeStory packet/search repair is disabled for this plugin install. Enable MCP sidecar repair for this plugin install?",
+                "confirm_next": [
+                    {
+                        "method": "tools/call",
+                        "tool": "sidecar_setup",
+                        "arguments": {"action": "enable"},
+                        "debug_command": sidecar_setup["enable_command"]
+                    },
+                    {
+                        "method": "resources/read",
+                        "uri": "codestory://status"
+                    }
+                ]
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            }
+        ]),
+        "unmanaged" => serde_json::json!([
+            {
+                "method": "host/instruction",
+                "instruction": "Sidecar setup policy is not persisted for this host, so MCP repair is blocked until the host/plugin provides CODESTORY_PLUGIN_SIDECAR_POLICY_PATH. Use codestory://status for current state or run CLI repair outside MCP."
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            },
+            {
+                "method": "resources/read",
+                "uri": "codestory://agent-guide"
+            }
+        ]),
+        _ => serde_json::json!([
+            {
+                "method": "resources/read",
+                "uri": "codestory://status"
+            }
+        ]),
+    }
+}
+
+#[cfg(test)]
 fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -4090,12 +4979,6 @@ fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
     None
 }
 
-fn stdio_tail_text(text: &str, max_chars: usize) -> String {
-    let mut chars: Vec<char> = text.chars().rev().take(max_chars).collect();
-    chars.reverse();
-    chars.into_iter().collect()
-}
-
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -4110,7 +4993,16 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(test)]
 fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+    stdio_allowed_surfaces_with_policy(readiness, None, None)
+}
+
+fn stdio_allowed_surfaces_with_policy(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: Option<&serde_json::Value>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
+) -> serde_json::Value {
     let local = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation);
@@ -4143,26 +5035,125 @@ fn stdio_allowed_surfaces(readiness: &[ReadinessVerdictDto]) -> serde_json::Valu
         surfaces.insert(surface.to_string(), stdio_allowed_surface(agent));
     }
     surfaces.insert(
+        "sidecar_setup".to_string(),
+        stdio_sidecar_setup_surface(readiness, sidecar_setup, native_embedding_hard_busy),
+    );
+    surfaces.insert(
         "repair_all".to_string(),
-        stdio_repair_all_surface(readiness),
+        stdio_repair_all_surface(readiness, sidecar_setup, native_embedding_hard_busy),
     );
     serde_json::Value::Object(surfaces)
 }
 
-fn stdio_repair_all_surface(readiness: &[ReadinessVerdictDto]) -> serde_json::Value {
+fn stdio_sidecar_setup_surface(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: Option<&serde_json::Value>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
+) -> serde_json::Value {
+    let Some(non_ready) = crate::readiness::primary_non_ready(readiness) else {
+        return serde_json::json!({
+            "allowed": true,
+            "readiness_goal": "agent_packet_search",
+            "status": "ready",
+            "summary": "sidecar_setup status is available; repair is not currently required.",
+            "allowed_actions": ["status"],
+            "canonical_arguments": {"action": "status"},
+        });
+    };
+    if non_ready.goal != ReadinessGoalDto::AgentPacketSearch {
+        return serde_json::json!({
+            "allowed": true,
+            "readiness_goal": crate::readiness::goal_label(non_ready.goal),
+            "status": crate::readiness::status_label(non_ready.status),
+            "summary": "sidecar_setup status is available; repair actions are for agent packet/search sidecars.",
+            "allowed_actions": ["status"],
+            "canonical_arguments": {"action": "status"},
+        });
+    }
+    if let Some(busy) = native_embedding_hard_busy {
+        return serde_json::json!({
+            "allowed": true,
+            "readiness_goal": "agent_packet_search",
+            "status": "busy",
+            "failed_layer": "native_embedding_runtime",
+            "summary": "sidecar_setup status is available; repair is blocked because CodeStory native embedding runtime is already owned by another operation.",
+            "owner_pid": busy.owner_pid,
+            "owner_project_id": busy.owner_project_id,
+            "owner_workspace_root": busy.owner_workspace_root,
+            "allowed_actions": ["status"],
+            "canonical_arguments": {"action": "status"},
+        });
+    }
+    let (allowed_actions, canonical_action) = match sidecar_setup.map(stdio_sidecar_policy_state) {
+        Some("enabled") => (serde_json::json!(["status", "repair"]), "repair"),
+        Some("ask") => (serde_json::json!(["status", "enable", "disable"]), "status"),
+        Some("disabled") => (serde_json::json!(["status", "enable"]), "status"),
+        Some("unmanaged") => (serde_json::json!(["status"]), "status"),
+        _ => (serde_json::json!(["status"]), "status"),
+    };
+    serde_json::json!({
+        "allowed": true,
+        "readiness_goal": "agent_packet_search",
+        "status": crate::readiness::status_label(non_ready.status),
+        "failed_layer": crate::readiness::failed_layer(non_ready),
+        "summary": "Use sidecar_setup for the MCP-managed agent packet/search repair path.",
+        "allowed_actions": allowed_actions,
+        "canonical_arguments": {"action": canonical_action},
+        "minimum_next": non_ready.minimum_next,
+        "full_repair": non_ready.full_repair,
+    })
+}
+
+fn stdio_repair_all_surface(
+    readiness: &[ReadinessVerdictDto],
+    sidecar_setup: Option<&serde_json::Value>,
+    native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
+) -> serde_json::Value {
     if let Some(setup) = readiness
         .iter()
         .find(|verdict| verdict.status == ReadinessStatusDto::RepairSetup)
     {
         return stdio_allowed_surface(Some(setup));
     }
+    if let Some((status, blocked_reason)) = sidecar_setup.and_then(stdio_repair_blocked_by_policy) {
+        return serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "agent_packet_search",
+            "status": status,
+            "failed_layer": "mcp_sidecar_policy",
+            "summary": blocked_reason,
+            "repair_reason": blocked_reason,
+            "blocked_reason": blocked_reason,
+            "minimum_next": [],
+            "full_repair": [],
+        });
+    }
+    if let Some(busy) = native_embedding_hard_busy {
+        return serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "agent_packet_search",
+            "status": "busy",
+            "failed_layer": "native_embedding_runtime",
+            "summary": "CodeStory native embedding runtime is already owned by another operation.",
+            "repair_reason": "native_embedding_runtime_busy",
+            "blocked_reason": "native_embedding_runtime_busy",
+            "owner_pid": busy.owner_pid,
+            "owner_project_id": busy.owner_project_id,
+            "owner_workspace_root": busy.owner_workspace_root,
+            "minimum_next": [],
+            "full_repair": [],
+        });
+    }
 
     serde_json::json!({
-        "allowed": true,
+        "allowed": false,
         "readiness_goal": "agent_packet_search",
-        "status": "ready",
+        "status": "compatibility_alias",
         "failed_layer": null,
-        "summary": "MCP repair_all may run bounded CodeStory agent repair for this runtime.",
+        "summary": "repair_all is a deprecated compatibility alias. Follow recommended_next_calls and call sidecar_setup with action=repair.",
+        "canonical_tool": "sidecar_setup",
+        "canonical_arguments": {"action": "repair"},
+        "deprecated": true,
         "repair_reason": null,
         "blocked_reason": null,
         "minimum_next": [],
@@ -4516,6 +5507,650 @@ mod tests {
     }
 
     #[test]
+    fn stdio_cancellation_marks_matching_queued_request() {
+        let mut queued = VecDeque::new();
+        queue_stdio_frame(
+            StdioFrame::Line(
+                br#"{"jsonrpc":"2.0","id":"request-1","method":"tools/call"}
+"#
+                .to_vec(),
+            ),
+            &mut queued,
+            None,
+        );
+        let cancelled = match queued.front().expect("queued request") {
+            StdioQueuedWork::Message(message) => Arc::clone(&message.cancelled),
+            StdioQueuedWork::Response(response) => panic!("unexpected response: {response}"),
+        };
+
+        queue_stdio_frame(
+            StdioFrame::Line(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"request-1"}}
+"#
+                .to_vec(),
+            ),
+            &mut queued,
+            None,
+        );
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            queued.len(),
+            1,
+            "cancellation notifications have no response"
+        );
+    }
+
+    #[test]
+    fn stdio_cancellation_keeps_json_id_types_distinct() {
+        assert_eq!(stdio_message_id_key(r#"{"id":7}"#).as_deref(), Some("7"));
+        assert_eq!(
+            stdio_cancellation_target_key(
+                r#"{"method":"notifications/cancelled","params":{"requestId":"7"}}"#
+            )
+            .as_deref(),
+            Some("\"7\"")
+        );
+    }
+
+    #[test]
+    fn sidecar_repair_enqueue_lock_is_single_flight() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+
+        let first = try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+            .expect("first enqueue lock")
+            .expect("first enqueue lock acquired");
+        assert!(
+            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+                .expect("second enqueue lock")
+                .is_none(),
+            "concurrent stdio repair enqueue should be blocked"
+        );
+        drop(first);
+        assert!(
+            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+                .expect("third enqueue lock")
+                .is_some(),
+            "enqueue lock should be reusable after drop"
+        );
+    }
+
+    fn agent_packet_search_not_ready() -> ReadinessVerdictDto {
+        ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::RepairRetrieval,
+            summary: "agent packet/search sidecars need repair".to_string(),
+            minimum_next: vec!["codestory-cli ready --goal agent --repair".to_string()],
+            full_repair: vec!["codestory-cli ready --goal agent --repair".to_string()],
+            setup: None,
+            index: None,
+            sidecar: None,
+        }
+    }
+
+    #[test]
+    fn stdio_gpu_proof_blocks_manual_assertion_and_allows_runtime_smoke() {
+        let sidecar = args::DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("agent-default".to_string()),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "accelerated".to_string(),
+            embedding_device_observation_source: "manual_env".to_string(),
+            embedding_detected_provider: Some("metal".to_string()),
+            embedding_detected_gpu: Some("Metal".to_string()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("metal".to_string()),
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: false,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let input = crate::readiness_broker::BrokerGpuProofInput {
+            embedding_device_policy: Some(sidecar.embedding_device_policy.clone()),
+            embedding_device_state: Some(sidecar.embedding_device_state.clone()),
+            embedding_device_observation_source: Some(
+                sidecar.embedding_device_observation_source.clone(),
+            ),
+            embedding_detected_provider: sidecar.embedding_detected_provider.clone(),
+            embedding_detected_gpu: sidecar.embedding_detected_gpu.clone(),
+            embedding_accelerator_requested: Some(true),
+            embedding_accelerator_request_provider: Some("metal".to_string()),
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: Some(false),
+            embed_smoke_ok: Some(true),
+            embed_smoke_ms: Some(12),
+            degraded_reason: None,
+        };
+        let manual_proof = crate::readiness_broker::gpu_proof(input.clone());
+        assert_eq!(manual_proof.proof_status, "gpu_unverified");
+
+        let blocked = stdio_agent_sidecar_with_gpu_proof(&sidecar, Some(&manual_proof));
+
+        assert_eq!(blocked.retrieval_mode, "unavailable");
+        assert_eq!(blocked.degraded_reason.as_deref(), Some("gpu_unverified"));
+
+        let mut runtime_input = input;
+        runtime_input.embedding_device_observation_source = Some("native_log".to_string());
+        let runtime_proof = crate::readiness_broker::gpu_proof(runtime_input);
+        assert_eq!(runtime_proof.proof_status, "verified");
+
+        let allowed = stdio_agent_sidecar_with_gpu_proof(&sidecar, Some(&runtime_proof));
+
+        assert_eq!(allowed.retrieval_mode, "full");
+        assert_eq!(allowed.degraded_reason, None);
+    }
+
+    fn broker_snapshot_with_native_resource(
+        project_root: &Path,
+        resource: crate::readiness_broker::BrokerResourceSnapshot,
+    ) -> crate::readiness_broker::ReadinessBrokerSnapshot {
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project_root,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let mut resources = std::collections::BTreeMap::new();
+        resources.insert(
+            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE.to_string(),
+            resource,
+        );
+        crate::readiness_broker::ReadinessBrokerSnapshot {
+            schema_version: crate::readiness_broker::BROKER_SCHEMA_VERSION,
+            identity: scope.identity.clone(),
+            install_id: "test-install".to_string(),
+            project_id: scope.project_id,
+            canonical_root_hash: "test-root-hash".to_string(),
+            workspace_root: scope.workspace_root,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            updated_at_epoch_ms: crate::ready_repair_status::now_epoch_ms(),
+            snapshot_path: None,
+            persistence_status: "pending".to_string(),
+            persistence_error: None,
+            operations: Vec::new(),
+            resources,
+            reconciliation: crate::readiness_broker::BrokerReconciliationSnapshot {
+                status: "observed".to_string(),
+                cleanup_performed: false,
+                stale_status_paths_removed: Vec::new(),
+                stale_lock_paths_removed: Vec::new(),
+                abandoned_repairs: Vec::new(),
+                local_refresh_cleanups: Vec::new(),
+                active_repair: None,
+                unresolved_orphan_reason: None,
+            },
+            gpu_proof: None,
+        }
+    }
+
+    fn native_resource_snapshot_for_scope(
+        scope: &crate::readiness_broker::BrokerScope,
+        status: &str,
+        owner_pid: u32,
+    ) -> crate::readiness_broker::BrokerResourceSnapshot {
+        crate::readiness_broker::BrokerResourceSnapshot {
+            resource: crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE.to_string(),
+            scope: "machine".to_string(),
+            status: status.to_string(),
+            owner_pid: Some(owner_pid),
+            owner_operation_id: None,
+            owner_project_id: Some(scope.project_id.clone()),
+            owner_workspace_root: Some(scope.workspace_root.clone()),
+            started_at_epoch_ms: Some(crate::ready_repair_status::now_epoch_ms()),
+            lock_path: "C:/cache/readiness-broker/machine/native.lock".to_string(),
+            queued_reason: (status == "busy").then(|| "machine_resource_busy".to_string()),
+        }
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_keeps_live_status_phase() {
+        let project = tempfile::tempdir().expect("project");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: std::process::id(),
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let status = json!({
+            "sidecar_setup": {
+                "active_repair": {
+                    "status": "repairing",
+                    "project_root": project.path().display().to_string(),
+                    "profile": "agent",
+                    "run_id": "shared-agent",
+                    "namespace": "codestory-test",
+                    "phase": "Qdrant finalize",
+                    "pid": 22,
+                    "updated_at_epoch_ms": 200
+                }
+            },
+            "readiness_broker": {
+                "operations": []
+            }
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(status, &mut recent, project.path());
+
+        assert_eq!(
+            updated["sidecar_setup"]["active_repair"]["phase"],
+            json!("Qdrant finalize")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["phase"],
+            json!("Qdrant finalize")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["pid"],
+            json!(22)
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["updated_at_epoch_ms"],
+            json!(200)
+        );
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_synthesizes_starting_when_status_is_empty() {
+        let project = tempfile::tempdir().expect("project");
+        let live_pid = std::process::id();
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: live_pid,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let status = json!({
+            "sidecar_setup": {
+                "active_repair": null
+            },
+            "readiness_broker": {
+                "operations": []
+            }
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(status, &mut recent, project.path());
+
+        assert_eq!(
+            updated["sidecar_setup"]["active_repair"]["phase"],
+            json!("starting")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["phase"],
+            json!("starting")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["pid"],
+            json!(live_pid)
+        );
+    }
+
+    fn empty_recent_repair_status() -> serde_json::Value {
+        json!({
+            "sidecar_setup": {
+                "active_repair": null
+            },
+            "readiness_broker": {
+                "operations": []
+            }
+        })
+    }
+
+    fn write_live_durable_ready_repair(project_root: &Path, run_id: &str, phase: &str) {
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project_root,
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(run_id),
+        );
+        crate::ready_repair_status::write_ready_repair_status(
+            &sidecar,
+            project_root,
+            phase,
+            crate::ready_repair_status::now_epoch_ms(),
+            std::process::id(),
+        )
+        .expect("write durable ready repair status");
+    }
+
+    fn clear_durable_ready_repair(project_root: &Path, run_id: &str) {
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project_root,
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(run_id),
+        );
+        if let Some(status) =
+            crate::ready_repair_status::active_ready_repair_status(project_root, Some(run_id))
+        {
+            crate::ready_repair_status::clear_ready_repair_status(
+                &sidecar,
+                status.started_at_epoch_ms,
+                status.pid,
+            );
+        }
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_clears_when_pid_dead_and_no_durable_status() {
+        let project = tempfile::tempdir().expect("project");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut recent,
+            project.path(),
+        );
+
+        assert!(
+            recent.is_none(),
+            "dead pid without durable status must clear overlay"
+        );
+        assert!(updated["sidecar_setup"]["active_repair"].is_null());
+        assert_eq!(updated["readiness_broker"]["operations"], json!([]));
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_retains_when_durable_active_even_if_overlay_pid_dead() {
+        let project = tempfile::tempdir().expect("project");
+        let run_id = "shared-agent";
+        write_live_durable_ready_repair(project.path(), run_id, "Qdrant finalize");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: run_id.to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut recent,
+            project.path(),
+        );
+        clear_durable_ready_repair(project.path(), run_id);
+
+        assert!(
+            recent.is_some(),
+            "durable active repair must retain overlay even when overlay pid is dead"
+        );
+        assert_eq!(
+            updated["sidecar_setup"]["active_repair"]["phase"],
+            json!("starting")
+        );
+        assert_eq!(
+            updated["readiness_broker"]["operations"][0]["pid"],
+            json!(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_ttl_still_clears_even_with_durable_active() {
+        // Overlay honesty: TTL is independent of durable_active. Aged overlays clear
+        // even when a live durable repair status still exists.
+        let project = tempfile::tempdir().expect("project");
+        let run_id = "shared-agent";
+        write_live_durable_ready_repair(project.path(), run_id, "Qdrant finalize");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: run_id.to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: std::process::id(),
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now()
+                .checked_sub(STDIO_RECENT_REPAIR_TTL + Duration::from_secs(1))
+                .expect("instant subtract"),
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut recent,
+            project.path(),
+        );
+        clear_durable_ready_repair(project.path(), run_id);
+
+        assert!(
+            recent.is_none(),
+            "aged overlay must clear even when durable repair is still active"
+        );
+        assert!(updated["sidecar_setup"]["active_repair"].is_null());
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_clears_on_project_root_mismatch() {
+        let project = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        let mut recent = Some(StdioRecentSidecarRepair {
+            project_root: other.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: std::process::id(),
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+
+        let updated = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut recent,
+            project.path(),
+        );
+
+        assert!(recent.is_none(), "project_root mismatch must clear overlay");
+        assert!(updated["sidecar_setup"]["active_repair"].is_null());
+    }
+
+    #[test]
+    fn stdio_status_recent_repair_overlay_honesty_requires_project_ttl_and_liveness() {
+        // clear unless same project AND within TTL AND (pid_alive OR durable_active)
+        let project = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other");
+
+        let mut mismatched = Some(StdioRecentSidecarRepair {
+            project_root: other.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: std::process::id(),
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let _ = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut mismatched,
+            project.path(),
+        );
+        assert!(mismatched.is_none(), "honesty: different project clears");
+
+        let mut aged = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: std::process::id(),
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now()
+                .checked_sub(STDIO_RECENT_REPAIR_TTL + Duration::from_secs(1))
+                .expect("instant subtract"),
+        });
+        let _ = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut aged,
+            project.path(),
+        );
+        assert!(aged.is_none(), "honesty: outside TTL clears");
+
+        let mut dead_without_durable = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let _ = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut dead_without_durable,
+            project.path(),
+        );
+        assert!(
+            dead_without_durable.is_none(),
+            "honesty: dead pid without durable clears"
+        );
+
+        write_live_durable_ready_repair(project.path(), "shared-agent", "starting");
+        let mut dead_with_durable = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: u32::MAX,
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let _ = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut dead_with_durable,
+            project.path(),
+        );
+        clear_durable_ready_repair(project.path(), "shared-agent");
+        assert!(
+            dead_with_durable.is_some(),
+            "honesty: same project + TTL + durable_active retains"
+        );
+
+        let mut live_pid = Some(StdioRecentSidecarRepair {
+            project_root: project.path().to_path_buf(),
+            run_id: "shared-agent".to_string(),
+            namespace: "codestory-test".to_string(),
+            compose_project: "codestory-test".to_string(),
+            pid: std::process::id(),
+            started_at_epoch_ms: 100,
+            observed_at: Instant::now(),
+        });
+        let _ = stdio_status_with_recent_sidecar_repair(
+            empty_recent_repair_status(),
+            &mut live_pid,
+            project.path(),
+        );
+        assert!(
+            live_pid.is_some(),
+            "honesty: same project + TTL + pid_alive retains"
+        );
+    }
+
+    #[test]
+    fn stdio_status_cache_key_invalidates_on_broker_lock_fingerprint_change() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = crate::runtime::RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("inspect runtime");
+        let before_fp = crate::readiness_broker::machine_resource_cache_fingerprint(
+            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
+        );
+        let before = stdio_status_cache_key(&runtime);
+        assert!(
+            before.contains(&format!("native_embedding_broker:{before_fp}")),
+            "status cache key must include broker lock fingerprint: {before}"
+        );
+
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            Some("shared-agent"),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let acquired = crate::readiness_broker::try_acquire_machine_resource_lock(
+            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
+            &scope,
+        )
+        .expect("probe native embedding lock");
+        match acquired {
+            crate::readiness_broker::BrokerMachineResourceLockAttempt::Acquired(lock) => {
+                let after = stdio_status_cache_key(&runtime);
+                drop(lock);
+                assert_ne!(
+                    before, after,
+                    "native embedding broker lock fingerprint must bust the stdio status cache key"
+                );
+            }
+            crate::readiness_broker::BrokerMachineResourceLockAttempt::Busy(_) => {
+                let busy_fp = crate::readiness_broker::machine_resource_cache_fingerprint(
+                    crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
+                );
+                let busy_key = stdio_status_cache_key(&runtime);
+                assert!(
+                    busy_key.contains(&format!("native_embedding_broker:{busy_fp}")),
+                    "busy broker lock fingerprint must still be part of the status cache key: {busy_key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stdio_workspace_mismatch_status_blocks_repo_repair_guidance() {
+        let served = tempfile::tempdir().expect("served");
+        let active = tempfile::tempdir().expect("active");
+        let state_file = tempfile::NamedTempFile::new().expect("active state");
+        let mismatch = StdioWorkspaceMismatch {
+            active_state_path: state_file.path().to_path_buf(),
+            served_root: served.path().to_path_buf(),
+            active_root: active.path().to_path_buf(),
+        };
+
+        let status = stdio_workspace_mismatch_status(&mismatch);
+        assert_eq!(status["status"], json!("workspace_mismatch"));
+        assert_eq!(status["degraded_reason"], json!("workspace_mismatch"));
+        assert_eq!(status["readiness"][0]["minimum_next"], json!([]));
+        assert_eq!(status["readiness"][0]["full_repair"], json!([]));
+        assert_eq!(
+            status["allowed_surfaces"]["sidecar_setup"]["allowed_actions"],
+            json!(["status", "enable", "disable", "ask"])
+        );
+        assert_eq!(
+            status["allowed_surfaces"]["repair_all"]["status"],
+            json!("workspace_mismatch")
+        );
+
+        let setup = stdio_workspace_mismatch_sidecar_setup(&mismatch);
+        assert_eq!(setup["status"], json!("workspace_mismatch"));
+        assert!(setup["next_repair_command"].is_null());
+        assert!(setup["last_repair"].is_null());
+        assert!(setup["active_repair"].is_null());
+        assert!(
+            !setup.to_string().contains("ready --goal agent --repair"),
+            "workspace mismatch must not advertise CLI agent repair: {setup}"
+        );
+    }
+
+    #[test]
     fn stdio_recommended_next_calls_labels_restart_boundary_as_host_action() {
         let restart =
             "Restart/reload the Codex host/app so MCP relaunches codestory-cli 0.11.11 from C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe; then open a fresh agent thread and read codestory://status."
@@ -4533,6 +6168,7 @@ mod tests {
                 sidecar: None,
             }],
             &json!({"state": "enabled"}),
+            None,
         );
 
         assert_eq!(calls[0]["method"], json!("host/restart"));
@@ -4541,6 +6177,145 @@ mod tests {
             calls[0].get("command").is_none(),
             "restart boundary should not be exposed as a CLI command: {calls}"
         );
+    }
+
+    #[test]
+    fn stdio_native_embedding_same_project_reusable_lock_does_not_block_repair() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let resource = native_resource_snapshot_for_scope(&scope, "busy", 44);
+        let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
+        let mut classifier_called = false;
+
+        let hard_busy = stdio_native_embedding_resource_hard_busy_with_classifier(
+            project.path(),
+            &sidecar,
+            Some(&snapshot),
+            |classifier_scope, classifier_sidecar, classifier_resource| {
+                classifier_called = true;
+                assert_eq!(classifier_scope.project_id, scope.project_id);
+                assert_eq!(classifier_sidecar.run_id, sidecar.run_id);
+                assert_eq!(classifier_resource.owner_pid, Some(44));
+                Ok(Some(44))
+            },
+        );
+        let calls = stdio_status_recommended_next_calls(
+            &[agent_packet_search_not_ready()],
+            &json!({"state": "enabled"}),
+            hard_busy,
+        );
+        let surfaces = stdio_allowed_surfaces_with_policy(
+            &[agent_packet_search_not_ready()],
+            Some(&json!({"state": "enabled"})),
+            hard_busy,
+        );
+
+        assert!(classifier_called);
+        assert!(hard_busy.is_none());
+        assert_eq!(calls[0]["tool"], json!("sidecar_setup"));
+        assert_eq!(calls[0]["arguments"]["action"], json!("repair"));
+        assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(true));
+        assert_eq!(
+            surfaces["sidecar_setup"]["canonical_arguments"]["action"],
+            json!("repair")
+        );
+    }
+
+    #[test]
+    fn stdio_native_embedding_foreign_lock_blocks_repair() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let mut resource = native_resource_snapshot_for_scope(&scope, "busy", 45);
+        resource.owner_project_id = Some("foreign-project".to_string());
+        let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
+
+        let hard_busy = stdio_native_embedding_resource_hard_busy_with_classifier(
+            project.path(),
+            &sidecar,
+            Some(&snapshot),
+            |_classifier_scope, _classifier_sidecar, _classifier_resource| Ok(None),
+        );
+        let calls = stdio_status_recommended_next_calls(
+            &[agent_packet_search_not_ready()],
+            &json!({"state": "enabled"}),
+            hard_busy,
+        );
+        let surfaces = stdio_allowed_surfaces_with_policy(
+            &[agent_packet_search_not_ready()],
+            Some(&json!({"state": "enabled"})),
+            hard_busy,
+        );
+
+        assert!(hard_busy.is_some());
+        assert_eq!(calls[0]["method"], json!("host/instruction"));
+        assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(true));
+        assert_eq!(surfaces["sidecar_setup"]["status"], json!("busy"));
+        assert_eq!(
+            surfaces["sidecar_setup"]["allowed_actions"],
+            json!(["status"])
+        );
+        assert_eq!(
+            surfaces["sidecar_setup"]["canonical_arguments"]["action"],
+            json!("status")
+        );
+        assert_eq!(surfaces["repair_all"]["status"], json!("busy"));
+        assert_eq!(
+            surfaces["repair_all"]["repair_reason"],
+            json!("native_embedding_runtime_busy")
+        );
+    }
+
+    #[test]
+    fn stdio_native_embedding_stale_snapshot_does_not_block_repair() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+        );
+        let scope = crate::readiness_broker::agent_repair_scope(
+            project.path(),
+            sidecar.run_id.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let resource = native_resource_snapshot_for_scope(&scope, "stale", 46);
+        let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
+
+        let hard_busy = stdio_native_embedding_resource_hard_busy_with_classifier(
+            project.path(),
+            &sidecar,
+            Some(&snapshot),
+            |_classifier_scope, _classifier_sidecar, _classifier_resource| {
+                panic!("stale native lock snapshots must not reach busy classification")
+            },
+        );
+        let calls = stdio_status_recommended_next_calls(
+            &[agent_packet_search_not_ready()],
+            &json!({"state": "enabled"}),
+            hard_busy,
+        );
+
+        assert!(hard_busy.is_none());
+        assert_eq!(calls[0]["tool"], json!("sidecar_setup"));
+        assert_eq!(calls[0]["arguments"]["action"], json!("repair"));
     }
 
     #[test]

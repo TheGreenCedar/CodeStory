@@ -17,6 +17,11 @@ services:
       dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
       dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
       dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
+      dev.codestory.project_id: ${CODESTORY_PROJECT_ID:-}
+      dev.codestory.workspace_id: ${CODESTORY_WORKSPACE_ID:-}
+      dev.codestory.artifact_scope_id: ${CODESTORY_ARTIFACT_SCOPE_ID:-}
+      dev.codestory.project_identity_schema_version: ${CODESTORY_PROJECT_IDENTITY_SCHEMA_VERSION:-}
+      dev.codestory.workspace_root: ${CODESTORY_WORKSPACE_ROOT:-}
     ports:
       - "127.0.0.1:${CODESTORY_QDRANT_HTTP_PORT:-6333}:6333"
       - "127.0.0.1:${CODESTORY_QDRANT_GRPC_PORT:-6334}:6334"
@@ -34,6 +39,11 @@ services:
       dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
       dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
       dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
+      dev.codestory.project_id: ${CODESTORY_PROJECT_ID:-}
+      dev.codestory.workspace_id: ${CODESTORY_WORKSPACE_ID:-}
+      dev.codestory.artifact_scope_id: ${CODESTORY_ARTIFACT_SCOPE_ID:-}
+      dev.codestory.project_identity_schema_version: ${CODESTORY_PROJECT_IDENTITY_SCHEMA_VERSION:-}
+      dev.codestory.workspace_root: ${CODESTORY_WORKSPACE_ROOT:-}
     ports:
       - "127.0.0.1:${CODESTORY_ZOEKT_PORT:-6070}:6070"
     volumes:
@@ -51,6 +61,11 @@ services:
       dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
       dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
       dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
+      dev.codestory.project_id: ${CODESTORY_PROJECT_ID:-}
+      dev.codestory.workspace_id: ${CODESTORY_WORKSPACE_ID:-}
+      dev.codestory.artifact_scope_id: ${CODESTORY_ARTIFACT_SCOPE_ID:-}
+      dev.codestory.project_identity_schema_version: ${CODESTORY_PROJECT_IDENTITY_SCHEMA_VERSION:-}
+      dev.codestory.workspace_root: ${CODESTORY_WORKSPACE_ROOT:-}
     ports:
       - "127.0.0.1:${CODESTORY_EMBED_PORT:-8080}:8080"
     volumes:

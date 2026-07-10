@@ -149,10 +149,19 @@ function commandName(name) {
 }
 
 function codestoryCacheRoot() {
-  if (process.platform === "win32" && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, "codestory", "cache");
+  if (process.env.CODESTORY_CACHE_ROOT?.trim()) {
+    return path.resolve(process.env.CODESTORY_CACHE_ROOT.trim());
   }
-  return path.join(os.homedir(), ".cache", "codestory", "cache");
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+    return path.join(process.env.LOCALAPPDATA, "codestory", "codestory", "cache");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Caches", "dev.codestory.codestory");
+  }
+  if (process.env.XDG_CACHE_HOME && path.isAbsolute(process.env.XDG_CACHE_HOME)) {
+    return path.join(process.env.XDG_CACHE_HOME, "codestory");
+  }
+  return path.join(os.homedir(), ".cache", "codestory");
 }
 
 function cliPath(release) {
@@ -340,6 +349,7 @@ const LLAMA_BACKENDS_MANIFEST = path.join(
   "llama-sidecar-backends.json",
 );
 const LLAMA_INSTALL_MANIFEST = "install-manifest.json";
+const LLAMA_EXTRACTED_MARKER = ".codestory-extracted";
 
 function readLlamaBackends() {
   return JSON.parse(fs.readFileSync(LLAMA_BACKENDS_MANIFEST, "utf8")).backends ?? [];
@@ -435,6 +445,81 @@ async function validateExtractedExecutable(file, backend) {
   return executableSha;
 }
 
+function pathIsInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function copyManagedPayloadSymlink(source, target, root) {
+  const linkTarget = fs.readlinkSync(source);
+  if (path.isAbsolute(linkTarget)) {
+    throw new Error(`Managed llama-server archive symlink must be relative: ${source} -> ${linkTarget}`);
+  }
+  const resolved = fs.realpathSync(path.resolve(path.dirname(source), linkTarget));
+  if (!pathIsInside(root, resolved)) {
+    throw new Error(`Managed llama-server archive symlink escapes payload: ${source} -> ${resolved}`);
+  }
+  if (!fs.statSync(resolved).isFile()) {
+    throw new Error(`Managed llama-server archive symlink target is not a regular file: ${source} -> ${resolved}`);
+  }
+  fs.copyFileSync(resolved, target);
+}
+
+function copyManagedPayload(source, target, root = fs.realpathSync(source)) {
+  fs.mkdirSync(target, { recursive: true });
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const sourcePath = path.join(source, entry.name);
+    const targetPath = path.join(target, entry.name);
+    if (entry.isSymbolicLink()) {
+      copyManagedPayloadSymlink(sourcePath, targetPath, root);
+    } else if (entry.isDirectory()) {
+      copyManagedPayload(sourcePath, targetPath, root);
+    } else if (entry.isFile()) {
+      fs.copyFileSync(sourcePath, targetPath);
+    } else {
+      throw new Error(`Managed llama-server archive member is not a regular file or directory: ${sourcePath}`);
+    }
+  }
+}
+
+async function installExtractedLlamaServerPayload(backend, extracted, dest) {
+  await validateExtractedExecutable(extracted, backend);
+  const targetDir = path.dirname(dest);
+  const sourceDir = path.dirname(extracted);
+  const targetParent = path.dirname(targetDir);
+  fs.mkdirSync(targetParent, { recursive: true });
+  const stagingDir = `${targetDir}.download`;
+  fs.rmSync(stagingDir, { recursive: true, force: true });
+  copyManagedPayload(sourceDir, stagingDir);
+  const stagedExecutable = path.join(stagingDir, backend.executable_rel_path);
+  fs.chmodSync(stagedExecutable, 0o755);
+  const executableSha = await sha256File(stagedExecutable);
+  if (executableSha !== backend.executable_sha256.toLowerCase()) {
+    throw new Error(
+      `llama-server executable SHA-256 mismatch for ${stagedExecutable}: got ${executableSha}, expected ${backend.executable_sha256}`,
+    );
+  }
+  fs.writeFileSync(path.join(stagingDir, LLAMA_EXTRACTED_MARKER), "1");
+  fs.writeFileSync(
+    path.join(stagingDir, LLAMA_INSTALL_MANIFEST),
+    `${JSON.stringify(
+      {
+        backend: backend.id,
+        artifact: backend.artifact,
+        artifact_sha256: backend.sha256,
+        executable_rel_path: backend.executable_rel_path,
+        executable_sha256: backend.executable_sha256,
+        source_url: backend.url,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  fs.rmSync(targetDir, { recursive: true, force: true });
+  fs.renameSync(stagingDir, targetDir);
+  return dest;
+}
+
 function printLlamaServerPlan(backend) {
   console.log("\nManaged llama-server:");
   console.log(`  backend: ${backend.id}`);
@@ -488,7 +573,7 @@ async function fetchLlamaServer(opts) {
     fs.writeFileSync(archive, Buffer.from(await response.arrayBuffer()));
     await verifySha256(archive, backend.sha256, "llama-server artifact");
     const member = safeArchiveMemberPath(backend.executable_archive_path);
-    const result = spawnSync(commandName("tar"), ["-xzf", archive, "-C", extractDir, member], {
+    const result = spawnSync(commandName("tar"), ["-xzf", archive, "-C", extractDir], {
       encoding: "utf8",
       shell: false,
     });
@@ -496,30 +581,8 @@ async function fetchLlamaServer(opts) {
       throw new Error(`tar failed extracting ${archive}: ${result.stderr || result.stdout}`);
     }
     const extracted = path.join(extractDir, ...member.split("/"));
-    await validateExtractedExecutable(extracted, backend);
-    fs.copyFileSync(extracted, dest);
-    fs.chmodSync(dest, 0o755);
+    await installExtractedLlamaServerPayload(backend, extracted, dest);
     const executableSha = await sha256File(dest);
-    if (executableSha !== backend.executable_sha256.toLowerCase()) {
-      throw new Error(
-        `llama-server executable SHA-256 mismatch for ${dest}: got ${executableSha}, expected ${backend.executable_sha256}`,
-      );
-    }
-    fs.writeFileSync(
-      existingManifest,
-      `${JSON.stringify(
-        {
-          backend: backend.id,
-          artifact: backend.artifact,
-          artifact_sha256: backend.sha256,
-          executable_rel_path: backend.executable_rel_path,
-          executable_sha256: backend.executable_sha256,
-          source_url: backend.url,
-        },
-        null,
-        2,
-      )}\n`,
-    );
     console.log(`Wrote ${dest} (sha256=${executableSha})`);
     return dest;
   } finally {
@@ -567,6 +630,43 @@ async function runSelfTest() {
   const selected = selectedLlamaBackend({ llamaBackend: "macos-aarch64-metal" });
   if (managedLlamaServerPath(selected).split(path.sep).join("/").endsWith("llama-server") !== true) {
     throw new Error("managed llama-server target path should end in llama-server");
+  }
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-llama-self-test-"));
+  try {
+    const payloadDir = path.join(tempRoot, "extract", "llama-b9902");
+    fs.mkdirSync(payloadDir, { recursive: true });
+    const executable = path.join(payloadDir, "llama-server");
+    fs.writeFileSync(executable, "fake exe");
+    fs.writeFileSync(path.join(payloadDir, "libllama-test.dylib"), "fake dylib");
+    const executableSha = await sha256File(executable);
+    const backend = {
+      id: "self-test",
+      artifact: "llama-test.tar.gz",
+      sha256: "0".repeat(64),
+      executable_archive_path: "llama-b9902/llama-server",
+      executable_rel_path: "llama-server",
+      executable_sha256: executableSha,
+      url: "https://example.invalid/llama-test.tar.gz",
+    };
+    const dest = path.join(tempRoot, "managed", "llama-server");
+    await installExtractedLlamaServerPayload(backend, executable, dest);
+    if (fs.readFileSync(dest, "utf8") !== "fake exe") {
+      throw new Error("managed install self-test did not copy executable");
+    }
+    if (fs.readFileSync(path.join(path.dirname(dest), "libllama-test.dylib"), "utf8") !== "fake dylib") {
+      throw new Error("managed install self-test did not copy sibling payload");
+    }
+    if (!fs.existsSync(path.join(path.dirname(dest), LLAMA_EXTRACTED_MARKER))) {
+      throw new Error("managed install self-test did not write extraction marker");
+    }
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(path.dirname(dest), LLAMA_INSTALL_MANIFEST), "utf8"),
+    );
+    if (manifest.artifact !== backend.artifact || manifest.executable_sha256 !== executableSha) {
+      throw new Error("managed install self-test wrote stale manifest metadata");
+    }
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   console.log("setup-retrieval-env self-test passed");
 }

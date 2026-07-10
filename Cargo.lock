@@ -455,7 +455,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "codestory-bench"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-cli"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -479,6 +479,7 @@ dependencies = [
  "codestory-contracts",
  "codestory-retrieval",
  "codestory-runtime",
+ "codestory-workspace",
  "crossbeam-channel",
  "crossterm 0.28.1",
  "directories",
@@ -488,13 +489,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
  "toml",
  "ureq 2.12.1",
 ]
 
 [[package]]
 name = "codestory-contracts"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -509,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-indexer"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -548,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-retrieval"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -569,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-runtime"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -595,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-store"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -610,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "codestory-workspace"
-version = "0.13.12"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "codestory-contracts",
@@ -4338,6 +4340,28 @@ dependencies = [
  "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
+]
+
+[[package]]
+name = "tokio"
+version = "1.52.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+dependencies = [
+ "bytes",
+ "pin-project-lite",
+ "tokio-macros",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
