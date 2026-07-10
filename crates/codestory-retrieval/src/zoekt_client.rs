@@ -1,6 +1,6 @@
 use crate::config::{SidecarLayout, ZOEKT_HEALTH_BUDGET};
 use crate::outbound_http::read_text;
-use crate::zoekt_index::{search_lexical_index, shard_dir_for, shard_has_lexical_index};
+use crate::zoekt_index::{search_lexical_index, shard_dir_for};
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
@@ -57,16 +57,13 @@ impl ZoektClient {
         &self,
         layout: &SidecarLayout,
         project_id: &str,
+        sidecar_input_hash: &str,
         query: &str,
         limit: usize,
     ) -> Result<Vec<super::CandidateHit>> {
         use super::candidate::{CandidateHit, CandidateSource};
         let shard_dir = shard_dir_for(&layout.zoekt_data_dir, project_id);
-        if !shard_has_lexical_index(&shard_dir) {
-            return Ok(Vec::new());
-        }
-
-        let hits = search_lexical_index(&shard_dir, query, limit)?
+        let hits = search_lexical_index(&shard_dir, sidecar_input_hash, query, limit)?
             .into_iter()
             .map(|hit| {
                 let mut candidate = CandidateHit::with_source(
@@ -89,8 +86,9 @@ impl ZoektClient {
         &self,
         layout: &SidecarLayout,
         project_id: &str,
+        sidecar_input_hash: &str,
     ) -> Result<Vec<String>> {
-        let hits = self.search(layout, project_id, "fn", 4)?;
+        let hits = self.search(layout, project_id, sidecar_input_hash, "fn", 4)?;
         Ok(hits.into_iter().map(|hit| hit.file_path).collect())
     }
 }
@@ -98,7 +96,7 @@ impl ZoektClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zoekt_index::build_zoekt_shard;
+    use crate::zoekt_index::{build_zoekt_shard, lexical_input_fingerprint};
     use tempfile::TempDir;
 
     #[test]
@@ -119,20 +117,24 @@ mod tests {
         .expect("write b");
 
         let zoekt_data = TempDir::new().expect("zoekt data");
+        let fingerprint_a = lexical_input_fingerprint(project_a.path(), None).expect("input a");
         build_zoekt_shard(
             project_a.path(),
             None,
             zoekt_data.path(),
             "project-a",
-            false,
+            &fingerprint_a,
+            "input-a",
         )
         .expect("index a");
+        let fingerprint_b = lexical_input_fingerprint(project_b.path(), None).expect("input b");
         build_zoekt_shard(
             project_b.path(),
             None,
             zoekt_data.path(),
             "project-b",
-            false,
+            &fingerprint_b,
+            "input-b",
         )
         .expect("index b");
 
@@ -141,7 +143,7 @@ mod tests {
         let client = ZoektClient::new(&layout);
 
         let hits = client
-            .search(&layout, "project-a", "project_b_handler", 10)
+            .search(&layout, "project-a", "input-a", "project_b_handler", 10)
             .expect("search a");
         assert!(
             hits.is_empty(),

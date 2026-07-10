@@ -92,6 +92,7 @@ impl<'a> QueryExecutor<'a> {
     /// `total_budget_ms` caps retrieval work only; it does not include runtime candidate
     /// resolution, packet sufficiency checks, or answer composition.
     pub fn execute(&mut self, query: &str, total_budget_ms: Option<u64>) -> Result<QueryResult> {
+        let request_started = Instant::now();
         let features = classify_query(query);
         let fingerprint = query_fingerprint(&features.raw_query);
 
@@ -115,7 +116,7 @@ impl<'a> QueryExecutor<'a> {
                         retrieval_mode: mode.as_str().into(),
                         degraded_reason: None,
                         total_budget_ms: 0,
-                        elapsed_ms: 0,
+                        elapsed_ms: request_started.elapsed().as_millis() as u64,
                         cancel_reason: None,
                         cache_hit: true,
                         stages: Vec::new(),
@@ -169,7 +170,7 @@ impl<'a> QueryExecutor<'a> {
                 retrieval_mode: mode.as_str().into(),
                 degraded_reason,
                 total_budget_ms: plan.total_budget_ms,
-                elapsed_ms: started.elapsed().as_millis() as u64,
+                elapsed_ms: request_started.elapsed().as_millis() as u64,
                 cancel_reason,
                 cache_hit: false,
                 stages: stage_traces,

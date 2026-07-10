@@ -10,7 +10,7 @@ use crate::scip_index::{
     import_precise_semantic_scip_artifact,
 };
 use crate::zoekt_client::ZoektClient;
-use crate::zoekt_index::{build_zoekt_shard, lexical_input_fingerprint};
+use crate::zoekt_index::{LexicalInputFingerprint, build_zoekt_shard, lexical_input_fingerprint};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, SymbolSearchDoc};
@@ -267,13 +267,17 @@ pub fn finalize_index_for_runtime_with_progress(
                     let scip_dir = layout.scip_project_dir(generation);
                     if update_precise_semantic_import_status(&scip_dir, &mut manifest)? {
                         return persist_finalized_manifest(
+                            project_root,
                             storage_path,
+                            &sidecar_input,
                             project_id,
                             manifest,
                             degraded_modes,
-                            zoekt_stubbed,
-                            qdrant_stubbed,
-                            scip_stubbed,
+                            SidecarStubFlags {
+                                zoekt_stubbed,
+                                qdrant_stubbed,
+                                scip_stubbed,
+                            },
                         );
                     }
                 }
@@ -329,6 +333,7 @@ pub fn finalize_index_for_runtime_with_progress(
             &generation,
             sidecar_input.lexical_file_count,
             &sidecar_input.lexical_hash,
+            &sidecar_input.hash,
         );
     let qdrant_ready_points = if existing_status.qdrant.capabilities.semantic {
         qdrant_ready_point_count(&qdrant_client, &collection, sidecar_input.projection_count)
@@ -354,13 +359,17 @@ pub fn finalize_index_for_runtime_with_progress(
                 "current generated sidecars already healthy; persisted manifest without rebuild"
             );
             return persist_finalized_manifest(
+                project_root,
                 storage_path,
+                &sidecar_input,
                 project_id,
                 manifest,
                 degraded_modes,
-                zoekt_stubbed,
-                qdrant_stubbed,
-                scip_stubbed,
+                SidecarStubFlags {
+                    zoekt_stubbed,
+                    qdrant_stubbed,
+                    scip_stubbed,
+                },
             );
         }
     }
@@ -370,9 +379,12 @@ pub fn finalize_index_for_runtime_with_progress(
             project_root,
             storage_path,
             &layout,
-            &project_id,
             &generation,
-            zoekt_probe.reachable,
+            &LexicalInputFingerprint {
+                file_count: sidecar_input.lexical_file_count,
+                hash: sidecar_input.lexical_hash.clone(),
+            },
+            &sidecar_input.hash,
             zoekt_ready,
         )
     })?;
@@ -406,6 +418,7 @@ pub fn finalize_index_for_runtime_with_progress(
 
     with_finalize_progress(&mut progress, "manifest write", || {
         finalize_manifest_after_health_check(
+            project_root,
             storage_path,
             &layout,
             &qdrant_client,
@@ -437,34 +450,42 @@ fn ensure_zoekt_generation(
     project_root: &Path,
     storage_path: &Path,
     layout: &SidecarLayout,
-    project_id: &str,
     generation: &str,
-    zoekt_probe_reachable: bool,
+    expected: &LexicalInputFingerprint,
+    sidecar_input_hash: &str,
     mut zoekt_ready: bool,
 ) -> Result<String> {
     if zoekt_ready {
-        info!(project_id = %project_id, sidecar_generation = %generation, "Zoekt lexical shard reused");
+        info!(sidecar_generation = %generation, "Zoekt lexical shard reused");
     } else {
         match build_zoekt_shard(
             project_root,
             Some(storage_path),
             &layout.zoekt_data_dir,
             generation,
-            zoekt_probe_reachable,
+            expected,
+            sidecar_input_hash,
         ) {
             Ok(true) => {
                 zoekt_ready = true;
-                info!(project_id = %project_id, sidecar_generation = %generation, "Zoekt lexical shard built");
+                info!(sidecar_generation = %generation, "Zoekt lexical shard built");
             }
             Ok(false) => {
-                warn!(project_id = %project_id, "Zoekt shard build produced no files");
+                warn!(sidecar_generation = %generation, "Zoekt shard build produced no files");
             }
-            Err(error) => bail!("mandatory Zoekt shard build failed for {project_id}: {error}"),
+            Err(error) => bail!("mandatory Zoekt shard build failed for {generation}: {error}"),
         }
     }
-    let shard_dir = crate::zoekt_index::shard_dir_for(&layout.zoekt_data_dir, generation);
-    if !zoekt_ready || !crate::zoekt_index::shard_has_lexical_index(&shard_dir) {
-        bail!("mandatory Zoekt lexical shard is missing for {project_id}");
+    if !zoekt_ready
+        || !crate::zoekt_index::shard_matches_lexical_input(
+            &layout.zoekt_data_dir,
+            generation,
+            expected.file_count,
+            &expected.hash,
+            sidecar_input_hash,
+        )
+    {
+        bail!("mandatory Zoekt lexical shard is incomplete for {generation}");
     }
     Ok(ZOEKT_REAL_VERSION_PIN.to_string())
 }
@@ -635,6 +656,7 @@ fn update_precise_semantic_import_status(
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_manifest_after_health_check(
+    project_root: &Path,
     storage_path: &Path,
     layout: &SidecarLayout,
     qdrant_client: &QdrantClient,
@@ -646,6 +668,19 @@ fn finalize_manifest_after_health_check(
     stub_flags: SidecarStubFlags,
     embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
 ) -> Result<FinalizeIndexOutcome> {
+    let generation = manifest
+        .sidecar_generation
+        .as_deref()
+        .context("mandatory sidecar manifest is missing its generation")?;
+    if !crate::zoekt_index::shard_matches_lexical_input(
+        &layout.zoekt_data_dir,
+        generation,
+        sidecar_input.lexical_file_count,
+        &sidecar_input.lexical_hash,
+        &sidecar_input.hash,
+    ) {
+        bail!("mandatory Zoekt lexical shard is incomplete for {project_id}");
+    }
     let status = probe_sidecar_health_with_embedding_device(
         layout,
         &project_id,
@@ -668,14 +703,26 @@ fn finalize_manifest_after_health_check(
     }
 
     persist_finalized_manifest(
+        project_root,
         storage_path,
+        sidecar_input,
         project_id,
         manifest,
         degraded_modes,
-        stub_flags.zoekt_stubbed,
-        stub_flags.qdrant_stubbed,
-        stub_flags.scip_stubbed,
+        stub_flags,
     )
+}
+
+fn ensure_lexical_input_unchanged(
+    project_root: &Path,
+    storage_path: &Path,
+    expected: &SidecarInputFingerprint,
+) -> Result<()> {
+    let current = lexical_input_fingerprint(project_root, Some(storage_path))?;
+    if current.file_count != expected.lexical_file_count || current.hash != expected.lexical_hash {
+        bail!("lexical input changed before sidecar manifest publication");
+    }
+    Ok(())
 }
 
 #[allow(dead_code)] // Phase 2 cache keys
@@ -797,13 +844,13 @@ fn qdrant_ready_point_count(
 }
 
 fn persist_finalized_manifest(
+    project_root: &Path,
     storage_path: &Path,
+    sidecar_input: &SidecarInputFingerprint,
     project_id: String,
     mut manifest: RetrievalIndexManifest,
     degraded_modes: Vec<String>,
-    zoekt_stubbed: bool,
-    qdrant_stubbed: bool,
-    scip_stubbed: bool,
+    stub_flags: SidecarStubFlags,
 ) -> Result<FinalizeIndexOutcome> {
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
@@ -814,6 +861,7 @@ fn persist_finalized_manifest(
             "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
         );
     }
+    ensure_lexical_input_unchanged(project_root, storage_path, sidecar_input)?;
     storage
         .upsert_retrieval_index_manifest(&manifest)
         .context("persist retrieval_index_manifest")?;
@@ -831,9 +879,9 @@ fn persist_finalized_manifest(
         project_id,
         manifest,
         degraded_modes,
-        zoekt_stubbed,
-        qdrant_stubbed,
-        scip_stubbed,
+        zoekt_stubbed: stub_flags.zoekt_stubbed,
+        qdrant_stubbed: stub_flags.qdrant_stubbed,
+        scip_stubbed: stub_flags.scip_stubbed,
     })
 }
 

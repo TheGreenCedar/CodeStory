@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Published lexical shard data, metadata, and runtime sidecar state through
+  validated same-directory temporary files with atomic replacement. Shard
+  readiness and search now reject malformed, truncated, count-mismatched, or
+  hash-mismatched JSONL; bind published bytes and metadata to the manifest's
+  sidecar input; and recheck live lexical input before manifest publication so
+  failed or raced rebuilds preserve the last known good shard.
 - Added a `dev/codestory-next` merge workflow that closes same-repository
   issues named by `Closes`, `Fixes`, or `Resolves` in merged pull requests.
 - Made live incremental indexing crash-safe. Runs now persist an incomplete-run
