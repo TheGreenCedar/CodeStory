@@ -52,6 +52,10 @@ const TABLE_STATEMENTS: &[&str] = &[
         line_count INTEGER DEFAULT 0,
         file_role TEXT NOT NULL DEFAULT 'source'
     )",
+    "CREATE TABLE IF NOT EXISTS incomplete_index_run (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        started_at_epoch_ms INTEGER NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS local_symbol (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
@@ -343,9 +347,16 @@ pub(super) fn create_deferred_indexes(conn: &Connection) -> Result<(), StorageEr
 pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageError> {
     let stored_version = storage.schema_version()?;
 
-    if stored_version > SCHEMA_VERSION {
+    if stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && stored_version > SCHEMA_VERSION {
         return Err(StorageError::Other(format!(
             "Unsupported database schema version: {stored_version} (max supported: {SCHEMA_VERSION})"
+        )));
+    }
+    if stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+        && !storage.has_incomplete_incremental_run()?
+    {
+        return Err(StorageError::Other(format!(
+            "Database schema version {stored_version} is only valid while an incremental index run is marked incomplete"
         )));
     }
 

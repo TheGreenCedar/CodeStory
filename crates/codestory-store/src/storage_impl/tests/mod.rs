@@ -38,6 +38,101 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
 }
 
 #[test]
+fn incomplete_incremental_run_marker_survives_reopen_until_success() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("incomplete-incremental-run");
+    {
+        let storage = Storage::open(&path)?;
+        assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+        assert!(!Storage::database_has_incomplete_incremental_run(&path)?);
+        assert!(!storage.has_incomplete_incremental_run()?);
+        storage.begin_incremental_run()?;
+        assert!(storage.has_incomplete_incremental_run()?);
+        assert!(Storage::database_has_incomplete_incremental_run(&path)?);
+        assert_eq!(
+            Storage::database_schema_version(&path)?,
+            INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+        );
+    }
+    {
+        let storage = Storage::open(&path)?;
+        assert!(storage.has_incomplete_incremental_run()?);
+        storage.finish_incremental_run()?;
+        assert!(!storage.has_incomplete_incremental_run()?);
+        assert!(!Storage::database_has_incomplete_incremental_run(&path)?);
+        assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
+fn incomplete_incremental_begin_failure_keeps_clean_schema_and_no_marker()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("incomplete-begin-rollback");
+    let storage = Storage::open(&path)?;
+    storage.get_connection().execute_batch(
+        "CREATE TRIGGER fail_incomplete_begin
+         BEFORE INSERT ON incomplete_index_run
+         BEGIN SELECT RAISE(ABORT, 'forced marker insert failure'); END;",
+    )?;
+
+    assert!(storage.begin_incremental_run().is_err());
+    assert!(!storage.has_incomplete_incremental_run()?);
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
+fn transient_incomplete_schema_fence_requires_marker() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("incomplete-schema-fence");
+    {
+        let storage = Storage::open(&path)?;
+        storage.set_schema_version(INCOMPLETE_INCREMENTAL_SCHEMA_VERSION)?;
+    }
+
+    assert!(Storage::database_has_incomplete_incremental_run(&path).is_err());
+    let error = match Storage::open(&path) {
+        Ok(_) => panic!("schema fence without marker must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("marked incomplete"));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
+fn sequential_future_schema_is_not_mistaken_for_incomplete_fence() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("future-schema-fence");
+    {
+        let storage = Storage::open(&path)?;
+        storage.begin_incremental_run()?;
+        storage.set_schema_version(SCHEMA_VERSION + 1)?;
+    }
+
+    assert!(Storage::database_has_incomplete_incremental_run(&path).is_err());
+    let error = match Storage::open(&path) {
+        Ok(_) => panic!("future schema must fail even when the incomplete marker exists"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("Unsupported database schema"));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
 fn test_batch_inserts() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
 

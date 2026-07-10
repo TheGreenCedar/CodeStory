@@ -29,6 +29,9 @@ use helpers::{
 };
 
 const SCHEMA_VERSION: u32 = 18;
+// Reserved outside the sequential migration range so a future real schema version cannot
+// accidentally be treated as an interrupted run from this release.
+const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
 /// Current SQLite schema version expected by `Store`.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
@@ -895,6 +898,38 @@ impl Storage {
         Ok(version.max(0) as u32)
     }
 
+    /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
+    pub fn database_has_incomplete_incremental_run(path: &Path) -> Result<bool, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && version > SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
+            )));
+        }
+        let table_exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'incomplete_index_run'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        let marked = table_exists != 0
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incomplete_index_run WHERE id = 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && !marked {
+            return Err(StorageError::Other(format!(
+                "Database schema version {version} is only valid while an incremental index run is marked incomplete"
+            )));
+        }
+        Ok(marked)
+    }
+
     pub fn copy_database_snapshot(
         source_path: &Path,
         target_path: &Path,
@@ -1217,6 +1252,44 @@ impl Storage {
     pub fn invalidate_grounding_snapshots(&self) -> Result<(), StorageError> {
         self.mark_grounding_snapshots_dirty()?;
         self.invalidate_resolution_support_snapshot()?;
+        Ok(())
+    }
+
+    /// Mark a live incremental index run incomplete before it mutates projections.
+    pub fn begin_incremental_run(&self) -> Result<(), StorageError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
+             VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET
+                started_at_epoch_ms = excluded.started_at_epoch_ms",
+            params![current_epoch_ms()],
+        )?;
+        transaction.pragma_update(
+            None,
+            "user_version",
+            INCOMPLETE_INCREMENTAL_SCHEMA_VERSION.to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Whether a prior live incremental index run did not reach its success boundary.
+    pub fn has_incomplete_incremental_run(&self) -> Result<bool, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM incomplete_index_run WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Clear the live incremental marker only after resolution and snapshots succeed.
+    pub fn finish_incremental_run(&self) -> Result<(), StorageError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM incomplete_index_run WHERE id = 1", [])?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION.to_string())?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -5032,6 +5105,17 @@ impl Storage {
             }))
         } else {
             Ok(None)
+        }
+    }
+
+    pub fn first_incomplete_file_path(&self) -> Result<Option<PathBuf>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM file WHERE complete = 0 ORDER BY id LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(PathBuf::from(row.get::<_, String>(0)?))),
+            None => Ok(None),
         }
     }
 

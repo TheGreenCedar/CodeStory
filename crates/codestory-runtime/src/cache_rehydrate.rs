@@ -82,6 +82,42 @@ pub fn rehydrate_cache(request: CacheRehydrateRequest<'_>) -> Result<CacheRehydr
             rebuild,
         ));
     }
+    let _source_writer_guard = if request.dry_run {
+        None
+    } else {
+        Some(match super::IndexWriterGuard::try_acquire(&source_db) {
+            Ok(guard) => guard,
+            Err(error) if error.code == "cache_busy" => {
+                return Ok(skipped(
+                    request,
+                    format!("source cache is busy: {}", error.message),
+                    rebuild,
+                ));
+            }
+            Err(error) => bail!(
+                "failed to acquire source cache writer lock: {}",
+                error.message
+            ),
+        })
+    };
+    let _target_writer_guard = if request.dry_run {
+        None
+    } else {
+        Some(match super::IndexWriterGuard::try_acquire(&target_db) {
+            Ok(guard) => guard,
+            Err(error) if error.code == "cache_busy" => {
+                return Ok(skipped(
+                    request,
+                    format!("target cache is busy: {}", error.message),
+                    rebuild,
+                ));
+            }
+            Err(error) => bail!(
+                "failed to acquire target cache writer lock: {}",
+                error.message
+            ),
+        })
+    };
     if target_cache_has_contents(request.target_cache_dir)? {
         return Ok(skipped(request, "target cache dir is not empty", rebuild));
     }
@@ -247,6 +283,12 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
     let workspace = WorkspaceManifest::open(project.to_path_buf())
         .with_context(|| format!("open source workspace {}", project.display()))?;
     let storage = Store::open(source_db).context("open source cache for freshness")?;
+    if storage
+        .has_incomplete_incremental_run()
+        .context("inspect source cache incomplete index marker")?
+    {
+        bail!("source cache has an incomplete incremental index run");
+    }
     let plan = workspace
         .build_execution_plan(&RefreshInputs {
             stored_files: storage.files().inventory()?,
@@ -298,11 +340,14 @@ fn target_cache_has_contents(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    Ok(fs::read_dir(path)
-        .with_context(|| format!("read target cache dir {}", path.display()))?
-        .next()
-        .transpose()?
-        .is_some())
+    for entry in
+        fs::read_dir(path).with_context(|| format!("read target cache dir {}", path.display()))?
+    {
+        if entry?.file_name() != "codestory.index-writer.lock" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn target_cache_nested_in_source(source: &Path, target: &Path) -> Result<bool> {
@@ -380,9 +425,9 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
             Store::copy_database_snapshot(&source_path, &target_path)?;
         } else if matches!(
             entry.file_name().to_string_lossy().as_ref(),
-            "codestory.db-wal" | "codestory.db-shm"
+            "codestory.db-wal" | "codestory.db-shm" | "codestory.index-writer.lock"
         ) {
-            // SQLite backup snapshots the DB; copying WAL/SHM would reintroduce live state.
+            // SQLite backup snapshots the DB; live sidecars and process locks are never portable.
             continue;
         } else {
             fs::copy(&source_path, &target_path)?;
@@ -536,6 +581,9 @@ mod tests {
         let source_cache = tempdir().expect("source cache");
         let target_cache = tempdir().expect("target cache");
         let target_cache_path = target_cache.path().join("empty");
+        fs::create_dir_all(&target_cache_path).expect("create lock-only target cache");
+        fs::write(target_cache_path.join("codestory.index-writer.lock"), b"")
+            .expect("seed persistent target lock");
         let source_db = source_cache.path().join("codestory.db");
         seed_cache(&source_db, source_project.path());
 
@@ -550,6 +598,12 @@ mod tests {
 
         assert_eq!(output.status, "rehydrated");
         assert!(target_cache_path.join("codestory.db").is_file());
+        assert!(
+            target_cache_path
+                .join("codestory.index-writer.lock")
+                .exists(),
+            "the target owns its persistent writer lock after rehydrate"
+        );
         assert_eq!(output.invalidated_retrieval_manifests, 1);
         assert_eq!(output.invalidated_index_artifact_rows, 1);
         assert!(output.rebased_path_bound_rows > 0);
@@ -616,6 +670,43 @@ mod tests {
                 .get_index_artifact_cache(Path::new("legacy.rs"), "v1:path-bound:legacy")
                 .expect("legacy artifact cache lookup")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn rehydrate_dry_run_does_not_create_target_cache_metadata() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_parent = tempdir().expect("target parent");
+        let target_cache_path = target_parent.path().join("absent-cache");
+        seed_cache(
+            &source_cache.path().join("codestory.db"),
+            source_project.path(),
+        );
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: true,
+        })
+        .expect("rehydrate dry run");
+
+        assert_eq!(output.status, "would_rehydrate");
+        assert!(!output.copied);
+        assert!(
+            !source_cache
+                .path()
+                .join("codestory.index-writer.lock")
+                .exists(),
+            "dry-run must not create a source lock"
+        );
+        assert!(
+            !target_cache_path.exists(),
+            "dry-run must not create a target lock or cache directory"
         );
     }
 
@@ -692,6 +783,104 @@ mod tests {
             );
             assert!(!target_cache.path().join("codestory.db").exists());
         }
+    }
+
+    #[test]
+    fn rehydrate_skips_incomplete_source_cache() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let target_cache_path = target_cache.path().join("empty");
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+        Store::open(&source_db)
+            .expect("open source cache")
+            .get_connection()
+            .execute(
+                "INSERT INTO incomplete_index_run (id, started_at_epoch_ms) VALUES (1, 1)",
+                [],
+            )
+            .expect("seed schema-compatible incomplete marker");
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        assert!(
+            output
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("incomplete incremental")),
+            "unexpected skip reason: {output:?}"
+        );
+        assert!(!target_cache_path.join("codestory.db").exists());
+    }
+
+    #[test]
+    fn rehydrate_skips_while_source_index_writer_is_active() {
+        let source_project = tempdir().expect("source project");
+        let target_project = tempdir().expect("target project");
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let source_db = source_cache.path().join("codestory.db");
+        drop(Store::open(&source_db).expect("seed source cache"));
+        let _guard = crate::IndexWriterGuard::try_acquire(&source_db).expect("source writer lock");
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: target_cache.path(),
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        assert!(
+            output
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("source cache is busy")),
+            "unexpected skip reason: {output:?}"
+        );
+    }
+
+    #[test]
+    fn rehydrate_skips_while_target_index_writer_is_active() {
+        let source_project = tempdir().expect("source project");
+        let target_project = tempdir().expect("target project");
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let source_db = source_cache.path().join("codestory.db");
+        let target_db = target_cache.path().join("codestory.db");
+        drop(Store::open(&source_db).expect("seed source cache"));
+        let _guard = crate::IndexWriterGuard::try_acquire(&target_db).expect("target writer lock");
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: target_cache.path(),
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "skipped");
+        assert!(
+            output
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("target cache is busy")),
+            "unexpected skip reason: {output:?}"
+        );
     }
 
     #[test]

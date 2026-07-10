@@ -2765,7 +2765,7 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
         format!("storage:{}", runtime.storage_path.display()),
         format!(
             "storage_state:{}",
-            stdio_path_fingerprint(&runtime.storage_path)
+            stdio_storage_fingerprint(&runtime.storage_path)
         ),
         format!(
             "sidecar_state:{}",
@@ -7465,5 +7465,33 @@ starting sidecar setup
         std::fs::write(temp.path().join("codestory.db-wal"), b"wal").expect("write wal");
         let with_wal = stdio_storage_fingerprint(&db_path);
         assert_ne!(rewritten, with_wal);
+    }
+
+    #[test]
+    fn stdio_status_cache_key_tracks_wal_changes() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = crate::runtime::RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("inspect runtime");
+        std::fs::create_dir_all(runtime.storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        std::fs::write(&runtime.storage_path, b"db").expect("write db");
+        let clean = stdio_status_cache_key(&runtime);
+
+        let wal_path = runtime.storage_path.with_extension("db-wal");
+        std::fs::write(&wal_path, b"incomplete-marker-frame").expect("write marker WAL frame");
+        let incomplete = stdio_status_cache_key(&runtime);
+        assert_ne!(clean, incomplete, "WAL write must bust cached fresh status");
+
+        std::fs::write(&wal_path, b"incomplete-marker-frame-cleared")
+            .expect("write marker-clear WAL frame");
+        let finished = stdio_status_cache_key(&runtime);
+        assert_ne!(
+            incomplete, finished,
+            "marker clear must bust cached stale status"
+        );
     }
 }
