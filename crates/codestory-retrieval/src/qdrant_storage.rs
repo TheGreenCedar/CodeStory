@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
-/// Default cap for `codestory_*` collections; protected manifest collections are never pruned.
-pub const DEFAULT_QDRANT_COLLECTION_RETENTION: usize = 64;
+/// Bootstrap repairs invalid storage only. Valid generation retention runs after publication.
+pub const DEFAULT_QDRANT_COLLECTION_RETENTION: usize = 0;
 
 /// Machine-readable reason when retention deletes are skipped after protection-scan errors.
 pub const PRUNE_SUPPRESSED_PROTECTION_SCAN_ERROR: &str = "protection_scan_error";
+pub const PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION: &str =
+    "post_publication_generation_retention";
 
 /// Inputs for manifest-aware Qdrant collection protection during bootstrap repair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +89,9 @@ pub fn repair_qdrant_storage(
             (0, 0)
         };
 
-    let prune_suppressed_reason = prune_suppressed_reason(&scan.scan_errors);
+    let prune_suppressed_reason = prune_suppressed_reason(&scan.scan_errors).or_else(|| {
+        (max_keep == 0).then(|| PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION.to_string())
+    });
     let suppress_prune = prune_suppressed_reason.is_some();
 
     let (pruned, collections_seen, prune_candidates, overflow_protected) = if suppress_prune {
@@ -97,7 +101,7 @@ pub fn repair_qdrant_storage(
             probe.reachable,
             &protected,
             &scan.recency_by_collection,
-            max_keep,
+            if max_keep == 0 { usize::MAX } else { max_keep },
         )?
     } else if probe.reachable {
         execute_retention_via_http(
@@ -842,6 +846,47 @@ mod tests {
         );
         assert_eq!(report.pruned_collections, 0);
         assert!(collections.join("codestory_prune_64").exists());
+    }
+
+    #[test]
+    fn bootstrap_default_defers_valid_collection_pruning_until_publication() {
+        let cache_root = tempdir().expect("cache");
+        let qdrant_data = tempdir().expect("qdrant data");
+        let collections = qdrant_data.path().join("collections");
+        for index in 0..3 {
+            touch_collection(
+                &collections,
+                &format!("codestory_deferred_{index:02}"),
+                true,
+            );
+        }
+        let scope = BootstrapStorageScope {
+            repo_root: None,
+            active_storage_path: None,
+            active_cache_root: Some(cache_root.path().to_path_buf()),
+            global_cache_root: cache_root.path().to_path_buf(),
+        };
+
+        let report = repair_qdrant_storage(
+            &offline_test_layout(&qdrant_data),
+            &scope,
+            DEFAULT_QDRANT_COLLECTION_RETENTION,
+        )
+        .expect("bootstrap repair");
+
+        assert_eq!(report.pruned_collections, 0);
+        assert_eq!(report.prune_candidates, 0);
+        assert_eq!(
+            report.prune_suppressed_reason.as_deref(),
+            Some(PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION)
+        );
+        for index in 0..3 {
+            assert!(
+                collections
+                    .join(format!("codestory_deferred_{index:02}"))
+                    .is_dir()
+            );
+        }
     }
 
     #[test]

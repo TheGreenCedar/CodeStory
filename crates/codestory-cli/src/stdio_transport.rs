@@ -4523,6 +4523,9 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let managed_cli_retention = env_nonempty("CODESTORY_PLUGIN_CLI_RETENTION")
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        .filter(|value| !value.is_null());
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
         "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
@@ -4540,6 +4543,7 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         "managed_binary_path": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_PATH") } else { None },
         "managed_binary_sha256": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_SHA256") } else { None },
         "managed_manifest_path": env_nonempty("CODESTORY_PLUGIN_CLI_MANIFEST_PATH"),
+        "managed_cli_retention": managed_cli_retention,
         "warnings": warnings
     })
 }

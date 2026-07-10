@@ -1,7 +1,17 @@
 use crate::compose::{EmbedModelInventory, embed_model_inventory};
 use crate::config::{SidecarRuntimeConfig, user_cache_root};
+use crate::generation::{manifest_has_current_sidecar_contract, manifest_unavailable_reason};
+use crate::health::probe_sidecar_health_with_embedding_device;
+use crate::qdrant_client::QdrantClient;
+use crate::retention::{
+    FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
+    GenerationRetentionLock, GenerationRetentionPlan, apply_generation_retention,
+    global_generation_gc_state_file, plan_generation_retention_with_qdrant_collections,
+    scan_retention_protection,
+};
 use crate::sidecar::SidecarStateFile;
 use anyhow::{Context, Result};
+use codestory_store::Store;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -75,6 +85,8 @@ pub struct SidecarInventoryReport {
     pub docker_error: Option<String>,
     pub cache_root: String,
     pub namespaces: Vec<SidecarInventoryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_retention: Option<GenerationRetentionPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +112,8 @@ pub struct SidecarGcReport {
     pub removed: Vec<SidecarGcNamespaceResult>,
     pub blocked: Vec<SidecarGcNamespaceResult>,
     pub namespaces: Vec<SidecarInventoryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_retention: Option<GenerationRetentionApplyReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +136,20 @@ pub fn sidecar_inventory(project_root: &Path) -> Result<SidecarInventoryReport> 
     sidecar_inventory_with_cache_root(project_root, &user_cache_root())
 }
 
+pub fn sidecar_inventory_with_storage(
+    project_root: &Path,
+    storage_path: &Path,
+) -> Result<SidecarInventoryReport> {
+    let cache_root = user_cache_root();
+    let mut report = sidecar_inventory_with_cache_root(project_root, &cache_root)?;
+    report.generation_retention = Some(generation_retention_plan_for_storage(
+        project_root,
+        storage_path,
+        &cache_root,
+    )?);
+    Ok(report)
+}
+
 pub fn sidecar_inventory_with_cache_root(
     project_root: &Path,
     cache_root: &Path,
@@ -137,6 +165,25 @@ pub fn sidecar_inventory_with_cache_root(
 
 pub fn sidecar_gc_apply(project_root: &Path) -> Result<SidecarGcReport> {
     sidecar_gc_apply_with_cache_root(project_root, &user_cache_root())
+}
+
+pub fn sidecar_gc_apply_with_storage(
+    project_root: &Path,
+    storage_path: &Path,
+) -> Result<SidecarGcReport> {
+    let cache_root = user_cache_root();
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
+    let global_gc_state_file = global_generation_gc_state_file(&runtime);
+    let _global_gc_lock =
+        GenerationRetentionLock::acquire(&global_gc_state_file, GLOBAL_GENERATION_GC_LOCK_SCOPE)
+            .context("coordinate global sidecar cleanup with generation publication")?;
+    let mut report = sidecar_gc_apply_with_cache_root(project_root, &cache_root)?;
+    report.generation_retention = Some(apply_generation_retention_for_storage(
+        project_root,
+        storage_path,
+        &cache_root,
+    )?);
+    Ok(report)
 }
 
 pub fn sidecar_gc_apply_with_cache_root(
@@ -208,6 +255,7 @@ fn build_inventory_with_model(
         docker_error: docker.error,
         cache_root: cache_root.display().to_string(),
         namespaces: entries,
+        generation_retention: None,
     }
 }
 
@@ -332,6 +380,133 @@ fn apply_inventory(
         removed,
         blocked,
         namespaces: rows.into_iter().map(|(_, entry)| entry).collect(),
+        generation_retention: None,
+    }
+}
+
+fn generation_retention_plan_for_storage(
+    project_root: &Path,
+    storage_path: &Path,
+    cache_root: &Path,
+) -> Result<GenerationRetentionPlan> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
+    let layout = &runtime.layout;
+    let project_id = crate::index::sidecar_project_id_for_root(project_root);
+    let _lock = GenerationRetentionLock::acquire(&layout.state_file, &project_id)
+        .context("lock sidecar generation inventory")?;
+    Ok(build_generation_retention_plan(
+        storage_path,
+        cache_root,
+        &runtime,
+        &project_id,
+    ))
+}
+
+fn apply_generation_retention_for_storage(
+    project_root: &Path,
+    storage_path: &Path,
+    cache_root: &Path,
+) -> Result<GenerationRetentionApplyReport> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
+    let project_id = crate::index::sidecar_project_id_for_root(project_root);
+    let _lock = GenerationRetentionLock::acquire(&runtime.layout.state_file, &project_id)
+        .context("lock sidecar generation retention apply")?;
+    let plan = build_generation_retention_plan(storage_path, cache_root, &runtime, &project_id);
+    let mut remover = FsQdrantGenerationRemover::new(&runtime.layout);
+    Ok(apply_generation_retention(&plan, &mut remover))
+}
+
+fn build_generation_retention_plan(
+    storage_path: &Path,
+    cache_root: &Path,
+    runtime: &SidecarRuntimeConfig,
+    project_id: &str,
+) -> GenerationRetentionPlan {
+    let layout = &runtime.layout;
+    let mut protection =
+        scan_retention_protection(cache_root, Some(storage_path), &layout.state_file);
+    let manifest = if storage_path.is_file() {
+        match Store::open(storage_path) {
+            Ok(store) => match store.get_retrieval_index_manifest(project_id) {
+                Ok(Some(manifest)) => {
+                    record_manifest_retention_freshness(
+                        &store,
+                        project_id,
+                        &manifest,
+                        &mut protection.errors,
+                    );
+                    Some(manifest)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    protection
+                        .errors
+                        .push(format!("load active manifest for retention: {error:#}"));
+                    None
+                }
+            },
+            Err(error) => {
+                protection
+                    .errors
+                    .push(format!("open active storage for retention: {error:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    match manifest {
+        Some(manifest) if manifest_has_current_sidecar_contract(project_id, &manifest) => {
+            let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+            let health = probe_sidecar_health_with_embedding_device(
+                layout,
+                project_id,
+                Some(manifest),
+                &embedding_device,
+            );
+            if health.retrieval_mode != "full" {
+                protection.errors.push(format!(
+                    "active generation is not verified full; pruning suppressed: mode={} reason={}",
+                    health.retrieval_mode,
+                    health.degraded_reason.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
+        Some(_) => protection.errors.push(
+            "active retrieval manifest does not satisfy the current sidecar contract; pruning suppressed"
+                .to_string(),
+        ),
+        None => protection
+            .errors
+            .push("active retrieval manifest is unavailable; pruning suppressed".to_string()),
+    }
+    let live_qdrant_collections = match QdrantClient::new(layout).list_collection_names() {
+        Ok(collections) => collections,
+        Err(error) => {
+            protection.errors.push(format!(
+                "list live Qdrant collections for retention: {error:#}"
+            ));
+            Vec::new()
+        }
+    };
+    plan_generation_retention_with_qdrant_collections(
+        layout,
+        project_id,
+        &protection,
+        &live_qdrant_collections,
+    )
+}
+
+fn record_manifest_retention_freshness(
+    store: &Store,
+    project_id: &str,
+    manifest: &codestory_store::RetrievalIndexManifest,
+    errors: &mut Vec<String>,
+) {
+    if let Some(reason) = manifest_unavailable_reason(project_id, store, manifest) {
+        errors.push(format!(
+            "active retrieval manifest is stale; pruning suppressed: {reason}"
+        ));
     }
 }
 
@@ -838,6 +1013,22 @@ fn labels_from_value(value: Option<&serde_json::Value>) -> BTreeMap<String, Stri
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn stale_active_manifest_records_a_pruning_suppression_error() {
+        let root = tempdir().expect("root");
+        let store = Store::open(root.path().join("codestory.db")).expect("store");
+        let project_id = "repo-v1-project";
+        let mut manifest = crate::test_support::retrieval_manifest_fixture(project_id, "input");
+        manifest.embedding_dim = Some(1);
+        let mut errors = Vec::new();
+
+        record_manifest_retention_freshness(&store, project_id, &manifest, &mut errors);
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("active retrieval manifest is stale; pruning suppressed"));
+        assert!(errors[0].contains("sidecar_embedding_dim_changed"));
+    }
 
     fn write_state(path: &Path, state: &SidecarStateFile) {
         std::fs::create_dir_all(path.parent().expect("state parent")).expect("state parent");

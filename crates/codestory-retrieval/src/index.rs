@@ -5,6 +5,13 @@ use crate::generation::{
 };
 use crate::health::probe_sidecar_health_with_embedding_device;
 use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
+use crate::retention::{
+    FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
+    GenerationRetentionLock, GenerationRetentionMarker, GenerationRetentionPlan,
+    VerifiedRollbackManifest, apply_generation_retention, global_generation_gc_state_file,
+    plan_generation_retention_with_qdrant_collections, read_retention_marker,
+    scan_retention_protection, write_retention_marker,
+};
 use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
     import_precise_semantic_scip_artifact,
@@ -28,6 +35,8 @@ pub struct FinalizeIndexOutcome {
     pub zoekt_stubbed: bool,
     pub qdrant_stubbed: bool,
     pub scip_stubbed: bool,
+    pub generation_retention_plan: GenerationRetentionPlan,
+    pub generation_retention: GenerationRetentionApplyReport,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,6 +67,13 @@ struct SidecarStubFlags {
     zoekt_stubbed: bool,
     qdrant_stubbed: bool,
     scip_stubbed: bool,
+}
+
+struct GenerationRetentionContext<'a> {
+    layout: &'a SidecarLayout,
+    workspace_id: &'a str,
+    previous_manifest: Option<&'a RetrievalIndexManifest>,
+    embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = QDRANT_INDEX_UPSERT_BATCH_SIZE * 8;
@@ -193,9 +209,21 @@ pub fn finalize_index_for_runtime_with_progress(
 ) -> Result<FinalizeIndexOutcome> {
     runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
-    layout.ensure_data_dirs()?;
-
     let project_id = sidecar_project_id_for_root(project_root);
+    let workspace_id = runtime
+        .project_identity
+        .as_ref()
+        .map(|identity| identity.workspace_id.clone())
+        .unwrap_or_else(|| codestory_workspace::workspace_id_for_root(project_root));
+    let global_gc_state_file = global_generation_gc_state_file(runtime);
+    let _global_gc_lock = GenerationRetentionLock::acquire_shared(
+        &global_gc_state_file,
+        GLOBAL_GENERATION_GC_LOCK_SCOPE,
+    )
+    .context("coordinate sidecar publication with global generation cleanup")?;
+    let _generation_lock = GenerationRetentionLock::acquire(&layout.state_file, &project_id)
+        .context("lock sidecar generation publication and retention")?;
+    layout.ensure_data_dirs()?;
     let degraded_modes = Vec::new();
     let zoekt_stubbed = false;
     let qdrant_stubbed = false;
@@ -236,6 +264,12 @@ pub fn finalize_index_for_runtime_with_progress(
         .as_ref()
         .and_then(|manifest| manifest_unavailable_reason(&project_id, &storage, manifest));
     drop(storage);
+    let retention_context = GenerationRetentionContext {
+        layout: &layout,
+        workspace_id: &workspace_id,
+        previous_manifest: previous_manifest.as_ref(),
+        embedding_device: &embedding_device,
+    };
 
     if let Some(previous) = previous_manifest.as_ref() {
         if let Some(reason) = previous_manifest_unavailable_reason.as_ref() {
@@ -269,6 +303,7 @@ pub fn finalize_index_for_runtime_with_progress(
                         return persist_finalized_manifest(
                             project_root,
                             storage_path,
+                            &retention_context,
                             &sidecar_input,
                             project_id,
                             manifest,
@@ -289,14 +324,20 @@ pub fn finalize_index_for_runtime_with_progress(
                     lexical_file_count = sidecar_input.lexical_file_count,
                     "retrieval sidecar generation unchanged; reused existing full sidecars"
                 );
-                return Ok(FinalizeIndexOutcome {
+                return persist_finalized_manifest(
+                    project_root,
+                    storage_path,
+                    &retention_context,
+                    &sidecar_input,
                     project_id,
-                    manifest: previous.clone(),
+                    previous.clone(),
                     degraded_modes,
-                    zoekt_stubbed,
-                    qdrant_stubbed,
-                    scip_stubbed,
-                });
+                    SidecarStubFlags {
+                        zoekt_stubbed,
+                        qdrant_stubbed,
+                        scip_stubbed,
+                    },
+                );
             }
             warn!(
                 project_id = %project_id,
@@ -344,7 +385,7 @@ pub fn finalize_index_for_runtime_with_progress(
 
     if zoekt_ready && qdrant_ready_points.is_some() && scip_ready {
         update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
-        manifest.disk_bytes = sidecar_disk_bytes(&layout, &scip_dir);
+        manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
         let status = probe_sidecar_health_with_embedding_device(
             &layout,
             &project_id,
@@ -361,6 +402,7 @@ pub fn finalize_index_for_runtime_with_progress(
             return persist_finalized_manifest(
                 project_root,
                 storage_path,
+                &retention_context,
                 &sidecar_input,
                 project_id,
                 manifest,
@@ -414,12 +456,13 @@ pub fn finalize_index_for_runtime_with_progress(
 
     manifest.zoekt_version = zoekt_version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
-    manifest.disk_bytes = sidecar_disk_bytes(&layout, &scip_dir);
+    manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
 
     with_finalize_progress(&mut progress, "manifest write", || {
         finalize_manifest_after_health_check(
             project_root,
             storage_path,
+            &retention_context,
             &layout,
             &qdrant_client,
             project_id,
@@ -658,6 +701,7 @@ fn update_precise_semantic_import_status(
 fn finalize_manifest_after_health_check(
     project_root: &Path,
     storage_path: &Path,
+    retention_context: &GenerationRetentionContext<'_>,
     layout: &SidecarLayout,
     qdrant_client: &QdrantClient,
     project_id: String,
@@ -705,6 +749,7 @@ fn finalize_manifest_after_health_check(
     persist_finalized_manifest(
         project_root,
         storage_path,
+        retention_context,
         sidecar_input,
         project_id,
         manifest,
@@ -804,11 +849,21 @@ fn read_scip_revision(scip_dir: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn sidecar_disk_bytes(layout: &SidecarLayout, scip_dir: &Path) -> Option<i64> {
+fn sidecar_disk_bytes(
+    layout: &SidecarLayout,
+    generation: &str,
+    collection: &str,
+    scip_dir: &Path,
+) -> Option<i64> {
     Some(
-        dir_size_bytes(&layout.zoekt_data_dir)
-            .saturating_add(dir_size_bytes(&layout.qdrant_data_dir))
-            .saturating_add(dir_size_bytes(scip_dir)) as i64,
+        dir_size_bytes(&crate::zoekt_index::shard_dir_for(
+            &layout.zoekt_data_dir,
+            generation,
+        ))
+        .saturating_add(dir_size_bytes(
+            &layout.qdrant_data_dir.join("collections").join(collection),
+        ))
+        .saturating_add(dir_size_bytes(scip_dir)) as i64,
     )
 }
 
@@ -843,9 +898,11 @@ fn qdrant_ready_point_count(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_finalized_manifest(
     project_root: &Path,
     storage_path: &Path,
+    retention_context: &GenerationRetentionContext<'_>,
     sidecar_input: &SidecarInputFingerprint,
     project_id: String,
     mut manifest: RetrievalIndexManifest,
@@ -865,6 +922,10 @@ fn persist_finalized_manifest(
     storage
         .upsert_retrieval_index_manifest(&manifest)
         .context("persist retrieval_index_manifest")?;
+    drop(storage);
+
+    let (generation_retention_plan, generation_retention) =
+        retain_published_generations(storage_path, retention_context, &project_id, &manifest);
 
     info!(
         project_id = %project_id,
@@ -882,7 +943,103 @@ fn persist_finalized_manifest(
         zoekt_stubbed: stub_flags.zoekt_stubbed,
         qdrant_stubbed: stub_flags.qdrant_stubbed,
         scip_stubbed: stub_flags.scip_stubbed,
+        generation_retention_plan,
+        generation_retention,
     })
+}
+
+fn retain_published_generations(
+    storage_path: &Path,
+    context: &GenerationRetentionContext<'_>,
+    project_id: &str,
+    active: &RetrievalIndexManifest,
+) -> (GenerationRetentionPlan, GenerationRetentionApplyReport) {
+    let now = Utc::now().timestamp_millis();
+    let mut errors = Vec::new();
+    let existing_marker =
+        match read_retention_marker(&context.layout.state_file, context.workspace_id) {
+            Ok(marker) => marker,
+            Err(error) => {
+                errors.push(format!("read generation retention marker: {error:#}"));
+                None
+            }
+        };
+    let active_generation = active.sidecar_generation.as_deref();
+    let mut candidates = Vec::new();
+    if let Some(previous) = context.previous_manifest {
+        candidates.push(previous.clone());
+    }
+    if let Some(marker) = existing_marker.as_ref() {
+        candidates.push(marker.active.clone());
+        if let Some(rollback) = marker.rollback.as_ref() {
+            candidates.push(rollback.manifest.clone());
+        }
+    }
+    candidates.retain(|candidate| {
+        candidate.project_id == project_id
+            && candidate.sidecar_generation.as_deref() != active_generation
+            && manifest_has_current_sidecar_contract(project_id, candidate)
+    });
+    candidates.sort_by_key(|candidate| candidate.built_at_epoch_ms);
+    candidates.dedup_by(|left, right| left.sidecar_generation == right.sidecar_generation);
+    let verified_previous = candidates.into_iter().rev().find_map(|candidate| {
+        let status = probe_sidecar_health_with_embedding_device(
+            context.layout,
+            project_id,
+            Some(candidate.clone()),
+            context.embedding_device,
+        );
+        (status.retrieval_mode == "full").then_some(VerifiedRollbackManifest {
+            manifest: candidate,
+            verified_at_epoch_ms: now,
+        })
+    });
+
+    let marker = GenerationRetentionMarker::next(
+        context.workspace_id,
+        active.clone(),
+        verified_previous.clone(),
+        now,
+    );
+    match marker {
+        Ok(marker) => {
+            if let Err(error) = write_retention_marker(&context.layout.state_file, &marker) {
+                errors.push(format!("write generation retention marker: {error:#}"));
+            }
+        }
+        Err(error) => errors.push(format!("build generation retention marker: {error:#}")),
+    }
+
+    let mut protection = scan_retention_protection(
+        &crate::config::user_cache_root(),
+        Some(storage_path),
+        &context.layout.state_file,
+    );
+    if let Some(rollback) = verified_previous {
+        protection
+            .authoritative_rollback
+            .push(rollback.manifest.clone());
+        protection.rollback.push(rollback.manifest);
+    }
+    protection.errors.extend(errors);
+    let live_qdrant_collections = match QdrantClient::new(context.layout).list_collection_names() {
+        Ok(collections) => collections,
+        Err(error) => {
+            protection.errors.push(format!(
+                "list live Qdrant collections for retention: {error:#}"
+            ));
+            Vec::new()
+        }
+    };
+    let plan = plan_generation_retention_with_qdrant_collections(
+        context.layout,
+        project_id,
+        &protection,
+        &live_qdrant_collections,
+    );
+    let mut remover = FsQdrantGenerationRemover::new(context.layout);
+    let apply = apply_generation_retention(&plan, &mut remover);
+    (plan, apply)
 }
 
 pub(crate) fn compute_sidecar_input_fingerprint(
