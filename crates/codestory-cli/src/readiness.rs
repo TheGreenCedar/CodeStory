@@ -1,7 +1,6 @@
 use codestory_contracts::api::{
     IndexFreshnessDto, IndexFreshnessStatusDto, ReadinessGoalDto, ReadinessIndexSnapshotDto,
-    ReadinessSetupSnapshotDto, ReadinessSidecarSnapshotDto, ReadinessStatusDto,
-    ReadinessVerdictDto, StorageStatsDto,
+    ReadinessSidecarSnapshotDto, ReadinessStatusDto, ReadinessVerdictDto, StorageStatsDto,
 };
 use serde::Serialize;
 
@@ -12,17 +11,7 @@ pub(crate) struct ReadinessInputs<'a> {
     pub(crate) project: &'a str,
     pub(crate) stats: &'a StorageStatsDto,
     pub(crate) freshness: Option<&'a IndexFreshnessDto>,
-    pub(crate) setup: Option<&'a ReadinessSetupInput>,
     pub(crate) sidecar: Option<ReadinessSidecarInput<'a>>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReadinessSetupInput {
-    pub(crate) active_path: String,
-    pub(crate) active_version: String,
-    pub(crate) latest_version: String,
-    pub(crate) newer_installed_path: Option<String>,
-    pub(crate) newer_installed_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,12 +89,10 @@ pub(crate) fn build_readiness_verdict(
     let project = clean_path_string(inputs.project);
     let project_arg = project_arg(&project);
     let index = readiness_index_snapshot(inputs.stats, inputs.freshness);
-    let setup = inputs.setup.map(readiness_setup_snapshot);
     let sidecar = inputs.sidecar.map(readiness_sidecar_snapshot);
 
     let (status, summary, minimum_next, full_repair) = verdict_state(
         goal,
-        inputs.setup,
         inputs.stats,
         inputs.freshness,
         inputs.sidecar,
@@ -118,7 +105,7 @@ pub(crate) fn build_readiness_verdict(
         summary,
         minimum_next,
         full_repair,
-        setup,
+        setup: None,
         index: Some(index),
         sidecar,
     }
@@ -272,49 +259,11 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
 
 fn verdict_state(
     goal: ReadinessGoalDto,
-    setup: Option<&ReadinessSetupInput>,
     stats: &StorageStatsDto,
     freshness: Option<&IndexFreshnessDto>,
     sidecar: Option<ReadinessSidecarInput<'_>>,
     project_arg: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
-    if let Some(setup) = setup {
-        if let (Some(newer_path), Some(newer_version)) = (
-            setup.newer_installed_path.as_ref(),
-            setup.newer_installed_version.as_ref(),
-        ) {
-            let restart = format!(
-                "Restart/reload the Codex host/app so MCP relaunches codestory-cli {newer_version} from {newer_path}; then open a fresh agent thread and read codestory://status."
-            );
-            return (
-                ReadinessStatusDto::RepairSetup,
-                format!(
-                    "Active codestory-cli {} at {} is older than latest release {}; a newer installed codestory-cli {} exists at {}. Restart or reload the host before retrying CodeStory surfaces.",
-                    setup.active_version,
-                    setup.active_path,
-                    setup.latest_version,
-                    newer_version,
-                    newer_path
-                ),
-                vec![restart.clone()],
-                vec![restart],
-            );
-        }
-        let install = format!(
-            "powershell -NoProfile -ExecutionPolicy Bypass -Command '$installer = Join-Path $env:TEMP \"install-codestory.ps1\"; Invoke-WebRequest -UseBasicParsing -Uri \"https://raw.githubusercontent.com/TheGreenCedar/CodeStory/v{}/scripts/install-codestory.ps1\" -OutFile $installer; & $installer -Project {project_arg} -Version {}'",
-            setup.latest_version, setup.latest_version
-        );
-        return (
-            ReadinessStatusDto::RepairSetup,
-            format!(
-                "Active codestory-cli {} at {} is older than latest release {}; repair setup before using CodeStory surfaces.",
-                setup.active_version, setup.active_path, setup.latest_version
-            ),
-            vec![install.clone()],
-            vec![install],
-        );
-    }
-
     if goal == ReadinessGoalDto::LocalNavigation {
         if stats.node_count == 0 {
             return index_repair_state(goal, "No indexed symbols are available yet.", project_arg);
@@ -540,16 +489,6 @@ fn readiness_index_snapshot(
     }
 }
 
-fn readiness_setup_snapshot(input: &ReadinessSetupInput) -> ReadinessSetupSnapshotDto {
-    ReadinessSetupSnapshotDto {
-        active_path: input.active_path.to_string(),
-        active_version: input.active_version.to_string(),
-        latest_version: input.latest_version.to_string(),
-        newer_installed_path: input.newer_installed_path.clone(),
-        newer_installed_version: input.newer_installed_version.clone(),
-    }
-}
-
 fn readiness_sidecar_snapshot(input: ReadinessSidecarInput<'_>) -> ReadinessSidecarSnapshotDto {
     ReadinessSidecarSnapshotDto {
         profile: input.profile.map(ToOwned::to_owned),
@@ -627,7 +566,6 @@ mod tests {
             project: "C:/workspace/project",
             stats,
             freshness,
-            setup: None,
             sidecar,
         }
     }
@@ -705,122 +643,6 @@ mod tests {
             verdicts[0].minimum_next[0].contains("ready --goal local --repair"),
             "missing index repair should request full refresh: {verdicts:?}"
         );
-    }
-
-    #[test]
-    fn stale_active_cli_requires_setup_repair_before_index_or_sidecars() {
-        let stats = stats(3);
-        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
-        let verdicts = build_readiness_verdicts(ReadinessInputs {
-            project: "C:/workspace/project",
-            stats: &stats,
-            freshness: Some(&freshness),
-            setup: Some(&ReadinessSetupInput {
-                active_path: "C:/Users/alber/.local/bin/codestory-cli.exe".to_string(),
-                active_version: "0.11.6".to_string(),
-                latest_version: "0.11.9".to_string(),
-                newer_installed_path: None,
-                newer_installed_version: None,
-            }),
-            sidecar: Some(ReadinessSidecarInput {
-                profile: Some("agent"),
-                run_id: Some("run"),
-                retrieval_mode: "full",
-                degraded_reason: None,
-                embedding_device_policy: Some("accelerator_required"),
-                embedding_device_state: Some("accelerated"),
-                embedding_device_observation_source: Some("manual_env"),
-                embedding_detected_provider: None,
-                embedding_detected_gpu: None,
-                embedding_accelerator_requested: false,
-                embedding_accelerator_request_provider: None,
-                embedding_accelerator_request_device: None,
-                embedding_cpu_allowed: false,
-                manifest_generation: Some("generation"),
-                manifest_input_hash: Some("hash"),
-            }),
-        });
-
-        assert!(
-            verdicts
-                .iter()
-                .all(|verdict| verdict.status == ReadinessStatusDto::RepairSetup),
-            "stale active CLI must block all readiness goals: {verdicts:?}"
-        );
-        for verdict in verdicts {
-            let setup = verdict.setup.as_ref().expect("setup snapshot");
-            assert_eq!(setup.active_version, "0.11.6");
-            assert_eq!(setup.latest_version, "0.11.9");
-            assert!(
-                setup.active_path.contains("codestory-cli.exe"),
-                "setup snapshot should expose stale executable path: {setup:?}"
-            );
-            assert!(
-                verdict.minimum_next[0].contains("install-codestory.ps1")
-                    && verdict.minimum_next[0].contains("0.11.9"),
-                "stale CLI repair must be an install action, not advice: {verdict:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn stale_active_cli_with_newer_installed_binary_reports_restart_boundary() {
-        let stats = stats(3);
-        let freshness = freshness(IndexFreshnessStatusDto::Fresh);
-        let verdicts = build_readiness_verdicts(ReadinessInputs {
-            project: "C:/workspace/project",
-            stats: &stats,
-            freshness: Some(&freshness),
-            setup: Some(&ReadinessSetupInput {
-                active_path: "C:/Users/alber/.local/bin/codestory-cli.exe".to_string(),
-                active_version: "0.11.10".to_string(),
-                latest_version: "0.11.12".to_string(),
-                newer_installed_path: Some(
-                    "C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe".to_string(),
-                ),
-                newer_installed_version: Some("0.11.11".to_string()),
-            }),
-            sidecar: Some(ReadinessSidecarInput {
-                profile: Some("agent"),
-                run_id: Some("run"),
-                retrieval_mode: "full",
-                degraded_reason: None,
-                embedding_device_policy: Some("accelerator_required"),
-                embedding_device_state: Some("accelerated"),
-                embedding_device_observation_source: Some("manual_env"),
-                embedding_detected_provider: None,
-                embedding_detected_gpu: None,
-                embedding_accelerator_requested: false,
-                embedding_accelerator_request_provider: None,
-                embedding_accelerator_request_device: None,
-                embedding_cpu_allowed: false,
-                manifest_generation: Some("generation"),
-                manifest_input_hash: Some("hash"),
-            }),
-        });
-
-        assert!(
-            verdicts
-                .iter()
-                .all(|verdict| verdict.status == ReadinessStatusDto::RepairSetup),
-            "stale active CLI must remain a setup repair state: {verdicts:?}"
-        );
-        for verdict in verdicts {
-            let setup = verdict.setup.as_ref().expect("setup snapshot");
-            assert_eq!(
-                setup.newer_installed_path.as_deref(),
-                Some("C:/Users/alber/AppData/Local/CodeStory/bin/codestory-cli.exe")
-            );
-            assert_eq!(setup.newer_installed_version.as_deref(), Some("0.11.11"));
-            assert!(
-                verdict.minimum_next[0].contains("Restart/reload the Codex host/app"),
-                "stale CLI with newer installed binary should report the host boundary: {verdict:?}"
-            );
-            assert!(
-                !verdict.minimum_next[0].contains("install-codestory.ps1"),
-                "minimum_next should not repeat the installer after a newer binary is present: {verdict:?}"
-            );
-        }
     }
 
     #[test]

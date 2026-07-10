@@ -2452,7 +2452,6 @@ pub(crate) fn local_refresh_output_from_summary(
             project: &summary.root,
             stats: &summary.stats,
             freshness: summary.freshness.as_ref(),
-            setup: None,
             sidecar: None,
         },
     );
@@ -11174,7 +11173,6 @@ fn build_summary_readiness(
         project,
         stats,
         freshness,
-        setup: None,
         sidecar: Some(readiness_sidecar_input(sidecar)),
     })
 }

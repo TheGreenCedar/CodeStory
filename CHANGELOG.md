@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- Separated release-update advice from runtime readiness. A newer GitHub
+  release or a newer checksum-valid managed CLI now appears under the
+  non-blocking `runtime_update` status field without disabling compatible local
+  graph or agent surfaces; an installed newer runtime recommends a host reload.
+- Removed GitHub release discovery and CLI subprocess probes from the status
+  request path. Release metadata is cached for six hours, refreshed in the
+  background under a cross-process lock, and remains advisory when offline,
+  rate-limited, stale, or malformed.
 - Made MCP sidecar repair transfer one durable attempt reservation to the
   spawned CLI worker instead of rejecting its own handoff as a competing
   repair. The worker now inherits the parent cache scope, and MCP records its

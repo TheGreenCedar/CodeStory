@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -12,8 +13,11 @@ struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,
     hash_embeddings: bool,
-    latest_release_version: String,
+    latest_release_version: Option<String>,
+    disable_release_probe: bool,
     disable_installed_cli_probe: bool,
+    plugin_data_dir: Option<PathBuf>,
+    plugin_cli_source: Option<String>,
     sidecar_policy_state: Option<String>,
     sidecar_last_repair_command: Option<String>,
     dirty_marker_path: Option<PathBuf>,
@@ -175,8 +179,11 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         workspace,
         cache_dir,
         hash_embeddings,
-        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
         disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
         sidecar_policy_state: None,
         sidecar_last_repair_command: None,
         dirty_marker_path: None,
@@ -195,8 +202,11 @@ fn unindexed_fixture() -> StdioFixture {
         workspace,
         cache_dir,
         hash_embeddings: true,
-        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
         disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
         sidecar_policy_state: None,
         sidecar_last_repair_command: None,
         dirty_marker_path: None,
@@ -268,6 +278,31 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+fn write_managed_cli_fixture(plugin_data: &Path, version: &str) -> PathBuf {
+    let version_dir = plugin_data.join("codestory-cli").join(version);
+    let bin_dir = version_dir.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create managed CLI fixture dir");
+    let executable = bin_dir.join(if cfg!(windows) {
+        "codestory-cli.exe"
+    } else {
+        "codestory-cli"
+    });
+    let content = format!("managed CLI fixture {version}");
+    fs::write(&executable, content.as_bytes()).expect("write managed CLI fixture");
+    let sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    fs::write(
+        version_dir.join("manifest.json"),
+        json!({
+            "path": format!("bin/{}", executable.file_name().unwrap().to_string_lossy()),
+            "sha256": sha256,
+            "version": version
+        })
+        .to_string(),
+    )
+    .expect("write managed CLI fixture manifest");
+    executable
+}
+
 fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
     if hash_embeddings {
         command.env("CODESTORY_EMBED_RUNTIME_MODE", "hash");
@@ -289,12 +324,20 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
-    command.env(
-        "CODESTORY_LATEST_RELEASE_VERSION",
-        &fixture.latest_release_version,
-    );
+    if let Some(version) = &fixture.latest_release_version {
+        command.env("CODESTORY_LATEST_RELEASE_VERSION", version);
+    }
+    if fixture.disable_release_probe {
+        command.env("CODESTORY_DISABLE_RELEASE_PROBE", "1");
+    }
     if fixture.disable_installed_cli_probe {
         command.env("CODESTORY_DISABLE_INSTALLED_CLI_PROBE", "1");
+    }
+    if let Some(plugin_data) = &fixture.plugin_data_dir {
+        command.env("CODESTORY_PLUGIN_DATA", plugin_data);
+    }
+    if let Some(source) = &fixture.plugin_cli_source {
+        command.env("CODESTORY_PLUGIN_CLI_SOURCE", source);
     }
     if let Some(state) = &fixture.sidecar_policy_state {
         command.env("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE", state);
@@ -3931,9 +3974,80 @@ fn resources_read_status_dirty_marker_fail_open_matrix() {
 }
 
 #[test]
-fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
+fn update_available_is_advisory_and_preserves_compatible_surfaces() {
     let mut fixture = indexed_fixture();
-    fixture.latest_release_version = "999.0.0".to_string();
+    let plugin_data = fixture.cache_dir.path().join("plugin-data-update");
+    let installed = write_managed_cli_fixture(&plugin_data, "999.0.0");
+    fixture.latest_release_version = Some("999.0.0".to_string());
+    fixture.plugin_data_dir = Some(plugin_data);
+    fixture.plugin_cli_source = Some("managed".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-update-advisory",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-update-advisory"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["runtime_update"]["state"], json!("available"));
+    assert_eq!(status["runtime_update"]["blocking"], json!(false));
+    assert_eq!(status["runtime_update"]["readiness_impact"], json!("none"));
+    assert_eq!(
+        status["runtime_update"]["active_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(status["runtime_update"]["latest_version"], "999.0.0");
+    assert_eq!(status["runtime_update"]["restart_recommended"], json!(true));
+    assert_eq!(
+        status["runtime_update"]["recommended_action"],
+        json!("restart_host")
+    );
+    assert_eq!(
+        status["runtime_update"]["newer_installed_version"],
+        json!("999.0.0")
+    );
+    assert!(
+        status["runtime_update"]["newer_installed_path"]
+            .as_str()
+            .is_some_and(
+                |path| path.ends_with(installed.file_name().unwrap().to_string_lossy().as_ref())
+            ),
+        "status should expose the checksum-valid managed candidate: {status}"
+    );
+    assert_eq!(status["readiness"][0]["status"], json!("ready"));
+    assert!(status["readiness"][0].get("setup").is_none());
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(&status, "files", true, "local_navigation", "ready");
+    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        !next_call_text.contains("install-codestory.ps1") && !next_call_text.contains("999.0.0"),
+        "release availability must not replace readiness repair guidance: {status}"
+    );
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-with-update-available",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {}}
+        }),
+    );
+    assert_tool_success(&ground, json!("ground-with-update-available"));
+}
+
+#[test]
+fn offline_release_metadata_is_non_blocking_and_unknown() {
+    let mut fixture = indexed_fixture();
+    fixture.plugin_data_dir = Some(fixture.cache_dir.path().join("plugin-data-offline"));
+    fixture.latest_release_version = None;
+    fixture.disable_release_probe = true;
     fixture.disable_installed_cli_probe = true;
     let mut server = spawn_stdio_server(&fixture);
 
@@ -3941,113 +4055,107 @@ fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "status-stale-cli",
+            "id": "status-offline-release-metadata",
             "method": "resources/read",
             "params": {"uri": "codestory://status"}
         }),
     );
-    let result = assert_success_envelope(&response, json!("status-stale-cli"));
+    let result = assert_success_envelope(&response, json!("status-offline-release-metadata"));
     let status = json_resource_content(result, "codestory://status");
 
+    assert_eq!(status["runtime_update"]["state"], json!("unknown"));
     assert_eq!(
-        status["readiness"][0]["status"],
-        json!("repair_setup"),
-        "stale active CLI should be a hard setup repair state: {status}"
+        status["runtime_update"]["metadata_source"],
+        json!("disabled")
     );
-    let setup = &status["readiness"][0]["setup"];
-    assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(setup["latest_version"], "999.0.0");
-    assert!(
-        setup["active_path"]
-            .as_str()
-            .is_some_and(|path| path.contains("codestory-cli")),
-        "setup snapshot should expose active executable path: {status}"
+    assert_eq!(status["runtime_update"]["blocking"], json!(false));
+    assert_eq!(
+        status["runtime_update"]["metadata_refresh_scheduled"],
+        json!(false)
     );
-    for surface in [
-        "ground",
-        "files",
-        "packet",
-        "search",
-        "context",
-        "repair_all",
-    ] {
-        let surface_status = &status["allowed_surfaces"][surface];
-        assert_eq!(surface_status["allowed"], json!(false));
-        assert_eq!(surface_status["status"], json!("repair_setup"));
-        assert_eq!(surface_status["repair_reason"], json!("stale_active_cli"));
-    }
-    let next_call_text = status["recommended_next_calls"].to_string();
-    assert!(
-        next_call_text.contains("install-codestory.ps1") && next_call_text.contains("999.0.0"),
-        "stale active CLI repair should be an installer command, not a prompt: {status}"
-    );
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
 }
 
 #[test]
-fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
+fn failed_release_refresh_keeps_stale_cached_advice_without_blocking() {
     let mut fixture = indexed_fixture();
-    fixture.latest_release_version = "999.0.0".to_string();
+    let plugin_data = fixture.cache_dir.path().join("plugin-data-stale-cache");
+    fs::create_dir_all(&plugin_data).expect("create stale release cache dir");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64;
+    fs::write(
+        plugin_data.join("release-metadata.json"),
+        json!({
+            "schema_version": 1,
+            "latest_version": "999.0.0",
+            "checked_at_epoch_ms": now,
+            "refresh_failed": true
+        })
+        .to_string(),
+    )
+    .expect("write stale release metadata");
+    fixture.plugin_data_dir = Some(plugin_data);
+    fixture.latest_release_version = None;
+    fixture.disable_release_probe = true;
     fixture.disable_installed_cli_probe = true;
     let mut server = spawn_stdio_server(&fixture);
 
-    for (tool, arguments) in [
-        ("ground", json!({})),
-        ("search", json!({"query": "AppController"})),
-        ("repair_all", json!({})),
-    ] {
-        let response = send_json(
-            &mut server,
-            json!({
-                "jsonrpc": "2.0",
-                "id": format!("stale-{tool}"),
-                "method": "tools/call",
-                "params": {
-                    "name": tool,
-                    "arguments": arguments
-                }
-            }),
-        );
-        let error = assert_tool_error(&response, json!(format!("stale-{tool}")));
-        assert_eq!(
-            error.pointer("/code").and_then(Value::as_str),
-            Some("codestory_tool_blocked")
-        );
-        assert_eq!(
-            error.pointer("/status").and_then(Value::as_str),
-            Some("repair_setup")
-        );
-        assert_eq!(
-            error.pointer("/repair_reason").and_then(Value::as_str),
-            Some("stale_active_cli")
-        );
-        let setup = error
-            .pointer("/setup")
-            .unwrap_or_else(|| panic!("blocked stale CLI tool should include setup: {response}"));
-        assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(setup["latest_version"], "999.0.0");
-        let minimum_next = error
-            .pointer("/minimum_next")
-            .and_then(Value::as_array)
-            .unwrap_or_else(|| {
-                panic!("blocked stale CLI tool should include minimum_next: {response}")
-            });
-        assert!(
-            minimum_next.iter().all(|call| call
-                .get("method")
-                .and_then(Value::as_str)
-                .is_some_and(|method| method != "cli")),
-            "blocked stale CLI tool should not expose CLI as the normal repair method: {response}"
-        );
-        assert!(
-            minimum_next.iter().any(|call| call
-                .get("debug_command")
-                .and_then(Value::as_str)
-                .is_some_and(
-                    |text| text.contains("install-codestory.ps1") && text.contains("999.0.0")
-                )),
-            "blocked stale CLI tool should keep installer detail as debug metadata: {response}"
-        );
-    }
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-release-metadata",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-stale-release-metadata"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["runtime_update"]["state"], json!("available"));
+    assert_eq!(
+        status["runtime_update"]["metadata_source"],
+        json!("stale_cache")
+    );
+    assert_eq!(status["runtime_update"]["metadata_stale"], json!(true));
+    assert_eq!(
+        status["runtime_update"]["metadata_refresh_scheduled"],
+        json!(false)
+    );
+    assert_eq!(status["runtime_update"]["blocking"], json!(false));
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+}
+
+#[test]
+fn local_dev_override_does_not_recommend_restart_for_managed_history() {
+    let mut fixture = indexed_fixture();
+    let plugin_data = fixture.cache_dir.path().join("plugin-data-local-override");
+    write_managed_cli_fixture(&plugin_data, "999.0.0");
+    fixture.plugin_data_dir = Some(plugin_data);
+    fixture.plugin_cli_source = Some("local_dev_override".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-local-dev-override",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-local-dev-override"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["runtime_update"]["state"], json!("current"));
+    assert_eq!(
+        status["runtime_update"]["restart_recommended"],
+        json!(false)
+    );
+    assert!(status["runtime_update"]["newer_installed_path"].is_null());
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
 }
 
 #[test]

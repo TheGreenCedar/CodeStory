@@ -226,10 +226,16 @@ CLI health does not prove MCP is live in the agent host.
 
 ## Runtime drift after update
 
-Symptoms: `repair_setup`, stale `server_executable`, or version mismatch in status.
+Symptoms: `runtime_update.state=available`, a stale `server_executable`, or an
+actual runtime launch/compatibility failure reported as `repair_setup`.
 
-**You:** Let the plugin provision the current release, or restart the host after
-install. Confirm with a fresh `codestory://status` read.
+Release availability is advisory: it never disables otherwise compatible
+surfaces. Keep using the current runtime according to `allowed_surfaces`. If
+`runtime_update.restart_recommended=true`, restart the host when convenient so
+MCP launches the already-installed newer CLI. If status reports
+`repair_setup`, follow `recommended_next_calls`; that state is reserved for an
+actual runtime startup or compatibility problem. Confirm any runtime change
+with a fresh `codestory://status` read.
 
 **Local dev:** Set `CODESTORY_CLI` to a built binary; status labels this
 `local_dev_override`.
