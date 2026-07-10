@@ -22,7 +22,9 @@
         "--port",
         "{port}",
         "--n-gpu-layers",
-        "{n_gpu_layers}"
+        "{n_gpu_layers}",
+        "--log-verbosity",
+        "4"
       ],
       "device_arg_policy": "none_by_default",
       "log_markers": ["metal", "offloaded"]

@@ -581,6 +581,47 @@ fn native_embedding_reused_post_transfer_cleanup_is_noop() {
 }
 
 #[test]
+fn native_embedding_acquired_post_transfer_cleanup_releases_handed_off_lock() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-post-transfer-cleanup");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "shared-agent");
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+    let path = machine_resource_lock_path(&resource);
+    let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+    let state = native_sidecar_state(Some(now_epoch_ms()));
+    let launch = state.embedding_launch.as_ref().expect("native launch");
+    let pid = launch.pid.expect("native pid");
+
+    transfer_native_embedding_resource_lease_with_validator(&mut lease, &state, |_| Ok(pid))
+        .expect("transfer native lock to launched pid");
+    let mut cleanup_called = false;
+    cleanup_transferred_native_embedding_resource_after_error_with_cleanup(
+        &lease,
+        Some(launch),
+        || {
+            cleanup_called = true;
+            Ok(())
+        },
+        |launch| release_machine_resource_lock_for_native_launch(&resource, launch),
+    )
+    .expect("cleanup after post-transfer proof failure");
+
+    assert!(cleanup_called);
+    assert!(
+        !path.exists(),
+        "post-transfer cleanup should release the lock"
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
 fn native_embedding_reused_post_transfer_cleanup_skips_state_read() {
     let project = tempdir().expect("temp project");
     let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
